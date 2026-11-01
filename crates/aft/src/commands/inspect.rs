@@ -754,6 +754,25 @@ fn handle_inspect_payload(
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
     };
+    // A checkout over `views.callgraph_copies` reads the main checkout's
+    // graph. Where its files differ, dead code and the other graph-backed
+    // categories would describe the main checkout's code, so they report the
+    // borrowed graph as unavailable instead.
+    let routed_store = match (&routed_store, v3_routed) {
+        (crate::context::CallgraphStoreAccess::Ready(_), true) => {
+            match crate::commands::callgraph_borrowed::borrowed_callgraph(ctx)
+                .filter(crate::commands::callgraph_borrowed::BorrowedCallgraph::can_differ)
+            {
+                Some(borrowed) => crate::context::CallgraphStoreAccess::Error(
+                    crate::callgraph_store::CallGraphStoreError::Unavailable(
+                        borrowed.summary_line(),
+                    ),
+                ),
+                None => routed_store,
+            }
+        }
+        _ => routed_store,
+    };
     let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
     // Why the v3 view could not serve, observed once from the access this
     // request already holds: a SQLite lock is contention (pending, retry),
@@ -1557,6 +1576,7 @@ fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapsh
 }
 
 fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
+    let response = crate::access_policy::finish_current_plugin_response(response);
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let _ = tx.send(response);
     DispatchOutcome::Deferred(PendingResponse::from_receiver(

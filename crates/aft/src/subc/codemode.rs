@@ -645,10 +645,12 @@ fn effective_identity(
         role: run.role,
         trust: owner.trust,
         spawn_principal: owner.spawn_principal.clone(),
-        // Kept so an untrusted owner's shell call reaches the same approval
-        // step as the owner's direct call, which then refuses it because a run
-        // route has nobody to answer.
+        // Keep the owner's shell approval requirement. A capable agent program
+        // routes that approval through Cingulate rather than asking its tool
+        // consumer to display a prompt.
         consumer_elicitation_capable: owner.consumer_elicitation_capable,
+        held_reply: run.held_reply,
+        held_update: run.held_update,
         // Format negotiation belongs to the consumer receiving this reply.
         tool_result_body: run.tool_result_body,
         disabled_tools: Arc::clone(&owner.disabled_tools),

@@ -199,6 +199,12 @@ pub fn scope_config(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Optio
     json.map(|json| decode(&json)).transpose()
 }
 
+/// Confirmed ends remain authoritative even when cleanup of another table fails.
+pub(crate) fn scope_ended(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended!=0)",
+        params![key.owner,key.scope_ref,key.epoch.to_string()], |row| row.get(0))
+}
+
 /// Resolve a head's last observed policy at or before its attested epoch.
 /// Select tombstones too: an ended epoch must block an older live policy.
 /// Read grants from the selected row instead of copying them, so revocation

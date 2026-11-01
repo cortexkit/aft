@@ -1,0 +1,1 @@
+- Tool results AFT sends to the Broca and Thalamus runners for ordinary model calls no longer carry AFT's internal response, such as an edit's full diff or a command's output repeated three times. What the model reads is unchanged. Code-mode programs and AFT's own OpenCode and Pi plugins still get the full result.

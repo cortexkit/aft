@@ -107,12 +107,7 @@ fn selector_matches(selector: &Value, root: &Path, file: &Path) -> bool {
                 return false;
             }
             if filter.get("language").is_some_and(|language| {
-                language.as_str()
-                    != Some(super::manager::language_id_for_extension(
-                        file.extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or_default(),
-                    ))
+                language.as_str() != Some(super::manager::language_id_for_path(file, None))
             }) {
                 return false;
             }

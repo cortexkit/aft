@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/parser.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "slices": [
+    "h-header-language"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/parser.rs and crates/aft/src/semantic_index.rs. A .h file now parses as C, then C++, then Objective-C, taking the first error-free parse, and that language feeds symbols, outlines, call graphs and semantic chunks. Only .h files can change, and the search benchmark corpora contain no .h files, so ranked rows must remain byte-identical to the committed reference. Clean C headers keep their old keys and chunks; scoring and routing are unchanged."
+}

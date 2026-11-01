@@ -38,9 +38,30 @@ pub(super) struct ScopeDescriptions {
     entries: HashMap<ScopeKey, (Instant, Value)>,
     order: VecDeque<ScopeKey>,
     evicted: u64,
+    cleanup_pending: HashSet<ScopeKey>,
+    cleanup_failed_attempts: u64,
 }
 
 impl ScopeDescriptions {
+    pub(super) fn cleanup_started(&mut self, stamp: &ScopeStamp) {
+        self.cleanup_pending
+            .insert(scope_describe::stamp_key(stamp));
+    }
+
+    pub(super) fn cleanup_result(&mut self, stamp: &ScopeStamp, complete: bool) {
+        let key = scope_describe::stamp_key(stamp);
+        if complete {
+            self.cleanup_pending.remove(&key);
+        } else {
+            self.cleanup_pending.insert(key);
+            self.cleanup_failed_attempts = self.cleanup_failed_attempts.saturating_add(1);
+        }
+    }
+
+    pub(super) fn cleanup_health(&self) -> Value {
+        json!({"pending_scopes": self.cleanup_pending.len(), "failed_attempts": self.cleanup_failed_attempts})
+    }
+
     pub(super) fn record(
         &mut self,
         stamp: &ScopeStamp,
@@ -79,6 +100,9 @@ impl ScopeDescriptions {
             .map_or(Value::Null, |(at, value)| {
                 let mut value = value.clone();
                 value["age_ms"] = json!(age(now, *at));
+                value["cleanup_pending"] = json!(self
+                    .cleanup_pending
+                    .contains(&scope_describe::stamp_key(stamp)));
                 value
             })
     }
@@ -290,6 +314,7 @@ pub(super) fn snapshot(
         summary: json!({"bound_roots": root_count, "bound_routes": route_count,
             "all_routes_idle_over_30m_roots": idle_roots, "roots_with_ended_scopes": ended_roots,
             "scope_describe_cache_evicted": descriptions.evicted,
+            "scope_cleanup": descriptions.cleanup_health(),
             "scoped": scoped.value(), "unscoped": unscoped.value(), "by_principal": by_principal,
             "principal_limit": PRINCIPAL_LIMIT, "principals_omitted": omitted_principals,
             "omitted_principal_routes": omitted_routes, "omitted_principal_roots": omitted_roots.len()}),
@@ -578,15 +603,29 @@ mod tests {
         fixture.bind(&root, 1, false, "direct", now);
         fixture.bind(&root, 2, false, "direct", now);
         let metrics = DispatchPathMetrics::new();
-        let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+        // Registering the actor wakes the executor scheduler. The census try-locks
+        // that scheduler before reading the task registry, so even this process-free
+        // fixture can briefly report unknown pins. Retry only unknown snapshots;
+        // the running task and watch remain registered for the exact counts below.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let value = loop {
+            let value = fixture.snapshot(&executor, &metrics, now).render(&executor);
+            let rendered = value.to_string();
+            assert!(!rendered.contains("secret pattern"));
+            assert!(!rendered.contains("fake running command"));
+            assert!(!rendered.contains("private task output"));
+            if !value["roots"][0]["routes"][0]["pins"]["running_bash"].is_null()
+                || Instant::now() >= deadline
+            {
+                break value;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         for route in value["roots"][0]["routes"].as_array().unwrap() {
             assert_eq!(route["pins"]["running_bash"], 1);
             assert_eq!(route["pins"]["active_watch"], 1);
             assert_eq!(route["last_background_work_age_ms"], 0);
         }
-        assert!(!value.to_string().contains("secret pattern"));
-        assert!(!value.to_string().contains("fake running command"));
-        assert!(!value.to_string().contains("private task output"));
         let guard = task.state.lock().unwrap();
         let busy = fixture.snapshot(&executor, &metrics, now).render(&executor);
         assert!(busy["roots"][0]["routes"][0]["pins"]["running_bash"].is_null());

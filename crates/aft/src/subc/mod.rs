@@ -1436,10 +1436,7 @@ pub(crate) fn recovered_bash_frame(
         1,
         control_flags(),
         &result,
-        wire::ToolResponsePolicy {
-            trust: BindTrust::FirstParty,
-            tool_result_body: true,
-        },
+        wire::ToolResponsePolicy::for_retention(),
     )
     .ok()?;
     projected.frame = Frame::build_with_version(
@@ -1462,6 +1459,38 @@ pub(crate) fn recovered_bash_frame(
         outcome,
         tool_result_body,
     ))
+}
+
+pub(crate) fn project_held_ledger_result(
+    frame: &crate::db::call_ledger::RecordedFrame,
+    source: Option<&[u8]>,
+    include_structured: bool,
+) -> Result<crate::db::call_ledger::RecordedFrame, String> {
+    let frame = Frame::build(frame.ty, control_flags(), 1, 1, 1, frame.body.clone())
+        .map_err(|error| error.to_string())?;
+    let mut outgoing = WriterFrame::retained_tool_response_with_source(
+        frame,
+        wire::ToolResponsePolicy {
+            trust: if include_structured {
+                BindTrust::FirstParty
+            } else {
+                BindTrust::Untrusted
+            },
+            tool_result_body: true,
+            // This is a stored terminal body, not delivery to a route. Late
+            // readers and keyed replays apply their own recipient policy.
+            model_only: false,
+        },
+        None,
+        source.map(|source| source.to_vec()),
+    );
+    outgoing
+        .project_tool_result()
+        .map_err(|error| error.to_string())?;
+    Ok(crate::db::call_ledger::RecordedFrame {
+        ty: outgoing.header.ty,
+        body: outgoing.frame.body,
+    })
 }
 
 #[derive(Debug)]
@@ -1589,6 +1618,8 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    held_reply: bool,
+    held_update: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -7819,6 +7850,7 @@ async fn handle_route_bind_completion(
         .cloned()
     {
         let runtime = tokio::runtime::Handle::current();
+        let consent_executor = Arc::clone(executor);
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -7833,7 +7865,9 @@ async fn handle_route_bind_completion(
                     Ok(()) => {
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
-                        consent::reattach(ctx, &identity, &runtime);
+                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                            consent::reattach(&ctx, &identity, &runtime);
+                        }
                         Response::success("scope-bind", json!({}))
                     }
                     Err(error) => {
@@ -8596,6 +8630,12 @@ async fn handle_control_request(
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
             let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
+            let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                consumer_capabilities.as_deref(),
+            );
+            let held_reply = consumer_capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -8686,6 +8726,8 @@ async fn handle_control_request(
                 },
                 consumer_elicitation_capable,
                 tool_result_body,
+                held_reply,
+                held_update,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -10241,6 +10283,25 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if identity_for_run.run_owner.is_some() {
+                if let Err(response) = tool_provider::check_program_scope(
+                    ctx,
+                    &request_id_for_force,
+                    &identity_for_run,
+                ) {
+                    return response;
+                }
+                if let Some(key) = ledger_key.as_ref().filter(|_| approved_io_window.is_some()) {
+                    if let Err(response) = tool_provider::begin_approved_call(
+                        ctx,
+                        key,
+                        &request_id_for_force,
+                        &identity_for_run,
+                    ) {
+                        return response;
+                    }
+                }
+            }
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
@@ -10448,7 +10509,9 @@ async fn hold_for_consent(
         access_grants::ask_route(&plain_run.identity),
         crate::access_policy::AskRoute::Elicitation { .. }
     );
-    let reply_deadline = if elicitation {
+    let reply_deadline = if plain_run.identity.run_owner.is_some() {
+        consent::program_reply_deadline()
+    } else if elicitation {
         plain_run.reply_deadline
     } else {
         plain_run.io_budget.deadline
@@ -10465,8 +10528,22 @@ async fn hold_for_consent(
         active: Arc::clone(active_tool_calls),
         connection_cancel: connection_cancel.clone(),
         drain: module_drain.clone(),
+        ledger_key: plain_run.ledger_key.clone(),
+        shell_claim: None,
     };
-    let rerun = |ask_route| {
+    if plain_run.identity.run_owner.is_some() && plain_run.ledger_key.is_some() {
+        if consent::persist_permission_hold(&held).await.is_err() {
+            return Some((response, text));
+        }
+        let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+    let rerun = |ask_route, _shell| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
         // Start the renewed allowance when the executor admits the approved
         // work. Queueing after approval must not spend its filesystem budget.
@@ -10498,12 +10575,24 @@ async fn hold_for_consent(
                     &format_context,
                 ),
             };
-            (response, text)
+            Some((response, text))
         }
     };
     let result = if elicitation {
-        standalone::run_with_elicitation(held, (response, text), rerun, writer, metrics, ver, flags)
-            .await
+        standalone::run_with_elicitation(
+            held,
+            (response, text),
+            |route| async move {
+                rerun(route, Vec::<String>::new())
+                    .await
+                    .expect("file reruns do not hand off tasks")
+            },
+            writer,
+            metrics,
+            ver,
+            flags,
+        )
+        .await
     } else {
         consent::run_with_consent(held, (response, text), rerun).await
     };
@@ -11362,9 +11451,14 @@ async fn handle_tool_call_with_capabilities(
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_some() {
-            // An untrusted head's shell call asks its consumer first; a
-            // program's run route has nobody to put that question to.
+        if matches!(bind_trust, BindTrust::Untrusted)
+            && matches!(
+                access_grants::ask_route(&identity),
+                crate::access_policy::AskRoute::Unavailable
+            )
+        {
+            // Worker programs and programs without held replies cannot carry
+            // an untrusted shell approval through the consent service.
             let error = subc_protocol::ErrorBody::new(
                 crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
                 "this shell call needs an approval, and a codemode program can't ask for it",
@@ -11372,7 +11466,7 @@ async fn handle_tool_call_with_capabilities(
             .with_detail(json!({"permission": "bash", "resource": bare_name}));
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) {
+        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_none() {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,
                 identity.project_root.as_path(),
@@ -13508,6 +13602,8 @@ pub(crate) mod test_support {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14787,6 +14883,8 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19902,6 +20000,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20034,6 +20134,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),

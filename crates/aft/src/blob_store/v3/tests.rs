@@ -595,7 +595,7 @@ fn busy_validation_is_not_persisted_as_schema_drift() {
 }
 
 #[test]
-fn changing_derived_database_reports_busy_then_measurement_recovers() {
+fn changing_derived_database_records_an_owed_overstatement_then_measurement_recovers() {
     let _guard = serial();
     let root = tempdir().unwrap();
     seed(root.path(), A);
@@ -621,17 +621,19 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
             Ok(())
         }))
     });
-    let result = writer.covering_measurement();
+    let reservation = writer.reserve(1024).unwrap();
+    let result = writer.measure_and_release(Some(reservation.id), None);
     RECHECK_HOOK.with(|hook| *hook.borrow_mut() = None);
-    let error = result.unwrap_err();
+    // A namespace that never holds still is not a failure: the reservation is
+    // released, and the largest total seen is recorded and left owed.
+    assert_eq!(result.unwrap(), Measurement::Owed);
     assert_eq!(writes.get(), 8);
-    assert!(error.is_busy(), "{error}");
-    let detail = error.to_string();
+    assert_eq!(writer.accounting().unwrap().reserved_bytes, 0);
+    let recorded = writer.accounting().unwrap().measured_bytes;
     assert!(
-        detail.starts_with("reservation_ledger_busy: measure registry"),
-        "{detail}"
+        recorded >= allocated_bytes(writer.family_dir()).unwrap(),
+        "{recorded} understates the namespace"
     );
-    assert!(detail.contains("8 measurements"), "{detail}");
 
     let measured = writer.covering_measurement().unwrap();
     assert_eq!(measured, allocated_bytes(writer.family_dir()).unwrap());
@@ -639,36 +641,22 @@ fn changing_derived_database_reports_busy_then_measurement_recovers() {
 }
 
 #[test]
-fn floor_refusal_before_creation_and_budget_recheck_leave_no_plane_or_row() {
+fn floor_refusal_before_creation_leaves_no_store_and_no_family_byte_budget_applies() {
     let _guard = serial();
     let root = tempdir().unwrap();
-    let _low_space =
-        set_free_space_for_test(root.path(), NAMESPACE_BUDGET - 1, 8 * NAMESPACE_BUDGET);
+    let low_space = set_free_space_for_test(root.path(), MIN_FREE_BYTES - 1, 8 * MIN_FREE_BYTES);
     let error = publish(root.path(), A, 1, None, |_| Ok(())).unwrap_err();
     assert_eq!(error.to_string(), "device_free_space_floor");
     assert!(!root.path().join("blobs/v3").exists());
     assert!(!root.path().join("reader-floor.json").exists());
+    drop(low_space);
+    // With room on the device, a request far larger than any one family's
+    // data is admitted (no per-family byte limit), and its reservation is
+    // released after.
     let _space = set_free_space_for_test(root.path(), u64::MAX, u64::MAX / 2);
-    let error = publish(root.path(), A, NAMESPACE_BUDGET, None, |_| -> Result<()> {
-        panic!("budget must refuse before body")
-    })
-    .unwrap_err();
-    assert_eq!(error.to_string(), "v3_namespace_budget");
+    publish(root.path(), A, 5 * MIN_FREE_BYTES, None, |_| Ok(())).unwrap();
     let ledger = LedgerReader::open_existing(root.path(), A).unwrap();
     assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
-    assert_eq!(
-        ledger
-            .database
-            .connection()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM reservations", [], |r| r
-                .get::<_, u64>(0))
-            .unwrap(),
-        0
-    );
-    assert!(!plane_path(root.path(), A, FamilyPlane::Semantic)
-        .unwrap()
-        .exists());
 }
 
 struct Recheck<'a> {
@@ -682,8 +670,8 @@ impl DurabilityObserver for Recheck<'_> {
             drop(space.take());
             *space = Some(set_free_space_for_test(
                 self.storage,
-                NAMESPACE_BUDGET,
-                8 * NAMESPACE_BUDGET,
+                MIN_FREE_BYTES,
+                8 * MIN_FREE_BYTES,
             ));
         }
     }
@@ -727,7 +715,7 @@ fn sequential_reservations_sum_other_family_without_mutating_it() {
     let mut a = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
     let reservation = a.reserve(100).unwrap();
     let before = a.accounting().unwrap();
-    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), MIN_FREE_BYTES + 150, 8 * MIN_FREE_BYTES);
     let started = std::time::Instant::now();
     let error = publish_locked(root.path(), B, 100, &lock, None, |_| Ok(())).unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -896,16 +884,6 @@ fn failed_plane_commit_releases_reservation_but_keeps_orphan_charge() {
     assert_eq!(usage.reserved_bytes, 0);
     assert_eq!(usage.usage(), inventory(&writer.dir));
     assert!(usage.usage() >= 1024 * 1024);
-    let error = publish_locked(
-        root.path(),
-        A,
-        NAMESPACE_BUDGET - 1024 * 1024,
-        &lock,
-        None,
-        |_| Ok(()),
-    )
-    .unwrap_err();
-    assert_eq!(error.to_string(), "v3_namespace_budget");
     assert_eq!(
         PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic)
             .unwrap()
@@ -1143,8 +1121,7 @@ fn v3_child() {
         return;
     }
     if mode == "reserve" {
-        let _space =
-            set_free_space_for_test(&storage, NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+        let _space = set_free_space_for_test(&storage, MIN_FREE_BYTES + 150, 8 * MIN_FREE_BYTES);
         let result = (|| -> Result<()> {
             let rendezvous = control.parent().unwrap();
             fs::write(rendezvous.join(format!("started-{family}")), b"ready")?;
@@ -1406,7 +1383,7 @@ fn nested_writer_uses_existing_root_guard_and_does_not_touch_peer_ledger() {
 fn capacity_percentage_floor_applies_above_the_four_gib_minimum() {
     let _g = serial();
     let root = tempdir().unwrap();
-    let _space = set_free_space_for_test(root.path(), 2 * NAMESPACE_BUDGET, 200 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), 2 * MIN_FREE_BYTES, 200 * MIN_FREE_BYTES);
     assert_eq!(
         publish(root.path(), A, 1, None, |_| Ok(()))
             .unwrap_err()
@@ -1467,8 +1444,6 @@ fn reclaimed_plane_pages_reduce_usage_only_at_the_next_covering_measurement() {
     assert_eq!(after, inventory(&registry.dir));
     let freed = before - after;
     assert!(freed > 0, "incremental reclaim must free allocated pages");
-    let reservation = registry.reserve(NAMESPACE_BUDGET - before + freed).unwrap();
-    registry.release(reservation).unwrap();
 }
 
 #[test]
@@ -1784,7 +1759,7 @@ fn reader_vfs_audit_counts_real_scratch_writes_truncates_and_syncs() {
 
 #[cfg(unix)]
 #[test]
-fn reader_created_shm_stays_within_the_covering_inventory_at_the_budget_boundary() {
+fn reader_created_shm_stays_within_the_covering_inventory() {
     let _g = serial();
     let root = tempdir().unwrap();
     let control = tempdir().unwrap();
@@ -1802,10 +1777,6 @@ fn reader_created_shm_stays_within_the_covering_inventory_at_the_budget_boundary
     wait_file(&ready, &mut reader);
     assert!(shm.exists());
     assert!(inventory(&family_dir(root.path(), A).unwrap()) <= covered);
-    let lock = ReservationLock::acquire(root.path()).unwrap();
-    let mut writer = RegistryWriter::open_existing(root.path(), A, &lock).unwrap();
-    let reservation = writer.reserve(NAMESPACE_BUDGET - covered).unwrap();
-    writer.release(reservation).unwrap();
     fs::write(ready.with_extension("release"), b"close").unwrap();
     assert!(reader.wait().unwrap().success());
     assert_reader_io_is_read_only(&audit_result(&ready));
@@ -1873,7 +1844,7 @@ fn publish_after_dead_owner(target: &str) {
             .reserved_bytes,
         100
     );
-    let _space = set_free_space_for_test(root.path(), NAMESPACE_BUDGET + 150, 8 * NAMESPACE_BUDGET);
+    let _space = set_free_space_for_test(root.path(), MIN_FREE_BYTES + 150, 8 * MIN_FREE_BYTES);
     publish(root.path(), target, 100, None, |_| Ok(()))
         .expect("dead reservations must be recovered before the final floor decision");
     assert_eq!(

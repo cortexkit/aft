@@ -136,6 +136,8 @@ pub(super) struct WriterFrame {
     pub(super) frame: Frame,
     body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    /// Keep the recipient policy after retention consumes result_projection.
+    response_policy: Option<ToolResponsePolicy>,
     result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
     prepared_projection: Option<Arc<Vec<u8>>>,
     ack_receipt: Option<(
@@ -165,6 +167,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
+            response_policy: None,
             result_projection: None,
             prepared_projection: None,
             ack_receipt: None,
@@ -178,6 +181,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
+            response_policy: None,
             result_projection: None,
             prepared_projection: None,
             ack_receipt: None,
@@ -264,6 +268,7 @@ impl WriterFrame {
         image_alt: Option<&str>,
     ) -> Self {
         let mut outgoing = Self::plain(frame);
+        outgoing.response_policy = Some(policy);
         if policy.tool_result_body {
             let source = if outgoing.header.ty == FrameType::Response {
                 if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
@@ -300,6 +305,12 @@ impl WriterFrame {
                 None
             };
             outgoing.result_projection = Some((policy, MAX_FRAME_BODY_LEN as usize, source));
+        } else if policy.model_only && outgoing.header.ty == FrameType::Response {
+            outgoing.prepared_projection = Some(Arc::new(
+                model_only_body(&outgoing.frame.body).unwrap_or_else(|_| {
+                    br#"{"content":[{"type":"text","text":"retained tool reply could not be decoded"}],"isError":true}"#.to_vec()
+                }),
+            ));
         }
         outgoing
     }
@@ -318,7 +329,7 @@ impl WriterFrame {
         let rendered = super::retained_result::render(
             &source,
             &frame.body,
-            !matches!(policy.trust, BindTrust::Untrusted),
+            policy.include_structured(),
             super::result_body::MAX_RESULT_BYTES,
         );
         let refusal = match rendered {
@@ -332,6 +343,7 @@ impl WriterFrame {
                 });
                 if valid {
                     let mut outgoing = Self::plain(frame);
+                    outgoing.response_policy = Some(policy);
                     outgoing.prepared_projection = Some(Arc::new(rendered.bytes));
                     return outgoing;
                 }
@@ -397,7 +409,7 @@ impl WriterFrame {
                 header.corr,
                 header.flags,
                 fallback,
-                policy.trust,
+                policy,
                 body_limit,
             )?;
             projected = frame;
@@ -432,6 +444,21 @@ impl WriterFrame {
         )
         .map_err(SubcError::FrameBuild)?;
         Ok(())
+    }
+
+    /// A failed ledger write may report the result, but must not bypass the
+    /// recipient's projection by quoting the complete retained legacy body.
+    pub(super) fn settlement_error_body(&self) -> Cow<'_, [u8]> {
+        if !self.response_policy.is_some_and(|policy| policy.model_only) {
+            return Cow::Borrowed(&self.frame.body);
+        }
+        if let Some(body) = &self.prepared_projection {
+            return Cow::Borrowed(body.as_slice());
+        }
+        Cow::Owned(
+            model_only_body(&self.frame.body)
+                .unwrap_or_else(|_| b"runner result could not be projected".to_vec()),
+        )
     }
 
     fn prepare_tool_result(&mut self) -> Result<(), SubcError> {
@@ -472,7 +499,7 @@ impl WriterFrame {
             header.corr,
             header.flags,
             result,
-            policy.trust,
+            policy,
             limit,
         )?;
         Ok(Some((projected.0, projected.1, policy, limit)))
@@ -1049,10 +1076,54 @@ fn response_too_large_frame(
     .expect("fixed response_too_large envelope must fit the protocol frame limit")
 }
 
+// No caller-role attestation reaches RouteIdentity. Use exact principals, not
+// harnesses: Thalamus shares `opencode` with AFT's own plugin, which needs diffs.
+const LLM_RUNNER_PRINCIPALS: &[&str] = &["reserved:broca", "reserved:thalamus-harness"];
+
 #[derive(Clone, Copy)]
 pub(super) struct ToolResponsePolicy {
     pub(super) trust: BindTrust,
     pub(super) tool_result_body: bool,
+    pub(super) model_only: bool,
+}
+
+impl ToolResponsePolicy {
+    /// Retain the complete native result when the original route is gone.
+    /// Delivery must instead derive its policy from the receiving route.
+    pub(super) fn for_retention() -> Self {
+        Self {
+            trust: BindTrust::FirstParty,
+            tool_result_body: true,
+            model_only: false,
+        }
+    }
+
+    fn include_structured(self) -> bool {
+        !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
+    }
+
+    /// Custody replies embed recorded results, not freshly serialized tool
+    /// replies. Project those copies without changing the durable records.
+    pub(super) fn project_custody_body(self, body: Vec<u8>) -> Result<Vec<u8>, serde_json::Error> {
+        if !self.model_only {
+            return Ok(body);
+        }
+        let mut reply: Value = serde_json::from_slice(&body)?;
+        let strip_result = |entry: &mut Value| {
+            if let Some(result) = entry.get_mut("result").and_then(Value::as_object_mut) {
+                result.remove("structuredContent");
+            }
+        };
+        // Completed withdraw answers and individual late entries embed one
+        // result; late_results pages embed one per entry.
+        strip_result(&mut reply);
+        if let Some(entries) = reply.get_mut("entries").and_then(Value::as_array_mut) {
+            for entry in entries {
+                strip_result(entry);
+            }
+        }
+        serde_json::to_vec(&reply)
+    }
 }
 
 impl From<BindTrust> for ToolResponsePolicy {
@@ -1060,15 +1131,24 @@ impl From<BindTrust> for ToolResponsePolicy {
         Self {
             trust,
             tool_result_body: false,
+            model_only: false,
         }
     }
 }
 
 impl From<&super::RouteIdentity> for ToolResponsePolicy {
     fn from(identity: &super::RouteIdentity) -> Self {
+        let runner = matches!(
+            &identity.spawn_principal,
+            super::AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
+                if LLM_RUNNER_PRINCIPALS.contains(&id.as_str())
+        );
         Self {
             trust: identity.trust,
             tool_result_body: identity.tool_result_body,
+            // Programs read arbitrary fields. Only positively identified
+            // ordinary calls lose structured data; flow and unknown modes keep it.
+            model_only: identity.call_mode == subc_protocol::call_mode::CallMode::Classic && runner,
         }
     }
 }
@@ -1129,25 +1209,22 @@ pub(super) fn build_tool_response_frame_with_limit(
     policy: impl Into<ToolResponsePolicy>,
     max_body_len: usize,
 ) -> Result<WriterFrame, SubcError> {
-    let ToolResponsePolicy {
-        trust,
-        tool_result_body,
-    } = policy.into();
-    let policy = ToolResponsePolicy {
-        trust,
-        tool_result_body,
-    };
-    if !tool_result_body {
-        return build_legacy_tool_response_frame(
-            ver,
-            route,
-            corr,
-            flags,
-            result,
-            trust,
-            max_body_len,
-        )
-        .map(WriterFrame::plain);
+    let policy = policy.into();
+    let trust = policy.trust;
+    if !policy.tool_result_body {
+        let frame =
+            build_legacy_tool_response_frame(ver, route, corr, flags, result, trust, max_body_len)?;
+        // The ledger retains the full legacy frame. Only the final writer sees
+        // the runner's projection, just as it does for tool-result/v1 replies.
+        let projection = policy
+            .model_only
+            .then(|| model_only_body(&frame.body))
+            .transpose()
+            .map_err(SubcError::Json)?;
+        let mut outgoing = WriterFrame::plain(frame);
+        outgoing.response_policy = Some(policy);
+        outgoing.prepared_projection = projection.map(Arc::new);
+        return Ok(outgoing);
     }
     let mut source = ToolCallResult {
         text: result.text.clone(),
@@ -1186,6 +1263,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         }
     }
     let mut outgoing = WriterFrame::plain(frame);
+    outgoing.response_policy = Some(policy);
     outgoing.result_projection = Some((policy, max_body_len, Some(source)));
     Ok(outgoing)
 }
@@ -1298,6 +1376,34 @@ fn retained_tool_result(body: &[u8]) -> Result<ToolCallResult, SubcError> {
     })
 }
 
+/// Preserve the model-facing fields verbatim while dropping display data.
+/// Raw values keep image parts and escaped text unchanged on legacy replies.
+fn model_only_body(body: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
+    use serde_json::value::RawValue;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ModelResult<'a> {
+        #[serde(borrow)]
+        content: &'a RawValue,
+        #[serde(borrow)]
+        is_error: &'a RawValue,
+        #[serde(borrow)]
+        error_code: Option<&'a RawValue>,
+    }
+    let result: ModelResult<'_> = serde_json::from_slice(body)?;
+    let mut slim = Vec::with_capacity(result.content.get().len() + 128);
+    slim.extend_from_slice(b"{\"content\":");
+    slim.extend_from_slice(result.content.get().as_bytes());
+    slim.extend_from_slice(b",\"isError\":");
+    slim.extend_from_slice(result.is_error.get().as_bytes());
+    if let Some(code) = result.error_code {
+        slim.extend_from_slice(b",\"errorCode\":");
+        slim.extend_from_slice(code.get().as_bytes());
+    }
+    slim.push(b'}');
+    Ok(slim)
+}
+
 fn complete_image_dimensions(result: &mut ToolCallResult) -> Result<(), String> {
     use base64::Engine;
     let Some(parts) = result
@@ -1339,10 +1445,10 @@ fn build_result_body_frame(
     corr: u64,
     flags: Flags,
     mut result: ToolCallResult,
-    trust: BindTrust,
+    policy: ToolResponsePolicy,
     max_body_len: usize,
 ) -> Result<(Frame, ToolCallResult), SubcError> {
-    let include_structured = !matches!(trust, BindTrust::Untrusted);
+    let include_structured = policy.include_structured();
     let mut body = serialize_tool_response_body_with_text(
         &result,
         include_structured,
@@ -1396,6 +1502,41 @@ pub(super) fn build_error_frame(
     let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(SubcError::Json)?;
     Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
         .map_err(SubcError::FrameBuild)
+}
+
+pub(super) fn build_held_frame(
+    ver: u8,
+    route: super::RouteChannel,
+    corr: u64,
+    flags: Flags,
+    reason: &str,
+    detail: Option<Value>,
+) -> Result<Frame, SubcError> {
+    use cortexkit_role_tool_provider::result::{ContentPart, HeldReply, ToolResult};
+    let mut held = serde_json::to_value(HeldReply::new(reason)).map_err(SubcError::Json)?;
+    if let Some(detail) = detail {
+        held["detail"] = detail;
+    }
+    let held = serde_json::from_value(held).map_err(SubcError::Json)?;
+    let body = ToolResult::new(vec![ContentPart::Text {
+        text: String::new(),
+    }])
+    .with_held(held);
+    cortexkit_role_tool_provider::result::validate(&body).map_err(|error| {
+        SubcError::Json(<serde_json::Error as serde::ser::Error>::custom(
+            error.to_string(),
+        ))
+    })?;
+    Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        flags,
+        route.channel,
+        route.epoch,
+        corr,
+        serde_json::to_vec(&body).map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
 }
 
 /// [`build_error_frame`] with a machine-readable `detail` object, for errors
@@ -1762,6 +1903,327 @@ pub(super) mod tests {
             &crate::subc_format::FormatContext::default(),
         );
         ToolCallResult { text, response }
+    }
+
+    fn result_route(
+        principal: Option<&str>,
+        harness: &str,
+        mode: subc_protocol::call_mode::CallMode,
+    ) -> crate::subc::RouteIdentity {
+        let root =
+            crate::subc::ProjectRootId::from_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+        let mut identity = crate::subc::test_support::route_identity_with_harness(
+            &root,
+            "result-session",
+            BindTrust::FirstParty,
+            harness,
+        );
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.tool_result_body = true;
+        data.call_mode = mode;
+        let crate::subc::AuthenticatedPrincipal::RouteBind {
+            principal_id,
+            harness: bound_harness,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            unreachable!("fixture route bind");
+        };
+        *principal_id = principal.map(str::to_owned);
+        *bound_harness = harness.into();
+        identity
+    }
+
+    fn display_results() -> [ToolCallResult; 2] {
+        [
+            ToolCallResult {
+                text: "Edited fixture.rs".into(),
+                response: Response::success(
+                    "edit-id",
+                    json!({
+                        "path": "fixture.rs",
+                        "metadata": {"diff": "--- a/fixture.rs\n+++ b/fixture.rs\n@@ -1 +1 @@\n-old\n+new\n"},
+                        "status_bar": {"errors": 0},
+                    }),
+                ),
+            },
+            ToolCallResult {
+                text: "command output".into(),
+                response: Response::success(
+                    "bash-id",
+                    json!({
+                        "output": "command output",
+                        "output_preview": "command output",
+                        "text": "command output",
+                        "exit_code": 0,
+                        "status": "completed",
+                    }),
+                ),
+            },
+        ]
+    }
+
+    fn projected_result_body(
+        result: &ToolCallResult,
+        policy: impl Into<ToolResponsePolicy>,
+    ) -> Vec<u8> {
+        let mut outgoing = build_tool_response_frame(
+            PROTOCOL_VERSION,
+            route_key(7, 3),
+            42,
+            control_flags(),
+            result,
+            policy,
+        )
+        .unwrap();
+        outgoing.project_tool_result().unwrap();
+        outgoing.frame.body
+    }
+
+    fn assert_full_results(identity: &crate::subc::RouteIdentity) {
+        for result in display_results() {
+            assert_eq!(
+                projected_result_body(&result, identity),
+                legacy_tool_response_body(&result, true),
+                "full structured result must remain byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_ordinary_edit_has_only_model_content() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            let identity = result_route(Some(principal), "opencode", CallMode::Classic);
+            assert_eq!(
+                projected_result_body(&display_results()[0], &identity),
+                br#"{"content":[{"type":"text","text":"Edited fixture.rs"}],"isError":false}"#
+            );
+        }
+    }
+
+    #[test]
+    fn runner_ordinary_bash_has_no_duplicate_output() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            let identity = result_route(Some(principal), "opencode", CallMode::Classic);
+            assert_eq!(
+                projected_result_body(&display_results()[1], &identity),
+                br#"{"content":[{"type":"text","text":"command output"}],"isError":false}"#
+            );
+        }
+    }
+
+    #[test]
+    fn codemode_results_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in [
+            "reserved:broca",
+            "reserved:thalamus-harness",
+            "reserved:basal",
+        ] {
+            assert_full_results(&result_route(
+                Some(principal),
+                "opencode",
+                CallMode::Codemode,
+            ));
+        }
+    }
+
+    #[test]
+    fn plugin_results_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for harness in ["opencode", "pi"] {
+            for principal in ["direct", "reserved:aft"] {
+                assert_full_results(&result_route(Some(principal), harness, CallMode::Classic));
+            }
+        }
+    }
+
+    #[test]
+    fn unidentified_callers_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in [
+            None,
+            Some("reserved:prefrontal"),
+            Some("reserved:basal"),
+            Some("reserved:broca-next"),
+            Some("reserved:thalamus-harness-copy"),
+        ] {
+            assert_full_results(&result_route(principal, "opencode", CallMode::Classic));
+        }
+    }
+
+    #[test]
+    fn runner_flow_and_unknown_modes_keep_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        for mode in [CallMode::Flow, CallMode::Unknown("future-mode".into())] {
+            assert_full_results(&result_route(Some("reserved:broca"), "broca", mode));
+        }
+    }
+
+    #[test]
+    fn runner_legacy_results_are_slimmed_only_at_write() {
+        use subc_protocol::call_mode::CallMode;
+        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
+            let mut runner = result_route(Some(principal), "opencode", CallMode::Classic);
+            Arc::get_mut(&mut runner.0).unwrap().tool_result_body = false;
+            for result in display_results() {
+                let mut outgoing = build_tool_response_frame(
+                    PROTOCOL_VERSION,
+                    route_key(7, 3),
+                    42,
+                    control_flags(),
+                    &result,
+                    &runner,
+                )
+                .unwrap();
+                let full = legacy_tool_response_body(&result, true);
+                assert_eq!(outgoing.frame.body, full, "ledger source stays complete");
+                assert!(outgoing
+                    .tool_result_source_for_retention()
+                    .unwrap()
+                    .is_none());
+                let retained = outgoing.frame.clone();
+                outgoing.project_tool_result().unwrap();
+                assert_eq!(
+                    outgoing.frame.body,
+                    legacy_tool_response_body(&result, false)
+                );
+
+                let mut replay =
+                    WriterFrame::retained_tool_response(retained.clone(), (&runner).into(), None);
+                replay.project_tool_result().unwrap();
+                assert_eq!(replay.frame.body, outgoing.frame.body);
+                for (principal, mode) in [
+                    ("direct", CallMode::Classic),
+                    (principal, CallMode::Codemode),
+                ] {
+                    let mut consumer = result_route(Some(principal), "opencode", mode);
+                    Arc::get_mut(&mut consumer.0).unwrap().tool_result_body = false;
+                    let mut replay = WriterFrame::retained_tool_response(
+                        retained.clone(),
+                        (&consumer).into(),
+                        None,
+                    );
+                    replay.project_tool_result().unwrap();
+                    assert_eq!(replay.frame.body, full);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn runner_result_preserves_images_error_flags_and_error_codes() {
+        use subc_protocol::call_mode::CallMode;
+        let identity = result_route(Some("reserved:broca"), "broca", CallMode::Classic);
+        let result = ToolCallResult {
+            text: "image with an error".into(),
+            response: Response {
+                id: "image-id".into(),
+                success: false,
+                data: json!({
+                    "code": "HTTP-Error / 403",
+                    "attachments": [{"kind":"image", "data":"AQID", "mime":"image/png", "width":1, "height":1, "alt":"fixture.png"}],
+                    "metadata": {"diff": "private diff"},
+                }),
+            },
+        };
+        let slim = projected_result_body(&result, &identity);
+        assert_eq!(slim, br#"{"content":[{"type":"text","text":"image with an error"},{"type":"image","data":"AQID","mimeType":"image/png","width":1,"height":1,"alt":"fixture.png"}],"isError":true,"errorCode":"http_error_403"}"#);
+        let mut full: Value = serde_json::from_slice(&projected_result_body(
+            &result,
+            ToolResponsePolicy {
+                trust: BindTrust::FirstParty,
+                tool_result_body: true,
+                model_only: false,
+            },
+        ))
+        .unwrap();
+        full.as_object_mut().unwrap().remove("structuredContent");
+        assert_eq!(serde_json::from_slice::<Value>(&slim).unwrap(), full);
+
+        let mut untrusted = identity;
+        Arc::get_mut(&mut untrusted.0).unwrap().trust = BindTrust::Untrusted;
+        assert_eq!(
+            projected_result_body(&result, &untrusted),
+            projected_result_body(
+                &result,
+                ToolResponsePolicy {
+                    trust: BindTrust::Untrusted,
+                    tool_result_body: true,
+                    model_only: false
+                }
+            ),
+        );
+    }
+
+    #[test]
+    fn retained_results_follow_the_replaying_routes_policy() {
+        use subc_protocol::call_mode::CallMode;
+        let runner = result_route(Some("reserved:broca"), "opencode", CallMode::Classic);
+        let plugin = result_route(Some("direct"), "opencode", CallMode::Classic);
+        let codemode = result_route(Some("reserved:broca"), "broca", CallMode::Codemode);
+        for result in display_results() {
+            let mut outgoing = build_tool_response_frame(
+                PROTOCOL_VERSION,
+                route_key(7, 3),
+                42,
+                control_flags(),
+                &result,
+                &runner,
+            )
+            .unwrap();
+            let source = outgoing
+                .tool_result_source_for_retention()
+                .unwrap()
+                .unwrap();
+            for identity in [&runner, &plugin, &codemode] {
+                for with_source in [false, true] {
+                    let mut replay = WriterFrame::retained_tool_response_with_source(
+                        outgoing.frame.clone(),
+                        identity.into(),
+                        None,
+                        with_source.then(|| source.clone()),
+                    );
+                    replay.project_tool_result().unwrap();
+                    assert_eq!(replay.frame.body, projected_result_body(&result, identity));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custody_projection_keeps_nonrunner_bytes_and_slims_individual_late_entries() {
+        use subc_protocol::call_mode::CallMode;
+        let body = br#"{ "kind":"result", "result":{"content":[{"type":"text","text":"done"}],"isError":false,"errorCode":"tool_error","structuredContent":{"metadata":{"diff":"private diff"}}} }"#;
+        for (principal, mode) in [
+            ("direct", CallMode::Classic),
+            ("reserved:basal", CallMode::Flow),
+            ("reserved:broca", CallMode::Codemode),
+            ("reserved:broca", CallMode::Unknown("future-mode".into())),
+        ] {
+            let identity = result_route(Some(principal), "opencode", mode);
+            assert_eq!(
+                identity
+                    .reply_policy()
+                    .project_custody_body(body.to_vec())
+                    .unwrap(),
+                body
+            );
+        }
+        let runner = result_route(Some("reserved:broca"), "opencode", CallMode::Classic);
+        let slim = runner
+            .reply_policy()
+            .project_custody_body(body.to_vec())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&slim).unwrap(),
+            json!({
+                "kind":"result", "result":{"content":[{"type":"text","text":"done"}],"isError":false,"errorCode":"tool_error"}
+            })
+        );
     }
 
     #[test]

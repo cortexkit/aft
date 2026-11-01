@@ -96,7 +96,11 @@ def verify_lineage(oid: str, line: str, seen: set[str] | None = None) -> None:
         raise ValueError("cyclic release provenance")
     seen.add(oid)
     message = git("show", "-s", "--format=%B", oid)
-    match = re.fullmatch(r"release: v([0-9]+\.[0-9]+\.[0-9]+)\n+Release-retry-from: (v[0-9]+\.[0-9]+\.[0-9]+)\s*", message)
+    # Commit hooks may add trailers after Release-retry-from (this repository's
+    # adds a Co-authored-by line to every commit). Only trailer lines may follow;
+    # what the bump commit may change is proven from its tree below, not its text.
+    match = re.fullmatch(r"release: v([0-9]+\.[0-9]+\.[0-9]+)\n+Release-retry-from: (v[0-9]+\.[0-9]+\.[0-9]+)"
+                         r"(?:\n+[A-Za-z][A-Za-z0-9-]*: [^\n]+)*\s*", message)
     if not match:
         raise ValueError("release head is not a version/notes retry bump")
     version, tag = match.groups()
@@ -177,7 +181,14 @@ def run(arguments: list[str]) -> int:
     parser.add_argument("--retry-from", required=True)
     parser.add_argument("version")
     parser.add_argument("--fix", action="append", required=True, help="one non-merge commit already on origin/main; repeat in cherry-pick order")
+    parser.add_argument("--notes-file", help="release notes for the new version. Use it for a patch of a published "
+                        "release, whose notes describe only the fixes; the default renames the failed tag's "
+                        "notes and adds one line per fix, which suits a tag that never published")
     args = parser.parse_args(arguments)
+    # Read the notes now: the run moves into a disposable worktree below.
+    notes_text = Path(args.notes_file).read_text() if args.notes_file else None
+    if notes_text is not None and not notes_text.strip():
+        raise ValueError("--notes-file is empty")
     tag, version = args.retry_from, args.version
     previous = VERSION.fullmatch(tag)
     if previous is None or not tag.startswith("v"):
@@ -223,7 +234,7 @@ def run(arguments: list[str]) -> int:
                     git("cherry-pick", "-x", fix)
                 preflight(repo, branch)
                 notes = Path(f".alfonso/release-notes/v{version}.md")
-                notes.write_text(fix_notes(tag, version, fixes))
+                notes.write_text(notes_text if notes_text is not None else fix_notes(tag, version, fixes))
                 for command in (["node", "scripts/version-sync.mjs", version],
                                 ["node", "scripts/check-release-notes.mjs", str(notes)],
                                 ["bun", "install", "--silent"],

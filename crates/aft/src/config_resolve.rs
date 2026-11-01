@@ -574,10 +574,31 @@ pub struct RawSubc {
     pub client_reaper: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawViews {
     pub enabled: Option<bool>,
+    pub callgraph_copies: Option<Value>,
+    pub idle_checkout_hours: Option<Value>,
+}
+
+/// Each tier sets only the views keys it names; a project that sets
+/// `views.enabled` keeps the user's copy limit.
+fn merge_views(base: Option<RawViews>, over: Option<RawViews>) -> Option<RawViews> {
+    let Some(over) = over else {
+        return base;
+    };
+    let mut views = base.unwrap_or_default();
+    if over.enabled.is_some() {
+        views.enabled = over.enabled;
+    }
+    if over.callgraph_copies.is_some() {
+        views.callgraph_copies = over.callgraph_copies;
+    }
+    if over.idle_checkout_hours.is_some() {
+        views.idle_checkout_hours = over.idle_checkout_hours;
+    }
+    Some(views)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -1690,9 +1711,7 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    if override_config.views.is_some() {
-        base.views = override_config.views;
-    }
+    base.views = merge_views(base.views.take(), override_config.views);
     if override_config.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = override_config.callgraph_chunk_size;
     }
@@ -1805,9 +1824,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     // A project may switch an index off but never back on.
     base.indexes = merge_indexes(base.indexes, project.indexes, true);
-    if project.views.is_some() {
-        base.views = project.views;
-    }
+    base.views = merge_views(base.views.take(), project.views);
     if project.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = project.callgraph_chunk_size;
     }
@@ -2735,8 +2752,26 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
-    if let Some(value) = raw.views.as_ref().and_then(|views| views.enabled) {
-        config.views.enabled = value;
+    if let Some(views) = raw.views.as_ref() {
+        if let Some(value) = views.enabled {
+            config.views.enabled = value;
+        }
+        config.views.callgraph_copies = resolve_clamped_views_setting(
+            views.callgraph_copies.as_ref(),
+            "views.callgraph_copies",
+            crate::config::DEFAULT_VIEWS_CALLGRAPH_COPIES,
+            0,
+            crate::config::MAX_VIEWS_CALLGRAPH_COPIES,
+            warnings,
+        );
+        config.views.idle_checkout_hours = resolve_clamped_views_setting(
+            views.idle_checkout_hours.as_ref(),
+            "views.idle_checkout_hours",
+            crate::config::DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS,
+            1,
+            crate::config::MAX_VIEWS_IDLE_CHECKOUT_HOURS,
+            warnings,
+        );
     }
     if let Some(value) = raw.callgraph_chunk_size {
         config.callgraph_chunk_size = value;
@@ -2948,6 +2983,40 @@ fn resolve_clamped_minutes(
     if i64::from(clamped) != parsed {
         warnings.push(ConfigWarning {
             code: "clamped_idle_ttl",
+            key,
+            tier: "config".to_string(),
+            value: parsed.to_string(),
+            message: format!("{key}={parsed} is outside {min}..={max}; clamped to {clamped}"),
+        });
+    }
+    clamped
+}
+
+fn resolve_clamped_views_setting(
+    raw: Option<&Value>,
+    key: &'static str,
+    default: u32,
+    min: u32,
+    max: u32,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u32 {
+    let Some(value) = raw else {
+        return default;
+    };
+    let Some(parsed) = json_integer(value) else {
+        warnings.push(ConfigWarning {
+            code: "invalid_views_setting",
+            key,
+            tier: "config".to_string(),
+            value: value.to_string(),
+            message: format!("{key} must be an integer; using default {default}"),
+        });
+        return default;
+    };
+    let clamped = parsed.clamp(i64::from(min), i64::from(max)) as u32;
+    if i64::from(clamped) != parsed {
+        warnings.push(ConfigWarning {
+            code: "clamped_views_setting",
             key,
             tier: "config".to_string(),
             value: parsed.to_string(),
@@ -5265,6 +5334,43 @@ mod tests {
         let at_max = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 30 } }"#)]);
         assert_eq!(at_max.config.idle.root_ttl_minutes, 30);
         assert!(at_max.warnings.is_empty());
+    }
+
+    #[test]
+    fn views_copy_settings_default_clamp_and_merge_per_key() {
+        let default = resolve_config(&[tier("user", r#"{}"#)]);
+        assert_eq!(default.config.views.callgraph_copies, 4);
+        assert_eq!(default.config.views.idle_checkout_hours, 168);
+
+        // A project that only turns views on keeps the user's copy settings.
+        let merged = resolve_config(&[
+            tier(
+                "user",
+                r#"{"views":{"callgraph_copies":0,"idle_checkout_hours":2}}"#,
+            ),
+            tier("project", r#"{"views":{"enabled":true}}"#),
+        ]);
+        assert!(merged.config.views.enabled);
+        assert_eq!(merged.config.views.callgraph_copies, 0);
+        assert_eq!(merged.config.views.idle_checkout_hours, 2);
+        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+
+        let clamped = resolve_config(&[tier(
+            "user",
+            r#"{"views":{"idle_checkout_hours":0,"callgraph_copies":1000}}"#,
+        )]);
+        assert_eq!(clamped.config.views.idle_checkout_hours, 1);
+        assert_eq!(clamped.config.views.callgraph_copies, 256);
+        for key in ["views.idle_checkout_hours", "views.callgraph_copies"] {
+            assert!(
+                clamped
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "clamped_views_setting" && warning.key == key),
+                "{key}: {:?}",
+                clamped.warnings
+            );
+        }
     }
 
     #[test]

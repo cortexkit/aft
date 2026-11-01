@@ -35,7 +35,7 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 const MIGRATION_VERSIONS: &[u32] = &[
     1,
@@ -62,6 +62,7 @@ const MIGRATION_VERSIONS: &[u32] = &[
     22,
     23,
     24,
+    25,
 ];
 
 // Performance-only indexes do not change the table format or reader floor.
@@ -997,6 +998,7 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
             .map(|object_count| object_count == 1),
         14 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
         24 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get::<_, u32>(0)).map(|count| count == 2),
+        25 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('call_ledger_updates','idx_call_ledger_updates_cursor')", [], |row| row.get::<_, u32>(0)).map(|count| count == 2),
         _ => Ok(false),
     }
 }
@@ -1036,6 +1038,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
             harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, watch_id TEXT NOT NULL,
             batch TEXT NOT NULL, PRIMARY KEY (harness, session_id, task_id, watch_id)
         )"),
+        25 => conn.execute_batch(call_ledger::HELD_UPDATES_MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1101,7 +1104,10 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}");
         }
-        assert_eq!(MIGRATION_VERSIONS, (1..=24).collect::<Vec<_>>());
+        assert_eq!(
+            MIGRATION_VERSIONS,
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1148,7 +1154,7 @@ mod tests {
         assert!(!migration_already_applied(&conn, 24).unwrap());
         let count: u32 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('bash_watch_delivery_acks','bash_watch_delivery_gaps')", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 0);
-        assert_eq!(run_migrations(&mut conn).unwrap(), 24);
+        assert_eq!(run_migrations(&mut conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert!(migration_already_applied(&conn, 24).unwrap());
         bash_watches::acknowledge_delivery(&conn, "opencode", "session", "task", "watch", 7, None)
             .unwrap();
@@ -1544,6 +1550,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn audit_schema25_is_refused_by_schema24_reader_without_row_loss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = open(&path).unwrap();
+        conn.execute("INSERT INTO call_ledger(carrier,call_key,digest,state,event_id) VALUES ('audit','preserved','digest','Prepared','event')", []).unwrap();
+        drop(conn);
+        let mut old_reader = Connection::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            run_migrations_supported(&mut old_reader, 24),
+            Err(OpenError::DowngradeRefused {
+                db_version: 25,
+                supported: 24
+            })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            old_reader
+                .query_row("SELECT version FROM schema_version", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            25
+        );
+        assert_eq!(
+            old_reader
+                .query_row(
+                    "SELECT count(*) FROM call_ledger WHERE call_key='preserved'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

@@ -1182,11 +1182,11 @@ class ReleaseRetryTests(PRFixture):
         self.write_state(retry_branch="release/1.0")
         return fixes
 
-    def retry(self, fixes: list[str]) -> subprocess.CompletedProcess:
+    def retry(self, fixes: list[str], *extra: str) -> subprocess.CompletedProcess:
         args = ["--retry-from", "v1.0.0", "1.0.1"]
         for fix in fixes:
             args.extend(("--fix", fix))
-        return self.run_script("release.sh", *args)
+        return self.run_script("release.sh", *args, *extra)
 
     def assert_caller_unchanged(self, head: str) -> None:
         self.assertEqual(self.git("branch", "--show-current"), "main")
@@ -1216,6 +1216,24 @@ class ReleaseRetryTests(PRFixture):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertEqual(self.git("rev-parse", "release/1.0"), released)
         self.assert_caller_unchanged(head)
+
+    def test_retry_accepts_a_commit_hook_trailer_on_the_bump(self) -> None:
+        # The fixture disables hooks, but a real checkout's prepare-commit-msg
+        # hook adds a Co-authored-by trailer to every commit, including the
+        # retry's own version bump. The lineage check must still accept it.
+        fixes = self.prepare_retry()
+        hooks = Path(self.temp.name) / "hooks"
+        hooks.mkdir()
+        hook = hooks / "prepare-commit-msg"
+        hook.write_text('#!/bin/sh\ngit interpret-trailers --in-place --if-exists doNothing '
+                        '--trailer "Co-authored-by: alfonso-aft <bot@example.invalid>" "$1"\n')
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks))
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        bump = self.git("show", "-s", "--format=%B", "v1.0.1^{commit}")
+        self.assertIn("Release-retry-from: v1.0.0", bump)
+        self.assertIn("Co-authored-by: alfonso-aft <bot@example.invalid>", bump)
 
     def test_retry_refuses_fix_not_on_main(self) -> None:
         self.prepare_retry()
@@ -1316,6 +1334,27 @@ class ReleaseRetryTests(PRFixture):
         rejected = self.gate(released)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("differs from its remote peeled SHA", rejected.stderr)
+
+    def test_retry_notes_file_replaces_the_renamed_notes(self) -> None:
+        fixes = self.prepare_retry()
+        head = self.git("rev-parse", "HEAD")
+        notes = Path(self.temp.name) / "patch-notes.md"
+        notes.write_text("# v1.0.1\n\nFixes two regressions in 1.0.0.\n")
+        result = self.retry(fixes, "--notes-file", str(notes))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        released = self.git("rev-list", "-n", "1", "v1.0.1")
+        self.assertEqual(self.git("show", f"{released}:.alfonso/release-notes/v1.0.1.md"),
+                         "# v1.0.1\n\nFixes two regressions in 1.0.0.")
+        self.assert_caller_unchanged(head)
+
+    def test_retry_refuses_an_empty_notes_file(self) -> None:
+        fixes = self.prepare_retry()
+        notes = Path(self.temp.name) / "empty-notes.md"
+        notes.write_text("\n")
+        result = self.retry(fixes, "--notes-file", str(notes))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--notes-file is empty", result.stderr)
+        self.assertNotIn("v1.0.1", self.git("tag", "--list"))
 
     def test_retry_can_continue_from_a_failed_retry_tag(self) -> None:
         fixes = self.prepare_retry()

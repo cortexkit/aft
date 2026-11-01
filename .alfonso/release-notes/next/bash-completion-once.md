@@ -1,0 +1,1 @@
+- AFT no longer re-runs the finished background commands of a deleted worker checkout every 30 seconds; the checkout is released once none of its processes are left.

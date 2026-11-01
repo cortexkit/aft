@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "storage-retention-unchanged-passes"
+  ],
+  "note": "Storage retention defers accounting for live roots, remembers unchanged retained trash, and recognizes symbol-cache retirements. No changed path matches RANKING_FENCE_PREFIXES."
+}
