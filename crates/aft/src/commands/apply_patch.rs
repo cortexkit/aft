@@ -1549,7 +1549,10 @@ mod tests {
                 json!({"filePath": "edge.ts", "relativePath": "edge.ts", "type": "update", "patch": "Index: edge.ts\n===================================================================\n--- edge.ts\n+++ edge.ts\n@@ -1 +1 @@\n-original\n+é\n", "additions": 1, "deletions": 1})
             ]
         );
-        assert_eq!(diff, files[0]["patch"].as_str().unwrap());
+        assert_eq!(
+            diff.as_deref().unwrap(),
+            files[0]["patch"].as_str().unwrap()
+        );
         assert_eq!(
             edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.get()),
             1,

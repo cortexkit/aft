@@ -1368,6 +1368,7 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
 /// `metadata.diff`. Host wrappers may alternatively consume the `diff.before` /
 /// `diff.after` response fields and render their own patch, but returning the
 /// ready-to-display string keeps the bridge contract self-contained.
+/// Returns `None` when the source text is too large to render or the encoded patch is too large to send.
 pub fn build_unified_diff(file: &str, before: &str, after: &str) -> Option<String> {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     crate::mutation_diff::DiffBudget::default().patch(file, before, after, 1)
