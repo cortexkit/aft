@@ -1286,6 +1286,10 @@ impl Drop for ConfigFileWatch {
 }
 
 const CONFIG_WATCH_POLL: Duration = Duration::from_millis(200);
+// Ancestor replacement (for example ~/.config becoming a symlink) may send no
+// event to the watched folder, so discovering it can take up to two seconds.
+// Avoid walking every config's ancestors on each attachment-maintenance tick.
+const CONFIG_TARGET_RECHECK: Duration = Duration::from_secs(2);
 
 /// The watcher a config-file watch keeps on one directory at a time. macOS
 /// and Windows use AFT's own backends; notify's Windows watcher can leave a
@@ -1320,20 +1324,43 @@ fn config_path_is_symlink(file: &Path) -> bool {
 fn attach_config_directory(
     watcher: &mut ConfigDirectoryWatcher,
     attachment: &mut DirAttachment,
-) -> bool {
+) -> (bool, bool) {
     use notify::RecursiveMode;
     #[cfg(not(any(target_os = "macos", windows)))]
     use notify::Watcher;
 
-    attachment.attach(&mut |op| match op {
-        WatchOp::Watch(path) => watcher
-            .watch(path, RecursiveMode::NonRecursive)
-            .map_err(|error| error.to_string()),
+    let mut attempted = false;
+    let check_file = attachment.attach(&mut |op| match op {
+        WatchOp::Watch(path) => {
+            attempted = true;
+            watcher
+                .watch(path, RecursiveMode::NonRecursive)
+                .map_err(|error| error.to_string())
+        }
         WatchOp::Unwatch(path) => {
             let _ = watcher.unwatch(path);
             Ok(())
         }
-    })
+    });
+    // Target discovery also needs refreshing after an ancestor attachment or a
+    // failed watch attempt, even when the config's own directory was not armed.
+    (check_file, attempted)
+}
+
+fn recheck_config_target(
+    next_check: &mut Instant,
+    now: Instant,
+    immediate: bool,
+    refresh: impl FnOnce(bool) -> bool,
+) -> bool {
+    let poll_content = now >= *next_check;
+    if !immediate && !poll_content {
+        return false;
+    }
+    if poll_content {
+        *next_check = now + CONFIG_TARGET_RECHECK;
+    }
+    refresh(poll_content)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1393,6 +1420,7 @@ fn refresh_config_target_watch(
     target: &mut Option<ConfigTargetWatch>,
     tx: &mpsc::Sender<notify::Result<notify::Event>>,
     counters: &Arc<crate::context::WatcherCounters>,
+    poll_content: bool,
 ) -> bool {
     let mut changed = false;
     if !config_path_is_symlink(file) {
@@ -1421,9 +1449,12 @@ fn refresh_config_target_watch(
         target.watcher = new_config_directory_watcher(tx.clone(), Arc::clone(counters)).ok();
     }
     if let Some(watcher) = target.watcher.as_mut() {
-        changed |= attach_config_directory(watcher, &mut target.attachment);
+        let (check_file, _) = attach_config_directory(watcher, &mut target.attachment);
+        changed |= check_file;
     }
-    changed |= target.poll_if_unattached(file);
+    if poll_content {
+        changed |= target.poll_if_unattached(file);
+    }
     changed
 }
 
@@ -1463,9 +1494,10 @@ fn run_config_file_watch(
     let mut attachment = DirAttachment::new(dir.clone());
     attach_config_directory(&mut watcher, &mut attachment);
     let mut target = None;
-    if refresh_config_target_watch(&file, &mut target, &tx, &counters) {
+    if refresh_config_target_watch(&file, &mut target, &tx, &counters, true) {
         on_change();
     }
+    let mut next_target_check = Instant::now() + CONFIG_TARGET_RECHECK;
     #[cfg(test)]
     let notify_attached = |attachment: &DirAttachment| {
         // On macOS, watch() returns after the FSEvents stream-start handshake;
@@ -1479,11 +1511,13 @@ fn run_config_file_watch(
     notify_attached(&attachment);
 
     while !shutdown.load(Ordering::Acquire) {
+        let mut refresh_target = false;
         match rx.recv_timeout(CONFIG_WATCH_POLL) {
             Ok(Ok(event)) => {
-                handle_config_watch_event(&file, &event, &mut attachment, on_change.as_ref());
+                refresh_target |=
+                    handle_config_watch_event(&file, &event, &mut attachment, on_change.as_ref());
                 if let Some(target) = target.as_mut() {
-                    handle_config_watch_event(
+                    refresh_target |= handle_config_watch_event(
                         &target.file,
                         &event,
                         &mut target.attachment,
@@ -1497,6 +1531,7 @@ fn run_config_file_watch(
                     target.attachment.force_reattach();
                 }
                 on_change();
+                refresh_target = true;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -1504,10 +1539,19 @@ fn run_config_file_watch(
         // On every event and every tick: the directory appeared, vanished or
         // was replaced. Move the watch, and check the file, which may have
         // changed together with its directory.
-        if attach_config_directory(&mut watcher, &mut attachment) {
+        let (check_file, attempted) = attach_config_directory(&mut watcher, &mut attachment);
+        if check_file {
             on_change();
         }
-        if refresh_config_target_watch(&file, &mut target, &tx, &counters) {
+        refresh_target |= attempted;
+        if recheck_config_target(
+            &mut next_target_check,
+            Instant::now(),
+            refresh_target,
+            |poll_content| {
+                refresh_config_target_watch(&file, &mut target, &tx, &counters, poll_content)
+            },
+        ) {
             on_change();
         }
         #[cfg(test)]
@@ -1520,9 +1564,9 @@ fn handle_config_watch_event(
     event: &notify::Event,
     attachment: &mut DirAttachment,
     on_change: &dyn Fn(),
-) {
+) -> bool {
     let Some(dir) = file.parent() else {
-        return;
+        return false;
     };
     // Backends may report the resolved spelling of the directory (macOS
     // `/private/var` for `/var`), so compare both.
@@ -1547,6 +1591,7 @@ fn handle_config_watch_event(
                 | notify::EventKind::Remove(_)
                 | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
         );
+    let mut reattach = false;
     if let Some(watched) = attachment.watched().filter(|_| directory_lifetime_changed) {
         let resolved_watched = std::fs::canonicalize(watched).ok();
         if event
@@ -1555,11 +1600,13 @@ fn handle_config_watch_event(
             .any(|path| path == watched || resolved_watched.as_deref() == Some(path.as_path()))
         {
             attachment.force_reattach();
+            reattach = true;
         }
     }
     if relevant {
         on_change();
     }
+    relevant || reattach
 }
 
 /// A watch request made by [`DirAttachment`].

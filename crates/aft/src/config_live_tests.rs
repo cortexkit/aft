@@ -1362,6 +1362,72 @@ fn publishing_inside_update_config_panics_instead_of_deadlocking() {
 }
 
 #[test]
+fn idle_regular_config_checks_symlinks_only_once_per_two_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::canonicalize(dir.path()).unwrap().join("aft.jsonc");
+    std::fs::write(&file, "{}").unwrap();
+    let start = Instant::now();
+    let mut next_check = start;
+    let mut checks = 0;
+    for tick in 0..=30 {
+        let now = start + CONFIG_WATCH_POLL * tick;
+        recheck_config_target(&mut next_check, now, false, |poll_content| {
+            checks += 1;
+            assert!(!config_path_is_symlink(&file));
+            assert!(poll_content);
+            false
+        });
+        assert_eq!(checks, 1 + tick / 10, "symlink checks at idle tick {tick}");
+    }
+    assert_eq!(checks, 4, "startup plus three two-second revalidations");
+}
+
+#[test]
+fn config_target_events_refresh_immediately_without_extra_fingerprint_polls() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.jsonc");
+    std::fs::write(&file, "{}").unwrap();
+    let mut attachment = DirAttachment::new(dir.path().to_path_buf());
+    assert!(attachment.attach(&mut |_| Ok(())));
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Any,
+    )))
+    .add_path(file.clone());
+    let start = Instant::now();
+    let mut next_check = start;
+    let mut refreshes = 0;
+    let mut polls = 0;
+    for tick in 0..=10 {
+        let now = start + CONFIG_WATCH_POLL * tick;
+        let relevant = handle_config_watch_event(&file, &event, &mut attachment, &|| {});
+        assert!(
+            relevant,
+            "the target's actual filename must trigger discovery"
+        );
+        recheck_config_target(&mut next_check, now, relevant, |poll_content| {
+            refreshes += 1;
+            polls += u32::from(poll_content);
+            false
+        });
+    }
+    assert_eq!(refreshes, 11, "events bypass the idle discovery deadline");
+    assert_eq!(
+        polls, 2,
+        "fingerprints are polled only at startup and two seconds"
+    );
+    let unrelated = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Any,
+    )))
+    .add_path(dir.path().join("unrelated"));
+    assert!(!handle_config_watch_event(
+        &file,
+        &unrelated,
+        &mut attachment,
+        &|| {}
+    ));
+}
+
+#[test]
 fn config_target_fallback_hashes_bounded_content_and_stops_when_attached() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("settings.jsonc");
