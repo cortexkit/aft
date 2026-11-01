@@ -21,10 +21,10 @@ use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
 
 use super::{
-    gh_session_id, governed_seam_state, governed_wire_request, project_root_for,
-    render_applied_state, render_governed_response, seam_state, write_last_probe_silently,
-    write_seam_state, AgentBinding, GovernedRequest, LastProbeReport, LastSeamRefusal, Manifest,
-    ProbeStage, RouteOutcome, RungRecord, SeamState, StatePaths,
+    gh_session_id, governed_seam_state, governed_wire_request, render_applied_state,
+    render_governed_response, seam_state, write_last_probe_silently, write_seam_state,
+    AgentBinding, GovernedRequest, LastProbeReport, LastSeamRefusal, Manifest, ProbeStage,
+    RouteOutcome, RungRecord, SeamState, StatePaths,
 };
 use crate::gh_shim_relay::{
     facade_refusal_code, facade_reply, BINDINGS_READ_OPERATION, BOT_REQUEST_OPERATION,
@@ -1392,8 +1392,6 @@ pub(super) fn route(
     let Some(connection_file) = relay.connection_file.clone() else {
         return RouteOutcome::GovernanceUnavailable;
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = project_root_for(&cwd);
     // One nonce per invocation: every resend of this request reuses it, so
     // plexus can tell a retry from a second write.
     let invocation = request.invocation.clone();
@@ -1438,11 +1436,7 @@ pub(super) fn route(
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface { module_id },
-                    BindIdentity::new(
-                        project_root.to_string_lossy().into_owned(),
-                        "aft-gh-shim",
-                        gh_session_id(&agent_binding.agent_id),
-                    ),
+                    BindIdentity::new("aft-gh-shim", gh_session_id(&agent_binding.agent_id)),
                     CallOptions::default(),
                 )
                 .await
@@ -1677,10 +1671,9 @@ fn session_context(relay: &RelayContext) -> Result<Option<SessionContext>, Strin
             let consumer = SubcConsumer::connect(connection, ConsumerOptions {
                 call_timeout: budget, handshake_timeout: budget, ..ConsumerOptions::default()
             }).await.map_err(|error| format!("worker read session lookup failed: {error}"))?;
-            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
             let route = consumer.open_route(
                 RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
-                BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-session"),
+                BindIdentity::new("aft-gh-shim", "gh-read-session"),
                 CallOptions::default(),
             ).await.map_err(|error| format!("worker read session lookup is unavailable; restart the AFT daemon: {error}"))?;
             let request = json!({"op": crate::gh_shim_relay::SESSION_CONTEXT_OPERATION, "params": {"ticket": ticket}});
@@ -1738,10 +1731,9 @@ pub(super) fn read_request(relay: &RelayContext, request: &Value) -> Result<Valu
                 let consumer = SubcConsumer::connect(connection, ConsumerOptions {
                     call_timeout: budget, handshake_timeout: SETUP_TIMEOUT, ..ConsumerOptions::default()
                 }).await.map_err(|error| error.to_string())?;
-                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
                 let route = consumer.open_route(
                     RouteTarget::ManagementSurface { module_id: RELAY_MODULE_ID.to_string() },
-                    BindIdentity::new(project_root_for(&cwd).to_string_lossy().into_owned(), "aft-gh-shim", "gh-read-request"),
+                    BindIdentity::new("aft-gh-shim", "gh-read-request"),
                     CallOptions::default(),
                 ).await.map_err(|error| error.to_string())?;
                 Ok::<_, String>((consumer, route))

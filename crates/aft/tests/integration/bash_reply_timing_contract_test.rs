@@ -1111,9 +1111,7 @@ impl ModuleProcess {
     fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path, env: &[(&str, &str)]) -> Self {
         use std::os::unix::process::CommandExt;
 
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = crate::test_helpers::aft_binary::aft_binary();
         let mut command = Command::new(binary);
         command
             .arg("--subc")
@@ -1229,24 +1227,26 @@ async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
     )
     .expect("write project config");
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: ROUTE_CHANNEL,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            SESSION_ID.to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        call_mode: None,
-        role_versions: v1
-            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: ROUTE_CHANNEL,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("opencode".to_string(), SESSION_ID.to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            call_mode: None,
+            role_versions: v1
+                .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     send_frame(
         stream,

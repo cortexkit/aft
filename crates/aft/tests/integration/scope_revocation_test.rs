@@ -242,20 +242,26 @@ async fn bind_route_as(
         )
         .unwrap();
     }
-    let body = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(root, "opencode", session),
-        principal: Some(principal),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope,
-        role_versions: v1
-            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
-        call_mode: mode,
+    let body = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("opencode", session),
+            principal: Some(principal),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope,
+            role_versions: v1
+                .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
+            call_mode: mode,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root);
+
+        bind
     };
     send_frame(
         stream,

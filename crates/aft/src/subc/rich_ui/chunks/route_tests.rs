@@ -142,22 +142,24 @@ impl Wire {
         scope: Option<subc_protocol::scope::ScopeStamp>,
         v1: bool,
     ) -> Frame {
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: 1,
-            target,
-            identity: subc_protocol::BindIdentity::new(
-                &self.root,
-                "runner",
-                &format!("session-{channel}"),
-            ),
-            principal: Some(principal),
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope,
-            role_versions: v1
-                .then(|| BTreeMap::from([("tool-provider".to_string(), "v1".to_string())])),
-            call_mode: None,
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target,
+                identity: subc_protocol::BindIdentity::new("runner", &format!("session-{channel}")),
+                principal: Some(principal),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope,
+                role_versions: v1
+                    .then(|| BTreeMap::from([("tool-provider".to_string(), "v1".to_string())])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.root);
+
+            bind
         };
         let corr = 1_000 + u64::from(channel);
         self.send(

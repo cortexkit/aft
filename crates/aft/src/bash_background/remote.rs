@@ -2697,7 +2697,7 @@ impl BgTaskRegistry {
         &self,
         client: &mut ExecRemoteClient,
         sink: &mut TaskSink,
-        root: &Path,
+        _root: &Path,
         mut fresh: bool,
     ) -> Result<Option<exec::RemoteStream>, String> {
         sink.checkpoint_progress().map_err(|e| e.to_string())?;
@@ -2779,7 +2779,7 @@ impl BgTaskRegistry {
                 }
                 let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
-                let result = if result.is_ok() && tests::lose_submission_replies(root) {
+                let result = if result.is_ok() && tests::lose_submission_replies(_root) {
                     // A round trip confirms dispatch reached the fake executor
                     // before losing the caller's dispatch result.
                     let _ = client.status().await;
@@ -2802,7 +2802,6 @@ impl BgTaskRegistry {
                     if let Ok(Ok(reconnected)) = tokio::time::timeout(
                         Duration::from_millis(expires.saturating_sub(unix_millis())),
                         client.reopen_route(subc_protocol::BindIdentity::new(
-                            root.display().to_string(),
                             remote.harness.clone(),
                             remote.session.clone(),
                         )),
@@ -3077,7 +3076,6 @@ impl BgTaskRegistry {
                     Ok(path) => ExecRemoteClient::connect(
                         path,
                         subc_protocol::BindIdentity::new(
-                            root.display().to_string(),
                             remote.harness.clone(),
                             remote.session.clone(),
                         ),
@@ -3893,7 +3891,7 @@ impl BgTaskRegistry {
         client: &mut ExecRemoteClient,
         point: ResumePoint,
         remote: &RemoteTask,
-        root: &Path,
+        _root: &Path,
         task: &Arc<BgTask>,
         recovery: &mut ReattachBudget,
     ) -> Result<Attached, String> {
@@ -3932,7 +3930,6 @@ impl BgTaskRegistry {
             recovery.pause(point.job_id).await?;
             if let Some(path) = &remote.connection_file {
                 let identity = subc_protocol::BindIdentity::new(
-                    root.display().to_string(),
                     remote.harness.clone(),
                     remote.session.clone(),
                 );
@@ -4680,14 +4677,9 @@ async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result
         .connection_file
         .as_ref()
         .ok_or("no runner connection was saved")?;
-    let root = metadata.project_root.as_deref().unwrap_or(Path::new("/"));
     let client = ExecRemoteClient::connect(
         connection,
-        subc_protocol::BindIdentity::new(
-            root.display().to_string(),
-            remote.harness.clone(),
-            remote.session.clone(),
-        ),
+        subc_protocol::BindIdentity::new(remote.harness.clone(), remote.session.clone()),
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -5244,7 +5236,7 @@ async fn send_owed_cancel(session_dir: &Path, task_id: &str) -> OwedCancelSend {
 /// retrying a failed connection or call with doubling waits.
 #[cfg(unix)]
 async fn cancel_with_backoff(
-    metadata: &PersistedTask,
+    _metadata: &PersistedTask,
     remote: &RemoteTask,
     task_id: &str,
     job_id: Uuid,
@@ -5255,20 +5247,12 @@ async fn cancel_with_backoff(
         );
         return Err("no runner connection was saved".into());
     };
-    let root = metadata
-        .project_root
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/"));
     let mut wait = OWED_CANCEL_FIRST_BACKOFF;
     let mut last_error = String::new();
     for attempt in 1..=OWED_CANCEL_ATTEMPTS {
         let result = match ExecRemoteClient::connect(
             connection,
-            subc_protocol::BindIdentity::new(
-                root.display().to_string(),
-                remote.harness.clone(),
-                remote.session.clone(),
-            ),
+            subc_protocol::BindIdentity::new(remote.harness.clone(), remote.session.clone()),
         )
         .await
         {

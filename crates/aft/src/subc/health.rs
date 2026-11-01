@@ -999,8 +999,18 @@ impl DispatchPathMetrics {
         if let Ok(mut operation) = self.frame_operation.try_lock() {
             operation.op = name;
             operation.awaited = awaited;
-            if let super::ModuleControlRequest::RouteBind { identity, .. } = request {
-                operation.root = identity.project_root.to_string_lossy().into_owned();
+            if let super::ModuleControlRequest::RouteBind {
+                identity, scope, ..
+            } = request
+            {
+                operation.root = scope
+                    .as_ref()
+                    .and_then(|stamp| stamp.workdir.clone())
+                    .or_else(|| {
+                        super::legacy_route_project_root(frame)
+                            .map(|root| root.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
                 operation.session.clone_from(&identity.session);
             }
         }
@@ -5480,7 +5490,14 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let report = read_report();
-            if report.detail.as_deref() != Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL) {
+            // Indexing started by other tests in the process can prefix the
+            // detail ("<indexing>; <contention>"), so match the contention
+            // text anywhere; an exact match would return a contended report.
+            let contended = report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL));
+            if !contended {
                 return report;
             }
             assert!(
@@ -6968,9 +6985,16 @@ mod tests {
             &app,
         );
         assert_eq!(report.status, HealthStatus::Degraded);
-        assert_eq!(
-            report.detail.as_deref(),
-            Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)
+        // Indexing that other tests run in this process can prefix the detail
+        // ("<indexing>; <contention>"), so require the contention text, not
+        // an exact detail.
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)),
+            "{:?}",
+            report.detail
         );
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["generated_at_ms"], 1_000);
@@ -10284,5 +10308,49 @@ mod watch_gap_tests {
         let unconfirmed = super::super::watch_delivery::health_from_census(0, 0, true, 1);
         assert_eq!(unconfirmed["status"], "degraded");
         assert_eq!(unconfirmed["reason"], "watch_gap_persistence_unconfirmed");
+    }
+}
+
+#[cfg(test)]
+mod compatibility_root_tests {
+    use super::*;
+
+    #[test]
+    fn frame_loop_control_uses_filled_root_when_scope_workdir_is_absent() {
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Direct,
+            "frame-root",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        for (scope, expected) in [
+            (None, "/legacy-root"),
+            (Some(stamp.clone()), "/legacy-root"),
+            (
+                Some(stamp.with_workdir(Some("/stamped-root".into()))),
+                "/stamped-root",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "op":"route.bind", "route_channel":7, "epoch":1,
+                "target":{"kind":"tool_provider", "module_id":"aft"},
+                "identity":{"harness":"opencode", "session":"frame-root", "project_root":"/legacy-root"},
+                "scope":scope,
+            });
+            let request: subc_protocol::session::ModuleControlRequest =
+                serde_json::from_value(body.clone()).unwrap();
+            let frame = subc_protocol::Frame::build(
+                subc_protocol::FrameType::Request,
+                subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+                0,
+                0,
+                42,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let metrics = DispatchPathMetrics::new();
+            metrics.mark_frame_loop_control(&request, &frame);
+            assert_eq!(metrics.frame_operation.lock().unwrap().root, expected);
+        }
     }
 }

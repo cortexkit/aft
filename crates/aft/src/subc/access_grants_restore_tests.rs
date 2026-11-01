@@ -118,25 +118,30 @@ impl WireRestore {
             .send(FrameType::HelloAck, 0, HELLO_CORR, json!({}))
             .await;
         for (channel, scope) in [(41, fixture.revived.scope.clone()), (42, None)] {
-            let bind = ModuleControlRequest::RouteBind {
-                route_channel: channel,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    &fixture.revived.project_root,
-                    "runner",
-                    if channel == 41 { "worker" } else { "healthy" },
-                ),
-                principal: Some(Principal::Reserved {
-                    module_id: "broca".into(),
-                }),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope,
-                role_versions: None,
-                call_mode: None,
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: channel,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "runner",
+                        if channel == 41 { "worker" } else { "healthy" },
+                    ),
+                    principal: Some(Principal::Reserved {
+                        module_id: "broca".into(),
+                    }),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(&fixture.revived.project_root);
+
+                bind
             };
             fixture
                 .send(

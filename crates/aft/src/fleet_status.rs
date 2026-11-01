@@ -683,7 +683,6 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                         // `BindIdentity::new` leaves the registered project id
                         // unset: the dial has no resolved id to send.
                         let identity = BindIdentity::new(
-                            route_identity.project_root.clone(),
                             route_identity.harness.clone(),
                             route_identity.session.clone(),
                         );
@@ -1534,7 +1533,7 @@ mod tests {
                         &mut stream,
                         &key,
                         &daemon_id,
-                        "subc-test",
+                        "0.39.0",
                         Duration::from_secs(5),
                     )
                     .await
@@ -1609,7 +1608,8 @@ mod tests {
                 key,
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "fleet-status-refusal-test".to_string(),
+                // Reach the scripted refusal instead of the SDK's old-daemon guard.
+                daemon_ver: "0.39.0".to_string(),
             },
         )
         .unwrap();
@@ -1644,7 +1644,7 @@ mod tests {
         let failure = StatusConsumer::open_route(
             &consumer,
             holder_target(),
-            BindIdentity::new("/tmp/project", "runner", "session-1"),
+            BindIdentity::new("runner", "session-1"),
         )
         .await
         .expect_err("the fake daemon refuses every open");
@@ -1667,7 +1667,7 @@ mod tests {
         let error = SubcConsumer::open_route(
             &consumer,
             holder_target(),
-            BindIdentity::new("/tmp/project", "runner", "session-1"),
+            BindIdentity::new("runner", "session-1"),
             CallOptions {
                 timeout: Duration::from_millis(400),
                 route_retry_deadline: Duration::from_millis(400),

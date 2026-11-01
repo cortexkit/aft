@@ -14,6 +14,11 @@ use base64::Engine;
 use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Value};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+// Protocol 0.34 route opens are version-gated before sending. The connected
+// governance stand-in must advertise daemon 0.39.0 so its delay and reply scripts
+// exercise governance behavior rather than the local compatibility refusal.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
 
 const DEV_MANIFEST_SEED: [u8; 32] = [
@@ -2363,7 +2368,7 @@ impl SlowTestDaemon {
                                     &mut stream,
                                     &k,
                                     &d,
-                                    "subc-test",
+                                    FAKE_DAEMON_VERSION,
                                     Duration::from_secs(5),
                                 )
                                 .await
@@ -2555,7 +2560,7 @@ impl SlowTestDaemon {
             key: self.key.clone(),
             daemon_id: self.daemon_id,
             pid: std::process::id(),
-            daemon_ver: "gh-shim-test-daemon".to_string(),
+            daemon_ver: FAKE_DAEMON_VERSION.to_string(),
         };
         connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
     }

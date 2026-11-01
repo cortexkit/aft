@@ -3153,7 +3153,7 @@ fn probe_governance_with_retry(
 fn probe_governance(
     paths: &StatePaths,
     connection_file: &Path,
-    cwd: &Path,
+    _cwd: &Path,
     deadline: std::time::Instant,
     agent_id: &str,
 ) -> ProbeResult {
@@ -3171,7 +3171,6 @@ fn probe_governance(
         };
     }
     let connection_file = connection_file.to_path_buf();
-    let project_root = project_root_for(cwd);
     let record_paths = paths.clone();
     let agent_id = agent_id.to_string();
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -3223,11 +3222,7 @@ fn probe_governance(
             *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
             // `BindIdentity::new` sends no registered project id; the shim
             // never resolved one before the field existed.
-            let identity = BindIdentity::new(
-                project_root.to_string_lossy().into_owned(),
-                "aft-gh-shim",
-                gh_session_id(&agent_id),
-            );
+            let identity = BindIdentity::new("aft-gh-shim", gh_session_id(&agent_id));
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface {
@@ -15594,7 +15589,7 @@ INHERITED FLAGS
                                         &mut stream,
                                         &k,
                                         &d,
-                                        "subc-test",
+                                        "0.39.0",
                                         Duration::from_secs(5),
                                     )
                                     .await
@@ -15762,7 +15757,8 @@ INHERITED FLAGS
                 key: self.key.clone(),
                 daemon_id: self.daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "gh-shim-test-daemon".to_string(),
+                // The SDK requires daemon 0.39+ before opening a project-free route.
+                daemon_ver: "0.39.0".to_string(),
             };
             connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
         }

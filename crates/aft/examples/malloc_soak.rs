@@ -90,21 +90,23 @@ async fn bind(
         stream,
         0,
         corr,
-        serde_json::to_value(ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: 1,
-            target,
-            identity: BindIdentity::new(
-                root.to_path_buf(),
-                "opencode",
-                format!("malloc-soak-{channel}"),
-            ),
-            consumer_capabilities: None,
-            principal: Some(Principal::Direct),
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
+        serde_json::to_value({
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target,
+                identity: BindIdentity::new("opencode", format!("malloc-soak-{channel}")),
+                consumer_capabilities: None,
+                principal: Some(Principal::Direct),
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+            bind
         })
         .unwrap(),
         out,

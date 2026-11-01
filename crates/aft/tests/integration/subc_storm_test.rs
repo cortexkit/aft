@@ -2465,23 +2465,25 @@ fn send_bind_epoch(
     doc: Value,
 ) {
     publish_storm_project_config(root, &doc);
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            session.to_string(),
-        ),
-        consumer_capabilities: None,
-        principal: Some(Principal::Direct),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("opencode".to_string(), session.to_string()),
+            consumer_capabilities: None,
+            principal: Some(Principal::Direct),
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     send_control(tx, corr, request);
 }
@@ -2494,23 +2496,25 @@ async fn write_measure_bind(
 ) {
     publish_storm_project_config(root, &storm_project_config(false, false, false, 0));
     let corr = 700_000 + u64::from(channel);
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "opencode".to_string(),
-            session.to_string(),
-        ),
-        consumer_capabilities: None,
-        principal: Some(Principal::Direct),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("opencode".to_string(), session.to_string()),
+            consumer_capabilities: None,
+            principal: Some(Principal::Direct),
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     let frame = Frame::build(
         FrameType::Request,
@@ -2598,7 +2602,7 @@ fn print_egress_summary(observations: &[EgressObservation], push_frames: usize) 
     }
 }
 
-fn send_control(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: ModuleControlRequest) {
+fn send_control<T: serde::Serialize>(tx: &mpsc::UnboundedSender<Frame>, corr: u64, request: T) {
     tx.send(
         Frame::build(
             FrameType::Request,

@@ -1165,7 +1165,7 @@ impl FakeRelayDaemon {
                             let requests = Arc::clone(&server_requests);
                             tokio::spawn(async move {
                                 if subc_transport::authenticate_server(
-                                    &mut stream, &key, &daemon_id, "subc-test", Duration::from_secs(5),
+                                    &mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(5),
                                 ).await.is_err() {
                                     return;
                                 }
@@ -1258,7 +1258,8 @@ impl FakeRelayDaemon {
                 key: self.key.clone(),
                 daemon_id: self.daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "gh-shim-relay-test".to_string(),
+                // Project-free route.open requires daemon 0.39+ in the real SDK.
+                daemon_ver: "0.39.0".to_string(),
             },
         )
         .unwrap();

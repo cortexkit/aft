@@ -1311,6 +1311,10 @@ fn audit_head_write_still_routes_through_the_relay() {
     use std::sync::Arc;
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(20);
+    // A successful relay write records activity; HOME does not redirect the
+    // Windows LocalAppData storage default to the fixture's temporary home.
+    let storage = fixture.home.path().join("storage");
+    let _storage = Env::set("AFT_STORAGE_DIR", Some(storage.as_os_str()));
     let mut manifest_value: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/gh_shim/v20-manifest.json"
     ))

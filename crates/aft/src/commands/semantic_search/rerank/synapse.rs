@@ -318,7 +318,8 @@ pub(crate) mod tests {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "synapse-test".into(),
+                // The SDK requires daemon 0.39+ for project-free management opens.
+                daemon_ver: "0.39.0".into(),
             },
         )
         .unwrap();
@@ -344,7 +345,7 @@ pub(crate) mod tests {
                 tokio::time::timeout(Duration::from_secs(30), async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(30)).await.unwrap();
+                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "0.39.0", Duration::from_secs(30)).await.unwrap();
                     let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
                     let modules = if registered { json!([{"module_id":"synapse","module_version":"1","roles":[{"role":"management_surface","operations":[{"name":"models.list","kind":"query"},{"name":"rerank.score","kind":"query"}],"config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}]) } else { json!([]) };
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":modules,"subc_ops":["catalog.list","route.open"]})).await;
@@ -366,8 +367,8 @@ pub(crate) mod tests {
                         else {
                             // Withhold the reply until the client has timed out, then detect any retry.
                             tokio::time::sleep(Duration::from_millis(300)).await;
-                            if let Ok(frame) = tokio::time::timeout(Duration::from_millis(50), subc_transport::read_frame(&mut stream)).await {
-                                assert!(frame.unwrap().is_none(), "unexpected retry on route");
+                            if let Ok(has_byte) = tokio::time::timeout(Duration::from_millis(50), crate::synapse_embed::pause_test_support::has_next_frame_byte(&stream)).await {
+                                assert!(!has_byte, "unexpected retry on route");
                             }
                             assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
                         }

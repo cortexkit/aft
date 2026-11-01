@@ -23,6 +23,10 @@ use subc_transport::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
+// The router-host probes also open SDK routes through this daemon. Protocol
+// 0.34 clients require its connection metadata to advertise daemon 0.39.0.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
@@ -680,7 +684,7 @@ impl Jail {
             key: vec![0x42; subc_transport::KEY_LEN],
             daemon_id: [0x24; subc_transport::DAEMON_ID_LEN],
             pid: std::process::id(),
-            daemon_ver: "worker-jail".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         };
         let connection_path = if custom_layout {
             let auth = base.join("custom-relay/auth");
@@ -743,7 +747,7 @@ impl Jail {
             &mut stream,
             &[0x42; subc_transport::KEY_LEN],
             &[0x24; subc_transport::DAEMON_ID_LEN],
-            "worker-jail",
+            FAKE_DAEMON_VERSION,
             Duration::from_secs(5),
         )
         .await
@@ -813,61 +817,77 @@ impl Jail {
             "attributes": {"agent_id":"worker-read-principal", "delegates":true},
         }))
         .unwrap();
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: 1,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: BindIdentity::new(&self.worktree, "runner", "worker-session"),
-            principal: Some(Principal::Reserved {
-                module_id: "broca".into(),
-            }),
-            consumer_capabilities: None,
-            admission_facts: None,
-            scope: Some(scope),
-            role_versions: Some(std::collections::BTreeMap::from([(
-                "tool-provider".into(),
-                "v1".into(),
-            )])),
-            call_mode: None,
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 1,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", "worker-session"),
+                principal: Some(Principal::Reserved {
+                    module_id: "broca".into(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(scope),
+                role_versions: Some(std::collections::BTreeMap::from([(
+                    "tool-provider".into(),
+                    "v1".into(),
+                )])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.worktree);
+
+            bind
         };
         self.bind(bind).await;
     }
 
     async fn bind_grant_head(&mut self) {
         let root = self.base.clone();
-        self.bind(ModuleControlRequest::RouteBind {
-            route_channel: 2,
-            epoch: 1,
-            target: RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: BindIdentity::new(&root, "runner", "head-session"),
-            principal: Some(Principal::Reserved {
-                module_id: "broca".into(),
-            }),
-            consumer_capabilities: None,
-            admission_facts: None,
-            scope: Some(
-                serde_json::from_value(json!({
-                    "owner": {"kind":"reserved","module_id":"prefrontal-core"},
-                    "ref":"head-scope", "scope_epoch":7, "kind":"head",
-                    "owner_authorized":true, "attributes":{"agent_id":"head"},
-                }))
-                .unwrap(),
-            ),
-            role_versions: Some(std::collections::BTreeMap::from([(
-                "tool-provider".into(),
-                "v1".into(),
-            )])),
-            call_mode: None,
+        self.bind({
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 2,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", "head-session"),
+                principal: Some(Principal::Reserved {
+                    module_id: "broca".into(),
+                }),
+                consumer_capabilities: None,
+                admission_facts: None,
+                scope: Some(
+                    serde_json::from_value(json!({
+                        "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+                        "ref":"head-scope", "scope_epoch":7, "kind":"head",
+                        "owner_authorized":true, "attributes":{"agent_id":"head"},
+                    }))
+                    .unwrap(),
+                ),
+                role_versions: Some(std::collections::BTreeMap::from([(
+                    "tool-provider".into(),
+                    "v1".into(),
+                )])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&root);
+
+            bind
         })
         .await;
     }
 
-    async fn bind(&mut self, bind: ModuleControlRequest) {
-        let binding = match &bind {
+    async fn bind<T: serde::Serialize>(&mut self, bind: T) {
+        // Preserve retired project fields in the wire payload. Decode a copy
+        // only for tracking the identity and scope this fixture binds.
+        let body = serde_json::to_value(bind).unwrap();
+        let request: ModuleControlRequest = serde_json::from_value(body.clone()).unwrap();
+        let binding = match &request {
             ModuleControlRequest::RouteBind {
                 identity, scope, ..
             } => Some((identity.session.clone(), scope.clone())),
@@ -883,7 +903,7 @@ impl Jail {
                 0,
                 0,
                 corr,
-                serde_json::to_vec(&bind).unwrap(),
+                serde_json::to_vec(&body).unwrap(),
             )
             .unwrap(),
         )
@@ -3684,24 +3704,30 @@ async fn worker_gh_read_t8_live_scope_rebind_refuses_before_upstream() {
     wait_test_file(&ready).await;
     let mut scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
     scope.scope_epoch += 1;
-    jail.bind(ModuleControlRequest::RouteBind {
-        route_channel: 2,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(&jail.worktree, "runner", "worker-session"),
-        principal: Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-        consumer_capabilities: None,
-        admission_facts: None,
-        scope: Some(scope),
-        role_versions: Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-        call_mode: None,
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
+
+        bind
     })
     .await;
     std::fs::write(go, "go").unwrap();
@@ -3853,24 +3879,30 @@ async fn cross_command_broker_isolation(profile: &str) {
     std::os::unix::fs::symlink(parts[0], &alias).unwrap();
     let mut other_scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
     other_scope.scope_ref = "other-worker-scope".into();
-    jail.bind(ModuleControlRequest::RouteBind {
-        route_channel: 2,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(&other_root, "runner", "other-worker-session"),
-        principal: Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-        consumer_capabilities: None,
-        admission_facts: None,
-        scope: Some(other_scope),
-        role_versions: Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-        call_mode: None,
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "other-worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(other_scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&other_root);
+
+        bind
     })
     .await;
     let task_temp_root = Path::new(parts[1])
@@ -4065,7 +4097,7 @@ async fn gh_shim_router_host_scope_dials_require_the_live_bind() {
     let target = RouteTarget::ToolProvider {
         module_id: "plexus".into(),
     };
-    let identity = BindIdentity::new(&jail.worktree, "aft-gh-relay", "worker-session");
+    let identity = BindIdentity::new("aft-gh-relay", "worker-session");
     let options = subc_client_rs::CallOptions {
         timeout: Duration::from_secs(3),
         route_retry_deadline: Duration::from_secs(3),
@@ -4375,24 +4407,30 @@ async fn worker_gh_read_t10_promotion_keeps_the_original_command_grant() {
         "start as a foreground command"
     );
     let scope = jail.read_holder.lock().unwrap().binds["worker-session"].clone();
-    jail.bind(ModuleControlRequest::RouteBind {
-        route_channel: 2,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(&jail.worktree, "runner", "worker-session"),
-        principal: Some(Principal::Reserved {
-            module_id: "broca".into(),
-        }),
-        consumer_capabilities: None,
-        admission_facts: None,
-        scope: Some(scope),
-        role_versions: Some(std::collections::BTreeMap::from([(
-            "tool-provider".into(),
-            "v1".into(),
-        )])),
-        call_mode: None,
+    jail.bind({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 2,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new("runner", "worker-session"),
+            principal: Some(Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            consumer_capabilities: None,
+            admission_facts: None,
+            scope: Some(scope),
+            role_versions: Some(std::collections::BTreeMap::from([(
+                "tool-provider".into(),
+                "v1".into(),
+            )])),
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(&jail.worktree);
+
+        bind
     })
     .await;
     // Detaching the route's foreground wait promotes its running bash command

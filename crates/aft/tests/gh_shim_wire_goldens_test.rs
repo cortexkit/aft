@@ -34,6 +34,11 @@ use ring::signature::Ed25519KeyPair;
 use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+// Protocol 0.34 route opens require numeric daemon versions of at least 0.39.0.
+// This holder already accepts project-free opens; publish matching connection
+// and authentication versions so the golden requests reach its handler.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
 
 #[path = "../src/gh_shim/plexus_bindings_contract.rs"]
@@ -564,7 +569,7 @@ impl CapturingHolder {
             key: self.key.clone(),
             daemon_id: self.daemon_id,
             pid: std::process::id(),
-            daemon_ver: "gh-shim-wire-goldens-holder".to_string(),
+            daemon_ver: FAKE_DAEMON_VERSION.to_string(),
         };
         connection_file::write_atomic(path, &connection).expect("write fake holder connection");
     }
@@ -598,7 +603,7 @@ async fn serve_connection(
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await

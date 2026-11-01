@@ -17,24 +17,26 @@ async fn bind_scoped_worker(stream: &mut tokio::net::TcpStream, root: &std::path
         "owner_authorized": true,
     }))
     .unwrap();
-    send_control_request(
-        stream,
-        WORKER_CHANNEL as u64,
-        ModuleControlRequest::RouteBind {
+    send_control_request(stream, WORKER_CHANNEL as u64, {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: WORKER_CHANNEL,
             epoch: 1,
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root, "opencode", "confine-admission-worker"),
+            identity: BindIdentity::new("opencode", "confine-admission-worker"),
             principal: Some(Principal::Direct),
             consumer_capabilities: None,
             admission_facts: Default::default(),
             scope: Some(scope),
             role_versions: None,
             call_mode: None,
-        },
-    )
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root);
+
+        bind
+    })
     .await;
     expect_route_bind_ack(stream, WORKER_CHANNEL as u64).await;
 }

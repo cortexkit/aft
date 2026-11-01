@@ -8,7 +8,6 @@
 //! children it spawns (foreground, background and PTY) see neither variable
 //! and do not hold the pipe.
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -47,9 +46,7 @@ fn spawn_module_with_pipe_nonce(
 ) -> ModuleProcess {
     use std::os::unix::process::CommandExt;
 
-    let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+    let binary = crate::test_helpers::aft_binary::aft_binary();
     let mut command = Command::new(binary);
     command
         .arg("--subc")
@@ -169,7 +166,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
 
         assert_eq!(
             manifest["provenance"]["wire_crate_version"],
-            json!("0.33.5")
+            json!("0.34.2")
         );
         // `build.rs` embeds Git's HEAD only when it recognizes the tracked AFT
         // workspace. Snapshot builds without that metadata can omit the SHA; the
