@@ -7910,6 +7910,105 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     #[test]
+    #[ignore = "cold linked-worktree profile; requires AFT_INSPECT_COLD_PROFILE_OUTPUT"]
+    fn inspect_cold_workspace_profile() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let scratch = source.join("target/scratch/inspect-cold-profile");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut measurements = Vec::new();
+        for (name, params) in [
+            ("scoped-default", serde_json::json!({})),
+            (
+                "scoped-diagnostics",
+                serde_json::json!({"sections": "diagnostics"}),
+            ),
+            (
+                "scoped-dead-code",
+                serde_json::json!({"sections": "dead_code"}),
+            ),
+            ("unscoped", serde_json::json!({})),
+        ] {
+            let dir = tempfile::Builder::new()
+                .prefix(name)
+                .tempdir_in(&scratch)
+                .unwrap();
+            let root = dir.path().join("checkout");
+            let status = std::process::Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&root)
+                .arg("HEAD")
+                .current_dir(&source)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let storage = dir.path().join("storage");
+            let mut config = Config::default();
+            config.project_root = Some(root.clone());
+            config.storage_dir = Some(storage.clone());
+            config.indexes.trigram = false;
+            config.indexes.semantic = false;
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                config,
+            ));
+            ctx.set_harness(crate::harness::Harness::Opencode);
+            let configure: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": format!("{name}-configure"), "command": "configure",
+                "params": {"project_root": root, "storage_dir": storage, "harness": "opencode",
+                    "config": {"indexes": {"trigram": false, "semantic": false}}}
+            }))
+            .unwrap();
+            let start = Instant::now();
+            let response = crate::commands::configure::handle_configure(&configure, &ctx);
+            assert!(response.success, "{}", response.data);
+            let configure_ms = start.elapsed().as_millis();
+            let mut request = inspect_request(name);
+            request.session_id = Some("alfonso:bg_inspect-cold-profile".into());
+            request.params = params;
+            if name != "unscoped" {
+                request.params["scope"] = serde_json::json!([
+                    "crates/aft/src/commands/inspect.rs",
+                    "crates/aft/src/inspect/manager.rs"
+                ]);
+            }
+            let start = Instant::now();
+            let DispatchOutcome::Deferred(mut pending) =
+                handle_inspect_deferred(&request, ctx.clone())
+            else {
+                panic!("inspect must be deferred");
+            };
+            let response = loop {
+                if let Some(response) = (pending.poll)(&ctx) {
+                    break response;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(240),
+                    "profile exceeded 240s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let elapsed_ms = start.elapsed().as_millis();
+            let phases = crate::inspect::inspect_phase_log_for_request(name).unwrap();
+            let phases = phases.records.iter().map(|phase| serde_json::json!({
+                "phase": phase.entry, "start_ms": phase.started.saturating_duration_since(start).as_millis(),
+                "duration_ms": phase.duration_ms(), "error": phase.terminal_error(),
+            })).collect::<Vec<_>>();
+            let measurement = serde_json::json!({
+                "case": name, "configure_ms": configure_ms, "elapsed_ms": elapsed_ms,
+                "phases": phases, "response": response,
+            });
+            eprintln!("cold inspect {name}: configure={configure_ms}ms inspect={elapsed_ms}ms phases={phases:?}");
+            measurements.push(measurement);
+            std::fs::write(
+                std::env::var_os("AFT_INSPECT_COLD_PROFILE_OUTPUT").unwrap(),
+                serde_json::to_vec_pretty(&measurements).unwrap(),
+            )
+            .unwrap();
+            drop(ctx);
+        }
+    }
+
+    #[test]
     #[ignore = "real-checkout inspect walk and output measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
     fn inspect_checkout_walk_profile() {
         use crate::inspect::walk_profile;
