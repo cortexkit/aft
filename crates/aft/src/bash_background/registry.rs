@@ -12494,7 +12494,8 @@ impl BgTaskRegistry {
                 claim.adopters.push(Arc::downgrade(&self.inner));
                 let held = claim.held;
                 let publishes = self.register_claimed_task(&task)?;
-                let resume_allowed = !cancel_before_resume || self.record_remote_cancel(&task)?;
+                let resume_allowed =
+                    !cancel_before_resume || self.record_remote_cancel_owed(&task, false)?;
                 // The owner's worker stopped without finishing the task: run
                 // it here, unless this registry is itself holding tasks for a
                 // pause, which must reach a task before its worker does.
@@ -12517,7 +12518,7 @@ impl BgTaskRegistry {
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
-        if cancel_before_resume && !self.record_remote_cancel(&task)? {
+        if cancel_before_resume && !self.record_remote_cancel_owed(&task, false)? {
             return Ok(());
         }
         let held = self.hold_remote_worker(&task_id);
