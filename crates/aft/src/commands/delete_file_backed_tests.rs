@@ -87,7 +87,7 @@ fn backed_delete_commits_one_full_sync_before_unlink_and_restores_after_restart(
 struct ResetClock;
 impl Drop for ResetClock {
     fn drop(&mut self) {
-        CAPTURE_CLOCK.with(|clock| clock.borrow_mut().take());
+        CAPTURE_CLOCK.with(|clock| *clock.borrow_mut() = None);
     }
 }
 
