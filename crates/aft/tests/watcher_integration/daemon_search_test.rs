@@ -587,3 +587,122 @@ async fn bound_daemon_index_readiness_does_not_imply_watcher_readiness() {
     .await;
     assert_empty_arrival(&mut daemon, &root.join("crates/after-watcher")).await;
 }
+
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test]
+async fn bound_daemon_views_on_file_changes_before_registration_are_not_complete_misses() {
+    let _serial = crate::helpers::watcher_serial_lock();
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.join("crates/old/src")).unwrap();
+    let indexed = root.join("crates/old/src/lib.rs");
+    std::fs::write(&indexed, "// indexed_before_attach_seed\n").unwrap();
+    let gate = state.path().join("file-window-attach.hold");
+    std::fs::write(&gate, b"hold").unwrap();
+    let mut daemon = Daemon::start_with_attach_gate(root, state.path(), true, Some(&gate)).await;
+    assert_visible(
+        &mut daemon,
+        "crates/old/src/lib.rs",
+        "indexed_before_attach_seed",
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !gate.with_extension("waiting").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "watcher did not reach the file-window attach gate"
+        );
+        let _ = watcher_counts(&mut daemon).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let held = watcher_counts(&mut daemon).await;
+    assert_eq!(
+        held["raw_events_total"], 0,
+        "native attachment is held: {held}"
+    );
+    let tokens = [
+        ("crates/old/src/new.rs", "startup_new_file_7d9a2"),
+        ("crates/old/src/lib.rs", "startup_edited_file_8e1b3"),
+    ];
+    std::fs::write(root.join(tokens[0].0), format!("// {}\n", tokens[0].1)).unwrap();
+    std::fs::write(&indexed, format!("// {}\n", tokens[1].1)).unwrap();
+    assert!(gate.exists());
+    std::fs::remove_file(&gate).unwrap();
+    wait_watcher_intake(&mut daemon, root).await;
+
+    // Do not hide a complete false negative by polling until it repairs itself.
+    // Inspect each first post-registration answer before requiring convergence.
+    let mut evidence = Vec::new();
+    for (relative, token) in tokens {
+        for tool in ["grep", "search"] {
+            let arguments = if tool == "grep" {
+                json!({"pattern":token, "path":"crates/old/src"})
+            } else {
+                json!({"pattern":token, "includeTests":true})
+            };
+            let reply = daemon.request(tool, arguments).await;
+            let found = file_window_token_found(&reply, tool, relative, token);
+            let incomplete =
+                reply["structuredContent"]["complete"] == false || reply["isError"] == true;
+            evidence.push(json!({"tool":tool, "token":token, "found":found, "incomplete":incomplete, "reply":reply}));
+        }
+    }
+    println!("startup_file_window {}", json!(evidence));
+    assert!(
+        evidence
+            .iter()
+            .all(|row| row["found"] == true || row["incomplete"] == true),
+        "complete post-registration answer missed pre-registration file changes: {}",
+        json!(evidence)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for (relative, token) in tokens {
+        loop {
+            let grep = daemon
+                .request("grep", json!({"pattern":token, "path":"crates/old/src"}))
+                .await;
+            let search = daemon
+                .request("search", json!({"pattern":token, "includeTests":true}))
+                .await;
+            if file_window_token_found(&grep, "grep", relative, token)
+                && grep["structuredContent"]["index_status"] == "Ready"
+                && grep["structuredContent"]["complete"] == true
+                && file_window_token_found(&search, "search", relative, token)
+            {
+                assert_eq!(
+                    grep["structuredContent"]["files_read_directly"], 0,
+                    "{grep}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline,
+                "pre-registration token did not reach the view: {token}\ngrep: {grep}\nsearch: {search}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+fn file_window_token_found(reply: &Value, tool: &str, relative: &str, token: &str) -> bool {
+    let data = &reply["structuredContent"];
+    let rows = data[if tool == "grep" { "matches" } else { "results" }].as_array();
+    rows.is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row["file"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(relative))
+                && if tool == "grep" {
+                    data["total_matches"] == 1
+                        && data["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(token))
+                } else {
+                    row["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains(token))
+                }
+        })
+    })
+}
