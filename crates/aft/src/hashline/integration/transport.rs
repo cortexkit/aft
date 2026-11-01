@@ -379,7 +379,10 @@ fn build_display_metadata(
 
 fn line_diff_counts(before: &str, after: &str) -> (usize, usize) {
     if before.is_empty() || after.is_empty() {
-        return (after.lines().count(), before.lines().count());
+        return (
+            crate::edit::diff_line_count(after),
+            crate::edit::diff_line_count(before),
+        );
     }
     use similar::ChangeTag;
     let diff = similar::TextDiff::from_lines(before, after);

@@ -1475,6 +1475,23 @@ fn diff_counts(before: &str, after: &str) -> (usize, usize) {
     counts_from_diff(&construct_diff(before, after))
 }
 
+/// Count the line tokens used by `similar`, including bare CR line endings.
+pub(crate) fn diff_line_count(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let mut count = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\r' || (byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r')) {
+            count += 1;
+        }
+    }
+    count
+        + usize::from(
+            bytes
+                .last()
+                .is_some_and(|&byte| !matches!(byte, b'\r' | b'\n')),
+        )
+}
+
 pub(crate) fn response_diff(
     budget: &mut crate::mutation_diff::DiffBudget,
     params: &serde_json::Value,
@@ -1489,8 +1506,8 @@ pub(crate) fn response_diff(
         // so the renderer can reject their oversized output before diffing.
         (
             budget.patch(file, before, after, copies),
-            after.lines().count(),
-            before.lines().count(),
+            diff_line_count(after),
+            diff_line_count(before),
         )
     } else {
         let diff = construct_diff(before, after);
