@@ -8041,6 +8041,17 @@ mod deferred_terminal_tests {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let scratch = source.join("target/scratch/inspect-cold-profile");
         std::fs::create_dir_all(&scratch).unwrap();
+        // Build-server snapshots expose a read-only .git. Give linked worktrees
+        // their own writable repository rather than registering them there.
+        let repository_dir = tempfile::tempdir_in(&scratch).unwrap();
+        let repository = repository_dir.path().join("repository");
+        assert!(std::process::Command::new("git")
+            .args(["clone", "--no-hardlinks", "--no-checkout"])
+            .arg(&source)
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success());
         let mut measurements = Vec::new();
         for (name, params) in [
             ("scoped-default", serde_json::json!({})),
@@ -8063,7 +8074,7 @@ mod deferred_terminal_tests {
                 .args(["worktree", "add", "--detach"])
                 .arg(&root)
                 .arg("HEAD")
-                .current_dir(&source)
+                .current_dir(&repository)
                 .status()
                 .unwrap();
             assert!(status.success());
