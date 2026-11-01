@@ -18,7 +18,10 @@ prepush_step rust-analyzer bash scripts/prepush/require-tools.sh linux --probe r
 prepush_step msrv-toolchain bash scripts/prepush/require-tools.sh linux --probe 'Rust 1.92.0 toolchain' rustup run 1.92.0 cargo --version
 prepush_step sandbox-capability python3 scripts/prepush/linux-capabilities.py
 prepush_step dependencies bun install --frozen-lockfile --offline
-prepush_step pyright-cache npm install --prefix target/prepush-pyright --no-save --offline pyright@1.1.411
+# The lane runs with network (linux,16c,net). The runner image has no npm cache
+# entry for pyright, so fetch the exact version CI installs
+# (.github/actions/integration-shard/action.yml).
+prepush_step pyright-install npm install --prefix target/prepush-pyright --no-save --fetch-retries=5 pyright@1.1.411
 export PATH="$PWD/target/prepush-pyright/node_modules/.bin:$PATH"
 prepush_step typescript-server-cache bash scripts/install-typescript-test-servers.sh "$PWD/target/prepush-typescript" --offline
 export AFT_TEST_TS7_NODE_MODULES="$PWD/target/prepush-typescript/ts7/node_modules"

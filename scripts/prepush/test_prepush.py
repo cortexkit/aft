@@ -212,7 +212,8 @@ class PrepushTests(unittest.TestCase):
         self.assertIn("export CARGO_NET_OFFLINE=true", rust_lane)
         self.assertNotIn("rustup target add", compile_lane)
         self.assertIn("bun install --frozen-lockfile --offline", rust_lane)
-        self.assertIn("--no-save --offline pyright@", rust_lane)
+        # pyright is the one network fetch, pinned to the version CI installs.
+        self.assertIn("--no-save --fetch-retries=5 pyright@1.1.411", rust_lane)
         self.assertIn('"$PWD/target/prepush-typescript" --offline', rust_lane)
 
     def test_typescript_server_installer_only_requests_offline_when_selected(self):
