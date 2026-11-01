@@ -2013,7 +2013,7 @@ async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted:
         };
         let directory = scope_before_db(&grant).await;
         let identity = f.worker.clone();
-        let arguments = json!({"filePath": a});
+        let arguments = json!({"path": a});
         let prepared = with_db_handle(&scope_probe_call(&f, &a), move |db, ctx| {
             prepare(
                 db, ctx, &identity, "read", &arguments, &grant, &directory, None,
@@ -2025,7 +2025,9 @@ async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted:
         assert!(f.asks()[0].elicitation_id.is_none());
         let rx2 = f.send_read(&f.worker, &b, 902).await;
         wait_for(|| f.fake.calls("consent.request").len() == 2).await;
-        let rx1 = f.send_read(&f.worker, &a, 901).await;
+        let rx1 = f
+            .send_tool(&f.worker, "read", json!({"path": a}), 901, read_dispatch)
+            .await;
         (rx1, rx2)
     } else {
         let rx1 = f.send_read(&f.worker, &a, 901).await;
