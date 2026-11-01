@@ -7410,6 +7410,7 @@ pub(in crate::subc) mod route_tests {
                 worker_mode
             };
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
@@ -7532,6 +7533,7 @@ pub(in crate::subc) mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),
