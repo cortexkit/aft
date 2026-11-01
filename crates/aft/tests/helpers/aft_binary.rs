@@ -86,6 +86,17 @@ fn unchanged(source: &File, path: &Path, expected: &Identity) -> io::Result<()> 
 
 #[cfg(unix)]
 fn deploy(source: &Path, temporary_root: &Path) -> io::Result<PathBuf> {
+    deploy_observing_copy(source, temporary_root, |_| {})
+}
+
+#[cfg(unix)]
+fn deploy_observing_copy(
+    source: &Path,
+    temporary_root: &Path,
+    copied: impl FnOnce(&Path),
+) -> io::Result<PathBuf> {
+    use std::process::{Command, Stdio};
+
     let source = source.canonicalize()?;
     let run = std::env::var("NEXTEST_RUN_ID")
         .ok()
@@ -106,7 +117,7 @@ fn deploy(source: &Path, temporary_root: &Path) -> io::Result<PathBuf> {
         .truncate(false)
         .open(cache.join("publish.lock"))?;
     lock.lock()?;
-    let mut input = File::open(&source)?;
+    let input = File::open(&source)?;
     let identity = Identity::from_metadata(&source, &input.metadata()?)?;
     let directory = cache.join(identity.key());
     let image = directory.join(if cfg!(windows) { "aft.exe" } else { "aft" });
@@ -127,19 +138,32 @@ fn deploy(source: &Path, temporary_root: &Path) -> io::Result<PathBuf> {
         .prefix(".publishing-")
         .tempdir_in(&cache)?;
     let pending_image = pending.path().join(image.file_name().unwrap());
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&pending_image)?;
-    let copied = io::copy(&mut input, &mut output)?;
-    if copied != identity.size {
+    // Other test threads fork while this copy is in progress. Only the writer
+    // child may hold a writable image descriptor: an unrelated fork could
+    // retain a parent's descriptor after publication and make exec fail with
+    // "text file busy" (ETXTBSY) even after the parent closed it.
+    let status = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "umask 077; set -C; /bin/cat > \"$1\"",
+            "aft-fixture-image-writer",
+        ])
+        .arg(&pending_image)
+        .stdin(Stdio::from(input.try_clone()?))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("AFT fixture image writer failed"));
+    }
+    if fs::metadata(&pending_image)?.len() != identity.size {
         return Err(io::Error::other("AFT fixture image copy was incomplete"));
     }
-    output.sync_all()?;
+    File::open(&pending_image)?.sync_all()?;
+    copied(&pending_image);
     let mut permissions = input.metadata()?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(&pending_image, permissions)?;
-    drop(output);
     unchanged(&input, &source, &identity)?;
     // Publish a completed directory by rename. Readers never see a partial
     // image and an existing nonempty source-identity directory is not replaced.
@@ -218,5 +242,56 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert!(paths.iter().all(|path| path == &paths[0]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fixture_image_writer_is_not_inherited_by_parallel_forks() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        struct ForkGuard {
+            pid: libc::pid_t,
+            release: UnixStream,
+        }
+        impl Drop for ForkGuard {
+            fn drop(&mut self) {
+                self.release.shutdown(std::net::Shutdown::Both).unwrap();
+                // SAFETY: pid names only the child created below.
+                unsafe {
+                    while libc::waitpid(self.pid, std::ptr::null_mut(), 0) == -1
+                        && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                    {
+                    }
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let source = source_image(root.path(), b"#!/bin/sh\nexit 0\n");
+        let mut inherited = None;
+        let image = deploy_observing_copy(&source, root.path(), |_| {
+            let (reader, release) = UnixStream::pair().unwrap();
+            let reader_fd = reader.as_raw_fd();
+            let release_fd = release.as_raw_fd();
+            // Model an unrelated test thread's fork retaining all descriptors
+            // until after the copied image has been published and executed.
+            // SAFETY: the child calls only async-signal-safe libc functions.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::close(release_fd);
+                    let mut byte = 0u8;
+                    libc::read(reader_fd, std::ptr::addr_of_mut!(byte).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            inherited = Some(ForkGuard { pid, release });
+        })
+        .unwrap();
+        let result = std::process::Command::new(image).status();
+        drop(inherited);
+        assert!(result.unwrap().success());
     }
 }

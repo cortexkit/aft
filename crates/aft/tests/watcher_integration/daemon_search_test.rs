@@ -145,7 +145,7 @@ impl Daemon {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root.to_path_buf(), "opencode", "watcher-search"),
+            identity: BindIdentity::new("opencode", "watcher-search"),
             principal: Some(Principal::Direct),
             consumer_capabilities: None,
             admission_facts: Default::default(),
@@ -153,6 +153,9 @@ impl Daemon {
             role_versions: None,
             call_mode: None,
         };
+        // Keep the legacy root-bearing route while using the project-free SDK.
+        let mut bind = serde_json::to_value(bind).unwrap();
+        bind["identity"]["project_root"] = json!(root);
         write_frame(
             &mut stream,
             &Frame::build(
