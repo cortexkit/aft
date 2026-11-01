@@ -102,7 +102,123 @@ function executionDeadline() {
   };
 }
 
+async function heldStandalone(boundary: "permission" | "dispatched") {
+  const pool = new FakePool();
+  const deadline = executionDeadline();
+  const entered = gate();
+  const resume = gate();
+  const continued = gate();
+  let dispatches = 0;
+  let settled = false;
+  let continuationError: unknown;
+  pool.bridge.toolCall = async () => {
+    dispatches++;
+    if (boundary === "dispatched") {
+      entered.open();
+      await resume.promise;
+    }
+    return { success: true, text: "real result" };
+  };
+  const location = await acquireBridge("/fixture/shared-execution", options(), {
+    createPool: async () => pool,
+    executionClock: deadline.clock,
+  });
+  const outcome = withLocationExecution(location, async () => {
+    const transport = location.getBridge("/fixture/shared-execution");
+    try {
+      if (boundary === "permission") {
+        entered.open();
+        await resume.promise;
+      }
+      return await transport.toolCall("session", "write", {});
+    } catch (error) {
+      continuationError = error;
+      throw error;
+    } finally {
+      continued.open();
+    }
+  }).then(
+    (value) => {
+      settled = true;
+      return { value };
+    },
+    (error: unknown) => {
+      settled = true;
+      return { error };
+    },
+  );
+  await entered.promise;
+  return {
+    pool,
+    location,
+    deadline,
+    resume,
+    continued,
+    outcome,
+    dispatches: () => dispatches,
+    settled: () => settled,
+    continuationError: () => continuationError,
+    replace: () =>
+      acquireBridge("/fixture/shared-execution", options(), {
+        createPool: async () => {
+          throw new Error("replacement must share the owner");
+        },
+      }),
+  };
+}
+
 describe("Location execution holds", () => {
+  for (const boundary of ["permission", "dispatched"] as const) {
+    test(`shared owner preserves ${boundary} call past the drain deadline with its real result`, async () => {
+      const r = await heldStandalone(boundary);
+      const disposal = releaseBridge(r.location);
+      const replacement = await r.replace();
+      try {
+        r.deadline.expire();
+        await disposal;
+        expect(r.settled()).toBe(false);
+        expect(r.pool.shutdownCalls).toBe(0);
+        r.resume.open();
+        expect(await r.outcome).toEqual({ value: { success: true, text: "real result" } });
+        expect(r.dispatches()).toBe(1);
+      } finally {
+        r.resume.open();
+        await disposal;
+        await releaseBridge(replacement);
+      }
+    });
+
+    test(`last replacement shutdown interrupts a retired ${boundary} hold, not its earlier deadline`, async () => {
+      const r = await heldStandalone(boundary);
+      const disposal = releaseBridge(r.location);
+      const replacement = await r.replace();
+      try {
+        r.deadline.expire();
+        await disposal;
+        expect(r.settled()).toBe(false);
+        await releaseBridge(replacement);
+        const outcome = await r.outcome;
+        expect(outcome).toHaveProperty("error");
+        const error = (outcome as { error: unknown }).error;
+        if (boundary === "dispatched") {
+          expect(error).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+          expect(error).not.toMatchObject({ kind: "not_sent" });
+        } else {
+          expect(error).toMatchObject({ kind: "not_sent", message: LOCATION_RELOADED_NOT_SENT });
+        }
+        r.resume.open();
+        await r.continued.promise;
+        if (boundary === "permission") expect(r.continuationError()).toBe(error);
+        expect(r.dispatches()).toBe(boundary === "dispatched" ? 1 : 0);
+        expect(r.pool.shutdownCalls).toBe(1);
+      } finally {
+        r.resume.open();
+        await disposal;
+        await releaseBridge(replacement);
+      }
+    });
+  }
+
   test("unsolicited transport callbacks outlive a completed call without retaining its hold", async () => {
     const pool = new FakePool();
     let dispatches = 0;
@@ -203,9 +319,11 @@ describe("Location execution holds", () => {
       ).catch((error: unknown) => error);
       await acknowledged.promise;
       const disposal = releaseBridge(location);
-      const replacement = await acquireBridge("/fixture/acknowledged", options(subc), {
-        createPool: async () => new FakePool(),
-      });
+      const replacement = subc
+        ? await acquireBridge("/fixture/acknowledged", options(subc), {
+            createPool: async () => new FakePool(),
+          })
+        : undefined;
       try {
         deadline.expire();
         const error = await outcome;
@@ -215,14 +333,17 @@ describe("Location execution holds", () => {
         await disposal;
         reply.open();
         expect(dispatches).toBe(1);
-        expect(pool.shutdownCalls).toBe(subc ? 1 : 0);
-        expect(await replacement.toolCall("/fixture/acknowledged", {}, "read", {})).toMatchObject({
-          success: true,
-        });
+        expect(pool.shutdownCalls).toBe(1);
+        if (replacement)
+          expect(await replacement.toolCall("/fixture/acknowledged", {}, "read", {})).toMatchObject(
+            {
+              success: true,
+            },
+          );
       } finally {
         reply.open();
         await disposal;
-        await releaseBridge(replacement);
+        if (replacement) await releaseBridge(replacement);
       }
     });
   }

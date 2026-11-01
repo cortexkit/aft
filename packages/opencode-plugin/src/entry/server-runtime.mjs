@@ -125,7 +125,14 @@ async function bootLocation(context, location, dependencies) {
     ...consumers.transportOptions,
     ...subcWakes?.handlers,
   });
-  consumers.withExecution = (operation) => withLocationExecution(pool, operation);
+  const executions = new Set();
+  consumers.withExecution = (operation) => {
+    const execution = withLocationExecution(pool, operation);
+    executions.add(execution);
+    const finished = () => executions.delete(execution);
+    void execution.then(finished, finished);
+    return execution;
+  };
   environment.attach(pool);
   const toolContext = {
     pool,
@@ -167,7 +174,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes };
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock, subcWakes, executions };
   } catch (error) {
     // Boot failures precede finalizer ownership, so unwind every acquired resource here.
     await Promise.allSettled([
@@ -240,20 +247,41 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
+      let runtime;
       // Release the Location before tearing down registrations, so admission closes
       // before asynchronous cleanup. Draining calls keep the session records they
       // need to record or kill a late background task.
       const registrationScope = yield* Effect.acquireRelease(
         Scope.make(),
-        (scope) => Scope.close(scope, Exit.succeed(undefined)),
+        (scope) => Effect.promise(async () => {
+          const cleanup = async () => {
+            try {
+              await runtime?.consumers.dispose?.();
+            } finally {
+              await Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
+            }
+          };
+          if (runtime?.executions?.size) {
+            // A replacement may keep the owner alive after this Location's bounded
+            // drain. Its admitted calls still need permissions and task tracking.
+            void Promise.allSettled([...runtime.executions]).then(cleanup).catch((cleanupError) => {
+              error(`AFT retired Location cleanup failed: ${String(cleanupError)}`);
+            });
+          } else {
+            await cleanup();
+          }
+        }),
       );
       const register = (effect) =>
         effect.pipe(Effect.provideService(Scope.Scope, registrationScope));
       // The host runs this program under Effect.ignoreCause, so a rejected boot
       // would otherwise leave the Location without AFT and without any log.
       // Interruption is the host disposing the Location mid-boot, not a failure.
-      const runtime = yield* Effect.acquireRelease(
-        Effect.promise(() => bootLocation(context, location, dependencies)),
+      runtime = yield* Effect.acquireRelease(
+        Effect.promise(async () => {
+          runtime = await bootLocation(context, location, dependencies);
+          return runtime;
+        }),
         (runtime) => Effect.promise(async () => {
           // Close admission immediately, but retain consumers until admitted calls
           // finish: background spawn replies can still need their tracking RPCs.
@@ -263,11 +291,7 @@ export function makeServerEffect(overrides = {}) {
           try {
             runtime.liveConfigReload?.stop();
           } finally {
-            try {
-              await released;
-            } finally {
-              await runtime.consumers.dispose?.();
-            }
+            await released;
           }
         }),
       ).pipe(

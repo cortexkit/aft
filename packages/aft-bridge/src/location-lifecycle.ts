@@ -77,6 +77,8 @@ export interface BridgeLifecycleCensusOptions {
 interface StandaloneOwner {
   readonly pool: AftTransportPool;
   readonly configByRoot: Map<string, Record<string, unknown>>;
+  /** Includes admitted calls on retired leases until those calls settle. */
+  executionInterrupts?: Set<() => void>;
   /**
    * Each live Location's own version-mismatch handler, in acquisition order.
    * The pool is built once with the first Location's options, but that
@@ -171,6 +173,7 @@ class LocationBridgeLease implements ReleasableLocationPool {
     readonly mode: TransportMode,
     private readonly pool: AftTransportPool,
     private readonly releaseOwner: () => Promise<void>,
+    private readonly ownerExecutions: Set<() => void>,
     private readonly dependencies: AcquireBridgeDependencies,
   ) {}
 
@@ -181,6 +184,11 @@ class LocationBridgeLease implements ReleasableLocationPool {
       interrupt = reject;
     });
     const hold: ExecutionHold = { dispatched: false, finished: false, interrupt };
+    const interruptForShutdown = () => {
+      hold.error ??= this.interrupted(hold);
+      hold.interrupt(hold.error);
+    };
+    this.ownerExecutions.add(interruptForShutdown);
     this.holds.add(hold);
     // Admission is synchronous. Async-local ownership follows the whole invocation,
     // including permission waits and RPCs made after an earlier mutation answered.
@@ -189,6 +197,7 @@ class LocationBridgeLease implements ReleasableLocationPool {
         return await Promise.race([operation(), interrupted]);
       } finally {
         hold.finished = true;
+        this.ownerExecutions.delete(interruptForShutdown);
         this.holds.delete(hold);
         if (this.holds.size === 0) this.drained?.();
       }
@@ -326,13 +335,12 @@ class LocationBridgeLease implements ReleasableLocationPool {
     try {
       await new Promise<void>((resolve) => {
         this.drained = resolve;
-        timer = clock.setTimeout(() => {
-          for (const hold of this.holds) {
-            hold.error = this.interrupted(hold);
-            hold.interrupt(hold.error);
-          }
-          resolve();
-        }, this.dependencies.executionDrainTimeoutMs ?? EXECUTION_DRAIN_TIMEOUT_MS);
+        // The deadline only releases this Location's reference. Calls can keep
+        // using a shared owner; only actual owner shutdown interrupts them.
+        timer = clock.setTimeout(
+          resolve,
+          this.dependencies.executionDrainTimeoutMs ?? EXECUTION_DRAIN_TIMEOUT_MS,
+        );
       });
     } finally {
       if (timer !== undefined) clock.clearTimeout(timer);
@@ -368,6 +376,7 @@ export async function acquireBridge(
   return withLock(directory, async () => {
     if (mode === "subc") {
       const pool = await createPool(options);
+      const ownerExecutions = new Set<() => void>();
       let lease!: LocationBridgeLease;
       lease = new LocationBridgeLease(
         directory,
@@ -376,9 +385,11 @@ export async function acquireBridge(
         async () => {
           await withLock(directory, async () => {
             lifecycleState().subcLeases.delete(lease);
+            for (const interrupt of ownerExecutions) interrupt();
             await pool.shutdown();
           });
         },
+        ownerExecutions,
         dependencies,
       );
       lifecycleState().subcLeases.add(lease);
@@ -421,6 +432,7 @@ export async function acquireBridge(
       owner.references += 1;
       owner.referencesByRoot.set(directory, (owner.referencesByRoot.get(directory) ?? 0) + 1);
       owner.configByRoot.set(directory, { ...options.configOverrides });
+      const ownerExecutions = (owner.executionInterrupts ??= new Set<() => void>());
       const acquiredOwner = owner;
       const lease: LocationBridgeLease = new LocationBridgeLease(
         directory,
@@ -441,10 +453,12 @@ export async function acquireBridge(
               }
               if (current.references > 0) return;
               lifecycleState().standalone = null;
+              for (const interrupt of ownerExecutions) interrupt();
               await current.pool.shutdown();
             }),
           );
         },
+        ownerExecutions,
         dependencies,
       );
       const onVersionMismatch = options.poolOptions.onVersionMismatch;

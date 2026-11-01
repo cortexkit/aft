@@ -35,6 +35,7 @@ async function rig(
   const resume = gate();
   const retiring = gate();
   const continued = gate();
+  const consumersDisposed = gate();
   const calls: string[] = [];
   let shutdowns = 0;
   let disposedConsumers = false;
@@ -127,6 +128,7 @@ async function rig(
         requestPermission: pause,
         dispose: () => {
           disposedConsumers = true;
+          consumersDisposed.open();
         },
         executeBash: async ({ context }: any) => {
           // An older spawn epoch forces the real tracking helper's kill RPC.
@@ -201,6 +203,7 @@ async function rig(
     resume,
     retiring,
     continued,
+    consumersDisposed,
     invoke,
     dispose,
     location,
@@ -280,6 +283,59 @@ test("V2 disposal closes admission before asynchronous registration cleanup", as
     await disposal;
   }
 });
+
+for (const boundary of ["permission", "edit", "bash"] as const) {
+  test(`V2 same-root replacement preserves ${boundary} result beyond the drain deadline`, async () => {
+    let expire!: () => void;
+    const r = await rig(boundary, {
+      executionClock: {
+        setTimeout(callback) {
+          expire = callback;
+          return 0;
+        },
+        clearTimeout() {},
+      },
+    });
+    let settled = false;
+    const outcome = r.invoke().then(
+      (value) => {
+        settled = true;
+        return { value };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+    await r.entered.promise;
+    const disposal = r.dispose();
+    await r.retiring.promise;
+    const replacement = await r.replace();
+    try {
+      expire();
+      await disposal;
+      expect(settled).toBe(false);
+      expect(r.shutdowns()).toBe(0);
+      expect(r.disposedConsumers()).toBe(false);
+      r.resume.open();
+      expect(await outcome).toEqual({
+        value: { content: boundary === "bash" ? "started" : "written" },
+      });
+      await r.consumersDisposed.promise;
+      expect(r.calls).toEqual(
+        boundary === "bash"
+          ? ["bash", "bash_kill"]
+          : boundary === "edit"
+            ? ["edit:preview", "edit"]
+            : ["write"],
+      );
+    } finally {
+      r.resume.open();
+      await disposal;
+      await releaseBridge(replacement);
+    }
+  });
+}
 
 test("V2 composite bash interrupted after spawning reports unknown, never not-started", async () => {
   let expire!: () => void;
