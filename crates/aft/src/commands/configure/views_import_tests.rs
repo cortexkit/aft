@@ -323,6 +323,8 @@ fn views_import_building_retries_callgraph_without_load_failures_then_answers() 
         .degraded_reasons()
         .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
 
+    assert!(!crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
+
     drop(slot);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

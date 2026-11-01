@@ -916,17 +916,6 @@ impl CallgraphView {
                 completion_busy: false,
             });
         }
-        if self
-            .legacy_import
-            .as_ref()
-            .is_some_and(|job| job.is_building())
-        {
-            return Err(CallgraphViewError {
-                reason: "legacy text and symbol import building".into(),
-                busy: true,
-                completion_busy: false,
-            });
-        }
         let mut retry = self
             .query
             .lock()
@@ -947,6 +936,15 @@ impl CallgraphView {
             now,
             |error| error.busy,
             || {
+                if self
+                    .legacy_import
+                    .as_ref()
+                    .is_some_and(|job| job.is_building())
+                {
+                    return Err(CallgraphViewError::from(
+                        "legacy text and symbol import building",
+                    ));
+                }
                 #[cfg(test)]
                 self.acquisitions
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
