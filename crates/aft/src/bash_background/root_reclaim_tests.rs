@@ -341,6 +341,7 @@ fn root_reclaim_identity_is_resolved_before_spawn_admission() {
                     false,
                     false,
                     Some(root.path().into()),
+                    false,
                 )
                 .map_err(|error| error.to_string()),
             _ => unreachable!(),

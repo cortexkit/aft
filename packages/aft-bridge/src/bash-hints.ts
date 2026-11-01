@@ -223,6 +223,11 @@ export function taskKillDeadlineText(
   let source: string;
   if (hardKill.source === "timeout") {
     source = "(the `timeout` you passed)";
+  } else if (hardKill.source === "scope") {
+    source = "(its fixed Linux task scope limit; waits cannot extend this limit)";
+  } else if (hardKill.source === "scoped_default" && role === "worker") {
+    source =
+      "(its default background limit; worker waits can extend this deadline, but cannot extend the fixed Linux task scope limit)";
   } else if (role === "worker") {
     source =
       "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit";

@@ -529,7 +529,7 @@ mod tests {
     fn a0_sender_is_captured_before_ledger_proxy_wraps_the_bulk_lane() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")
@@ -1380,7 +1380,7 @@ mod ordering_tests {
     fn production_control_lane_and_completion_priority_are_explicit() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")

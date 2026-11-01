@@ -259,6 +259,7 @@ fn allocate_past_cap(
                 true,
                 false,
                 None,
+                false,
             )
             .unwrap()
     };
@@ -599,6 +600,7 @@ fn memory_limit_cmd_waiter_contains_and_kills_powershell_tree() {
                     true,
                     false,
                     None,
+                    false,
                 )
                 .unwrap()
         };
@@ -1131,7 +1133,9 @@ fn memory_limit_terminal_accounting_failure_still_samples_and_notifies() {
         state.metadata.memory_policy = Some(policy.clone());
         state.metadata.completion_delivered = false;
     }
-    let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id).unwrap();
+    let mut monitor = super::super::memory_limit::Monitor::recover(policy.clone(), &id)
+        .unwrap()
+        .unwrap();
     monitor.force_exceeded_for_test();
     registry
         .inner

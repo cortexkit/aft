@@ -2115,6 +2115,7 @@ struct LocalFallback {
     // Keep the submitting request's local ceiling even if configuration reloads.
     memory_limit_mib: Option<u64>,
     linux_scope: bool,
+    linux_scope_max_runtime_secs: u64,
 }
 
 /// How `attach_remote` ended when it did not fail.
@@ -2357,6 +2358,7 @@ impl BgTaskRegistry {
             notify,
             compressed,
             root,
+            false,
         )
         .map_err(|error| error.to_string())
     }
@@ -2378,6 +2380,7 @@ impl BgTaskRegistry {
         notify: bool,
         compressed: bool,
         root: Option<PathBuf>,
+        linux_scope: bool,
     ) -> Result<String, RegistryError> {
         let mut timings = super::super::take_runon_timings();
         timings.enter("task_setup");
@@ -2469,15 +2472,16 @@ impl BgTaskRegistry {
         );
         attach_sandbox_metadata(&mut metadata, &plan);
         timings.enter("fallback_snapshot");
+        let linux_scope_max_runtime_secs = self.inner.task_scopes.max_runtime().as_secs();
         let digest = crate::sandbox_spawn::save_local_launch(
             &plan,
             root.as_deref().unwrap_or(&workdir),
             &workdir,
             &crate::sandbox_spawn::current_authenticated_principal(),
             &shell_path,
-            env.get("AFT_INTERNAL_LINUX_SCOPE")
-                .is_some_and(|v| v == "1"),
+            linux_scope,
             memory_limit_mib,
+            linux_scope_max_runtime_secs,
         )?;
         metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
         timings.enter("task_registration");
@@ -2510,9 +2514,7 @@ impl BgTaskRegistry {
             .io_handles = Some(handles);
         let request_root = root.as_deref().unwrap_or(&workdir);
         timings.enter("remote_environment");
-        let linux_scope = env
-            .remove("AFT_INTERNAL_LINUX_SCOPE")
-            .is_some_and(|v| v == "1");
+        env.remove(super::LINUX_SCOPE_ENV);
         // Configured `bash.env` values apply to local commands only: the
         // ambient environment must not carry one to a build server just
         // because it happens to be exported here. The request's own map is a
@@ -2617,6 +2619,7 @@ impl BgTaskRegistry {
             plan,
             shell_path,
             linux_scope,
+            linux_scope_max_runtime_secs,
             memory_limit_mib,
             env,
             capture_pipeline,
@@ -4049,37 +4052,119 @@ impl BgTaskRegistry {
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
         tests::after_local_fallback_marker(&task.task_id);
-        let mut memory_monitor = Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
-        let mut child = spawn_detached_child(
-            &local.plan,
-            &metadata.command,
-            super::super::BashShell::Bash,
-            &local.shell_path,
-            &task.paths,
-            &metadata.workdir,
-            &local.env,
+        let hard_kill = if metadata.default_hard_kill {
+            super::super::HardKill::Default
+        } else {
+            super::super::HardKill::After(Duration::from_millis(metadata.timeout_ms.unwrap_or(0)))
+        };
+        let mut scope = self
+            .inner
+            .task_scopes
+            .policy(
+                local.linux_scope,
+                Some(Duration::from_secs(local.linux_scope_max_runtime_secs)),
+                local.plan.is_native_launcher(),
+            )
+            .map(|policy| {
+                self.inner.task_scopes.prepare(
+                    policy,
+                    &task.task_id,
+                    hard_kill,
+                    local.memory_limit_mib,
+                    crate::bash_background::persistence::task_store_root(&task.paths.session_dir)
+                        .ok_or("task store root is unavailable")?,
+                )
+            })
+            .transpose()?
+            .flatten();
+        #[cfg(target_os = "linux")]
+        {
+            state.metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|error| error.to_string())?;
+        }
+        let mut memory_monitor = if scope.is_some() {
+            None
+        } else {
+            Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?
+        };
+        let gated = scope.is_some() || memory_monitor.is_some();
+        let spawn_child = |scope: Option<&super::super::task_scope::ScopeLaunch>,
+                           io_handles: &mut TaskIoHandles| {
+            spawn_detached_child(
+                &local.plan,
+                &metadata.command,
+                super::super::BashShell::Bash,
+                &local.shell_path,
+                &task.paths,
+                &metadata.workdir,
+                &local.env,
+                io_handles,
+                local.capture_pipeline,
+                local.memory_limit_mib.is_some(),
+                scope,
+                if gated {
+                    LocalIdentityGate::Required
+                } else {
+                    LocalIdentityGate::CommittedFallback
+                },
+            )
+        };
+        let mut child = spawn_child(
+            scope.as_ref(),
             state.io_handles.as_mut().ok_or("task handles absent")?,
-            local.capture_pipeline,
-            memory_monitor.is_some(),
-            local.linux_scope,
-            // The fallback's execution marker is already durable. Only capped
-            // commands need a second gate here, to attach the memory container.
-            if memory_monitor.is_some() {
-                LocalIdentityGate::Required
-            } else {
-                LocalIdentityGate::CommittedFallback
-            },
-        )?;
+        )
+        .and_then(|mut child| {
+            if let Some(launch) = scope.as_ref() {
+                if self.place_task_scope(&mut child, launch)? {
+                    scope = None;
+                    state.metadata.task_scope_runtime_ms = None;
+                    self.persist_task_locked(task, &state.metadata, &mut db)
+                        .map_err(|error| error.to_string())?;
+                    memory_monitor =
+                        Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?;
+                    return spawn_child(
+                        None,
+                        state.io_handles.as_mut().ok_or("task handles absent")?,
+                    );
+                }
+            }
+            Ok(child)
+        })?;
+        if scope.is_none() {
+            state.metadata.task_scope_runtime_ms = None;
+        }
+        #[cfg(target_os = "linux")]
+        if scope.is_some() {
+            match self.scoped_memory_limit(local.memory_limit_mib, &task.task_id) {
+                Ok(monitor) => memory_monitor = monitor,
+                Err(error) => {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
                 super::super::process::terminate_pgid(child.id() as i32, None);
-                let _ = child.wait();
+                if let Err(kill_error) =
+                    self.cleanup_failed_scope_spawn(&task.task_id, &mut child, scope.as_ref())
+                {
+                    crate::slog_warn!("failed spawn scope cleanup: {kill_error}");
+                }
                 return Err(error);
             }
             state.metadata.memory_policy = Some(monitor.policy.clone());
             // Persist the chosen enforcer before the gated fallback command can run.
             if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                 drop(child.stdin.take());
+                if let Some(scope) = scope.as_ref() {
+                    let _ = scope.stop();
+                }
                 let _ = child.wait();
                 return Err(error.to_string());
             }
@@ -4088,11 +4173,28 @@ impl BgTaskRegistry {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .insert(task.task_id.clone(), monitor);
+        }
+        if gated {
+            if local.memory_limit_mib.is_none() {
+                state.metadata.status = BgTaskStatus::Starting;
+                state.metadata.child_pid = Some(child.id());
+                state.metadata.pgid = Some(child.id() as i32);
+                state.metadata.child_start_time_ms =
+                    crate::root_cache::process_start_time_ms(child.id());
+                if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
+                    drop(child.stdin.take());
+                    if let Some(scope) = scope.as_ref() {
+                        let _ = scope.stop();
+                    }
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            }
             use std::io::Write;
             child
                 .stdin
                 .take()
-                .ok_or("memory cap launch gate missing")?
+                .ok_or("local identity launch gate missing")?
                 .write_all(b"run\n")
                 .map_err(|error| error.to_string())?;
         }
@@ -4140,14 +4242,20 @@ impl BgTaskRegistry {
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
                 .map_err(|e| e.to_string())?;
-            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
-                crate::sandbox_spawn::restore_local_launch(
-                    &layout,
-                    remote
-                        .fallback_digest
-                        .as_deref()
-                        .ok_or("local snapshot digest absent")?,
-                )?;
+            let (
+                plan,
+                shell_path,
+                env,
+                linux_scope,
+                memory_limit_mib,
+                linux_scope_max_runtime_secs,
+            ) = crate::sandbox_spawn::restore_local_launch(
+                &layout,
+                remote
+                    .fallback_digest
+                    .as_deref()
+                    .ok_or("local snapshot digest absent")?,
+            )?;
             let metadata = task
                 .state
                 .lock()
@@ -4173,6 +4281,7 @@ impl BgTaskRegistry {
                     env,
                     capture_pipeline,
                     linux_scope,
+                    linux_scope_max_runtime_secs,
                     memory_limit_mib,
                 },
                 reason,
