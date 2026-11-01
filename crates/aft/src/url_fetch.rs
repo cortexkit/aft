@@ -2576,7 +2576,8 @@ fn static_extension_for_lang_ext(ext: &str) -> Option<&'static str> {
         "py" | "pyi" => Some(".py"),
         "rs" => Some(".rs"),
         "go" => Some(".go"),
-        "c" | "h" => Some(".c"),
+        "c" => Some(".c"),
+        "h" => Some(".h"),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(".cpp"),
         "zig" => Some(".zig"),
         "cs" => Some(".cs"),
@@ -3186,6 +3187,11 @@ fn reqwest_error_detail(error: &reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_url_cache_preserves_ambiguous_extension() {
+        assert_eq!(super::static_extension_for_lang_ext("h"), Some(".h"));
+    }
+
     use super::*;
     use url::Url;
 

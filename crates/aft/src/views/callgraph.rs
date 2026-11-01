@@ -107,7 +107,14 @@ pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Has
         "config".to_owned()
     } else {
         let path = std::str::from_utf8(path).ok()?;
-        format!("{:?}", crate::parser::detect_language(Path::new(path))?).to_lowercase()
+        // A `.h` file's language comes from the parse already stored for this
+        // content (C, then C++, then Objective-C); an unparsed header has no
+        // key yet, so callers treat it as differing rather than guess C.
+        format!(
+            "{:?}",
+            crate::parser::language_for_content_hash(Path::new(path), source)?
+        )
+        .to_lowercase()
     };
     let key =
         crate::blob_store::CallgraphKey::from_source_digest(*source.as_bytes(), language, PRODUCER)

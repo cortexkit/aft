@@ -298,13 +298,18 @@ impl CallgraphBlob {
         let lang = language_id(language)
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
         let extractor_version = extractor_version.into();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar_for(lang))
-            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| ManifestJoinError::Parse("tree-sitter returned no tree".to_string()))?;
+        let tree = match crate::parser::cached_header_tree(source, lang) {
+            Some(tree) => tree,
+            None => {
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&grammar_for(lang))
+                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                parser.parse(source, None).ok_or_else(|| {
+                    ManifestJoinError::Parse("tree-sitter returned no tree".to_string())
+                })?
+            }
+        };
         let root = tree.root_node();
         let ast_nodes = ast_preorder_nodes(root);
         let line_index = super::LineIndex::new(source);

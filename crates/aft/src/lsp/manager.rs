@@ -2665,13 +2665,7 @@ impl LspManager {
         }
 
         let uri = uri_for_path(&canonical_path)?;
-        let language_id = language_id_for_extension(
-            canonical_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default(),
-        )
-        .to_string();
+        let language_id = language_id_for_path(&canonical_path, None).to_string();
         let needs_content = server_keys.iter().any(|key| {
             !self
                 .documents
@@ -2914,13 +2908,7 @@ impl LspManager {
         self.end_inspect_close_exception_on_reopen(&canonical_path);
 
         let uri = uri_for_path(&canonical_path)?;
-        let language_id = language_id_for_extension(
-            canonical_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default(),
-        )
-        .to_string();
+        let language_id = language_id_for_path(&canonical_path, Some(content)).to_string();
 
         let mut versions: Vec<(ServerKey, i32)> = Vec::with_capacity(server_keys.len());
         // Read once for every server's store (see `ensure_file_open`).
@@ -3857,14 +3845,8 @@ impl LspManager {
             return Ok(Vec::new());
         }
         let uri = uri_for_path(&canonical_path)?;
-        let language_id = language_id_for_extension(
-            canonical_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default(),
-        )
-        .to_string();
         let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
+        let language_id = language_id_for_path(&canonical_path, Some(&content)).to_string();
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
             self.invalidate_diagnostic_content(&key, &canonical_path);
@@ -8291,6 +8273,26 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     resolved
 }
 
+pub(crate) fn language_id_for_path(path: &Path, source: Option<&str>) -> &'static str {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+        let lang = match source {
+            Some(source) => crate::parser::detect_language_from_source(path, source),
+            None => crate::parser::detect_language(path),
+        };
+        return match lang {
+            Some(crate::parser::LangId::C) => "c",
+            Some(crate::parser::LangId::Cpp) => "cpp",
+            Some(crate::parser::LangId::ObjC) => "objective-c",
+            _ => "plaintext",
+        };
+    }
+    language_id_for_extension(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default(),
+    )
+}
+
 pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
         "ts" | "mts" | "cts" => "typescript",
@@ -8322,7 +8324,7 @@ pub(crate) fn language_id_for_extension(ext: &str) -> &'static str {
         "swift" => "swift",
         "cs" | "csx" => "csharp",
         "razor" | "cshtml" => "razor",
-        "c" | "h" => "c",
+        "c" => "c",
         "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" => "cpp",
         "lua" => "lua",
         "zig" | "zon" => "zig",
@@ -8768,11 +8770,7 @@ fn replay_startup_notifications(
                 return Err(LspError::ProjectClosed);
             }
             let payload = if opened {
-                let language = language_id_for_extension(
-                    path.extension()
-                        .and_then(|ext| ext.to_str())
-                        .unwrap_or_default(),
-                );
+                let language = language_id_for_path(&path, Some(&content));
                 serde_json::to_string(
                     &serde_json::json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri.as_str(), "languageId": language, "version": version, "text": content}}}),
                 )?
@@ -10291,6 +10289,13 @@ mod language_id_tests {
     fn every_registered_extension_has_a_language_id() {
         for server in crate::lsp::registry::builtin_servers() {
             for extension in &server.extensions {
+                if extension == "h" {
+                    assert_eq!(
+                        super::language_id_for_path(std::path::Path::new("header.h"), Some("")),
+                        "c"
+                    );
+                    continue;
+                }
                 assert_ne!(
                     super::language_id_for_extension(extension),
                     "plaintext",

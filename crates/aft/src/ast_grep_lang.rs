@@ -152,7 +152,7 @@ impl AstGrepLang {
         Pattern::contextual(&context, &selector, PhpPatternLang::Full)
     }
 
-    /// File extensions associated with this language.
+    /// Candidate file extensions. Ambiguous `.h` files are resolved by `matches_path`.
     pub fn extensions(&self) -> &'static [&'static str] {
         match self {
             Self::TypeScript => &["ts", "mts", "cts"],
@@ -162,7 +162,7 @@ impl AstGrepLang {
             Self::Rust => &["rs"],
             Self::Go => &["go"],
             Self::C => &["c", "h"],
-            Self::Cpp => &["cc", "cpp", "cxx", "hpp", "hh"],
+            Self::Cpp => &["cc", "cpp", "cxx", "hpp", "hh", "h"],
             Self::Cuda => &["cu", "cuh"],
             Self::Metal => &["metal"],
             Self::Zig => &["zig"],
@@ -181,7 +181,7 @@ impl AstGrepLang {
             Self::Pascal => &["pas", "pp", "dpr", "dpk", "lpr"],
             Self::R => &["R", "r"],
             Self::Groovy => &["groovy", "gvy", "gy", "gsh", "gradle"],
-            Self::ObjC => &["m", "mm"],
+            Self::ObjC => &["m", "mm", "h"],
         }
     }
 
@@ -190,8 +190,16 @@ impl AstGrepLang {
         self.extensions().contains(&ext)
     }
 
-    /// Check if a file path matches this language based on its extension.
+    /// Check a path's language, resolving ambiguous headers from their contents.
     pub fn matches_path(&self, path: &std::path::Path) -> bool {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+            return matches!(
+                (self, crate::parser::detect_language(path)),
+                (Self::C, Some(crate::parser::LangId::C))
+                    | (Self::Cpp, Some(crate::parser::LangId::Cpp))
+                    | (Self::ObjC, Some(crate::parser::LangId::ObjC))
+            );
+        }
         if matches!(self, Self::Groovy)
             && path.file_name().and_then(|name| name.to_str()) == Some("Jenkinsfile")
         {

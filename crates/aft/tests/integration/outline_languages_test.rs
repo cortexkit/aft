@@ -83,6 +83,79 @@ int compute(int value);
 }
 
 #[test]
+fn h_header_plain_c_outline_is_byte_identical_to_c() {
+    let dir = TempDir::new().unwrap();
+    let source = "#define LIMIT 8\ntypedef unsigned long Count;\nstruct Config { int size; };\nenum Mode { READY, BUSY };\nint compute(int value);\n";
+    let header = write_file(dir.path(), "plain.h", source);
+    let c_file = write_file(dir.path(), "plain.c", source);
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    // The .c path always uses the original C grammar and symbol extractor.
+    let original = outline_text(&mut aft, &c_file).replace("plain.c", "plain.h");
+    assert_eq!(
+        outline_text(&mut aft, &header).as_bytes(),
+        original.as_bytes()
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn h_header_cpp_outline_zoom_and_method_callers() {
+    let dir = TempDir::new().unwrap();
+    let header = write_file(dir.path(), "widget.h", "namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\ninline int use_widget() { api::Widget widget; return widget.value(); }\n");
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &header);
+    for name in ["api", "Widget", "value", "use_widget"] {
+        assert!(text.contains(name), "{text}");
+    }
+    let zoom = send(
+        &mut aft,
+        json!({"id":"header-zoom", "command":"zoom", "file":header, "symbol":"Widget"}),
+    );
+    assert_eq!(zoom["success"], true, "{zoom:#}");
+    assert!(zoom.to_string().contains("return 42"), "{zoom:#}");
+    let callers = send(
+        &mut aft,
+        json!({"id":"header-callers", "command":"callers", "file":header, "symbol":"value", "depth":1, "includeTests":true}),
+    );
+    assert_eq!(callers["success"], true, "{callers:#}");
+    assert!(
+        callers["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["callers"].as_array().unwrap())
+            .any(|caller| caller["symbol"] == "use_widget"),
+        "{callers:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn h_header_objc_outline_and_zoom() {
+    let dir = TempDir::new().unwrap();
+    let header = write_file(
+        dir.path(),
+        "greeter.h",
+        "@interface Greeter\n@property int value;\n- (void)greet;\n@end\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let text = outline_text(&mut aft, &header);
+    for name in ["Greeter", "value", "greet"] {
+        assert!(text.contains(name), "{text}");
+    }
+    let zoom = send(
+        &mut aft,
+        json!({"id":"objc-header-zoom", "command":"zoom", "file":header, "symbol":"Greeter"}),
+    );
+    assert_eq!(zoom["success"], true, "{zoom:#}");
+    assert!(zoom.to_string().contains("@property int value"), "{zoom:#}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_cpp_symbols_include_namespaces_templates_types_and_methods() {
     let dir = TempDir::new().unwrap();
     let file = write_file(

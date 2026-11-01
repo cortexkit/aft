@@ -154,8 +154,10 @@ fn zoom_parse_source(
     if LEGACY_ZOOM_PARSE.with(|legacy| legacy.get()) {
         return FileParser::new().parse_cloned(path);
     }
-    let lang = detect_language(path).ok_or_else(|| crate::error::AftError::InvalidRequest {
-        message: format!("unsupported file extension: {}", path.display()),
+    let lang = crate::parser::detect_language_from_source(path, source).ok_or_else(|| {
+        crate::error::AftError::InvalidRequest {
+            message: format!("unsupported file extension: {}", path.display()),
+        }
     })?;
     // Zoom already read these bytes. Parse the displayed source, not a second
     // disk snapshot that can differ if an editor saves during the request.
@@ -3032,6 +3034,20 @@ fn collect_calls_with_ranges(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_zoom_source_language_uses_displayed_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("widget.h");
+        std::fs::write(&path, "int old_c_function(void);\n").unwrap();
+        let (tree, language) = super::zoom_parse_source(
+            &path,
+            "template <typename T> class Widget { public: T run(T value); };\n",
+        )
+        .unwrap();
+        assert_eq!(language, crate::parser::LangId::Cpp);
+        assert!(!tree.root_node().has_error());
+    }
+
     use super::*;
     use crate::config::Config;
     use crate::context::AppContext;
