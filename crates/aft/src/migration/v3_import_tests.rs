@@ -274,6 +274,109 @@ fn streaming_semantic_conversion_equals_the_v2_conversion() {
     assert!(source.stats.largest_read <= READ_CHUNK);
 }
 
+#[test]
+fn v8_imports_healthy_files_but_leaves_skipped_files_for_the_plane() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = checkout(dir.path());
+    let storage = dir.path().join("storage");
+    let snapshot = legacy_semantic(&storage, &root);
+    assert_eq!(snapshot[0], 8);
+    let producer = producer();
+    let (complete, originally_skipped) =
+        super::super::per_checkout::convert_semantic(&snapshot, &root, &producer).unwrap();
+    let expected = complete
+        .entries
+        .into_iter()
+        .filter(|entry| entry.rel_path.as_bytes() != b"src/beta.rs")
+        .collect::<Vec<_>>();
+    assert!(expected
+        .iter()
+        .any(|entry| entry.rel_path.as_bytes() == b"src/alpha.rs"));
+
+    for refused in [true, false] {
+        let mut index = SemanticIndex::from_bytes(&snapshot, &root).unwrap();
+        let skipped = BTreeMap::from([(root.join("src/beta.rs"), 1)]);
+        if refused {
+            index.apply_refused_rows_update(skipped);
+        } else {
+            index.apply_context_skips_update(skipped);
+        }
+        let bytes = index.to_bytes();
+        let path = super::super::per_checkout::legacy_semantic_path(&storage, KEY);
+        fs::write(&path, &bytes).unwrap();
+        let config = crate::config::SemanticBackendConfig::default();
+        assert_eq!(
+            super::super::configured_fingerprint_for_legacy(&path, &config).unwrap(),
+            SemanticIndexFingerprint::for_config_dimension(&config, 16).as_string()
+        );
+        let (v2, skipped) =
+            super::super::per_checkout::convert_semantic(&bytes, &root, &producer).unwrap();
+        assert_eq!(v2.entries, expected);
+        assert_eq!(skipped, originally_skipped + 1);
+        let mut source = Source::open(&path).unwrap();
+        let mut entries = Vec::new();
+        let (hash, skipped) =
+            convert_semantic_streaming(&mut source, &root, &producer, &mut |entry| {
+                entries.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sorted(entries), expected);
+        assert_eq!(skipped, (originally_skipped + 1) as u64);
+        assert_eq!(hash, *blake3::hash(&bytes).as_bytes());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn v8_skipped_metadata_is_validated_before_any_semantic_file_is_emitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = checkout(dir.path());
+    let storage = dir.path().join("storage");
+    let mut snapshot = legacy_semantic(&storage, &root);
+    assert_eq!(snapshot[0], 8);
+    assert_eq!(&snapshot[snapshot.len() - 16..], &[0; 16]);
+    snapshot.truncate(snapshot.len() - 16);
+    let producer = producer();
+    let path = super::super::per_checkout::legacy_semantic_path(&storage, KEY);
+    for (total, rows) in [
+        (0_u64, vec![("src/beta.rs", 1_u64)]),
+        (1, vec![("src/beta.rs", 0)]),
+        (1, vec![("src/missing.rs", 1)]),
+        (2, vec![("src/beta.rs", 1), ("src/beta.rs", 1)]),
+        (
+            u64::MAX,
+            vec![("src/alpha.rs", u64::MAX), ("src/beta.rs", 1)],
+        ),
+    ] {
+        let mut bytes = snapshot.clone();
+        bytes.extend_from_slice(&total.to_le_bytes());
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (path, count) in rows {
+            bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        assert!(super::super::per_checkout::convert_semantic(&bytes, &root, &producer).is_err());
+        fs::write(&path, &bytes).unwrap();
+        let mut source = Source::open(&path).unwrap();
+        let mut emitted = 0;
+        assert!(
+            convert_semantic_streaming(&mut source, &root, &producer, &mut |_| {
+                emitted += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(emitted, 0);
+    }
+    fs::write(&path, &snapshot).unwrap();
+    let mut source = Source::open(&path).unwrap();
+    assert!(convert_semantic_streaming(&mut source, &root, &producer, &mut |_| Ok(())).is_err());
+    assert!(super::super::per_checkout::convert_semantic(&snapshot, &root, &producer).is_err());
+}
+
 /// The semantic decoder never repairs: appended bytes (a segment or a torn
 /// tail) reject the artifact, whose bytes stay exactly as they were.
 #[test]

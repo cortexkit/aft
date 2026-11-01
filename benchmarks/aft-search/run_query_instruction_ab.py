@@ -209,7 +209,8 @@ def resolve_no_vocabulary_band(index_path: Path, diagnostics: Sequence[JsonObjec
 
     with index_path.open("rb") as source, mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
         version_raw, offset = body_cap._take(data, 0, 1)
-        if version_raw[0] != 7:
+        version = version_raw[0]
+        if version not in (7, 8):
             raise ValueError(f"unsupported semantic.bin version {version_raw[0]}")
         dimension, offset = body_cap._u32(data, offset)
         row_count, offset = body_cap._u32(data, offset)
@@ -268,6 +269,13 @@ def resolve_no_vocabulary_band(index_path: Path, diagnostics: Sequence[JsonObjec
             if len(chunk_vectors) >= 2048:
                 score_chunk()
         score_chunk()
+        if version >= 8:
+            _, offset = body_cap._take(data, offset, 8)  # total skipped chunks
+            for _ in range(2):  # provider refusal and input-limit file tables
+                skipped_files, offset = body_cap._u32(data, offset)
+                for _ in range(skipped_files):
+                    offset = body_cap._skip_string(data, offset)
+                    _, offset = body_cap._take(data, offset, 8)  # skipped chunks in this file
         if offset != len(data):
             raise ValueError(f"semantic.bin trailing bytes: {len(data) - offset}")
 

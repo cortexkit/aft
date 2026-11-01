@@ -1641,6 +1641,9 @@ fn spawn_semantic_refresh_worker(
                         }
                         if event_tx
                             .send(SemanticRefreshEvent::Completed {
+                                refused_rows: index.refused_rows_for_paths(&update.completed_paths),
+                                context_skipped: index
+                                    .context_skipped_for_paths(&update.completed_paths),
                                 added_entries: update.added_entries,
                                 updated_metadata: update.updated_metadata,
                                 completed_paths: update.completed_paths,
