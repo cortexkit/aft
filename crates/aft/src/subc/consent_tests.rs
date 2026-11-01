@@ -1952,7 +1952,11 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
     let mut rx2 = f.send_read(&f.worker, &b, 902).await;
     wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
     let requests = f.fake.calls("consent.request");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.len(),
+        2,
+        "consent.request bodies (attempts in send order): {requests:#?}"
+    );
     let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
