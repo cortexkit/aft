@@ -4848,7 +4848,11 @@ impl CompositePlane for CallgraphBridge {
             })?;
             format!(
                 "{:?}",
-                crate::parser::detect_language(std::path::Path::new(path)).ok_or_else(|| {
+                crate::parser::detect_language_from_source(
+                    std::path::Path::new(path),
+                    std::str::from_utf8(bytes).unwrap_or("")
+                )
+                .ok_or_else(|| {
                     PlaneError {
                         plane: Some(FamilyPlane::Callgraph),
                         reason: format!("unsupported callgraph member: {path}"),

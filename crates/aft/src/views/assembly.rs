@@ -2508,8 +2508,12 @@ impl CandidateReader<'_> {
         let language = if resolution_input {
             Some("config".to_string())
         } else {
-            super::callgraph::source_language(absolute)
-                .map(|language| format!("{language:?}").to_lowercase())
+            crate::parser::detect_language_from_source(
+                absolute,
+                std::str::from_utf8(&source).unwrap_or(""),
+            )
+            .filter(|language| *language != crate::parser::LangId::Markdown)
+            .map(|language| format!("{language:?}").to_lowercase())
         };
         let (key, payload) = language
             .as_deref()

@@ -1118,7 +1118,7 @@ async fn try_apply_covering_grant(
     });
     Some(Hold::Run {
         once,
-        claim,
+        claim: Some(claim),
         approval_key: prep.call_key.clone(),
     })
 }
@@ -1161,11 +1161,11 @@ pub(super) async fn persist_permission_hold(call: &HeldCall) -> Result<(), Strin
 
 /// What a held call does after its ask was handled.
 enum Hold {
-    /// Run the call again with these capabilities approved once. `claim`
-    /// owns them until the call finishes.
+    /// Run the call again with these capabilities. `claim` owns call-bound
+    /// approvals until the call finishes; saved scope grants need no claim.
     Run {
         once: Vec<Permission>,
-        claim: Arc<ClaimedAsk>,
+        claim: Option<Arc<ClaimedAsk>>,
         approval_key: String,
     },
     /// End the call with this response.
@@ -1523,8 +1523,10 @@ where
                 claim,
                 approval_key,
             } => {
-                claim.retry_after_deadline.store(false, Ordering::SeqCst);
-                holder = Some(claim);
+                if let Some(claim) = &claim {
+                    claim.retry_after_deadline.store(false, Ordering::SeqCst);
+                }
+                holder = claim;
                 let approved = once
                     .last()
                     .cloned()
@@ -2684,6 +2686,15 @@ async fn hold(
         response.data["reason"] = json!("consent_path_unrepresentable");
         return Hold::Answer(response);
     }
+    if let Some(file) = grant.file() {
+        if let Some(approval_key) = reconcile_covering_asks(call, file).await {
+            return Hold::Run {
+                once: vec![grant],
+                claim: None,
+                approval_key,
+            };
+        }
+    }
     let identity = call.identity.clone();
     let tool = call.tool.clone();
     let arguments = call.arguments.clone();
@@ -3097,7 +3108,7 @@ async fn finish(
                     }
                     Hold::Run {
                         once,
-                        claim,
+                        claim: Some(claim),
                         approval_key: prep.call_key.clone(),
                     }
                 }
@@ -3278,13 +3289,167 @@ pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
 static REATTACHED: LazyLock<StdMutex<HashSet<(String, String, u64)>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));
 
-/// The first time this process binds a route for a stamped Alfonso worker
-/// scope (see `access_grants::alfonso_worker`), re-send every ask that scope
-/// left open under its persisted call key, so Cingulate keeps the same ask;
-/// nothing is withdrawn. Approvals claimed by an earlier process are
-/// discarded, never reused.
+fn open_prepared(record: asks::AskRecord) -> Option<(Prepared, Option<String>)> {
+    Some((
+        Prepared {
+            key: record.key,
+            call_key: record.call_key?,
+            request: record.request?,
+            selector: serde_json::from_value(record.selector).ok()?,
+            grant: record.pending?,
+        },
+        record.elicitation_id,
+    ))
+}
+
+/// Poll a persisted ask without waiting for another user answer. Only a saved
+/// scope approval can be applied without running the original call; once and
+/// refusal answers remain on that call's key for its own retry to handle.
+async fn reconcile_scope_answer(
+    ctx: &Arc<AppContext>,
+    identity: &RouteIdentity,
+    prep: Prepared,
+    mut elicitation: Option<String>,
+    resend: bool,
+) -> Option<(String, AccessGrant)> {
+    if prep.key.scope != access_grants::scope_key(identity) {
+        return None;
+    }
+    let db = ctx.db()?;
+    let transport = transport()?;
+    let method_call = |method, params| ConsentCall {
+        scope: prep.selector.clone(),
+        project_root: identity.project_root.clone(),
+        session: identity.session.clone(),
+        method,
+        params,
+        timeout: UNARY_TIMEOUT,
+    };
+    if resend || elicitation.is_none() {
+        let reply = transport
+            .call(method_call("consent.request", prep.request.clone()))
+            .await
+            .ok()?;
+        let id = decode_elicitation_id(&reply).ok()?;
+        let key = prep.key.clone();
+        let call_key = prep.call_key.clone();
+        let saved_id = id.clone();
+        let db = Arc::clone(&db);
+        tokio::task::spawn_blocking(move || {
+            let conn = db.lock().ok()?;
+            asks::set_elicitation(&conn, &key, &call_key, &saved_id).ok()
+        })
+        .await
+        .ok()??;
+        elicitation = Some(id);
+    }
+    let elicitation = elicitation?;
+    let reply = transport
+        .call(method_call(
+            "consent.await",
+            json!({"elicitation_id": elicitation, "timeout_ms": 0}),
+        ))
+        .await
+        .ok()?;
+    let settled = decode_record(&reply).ok()?;
+    let Settlement::Allow {
+        scope: true,
+        by_user,
+    } = settled
+    else {
+        return None;
+    };
+    let grant = advertised_scope(&prep)?;
+    log_consent(
+        &identity.session,
+        ConsentEvent::Settled(&settled),
+        &elicitation,
+        &prep.grant,
+    );
+    let ctx = Arc::clone(ctx);
+    let identity = identity.clone();
+    tokio::task::spawn_blocking(move || {
+        let holder = asks::new_holder();
+        // Reuse the transactional claim, live-scope checks and current head
+        // policy check. Consuming the claim runs no call-bound approvals.
+        match apply_allow(
+            &db,
+            &ctx,
+            &identity,
+            &prep.key,
+            &prep.call_key,
+            &holder,
+            &Permission::File(grant.clone()),
+            None,
+            true,
+            by_user,
+        ) {
+            Ok(Applied::Run(_)) => {
+                if let Ok(conn) = db.lock() {
+                    let _ = asks::consume(&conn, &prep.key, &holder);
+                }
+                Some((prep.call_key, grant))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                crate::slog_warn!("consent late scope application failed: {error}");
+                None
+            }
+        }
+    })
+    .await
+    .ok()?
+}
+
+/// A parked folder ask can settle after its caller has returned pending. Before
+/// creating another card, recover any such approval that covers the new path.
+async fn reconcile_covering_asks(call: &HeldCall, pending: &AccessGrant) -> Option<String> {
+    let ctx = call.executor.actor_context(&call.identity.root)?;
+    let scope = access_grants::scope_key(&call.identity);
+    let records = with_db(call, move |conn, _| asks::for_scope(conn, &scope))
+        .await
+        .ok()?;
+    let own_hash = args_hash(&call.identity, &call.tool, &call.arguments);
+    for record in records {
+        // Identical retries still own their terminal answer, and an active
+        // waiter must retain its claim and original-call execution semantics.
+        if record.key.args_hash == own_hash
+            || LIVE_COVERABLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .any(|live| live.key == record.key)
+        {
+            continue;
+        }
+        let Some((prep, elicitation)) = open_prepared(record) else {
+            continue;
+        };
+        let Some(covering) = advertised_scope(&prep) else {
+            continue;
+        };
+        if !covering.covers_kind(pending.operation, &pending.path, pending.kind) {
+            continue;
+        }
+        let covering_key = prep.key.clone();
+        let covering_id = elicitation.clone();
+        if let Some((key, grant)) =
+            reconcile_scope_answer(&ctx, &call.identity, prep, elicitation, false).await
+        {
+            if let Some(id) = covering_id {
+                settle_covered_asks(call, &grant, &covering_key, &id).await;
+            }
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// On the first bind of a worker scope, re-send open asks under their original
+/// call keys and poll once for approvals answered while AFT was down. Claimed
+/// approvals from an earlier process are discarded, never reused.
 pub(super) fn reattach(
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
     identity: &RouteIdentity,
     runtime: &tokio::runtime::Handle,
 ) {
@@ -3317,42 +3482,17 @@ pub(super) fn reattach(
         }
         records
     };
-    let Some(transport) = transport() else {
+    if transport().is_none() {
         return;
-    };
+    }
     for record in records {
-        let (Some(call_key), Some(request)) = (record.call_key.clone(), record.request.clone())
-        else {
+        let Some((prep, elicitation)) = open_prepared(record) else {
             continue;
         };
-        let Ok(scope) = serde_json::from_value::<ScopeSelector>(record.selector.clone()) else {
-            continue;
-        };
-        let call = ConsentCall {
-            scope,
-            project_root: identity.project_root.clone(),
-            session: identity.session.clone(),
-            method: "consent.request",
-            params: request,
-            timeout: UNARY_TIMEOUT,
-        };
-        let transport = Arc::clone(&transport);
-        let db = Arc::clone(&db);
+        let ctx = Arc::clone(ctx);
+        let identity = identity.clone();
         runtime.spawn(async move {
-            match transport.call(call).await {
-                Ok(reply) => {
-                    if let Ok(id) = decode_elicitation_id(&reply) {
-                        let key = record.key.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(conn) = db.lock() {
-                                let _ = asks::set_elicitation(&conn, &key, &call_key, &id);
-                            }
-                        })
-                        .await;
-                    }
-                }
-                Err(error) => log::warn!("consent reattach failed: {error:?}"),
-            }
+            reconcile_scope_answer(&ctx, &identity, prep, elicitation, true).await;
         });
     }
 }

@@ -224,6 +224,12 @@ pub(crate) enum Script {
     NetworkLost,
     NetworkUnsupported,
     Started,
+    /// Keep the original run alive; restored callers may be refused before
+    /// an attach finally returns output and a terminal (or an unknown outcome).
+    RestartRunning {
+        auth_refusals: u32,
+        lost: bool,
+    },
     Windows {
         code: Option<u32>,
         acknowledge: bool,
@@ -331,6 +337,7 @@ pub(crate) async fn daemon_with_capabilities(
     let claims: Vec<String> = claims.iter().map(|claim| (*claim).to_string()).collect();
     let server = tokio::spawn(async move {
         let mut runs = 0;
+        let mut attaches = 0;
         let mut submission: Option<Value> = None;
         for _ in 0..clients {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -457,6 +464,19 @@ pub(crate) async fn daemon_with_capabilities(
                                 }));
                             }
                         }
+                        "exec.attach" if matches!(script, Script::RestartRunning { .. }) => {
+                            let Script::RestartRunning { auth_refusals, lost } = script else { unreachable!() };
+                            attaches += 1;
+                            if attaches <= auth_refusals {
+                                replies.push(reply(FrameType::Error, json!({"code":"auth", "message":"host refused caller attach"})));
+                            } else {
+                                if !lost {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(1, OutputStream::Stdout, BytePayload(b"remote-restart-proof\n".to_vec())))).unwrap()));
+                                }
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), if lost { Outcome::OutcomeUnknown } else { Outcome::Exit { code: 0 } }, 1, 0, 0))).unwrap()));
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            }
+                        }
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
@@ -549,7 +569,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 if matches!(script, Script::Windows { .. }) {
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Started(Started::new(0, 123, 1).with_path_mapping(PathMapping::new("/", r"C:\m")))).unwrap()));
                                 }
-                                if matches!(script, Script::Started) {
+                                if matches!(script, Script::Started | Script::RestartRunning { .. }) {
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Started(Started::new(0, 123, 1))).unwrap()));
                                 }
                             }
@@ -571,7 +591,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::CancelTerminal { .. } | Script::CancelRefused | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::RestartRunning { .. } | Script::GatedAcceptance | Script::GatedAcceptanceThenExit | Script::GatedAcceptanceThenRefused | Script::GatedPreStartRefusal { .. } | Script::GatedAdmission { .. } | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {

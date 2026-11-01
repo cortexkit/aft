@@ -1436,10 +1436,7 @@ pub(crate) fn recovered_bash_frame(
         1,
         control_flags(),
         &result,
-        wire::ToolResponsePolicy {
-            trust: BindTrust::FirstParty,
-            tool_result_body: true,
-        },
+        wire::ToolResponsePolicy::for_retention(),
     )
     .ok()?;
     projected.frame = Frame::build_with_version(
@@ -1480,6 +1477,9 @@ pub(crate) fn project_held_ledger_result(
                 BindTrust::Untrusted
             },
             tool_result_body: true,
+            // This is a stored terminal body, not delivery to a route. Late
+            // readers and keyed replays apply their own recipient policy.
+            model_only: false,
         },
         None,
         source.map(|source| source.to_vec()),
@@ -7861,6 +7861,7 @@ async fn handle_route_bind_completion(
         .cloned()
     {
         let runtime = tokio::runtime::Handle::current();
+        let consent_executor = Arc::clone(executor);
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -7875,7 +7876,9 @@ async fn handle_route_bind_completion(
                     Ok(()) => {
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
-                        consent::reattach(ctx, &identity, &runtime);
+                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                            consent::reattach(&ctx, &identity, &runtime);
+                        }
                         Response::success("scope-bind", json!({}))
                     }
                     Err(error) => {

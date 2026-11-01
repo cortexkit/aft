@@ -1,0 +1,1 @@
+- `.h` headers written in C++ or Objective-C now get outlines, symbols and call graphs. AFT parses a `.h` file as C first and tries C++, then Objective-C, only when C reports errors, so plain C headers are unchanged (#1199).

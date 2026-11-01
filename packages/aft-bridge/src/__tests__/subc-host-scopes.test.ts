@@ -30,6 +30,7 @@ class HostClient implements SubcClientLike {
   readonly reads: unknown[] = [];
   readonly toolBodies: unknown[] = [];
   readonly toolChannels: number[] = [];
+  readonly toolReplies = new Map<string, Record<string, unknown>>();
   readonly closedRoutes: number[] = [];
   readonly modules = new Map<number, string>();
   answer: unknown = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
@@ -40,6 +41,7 @@ class HostClient implements SubcClientLike {
   requestError: SubcError | undefined;
   scopeOpenError: SubcError | undefined;
   scopeOpenGate: Promise<void> | undefined;
+  scopeRequestGate: Promise<void> | undefined;
   scopedOpenGate: Promise<void> | undefined;
   toolOpenGate: Promise<void> | undefined;
   unscopedOpenGate: Promise<void> | undefined;
@@ -48,7 +50,7 @@ class HostClient implements SubcClientLike {
   subscriptionChannels: number[] = [];
   private readonly subscriptions = new Map<
     number,
-    { finish: () => void; fail: (error: Error) => void }
+    { finish: () => void; fail: (error: Error) => void; onEvent: (event: Uint8Array) => void }
   >();
   private readonly endedChannels = new Set<number>();
 
@@ -104,6 +106,7 @@ class HostClient implements SubcClientLike {
       if (keys.join(",") !== "harness,session") {
         throw new SubcError("session.scope_identity params: unknown field", "invalid_request");
       }
+      await this.scopeRequestGate;
       if (this.answer instanceof Error) throw this.answer;
       // Core wraps every management answer as {result: <answer>}.
       return { result: this.answer };
@@ -116,10 +119,15 @@ class HostClient implements SubcClientLike {
       this.requestError = undefined;
       throw error;
     }
-    return { structuredContent: { success: true, text: "ok" } };
+    return {
+      structuredContent: this.toolReplies.get((body as { name: string }).name) ?? {
+        success: true,
+        text: "ok",
+      },
+    };
   }
 
-  subscribe(route: RouteHandle) {
+  subscribe(route: RouteHandle, _body: unknown, onEvent: (event: Uint8Array) => void) {
     this.subscriptionChannels.push(route.channel);
     let finish!: () => void;
     let fail!: (error: Error) => void;
@@ -127,11 +135,15 @@ class HostClient implements SubcClientLike {
       finish = resolve;
       fail = reject;
     }).finally(() => this.subscriptions.delete(route.channel));
-    this.subscriptions.set(route.channel, { finish, fail });
+    this.subscriptions.set(route.channel, { finish, fail, onEvent });
     return {
       closed,
       unsubscribe: finish,
     };
+  }
+
+  emitCompletion(channel: number) {
+    this.subscriptions.get(channel)?.onEvent(new TextEncoder().encode('{"op":"bg_events"}'));
   }
 
   endRoutes(event: ControlPush) {
@@ -188,7 +200,7 @@ function retryClock() {
   const active = new Set<ReturnType<typeof setTimeout>>();
   const realSet = globalThis.setTimeout;
   const realClear = globalThis.clearTimeout;
-  const retryDelays = new Set([5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000]);
+  const retryDelays = new Set([1, 5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000]);
   const set = spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
     const delayMs = delay ?? 0;
     if (!retryDelays.has(delayMs)) {
@@ -218,10 +230,10 @@ function retryClock() {
   return {
     pending,
     active,
-    async tick(ms: number) {
+    async tick(ms: number, earlyByMs = 0) {
       clock.advance(ms);
       for (const [timer, task] of [...pending]) {
-        if (task.at > Date.now()) continue;
+        if (task.at > Date.now() + earlyByMs) continue;
         pending.delete(timer);
         active.delete(timer);
         realClear(timer);
@@ -245,7 +257,11 @@ function scopeLogs(outcomesOnly = false) {
   return lines;
 }
 
-function setup(harness = "opencode", background = false, replacement?: HostClient) {
+function setup(
+  harness = "opencode",
+  background: boolean | (() => void) = false,
+  replacement?: HostClient,
+) {
   const client = new HostClient();
   let connected = false;
   let current = client;
@@ -263,7 +279,9 @@ function setup(harness = "opencode", background = false, replacement?: HostClien
     },
     routeRetrySleep: async () => {},
     bgBackoffSleep: async () => {},
-    ...(background ? { onBgEventsNudge: () => {} } : {}),
+    ...(background
+      ? { onBgEventsNudge: typeof background === "function" ? background : () => {} }
+      : {}),
   });
   pools.push(pool);
   return {
@@ -670,6 +688,137 @@ test("head scope background retry upgrades a timed out bind without another bind
   await bridge.toolCall("head", "read", {});
   expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
   expect(client.toolChannels).toEqual([oldChannel, client.opens.length]);
+});
+
+for (const harness of ["opencode", "pi"]) {
+  test(`head scope early retry wakeup recovers ${harness} launches, held calls and completion notices`, async () => {
+    const clock = retryClock();
+    const lines = scopeLogs();
+    const notices: unknown[] = [];
+    const drains: Promise<void>[] = [];
+    const { client, pool } = setup(harness, () => {
+      drains.push(
+        pool
+          .getBridge(TEST_PROJECT_ROOT)
+          .toolCall("head", "bash_drain_completions", {})
+          .then((reply) => {
+            notices.push(...((reply.bg_completions as unknown[]) ?? []));
+          }),
+      );
+    });
+    let releaseLookup!: () => void;
+    client.scopeRequestGate = new Promise<void>((resolve) => {
+      releaseLookup = resolve;
+    });
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await bridge.toolCall("head", "read", {});
+    await settle();
+    const fallback = client.toolChannels[0];
+    const oldSubscription = client.subscriptionChannels[0];
+    expect(client.opens[fallback - 1].opts?.scope).toBeUndefined();
+    expect(client.opens[oldSubscription - 1].opts?.scope).toBeUndefined();
+    expect(lines.some((line) => line.includes("result=timeout"))).toBe(true);
+    client.scopeRequestGate = undefined;
+    releaseLookup();
+    await settle();
+
+    let releaseHeld!: () => void;
+    client.toolGate = new Promise<void>((resolve) => {
+      releaseHeld = resolve;
+    });
+    let heldFinished = false;
+    const held = bridge
+      .toolCall("head", "bash_watch", { task_id: "bg-before-upgrade" })
+      .then((reply) => {
+        heldFinished = true;
+        return reply;
+      });
+    await settle();
+    client.toolGate = undefined;
+    let releaseScoped = () => {};
+    try {
+      expect(client.toolChannels.at(-1)).toBe(fallback);
+      // Timers can wake just before the wall-clock deadline, leaving one millisecond of backoff.
+      await clock.tick(4_999, 1);
+      expect(client.reads).toHaveLength(1);
+      expect(lines.some((line) => line.includes("reason=backoff retry_in=1ms"))).toBe(true);
+      expect(clock.pending.size).toBe(1);
+      client.scopedOpenGate = new Promise<void>((resolve) => {
+        releaseScoped = resolve;
+      });
+      await clock.tick(1);
+      expect(client.activeSubscriptionChannels).toEqual([]);
+      expect(lines.filter((line) => line.includes("route=upgraded"))).toHaveLength(0);
+      // A completion queued while the old stream is closed must replay on the scoped stream.
+      const completion = { task_id: "bg-before-upgrade", status: "completed" };
+      client.toolReplies.set("bash_drain_completions", {
+        success: true,
+        text: "",
+        bg_completions: [completion],
+        pending_matches: [],
+      });
+      client.scopedOpenGate = undefined;
+      releaseScoped();
+      await settle();
+      await Promise.all(drains);
+      expect(client.reads).toHaveLength(2);
+      expect(clock.pending.size).toBe(0);
+      expect(client.subscriptionChannels).toHaveLength(2);
+      const subscription = client.subscriptionChannels[1];
+      expect(client.activeSubscriptionChannels).toEqual([subscription]);
+      expect(client.opens[subscription - 1].opts?.scope).toEqual(scope);
+      expect(client.closedRoutes).toContain(oldSubscription);
+      expect(notices).toEqual([completion]);
+      expect(heldFinished).toBe(false);
+      expect(client.closedRoutes).not.toContain(fallback);
+
+      const command = "gh pr create --draft --title recovered --body recovered";
+      await bridge.toolCall("head", "bash", { command });
+      expect(client.toolBodies.at(-1)).toMatchObject({ name: "bash", arguments: { command } });
+      expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toEqual(scope);
+      expect(client.closedRoutes).not.toContain(fallback);
+
+      const laterCompletion = { task_id: "bg-after-upgrade", status: "completed" };
+      client.toolReplies.set("bash_drain_completions", {
+        success: true,
+        text: "",
+        bg_completions: [laterCompletion],
+        pending_matches: [],
+      });
+      client.emitCompletion(subscription);
+      await settle();
+      await Promise.all(drains);
+      expect(notices).toEqual([completion, laterCompletion]);
+      expect(lines.filter((line) => line.includes("route=upgraded"))).toHaveLength(1);
+    } finally {
+      releaseScoped();
+      releaseHeld();
+      expect((await held).text).toBe("ok");
+    }
+    expect(client.closedRoutes.filter((channel) => channel === fallback)).toHaveLength(1);
+  });
+}
+
+test("head scope explicit no_scope never starts a background retry loop", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup("pi", true);
+  client.answer = { answer: "no_scope" };
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await clock.tick(300_000);
+    await bridge.toolCall("head", "read", {});
+    await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+    expect(client.reads).toHaveLength(1);
+    expect(clock.pending.size).toBe(0);
+  }
+  expect(
+    client.opens
+      .filter((open) => open.target.module_id === "aft")
+      .every((open) => !open.opts?.scope),
+  ).toBe(true);
 });
 
 for (const code of ["scope_not_live", "scope_not_synced", "scope_changed"]) {

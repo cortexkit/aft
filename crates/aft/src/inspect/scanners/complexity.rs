@@ -12,7 +12,9 @@ use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
-use crate::parser::{detect_language, parse_source_with_cached_parser, LangId};
+use crate::parser::{
+    detect_language, detect_language_from_source, parse_source_with_cached_parser, LangId,
+};
 
 pub(crate) const COMPLEXITY_THRESHOLD: u32 = 10;
 const DRILL_DOWN_LIMIT: usize = 100;
@@ -420,7 +422,7 @@ fn unreadable_contribution(
 
 fn scan_source(project_root: &Path, path: &Path, source: &str) -> ComplexityContribution {
     let file = display_path(project_root, path);
-    let Some(language) = detect_language(path) else {
+    let Some(language) = detect_language_from_source(path, source) else {
         return skipped_contribution(file, "unknown");
     };
     let Some(spec) = language_spec(language) else {
@@ -735,6 +737,20 @@ fn push_children_with_state<'tree, T: Copy>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_complexity_uses_cpp_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("widget.h");
+        let result = scan_source(
+            root.path(),
+            &path,
+            "class Widget { public: int value(int x) { if (x) return 1; return 0; } };\n",
+        );
+        assert_eq!(result.language.as_deref(), Some("cpp"));
+        assert!(result.parse_error.is_none());
+        assert!(!result.functions.is_empty());
+    }
+
     use super::*;
     use std::fs;
 
