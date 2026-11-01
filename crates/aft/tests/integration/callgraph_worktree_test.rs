@@ -203,7 +203,10 @@ fn views_worktree_family_writes_publish_without_legacy_denial() {
     assert_eq!(response.data["total_callers"], 1);
     assert!(response.data.to_string().contains("workerCaller"));
     assert!(!response.data.to_string().contains("ownerCaller"));
-    let scope = aft::path_identity::project_scope_key(&checkout);
+    let scope = format!(
+        "{}.callgraph",
+        aft::path_identity::project_scope_key(&checkout)
+    );
     let family = ctx.memoized_artifact_cache_key(&checkout);
     let view_dir = aft::blob_store::v3::view_dir(&storage, &family, &scope).unwrap();
     let pointer = rusqlite::Connection::open_with_flags(
