@@ -1,0 +1,1 @@
+- When a GitHub bot write can't be verified because the session's head scope hasn't arrived yet, the refusal now says to retry in a minute instead of telling the agent to restart from a live session.
