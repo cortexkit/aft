@@ -9080,7 +9080,7 @@ impl AppContext {
         *self.last_request_at.lock() = Instant::now();
         let config = self.config();
         if config.views.enabled && config.project_root.is_some() {
-            let root = self.canonical_cache_root();
+            let root = crate::root_cache::canonical_root(config.project_root.as_deref().unwrap());
             let family = self.memoized_artifact_cache_key(&root);
             if let Err(error) = crate::storage_retention::touch_view_checkout(
                 &self.storage_paths(),
@@ -15355,7 +15355,6 @@ impl AppContext {
         search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
-        callgraph_borrow.take();
         backup.release_memory();
         *lexical_retry = Default::default();
         *callgraph_retry = Default::default();
@@ -15368,6 +15367,7 @@ impl AppContext {
             // so the views drop on the release thread too.
             lexical_view.take(),
             callgraph_view.take(),
+            callgraph_borrow.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -15380,6 +15380,7 @@ impl AppContext {
             refresh_worker,
             lexical_view,
             callgraph_view,
+            callgraph_borrow,
             lexical_retry,
             callgraph_retry,
         ));

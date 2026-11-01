@@ -45,6 +45,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
         config,
     ));
     ctx.set_harness(crate::harness::Harness::Opencode);
+    ctx.set_canonical_cache_root(root.as_path().to_path_buf());
     ctx.set_standing_artifact_exempt(true);
     ctx.note_request();
     let request: crate::protocol::RawRequest = serde_json::from_value(json!({
@@ -64,7 +65,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
         }]),
     )]);
     let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
-    let metrics = DispatchPathMetrics::default();
+    let metrics = DispatchPathMetrics::new();
     let sweep = |roots: &mut HashMap<ProjectRootId, RootMeta>, now| {
         reap_idle_roots_with_presence(
             now,
@@ -92,7 +93,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
         Box::new(move |_| {
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
-            crate::protocol::Response::ok("held-call", json!({}))
+            crate::protocol::Response::success("held-call", json!({}))
         }),
     );
     started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
