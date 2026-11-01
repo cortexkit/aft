@@ -65,6 +65,10 @@ impl Fixture {
         let response = crate::commands::configure::handle_configure(&req, &self.ctx);
         assert!(response.success, "configure failed: {:?}", response.data);
         crate::test_admission::settle(&self.ctx);
+        drop(_watcher);
+        // Config-file watches share the test switch, but no project watcher is started here.
+        let _config_watches = crate::test_env::with_project_watcher();
+        sync_config_watches(&self.ctx);
     }
 
     /// Run the reload the file watcher would have asked for.

@@ -18436,6 +18436,7 @@ mod tests {
     #[test]
     fn parent_folder_last_route_close_stops_watcher_and_exclusion_retries() {
         let _env = crate::test_env::hermetic_git_env_guard();
+        let _watcher = crate::test_env::with_project_watcher();
         let (dir, root) = test_root("parent-last-route");
         let storage = tempfile::tempdir().unwrap();
         for name in ["child", "sibling"] {
