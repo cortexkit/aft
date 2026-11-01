@@ -1130,6 +1130,65 @@ mod tests {
         assert!(matches!(result, IndexRead::Snapshot(_)));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn released_delete_pending_index_lock_allows_snapshot() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+            FILE_READ_ATTRIBUTES,
+        };
+
+        let dir = fixture(ObjectFormat::Sha1);
+        let lock = dir.path().join(".git/index.lock");
+        fs::write(&lock, b"writer").unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .open(&lock)
+            .unwrap();
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // Legacy disposition keeps the name delete-pending until the handle closes.
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    handle.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of_val(&disposition) as u32,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        // Prevent std's directory-listing fallback from hiding the delete-pending error.
+        let (_denied, enforced) = crate::blob_store::v3::deny_read_for_test(
+            lock.parent().unwrap(),
+            "delete-pending index.lock metadata",
+            || fs::symlink_metadata(&lock),
+        );
+        assert!(enforced, "the fixture must expose the delete-pending error");
+        let error = fs::symlink_metadata(&lock).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.raw_os_error(), Some(5));
+        eprintln!("delete-pending index.lock metadata: {error:?}");
+
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(handle);
+        });
+        let result = read_index(
+            &index(dir.path()),
+            ObjectFormat::Sha1,
+            ReadOptions {
+                lock_wait: Duration::from_secs(5),
+                ..ReadOptions::default()
+            },
+        );
+        writer.join().unwrap();
+        assert!(matches!(result, IndexRead::Snapshot(_)), "{result:?}");
+    }
+
     #[test]
     fn real_index_torn_read_retries_then_recovers() {
         let dir = fixture(ObjectFormat::Sha1);
