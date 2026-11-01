@@ -1309,7 +1309,7 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
                     &mut stream,
                     &key,
                     &daemon_id,
-                    "subc-test",
+                    "0.39.0",
                     std::time::Duration::from_secs(5),
                 )
                 .await
@@ -1534,7 +1534,8 @@ async fn fake_daemon(script: DaemonScript) -> FakeDaemon {
             key,
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "gh-shim-relay-scope-test".to_string(),
+            // Scope tests must reach route.open, which requires daemon 0.39+.
+            daemon_ver: "0.39.0".to_string(),
         },
     )
     .unwrap();

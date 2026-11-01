@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/rerank/synapse.rs"
+  ],
+  "note": "The semantic_search/rerank fence is touched only in the fake daemon's test-only version metadata: the 0.34 client requires daemon 0.39+ for project-free management opens. No search routing, scoring, ranking, model selection or results change. The other changes align management-client fixtures and exact wire-version provenance assertions with the published protocol."
+}

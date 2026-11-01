@@ -1533,7 +1533,7 @@ mod tests {
                         &mut stream,
                         &key,
                         &daemon_id,
-                        "subc-test",
+                        "0.39.0",
                         Duration::from_secs(5),
                     )
                     .await
@@ -1608,7 +1608,8 @@ mod tests {
                 key,
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "fleet-status-refusal-test".to_string(),
+                // Reach the scripted refusal instead of the SDK's old-daemon guard.
+                daemon_ver: "0.39.0".to_string(),
             },
         )
         .unwrap();

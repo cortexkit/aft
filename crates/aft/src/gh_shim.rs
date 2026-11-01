@@ -15589,7 +15589,7 @@ INHERITED FLAGS
                                         &mut stream,
                                         &k,
                                         &d,
-                                        "subc-test",
+                                        "0.39.0",
                                         Duration::from_secs(5),
                                     )
                                     .await
@@ -15757,7 +15757,8 @@ INHERITED FLAGS
                 key: self.key.clone(),
                 daemon_id: self.daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "gh-shim-test-daemon".to_string(),
+                // The SDK requires daemon 0.39+ before opening a project-free route.
+                daemon_ver: "0.39.0".to_string(),
             };
             connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
         }
