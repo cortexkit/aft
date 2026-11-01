@@ -93,6 +93,9 @@ pub(crate) fn admit(
         return Ok(Admission::Own);
     };
     let target_root = target.root.clone().unwrap_or_else(|| main.clone());
+    if needs_producer_rebuild(storage, family, policy, &target.scope) {
+        return Ok(Admission::Own);
+    }
     let borrow = Admission::Borrow {
         root: target_root.clone(),
         scope: target.scope.clone(),
@@ -203,6 +206,37 @@ fn matches_target(
     differing.complete && differing.files.is_empty()
 }
 
+/// An older extractor's publication cannot serve as a borrowed copy. The
+/// checkout builds its own current graph instead; other load errors still go
+/// through the strict reader, which retains their diagnostics.
+pub(crate) fn needs_producer_rebuild(
+    storage: &Path,
+    family: &str,
+    policy: crate::blob_store::v2::TrigramPolicy,
+    scope: &str,
+) -> bool {
+    let Some(generation) = published_generation(storage, family, scope) else {
+        return false;
+    };
+    let Ok(dir) = crate::blob_store::v3::view_dir(storage, family, scope) else {
+        return false;
+    };
+    let Some(store) = super::ViewStore::existing_dir(dir) else {
+        return false;
+    };
+    let Ok(manifest) = store.load_manifest_v2(&generation) else {
+        return false;
+    };
+    manifest
+        .header()
+        .producers
+        .has_older_callgraph_than(&super::manifest_v2::Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: None,
+            callgraph: super::callgraph::PRODUCER.into(),
+        })
+}
+
 /// Opens the published call graph of the member `scope`, bound to `root` so
 /// answers name `root`'s files. `Err((reason, busy))`; `busy` means the graph
 /// is not published yet or is being replaced, and a later call can succeed.
@@ -220,17 +254,18 @@ pub(crate) fn open_published(
         semantic: None,
         callgraph: super::callgraph::PRODUCER.into(),
     };
-    let generation = match super::base_refs::open_foreign_v3(storage, family, scope, &producers) {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            return Err((
-                "the main checkout's call graph is not published yet".into(),
-                true,
-            ))
-        }
-        Err(super::base_refs::BaseRefError::Unavailable(reason)) => return Err((reason, true)),
-        Err(error) => return Err((error.to_string(), false)),
-    };
+    let generation =
+        match super::base_refs::open_callgraph_seed_v3(storage, family, scope, &producers) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => {
+                return Err((
+                    "the main checkout's call graph is not published yet".into(),
+                    true,
+                ))
+            }
+            Err(super::base_refs::BaseRefError::Unavailable(reason)) => return Err((reason, true)),
+            Err(error) => return Err((error.to_string(), false)),
+        };
     let Some(route) = generation.v3_route().cloned() else {
         return Err(("call graph view has no v3 route".into(), false));
     };

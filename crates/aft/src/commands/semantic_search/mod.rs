@@ -2152,6 +2152,11 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
+        if let Ok(index) = ctx.semantic_index().try_read() {
+            if let Some(index) = index.as_ref() {
+                disclose_skipped_semantic_rows(data, index);
+            }
+        }
         // The lanes are observed after the answer was built, so on their own
         // they say whether an index is usable now, not what served this
         // answer. The answer records that itself: results read from files
@@ -2227,6 +2232,33 @@ impl SearchLaneStatus {
             serde_json::json!(lanes.omitted_lanes()),
         );
         data.insert("enrichment".to_string(), callgraph_enrichment_json(ctx));
+    }
+}
+
+fn disclose_skipped_semantic_rows(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    index: &SemanticIndex,
+) {
+    let Some(summary) = index.skipped_chunks_summary() else {
+        return;
+    };
+    append_reply_paragraph(data, &summary);
+    data.insert("complete".to_string(), serde_json::json!(false));
+    data.insert("status".to_string(), serde_json::json!("partial"));
+    data.insert("semantic_status".to_string(), serde_json::json!("partial"));
+    let gap = data
+        .entry("semantic_gap")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(gap) = gap.as_object_mut() {
+        gap.insert(
+            "skipped_chunks".to_string(),
+            serde_json::json!(index.skipped_rows()),
+        );
+        gap.insert(
+            "reason".to_string(),
+            serde_json::json!(index.skipped_chunk_reason()),
+        );
+        gap.insert("summary".to_string(), serde_json::json!(summary));
     }
 }
 
@@ -3589,7 +3621,7 @@ fn handle_external_semantic_or_hybrid_search(
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
 
-    search_response(
+    let mut response = search_response(
         req,
         SearchResponseParts {
             query: &params.query,
@@ -3614,7 +3646,11 @@ fn handle_external_semantic_or_hybrid_search(
             warnings,
             extras,
         },
-    )
+    );
+    if let (Some(data), Some(index)) = (response.data.as_object_mut(), semantic_index) {
+        disclose_skipped_semantic_rows(data, index);
+    }
+    response
 }
 
 fn semantic_fingerprint_matches_session(ctx: &AppContext, index: &SemanticIndex) -> bool {
@@ -10598,6 +10634,44 @@ mod tests {
         };
     }
 
+    #[test]
+    fn skipped_semantic_rows_disclose_partial_coverage_without_ready_footer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("healthy.rs"),
+            "pub fn healthy_value() {}\n",
+        )
+        .unwrap();
+        let ctx = test_context(root.path());
+        install_ready_semantic_lane(&ctx, root.path());
+        install_ready_search_index(&ctx, root.path());
+        ctx.semantic_index()
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .apply_refused_rows_update(std::collections::BTreeMap::from([(
+                root.path().join("poison.rs"),
+                1,
+            )]));
+        let response = response_value(handle_semantic_search(
+            &semantic_request("healthy_.*", 10),
+            &ctx,
+        ));
+        assert_eq!(response["complete"], false, "{response}");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["semantic_gap"]["skipped_chunks"], 1);
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "semantic search is incomplete: 1 chunks skipped because the embedding provider refused them: poison.rs"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("poison.rs"), "{text}");
+        assert!(!text.contains("semantic: ready"), "{text}");
+    }
+
     fn install_ready_search_index(ctx: &AppContext, project_root: &Path) {
         let index = SearchIndex::build(project_root);
         *ctx.search_index()
@@ -11693,7 +11767,10 @@ mod tests {
         let request: RawRequest =
             serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
                 .expect("status request");
-        let bound = Duration::from_millis(1_000);
+        // The probe stays blocked until released below, so a status or search
+        // that waited on it would never return. The bound only has to be far
+        // below that; 5 s leaves room for a loaded Windows runner (1.4 s seen).
+        let bound = Duration::from_secs(5);
 
         let started = std::time::Instant::now();
         let status = response_value(crate::commands::status::handle_status(&request, &ctx));

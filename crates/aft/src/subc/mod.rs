@@ -234,6 +234,8 @@ mod idle_root_retention_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
+#[cfg(test)]
+mod views_idle_checkout_tests;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
@@ -1506,7 +1508,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
-    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    /// The request stamp whose idle views have already been released.
+    views_released_for_request_at: Option<Instant>,
+    /// Tool demand clocks; unlike last_touched, polling and teardown do not reset them.
     last_tool_call: Option<Instant>,
     route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
@@ -1846,6 +1850,7 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            views_released_for_request_at: None,
             last_tool_call: None,
             route_activity: HashMap::new(),
             diagnostics_on_edit: false,
@@ -2576,6 +2581,32 @@ fn reap_idle_roots_with_presence(
             .get(root_id)
             .is_some_and(|channels| !channels.is_empty());
         let has_pending_bind = pending_bind_roots.contains(root_id);
+
+        // A connected route is not activity. Release only resident handles;
+        // keep the actor and watcher so its next call takes the normal reload
+        // path. Durable member deletion still rechecks every hold in retention.
+        if !deleted
+            && !has_pending_bind
+            && meta.active_bash_waits == 0
+            && !meta.maintenance_pending
+            && meta.maintenance_queued_kinds.is_empty()
+            && executor.try_actor_is_idle(root_id) == Some(true)
+        {
+            if let Some(Some(ctx)) = executor.try_actor_context(root_id) {
+                if let Some((requested, hours)) = ctx.try_views_idle_request() {
+                    let last_use = meta
+                        .last_tool_call
+                        .map_or(requested, |tool| tool.max(requested));
+                    if meta.views_released_for_request_at != Some(last_use)
+                        && now.saturating_duration_since(last_use)
+                            >= Duration::from_secs(u64::from(hours) * 60 * 60)
+                        && ctx.try_release_idle_checkout_views()
+                    {
+                        meta.views_released_for_request_at = Some(last_use);
+                    }
+                }
+            }
+        }
 
         if deleted {
             let mut retained = false;
@@ -13391,6 +13422,70 @@ pub(crate) mod test_support {
             "inspect must still produce its terminal: {:?}",
             terminal.data
         );
+    }
+
+    #[test]
+    fn bounded_scoped_inspect_abandoned_discovery_releases_reader_for_rebind() {
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("inspect-abandoned-discovery");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        executor.register_actor(root.clone(), ctx.clone());
+        let held_manager = ctx.lsp();
+        let inspect_ctx = ctx.clone();
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            "inspect-abandoned-discovery".into(),
+            "inspect",
+            Box::new(move |_| {
+                let request = serde_json::from_value(json!({
+                    "id": "inspect-abandoned-discovery", "command": "inspect",
+                    "scope": "README.md", "sections": "diagnostics"
+                }))
+                .unwrap();
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::inspect::handle_inspect_deferred(&request, inspect_ctx)
+                else {
+                    panic!("inspect must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("inspect-abandoned-discovery", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(1));
+        if pending.is_err() {
+            drop(held_manager);
+            panic!("inspect discovery kept the executor reader while waiting for the LSP manager");
+        }
+        let mut pending = pending.unwrap();
+        // Both route abandonment and CANCEL reach this same cancellation token.
+        executor.cancel_job(&root, &cancellation);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let terminal = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled discovery did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(terminal.data["inspect_terminal"], "interrupted");
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-after-abandoned-discovery".into(),
+            Box::new(|_| Response::success("subc-bind-after-abandoned-discovery", json!({}))),
+        );
+        assert!(
+            bind.recv_timeout(Duration::from_secs(1))
+                .expect("the released request no longer holds an executor reader")
+                .success
+        );
+        drop(held_manager);
     }
 
     #[test]

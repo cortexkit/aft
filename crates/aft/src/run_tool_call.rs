@@ -449,6 +449,7 @@ pub(crate) fn prepare_tool_call(
     app_ctx: &AppContext,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> Result<PreparedToolCall, ToolCallResult> {
+    app_ctx.note_request();
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_setup_done();
     }
