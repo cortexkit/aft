@@ -462,8 +462,8 @@ impl PlaneAdapter for CallgraphPlane {
     }
 }
 /// Why a checkout view could not supply a reader. `busy` marks transient
-/// contention on a view database or its family ledger, so callers can retry
-/// rather than reporting a permanently unavailable graph.
+/// states such as pending write verification, a changed checkout, or database
+/// contention, so callers retry rather than report a failed graph load.
 #[derive(Clone, Debug)]
 pub(crate) struct CallgraphViewError {
     pub reason: String,
@@ -598,6 +598,13 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
             ) {
                 Ok(Some(generation)) => generation,
                 Ok(None) => installed.generation().clone(),
+                Err(error @ super::base_refs::BaseRefError::Unavailable(_)) => {
+                    return Err(CallgraphViewError {
+                        reason: error.to_string(),
+                        busy: true,
+                        completion_busy: false,
+                    });
+                }
                 Err(error) => return Err(error.to_string().into()),
             }
         } else {
@@ -1038,6 +1045,37 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn planned_callgraph_load_states_use_bounded_backoff_then_reset() {
+        for reason in [
+            "callgraph view has unverified writes (pending=[RelPath([97, 46, 116, 115])], watcher=Healthy, unpublished=[])",
+            "view loader [driver]: checkout changed before snapshot installation: v3 worker publication failed or may have landed; revalidate: base unavailable",
+        ] {
+            let error = CallgraphViewError::from(reason);
+            assert!(error.busy, "{error}");
+            let mut retry = super::super::contracts::LoadRetry::default();
+            let mut now = std::time::Instant::now();
+            for seconds in [1, 2, 4, 8, 16, 30, 30] {
+                let result: Result<(), CallgraphViewError> = retry.run(
+                    || now, |error: &CallgraphViewError| error.busy, || Err(error.clone()),
+                );
+                assert!(result.is_err());
+                let deadline = now + std::time::Duration::from_secs(seconds);
+                assert_eq!(retry.pending.as_ref().unwrap().0, deadline);
+                let result: Result<(), CallgraphViewError> = retry.run(
+                    || deadline - std::time::Duration::from_nanos(1),
+                    |error| error.busy,
+                    || panic!("a pending graph load must wait until its retry deadline"),
+                );
+                assert!(result.is_err());
+                now = deadline;
+            }
+            assert!(retry.run(|| now, |error| error.busy, || Ok(())).is_ok());
+            assert!(retry.pending.is_none());
+            assert!(retry.delay.is_zero());
+        }
     }
 
     #[test]

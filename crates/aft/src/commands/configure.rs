@@ -15233,6 +15233,7 @@ mod tests {
             reason: String,
             ready: Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
             attempts: std::sync::atomic::AtomicUsize,
+            verified: std::sync::atomic::AtomicBool,
         }
         impl crate::views::callgraph::CallgraphReaderSource for Pending {
             fn acquire(
@@ -15241,7 +15242,8 @@ mod tests {
                 Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
                 crate::views::callgraph::CallgraphViewError,
             > {
-                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if !self.verified.load(Ordering::SeqCst) {
                     Err(self.reason.clone().into())
                 } else {
                     Ok(self.ready.clone())
@@ -15288,27 +15290,38 @@ mod tests {
                 reason: reason.into(),
                 ready: ready.clone(),
                 attempts: Default::default(),
+                verified: Default::default(),
             });
             ctx.install_callgraph_source_for_test(source.clone());
             for _ in 0..2 {
                 let answer = callers();
                 let text = answer.data.to_string();
                 assert!(!text.contains("This is an AFT bug"), "{text}");
+                assert_eq!(answer.data["code"], "callgraph_building", "{text}");
+                let search = crate::commands::semantic_search::handle_semantic_search(
+                    &semantic_search_request("target"),
+                    &ctx,
+                );
+                assert!(search.success, "{:?}", search.data);
+                assert!(!search.data.to_string().contains("This is an AFT bug"));
+                assert_eq!(search.data["enrichment"]["code"], "callgraph_building");
                 assert!(matches!(
                     ctx.callgraph_store_for_ops(),
                     CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention()
                 ));
             }
-            assert_eq!(source.attempts.load(Ordering::SeqCst), 1);
+            let attempts = source.attempts.load(Ordering::SeqCst);
+            assert!(attempts > 0);
             assert!(!ctx.callgraph_view_is_ready());
             let health = ctx.try_health_snapshot(&root);
             assert!(health.view_load_failures.is_empty());
             assert!(health.view_load_failure_last.is_none());
+            source.verified.store(true, Ordering::SeqCst);
             ctx.view_load_retry_due_for_test();
             let answer = callers();
             assert!(answer.success, "{:?}", answer.data);
             assert!(answer.data.to_string().contains("caller"), "{:?}", answer.data);
-            assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+            assert_eq!(source.attempts.load(Ordering::SeqCst), attempts + 1);
             assert!(ctx.callgraph_view_is_ready());
             assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
         }

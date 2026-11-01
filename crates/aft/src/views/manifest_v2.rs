@@ -55,7 +55,10 @@ impl Producers {
     pub(crate) fn has_older_callgraph_than(&self, expected: &Self) -> bool {
         fn version(producer: &str) -> Option<u64> {
             let rest = producer.strip_prefix("ruled-callgraph-v")?;
-            let (number, _) = rest.split_once('-')?;
+            let number = rest.split('-').next()?;
+            if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
             number.parse().ok()
         }
         self.trigram == expected.trigram
@@ -1286,6 +1289,7 @@ mod tests {
         let mut expected = producers();
         expected.callgraph = "ruled-callgraph-v13-python-import-bindings".into();
         for (producer, stale) in [
+            ("ruled-callgraph-v1", true),
             (
                 "ruled-callgraph-v11-callback-constructor-inline-test-items",
                 true,
