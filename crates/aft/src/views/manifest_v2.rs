@@ -50,6 +50,22 @@ pub struct Producers {
 }
 
 impl Producers {
+    /// Only a recognized older call-graph extractor can be rebuilt as an
+    /// upgrade. Unknown identities and newer extractors remain incompatible.
+    pub(crate) fn has_older_callgraph_than(&self, expected: &Self) -> bool {
+        fn version(producer: &str) -> Option<u64> {
+            let rest = producer.strip_prefix("ruled-callgraph-v")?;
+            let (number, _) = rest.split_once('-')?;
+            number.parse().ok()
+        }
+        self.trigram == expected.trigram
+            && self.semantic == expected.semantic
+            && matches!(
+                (version(&self.callgraph), version(&expected.callgraph)),
+                (Some(stored), Some(reader)) if stored < reader
+            )
+    }
+
     pub fn for_plane(&self, plane: FamilyPlane) -> Option<&str> {
         match plane {
             FamilyPlane::Trigram => Some(&self.trigram),
@@ -1263,6 +1279,32 @@ mod tests {
             .manifest_path(&replacement.to_string())
             .unwrap()
             .is_file());
+    }
+
+    #[test]
+    fn only_recognized_older_callgraph_producers_are_rebuildable() {
+        let mut expected = producers();
+        expected.callgraph = "ruled-callgraph-v13-python-import-bindings".into();
+        for (producer, stale) in [
+            (
+                "ruled-callgraph-v11-callback-constructor-inline-test-items",
+                true,
+            ),
+            ("ruled-callgraph-v13-python-import-bindings", false),
+            ("ruled-callgraph-v13-other-policy", false),
+            ("ruled-callgraph-v14-future", false),
+            ("unknown-extractor", false),
+        ] {
+            let mut stored = expected.clone();
+            stored.callgraph = producer.into();
+            assert_eq!(
+                stored.has_older_callgraph_than(&expected),
+                stale,
+                "{producer}"
+            );
+            stored.trigram = "other-policy".into();
+            assert!(!stored.has_older_callgraph_than(&expected));
+        }
     }
 
     #[test]

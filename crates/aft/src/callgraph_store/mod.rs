@@ -10138,6 +10138,7 @@ impl ReadonlyCallGraphStore {
         view_dir: PathBuf,
         generation: &str,
     ) -> Result<Self> {
+        ensure_manifest_producer_ready(&view_dir, generation)?;
         let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
         // A sealed donor never changes; open it without locks or a WAL.
@@ -10176,6 +10177,7 @@ impl ReadonlyCallGraphStore {
         generation: &str,
         pin: Option<Arc<crate::pins::QueryPin>>,
     ) -> Result<Self> {
+        ensure_manifest_producer_ready(&view_dir, generation)?;
         let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
@@ -12879,6 +12881,9 @@ pub(crate) fn manifest_view_database_ready(
     generation: &str,
     deadline: Instant,
 ) -> Result<bool> {
+    if !manifest_producer_ready(view_dir, generation)? {
+        return Ok(false);
+    }
     let path = manifest_view_database_path(view_dir, generation)?;
     match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => {}
@@ -12894,6 +12899,43 @@ pub(crate) fn manifest_view_database_ready(
     #[cfg(test)]
     write_amplification_tests::before_readiness_query(&conn);
     database_ready(&conn)
+}
+
+/// V2/V3 manifests carry extractor identities as well as database output
+/// versions. Publication and readers must agree on both before reusing a graph.
+fn manifest_producer_ready(view_dir: &Path, generation: &str) -> Result<bool> {
+    if crate::views::manifest_v2::GenerationName::parse(generation).is_none() {
+        return Ok(true);
+    }
+    let manifest = crate::views::ViewStore::existing_dir(view_dir.to_path_buf())
+        .ok_or_else(|| {
+            CallGraphStoreError::Unavailable("database is missing, stale, or mid-build".into())
+        })?
+        .load_manifest_v2(generation)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    let mut expected = manifest.header().producers.clone();
+    expected.callgraph = crate::views::callgraph::PRODUCER.into();
+    if manifest
+        .header()
+        .producers
+        .has_older_callgraph_than(&expected)
+    {
+        return Ok(false);
+    }
+    manifest
+        .ensure_producers(&expected)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    Ok(true)
+}
+
+fn ensure_manifest_producer_ready(view_dir: &Path, generation: &str) -> Result<()> {
+    if manifest_producer_ready(view_dir, generation)? {
+        Ok(())
+    } else {
+        Err(CallGraphStoreError::Unavailable(
+            "database is missing, stale, or mid-build".into(),
+        ))
+    }
 }
 
 fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {

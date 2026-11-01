@@ -15227,6 +15227,94 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_views_planned_load_states_retry_without_failure_or_footer() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Pending {
+            reason: String,
+            ready: Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+            attempts: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::views::callgraph::CallgraphReaderSource for Pending {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(self.reason.clone().into())
+                } else {
+                    Ok(self.ready.clone())
+                }
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let ready = match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => store,
+            _ => panic!("fixture must have a ready checkout graph"),
+        };
+        let callers = || {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "planned-callgraph-state".into(),
+                    command: "callers".into(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({"file": root.join("a.ts"), "symbol": "target", "depth": 1}),
+                },
+                &ctx,
+            )
+        };
+        for reason in [
+            "callgraph view has unverified writes (pending=[RelPath([97, 46, 116, 115])], watcher=Healthy, unpublished=[])",
+            "view loader [driver]: checkout changed before snapshot installation: v3 worker publication failed or may have landed; revalidate: base unavailable",
+        ] {
+            let source = Arc::new(Pending {
+                reason: reason.into(),
+                ready: ready.clone(),
+                attempts: Default::default(),
+            });
+            ctx.install_callgraph_source_for_test(source.clone());
+            for _ in 0..2 {
+                let answer = callers();
+                let text = answer.data.to_string();
+                assert!(!text.contains("This is an AFT bug"), "{text}");
+                assert!(matches!(
+                    ctx.callgraph_store_for_ops(),
+                    CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention()
+                ));
+            }
+            assert_eq!(source.attempts.load(Ordering::SeqCst), 1);
+            assert!(!ctx.callgraph_view_is_ready());
+            let health = ctx.try_health_snapshot(&root);
+            assert!(health.view_load_failures.is_empty());
+            assert!(health.view_load_failure_last.is_none());
+            ctx.view_load_retry_due_for_test();
+            let answer = callers();
+            assert!(answer.success, "{:?}", answer.data);
+            assert!(answer.data.to_string().contains("caller"), "{:?}", answer.data);
+            assert_eq!(source.attempts.load(Ordering::SeqCst), 2);
+            assert!(ctx.callgraph_view_is_ready());
+            assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
+        }
+    }
+
+    #[test]
     fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
         let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
         // Holds the process environment lock for the whole test, like the

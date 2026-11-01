@@ -54,8 +54,11 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // class: the loader refused to install a snapshot the watcher had already
     // moved past (for example the burst of events right after a watcher
     // starts), and the next attempt cuts a fresh one. It is retried, not
-    // counted as a failed load or reported as an AFT bug.
+    // counted as a failed load or reported as an AFT bug. The graph also waits
+    // until AFT verifies pending writes and includes them in its installed
+    // snapshot.
     checkout_changed_during_load(reason)
+        || reason.contains("callgraph view has unverified writes (")
         || reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")
         || reason.contains("v3 base build busy; retain direct-scan coverage and retry")

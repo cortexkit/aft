@@ -590,7 +590,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         // After a restart, start from this checkout's own published worker
         // generation; verification still reconciles it against the disk.
         let seed = if installed.generation().name() == "empty" {
-            match super::base_refs::open_foreign_v3(
+            match super::base_refs::open_callgraph_seed_v3(
                 &self.storage,
                 &self.family,
                 &self.scope,
@@ -598,13 +598,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
             ) {
                 Ok(Some(generation)) => generation,
                 Ok(None) => installed.generation().clone(),
-                Err(error) => {
-                    crate::slog_debug!(
-                        "callgraph v3 seed unavailable; reconciling current tree: {}",
-                        error
-                    );
-                    installed.generation().clone()
-                }
+                Err(error) => return Err(error.to_string().into()),
             }
         } else {
             installed.generation().clone()
@@ -1044,6 +1038,137 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn older_callgraph_view_producer_rebuilds_but_newer_and_corrupt_views_fail_loudly() {
+        use super::super::manifest_v2::{GenerationName, Producers, PublishV2};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        drop(graph);
+        let dir =
+            crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&root)).unwrap();
+        let store = super::super::ViewStore::existing_dir(dir.clone()).unwrap();
+        let current = store.current_generation_read_only().unwrap().unwrap();
+        let pin = crate::pins::QueryPin::acquire(&dir, &current).unwrap();
+        super::super::wait_for_generation_maintenance_for_test(&dir);
+        let mut manifest = store.load_manifest_v2(&current).unwrap();
+        manifest.header_mut().producers.callgraph =
+            "ruled-callgraph-v11-callback-constructor-inline-test-items".into();
+        let expected = Producers {
+            callgraph: PRODUCER.into(),
+            ..manifest.header().producers.clone()
+        };
+        let mismatch = manifest
+            .ensure_producers(&expected)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.starts_with("view producer mismatch: manifest was produced by Producers"));
+        assert!(mismatch.contains("ruled-callgraph-v11-callback-constructor-inline-test-items"));
+        assert!(mismatch.contains("ruled-callgraph-v13-python-import-bindings"));
+        let stale = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = store
+            .prepare_v2(&stale, Some(&current), &manifest, None)
+            .unwrap();
+        std::fs::copy(
+            super::super::resolve_derived_path(&dir, &current).unwrap(),
+            super::super::resolve_derived_path(&dir, &stale.to_string()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published { .. }
+        ));
+        assert!(!crate::callgraph_store::manifest_view_database_ready(
+            &dir,
+            &stale.to_string(),
+            std::time::Instant::now()
+        )
+        .unwrap());
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        assert!(super::super::callgraph_copies::needs_producer_rebuild(
+            &storage,
+            "donor-reuse",
+            policy,
+            &view_scope(&root)
+        ));
+        let (reason, busy) = super::super::callgraph_copies::open_published(
+            &storage,
+            "donor-reuse",
+            policy,
+            &view_scope(&root),
+            &root,
+        )
+        .unwrap_err();
+        assert!(busy, "{reason}");
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(CallgraphViewError {
+                reason, busy, completion_busy: false,
+            }))),
+            crate::context::CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention()
+        ));
+        let graph = view(&root, &storage);
+        assert!(!graph.is_ready());
+        let ready = graph.reader().unwrap();
+        assert!(graph.is_ready());
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        let rebuilt = store.current_generation_read_only().unwrap().unwrap();
+        assert_ne!(rebuilt, stale.to_string());
+        assert_eq!(
+            store.load_manifest_v2(&rebuilt).unwrap().header().producers,
+            expected
+        );
+        assert!(crate::callgraph_store::manifest_view_database_ready(
+            &dir,
+            &rebuilt,
+            std::time::Instant::now()
+        )
+        .unwrap());
+        drop(ready);
+        drop(graph);
+        drop(pin);
+
+        let mut newer = store.load_manifest_v2(&rebuilt).unwrap();
+        newer.header_mut().producers.callgraph = "ruled-callgraph-v999-future".into();
+        let name = GenerationName::for_manifest(&newer).unwrap();
+        let prepared = store
+            .prepare_v2(&name, Some(&rebuilt), &newer, None)
+            .unwrap();
+        assert!(matches!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published { .. }
+        ));
+        let error = view(&root, &storage).reader().unwrap_err();
+        assert!(!error.busy);
+        assert!(error.reason.contains("view producer mismatch:"), "{error}");
+        assert!(crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
+        assert_eq!(
+            store.current_generation_read_only().unwrap().unwrap(),
+            name.to_string()
+        );
+
+        let path = store.manifest_path(&name.to_string()).unwrap();
+        // Valid JSON with the wrong content fingerprint is genuine corruption,
+        // not an upgrade or a checkout that is still being reconciled.
+        std::fs::write(&path, manifest.to_json_bytes().unwrap()).unwrap();
+        let error = view(&root, &storage).reader().unwrap_err();
+        assert!(!error.busy);
+        assert!(error.reason.contains("content fingerprint"), "{error}");
+        assert!(error.reason.contains(&name.to_string()), "{error}");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.note_view_load_failure("callgraph", &error.reason);
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.values().sum::<u64>(), 1);
+        assert!(crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
     }
 
     /// With a steady watcher subscription and nothing recorded since the last

@@ -12708,6 +12708,15 @@ impl AppContext {
                 return Some(Ok(store.clone()));
             }
         }
+        if callgraph_copies::needs_producer_rebuild(
+            &storage.artifacts,
+            family,
+            policy,
+            &borrow.scope,
+        ) {
+            guard.take();
+            return None;
+        }
         borrow.checked_at = now;
         Some(
             match callgraph_copies::open_published(
