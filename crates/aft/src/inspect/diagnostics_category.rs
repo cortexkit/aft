@@ -100,8 +100,8 @@ pub(crate) fn start_inspect_rust_checks(
 }
 
 /// Whole-request server budget for blocking inspect. Every phase shares one
-/// absolute deadline derived from this value; client transport adds separate
-/// headroom so the server always answers before the client gives up.
+/// absolute deadline derived from this value and capped below the interactive
+/// client deadline by the inspect command.
 pub(crate) fn inspect_request_timeout(config: &Config) -> Duration {
     Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
         MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -422,7 +422,7 @@ pub(crate) fn run_diagnostics_category(
     }
     collection.record_producer_failures(producer_failures, &snapshot.project_root);
     if scoped.is_none() && !collection.producer_failures_by_key.is_empty() {
-        collection.record_unscoped_failure_files(snapshot, scope);
+        collection.record_unscoped_failure_files(snapshot, scope, sweep_deadline);
     }
     collection.not_applicable = not_applicable
         .iter()
@@ -1103,8 +1103,14 @@ impl DiagnosticsCollection {
         }
     }
 
-    fn record_unscoped_failure_files(&mut self, snapshot: &InspectSnapshot, scope: &JobScope) {
-        let candidates = scoped_coverage_candidates(snapshot, scope, &snapshot.config, None);
+    fn record_unscoped_failure_files(
+        &mut self,
+        snapshot: &InspectSnapshot,
+        scope: &JobScope,
+        deadline: Option<Instant>,
+    ) {
+        let candidates = scoped_coverage_candidates(snapshot, scope, &snapshot.config, deadline);
+        self.scope_walk_truncated |= !candidates.walk_complete;
         for file in candidates.files {
             for key in producer_keys_for_file(&file, &snapshot.config, &snapshot.project_root) {
                 if self.producer_failures_by_key.contains_key(&key) {
@@ -2604,6 +2610,27 @@ mod ignore_rule_candidate_tests {
             }),
             "{payload:#}"
         );
+    }
+
+    #[test]
+    fn unscoped_failure_file_walk_obeys_inspect_deadline_and_keeps_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::write(root.join("main.ts"), "export const main = 1;").unwrap();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-inspect"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let mut collection = DiagnosticsCollection::default();
+        collection.record_unscoped_failure_files(
+            &snapshot,
+            &JobScope::for_project(root),
+            Some(std::time::Instant::now()),
+        );
+        assert!(collection.scope_walk_truncated);
+        assert!(collection.producer_failure_files.is_empty());
     }
 
     #[test]

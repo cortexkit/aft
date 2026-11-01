@@ -38,13 +38,11 @@ const MAX_INSPECT_HEADER_PARTS: usize = 3;
 // producer leaves room for other categories and final freshness verification.
 // The cap avoids turning large configured budgets into equally long waits.
 const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
-// Scoped diagnostics are an interactive observation, not a workspace build.
-// Leave transport headroom even when the configured full-project budget is long.
-const SCOPED_INSPECT_REQUEST_CAP: Duration = Duration::from_secs(30);
-/// Reserve time inside the configured request budget for terminal assembly and
-/// egress. The server always answers before the client gives up: server work
-/// stops before `diagnostics_timeout_ms`, while the client waits for that budget
-/// plus its transport headroom.
+// Ordinary tool calls have a 25s client deadline (subc/health.rs). Cap every
+// inspect, not only scoped requests, below it even with a long configured budget.
+const INSPECT_REQUEST_CAP: Duration = Duration::from_secs(20);
+/// Leave time to assemble and send the final response inside the request cap,
+/// as well as headroom between the cap and the client's deadline.
 const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
 
 struct ParsedScope {
@@ -61,19 +59,23 @@ struct InspectRequestDeadline {
 
 impl InspectRequestDeadline {
     fn for_request(req: &RawRequest, config: &crate::config::Config) -> Self {
-        let budget = inspect_request_timeout(config);
-        Self::new(
-            if scope_was_provided(req.params.get("scope")) {
-                budget.min(SCOPED_INSPECT_REQUEST_CAP)
-            } else {
-                budget
-            },
+        Self::for_request_at(req, config, Instant::now())
+    }
+
+    fn for_request_at(_req: &RawRequest, config: &crate::config::Config, started: Instant) -> Self {
+        Self::new_at(
+            inspect_request_timeout(config).min(INSPECT_REQUEST_CAP),
             INSPECT_TERMINAL_MARGIN,
+            started,
         )
     }
 
+    #[cfg(test)]
     fn new(budget: Duration, terminal_margin: Duration) -> Self {
-        let started = Instant::now();
+        Self::new_at(budget, terminal_margin, Instant::now())
+    }
+
+    fn new_at(budget: Duration, terminal_margin: Duration, started: Instant) -> Self {
         let terminal_at = started + budget;
         let work_at = started + budget.saturating_sub(terminal_margin);
         Self {
@@ -774,7 +776,7 @@ fn handle_inspect_payload(
     // replaced by the legacy scanner's store.
     let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
     let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
-        ctx.callgraph_store_for_ops()
+        ctx.callgraph_store_for_query_without_wait()
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
     };
@@ -979,10 +981,12 @@ fn handle_inspect_payload(
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let cancellation = crate::executor::current_job_cancellation();
+        let io_budget = crate::bounded_io::current();
         let grant_scope = crate::access_policy::current_scope();
         let ask_route = crate::access_policy::capture_ask_route();
         let inventory = crate::inspect::inventory::current(&snapshot.project_root);
         std::thread::spawn(move || {
+            let _io = crate::bounded_io::enter(io_budget);
             let _inventory = inventory.as_ref().map(|inventory| inventory.install());
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
@@ -1435,15 +1439,12 @@ fn handle_inspect_deferred_with_clock(
     ctx: Arc<AppContext>,
     force_restrict: bool,
     reply_deadline: Option<Instant>,
-    _now: impl Fn() -> Instant + Send + 'static,
+    now: impl Fn() -> Instant + Send + 'static,
 ) -> DispatchOutcome {
-    if req.worker_session() {
-        ctx.disable_rust_cargo_for_worker();
-    }
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
-    let mut deadline = InspectRequestDeadline::for_request(req, &ctx.config());
+    let mut deadline = InspectRequestDeadline::for_request_at(req, &ctx.config(), now());
     if let Some(reply_deadline) = reply_deadline {
         deadline.terminal_at = deadline.terminal_at.min(reply_deadline);
         deadline.budget = deadline
@@ -1484,6 +1485,14 @@ fn handle_inspect_deferred_with_clock(
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
     let reports_diagnostics = scoped_roots.is_none() || diagnostics_selected(req);
+    // Prepare a fallback without findings counts before producer or graph waits:
+    // unfinished analysis must not look like zero findings. Deadline polling
+    // must never need the locks held by slow analysis.
+    let timeout_payload = inspect_deadline_payload(req, &ctx, &snapshot, &scope);
+    let timeout_log = phase_log.clone();
+    let timeout_id = request_id.clone();
+    let sections = parse_sections(req.params.get("sections"))
+        .expect("inspect sections were validated during preflight");
     let request = RawRequest {
         id: req.id.clone(),
         command: req.command.clone(),
@@ -1500,13 +1509,18 @@ fn handle_inspect_deferred_with_clock(
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
+    let timeout_cancellation = cancellation.clone();
     let root = snapshot.project_root.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
     let grant_scope = crate::access_policy::current_scope();
     let ask_route = crate::access_policy::current_ask_route();
-    let io_budget = crate::bounded_io::current().map(|budget| budget.capped(deadline.terminal_at));
+    let io_budget = Some(
+        crate::bounded_io::current()
+            .unwrap_or_else(|| crate::bounded_io::Budget::after(deadline.budget))
+            .capped(deadline.terminal_at),
+    );
     std::thread::Builder::new()
         .name("aft-inspect-request".into())
         .spawn(move || {
@@ -1516,6 +1530,11 @@ fn handle_inspect_deferred_with_clock(
             let _config_pin = ctx.pin_config_to(admitted_config);
             let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
             let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            // The first worker-policy transition can wait for the LSP manager.
+            // Keep it inside the deferred request's independently bounded body.
+            if request.worker_session() {
+                ctx.disable_rust_cargo_for_worker();
+            }
             // Discovery can wait for the manager or walk a large scope. Run it
             // outside executor setup so a slow manager cannot prevent another
             // session from configuring the same project.
@@ -1550,7 +1569,7 @@ fn handle_inspect_deferred_with_clock(
                 // Resolve call-graph availability before diagnostics can end the
                 // request. Response finalization must report the same outcome
                 // even if no background scan is submitted.
-                let _ = ctx.callgraph_store_for_ops();
+                let _ = ctx.callgraph_store_for_query_without_wait();
             }
             // Queueing instead of sharing a response keeps request-specific scopes,
             // phase logs, and terminals independent while bounding expensive work to
@@ -1587,17 +1606,100 @@ fn handle_inspect_deferred_with_clock(
             let _ = tx.send(crate::bounded_io::finish_response(response));
         })
         .expect("spawn inspect request worker");
+    let mut settled = false;
     DispatchOutcome::Deferred(
         PendingResponse::from_receiver(
             completion_request_id,
             String::new(),
             String::new(),
             rx,
-            |_, completion| completion.ok(),
+            move |_, completion| {
+                if settled {
+                    return None;
+                }
+                match completion {
+                    Ok(response) if inspect_failure_reason(&response) != "inspect_request_timeout" => {
+                        settled = true;
+                        Some(response)
+                    }
+                    _ if timeout_cancellation.cancel_requested_before_commit() => {
+                        settled = true;
+                        Some(build_inspect_terminal(&timeout_id, &timeout_log, InspectTerminal::Interrupted))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) if now() < deadline.work_at() => None,
+                    _ => {
+                        settled = true;
+                        timeout_cancellation.request_cancel();
+                        Some(build_inspect_terminal(&timeout_id, &timeout_log,
+                            InspectTerminal::Fresh(timeout_payload.clone(), sections.clone())))
+                    }
+                }
+            },
         )
+        // A completion-only wake cannot enforce an overall deadline when the
+        // producer never sends. Keep the transport timer armed independently.
+        .with_poll_interval(Duration::from_millis(50))
         .with_cancellation(cancellation)
         .with_shutdown(inspect_shutdown_terminal(request_id, shutdown_log)),
     )
+}
+
+fn inspect_deadline_payload(
+    req: &RawRequest,
+    ctx: &AppContext,
+    snapshot: &InspectSnapshot,
+    scope: &ParsedScope,
+) -> Value {
+    let sections = parse_sections(req.params.get("sections")).expect("validated sections");
+    let scoped = !scope.roots.is_empty();
+    let files = scope
+        .roots
+        .iter()
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    let reason = "analysis did not finish within its wait budget";
+    let mut payloads = BTreeMap::new();
+    for category in InspectCategory::active().iter().copied() {
+        let requested = !scoped
+            || if category == InspectCategory::Diagnostics {
+                sections.requests_scoped_diagnostics()
+            } else {
+                sections.detail_categories.is_empty() || sections.includes(category)
+            };
+        let payload = if !requested {
+            serde_json::json!({"status": "not_requested"})
+        } else if category == InspectCategory::Diagnostics {
+            let mut gaps = files.iter().map(|file| serde_json::json!({
+                "kind": "uncovered_file", "file": scope_root_display(&snapshot.project_root, file),
+                "reason": crate::inspect::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON,
+            })).collect::<Vec<_>>();
+            if !scoped || files.len() != scope.roots.len() {
+                gaps.push(serde_json::json!({"kind": "analysis_incomplete", "reason": reason}));
+            }
+            serde_json::json!({"complete": false, "items": [], "gaps": gaps})
+        } else {
+            serde_json::json!({"unavailable": true, "complete": false,
+                "gaps": [{"kind": "analysis_incomplete", "reason": reason}]})
+        };
+        payloads.insert(category, payload);
+    }
+    let mut payload = build_inspect_payload_with_offset(
+        snapshot,
+        &payloads,
+        &sections,
+        parse_top_k(&req.params).expect("validated top_k"),
+        parse_offset(&req.params).expect("validated offset"),
+        ctx,
+        scoped.then_some((
+            scope.roots.as_slice(),
+            files.len() as u64,
+            files.len() == scope.roots.len(),
+        )),
+    );
+    if payload["complete"] == true {
+        payload["gaps"] = serde_json::json!([{"kind": "analysis_incomplete", "reason": reason}]);
+    }
+    payload
 }
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
@@ -7929,7 +8031,9 @@ mod deferred_terminal_tests {
             }
             let ctx = deferred_test_context(root.path());
             let mut request = inspect_request("inspect-request-deadline");
-            request.params = serde_json::json!({"scope": ["one.rs", "two.rs"]});
+            request.session_id = Some("alfonso:bg_inspect-request-deadline".into());
+            request.params =
+                serde_json::json!({"scope": ["one.rs", "two.rs"], "worker_session": true});
             (root, ctx, request)
         }
 
@@ -7937,6 +8041,8 @@ mod deferred_terminal_tests {
             let start = Instant::now();
             let clock = Arc::new(Mutex::new(start));
             let now = clock.clone();
+            let wake = crate::response_finalize::DeferredResponseWake::default();
+            let _wake = wake.install();
             let DispatchOutcome::Deferred(mut pending) =
                 handle_inspect_deferred_with_clock(request, ctx.clone(), false, None, move || {
                     *now.lock().unwrap()
@@ -7945,8 +8051,9 @@ mod deferred_terminal_tests {
                 panic!("inspect must be deferred")
             };
             let cancellation = pending.cancellation.clone().unwrap();
+            assert_eq!(pending.poll_interval(), Some(Duration::from_millis(50)));
             assert!((pending.poll)(&ctx).is_none());
-            *clock.lock().unwrap() = start + Duration::from_secs(20);
+            *clock.lock().unwrap() = start + Duration::from_secs(15);
             let response = (pending.poll)(&ctx)
                 .expect("inspect must answer while the producer is still held, before the 25s client deadline");
             assert!(response.success, "{}", response.data);
@@ -8018,7 +8125,7 @@ mod deferred_terminal_tests {
         #[test]
         fn inspect_request_deadline_unscoped_callgraph_stays_building() {
             let (_root, ctx, mut request) = fixture();
-            request.params = serde_json::json!({});
+            request.params = serde_json::json!({"worker_session": true});
             let (_sender, receiver) = crossbeam_channel::unbounded();
             *ctx.callgraph_store_rx().lock() = Some(receiver);
             let manager = ctx.inspect_manager();
@@ -8046,7 +8153,13 @@ mod deferred_terminal_tests {
         let repository_dir = tempfile::tempdir_in(&scratch).unwrap();
         let repository = repository_dir.path().join("repository");
         assert!(std::process::Command::new("git")
-            .args(["clone", "--no-hardlinks", "--no-checkout"])
+            .args([
+                "-c",
+                "safe.directory=*",
+                "clone",
+                "--no-hardlinks",
+                "--no-checkout"
+            ])
             .arg(&source)
             .arg(&repository)
             .status()
@@ -8102,6 +8215,7 @@ mod deferred_terminal_tests {
             let mut request = inspect_request(name);
             request.session_id = Some("alfonso:bg_inspect-cold-profile".into());
             request.params = params;
+            request.params["worker_session"] = serde_json::json!(true);
             if name != "unscoped" {
                 request.params["scope"] = serde_json::json!([
                     "crates/aft/src/commands/inspect.rs",
@@ -8590,10 +8704,8 @@ mod deferred_terminal_tests {
         };
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let response = wait_for_pending_terminal(&mut pending, &ctx);
-        assert_eq!(
-            response.data["failure_reason"], "inspect_request_timeout",
-            "{response:?}"
-        );
+        assert_eq!(response.data["inspect_terminal"], "partial", "{response:?}");
+        assert_eq!(response.data["complete"], false);
         assert!(
             started.elapsed() < Duration::from_millis(900),
             "inspect missed caller reply deadline: {:?}",
