@@ -1,4 +1,12 @@
-import { coerceOptionalInt } from "@cortexkit/aft-bridge";
+import { stat } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
+import {
+  coerceBoolean,
+  coerceOptionalInt,
+  coerceStringArray,
+  prepareCanonicalEditArguments,
+  prepareCanonicalPathArguments,
+} from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionContext,
@@ -10,12 +18,20 @@ import { Value } from "typebox/value";
 import { detectPiHarness } from "./harness.js";
 import { warn } from "./logger.js";
 import {
+  bridgeFor,
+  callBridge,
+  callToolCallForSession,
+  resolveSessionId,
+} from "./tools/_shared.js";
+import { resolvePathArg, splitSearchPathArg } from "./tools/hoisted.js";
+import {
   asRecord,
   asString,
   collapsibleResult,
   type RenderContextLike,
   type RenderResultOptionsLike,
 } from "./tools/render-helpers.js";
+import type { PluginContext } from "./types.js";
 
 /** The host-owned router API used by the overrides; no URL handlers live in AFT. */
 export interface OmpInternalUrlRouter {
@@ -342,4 +358,254 @@ export function withOmpInternalUrls<TParams extends TSchema, TDetails, TState>(
         : new Text(resultText(result), 0, 0);
     },
   };
+}
+
+export interface AftProjection {
+  kind: "observation" | "mutation" | "execution" | "native" | "unknown";
+  paths: string[];
+  broad: boolean;
+}
+
+const UNKNOWN_SCOPE: AftProjection = { kind: "unknown", paths: [], broad: true };
+const NATIVE_URL_TOOLS = new Set(["read", "write", "edit", "grep", "bash"]);
+const PATH_ALIAS_TOOLS = new Set([
+  "read",
+  "write",
+  "grep",
+  "aft_search",
+  "aft_outline",
+  "aft_zoom",
+  "aft_callgraph",
+  "aft_conflicts",
+  "aft_import",
+  "aft_safety",
+  "aft_delete",
+  "aft_move",
+]);
+
+async function projectionPath(cwd: string, target: string): Promise<string> {
+  const path = await resolvePathArg(cwd, target);
+  return isAbsolute(path) ? path : resolve(cwd, path);
+}
+
+async function directoryScope(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function remoteTarget(path: string): boolean {
+  return /^(?:https?|issue|pr):\/\//.test(path);
+}
+
+/** Read-only scope projection for host policy hooks; engine previews retain the issuing session. */
+export async function projectAftCall(
+  ctx: PluginContext,
+  name: string,
+  rawInput: unknown,
+  cwd: string,
+  extCtx?: ExtensionContext,
+): Promise<AftProjection> {
+  try {
+    let input = asRecord(rawInput) ?? {};
+    if (
+      ctx.ompRouter &&
+      NATIVE_URL_TOOLS.has(name) &&
+      internalTarget(name, input, ctx.ompRouter) !== undefined
+    ) {
+      return { kind: "native", paths: [], broad: false };
+    }
+    if (name === "edit" && !ctx.hashlineEffective) {
+      input = prepareCanonicalEditArguments(name, input) as Record<string, unknown>;
+    } else if (PATH_ALIAS_TOOLS.has(name)) {
+      input = prepareCanonicalPathArguments(name, input) as Record<string, unknown>;
+    }
+
+    let kind: AftProjection["kind"] = "observation";
+    let targets: string[] = [];
+    let broad = false;
+    const path = asString(input.path);
+    switch (name) {
+      case "edit":
+      case "write":
+      case "aft_import":
+        if (name === "edit" && ctx.hashlineEffective && typeof input.patch === "string") {
+          const preview = await callToolCallForSession(
+            bridgeFor(ctx, cwd),
+            "hashline_preflight",
+            { patch: input.patch },
+            extCtx ? resolveSessionId(extCtx) : undefined,
+            extCtx,
+          );
+          targets = [
+            ...(Array.isArray(preview.affected_paths) ? preview.affected_paths : []),
+            ...(Array.isArray(preview.mv_destinations) ? preview.mv_destinations : []),
+          ].filter((value): value is string => typeof value === "string" && value.length > 0);
+          if (targets.length === 0) return UNKNOWN_SCOPE;
+        } else {
+          if (path === undefined) return UNKNOWN_SCOPE;
+          targets = name !== "aft_import" && /^(?:issue|pr):\/\//.test(path) ? [] : [path];
+        }
+        kind = "mutation";
+        break;
+      case "read":
+        if (path === undefined) return UNKNOWN_SCOPE;
+        targets = remoteTarget(path) ? [] : [path];
+        break;
+      case "grep":
+        if (path === undefined) {
+          targets = [cwd];
+          broad = true;
+          break;
+        }
+        targets = /\s/.test(path) ? path.trim().split(/\s+/).filter(Boolean) : [path];
+        broad = targets.length > 1;
+        break;
+      case "aft_outline": {
+        const target = input.target;
+        let values: string[] = [];
+        if (Array.isArray(target))
+          values = target.filter((value): value is string => typeof value === "string");
+        else if (typeof target === "string") values = [target];
+        if (values.length === 0) return UNKNOWN_SCOPE;
+        targets = values.filter((value) => !remoteTarget(value));
+        broad = targets.length > 0 && (coerceBoolean(input.files) === true || targets.length > 1);
+        break;
+      }
+      case "aft_zoom":
+        targets = (Array.isArray(input.batch) ? input.batch : [])
+          .map((entry) => asRecord(entry)?.target)
+          .filter((value): value is string => typeof value === "string" && !remoteTarget(value));
+        broad = targets.length > 1;
+        break;
+      case "aft_search":
+      case "aft_conflicts":
+        targets = [path?.trim() ? path : cwd];
+        broad = true;
+        break;
+      case "aft_inspect":
+        targets = (Array.isArray(input.scope) ? input.scope : [input.scope]).filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        );
+        if (targets.length === 0) targets = [cwd];
+        broad = true;
+        break;
+      case "aft_callgraph": {
+        if (path === undefined) return UNKNOWN_SCOPE;
+        const toPath = asString(input.toPath);
+        targets = toPath ? [path, toPath] : [path];
+        break;
+      }
+      case "aft_delete":
+        targets = coerceStringArray(input.files);
+        if (targets.length === 0) return UNKNOWN_SCOPE;
+        broad = coerceBoolean(input.recursive) === true;
+        kind = "mutation";
+        break;
+      case "aft_move": {
+        const destination = asString(input.destination);
+        if (path === undefined || destination === undefined) return UNKNOWN_SCOPE;
+        targets = [path, destination];
+        kind = "mutation";
+        break;
+      }
+      case "aft_safety": {
+        const files = coerceStringArray(input.files);
+        switch (input.op) {
+          case "list":
+            break;
+          case "history":
+            targets = path ? [path] : [];
+            break;
+          case "checkpoint":
+            targets = files;
+            if (targets.length === 0 && path) targets = [path];
+            if (targets.length === 0) return UNKNOWN_SCOPE;
+            kind = "mutation";
+            break;
+          case "purge":
+            if (!path) return UNKNOWN_SCOPE;
+            targets = [path];
+            kind = "mutation";
+            broad = true;
+            break;
+          case "undo":
+          case "restore": {
+            const restore = input.op === "restore";
+            const checkpoint = asString(input.name);
+            if (restore && !checkpoint) return UNKNOWN_SCOPE;
+            const request: Record<string, unknown> = {};
+            if (path) request.file = await projectionPath(cwd, path);
+            if (restore) {
+              request.name = checkpoint;
+              if (files.length > 0)
+                request.files = await Promise.all(files.map((file) => projectionPath(cwd, file)));
+            }
+            const preview = await callBridge(
+              bridgeFor(ctx, cwd),
+              restore ? "checkpoint_paths" : "undo_preview",
+              request,
+              extCtx,
+            );
+            targets = Array.isArray(preview.paths)
+              ? preview.paths.filter(
+                  (value): value is string => typeof value === "string" && value.length > 0,
+                )
+              : [];
+            kind = "mutation";
+            break;
+          }
+          default:
+            return UNKNOWN_SCOPE;
+        }
+        break;
+      }
+      case "ast_grep_search":
+      case "ast_grep_replace": {
+        kind =
+          name === "ast_grep_replace" && coerceBoolean(input.dryRun) !== true
+            ? "mutation"
+            : "observation";
+        const roots = coerceStringArray(input.paths);
+        if (roots.length === 0) return { kind, paths: [cwd], broad: true };
+        const paths: string[] = [];
+        broad = coerceStringArray(input.globs).length > 0;
+        for (const root of roots) {
+          const split = await splitSearchPathArg(cwd, root);
+          if (split.missing.length > 0) return UNKNOWN_SCOPE;
+          for (const target of split.paths) {
+            const resolved = await projectionPath(cwd, target);
+            // Validate every root, even when a previous directory already made the scope broad.
+            const directory = (await stat(resolved)).isDirectory();
+            broad = broad || directory;
+            paths.push(resolved);
+          }
+        }
+        return { kind, paths, broad };
+      }
+      case "bash":
+      case "powershell":
+      case "bash_write":
+        return { kind: "execution", paths: [], broad: true };
+      case "bash_kill":
+        return { kind: "execution", paths: [], broad: false };
+      case "bash_status":
+      case "bash_watch":
+        break;
+      default:
+        return UNKNOWN_SCOPE;
+    }
+    const paths = await Promise.all(targets.map((target) => projectionPath(cwd, target)));
+    if (!broad && (name === "read" || name === "grep" || name === "aft_outline")) {
+      broad = (await Promise.all(paths.map(directoryScope))).some(Boolean);
+    } else if (name === "aft_move") {
+      broad = await directoryScope(paths[0]);
+    }
+    return { kind, paths, broad };
+  } catch {
+    // A failed parser/engine preview cannot authorize a guessed or partial mutation scope.
+    return UNKNOWN_SCOPE;
+  }
 }
