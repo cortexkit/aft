@@ -3,6 +3,13 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+fn timing_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TIMING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn configure(root: &Path, storage: &Path, id: &str, full_validation: bool) -> Value {
     json!({"id":id,"command":"configure","harness":"opencode",
         "project_root":root,"storage_dir":storage,
@@ -30,6 +37,7 @@ fn response(aft: &mut AftProcess, id: &str) -> Value {
 // These cases use the production wall-clock budget, so their child startups
 // are serialized instead of competing for that budget with each other.
 fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Value {
+    let _timing = timing_guard();
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -94,7 +102,6 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
 }
 
 #[test]
-#[serial_test::serial(folder_admission_timing)]
 fn tool_from_same_burst_waits_for_pending_admission() {
     let tool = call_while_probe_is_held(true, false);
     assert_eq!(tool["success"], true, "{tool}");
@@ -103,7 +110,6 @@ fn tool_from_same_burst_waits_for_pending_admission() {
 }
 
 #[test]
-#[serial_test::serial(folder_admission_timing)]
 fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() {
     let tool = call_while_probe_is_held(false, false);
     assert_eq!(tool["success"], false, "{tool}");
@@ -117,7 +123,6 @@ fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() 
 }
 
 #[test]
-#[serial_test::serial(folder_admission_timing)]
 fn full_validation_call_does_not_starve_its_admission_replay() {
     let tool = call_while_probe_is_held(true, true);
     assert_eq!(tool["success"], true, "{tool}");
@@ -125,8 +130,8 @@ fn full_validation_call_does_not_starve_its_admission_replay() {
 }
 
 #[test]
-#[serial_test::serial(folder_admission_timing)]
 fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
+    let _timing = timing_guard();
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
