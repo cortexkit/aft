@@ -110,6 +110,8 @@ test-timing-hooks = []
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
 # never enable these hooks in production builds.
 test-hooks = []
+# Grammar fault controls are available only to test-seam binaries.
+test-grammar-seams = []
 # Compiles the test-only secret vault (V5). Nothing in the product reads it:
 # a release profile must never enable it, and
 # `scripts/check-secret-test-fake.sh` fails CI when one does.
@@ -129,7 +131,7 @@ parking_lot = "0.12"
 portable-pty = "0.9"
 libc = "0.2"
 getrandom = "0.3"
-tree-sitter = "0.26"
+tree-sitter = "=0.26.7"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
@@ -272,6 +274,11 @@ subc-os = "=0.1.30"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
+
+[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
+tree-sitter = { version = "=0.26.7", features = ["wasm"] }
+wasmtime = { version = "=36.0.6", default-features = false }
+wasmtime-c-api-impl = { version = "=36.0.6", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
