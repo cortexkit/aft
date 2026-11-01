@@ -4,7 +4,7 @@
 Ufuk's approval of the grammar revision, official wasi-sdk 34 archive checksum,
 two-C-file build, and the Zed parse-tree exemption. Zed's archive
 does not attest its compiler and flags, so it is not claimed to match the AFT
-toolchain. The archive, its extracted grammar, the CLI binary, and every source
+toolchain. The archive, its extracted grammar, the prebuilt runtime, and every source
 input are checksum-pinned. A mismatch fails closed; CI never updates pins.
 
 On Linux x86-64 with Python 3.12 or newer:
@@ -19,13 +19,13 @@ It compiles `src/parser.c` and `src/scanner.c` in two fresh directories, with
 the pinned SDK/flags, and requires byte equality. No grammar generation,
 extension code, `build.rs`, dependency compilation or package-manager hooks
 run. The external scanner runs only inside the grammar's WASM sandbox when
-the prebuilt official tree-sitter CLI parses the corpus. The CLI is passed an
-explicit WASM library and an isolated config/home; it cannot discover or build
-a developer-installed grammar.
+the prebuilt official Web Tree-sitter runtime parses the corpus. The verifier
+uses Node to load explicit WASM bytes; no grammar discovery or build path is
+used. Node is supplied by the runner, with no package installation.
 
 Both builds and the Zed grammar must parse the fixed `corpus/` inputs without
-errors. A, B and Zed must produce identical full XML trees, also equal to the
-checked-in XML oracles (including source positions, token text and anonymous
+errors. A, B and Zed must produce identical full JSON trees, also equal to the
+checked-in JSON oracles (including source positions, token text and anonymous
 nodes). `ifelseexpr.luau` is an unmodified real-project conformance test from
 `luau-lang/luau` at `535f92589bdc304c8a2012d6cfad5e7b9faff2f7` (tag 0.701).
 `features.luau` adds types, methods, require forms and scanner delimiters. The
@@ -40,7 +40,7 @@ loader manifest. The manifest URLs describe the content-addressed naming
 scheme, not a claim that either test artifact has already been published.
 
 For an intentional, reviewed pin/corpus update, use `--write-fixtures` once
-and review the changed fixtures, manifests and XML oracles. CI omits that flag
+and review the changed fixtures, manifests and JSON oracles. CI omits that flag
 and compares every generated fixture byte to Git. Keep the upstream MIT
 notices with the corpus and grammar artifacts.
 

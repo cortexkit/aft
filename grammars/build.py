@@ -2,7 +2,6 @@
 """Build only pinned generated C; verify repeatability and Zed parse parity."""
 
 import argparse
-import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -91,12 +90,11 @@ def run(args, *, cwd, env):
     return subprocess.check_output([str(a) for a in args], cwd=cwd, env=env, text=True)
 
 
-def parse(cli, module, source, *, cwd, env):
-    # --lib-path bypasses grammar discovery/building. The empty working directory
-    # and isolated config also prevent an installed developer grammar being used.
-    tree = run([cli, "parse", "--wasm", "--lib-path", module, "--lang-name", "luau",
-                "--xml", source], cwd=cwd, env=env)
-    if not tree.strip() or "<ERROR" in tree or "<MISSING" in tree:
+def parse(runtime, module, source, *, cwd, env):
+    # The verifier loads explicit WASM bytes, with no grammar discovery or build.
+    tree = run([shutil.which("node"), ROOT / "grammars/parse.cjs", runtime, module, source], cwd=cwd, env=env)
+    parsed = json.loads(tree)
+    if parsed["type"] != "chunk" or parsed.get("hasError") or parsed.get("isMissing"):
         raise ValueError(f"empty or invalid parse: {source}")
     return tree
 
@@ -183,11 +181,11 @@ def build(output, write_fixtures=False):
     elif zed["comparison"] != "parse_trees" or not zed.get("exemption"):
         raise ValueError("Zed comparison requires matching toolchain or reviewed exemption")
     verifier = pin["verifier"]
-    cli_archive = fetch(verifier["url"], verifier["sha256"], downloads / "tree-sitter.gz")
-    cli = work / "tree-sitter"
-    cli.write_bytes(gzip.decompress(cli_archive.read_bytes()))
-    cli.chmod(0o755)
-    verifier_version = run([cli, "--version"], cwd=work, env=env).strip()
+    runtime_archive = fetch(verifier["url"], verifier["sha256"], downloads / "web-tree-sitter.tar.gz")
+    runtime = work / "web-tree-sitter.cjs"
+    runtime.write_bytes(archive_member(runtime_archive, "./web-tree-sitter.cjs"))
+    (work / "web-tree-sitter.wasm").write_bytes(archive_member(runtime_archive, "./web-tree-sitter.wasm"))
+    verifier_version = f"Web Tree-sitter {verifier['release']}; " + run([shutil.which("node"), "--version"], cwd=work, env=env).strip()
     empty = work / "parse"
     empty.mkdir(exist_ok=True)
     corpus = json.loads((ROOT / "grammars/corpus/manifest.json").read_text())
@@ -196,7 +194,7 @@ def build(output, write_fixtures=False):
     for entry in corpus["files"]:
         path = ROOT / "grammars/corpus" / entry["file"]
         require_equal(digest(path.read_bytes()), entry["sha256"], "corpus bytes")
-        trees = [parse(cli, module, path, cwd=empty, env=env) for module in
+        trees = [parse(runtime, module, path, cwd=empty, env=env) for module in
                  (artifacts / manifests[0]["file"], artifacts / manifests[1]["file"], zed_path)]
         require_equal(trees[0], trees[1], f"A/B parse tree: {entry['file']}")
         require_equal(trees[0], trees[2], f"A/Zed parse tree: {entry['file']}")

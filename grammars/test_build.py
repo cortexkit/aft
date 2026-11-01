@@ -72,16 +72,17 @@ class BuildTests(unittest.TestCase):
             build.archive_member(archive, "./grammars/luau.wasm")
 
     def test_parsing_uses_explicit_wasm_not_grammar_discovery(self):
-        with patch.object(build, "run", return_value="<chunk/>\n") as run:
-            build.parse("cli", "module.wasm", "input.luau", cwd=self.work, env={})
-        self.assertEqual(run.call_args.args[0], ["cli", "parse", "--wasm", "--lib-path",
-                         "module.wasm", "--lang-name", "luau", "--xml", "input.luau"])
+        with patch.object(build, "run", return_value='{"type":"chunk"}\n') as run:
+            build.parse("runtime", "module.wasm", "input.luau", cwd=self.work, env={})
+        self.assertEqual(run.call_args.args[0][1:], [build.ROOT / "grammars/parse.cjs",
+                         "runtime", "module.wasm", "input.luau"])
 
     def test_empty_or_error_trees_are_not_parity(self):
-        for tree in ("", "<chunk><ERROR/></chunk>", "<chunk><MISSING/></chunk>"):
+        for tree in ('{}', '{"type":"ERROR"}', '{"type":"chunk","hasError":true}',
+                     '{"type":"chunk","isMissing":true}'):
             with self.subTest(tree=tree), patch.object(build, "run", return_value=tree):
-                with self.assertRaises(ValueError):
-                    build.parse("cli", "module", "source", cwd=self.work, env={})
+                with self.assertRaises((ValueError, KeyError)):
+                    build.parse("runtime", "module", "source", cwd=self.work, env={})
 
     def test_different_trees_fail(self):
         with self.assertRaisesRegex(ValueError, "differs"):

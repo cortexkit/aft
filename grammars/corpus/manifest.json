@@ -4,13 +4,13 @@
     {
       "file": "features.luau",
       "sha256": "a9ef6a608f15199c2ebdc3e7bb2c185fdf9d56cf6f8e5ca752253bf61f0b76da",
-      "tree": "features.xml",
+      "tree": "features.tree.json",
       "provenance": "AFT-authored Luau syntax and external-scanner coverage; parsed, never executed."
     },
     {
       "file": "ifelseexpr.luau",
       "sha256": "ed339da68d9c4474ef3f3e5b81c805a4f03180f9ec8235801f975a1a76924a18",
-      "tree": "ifelseexpr.xml",
+      "tree": "ifelseexpr.tree.json",
       "repository": "https://github.com/luau-lang/luau",
       "commit": "535f92589bdc304c8a2012d6cfad5e7b9faff2f7",
       "upstream_path": "tests/conformance/ifelseexpr.luau",
