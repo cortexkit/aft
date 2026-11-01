@@ -5,7 +5,7 @@ import {
   BridgeTransportUnknownOutcomeError,
   type VersionMismatchCallback,
 } from "./bridge.js";
-import { AftModuleUnavailableError, adaptToolError } from "./error-contract.js";
+import { AftModuleUnavailableError } from "./error-contract.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type {
@@ -201,14 +201,11 @@ class LocationBridgeLease implements ReleasableLocationPool {
 
   private interrupted(hold: ExecutionHold): Error {
     return hold.dispatched
-      ? (adaptToolError(
-          "",
-          new BridgeTransportUnknownOutcomeError(
-            `The AFT plugin reloaded before this invocation finished.${
-              hold.taskId ? ` Background task: ${hold.taskId}.` : ""
-            }`,
-          ),
-        ) as Error)
+      ? new BridgeTransportUnknownOutcomeError(
+          `The AFT plugin reloaded before this invocation finished, so its outcome is UNKNOWN: it may or may not have executed.${
+            hold.taskId ? ` Background task: ${hold.taskId}.` : ""
+          } Verify actual state before re-running, and never blind-retry a mutation.`,
+        )
       : this.notSent();
   }
 
