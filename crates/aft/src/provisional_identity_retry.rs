@@ -448,16 +448,6 @@ pub(crate) fn due(ctx: &AppContext) -> bool {
     ctx.provisional_identity_retry().is_due() || crate::folder_admission_runtime::recheck_due(ctx)
 }
 
-pub(crate) fn folder_due(ctx: &AppContext) -> bool {
-    let slot = ctx.provisional_identity_retry();
-    slot.is_due()
-        && slot
-            .0
-            .lock()
-            .as_ref()
-            .is_some_and(|retry| retry.kind == RetryKind::FolderAdmission)
-}
-
 pub(crate) fn finish_folder_check(ctx: &AppContext) {
     let mut slot = ctx.provisional_identity_retry().0.lock();
     if slot

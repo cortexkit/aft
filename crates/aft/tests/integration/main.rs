@@ -5,7 +5,6 @@ mod context_storage_test;
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 
-mod folder_admission_first_call_test;
 mod helpers;
 
 mod aft_search_contract_test;

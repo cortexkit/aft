@@ -6,7 +6,6 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -43,127 +42,6 @@ pub(crate) fn command() -> Command {
         }
     });
     builder.build()
-}
-
-/// Recognize ordinary working-tree control metadata without paying process
-/// startup time. Unusual layouts still use Git's read-only plumbing.
-pub(crate) fn metadata_worktree_head(
-    root: &Path,
-    start: std::time::Instant,
-    budget: std::time::Duration,
-) -> Option<PathBuf> {
-    let limits = DiscoveryLimits::from_command(&command());
-    let root = comparable(std::fs::canonicalize(root).ok()?);
-    let ceiling = limits
-        .ceilings
-        .iter()
-        .filter(|ceiling| root != **ceiling && root.starts_with(ceiling))
-        .max_by_key(|ceiling| ceiling.components().count());
-    let device = if limits.one_filesystem {
-        device_of(&root).ok()?
-    } else {
-        None
-    };
-    for directory in root.ancestors() {
-        if start.elapsed() >= budget {
-            return None;
-        }
-        if directory != root {
-            if ceiling
-                .is_some_and(|ceiling| directory == ceiling || !directory.starts_with(ceiling))
-            {
-                break;
-            }
-            if let Some(device) = device {
-                if device_of(directory).ok().flatten() != Some(device) {
-                    break;
-                }
-            }
-        }
-        if directory.join("HEAD").is_file()
-            && directory.join("objects").is_dir()
-            && directory.join("refs").is_dir()
-        {
-            return None;
-        }
-        let marker = directory.join(".git");
-        let Ok(metadata) = std::fs::metadata(&marker) else {
-            continue;
-        };
-        let (git, common) = if metadata.is_dir() {
-            (marker.clone(), marker.clone())
-        } else {
-            let text = metadata_git_file(&marker)?;
-            let target = text.trim().strip_prefix("gitdir: ")?;
-            let git = std::fs::canonicalize(directory.join(target)).ok()?;
-            let back = metadata_git_file(&git.join("gitdir"))?;
-            let back = std::fs::canonicalize(git.join(back.trim())).ok()?;
-            if comparable(back) != comparable(std::fs::canonicalize(&marker).ok()?) {
-                return None;
-            }
-            let common = metadata_git_file(&git.join("commondir"))?;
-            let common = std::fs::canonicalize(git.join(common.trim())).ok()?;
-            (git, common)
-        };
-        if root.starts_with(&comparable(git.clone())) {
-            return None;
-        }
-        if !common.join("objects").is_dir() || !common.join("refs").is_dir() {
-            return None;
-        }
-        let config = metadata_git_file(&common.join("config"))?;
-        let mut core = false;
-        let mut working_tree = false;
-        for line in config.lines() {
-            let line = line.trim().to_ascii_lowercase();
-            if line.starts_with('[') {
-                if line.starts_with("[include") || line.starts_with("[extensions") {
-                    return None;
-                }
-                core = line == "[core]";
-            } else if core {
-                if let Some((key, value)) = line.split_once('=') {
-                    match key.trim() {
-                        "bare" => working_tree = value.trim() == "false",
-                        "worktree" => return None,
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if !working_tree {
-            return None;
-        }
-        let head = git.join("HEAD");
-        let text = metadata_git_file(&head)?;
-        let text = text.trim();
-        let valid = matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
-            || text.strip_prefix("ref: refs/heads/").is_some_and(|name| {
-                !name.is_empty()
-                    && !name.contains("..")
-                    && !name.ends_with('.')
-                    && !name.ends_with('/')
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_/".contains(&b))
-            });
-        return valid.then_some(head);
-    }
-    None
-}
-
-fn metadata_git_file(path: &Path) -> Option<String> {
-    const MAX_CONTROL_BYTES: u64 = 16 * 1024;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(MAX_CONTROL_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_CONTROL_BYTES {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
 }
 
 /// `git rev-parse --show-toplevel`, run with `-C root` from AFT's own working
@@ -717,22 +595,6 @@ pub(crate) fn with_child_env_for_test<R>(
     });
     let _reset = Reset;
     body()
-}
-
-#[cfg(test)]
-pub(crate) fn capture_child_env_for_test() -> Vec<(OsString, OsString)> {
-    TEST_CHILD_ENV.with(|env| env.borrow().clone())
-}
-
-#[cfg(test)]
-pub(crate) fn with_captured_child_env_for_test<R>(
-    captured: Vec<(OsString, OsString)>,
-    body: impl FnOnce() -> R,
-) -> R {
-    TEST_CHILD_ENV.with(|env| *env.borrow_mut() = captured);
-    let result = body();
-    TEST_CHILD_ENV.with(|env| env.borrow_mut().clear());
-    result
 }
 
 /// Decode one line of Git path output, keeping raw bytes on Unix.

@@ -1,9 +1,0 @@
-crates/aft/src/commands/configure.rs
-crates/aft/src/folder_admission.rs
-crates/aft/src/folder_admission_runtime.rs
-crates/aft/src/git_probe.rs
-crates/aft/src/list_surfaces.rs
-crates/aft/src/main.rs
-crates/aft/src/provisional_identity_retry.rs
-crates/aft/src/subc/mod.rs
-crates/aft/src/subc/persistence.rs

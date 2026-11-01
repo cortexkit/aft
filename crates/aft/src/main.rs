@@ -704,18 +704,15 @@ fn main() {
         let gated = validation_gate.is_some();
 
         let configure_pending = configure_maintenance.has_pending(registry.current());
-        let recv_timeout =
-            if aft::folder_admission_runtime::waiting(registry.current()) && !pending.is_empty() {
-                Duration::from_millis(2)
-            } else if gated {
-                VALIDATION_GATE_POLL_INTERVAL
-            } else if configure_pending {
-                Duration::from_millis(100)
-            } else if pending.is_empty() {
-                DRAIN_INTERVAL
-            } else {
-                pending_poll_interval
-            };
+        let recv_timeout = if gated {
+            VALIDATION_GATE_POLL_INTERVAL
+        } else if configure_pending {
+            Duration::from_millis(100)
+        } else if pending.is_empty() {
+            DRAIN_INTERVAL
+        } else {
+            pending_poll_interval
+        };
         let line_frame = if let Some(result) = queued_lines.pop_front() {
             result
         } else {
@@ -856,9 +853,7 @@ fn main() {
                     runtime.note_request();
                     // Keep the request's configuration snapshot pinned through
                     // standalone response finalization.
-                    let waiting_for_admission =
-                        aft::folder_admission_runtime::request_waits(&req, runtime);
-                    let _request_pin = (!waiting_for_admission).then(|| runtime.pin_config());
+                    let _request_pin = runtime.pin_config();
                     let gates_on_validation = offloads_full_validation(&req, runtime);
                     let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
                         log_ctx::with_session(session_id_for_log, || {
@@ -876,12 +871,9 @@ fn main() {
                             Some(response)
                         }
                         Ok(DispatchOutcome::Deferred(pending_response)) => {
-                            let pending_response = if waiting_for_admission {
-                                pending_response
-                            } else {
-                                pending_response.with_admitted_config(runtime.config())
-                            };
-                            match pending.register(pending_response) {
+                            match pending
+                                .register(pending_response.with_admitted_config(runtime.config()))
+                            {
                                 Ok(()) => {
                                     if gates_on_validation {
                                         validation_gate = Some(request_id.clone());
@@ -1785,26 +1777,11 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let worker_session_id = req.session_id.clone();
     let disconnected_request_id = request_id.clone();
     let (tx, rx) = mpsc::sync_channel(1);
-    let admitted_config =
-        (!aft::folder_admission_runtime::request_waits(&req, &ctx)).then(|| ctx.config());
+    let admitted_config = ctx.config();
     let ask_route = aft::access_policy::capture_ask_route();
     thread::spawn(move || {
         let _ask_route = ask_route.install();
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
-        if admitted_config.is_none() {
-            while !aft::folder_admission_runtime::poll_wait(&ctx) {
-                if aft::executor::current_job_cancelled() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        if aft::executor::current_job_cancelled() {
-            let _ = tx.send(cancelled_deferred_response(&req.id, &req.command));
-            wake_standalone_loop_for_deferred_response();
-            return;
-        }
-        let admitted_config = admitted_config.unwrap_or_else(|| ctx.config());
         let _config_pin = ctx.pin_config_to(admitted_config);
         let command = req.command.clone();
         let id = req.id.clone();
@@ -1911,9 +1888,6 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
 }
 
 fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
-    if aft::folder_admission_runtime::request_waits(&req, ctx) {
-        return handle_dispatch_deferred(req, Arc::clone(ctx));
-    }
     if let Some(response) = aft::folder_admission_runtime::route_refusal(&req, ctx) {
         return DispatchOutcome::Immediate(response);
     }
