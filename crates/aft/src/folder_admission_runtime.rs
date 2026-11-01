@@ -150,6 +150,7 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
         binding.pending = true;
         binding.checking = false;
         binding.needs_apply = false;
+        binding.needs_off_bind = false;
         binding.decision = None;
         *probe = None;
     }
@@ -237,6 +238,8 @@ fn timeout_cache(
         relative_paths: false,
         policy: mode_policy(mode),
         checked_ms: now_ms(),
+        // No observation finished. Completed bounded probes keep their stamps
+        // even when their tree coverage is incomplete, and remain reusable.
         stamps: Vec::new(),
         decision: crate::folder_admission::exhausted(root, mode, ProbeBudgets::default()),
     }
@@ -591,7 +594,7 @@ pub(crate) fn admit_borrowed(
         crate::folder_admission::DetectionMode::Auto => {}
     }
     let cache = if let Some(cache) = raw.filter(|cache| {
-        cache.decision.reason != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+        !cache.stamps.is_empty()
             && intent_valid(cache, &config, root)
             && (cache.decision.classification == FolderClassification::Project
                 || now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS)
@@ -599,9 +602,7 @@ pub(crate) fn admit_borrowed(
         cache
     } else {
         if load_raw(&config, root).as_ref().is_some_and(|cache| {
-            cache.decision.reason
-                != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
-                && now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS
+            !cache.stamps.is_empty() && now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS
         }) {
             return Err("folder_admission_pending".into());
         }
@@ -633,9 +634,7 @@ pub(crate) fn admit_borrowed(
 pub fn standalone(root: &Path, config: &Config) -> Result<FolderAdmission, String> {
     let lock = root_probe_lock(root);
     let _probe = lock.lock();
-    if let Some(cache) = load_raw(config, root).filter(|cache| {
-        cache.decision.reason != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
-    }) {
+    if let Some(cache) = load_raw(config, root).filter(|cache| !cache.stamps.is_empty()) {
         if intent_valid(&cache, config, root)
             && (cache.decision.classification == FolderClassification::Project
                 || now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS)
@@ -876,7 +875,7 @@ pub(crate) fn prepare(
         }
         binding.decision.clone()?
     };
-    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+    if cache.stamps.is_empty() {
         return None;
     }
     if !replay
@@ -1088,6 +1087,8 @@ fn probe_cache(
     force: bool,
     checking: bool,
     fresh: bool,
+    live_generation: &std::sync::atomic::AtomicU64,
+    generation: u64,
 ) -> ProbeResult {
     let lock = root_probe_lock(root);
     let Some(_guard) = lock.try_lock_for(ProbeBudgets::default().time) else {
@@ -1096,10 +1097,7 @@ fn probe_cache(
     let raw = (!force)
         .then(|| load_raw(config, root))
         .flatten()
-        .filter(|cache| {
-            cache.decision.reason
-                != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
-        });
+        .filter(|cache| !cache.stamps.is_empty());
     if !fresh {
         if let Some(cache) = raw.as_ref().filter(|cache| {
             cache.decision.policy_version == POLICY_VERSION
@@ -1132,7 +1130,9 @@ fn probe_cache(
         decision,
         relative_paths: false,
     };
-    persist(config, root, &cache);
+    if live_generation.load(Ordering::Acquire) == generation {
+        persist(config, root, &cache);
+    }
     ProbeResult::Complete(cache, false)
 }
 
@@ -1152,10 +1152,9 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                 b.requested.clone(),
                 b.generation,
                 b.force
-                    || b.decision.as_ref().is_some_and(|cache| {
-                        cache.decision.reason
-                            == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
-                    }),
+                    || b.decision
+                        .as_ref()
+                        .is_some_and(|cache| cache.stamps.is_empty()),
                 b.checking,
                 b.fresh || b.force,
                 b.wait_deadline,
@@ -1195,6 +1194,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker_root = root.clone();
         let worker_config = config.clone();
+        let live_generation = ctx.configure_generation_flag();
         #[cfg(test)]
         let gate = state.probe_gate.lock().take();
         #[cfg(test)]
@@ -1219,7 +1219,17 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                     let _ = sender.send(ProbeResult::Exhausted);
                     return;
                 }
-                let work = || probe_cache(&worker_root, &worker_config, force, checking, fresh);
+                let work = || {
+                    probe_cache(
+                        &worker_root,
+                        &worker_config,
+                        force,
+                        checking,
+                        fresh,
+                        &live_generation,
+                        generation,
+                    )
+                };
                 #[cfg(test)]
                 let result = crate::git_probe::with_captured_child_env_for_test(child_env, work);
                 #[cfg(not(test))]
@@ -1270,7 +1280,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
         None if Instant::now() < deadline => return ResolveResult::Wait,
         None => timeout_cache(&root, &config, mode),
     };
-    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+    if wait_cap_exceeded {
         cache.decision.coverage.elapsed_ms = Instant::now()
             .saturating_duration_since(deadline - wait_budget())
             .as_millis()
@@ -1335,7 +1345,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
             wait_budget()
         );
     }
-    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+    if wait_cap_exceeded {
         let config = config.clone();
         let root = root.clone();
         let cache = cache.clone();

@@ -31,7 +31,7 @@ fn call_while_probe_is_held(project_evidence: bool) -> Value {
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
     if project_evidence {
-        crate::helpers::project::mark_project(&project).unwrap();
+        crate::test_helpers::project::mark_project(&project).unwrap();
     }
     std::fs::write(
         project.join("main.rs"),
@@ -97,7 +97,7 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
-    crate::helpers::project::mark_project(&project).unwrap();
+    crate::test_helpers::project::mark_project(&project).unwrap();
     std::fs::write(project.join("main.rs"), "fn callee() {}\n").unwrap();
     let delay = dir.path().join("delay");
     std::fs::write(&delay, "1500").unwrap();

@@ -8502,6 +8502,7 @@ pub(crate) fn drain_standalone_configure_unit(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     if crate::folder_admission_runtime::waiting(ctx) {
+        drop_superseded_parked_continuations(ctx, state);
         crate::provisional_identity_retry::drain_inline(ctx);
         return true;
     }

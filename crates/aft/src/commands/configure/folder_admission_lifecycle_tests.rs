@@ -424,13 +424,24 @@ fn folder_admission_discards_a_stale_probe_generation() {
     let worker =
         std::thread::spawn(move || isolated(&worker_root, || admission::resolve(&worker_ctx)));
     started.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        worker.join().unwrap(),
+        admission::ResolveResult::Wait
+    ));
     ctx.configure_generation_flag()
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     release.send(()).unwrap();
-    assert!(matches!(
-        worker.join().unwrap(),
-        admission::ResolveResult::Stale
-    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(admission::resolve(&ctx), admission::ResolveResult::Stale) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stale probe did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(admission::snapshot(&ctx).unwrap()["state"], "pending");
     assert_eq!(
         admission::snapshot(&ctx).unwrap()["classification"],
