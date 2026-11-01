@@ -2295,6 +2295,10 @@ pub fn run_watcher_thread<W, E, F>(
 {
     let (raw_tx, raw_rx) = mpsc::channel();
     let root_path = config.project_root.clone();
+    #[cfg(feature = "test-timing-hooks")]
+    if hold_watcher_attach_for_test(&shutdown) {
+        return;
+    }
     match attach(root_path.clone(), extra_watch_paths, raw_tx) {
         Ok(_watcher) => {
             if shutdown.load(Ordering::SeqCst) {
@@ -3186,6 +3190,21 @@ fn hold_watcher_intake_for_test(shutdown: &AtomicBool) {
     while gate.exists() && !shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Test seam: hold native registration independently of an index loaded by a
+/// concurrent query. Releasing the file permits ordinary backend attachment.
+#[cfg(feature = "test-timing-hooks")]
+fn hold_watcher_attach_for_test(shutdown: &AtomicBool) -> bool {
+    let Some(gate) = std::env::var_os("AFT_TEST_WATCHER_ATTACH_GATE_FILE").map(PathBuf::from)
+    else {
+        return false;
+    };
+    let _ = std::fs::write(gate.with_extension("waiting"), b"waiting");
+    while gate.exists() && !shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    shutdown.load(Ordering::SeqCst)
 }
 
 /// Test seam: while `<gate>.flush-hold` exists, the watcher thread keeps taken-in
