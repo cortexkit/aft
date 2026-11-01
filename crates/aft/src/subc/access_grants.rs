@@ -477,22 +477,76 @@ pub(super) struct PolicySnapshot {
     worker: bool,
 }
 
-/// Two snapshots are equal when they hold the same stored authority. `Config`
-/// has no `PartialEq`, so it is compared through its serialized form; a
-/// config that cannot be serialized compares unequal, which only makes a
-/// caller re-read the snapshot.
+/// Compare stored authority, not the randomized iteration order of Config's
+/// string sets. The remaining config fields are compared through JSON because
+/// Config has no PartialEq implementation.
 impl PartialEq for PolicySnapshot {
     fn eq(&self, other: &Self) -> bool {
+        let config_without_sets = |config: &Config| {
+            let mut config = config.clone();
+            config.disabled_lsp.clear();
+            config.lsp_auto_install_binaries.clear();
+            config.lsp_inflight_installs.clear();
+            serde_json::to_value(config)
+        };
         self.mode == other.mode
             && self.worker == other.worker
             && self.grants == other.grants
+            && self.config.disabled_lsp == other.config.disabled_lsp
+            && self.config.lsp_auto_install_binaries == other.config.lsp_auto_install_binaries
+            && self.config.lsp_inflight_installs == other.config.lsp_inflight_installs
             && match (
-                serde_json::to_value(&self.config),
-                serde_json::to_value(&other.config),
+                config_without_sets(&self.config),
+                config_without_sets(&other.config),
             ) {
                 (Ok(left), Ok(right)) => left == right,
                 _ => false,
             }
+    }
+}
+
+#[cfg(test)]
+mod policy_snapshot_tests {
+    use super::*;
+
+    fn snapshot(config: Config) -> PolicySnapshot {
+        PolicySnapshot {
+            config,
+            mode: crate::access_policy::ApprovalMode::Ask,
+            grants: Vec::new(),
+            worker: false,
+        }
+    }
+
+    #[test]
+    fn stored_policy_string_sets_compare_by_membership_after_reload() {
+        let mut config = Config::default();
+        for index in 0..64 {
+            config.disabled_lsp.insert(format!("disabled-{index}"));
+            config
+                .lsp_auto_install_binaries
+                .insert(format!("auto-{index}"));
+            config
+                .lsp_inflight_installs
+                .insert(format!("install-{index}"));
+        }
+        let stored = serde_json::to_value(&config).unwrap();
+        let original = snapshot(config);
+        let reloaded = || serde_json::from_value::<Config>(stored.clone()).unwrap();
+        assert!(original == snapshot(reloaded()));
+
+        let mut changed = reloaded();
+        changed.disabled_lsp.remove("disabled-0");
+        assert!(original != snapshot(changed));
+        let mut changed = reloaded();
+        changed.lsp_auto_install_binaries.remove("auto-0");
+        assert!(original != snapshot(changed));
+        let mut changed = reloaded();
+        changed.lsp_inflight_installs.remove("install-0");
+        assert!(original != snapshot(changed));
+        let mut changed = snapshot(reloaded());
+        changed.mode = crate::access_policy::ApprovalMode::ReadOnly;
+        assert!(original != changed);
     }
 }
 

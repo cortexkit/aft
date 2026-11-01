@@ -111,6 +111,7 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
     });
     let response = aft.send(&request.to_string());
     assert_eq!(response["success"], true, "configure: {response:?}");
+    aft.wait_for_folder_admission();
 }
 
 /// Ask for `target`'s callers until the store answers. The test harness lets

@@ -597,8 +597,24 @@ pub(crate) fn with_child_env_for_test<R>(
     body()
 }
 
+#[cfg(test)]
+pub(crate) fn capture_child_env_for_test() -> Vec<(OsString, OsString)> {
+    TEST_CHILD_ENV.with(|env| env.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn with_captured_child_env_for_test<R>(
+    captured: Vec<(OsString, OsString)>,
+    body: impl FnOnce() -> R,
+) -> R {
+    TEST_CHILD_ENV.with(|env| *env.borrow_mut() = captured);
+    let result = body();
+    TEST_CHILD_ENV.with(|env| env.borrow_mut().clear());
+    result
+}
+
 /// Decode one line of Git path output, keeping raw bytes on Unix.
-fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
+pub(crate) fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if bytes.is_empty() {

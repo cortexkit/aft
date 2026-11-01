@@ -1,0 +1,17 @@
+{
+  "project_detection": {
+    "mode": "off"
+  },
+  "harnesses": {
+    "pi": {
+      "project_detection": {
+        "overrides": [
+          {
+            "path": "/source",
+            "mode": "project"
+          }
+        ]
+      }
+    }
+  }
+}

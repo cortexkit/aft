@@ -35,7 +35,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let project_dir = tempfile::tempdir().expect("project dir");
+        let project_dir = crate::test_helpers::project::project_tempdir();
         let storage_dir = tempfile::tempdir().expect("storage dir");
         fs::write(
             project_dir.path().join("lib.rs"),
@@ -93,7 +93,7 @@ impl Fixture {
         .expect("configure request");
         let response = aft::commands::configure::handle_configure(&request, &ctx);
         assert!(response.success, "configure failed: {response:?}");
-        aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+        crate::test_helpers::admission::settle(&ctx);
         if indexes
             .as_object()
             .is_some_and(|planes| planes.values().any(|on| on == true))

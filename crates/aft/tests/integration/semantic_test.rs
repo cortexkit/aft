@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::project::project_tempdir();
 
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
@@ -50,7 +50,7 @@ fn configure_semantic(
     storage_dir: &Path,
     enabled: bool,
 ) -> Value {
-    send(
+    let response = send(
         aft,
         json!({
             "id": "cfg-semantic",
@@ -68,7 +68,11 @@ fn configure_semantic(
                 serde_json::json!({ "indexes": { "semantic": false, "trigram": false } })
             }),
         }),
-    )
+    );
+    if response["success"] == true {
+        aft.wait_for_folder_admission();
+    }
+    response
 }
 
 fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {

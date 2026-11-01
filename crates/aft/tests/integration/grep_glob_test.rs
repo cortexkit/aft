@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::project::project_tempdir();
 
     // Ignore-rule fixtures need a real repository: a partial .git directory is
     // corrupt metadata, not evidence that this project is outside Git.
@@ -51,6 +51,7 @@ fn configure(aft: &mut AftProcess, root: &Path) {
 }
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     let resp = send(
         aft,
         json!({
@@ -62,6 +63,7 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn send(aft: &mut AftProcess, request: Value) -> Value {
@@ -1734,7 +1736,10 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
 #[test]
 fn filtered_scope_distinguishes_no_files_from_no_matches() {
     for indexed in [false, true] {
-        let project = setup_project(&[("src/a.txt", "hello\n"), ("src/b.rs", "hello\n")]);
+        let project = crate::test_helpers::project::git_project_tempdir();
+        fs::create_dir(project.path().join("src")).unwrap();
+        fs::write(project.path().join("src/a.txt"), "hello\n").unwrap();
+        fs::write(project.path().join("src/b.rs"), "hello\n").unwrap();
         fs::create_dir(project.path().join("empty")).unwrap();
         let mut aft = AftProcess::spawn();
         if indexed {

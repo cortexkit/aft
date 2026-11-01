@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "opencode": {
+      "project_detection": {
+        "mode": "project"
+      }
+    }
+  }
+}

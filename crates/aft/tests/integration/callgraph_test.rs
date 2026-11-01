@@ -13,11 +13,13 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     let resp = aft.send(&format!(
         r#"{{"id":"configure","command":"configure","harness":"opencode","project_root":{}}}"#,
         crate::helpers::json_string(&root.display())
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn path_text_ends_with(path: &str, suffix: &str) -> bool {
@@ -2075,7 +2077,7 @@ fn callgraph_trace_to_symbol_not_found() {
 }
 
 fn temp_callgraph_fixture() -> (tempfile::TempDir, String) {
-    let temp = tempdir().unwrap();
+    let temp = crate::test_helpers::project::project_tempdir();
     let fixtures = fixture_path("callgraph");
     copy_dir_all(&fixtures, temp.path());
     let root = temp.path().display().to_string();

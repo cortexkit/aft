@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+pub mod admission;
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
+pub mod project;
 mod timeout_forensics;
 
 #[path = "../../src/test_env.rs"]
@@ -845,7 +847,8 @@ impl AftProcess {
         self.wait_for_child_exit(timeout, context)
     }
 
-    /// Send a configure command with project_root.
+    /// Configure a fixture and wait for its folder decision. Tests of the
+    /// acknowledgement itself use `send` or `send_silent` instead.
     pub fn configure(&mut self, project_root: &std::path::Path) -> serde_json::Value {
         // Build via serde_json so Windows paths (with backslashes) are
         // escaped correctly in the wire format. Hand-formatted JSON would
@@ -856,7 +859,57 @@ impl AftProcess {
             "harness": "opencode",
             "project_root": project_root.to_string_lossy(),
         });
-        self.send(&request.to_string())
+        let response = self.send(&request.to_string());
+        if response["success"] == true {
+            self.wait_for_folder_admission();
+        }
+        response
+    }
+
+    /// Configure an ordinary tool-behavior fixture, not a folder-admission test.
+    pub fn configure_project(&mut self, project_root: &std::path::Path) -> serde_json::Value {
+        project::ensure_project(project_root).expect("mark test project");
+        self.configure(project_root)
+    }
+
+    /// Finish project setup before testing a tool that must not run against
+    /// initializing persistence. Database-lifecycle fixtures use the configure
+    /// acknowledgement directly instead.
+    pub fn wait_for_project_ready(&mut self) {
+        self.wait_for_folder_admission();
+        let response = self.send(
+            r#"{"id":"fixture-database-ready","command":"db_get_host_state","key":"fixture-readiness"}"#,
+        );
+        assert_eq!(
+            response["success"], true,
+            "database setup failed: {response}"
+        );
+    }
+
+    /// The configure acknowledgement precedes the folder decision. Fixtures
+    /// testing tools rather than the acknowledgement must wait until the folder
+    /// decision is complete.
+    pub fn wait_for_folder_admission(&mut self) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = self.send(r#"{"id":"fixture-folder-admission","command":"status"}"#);
+            assert_eq!(status["success"], true, "status failed: {status}");
+            let replay_pending = status["degraded_reasons"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason == "folder_admission_pending")
+                });
+            if status["folder"]["state"] == "decided" && !replay_pending {
+                return status["folder"].clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder admission did not settle: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Send a configure command with `format_on_edit: true`.

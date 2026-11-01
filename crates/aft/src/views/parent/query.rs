@@ -206,6 +206,7 @@ pub(crate) fn grep_fan_out(
         };
         let mut snapshots = Vec::new();
         for child in overlapping(&session, search_root) {
+            super::worker::admit_child(&session, &child);
             let trigram = read(&child.trigram).clone();
             let Plane::Ready(trigram) = trigram else {
                 if let Some(reason) = trigram.gap_reason("trigram") {
@@ -324,6 +325,7 @@ pub(crate) fn glob_fan_out(
             continue;
         }
         for child in overlapping(&session, &search_root) {
+            super::worker::admit_child(&session, &child);
             let trigram = read(&child.trigram).clone();
             let Plane::Ready(trigram) = trigram else {
                 if let Some(reason) = trigram.gap_reason("trigram") {
@@ -511,6 +513,7 @@ fn callgraph(
         );
         return gap_response(req, operation, gaps);
     };
+    super::worker::admit_child(session, &child);
     let plane = read(&child.callgraph).clone();
     let Plane::Ready(callgraph) = plane else {
         if let Some(reason) = plane.gap_reason("call graph") {

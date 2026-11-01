@@ -136,6 +136,7 @@ fn configured_context(root: &Path) -> AppContext {
 }
 
 fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -167,6 +168,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -174,6 +176,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
 /// reserves terminal-egress time inside this value, and timeout detail still
 /// carries the configured budget.
 fn configured_restricted_context(root: &Path) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -199,10 +202,12 @@ fn configured_restricted_context(root: &Path) -> AppContext {
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -228,6 +233,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     ctx
 }
 
@@ -1874,6 +1880,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         &ctx,
     );
     assert!(configured.success, "{configured:?}");
+    crate::test_helpers::admission::settle(&ctx);
     assert!(
         !ctx.callgraph_writer(),
         "worktree must remain borrow-only for legacy artifacts"
@@ -8579,6 +8586,7 @@ fn configured_context_with_held_applicability(
     root: &Path,
     timeout_ms: u64,
 ) -> (AppContext, aft::context::ProjectApplicabilityHold) {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -8605,6 +8613,7 @@ fn configured_context_with_held_applicability(
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     (ctx, hold)
 }
 
@@ -8873,6 +8882,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     let storage_dir = root.join(".aft-test-storage");
     fs::create_dir_all(&root).expect("create project root");
     write_file(&root, "src/app.customts", "export const value = 1;\n");
+    crate::test_helpers::project::mark_project(&root).unwrap();
 
     let server_id = "needs-marker-ls";
     let ctx = AppContext::new(
@@ -8910,6 +8920,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         configure_response["success"], true,
         "configure failed: {configure_response:#}"
     );
+    crate::test_helpers::admission::settle(&ctx);
     ctx.lsp().override_binary(
         ServerKind::Custom(std::sync::Arc::from(server_id)),
         fake_server_path(),
@@ -9931,6 +9942,7 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx
@@ -10054,6 +10066,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx.lsp()
@@ -10204,6 +10217,7 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         configure_fake_rust_lsp(&ctx);
         // Default fake startup is already quiescent; its check therefore begins
         // after workspace load. The warming variant settles only on didOpen,

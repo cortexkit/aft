@@ -48,6 +48,7 @@ fn configured_context_with_storage(
     storage_dir: &Path,
     callgraph_store: bool,
 ) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -79,6 +80,7 @@ fn configured_context_with_storage(
     // this file's scheduling decisions, not the suite's load (issue #1190's
     // isolation seam).
     ctx.isolate_cold_build_limiter_for_test(2);
+    crate::test_helpers::admission::settle(&ctx);
     // These fixtures exercise scheduler behavior rather than LSP startup. Seed a
     // checked-clean report tied to real file content so the warm inspect path
     // can finish diagnostics without starting a language server.

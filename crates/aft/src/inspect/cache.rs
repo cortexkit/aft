@@ -4133,6 +4133,7 @@ pub(crate) mod tests {
         assert!(response.success, "{}", response.data);
         ctx.inspect_manager()
             .set_automatic_tier2_refresh_allowed(false);
+        crate::test_admission::settle(&ctx);
         ctx
     }
 

@@ -11,7 +11,7 @@ fn semantic_feature_after_configure(
     aft: &mut AftProcess,
     config: Option<serde_json::Value>,
 ) -> bool {
-    let project = tempfile::tempdir().expect("project dir");
+    let project = crate::test_helpers::project::project_tempdir();
     std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
     let mut request = json!({
         "id": "cfg",
@@ -27,6 +27,7 @@ fn semantic_feature_after_configure(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    aft.wait_for_folder_admission();
     let status = aft.send(&json!({ "id": "status", "command": "status" }).to_string());
     status["features"]["semantic_search"]
         .as_bool()

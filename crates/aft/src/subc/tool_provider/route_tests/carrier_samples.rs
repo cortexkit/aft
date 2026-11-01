@@ -92,10 +92,13 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     let (dir, _) = test_support::test_root("carrier-samples");
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
+    crate::test_project::mark_project(&project).unwrap();
     std::fs::write(project.join("main.rs"), SOURCE).unwrap();
     let root = ProjectRootId::from_path(&project).unwrap();
     let ctx = test_support::test_ctx();
-    let config = json!({"indexes":{"trigram":true,"semantic":false,"callgraph":true}});
+    // These samples need an installed SearchIndex, which views do not populate.
+    let config = json!({"indexes":{"trigram":true,"semantic":false,"callgraph":true},
+        "views":{"enabled":false}});
     let request: RawRequest = serde_json::from_value(json!({
         "id":"configure-carrier-samples", "command":"configure", "harness":"runner",
         "project_root":project, "storage_dir":dir.path().join("storage"),
@@ -104,7 +107,7 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     .unwrap();
     let response = crate::commands::configure::handle_configure(&request, &ctx);
     assert!(response.success, "configure: {response:?}");
-    crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_admission::settle(&ctx);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         crate::runtime_drain::drain_search_index_events(&ctx);

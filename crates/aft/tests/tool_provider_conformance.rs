@@ -37,6 +37,9 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
+#[path = "helpers/project.rs"]
+mod project_fixture;
+
 const LEGACY_FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/tool_provider_legacy_replies.json"
@@ -430,6 +433,7 @@ struct Subject {
     project: Mutex<Option<PathBuf>>,
     served_tools: Mutex<Option<BTreeSet<String>>>,
     capture_live_status: bool,
+    settled_project: bool,
     catalog_powershell: bool,
     legacy_diagnostics: Arc<Mutex<HashMap<String, Value>>>,
     /// Stands in for the consumer's elicitation provider: the permission
@@ -444,6 +448,7 @@ impl Subject {
             project: Mutex::new(None),
             served_tools: Mutex::new(None),
             capture_live_status: false,
+            settled_project: false,
             catalog_powershell: false,
             legacy_diagnostics: Arc::default(),
             stand_in: Arc::default(),
@@ -458,6 +463,10 @@ impl Subject {
     }
     fn with_catalog_powershell(mut self) -> Self {
         self.catalog_powershell = true;
+        self
+    }
+    fn with_settled_project(mut self) -> Self {
+        self.settled_project = true;
         self
     }
     fn assert_catalog_powershell_fixture_policy(&self) {
@@ -751,6 +760,8 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
             directory.display()
         ))
     })?;
+    project_fixture::mark_project(&root.join("project"))
+        .map_err(|error| HarnessError::new(format!("marking provider project: {error}")))?;
     let config = directory.join("aft.jsonc");
     std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "indexes": {"callgraph": false, "trigram": false, "semantic": false}})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
     Ok(())
@@ -1098,6 +1109,9 @@ impl Harness for Subject {
         route.scoped_preset = self.preset.or(Some("head"));
         route.legacy_diagnostics = Some(self.legacy_diagnostics.clone());
         wait_for_route_ready(&route, self.quick_call()).await;
+        if self.settled_project {
+            wait_for_folder_ready(&route, self.preset.unwrap_or("head")).await?;
+        }
         if self.served_tools.lock().unwrap().is_none() {
             let catalog = catalog_reply(&route, self.catalog_arguments()).await;
             *self.served_tools.lock().unwrap() = Some(
@@ -1458,6 +1472,51 @@ async fn wait_for_route_ready(route: &Route, probe: CallSpec) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Result inventories wait for admission before comparing tool replies. These
+/// tests replace the status reply with a fixed snapshot, so a valid regex search
+/// is used instead. It scans files with the text and semantic indexes off and
+/// does not depend on whether argument errors precede admission refusals.
+async fn wait_for_folder_ready(route: &Route, preset: &str) -> Result<(), HarnessError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Distinct patterns prevent setup retries from triggering repeated-call warnings.
+    for attempt in 0.. {
+        let frame = tokio::time::timeout_at(
+            deadline,
+            route.terminal(json!({
+                "op": "tool.call", "preset": preset, "name": "search",
+                "arguments": {"pattern": format!("__fixture_admission_{}_{attempt}__", route.channel)}
+            })),
+        )
+        .await
+        .map_err(harness_error)?;
+        let reply = response_json(&frame);
+        if reply["isError"] == false {
+            return Ok(());
+        }
+        let result = reply.get("structuredContent").unwrap_or(&reply);
+        let pending = result["code"] == "folder_not_admitted"
+            && result["reason"] == "folder_admission_pending";
+        // Text-only pending refusals still carry the code and reason.
+        let legacy_pending = reply["content"].as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block["text"] == "folder_not_admitted: folder_admission_pending")
+        });
+        if !pending && !legacy_pending {
+            return Err(HarnessError::new(format!(
+                "project fixture did not settle: {reply}"
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HarnessError::new(format!(
+                "folder admission timed out: {reply}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    unreachable!()
 }
 
 #[tokio::test]
@@ -4096,6 +4155,7 @@ async fn assert_legacy_probe_wire_bytes(subject: Subject) {
 }
 
 async fn assert_legacy_probe_wire_bytes_at(subject: Subject, root: &Path) {
+    let subject = subject.with_settled_project();
     let fixtures = legacy_fixtures();
     assert_eq!(
         fixtures["source_commit"],
@@ -4203,6 +4263,7 @@ async fn every_catalog_preset_passes_the_conformance_suite() {
 /// (`Route::adapt_preset`) therefore adds the subject's preset to every
 /// scoped tool call that is not a role operation.
 async fn conformance_inventory(subject: Subject) {
+    let subject = subject.with_settled_project();
     use cortexkit_role_tool_provider_conformance::{CaseOutcome, SuiteVerdict, CASES};
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/tool_provider_conformance.json")).unwrap();

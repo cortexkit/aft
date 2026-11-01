@@ -26,7 +26,7 @@ use crate::lsp::registry::{
     ServerKind,
 };
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
-use crate::protocol::{RawRequest, Response};
+use crate::protocol::{ConfigureWarningsFrame, RawRequest, Response};
 use crate::search_index::{
     build_path_filters, current_git_head, resolve_cache_dir_with_key,
     walk_project_files_bounded_matching, CacheLock, SearchIndex,
@@ -36,6 +36,10 @@ use crate::watcher_filter::{self, WatcherFilterConfig, WatcherThreadHandle};
 use crate::{slog_debug, slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+#[path = "configure/folder_admission_lifecycle_tests.rs"]
+mod folder_admission_lifecycle_tests;
 
 static SEMANTIC_STALE_GENERATION_DISCARDS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -659,13 +663,6 @@ fn configure_replay_session_calls_for_test() -> u64 {
     CONFIGURE_REPLAY_SESSION_CALLS.load(Ordering::SeqCst)
 }
 
-fn resolve_home_dir() -> Option<PathBuf> {
-    let raw = crate::environment::non_empty_os_var("HOME")
-        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
-        .map(PathBuf::from)?;
-    Some(std::fs::canonicalize(&raw).unwrap_or(raw))
-}
-
 pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     let home = crate::production_storage::account_home().ok()?;
@@ -676,6 +673,8 @@ pub(crate) fn resolve_account_home_dir() -> Option<PathBuf> {
     canonical.is_dir().then_some(canonical)
 }
 
+/// Authorizes `readonly_artifacts` scans outside the bound project. Index
+/// admission does not use this permission-widening rule.
 pub(crate) fn project_root_is_too_broad(
     canonical_root: &Path,
     canonicalization_failed: bool,
@@ -3929,7 +3928,11 @@ fn handle_configure_prepared(
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
     crate::lsp::typescript_project::clear_typescript_selection();
-    let response = handle_configure_inner(req, ctx, prepared);
+    let mut response = handle_configure_inner(req, ctx, prepared, None);
+    if response.success {
+        crate::folder_admission_runtime::after_configure(ctx, req);
+    }
+    crate::folder_admission_runtime::decorate(ctx, &mut response, true, req.session());
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
@@ -3947,10 +3950,55 @@ fn handle_configure_prepared(
     response
 }
 
+pub(crate) fn handle_folder_admission_replay(req: &RawRequest, ctx: &AppContext) -> Response {
+    let Some(config) = crate::folder_admission_runtime::requested(ctx) else {
+        return Response::success(&req.id, json!({}));
+    };
+    let mut response = handle_configure_inner(req, ctx, None, Some(&config));
+    #[cfg(debug_assertions)]
+    crate::folder_admission_runtime::trace_for_test(format_args!(
+        "replay returned success={} folder={:?}",
+        response.success,
+        crate::folder_admission_runtime::snapshot(ctx)
+    ));
+    if response.success {
+        crate::folder_admission_runtime::after_configure(ctx, req);
+    }
+    crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
+    crate::folder_admission_runtime::decorate(ctx, &mut response, true, req.session());
+    if response.success {
+        let warnings = response.data.get("folder_notice").and_then(Value::as_str).map(|message| vec![json!({
+            "code": "folder_not_admitted", "message": message, "folder": response.data["folder"]
+        })]).unwrap_or_default();
+        for session in crate::folder_admission_runtime::take_waiting_sessions(ctx) {
+            if session == req.session()
+                && response.data["warnings_pending"].as_bool().unwrap_or(false)
+            {
+                continue;
+            }
+            let _ = ctx.configure_warnings_sender().send((
+                ctx.configure_generation(),
+                ConfigureWarningsFrame {
+                    frame_type: "configure_warnings",
+                    session_id: Some(session),
+                    project_root: ctx
+                        .canonical_cache_root_opt()
+                        .unwrap_or_default()
+                        .display()
+                        .to_string(),
+                    warnings: warnings.clone(),
+                },
+            ));
+        }
+    }
+    response
+}
+
 fn handle_configure_inner(
     req: &RawRequest,
     ctx: &AppContext,
     prepared: Option<&Config>,
+    admission_config: Option<&Config>,
 ) -> Response {
     let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
@@ -4019,7 +4067,7 @@ fn handle_configure_inner(
     let previous_project_root = previous_config.project_root.clone();
     let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
     wait_on_configure_semantic_snapshot_gate_for_test(&req.id);
-    let mut next_config = previous_config.as_ref().clone();
+    let mut next_config = admission_config.unwrap_or(previous_config.as_ref()).clone();
     next_config.project_root = Some(root_path.clone());
     next_config.harness = Some(harness.clone());
 
@@ -4047,7 +4095,7 @@ fn handle_configure_inner(
     // deferred until the next connect must stay deferred. The running config
     // already holds this request's resolved tiers, so nothing is re-resolved
     // and the recorded config sources are left as they are.
-    let recovery = prepared.is_some();
+    let recovery = prepared.is_some() || admission_config.is_some();
     let bind_config = if recovery {
         None
     } else {
@@ -4315,39 +4363,32 @@ fn handle_configure_inner(
     let canonical_cache_root = canonical_root.unwrap_or_else(|_| root_path.clone());
     debug_assert!(canonical_cache_root.is_absolute());
     let mut degraded_reasons: Vec<String> = Vec::new();
-    let home = resolve_home_dir();
-    let home_root = home
-        .as_ref()
-        .is_some_and(|home| *home == canonical_cache_root);
-    if home_root {
-        degraded_reasons.push("home_root".to_string());
-    }
-    let account_home = resolve_account_home_dir();
-    let root_too_broad = home_root
-        || project_root_is_too_broad(
-            &canonical_cache_root,
-            canonicalization_failed,
-            account_home.as_deref(),
-        );
+    let force_folder_check =
+        admission_config.is_none() && params.get("refresh").and_then(Value::as_bool) == Some(true);
+    let admission = crate::folder_admission_runtime::prepare(
+        ctx,
+        &canonical_cache_root,
+        &next_config,
+        force_folder_check,
+        admission_config.is_some(),
+    );
+    let workspace = admission.as_ref().is_some_and(|a| {
+        a.classification == crate::folder_admission::FolderClassification::Workspace
+    });
+    let root_too_broad = canonicalization_failed
+        || admission.as_ref().is_none_or(|a| {
+            a.classification == crate::folder_admission::FolderClassification::NotProject
+        });
+    let combined_root_off = root_too_broad || workspace;
     if root_too_broad {
-        degraded_reasons.push("root_too_broad".to_string());
-        let warning_reason = if home_root {
-            "home_root"
-        } else if account_home.is_some() {
-            "root_too_broad"
-        } else {
-            "account_home_unknown"
-        };
-        let warning_message = if account_home.is_some() || home_root {
-            "Watching and indexing are off for this broad root; explicit-path tools remain available."
-        } else {
-            "The account home could not be determined, so only the filesystem or volume root is protected by the home rule. Watching and indexing are off for this broad root; explicit-path tools remain available."
-        };
-        configure_warnings.push(json!({
-            "code": "root_too_broad",
-            "reason": warning_reason,
-            "message": warning_message,
-        }));
+        degraded_reasons.push(
+            if admission.is_none() {
+                "folder_admission_pending"
+            } else {
+                "folder_not_admitted"
+            }
+            .into(),
+        );
     }
 
     // Equivalent live binds can reuse the existing topology and artifacts, but
@@ -4357,6 +4398,8 @@ fn handle_configure_inner(
         .filter(|canonical_root| {
             ctx.configure_generation() > 0
                 && !root_too_broad
+                && !workspace
+                && !crate::folder_admission_runtime::blocked(ctx)
                 && ctx.harness_opt().as_ref() == Some(&harness)
                 && (previous_project_root.as_deref() == Some(root_path.as_path())
                     || canonical_root.as_path() == root_path)
@@ -4528,7 +4571,11 @@ fn handle_configure_inner(
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
+    let (is_worktree_bridge, git_common_dir) = if combined_root_off {
+        (false, None)
+    } else {
+        detect_worktree_bridge(ctx, &canonical_cache_root)
+    };
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
@@ -4548,13 +4595,22 @@ fn handle_configure_inner(
         next_config.semantic.max_files = next_config.semantic.max_files.max(UNCAPPED);
     }
 
-    // Reject filesystem/volume roots, home and its ancestors before discovering
-    // repositories or scheduling indexes. Direct children of a volume can be
-    // ordinary projects; retain this project-specific admission for later work.
-    if root_too_broad {
+    let requested_config = next_config.clone();
+    // Admission precedes every root-wide index, including cached artifacts.
+    if combined_root_off {
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
+        next_config.disabled_lsp.extend(
+            crate::lsp::registry::builtin_servers()
+                .into_iter()
+                .map(|server| server.kind.id_str().to_ascii_lowercase()),
+        );
+        for server in &mut next_config.lsp_servers {
+            server.disabled = true;
+        }
+    }
+    if root_too_broad {
         next_config.views.enabled = false;
     }
     // A context that binds another root stops holding the parent folder
@@ -4566,15 +4622,17 @@ fn handle_configure_inner(
     // parent session, which serves those same types from the children.
     // The decision is a probe bounded by a short wall-clock budget; the full
     // walk for every child runs on the parent session's worker.
-    let parent_folder = !root_too_broad
+    let parent_folder = workspace
         && next_config.views.enabled
-        && crate::views::parent::prepare(
+        && crate::views::parent::prepare_admitted(
             &canonical_cache_root,
             crate::views::parent::RequestedPlanes {
-                trigram: next_config.indexes.trigram,
-                semantic: next_config.indexes.semantic,
-                callgraph: next_config.indexes.callgraph,
+                trigram: requested_config.indexes.trigram,
+                semantic: requested_config.indexes.semantic,
+                callgraph: requested_config.indexes.callgraph,
             },
+            admission.as_ref().expect("workspace admission"),
+            &next_config.project_detection,
         );
     let parent_semantic = next_config.semantic.clone();
     if parent_folder {
@@ -4614,7 +4672,8 @@ fn handle_configure_inner(
     );
     if ctx.configure_generation() > 0
         && !root_too_broad
-        && (!parent_folder || crate::views::parent::held_by(ctx, &canonical_cache_root))
+        && (!parent_folder
+            || crate::views::parent::prepared_matches_active(ctx, &canonical_cache_root))
         && !ctx.database_runtime_failed()
         && !ctx.artifact_identity_provisional()
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -4780,15 +4839,12 @@ fn handle_configure_inner(
     // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
     // by an explicit user override) it short-circuits. Must run here, not lazily
     // from the worker thread, because env mutation races ort's own dlopen.
-    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
+    if let Some(storage_dir) = next_config
+        .storage_dir
+        .as_deref()
+        .filter(|_| next_config.indexes.semantic)
+    {
         crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
-    }
-
-    if root_too_broad {
-        slog_warn!(
-            "watching and indexing auto-disabled: root_too_broad ({}). Open a project subdirectory for full features.",
-            canonical_cache_root.display()
-        );
     }
 
     // A new configure generation may observe a changed project-local formatter.
@@ -4806,7 +4862,7 @@ fn handle_configure_inner(
     // Choose a durable identity at the first bind that needs an artifact key.
     // With indexes and views off, keep the no-key, no-Git-probe fast path.
     let artifact_key_needed = cache_available
-        && !root_too_broad
+        && !combined_root_off
         && (next_config.indexes.trigram
             || next_config.indexes.semantic
             || next_config.indexes.callgraph
@@ -4974,12 +5030,9 @@ fn handle_configure_inner(
     // A parent folder, like HOME, runs no project-wide work over the folder
     // itself; its children are served from their own sessions' results.
     let inspect_writer_capability =
-        root_cache_storage_ok && !root_too_broad && !parent_folder && !identity_provisional;
-    let heavy_root_work_allowed = cache_available
-        && !root_too_broad
-        && !parent_folder
-        && !identity_provisional
-        && !degraded_reasons.iter().any(|reason| reason == "home_root");
+        root_cache_storage_ok && !combined_root_off && !parent_folder && !identity_provisional;
+    let heavy_root_work_allowed =
+        cache_available && !combined_root_off && !parent_folder && !identity_provisional;
 
     // Commit seal: past this point the configure mutates AppContext and must
     // run to completion. The seal races the canceller atomically — exactly one
@@ -4999,6 +5052,14 @@ fn handle_configure_inner(
         }
     }
     ctx.begin_configure_ack_phase("state_commit");
+    if combined_root_off
+        && !(parent_folder
+            && cache_available
+            && !identity_provisional
+            && crate::views::parent::prepared_matches_active(ctx, &canonical_cache_root))
+    {
+        ctx.folder_admission().close();
+    }
     // Each step below is timed separately inside `state_commit`, so a slow
     // commit names the step that took the time in the timing line.
     ctx.begin_configure_ack_step("database_runtime");
@@ -5081,10 +5142,14 @@ fn handle_configure_inner(
         ctx.request_checkpoint_namespace(storage_dir, harness.clone());
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
+    // A pending or refused root has not established ownership of shared
+    // artifacts. Low-level store APIs must not grant shared write authority
+    // before admission and topology are known, even if the root is not yet
+    // recognized as a linked worktree.
     crate::root_cache::configure_artifact_access(
         &canonical_cache_root,
         &project_key,
-        is_worktree_bridge,
+        is_worktree_bridge || combined_root_off || identity_provisional,
     );
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
@@ -5101,16 +5166,27 @@ fn handle_configure_inner(
         ctx.forget_unsettled_artifact_cache_key(&canonical_cache_root, &root_path);
     }
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
+    if combined_root_off
+        && (project_root_changed
+            || previous_config.indexes.trigram
+            || previous_config.indexes.semantic
+            || previous_config.indexes.callgraph)
+    {
+        ctx.reset_symbol_cache();
+    }
     if root_too_broad {
         ctx.stop_watcher_runtime();
-        crate::views::parent::deactivate(&canonical_cache_root);
+        crate::views::parent::release_context(ctx);
     }
     // Past the commit seal: start (or join) the parent session now, so the
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
     ctx.begin_configure_ack_step("views_parent");
-    if cache_available && !root_too_broad && !identity_provisional {
+    if cache_available && parent_folder && !root_too_broad && !identity_provisional {
         crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
+    } else {
+        crate::views::parent::forget_prepared(&canonical_cache_root);
+        crate::views::parent::release_context(ctx);
     }
     ctx.begin_configure_ack_step("warm_key");
     let warm_key = configure_warm_key(
@@ -5127,6 +5203,14 @@ fn handle_configure_inner(
         || previous_config.cache_epoch != next_config.cache_epoch;
     let (configure_generation, equivalent_warm_config) =
         ctx.note_configure_warm_key(warm_key, semantic_build_inputs_changed);
+    crate::folder_admission_runtime::commit(
+        ctx,
+        &canonical_cache_root,
+        requested_config,
+        req,
+        force_folder_check,
+        admission.is_none(),
+    );
     release_callgraph_start_waiters_for_generation_change(
         previous_canonical_cache_root.as_deref(),
         &canonical_cache_root,
@@ -5338,7 +5422,14 @@ fn handle_configure_inner(
             // root (linked worktree, borrowed index family) follows the
             // owner's published store; a token here would never be fulfilled
             // and would keep every later callgraph query Unavailable.
-            if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
+            // Once the folder probe admits a project, configure is replayed to
+            // restore indexes disabled only while that probe was pending. This
+            // is still their first real bind: validate and reuse an existing
+            // store rather than forcing a new generation.
+            if admission_config.is_none()
+                && previous_project_root.as_ref() == Some(&root_path)
+                && ctx.callgraph_writer()
+            {
                 ctx.mark_callgraph_store_force_rebuild(
                     "callgraph build inputs changed (storage, enablement, or worktree topology)",
                 );
@@ -5404,7 +5495,7 @@ fn handle_configure_inner(
         artifact_root: crate::root_cache::cache_root(&next_config),
         harness_dir: storage_root.join(harness.storage_segment()),
         session_id: req.session().to_string(),
-        root_too_broad,
+        root_too_broad: combined_root_off,
         format_tool_cache_clear_needed,
         run_bash_replay: !equivalent_warm_config || first_session_bind,
         configure_database_runtime: true,
@@ -5438,7 +5529,7 @@ fn handle_configure_inner(
     // On a normal project this finishes in <1 s and pushes a
     // `ConfigureWarningsFrame` for the plugin to surface; on a huge directory
     // it may take seconds-to-minutes, but configure itself returns now.
-    let warnings_pending = !root_too_broad && ctx.progress_sender_handle().is_some();
+    let warnings_pending = !combined_root_off && ctx.progress_sender_handle().is_some();
     if warnings_pending {
         let warning_tx = ctx.configure_warnings_sender();
         let session_id_for_bg = log_ctx::current_session();
@@ -5476,7 +5567,7 @@ fn handle_configure_inner(
         json!({
             "project_root": root_path.display().to_string(),
             "warnings": configure_warnings,
-            "warnings_pending": warnings_pending,
+        "warnings_pending": warnings_pending || admission.is_none(),
             "search_index_cache_reused": search_index_cache_reused,
             "artifact_owner": artifact_owner_status
                 .as_ref()
@@ -5585,6 +5676,9 @@ fn release_callgraph_start_waiters_for_generation_change(
 /// Whether this root may build or refresh its own semantic index (see
 /// `semantic_admission`). A root that may not still reads a saved index.
 fn semantic_work_admitted(ctx: &AppContext) -> bool {
+    if crate::folder_admission_runtime::blocked(ctx) {
+        return false;
+    }
     ctx.canonical_cache_root_opt().is_some_and(|root| {
         crate::semantic_admission::admission(&root, &ctx.config().index.roots).admits()
     })
@@ -5604,6 +5698,12 @@ fn semantic_status_is_not_opened(ctx: &AppContext) -> bool {
 }
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
+    if !crate::folder_admission_runtime::artifacts_admitted(ctx) {
+        return ArtifactLoadNeeds {
+            search: false,
+            semantic: false,
+        };
+    }
     let config = ctx.config();
     let search_enabled = config.indexes.trigram && !config.views.enabled;
     let semantic_enabled = config.indexes.semantic;
@@ -5741,6 +5841,9 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// dropped. Without the overlay, a read-only root serves the shared snapshot
 /// as-is.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if !crate::folder_admission_runtime::artifacts_admitted(ctx) || ctx.parent_query_only() {
+        return false;
+    }
     if ctx.config().views.enabled {
         return false;
     }
@@ -5908,6 +6011,9 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
 /// query. Writer-owned failed indexes retain their no-retry behavior; read-only
 /// roots may retry a previously absent shared snapshot.
 pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool {
+    if !crate::folder_admission_runtime::artifacts_admitted(ctx) || ctx.parent_query_only() {
+        return false;
+    }
     if ctx.canonical_cache_root_opt().is_none() {
         return false;
     }
@@ -8276,7 +8382,7 @@ pub(crate) fn standalone_configure_maintenance_pending(
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
     state.absorb_enqueued(ctx);
-    state.has_ready_job() || (state.jobs.is_empty() && ctx.provisional_identity_retry().is_due())
+    state.has_ready_job() || (state.jobs.is_empty() && crate::provisional_identity_retry::due(ctx))
 }
 
 /// Finish request-critical configure work before standalone dispatch resumes.
@@ -8286,6 +8392,14 @@ pub(crate) fn drain_standalone_configure_prefix(
     ctx: &AppContext,
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
+    // Reapply the admitted configuration before storage and artifact
+    // housekeeping so a queued first tool does not wait for unrelated work.
+    if crate::provisional_identity_retry::folder_due(ctx) {
+        crate::provisional_identity_retry::drain_inline(ctx);
+    }
+    if crate::folder_admission_runtime::waiting(ctx) {
+        return false;
+    }
     state.absorb_enqueued(ctx);
     let jobs_to_visit = state.jobs.len();
     let mut ran_prefix = false;
@@ -8407,6 +8521,11 @@ pub(crate) fn drain_standalone_configure_unit(
     ctx: &Arc<AppContext>,
     state: &mut ConfigureMaintenanceState,
 ) -> bool {
+    if crate::folder_admission_runtime::waiting(ctx) {
+        drop_superseded_parked_continuations(ctx, state);
+        crate::provisional_identity_retry::drain_inline(ctx);
+        return true;
+    }
     state.absorb_enqueued(ctx);
     drop_superseded_parked_continuations(ctx, state);
     if state.jobs.is_empty() && crate::provisional_identity_retry::drain_inline(ctx) {
@@ -8937,6 +9056,18 @@ fn run_configure_maintenance_unit_inner(
             }
 
             delay_configure_deferred_maintenance_for_test(&job.root_path);
+            if crate::folder_admission_runtime::pending(ctx) {
+                if matches!(
+                    crate::folder_admission_runtime::resolve(ctx),
+                    crate::folder_admission_runtime::ResolveResult::Settled
+                ) {
+                    crate::provisional_identity_retry::finish_folder_check(ctx);
+                }
+            }
+            if job.root_too_broad {
+                ctx.lsp().shutdown_all();
+            }
+            crate::folder_admission_runtime::ensure_metadata_watch(ctx);
             // Start artifact workers only after sending the configure acknowledgement,
             // and only if this job's configure generation is still active.
             if ctx
@@ -10360,7 +10491,51 @@ mod tests {
 
     fn handle_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
         let _git_env = crate::test_env::hermetic_git_env_guard();
+        if crate::folder_admission_runtime::snapshot(ctx).is_none() {
+            if let Some(root) = req.params.get("project_root").and_then(Value::as_str) {
+                let root = Path::new(root);
+                if root.is_absolute() && root.is_dir() {
+                    // These fixtures exercise configure work for a known project.
+                    // Admission's pending/ack tests use the raw handler instead.
+                    crate::test_admission::prepare_project(ctx, root);
+                }
+            }
+        }
         super::handle_configure(req, ctx)
+    }
+
+    fn handle_folder_configure_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        super::handle_configure(req, ctx)
+    }
+
+    fn settle_configure_for_test(ctx: &AppContext) {
+        // Configure returns before checking whether the folder can be indexed.
+        // Drain that check and the replayed configuration before reading an index view.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            super::drain_deferred_configure_maintenance(ctx);
+            if ctx.configure_tail_idle()
+                && !crate::folder_admission_runtime::pending(ctx)
+                && !crate::provisional_identity_retry::due(ctx)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "configure maintenance did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn handle_configure_and_settle_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let response = handle_configure_for_test(req, ctx);
+        if response.success {
+            settle_configure_for_test(ctx);
+        }
+        response
     }
 
     fn bash_background_replay_fixture(
@@ -14091,7 +14266,7 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("AFT is running without its caches until it is back.")));
-        super::drain_deferred_configure_maintenance(&ctx);
+        settle_configure_for_test(&ctx);
         assert!(ctx.cache_unavailable_reason().is_some());
         assert_eq!(
             ctx.try_health_snapshot(&project).cache_unavailable_reason,
@@ -14141,7 +14316,7 @@ mod tests {
             .unwrap()
             .iter()
             .all(|warning| warning["code"] != "cache_dir_unavailable"));
-        super::drain_deferred_configure_maintenance(&ctx);
+        settle_configure_for_test(&ctx);
         assert!(ctx.cache_unavailable_reason().is_none());
         assert!(ctx.cache_dir().ends_with("offline-volume/aft"));
         let _ = ctx.flush_search_index_on_graceful_shutdown();
@@ -14369,7 +14544,8 @@ mod tests {
             deltas.physical_total_for_test(),
         );
         let ctx = test_context();
-        let bound = handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx);
+        let bound =
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx);
         assert!(bound.success, "{:?}", bound.data);
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.search_index_rx().read().unwrap().is_none());
@@ -14393,11 +14569,16 @@ mod tests {
         )
         .unwrap();
         filetime::set_file_mtime(root.join("shared.ts"), stamp).unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::remove_file(root.join("shared.ts")).unwrap();
         std::fs::write(root.join(".gitignore"), "").unwrap();
+        ctx.record_checkout_watcher_change(&root.join("shared.ts"));
+        ctx.record_checkout_watcher_change(&root.join(".gitignore"));
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::rename(root.join("new.ts"), root.join("moved.ts")).unwrap();
+        ctx.record_checkout_watcher_change(&root.join("new.ts"));
+        ctx.record_checkout_watcher_change(&root.join("moved.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         ctx.record_checkout_watcher_overflow();
         std::fs::write(root.join("moved.ts"), "needle alpha after overflow\n").unwrap();
@@ -14423,8 +14604,11 @@ mod tests {
         drop(ctx);
         let restarted = test_context();
         assert!(
-            handle_configure_for_test(&configure_lexical_views(&root, &storage), &restarted)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_lexical_views(&root, &storage),
+                &restarted
+            )
+            .success
         );
         lexical_views_assert_public_parity(&restarted, &root);
         assert_eq!(std::fs::read(cache.join("cache.bin")).unwrap(), owner_cache);
@@ -14441,6 +14625,28 @@ mod tests {
     }
 
     #[test]
+    fn lexical_views_wait_for_folder_admission_after_acknowledgement() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let ctx = test_context();
+        let response = handle_folder_configure_for_test(
+            &configure_lexical_views(&root, &temp.path().join("storage")),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response.data);
+        assert!(crate::folder_admission_runtime::pending(&ctx));
+        assert!(!ctx.heavy_root_work_allowed());
+        assert!(ctx.lexical_view_snapshot("bind").is_none());
+
+        settle_configure_for_test(&ctx);
+        assert!(!crate::folder_admission_runtime::pending(&ctx));
+        assert!(ctx.heavy_root_work_allowed());
+        assert!(matches!(ctx.lexical_view_snapshot("bind"), Some(Ok(_))));
+    }
+
+    #[test]
     fn lexical_views_public_empty_generation_and_live_only_addition_match_legacy() {
         // Holds the process environment lock for the whole test. These views
         // resolve their storage root and verify the Git conversion policy on
@@ -14453,14 +14659,23 @@ mod tests {
         let root = temp.path().join("project");
         let storage = temp.path().join("storage");
         std::fs::create_dir_all(&root).unwrap();
+        assert!(git_command(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
         std::fs::write(
             root.join("new.ts"),
             "export const OLDER_COMMIT_TOKEN = 1;\nneedle alpha\n",
         )
         .unwrap();
+        ctx.record_checkout_watcher_change(&root.join("new.ts"));
         lexical_views_assert_public_parity(&ctx, &root);
         assert!(!storage.join("blobs/v2").exists());
     }
@@ -14479,7 +14694,10 @@ mod tests {
         init_git_fixture(&root);
         let storage = temp.path().join("storage");
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_with_storage(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_with_storage(&root, &storage), &ctx)
+                .success
+        );
         wait_for_search_index_ready(&ctx, Duration::from_secs(10));
         assert_eq!(ctx.lexical_view_route_counts(), [0; 3]);
         let floor = std::fs::read(storage.join("reader-floor.json")).ok();
@@ -14506,7 +14724,10 @@ mod tests {
             "export const OLDER_COMMIT_TOKEN = 7;\nneedle alpha\n",
         )
         .unwrap();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
         tx.send(stale).unwrap();
@@ -14539,7 +14760,7 @@ mod tests {
         std::fs::write(root.join("visible.ts"), "needle\n").unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14749,7 +14970,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14911,7 +15132,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -14973,7 +15194,7 @@ mod tests {
         .unwrap();
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_lexical_views(&root, &temp.path().join("storage")),
                 &ctx
             )
@@ -15023,7 +15244,10 @@ mod tests {
         let storage = PathBuf::from(std::env::var_os("AFT_LEXICAL_KILL_STORAGE").unwrap());
         let root = PathBuf::from(root);
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
         println!("LEXICAL_VIEW_PUBLISHED");
         use std::io::{Read, Write};
@@ -15084,7 +15308,10 @@ mod tests {
         )
         .unwrap();
         let ctx = test_context();
-        assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
+        assert!(
+            handle_configure_and_settle_for_test(&configure_lexical_views(&root, &storage), &ctx)
+                .success
+        );
         lexical_views_assert_public_parity(&ctx, &root);
     }
 
@@ -15144,7 +15371,7 @@ mod tests {
         }
         let oracle = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&copy_root, storage.path(), false),
                 &oracle
             )
@@ -15220,8 +15447,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         callgraph_views_assert_parity(&ctx, &root);
 
@@ -15251,7 +15481,7 @@ mod tests {
         drop(ctx);
         let restarted = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&root, &storage, true),
                 &restarted
             )
@@ -15305,8 +15535,11 @@ mod tests {
         // A legacy store built for this very root must not answer either.
         let legacy = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, false), &legacy)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, false),
+                &legacy
+            )
+            .success
         );
         let legacy_store = {
             let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&legacy, 60_000);
@@ -15314,8 +15547,11 @@ mod tests {
         };
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         *ctx.callgraph_store().write().unwrap() = Some(legacy_store);
         let refused = Arc::new(Refused(Default::default()));
@@ -15479,8 +15715,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         let failed_file = root.join("a.ts");
         let load_error = format!(
@@ -15644,8 +15883,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         assert!(ctx.views_route_root());
         // The view load stage runs here; a routed root opens no v1 view.
@@ -15705,7 +15947,7 @@ mod tests {
         // Views off is not a routed root.
         let off = test_context();
         assert!(
-            handle_configure_for_test(
+            handle_configure_and_settle_for_test(
                 &configure_callgraph_views(&root, &temp.path().join("off-storage"), false),
                 &off
             )
@@ -15798,8 +16040,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         let grep = || crate::commands::grep::handle_grep(&grep_request("target"), &ctx);
         let callers = || {
@@ -15861,8 +16106,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let ctx = test_context();
         assert!(
-            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
-                .success
+            handle_configure_and_settle_for_test(
+                &configure_callgraph_views(&root, &storage, true),
+                &ctx
+            )
+            .success
         );
         super::drain_deferred_configure_maintenance(&ctx);
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -16758,7 +17006,7 @@ mod tests {
                 "semantic":{"backend":"openai_compatible","model":"counting-test-embedding","base_url":server.base_url,"max_input_tokens":20,"timeout_ms":5000,"max_batch_size":64}
             }))]
         }));
-        let response = handle_configure(&request, &ctx);
+        let response = handle_configure_and_settle_for_test(&request, &ctx);
         assert!(response.success, "{response:?}");
         wait_for_semantic_build_ready(&ctx, Duration::from_secs(30));
         {
@@ -17772,6 +18020,7 @@ mod tests {
             },
         ));
         let executor = crate::executor::Executor::new();
+        crate::test_admission::prepare_project(&ctx, &root);
         let root_id = crate::path_identity::ProjectRootId::from_path(&canonical_root)
             .expect("canonical project root id");
         assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
@@ -17952,8 +18201,10 @@ mod tests {
         let root = projects.join("alpha");
         let storage = base.join("storage");
         init_git_fixture(&root);
+        // Parent indexing requires multiple sibling projects, not a lone child.
+        init_git_fixture(&projects.join("beta"));
         let ctx = test_context();
-        let response = super::handle_configure(
+        let response = handle_configure_for_test(
             &configure_request_with_params(json!({
                 "project_root": root,
                 "harness": "opencode",
@@ -18126,6 +18377,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         let request = trigram_bind_request(&root, &storage);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
@@ -18202,6 +18454,7 @@ mod tests {
         }
         let lock = hold_aft_db_exclusively(&storage);
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         // A reader that ran before the bind published its degraded reasons.
         let git_key = ctx.memoized_artifact_cache_key(&root);
         assert_eq!(
@@ -18321,6 +18574,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -18363,6 +18617,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::ZERO,
@@ -18393,6 +18648,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -18448,6 +18704,7 @@ mod tests {
                 "fatal: detected dubious ownership in repository",
             );
         let ctx = test_context();
+        crate::test_admission::prepare_project(&ctx, &root);
         crate::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
@@ -19475,8 +19732,7 @@ mod tests {
         let ctx = test_context();
         let disabled =
             configure_semantic_with_options(&project, &storage, &server.base_url, false, 64, false);
-        assert!(super::handle_configure(&disabled, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(handle_configure_and_settle_for_test(&disabled, &ctx).success);
 
         let mut stale =
             configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, false);
@@ -21354,7 +21610,8 @@ mod tests {
         git_commit_all(&live, "live head");
 
         let owner = test_context();
-        let response = handle_configure_for_test(&configure_with_storage(&live, &storage), &owner);
+        let response =
+            handle_configure_and_settle_for_test(&configure_with_storage(&live, &storage), &owner);
         assert!(
             response.success,
             "owner configure failed: {:?}",
@@ -24686,7 +24943,7 @@ mod tests {
         crate::artifact_owner::artifact_owner_test_lock()
     }
 
-    fn assert_broad_configure_root(root: &std::path::Path) {
+    fn assert_unadmitted_configure_root(root: &std::path::Path) {
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": root, "harness": "runner",
@@ -24696,12 +24953,18 @@ mod tests {
                 "views": { "enabled": true },
             }))],
         }));
-        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
         assert!(
             !ctx.heavy_root_work_allowed(),
-            "broad root must close the heavy-root-work gate"
+            "an undecided folder must close the heavy-root-work gate"
         );
-        assert!(ctx.degraded_reasons().contains(&"root_too_broad".into()));
+        settle_configure_for_test(&ctx);
+        let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], "not_project");
+        assert_eq!(folder["state"], "decided");
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"folder_not_admitted".into()));
         let assert_no_workers = || {
             assert!(!ctx.config().indexes.trigram);
             assert!(!ctx.config().indexes.semantic);
@@ -24720,14 +24983,14 @@ mod tests {
         assert_no_workers();
         let status = ctx.build_status_snapshot();
         for lane in ["search_index", "semantic_index"] {
-            assert_eq!(status[lane]["status"], "disabled");
-            assert_eq!(status[lane]["reason"], "root_too_broad");
+            assert_eq!(status[lane]["status"], "off");
+            assert_eq!(status[lane]["reason"], folder["reason"]);
         }
         for plane in crate::feature_status::IndexPlane::ALL {
             let observation =
                 crate::feature_status::observed_index_status(&ctx, plane).consumer_json();
             assert_eq!(observation["status"], "off");
-            assert_eq!(observation["reason"], "root_too_broad");
+            assert_eq!(observation["reason"], folder["reason"]);
         }
         let inspect = RawRequest {
             id: "inspect-broad".into(),
@@ -24738,7 +25001,8 @@ mod tests {
         };
         let response = crate::commands::inspect::handle_inspect(&inspect, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "root_too_broad");
+        assert_eq!(response.data["code"], "folder_not_admitted");
+        assert_eq!(response.data["reason"], folder["reason"]);
         let search = RawRequest {
             id: "search-broad".into(),
             command: "semantic_search".into(),
@@ -24748,20 +25012,14 @@ mod tests {
         };
         let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "no_search_lanes_enabled");
-        for lane in ["trigram", "semantic"] {
-            assert_eq!(response.data["lanes"][lane]["status"], "off");
-            assert_eq!(response.data["lanes"][lane]["reason"], "root_too_broad");
-        }
-        assert!(response.data["message"]
-            .as_str()
-            .unwrap()
-            .contains("off: root_too_broad"));
+        assert_eq!(response.data["code"], "folder_not_admitted");
+        assert_eq!(response.data["reason"], folder["reason"]);
+        assert_eq!(response.data["folder"]["classification"], "not_project");
         // A backend left by an older bind must be removed even on the same root.
         install_project_watcher_with(&ctx, root, Vec::new(), |_, _, tx| Ok::<_, &'static str>(tx));
         assert!(ctx.watcher_runtime_active());
-        assert!(handle_configure_for_test(&req, &ctx).success);
-        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
+        settle_configure_for_test(&ctx);
         super::ensure_project_watcher(&ctx);
         assert_no_workers();
     }
@@ -24770,7 +25028,7 @@ mod tests {
     #[test]
     fn configure_filesystem_root_disables_root_work() {
         let _env = home_env_mutex();
-        assert_broad_configure_root(std::path::Path::new("/"));
+        assert_unadmitted_configure_root(std::path::Path::new("/"));
     }
 
     #[test]
@@ -24779,7 +25037,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let (volume, _) = crate::storage_retention::volume_anchor(&canonical).unwrap();
-        assert_broad_configure_root(&volume);
+        assert_unadmitted_configure_root(&volume);
     }
 
     #[cfg(windows)]
@@ -24788,7 +25046,7 @@ mod tests {
         let _env = home_env_mutex();
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        assert_broad_configure_root(canonical.ancestors().last().unwrap());
+        assert_unadmitted_configure_root(canonical.ancestors().last().unwrap());
     }
 
     #[test]
@@ -24872,8 +25130,8 @@ mod tests {
         create_dir_symlink(&home, &alias);
         let _home = EnvVarGuard::set("HOME", alias.to_str().unwrap());
         let _profile = EnvVarGuard::set("USERPROFILE", alias.to_str().unwrap());
-        assert_broad_configure_root(&home);
-        assert_broad_configure_root(&alias);
+        assert_unadmitted_configure_root(&home);
+        assert_unadmitted_configure_root(&alias);
     }
 
     #[cfg(unix)]
@@ -24884,7 +25142,7 @@ mod tests {
         let req = configure_request_with_params(json!({
             "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
         }));
-        assert!(handle_configure_for_test(&req, &ctx).success);
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
         let project = tempfile::tempdir().unwrap();
         let file = project.path().join("readable.txt");
         std::fs::write(&file, "explicit path still works\n").unwrap();
@@ -24931,7 +25189,7 @@ mod tests {
                 "views": {"enabled": true},
             }))],
         }));
-        let response = handle_configure_for_test(&req, &ctx);
+        let response = handle_configure_and_settle_for_test(&req, &ctx);
         assert!(response.success, "{response:?}");
         assert!(ctx.heavy_root_work_allowed());
         assert!(ctx.config().indexes.trigram);
@@ -24953,76 +25211,32 @@ mod tests {
     }
 
     #[test]
-    fn handle_configure_enters_degraded_mode_when_project_root_is_home() {
+    fn handle_configure_refuses_a_home_folder_without_project_evidence() {
         let _guard = home_env_mutex();
-        // Simulate the Desktop-launches-from-`~` case by pointing `HOME` at a
-        // tempdir and using that same tempdir as `project_root`. The
-        // canonical-equality check inside `handle_configure` is the same
-        // mechanism that catches real `$HOME` regardless of HOME mutation.
         let temp = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(temp.path()).unwrap();
-
-        // Save + restore HOME so we don't pollute other tests in the
-        // same process (Rust runs tests in parallel by default but env
-        // mutation is process-global). For Windows, USERPROFILE is the
-        // var `resolve_home_dir` checks after HOME.
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        // SAFETY: env mutation is sound here — this is single-threaded test
-        // setup. The matching restore at the bottom runs even on assertion
-        // failure because Rust's panic path executes drop order, but we make
-        // the env writes explicit for clarity.
-        unsafe {
-            std::env::set_var("HOME", &canonical);
-            std::env::set_var("USERPROFILE", &canonical);
-        }
-
+        let _home = EnvVarGuard::set("HOME", canonical.to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", canonical.to_str().unwrap());
         let ctx = test_context();
-        // Supply search_index/semantic_search as a user config TIER (how real
-        // configures carry core fields under reset resolution). The point of this
-        // test is that the HOME-root degraded gate force-disables them EVEN WHEN
-        // user config enables them — so they must actually be enabled by the tier
-        // first, then asserted off below.
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
-        let response = handle_configure_for_test(&req, &ctx);
-
-        // Restore env immediately so a later assertion failure doesn't leak.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_userprofile {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-        drop(_guard);
-
+        let response = handle_folder_configure_for_test(&req, &ctx);
+        settle_configure_for_test(&ctx);
         assert!(response.success);
-        assert!(ctx.is_degraded(), "expected degraded mode for HOME root");
-        assert!(
-            !ctx.heavy_root_work_allowed(),
-            "HOME root configure must close the heavy-root-work gate"
-        );
-        assert!(
-            ctx.degraded_reasons().contains(&"home_root".to_string()),
-            "expected `home_root` reason, got {:?}",
-            ctx.degraded_reasons()
-        );
-        // Heavy subsystems must have been force-disabled regardless of user config.
-        assert!(
-            !ctx.config().indexes.trigram,
-            "search_index must be auto-disabled at HOME root"
-        );
-        assert!(
-            !ctx.config().indexes.semantic,
-            "semantic_search must be auto-disabled at HOME root"
-        );
+        assert!(ctx.is_degraded());
+        assert!(!ctx.heavy_root_work_allowed());
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"folder_not_admitted".into()));
+        assert!(!ctx.degraded_reasons().contains(&"home_root".into()));
+        let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], "not_project");
+        assert_eq!(folder["reason"], "no_project_evidence");
+        assert!(!ctx.config().indexes.trigram);
+        assert!(!ctx.config().indexes.semantic);
     }
 
     #[test]

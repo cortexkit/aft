@@ -104,7 +104,7 @@ fn h_header_cpp_outline_zoom_and_method_callers() {
     let dir = TempDir::new().unwrap();
     let header = write_file(dir.path(), "widget.h", "namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\ninline int use_widget() { api::Widget widget; return widget.value(); }\n");
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    assert_eq!(aft.configure_project(dir.path())["success"], true);
     let text = outline_text(&mut aft, &header);
     for name in ["api", "Widget", "value", "use_widget"] {
         assert!(text.contains(name), "{text}");

@@ -92,6 +92,7 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
         crate::context_storage::isolate(Config::default()),
     )
     .with_test_checkpoint_store();
+    crate::test_helpers::admission::prepare_project(&ctx, checkout, storage);
     let response = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-worktree-callgraph",

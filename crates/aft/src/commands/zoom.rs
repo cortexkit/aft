@@ -576,6 +576,18 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 /// whitespace in `symbol`/`symbols` strings separate same-file lookups; nested
 /// signature text stays intact.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    if req
+        .params
+        .get("callgraph")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        if let Some(response) =
+            crate::folder_admission_runtime::refusal(ctx, &req.id, req.session())
+        {
+            return response;
+        }
+    }
     let _fetch_temp = super::url_resolution::FetchTempScope::enter();
     super::url_output::cap_zoom_response(req, ctx, handle_zoom_inner(req, ctx))
 }

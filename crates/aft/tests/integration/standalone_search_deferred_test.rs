@@ -41,6 +41,7 @@ fn seed_stale_storage_entries(storage: &Path, transient_root: &Path, count: usiz
 }
 
 fn configure_without_indexes(project: &Path) -> String {
+    crate::test_helpers::project::ensure_project(project).unwrap();
     serde_json::to_string(&json!({
         "id": "configure-maintenance",
         "command": "configure",
@@ -419,6 +420,7 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
     let src = project.join("src");
     let storage = temp_dir.path().join("storage");
     fs::create_dir_all(&src).expect("create project source directory");
+    crate::test_helpers::project::mark_project(&project).unwrap();
     fs::write(src.join("main.rs"), "fn main() {}\n").expect("write fixture source");
     for file_index in 0..2_000 {
         let mut source = String::with_capacity(1_500);
@@ -584,6 +586,7 @@ fn assert_read_answers_during_inspect_lsp_work(
     read_path: &str,
     arguments: serde_json::Value,
 ) {
+    aft.wait_for_folder_admission();
     aft.send_silent(
         &serde_json::to_string(&json!({
             "id": "inspect-in-lsp-work",
@@ -725,6 +728,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
     let temp_dir = tempfile::tempdir().expect("create fixture");
     let project = temp_dir.path().join("project");
     fs::create_dir_all(&project).expect("create project");
+    crate::test_helpers::project::mark_project(&project).unwrap();
     fs::write(project.join("fake.toml"), "[project]\n").expect("write root marker");
     fs::write(project.join("main.fake"), "hello\n").expect("write fake source");
     fs::write(project.join("notes.txt"), "notes\n").expect("write read target");
@@ -849,7 +853,7 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
 
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
-    let project = tempfile::tempdir().expect("create standalone project");
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().expect("create standalone storage");
     let (base_url, query_started, release_query, embedding_server) = start_embedding_server();
     let mut aft = AftProcess::spawn();
@@ -984,7 +988,7 @@ fn standalone_edit_then_queued_grep_is_fresh_without_watcher_delivery() {
 
 #[cfg(unix)]
 fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
-    let project = tempfile::tempdir().expect("create freshness project");
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().expect("create freshness storage");
     let target = project.path().join("source.ts");
     fs::write(&target, "export const value = 'old_watcher_token';\n")
@@ -1152,7 +1156,7 @@ fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftPro
 fn mutation_freshness_fixture_with_content(
     content: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("src")).unwrap();
     fs::write(project.path().join("src/source.ts"), content).unwrap();

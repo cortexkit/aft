@@ -145,7 +145,7 @@ fn outline_directory_reports_parse_error_skips() {
     write_file(dir.path(), "src/invalid.ts", "export function broken( {\n");
 
     let mut aft = AftProcess::spawn();
-    assert_eq!(aft.configure(dir.path())["success"], true);
+    assert_eq!(aft.configure_project(dir.path())["success"], true);
 
     let resp = send(
         &mut aft,

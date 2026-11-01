@@ -58,7 +58,7 @@ fn outline_arrow_consts_keep_declarator_ranges() {
 
 #[test]
 fn outline_directory_and_array_match_real_structure_golden() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let files = [
         (
             "product.rs",
@@ -144,7 +144,7 @@ fn outline_single_file_lists_test_names_and_every_product_member() {
 #[test]
 fn outline_directory_keeps_files_with_unavailable_test_includes() {
     for (source, reason) in [(None, "file_not_found"), (Some("fn (\n"), "parse_error")] {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::test_helpers::project::git_project_tempdir();
         write_file(
             dir.path(),
             "lib.rs",
@@ -180,7 +180,7 @@ fn outline_directory_keeps_files_with_unavailable_test_includes() {
 
 #[test]
 fn outline_go_test_file_filter_and_explicit_targets_keep_their_contract() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "product.go",
@@ -336,7 +336,7 @@ let localCount = 0;
 
 #[test]
 fn outline_directory_skips_symlink_loops() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "src/main.ts",
@@ -373,7 +373,7 @@ fn outline_directory_skips_symlink_loops() {
 
 #[test]
 fn outline_directory_hides_test_files_and_previews_type_members() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     write_file(
         dir.path(),
         "src/service.ts",
@@ -823,7 +823,7 @@ function unused(): void {
 
 #[test]
 fn zoom_doc_commented_export_calls_match_call_tree_and_callers() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::project::git_project_tempdir();
     let lock = write_file(
         dir.path(),
         "lock.ts",

@@ -51,7 +51,7 @@ fn read(aft: &mut AftProcess, id: &str, file: &Path) -> String {
 
 #[test]
 fn standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result() {
-    let project = tempfile::tempdir().expect("status bar project");
+    let project = crate::test_helpers::project::project_tempdir();
     let file = project.path().join("a.ts");
     std::fs::write(&file, "// TODO: first\nexport const a = 1;\n").expect("write fixture");
     let mut aft = AftProcess::spawn();

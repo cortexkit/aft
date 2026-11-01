@@ -205,19 +205,31 @@ fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
 #[derive(Debug, Clone)]
 pub enum ServerAttemptResult {
     /// A reserved startup has not published its client yet.
-    InProgress { server_key: ServerKey },
+    InProgress {
+        server_key: ServerKey,
+    },
     /// The root has no live route; reopening it permits a lazy start again.
     ProjectClosed,
+    FolderNotAdmitted,
     /// Server is running and ready to serve requests for this file.
-    Ok { server_key: ServerKey },
+    Ok {
+        server_key: ServerKey,
+    },
     /// No workspace root was found by walking up from the file looking for
     /// any of the server's configured root markers.
-    NoRootMarker { looked_for: Vec<String> },
+    NoRootMarker {
+        looked_for: Vec<String>,
+    },
     /// The server's binary could not be found on PATH (or override was
     /// missing/invalid).
-    BinaryNotInstalled { binary: String },
+    BinaryNotInstalled {
+        binary: String,
+    },
     /// Binary was found but spawning or initializing the server failed.
-    SpawnFailed { binary: String, reason: String },
+    SpawnFailed {
+        binary: String,
+        reason: String,
+    },
 }
 
 /// One server's attempt to handle a file.
@@ -457,6 +469,7 @@ impl ServerAttemptResult {
         match self {
             Self::InProgress { .. } => START_IN_PROGRESS_REASON.into(),
             Self::ProjectClosed => "project closed; reopen the project and retry".into(),
+            Self::FolderNotAdmitted => "folder_not_admitted".into(),
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
             Self::SpawnFailed { reason, .. } => {
                 // Files outside every TypeScript project are a coverage gap,
@@ -1071,6 +1084,7 @@ pub struct LspManager {
     background_pull_idle_waiters: Vec<Sender<()>>,
     rust_cargo_disabled_for_worker: Arc<std::sync::atomic::AtomicBool>,
     quiesced: std::sync::atomic::AtomicBool,
+    folder_work_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Active server instances, keyed by (ServerKind, workspace_root).
     clients: HashMap<ServerKey, LspClient>,
     inspect_rust_checks: HashMap<
@@ -1384,6 +1398,7 @@ impl LspManager {
             retired_events_dropped: 0,
             rust_cargo_disabled_for_worker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quiesced: std::sync::atomic::AtomicBool::new(false),
+            folder_work_gate: None,
             clients: HashMap::new(),
             #[cfg(test)]
             startup_finished_hook: None,
@@ -1438,6 +1453,10 @@ impl LspManager {
     #[doc(hidden)]
     pub fn set_retry_clock(&mut self, clock: RetryClock) {
         self.retry_clock = clock;
+    }
+
+    pub(crate) fn set_folder_work_gate(&mut self, gate: Arc<std::sync::atomic::AtomicBool>) {
+        self.folder_work_gate = Some(gate);
     }
 
     pub(crate) fn enable_background_document_pulls(
@@ -1597,7 +1616,9 @@ impl LspManager {
         // failure and must not fabricate a retry backoff.
         if matches!(
             result,
-            ServerAttemptResult::ProjectClosed | ServerAttemptResult::InProgress { .. }
+            ServerAttemptResult::ProjectClosed
+                | ServerAttemptResult::FolderNotAdmitted
+                | ServerAttemptResult::InProgress { .. }
         ) {
             return result;
         }
@@ -2047,6 +2068,13 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> FileServerStart {
+        if self
+            .folder_work_gate
+            .as_ref()
+            .is_some_and(|gate| !gate.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return FileServerStart::Failed(ServerAttemptResult::FolderNotAdmitted);
+        }
         self.publish_completed_starts();
         if self.is_quiesced() {
             return FileServerStart::Failed(ServerAttemptResult::ProjectClosed);
@@ -2154,6 +2182,10 @@ impl LspManager {
                 continue;
             }
             let cancelled = self.is_quiesced()
+                || self
+                    .folder_work_gate
+                    .as_ref()
+                    .is_some_and(|gate| !gate.load(std::sync::atomic::Ordering::Acquire))
                 || reservation.clients_generation != self.clients_generation
                 || signal.cancelled.load(std::sync::atomic::Ordering::Acquire);
             let replay_pid = reservation.replay_pid;
@@ -7602,6 +7634,7 @@ impl LspManager {
             .unwrap_or_else(|| root.to_path_buf());
 
         Ok(PreparedSpawn {
+            folder_work_gate: self.folder_work_gate.clone(),
             start_signal: None,
             #[cfg(test)]
             spawn_hook: self.spawn_hook.clone(),
@@ -8058,6 +8091,7 @@ fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
     match result {
         ServerAttemptResult::InProgress { .. } => START_IN_PROGRESS_STATUS.into(),
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
+        ServerAttemptResult::FolderNotAdmitted => "folder_not_admitted".into(),
         ServerAttemptResult::SpawnFailed { binary, reason } => {
             format!("spawn_failed: {binary} ({reason})")
         }
@@ -8385,6 +8419,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// Everything needed to spawn and initialize one language server, gathered
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
+    folder_work_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
     start_signal: Option<Arc<StartSignal>>,
     #[cfg(test)]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -8464,9 +8499,13 @@ impl PreparedSpawn {
             hook();
         }
         if self
-            .start_signal
+            .folder_work_gate
             .as_ref()
-            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
+            .is_some_and(|gate| !gate.load(std::sync::atomic::Ordering::Acquire))
+            || self
+                .start_signal
+                .as_ref()
+                .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(SpawnFailure::NotStarted {
                 error: LspError::ProjectClosed,

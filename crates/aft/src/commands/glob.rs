@@ -16,6 +16,7 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 
 #[derive(Debug)]
 struct GlobDiscovery {
+    query_walk: Option<serde_json::Value>,
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
     walk_truncated: bool,
@@ -40,11 +41,15 @@ const MAX_DISPLAY_DIRECTORIES: usize = 6;
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let _pin = config.views.enabled.then(|| ctx.pin_config_to(config));
-    ctx.with_read_policy_snapshot(&req.id, || {
+    let mut response = ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
             crate::bounded_io::command(req, ctx, handle_glob_inner)
         })
-    })
+    });
+    if response.success {
+        crate::folder_admission_runtime::decorate(ctx, &mut response, false, req.session());
+    }
+    response
 }
 
 fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -144,6 +149,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let has_named_ignored_root = named_ignored_roots.iter().any(Option::is_some);
     let parent_answer = if crate::context::confinement::active()
+        || !crate::folder_admission_runtime::workspace_current(ctx)
         || ignored_targets.iter().any(|ignored| *ignored)
         || has_named_ignored_root
     {
@@ -151,6 +157,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
     };
+    let mut query_walks = Vec::new();
     let (
         mut files,
         walk_truncated,
@@ -196,6 +203,9 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             Err(error) => return crate::context::view_load_error_response(&req.id, error),
         };
         indexed_mtimes = discovery.indexed_mtimes;
+        if let Some(coverage) = discovery.query_walk {
+            query_walks.push(coverage);
+        }
         (
             discovery.files,
             discovery.walk_truncated,
@@ -246,6 +256,9 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "mixed/fallback"
         };
         for discovery in &discoveries {
+            if let Some(coverage) = &discovery.query_walk {
+                query_walks.push(coverage.clone());
+            }
             indexed_mtimes.extend(
                 discovery
                     .indexed_mtimes
@@ -311,6 +324,9 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let total = admitted_count.saturating_add(presence.unexamined);
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
+    let confined = crate::context::confinement::active();
+    let safe_confined_total = all_candidates_checked && !presence_budget_exhausted;
+    let walk_truncated = walk_truncated || (confined && !safe_confined_total);
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
@@ -318,10 +334,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-        "total": all_candidates_checked.then_some(total),
+        "total": (all_candidates_checked && if confined { safe_confined_total } else { !walk_truncated }).then_some(total),
         "truncated": result_truncated,
     });
-    if !all_candidates_checked {
+    if !query_walks.is_empty() {
+        body["query_walk"] = serde_json::json!(query_walks);
+    }
+    if !confined && (!all_candidates_checked || walk_truncated) {
         body["total_lower_bound"] = serde_json::json!(total);
         body["admitted_count"] = serde_json::json!(admitted_count);
         body["candidate_count"] = serde_json::json!(candidate_count);
@@ -403,7 +422,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let envelope = crate::list_surfaces::glob::build_glob_envelope_with_time_limit(
         rendered_count,
-        total,
+        if confined && !safe_confined_total {
+            admitted_count
+        } else {
+            total
+        },
         result_truncated,
         walk_truncated,
         walk_time_limit_reached,
@@ -515,6 +538,14 @@ fn discover_glob_root(
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> Result<GlobDiscovery, String> {
+    if named_ignored_root.is_some() && crate::folder_admission_runtime::bounded_query(ctx) {
+        return Ok(bounded_folder_glob(
+            search_root,
+            named_ignored_root.unwrap_or(search_root),
+            pattern,
+            ignored_target || named_ignored_root.is_some(),
+        ));
+    }
     if let Some(named_root) = named_ignored_root {
         let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
         let started = Instant::now();
@@ -524,6 +555,7 @@ fn discover_glob_root(
             &filters,
         );
         return Ok(GlobDiscovery {
+            query_walk: None,
             scope_has_files: !outcome.files.is_empty()
                 || outcome.walk_truncated
                 || outcome.skipped_foreign_mounts > 0,
@@ -570,7 +602,16 @@ fn glob_root(
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> Result<GlobDiscovery, String> {
+    let bounded = crate::folder_admission_runtime::bounded_query(ctx);
     if crate::context::confinement::active() {
+        if bounded {
+            return Ok(bounded_folder_glob(
+                search_root,
+                search_root,
+                pattern,
+                ignored_target,
+            ));
+        }
         return Ok(fallback_glob(
             project_root,
             search_root,
@@ -594,6 +635,7 @@ fn glob_root(
             .filter(|path| filters.matches(filter_root, path))
             .collect();
         return Ok(GlobDiscovery {
+            query_walk: None,
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
@@ -605,6 +647,14 @@ fn glob_root(
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: 0,
         });
+    }
+    if bounded {
+        return Ok(bounded_folder_glob(
+            search_root,
+            search_root,
+            pattern,
+            ignored_target,
+        ));
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
@@ -645,6 +695,7 @@ fn glob_root(
             })
             .collect();
         GlobDiscovery {
+            query_walk: None,
             entries_visited,
             files,
             indexed_mtimes,
@@ -684,6 +735,7 @@ fn glob_root(
                     let scope_started = Instant::now();
                     let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
                     return Ok(GlobDiscovery {
+                        query_walk: None,
                         files: outcome.files,
                         indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
@@ -738,6 +790,44 @@ fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
+fn bounded_folder_glob(
+    filter_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    ignored_target: bool,
+) -> GlobDiscovery {
+    let started = Instant::now();
+    let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
+    let filter_root = if filter_root.is_file() {
+        filter_root.parent().unwrap_or(filter_root)
+    } else {
+        filter_root
+    };
+    let outcome = crate::bounded_folder_walk::walk(
+        filter_root,
+        search_root,
+        &filters,
+        crate::grep_executor::fallback_walk_limit(),
+        crate::grep_executor::fallback_walk_budget(),
+        ignored_target,
+    );
+    let cut = outcome.stop != crate::bounded_folder_walk::Stop::Complete;
+    let coverage = serde_json::to_value(&outcome).unwrap_or_default();
+    GlobDiscovery {
+        query_walk: Some(coverage),
+        scope_has_files: !outcome.files.is_empty() || cut,
+        files: outcome.files,
+        indexed_mtimes: HashMap::new(),
+        walk_truncated: cut,
+        walk_time_limit_reached: outcome.stop == crate::bounded_folder_walk::Stop::TimeBudget,
+        source: "fallback",
+        entries_visited: outcome.entries_visited,
+        walk_time: started.elapsed(),
+        scope_probe: Duration::ZERO,
+        skipped_foreign_mounts: 0,
+    }
+}
+
 fn fallback_glob(
     _project_root: &std::path::Path,
     search_root: &std::path::Path,
@@ -760,6 +850,7 @@ fn fallback_glob(
     let scope_has_files =
         !outcome.files.is_empty() || outcome.walk_truncated || outcome.skipped_foreign_mounts > 0;
     GlobDiscovery {
+        query_walk: None,
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
         walk_truncated: outcome.walk_truncated,
@@ -1053,7 +1144,8 @@ mod tests {
         let capped = crate::grep_executor::with_walk_limit(1, || handle_glob(&request, &ctx));
         let body = serde_json::to_value(&capped).unwrap();
         assert_eq!(body["success"], true, "{body}");
-        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["total"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["total_lower_bound"], 1, "{body}");
         assert_eq!(body["walk_truncated"], true, "{body}");
         assert_eq!(body["complete"], false, "{body}");
         assert_eq!(body["walk_entries_examined"], 3, "{body}");
@@ -1069,7 +1161,8 @@ mod tests {
         );
         let body = serde_json::to_value(&timed).unwrap();
         assert_eq!(body["success"], true, "{body}");
-        assert_eq!(body["total"], 1, "{body}");
+        assert_eq!(body["total"], serde_json::Value::Null, "{body}");
+        assert_eq!(body["total_lower_bound"], 1, "{body}");
         assert_eq!(body["complete"], false, "{body}");
         assert_eq!(body["walk_entries_examined"], 2, "{body}");
         assert_eq!(

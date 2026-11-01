@@ -66,6 +66,7 @@ pub(crate) mod bash_env;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;
+pub(crate) mod bounded_folder_walk;
 pub(crate) mod bounded_io;
 pub mod build_breaker;
 pub mod cache_freshness;
@@ -97,6 +98,14 @@ pub mod exec_remote;
 #[cfg(test)]
 #[path = "../tests/helpers/executable_cache.rs"]
 mod executable_cache;
+
+#[cfg(test)]
+#[path = "../tests/helpers/project.rs"]
+pub(crate) mod test_project;
+
+#[cfg(test)]
+extern crate self as aft;
+
 pub mod executor;
 pub mod extract;
 pub mod feature_config;
@@ -104,6 +113,9 @@ pub mod feature_status;
 pub(crate) mod file_identity;
 pub mod file_kind;
 pub mod fleet_status;
+pub mod folder_admission;
+#[doc(hidden)]
+pub mod folder_admission_runtime;
 pub mod format;
 pub mod fs_lock;
 pub mod fuzzy_match;
@@ -207,6 +219,8 @@ pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
 pub(crate) mod task_temp_reads;
+#[cfg(test)]
+pub(crate) mod test_admission;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub mod tool_gate;

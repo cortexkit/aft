@@ -35,6 +35,7 @@ fn request(payload: Value) -> RawRequest {
 }
 
 fn configured_context(root: &Path) -> AppContext {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     crate::helpers::disable_in_process_file_watcher();
     fs::write(root.join(".aftignore"), "**/tsconfig*.json\npackage.json\n")
         .expect("ignore config-only diagnostics files");
@@ -60,6 +61,7 @@ fn configured_context(root: &Path) -> AppContext {
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    crate::test_helpers::admission::settle(&ctx);
     // Configure records which language servers apply on a background
     // thread; the status bar reads diagnostics as pending until it has.
     assert!(
