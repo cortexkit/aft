@@ -43,7 +43,7 @@ impl DiffBudget {
         file: &str,
         before: &str,
         after: &str,
-        diff: &similar::TextDiff<'a, 'a, 'a, str>,
+        diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
         copies: usize,
     ) -> Option<String> {
         self.render(before.len().saturating_add(after.len()), copies, |out| {
@@ -102,7 +102,7 @@ fn write_patch<'a>(
     out: &mut WireWriter,
     file: &str,
     identical: bool,
-    diff: &similar::TextDiff<'a, 'a, 'a, str>,
+    diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
 ) -> io::Result<()> {
     write!(
         out,

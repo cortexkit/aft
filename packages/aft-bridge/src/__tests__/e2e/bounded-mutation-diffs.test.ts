@@ -203,8 +203,14 @@ describe("bounded mutation diffs through the real bridge", () => {
       { length: 40 },
       (_, index) => `*** Add File: file-${index}.txt\n+${line}`,
     );
+    const patch = `*** Begin Patch\n${hunks.join("\n")}\n*** End Patch`;
+    const preview = await send("apply_patch", { patch_text: patch, preview: true });
+    omitted(preview);
+    expect(preview.files).toHaveLength(40);
+    expect(preview.files?.some((file) => file.diff_omitted)).toBe(true);
+    expect(await Bun.file(join(project, "file-0.txt")).exists()).toBe(false);
     const reply = await send("apply_patch", {
-      patch_text: `*** Begin Patch\n${hunks.join("\n")}\n*** End Patch`,
+      patch_text: patch,
     });
     omitted(reply);
     expect(reply.complete).toBe(true);
@@ -218,6 +224,27 @@ describe("bounded mutation diffs through the real bridge", () => {
       expect(file.deletions).toBe(0);
       expect(await readFile(join(project, `file-${index}.txt`), "utf8")).toBe(`${line}\n`);
     }
+  }, 120_000);
+
+  test("huge native additions and move-updates omit patches, not file results", async () => {
+    const before = "old\n".repeat(100_000);
+    const after = "new\n".repeat(100_000);
+    const added = await send("apply_patch", {
+      patch_text: `*** Begin Patch\n*** Add File: added.txt\n${"+old\n".repeat(100_000)}*** End Patch`,
+    });
+    omitted(added);
+    expect(added.metadata?.files?.[0].type).toBe("add");
+    expect(added.metadata?.files?.[0].additions).toBe(100_000);
+    expect(await readFile(join(project, "added.txt"), "utf8")).toBe(before);
+    const moved = await send("apply_patch", {
+      patch_text: `*** Begin Patch\n*** Update File: added.txt\n*** Move to: moved.txt\n@@\n${"-old\n".repeat(100_000)}${"+new\n".repeat(100_000)}*** End Patch`,
+    });
+    omitted(moved);
+    expect(moved.metadata?.files?.[0].type).toBe("move");
+    expect(moved.metadata?.files?.[0].additions).toBe(100_000);
+    expect(moved.metadata?.files?.[0].deletions).toBe(100_000);
+    expect(await Bun.file(join(project, "added.txt")).exists()).toBe(false);
+    expect(await readFile(join(project, "moved.txt"), "utf8")).toBe(after);
   }, 120_000);
 
   test("ordinary patch and preview diff bytes are unchanged", async () => {
