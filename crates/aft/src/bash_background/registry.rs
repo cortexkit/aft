@@ -9239,11 +9239,14 @@ impl BgTaskRegistry {
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
+    // Remote restoration starts a worker, so reject an out-of-scope match
+    // before registering it rather than leaving that check to the caller.
     fn status_relaxed_task(
         &self,
         task_id: &str,
         project_root: &Path,
         storage_dir: &Path,
+        accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
@@ -9261,6 +9264,7 @@ impl BgTaskRegistry {
                                 .map(canonicalized_path)
                                 .as_deref()
                                 == Some(canonical_project.as_path())
+                                && accept(&state.metadata)
                         })
                         .unwrap_or(false);
                     return matches_project.then_some(task);
@@ -9274,10 +9278,24 @@ impl BgTaskRegistry {
                 if disk.task_id != metadata.task_id || disk.session_id != metadata.session_id {
                     return None;
                 }
-                if self
-                    .insert_rehydrated_task(metadata, resolved.paths, true)
-                    .is_err()
+                // Remote output and its replay cursor commit to disk together;
+                // the database row can still describe an older checkpoint.
+                let metadata = if disk.remote.is_some() || metadata.remote.is_some() {
+                    disk
+                } else {
+                    metadata
+                };
+                if !accept(&metadata)
+                    || metadata
+                        .project_root
+                        .as_deref()
+                        .map(canonicalized_path)
+                        .as_deref()
+                        != Some(canonical_project.as_path())
                 {
+                    return None;
+                }
+                if self.restore_relaxed_task(metadata, resolved.paths).is_err() {
                     return None;
                 }
                 return self.task(task_id);
@@ -9351,6 +9369,9 @@ impl BgTaskRegistry {
             if metadata_project.as_deref() != Some(canonical_project.as_path()) {
                 continue;
             }
+            if !accept(&metadata) {
+                continue;
+            }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
                     .lock_state()
@@ -9362,19 +9383,35 @@ impl BgTaskRegistry {
                             .map(canonicalized_path)
                             .as_deref()
                             == Some(canonical_project.as_path())
+                            && accept(&state.metadata)
                     })
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
-            if self
-                .insert_rehydrated_task(metadata, resolved.paths, true)
-                .is_err()
-            {
+            if self.restore_relaxed_task(metadata, resolved.paths).is_err() {
                 return None;
             }
             return self.task(task_id);
         }
         None
+    }
+
+    fn restore_relaxed_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+    ) -> Result<(), String> {
+        if metadata.remote.is_some() {
+            // Registering a saved remote task is not enough: its worker must
+            // attach to the runner. Session recovery shares one worker across
+            // registries and lets an owner's pending pause reach it first.
+            let session_id = metadata.session_id.clone();
+            self.rehydrate_resolved_task(metadata, paths, &session_id)?;
+            self.start_watchdog();
+            Ok(())
+        } else {
+            self.insert_rehydrated_task(metadata, paths, true)
+        }
     }
 
     fn lookup_relaxed_task_from_db(
@@ -9428,7 +9465,11 @@ impl BgTaskRegistry {
         .and_then(Result::ok)
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
-        if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+        if let Some(task) =
+            self.status_relaxed_task(task_id, project_root, storage_dir, |metadata| {
+                metadata.session_id == session_id || metadata.scope.is_none()
+            })
+        {
             if task.session_id != session_id
                 && task
                     .lock_state()
@@ -9470,7 +9511,9 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
-            .status_relaxed_task(task_id, project_root, storage_dir)
+            .status_relaxed_task(task_id, project_root, storage_dir, |metadata| {
+                metadata.scope.is_none()
+            })
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         if task
             .lock_state()

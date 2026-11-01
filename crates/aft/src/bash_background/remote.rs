@@ -506,6 +506,8 @@ struct ReattachBudget {
     deadline: Option<tokio::time::Instant>,
     /// Failed recovery attempts since the last record; selects the next pause.
     attempts: u32,
+    /// Attach requests sent by this worker, including retries without progress.
+    attach_attempts: u32,
     /// A test shortened the budget: the job's limits stay treated as passed.
     #[cfg(test)]
     budget_override: bool,
@@ -547,6 +549,7 @@ impl ReattachBudget {
             limit_note,
             deadline: None,
             attempts: 0,
+            attach_attempts: 0,
             #[cfg(test)]
             budget_override: budget_override.is_some(),
             #[cfg(test)]
@@ -705,6 +708,16 @@ impl ReattachBudget {
                 .await;
         }
         self.wait(job_id, tokio::time::sleep(delay)).await
+    }
+
+    fn log_attach_failure(&self, task_id: &str, job_id: Uuid, error: &exec::Error) {
+        let reason = error.to_string();
+        let reason = crate::log_redact::aft_redactor(&reason);
+        crate::slog_warn!(
+            "runon: remote attach failed task_id={task_id} job_id={job_id} attempt={} next_backoff_ms={} reason={reason:?}",
+            self.attach_attempts,
+            duration_ms(reattach_backoff(self.attempts)),
+        );
     }
 }
 
@@ -3342,6 +3355,7 @@ impl BgTaskRegistry {
                 }
             }
             sink.sent_at = stream.sent_at();
+            let first_attach_record = stream.is_attach() && !stream.received_frame();
             let result = tokio::select! {
                 result=stream.next(&mut sink)=>result,
                 _=tokio::time::sleep(Duration::from_millis(50))=>{
@@ -3371,6 +3385,34 @@ impl BgTaskRegistry {
                 true
             };
             if let Ok(progress) = &result {
+                if first_attach_record && !matches!(progress, StreamProgress::AdmissionProgress) {
+                    if let Some(point) = stream.resume_point() {
+                        crate::slog_info!(
+                            "runon: remote attach succeeded task_id={} job_id={} attempt={}",
+                            task.task_id,
+                            point.job_id,
+                            recovery.attach_attempts,
+                        );
+                    }
+                    // A subscription alone is not proof of reattachment: the
+                    // runner may refuse it before sending any execution record.
+                    if task.state.lock().is_ok_and(|state| {
+                        state.metadata.remote.as_ref().is_some_and(|remote| {
+                            remote.submission.as_ref().is_some_and(|s| !s.reattached)
+                        })
+                    }) {
+                        if let Err(error) = sink.commit(|remote| {
+                            if let Some(submission) = &mut remote.submission {
+                                submission.reattached = true;
+                            }
+                        }) {
+                            crate::slog_warn!(
+                                "runon: could not save reattachment task_id={}: {error}",
+                                task.task_id,
+                            );
+                        }
+                    }
+                }
                 recovery.observe(progress);
             }
             match result {
@@ -3543,6 +3585,9 @@ impl BgTaskRegistry {
                     // attach. A quiet but open stream has no output deadline.
                     if stream.received_frame() {
                         recovery.reset();
+                    }
+                    if stream.is_attach() {
+                        recovery.log_attach_failure(&task.task_id, point.job_id, &error);
                     }
                     // Use the same bounded attach path as an AFT restart.
                     recovery.pause(point.job_id).await?;
@@ -3862,6 +3907,7 @@ impl BgTaskRegistry {
                 .remote
                 .as_ref()
                 .is_some_and(|r| r.cancel_requested);
+            recovery.attach_attempts = recovery.attach_attempts.saturating_add(1);
             let attempt = recovery
                 .wait(point.job_id, async {
                     if cancel {
@@ -3871,18 +3917,15 @@ impl BgTaskRegistry {
                             .map(|_| ())
                             .map_err(|e| e.to_string());
                         if self.finish_owner_pause_cancel(task, result) {
-                            return Some(Attached::OwnerPauseSettled);
+                            return Ok(Attached::OwnerPauseSettled);
                         }
                     }
-                    client
-                        .attach(point.clone())
-                        .await
-                        .ok()
-                        .map(Attached::Stream)
+                    client.attach(point.clone()).await.map(Attached::Stream)
                 })
                 .await?;
-            if let Some(attached) = attempt {
-                return Ok(attached);
+            match attempt {
+                Ok(attached) => return Ok(attached),
+                Err(error) => recovery.log_attach_failure(&task.task_id, point.job_id, &error),
             }
             // The route may have closed with the runner (a ck-motor restart).
             // Back off, then reconnect and attach again; never resubmit.

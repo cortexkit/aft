@@ -3681,9 +3681,17 @@ async fn runon_restart_reattach_drain_child() {
     fs::write(root.join("task-id"), task_id).unwrap();
 }
 
-async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed_lookup: bool) {
+async fn runon_restart_first_watch_reattaches(
+    watch_before_replay: bool,
+    relaxed_lookup: Option<bool>,
+    auth_refusals: u32,
+    lost: bool,
+) {
     let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
-        Script::Started,
+        Script::RestartRunning {
+            auth_refusals,
+            lost,
+        },
         &["exec-remote/v1", "exec-remote-submission-key/v1"],
         2,
     )
@@ -3714,7 +3722,47 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
     ctx.bash_background()
         .set_harness(crate::harness::Harness::Runner);
     let storage = crate::bash_background::task_storage_dir(&ctx);
-    if relaxed_lookup {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    remote_launch_log_captures()
+        .lock()
+        .unwrap()
+        .insert(project.canonicalize().unwrap(), capture.clone());
+    let saved = resolve_task_layout(&session_tasks_dir(&storage, "session"), &task_id).unwrap();
+    let saved = read_task_at(&saved).unwrap();
+    assert!(saved.scope.is_some());
+    assert!(!saved.remote.unwrap().submission.unwrap().reattached);
+    if let Some(database) = relaxed_lookup {
+        if database {
+            let db = Arc::new(Mutex::new(
+                crate::db::open(&root.path().join("aft.db")).unwrap(),
+            ));
+            ctx.bash_background().set_db_pool(db);
+            let resolved =
+                resolve_task_layout(&session_tasks_dir(&storage, "session"), &task_id).unwrap();
+            let mut old = read_task_at(&resolved).unwrap();
+            // The remote stream checkpoint on disk may be newer than its row.
+            old.remote.as_mut().unwrap().last_seq = None;
+            old.remote.as_mut().unwrap().started = None;
+            ctx.bash_background().dual_write_task(&resolved.paths, &old);
+        }
+        assert!(ctx
+            .bash_background()
+            .status_relaxed(
+                &task_id,
+                "foreign-session",
+                &project,
+                &storage,
+                0,
+                false,
+                Duration::ZERO,
+            )
+            .is_none());
+        assert!(ctx
+            .bash_background()
+            .kill_relaxed(&task_id, &project, &storage)
+            .is_err());
+        assert!(!ctx.bash_background().holds_task(&task_id));
+        assert_eq!(remote_workers(&task_id), (0, 0));
         let snapshot = ctx.bash_background().status_relaxed(
             &task_id,
             "session",
@@ -3757,7 +3805,7 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
         .await
         .unwrap();
     assert!(bound.success, "{bound:?}");
-    let gate = watch_before_replay.then(|| {
+    let mut gate = watch_before_replay.then(|| {
         crate::commands::configure::gate_configure_tail_stage_for_test(
             ctx.canonical_cache_root(),
             "replay_claimed",
@@ -3790,8 +3838,11 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
         runon_restart_principal(&project),
         || crate::commands::bash_watch::handle_deferred(&request, ctx.clone()),
     );
-    daemon.wait_for_requests("exec.attach", 1).await;
-    if let Some((_, _, release)) = &gate {
+    daemon
+        .wait_for_requests("exec.attach", auth_refusals as usize + 1)
+        .await;
+    if let Some((guard, _, release)) = gate.take() {
+        drop(guard);
         release.send(()).unwrap();
         tail.await.unwrap();
     }
@@ -3804,19 +3855,76 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
             .await
         }
     };
-    assert_eq!(response.data["status"], "completed", "{response:?}");
-    assert_eq!(response.data["exit_code"], 0, "{response:?}");
+    if lost {
+        assert_eq!(response.data["status"], "fate_unknown", "{response:?}");
+    } else {
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert_eq!(response.data["exit_code"], 0, "{response:?}");
+        assert!(
+            response.data["output"]
+                .as_str()
+                .unwrap()
+                .contains("remote-restart-proof"),
+            "{response:?}"
+        );
+    }
     assert_eq!(response.data["waited"]["reason"], "exited", "{response:?}");
     remote_worker_exited(&task_id).await;
     assert_eq!(remote_workers(&task_id), (1, 1));
+    let task = ctx.bash_background().task(&task_id).unwrap();
+    let completed = read_task(&task.paths.json).unwrap();
+    if lost {
+        assert!(completed
+            .status_reason
+            .as_deref()
+            .unwrap()
+            .contains("remote outcome unknown"));
+    }
+    assert!(completed.remote.unwrap().submission.unwrap().reattached);
+    let lines = capture.lock().unwrap();
+    let warnings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("runon: remote attach failed "))
+        .collect();
+    assert_eq!(warnings.len(), auth_refusals as usize, "{lines:?}");
+    for (index, warning) in warnings.iter().enumerate() {
+        assert!(
+            warning.contains(&format!("task_id={task_id} job_id={}", id())),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&format!(
+                "attempt={} next_backoff_ms={}",
+                index + 1,
+                100 << index
+            )),
+            "{warning}"
+        );
+        assert!(warning.contains("auth"), "{warning}");
+    }
+    let successes: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("runon: remote attach succeeded "))
+        .collect();
+    assert_eq!(successes.len(), 1, "{lines:?}");
+    assert!(
+        successes[0].contains(&format!(
+            "task_id={task_id} job_id={} attempt={}",
+            id(),
+            auth_refusals + 1
+        )),
+        "{successes:?}"
+    );
     let log = daemon.log.lock().unwrap();
     let attaches: Vec<_> = log
         .iter()
         .filter(|(_, body)| body["method"] == "exec.attach")
         .collect();
-    assert_eq!(attaches.len(), 1);
-    assert_eq!(attaches[0].1["params"]["job_id"], id().to_string());
-    assert_eq!(attaches[0].1["params"]["from_seq"], 1);
+    assert_eq!(attaches.len(), auth_refusals as usize + 1);
+    for (_, attach) in attaches {
+        assert_eq!(attach["params"]["job_id"], id().to_string());
+        assert_eq!(attach["params"]["from_seq"], 1);
+    }
     assert_eq!(
         log.iter()
             .filter(|(_, body)| body["method"] == "exec.run")
@@ -3828,22 +3936,36 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
 
 #[tokio::test]
 async fn runon_restart_reattach_first_watch_before_replay() {
-    runon_restart_first_watch_reattaches(true, false).await;
+    runon_restart_first_watch_reattaches(true, None, 0, false).await;
 }
 
 #[tokio::test]
 async fn runon_restart_reattach_first_watch_after_replay() {
-    runon_restart_first_watch_reattaches(false, false).await;
+    runon_restart_first_watch_reattaches(false, None, 0, false).await;
 }
 
 #[tokio::test]
 async fn runon_restart_reattach_relaxed_lookup_before_first_watch() {
-    runon_restart_first_watch_reattaches(true, true).await;
+    for database in [false, true] {
+        runon_restart_first_watch_reattaches(true, Some(database), 0, false).await;
+    }
 }
 
 #[tokio::test]
 async fn runon_restart_reattach_relaxed_lookup_before_replay() {
-    runon_restart_first_watch_reattaches(false, true).await;
+    for database in [false, true] {
+        runon_restart_first_watch_reattaches(false, Some(database), 0, false).await;
+    }
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_logs_each_auth_refusal_then_success() {
+    runon_restart_first_watch_reattaches(true, None, 2, false).await;
+}
+
+#[tokio::test]
+async fn runon_restart_reattach_unknown_job_ends_the_first_watch() {
+    runon_restart_first_watch_reattaches(true, None, 0, true).await;
 }
 
 #[tokio::test]
