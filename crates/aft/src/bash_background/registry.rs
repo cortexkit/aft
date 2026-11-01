@@ -7596,7 +7596,7 @@ impl BgTaskRegistry {
         }
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
-            return self.restore_claimed_remote_task(metadata, paths);
+            return self.restore_claimed_remote_task(metadata, paths, false);
         }
         // A finished remote task can still owe its runner a cancellation (an
         // owner pause marks the task finished before its worker sends it).
@@ -9294,11 +9294,15 @@ impl BgTaskRegistry {
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
+    // Remote restoration starts a worker, so reject an out-of-scope match
+    // before registering it rather than leaving that check to the caller.
     fn status_relaxed_task(
         &self,
         task_id: &str,
         project_root: &Path,
         storage_dir: &Path,
+        resume_remote: bool,
+        accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
@@ -9316,6 +9320,7 @@ impl BgTaskRegistry {
                                 .map(canonicalized_path)
                                 .as_deref()
                                 == Some(canonical_project.as_path())
+                                && accept(&state.metadata)
                         })
                         .unwrap_or(false);
                     return matches_project.then_some(task);
@@ -9329,8 +9334,25 @@ impl BgTaskRegistry {
                 if disk.task_id != metadata.task_id || disk.session_id != metadata.session_id {
                     return None;
                 }
+                // Remote output and its replay cursor commit to disk together;
+                // the database row can still describe an older checkpoint.
+                let metadata = if disk.remote.is_some() || metadata.remote.is_some() {
+                    disk
+                } else {
+                    metadata
+                };
+                if !accept(&metadata)
+                    || metadata
+                        .project_root
+                        .as_deref()
+                        .map(canonicalized_path)
+                        .as_deref()
+                        != Some(canonical_project.as_path())
+                {
+                    return None;
+                }
                 if self
-                    .insert_rehydrated_task(metadata, resolved.paths, true)
+                    .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                     .is_err()
                 {
                     return None;
@@ -9406,6 +9428,9 @@ impl BgTaskRegistry {
             if metadata_project.as_deref() != Some(canonical_project.as_path()) {
                 continue;
             }
+            if !accept(&metadata) {
+                continue;
+            }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
                     .lock_state()
@@ -9417,12 +9442,13 @@ impl BgTaskRegistry {
                             .map(canonicalized_path)
                             .as_deref()
                             == Some(canonical_project.as_path())
+                            && accept(&state.metadata)
                     })
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
             if self
-                .insert_rehydrated_task(metadata, resolved.paths, true)
+                .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                 .is_err()
             {
                 return None;
@@ -9430,6 +9456,33 @@ impl BgTaskRegistry {
             return self.task(task_id);
         }
         None
+    }
+
+    fn restore_relaxed_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        resume_remote: bool,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        if !resume_remote && metadata.remote.is_some() && !metadata.is_terminal() {
+            // Kill settlement also needs a worker, but its cancellation must
+            // be durable before the worker can consider a local fallback.
+            self.restore_claimed_remote_task(metadata, paths, true)?;
+            self.start_watchdog();
+            return Ok(());
+        }
+        if resume_remote && metadata.remote.is_some() {
+            // Registering a saved remote task is not enough: its worker must
+            // attach to the runner. Session recovery shares one worker across
+            // registries and lets an owner's pending pause reach it first.
+            let session_id = metadata.session_id.clone();
+            self.rehydrate_resolved_task(metadata, paths, &session_id)?;
+            self.start_watchdog();
+            Ok(())
+        } else {
+            self.insert_rehydrated_task(metadata, paths, true)
+        }
     }
 
     fn lookup_relaxed_task_from_db(
@@ -9483,7 +9536,11 @@ impl BgTaskRegistry {
         .and_then(Result::ok)
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
-        if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+        if let Some(task) =
+            self.status_relaxed_task(task_id, project_root, storage_dir, true, |metadata| {
+                metadata.session_id == session_id || metadata.scope.is_none()
+            })
+        {
             if task.session_id != session_id
                 && task
                     .lock_state()
@@ -9525,7 +9582,9 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
-            .status_relaxed_task(task_id, project_root, storage_dir)
+            .status_relaxed_task(task_id, project_root, storage_dir, false, |metadata| {
+                metadata.scope.is_none()
+            })
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         if task
             .lock_state()
@@ -12461,11 +12520,14 @@ impl BgTaskRegistry {
     /// recorded through either registry reaches the one state every worker
     /// check reads, and it starts no worker of its own while the owner holds
     /// the task or a worker runs.
+    /// A kill records its cancellation in that shared task before permitting
+    /// a recovery worker to start, so recovery cannot launch a local fallback.
     #[cfg(unix)]
     fn restore_claimed_remote_task(
         &self,
         metadata: PersistedTask,
         paths: TaskPaths,
+        cancel_before_resume: bool,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let canonical_project_root = canonicalized_path(
@@ -12487,10 +12549,13 @@ impl BgTaskRegistry {
                 claim.adopters.push(Arc::downgrade(&self.inner));
                 let held = claim.held;
                 let publishes = self.register_claimed_task(&task)?;
+                let resume_allowed =
+                    !cancel_before_resume || self.record_remote_cancel_owed(&task, false)?;
                 // The owner's worker stopped without finishing the task: run
                 // it here, unless this registry is itself holding tasks for a
                 // pause, which must reach a task before its worker does.
-                if !held
+                if resume_allowed
+                    && !held
                     && !self.holds_remote_workers()
                     && !task.remote_worker_running.load(Ordering::Acquire)
                     && !task.is_terminal()
@@ -12508,6 +12573,9 @@ impl BgTaskRegistry {
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
+        if cancel_before_resume && !self.record_remote_cancel_owed(&task, false)? {
+            return Ok(());
+        }
         let held = self.hold_remote_worker(&task_id);
         if !self.inner.saved_task_recovery.load(Ordering::Acquire) {
             *task
