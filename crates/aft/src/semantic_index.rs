@@ -12118,6 +12118,64 @@ pub(crate) use tests::saved_pre_budget_summary_fixture;
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn v8_refused_chunks_and_header_identity_round_trip_preserves_append_scan() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let header = root.join("widget.h");
+        let refused_file = root.join("partial.rs");
+        fs::write(
+            &header,
+            "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n",
+        )
+        .unwrap();
+        write_rust_file(&refused_file, "retained");
+        let mut index = build_test_index(&root, &[header.clone(), refused_file.clone()]);
+        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        );
+        index.set_fingerprint(fingerprint.clone());
+        let refused = BTreeMap::from([(refused_file, 2)]);
+        index.apply_refused_rows_update(refused.clone());
+        assert!(index.write_to_disk(storage.path(), "v8-header-refused"));
+
+        let data_path = storage
+            .path()
+            .join("semantic/v8-header-refused/semantic.bin");
+        let bytes = fs::read(&data_path).unwrap();
+        assert_eq!(bytes[0], SEMANTIC_INDEX_VERSION_V8);
+        let identity_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let identity: serde_json::Value =
+            serde_json::from_slice(&bytes[13..13 + identity_len]).unwrap();
+        assert_eq!(identity["header_languages_resolved"], true);
+
+        let restored = SemanticIndex::read_from_disk(
+            storage.path(),
+            "v8-header-refused",
+            &root,
+            false,
+            Some(&fingerprint.as_string()),
+        )
+        .unwrap();
+        assert_eq!(restored.skipped_rows(), 2);
+        assert_eq!(restored.skipped_rows.refused, refused);
+        // Reading this marker must preserve the recorded freshness of resolved C++ headers.
+        assert!(restored.recorded_file_freshness(&header).is_some());
+        assert_eq!(restored.to_bytes(), bytes);
+
+        let layout = SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            restored.persistence_snapshot().unwrap(),
+            &fingerprint.as_string(),
+            restored.dimension(),
+            false,
+        )
+        .expect("V8 append identity must ignore the stored header migration marker");
+        assert!(layout.bytes_read < bytes.len());
+    }
+
+    #[test]
     fn h_header_marker_preserves_non_header_incremental_append_scan() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
