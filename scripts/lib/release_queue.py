@@ -154,10 +154,11 @@ def run_isolated(arguments: list[str]) -> int:
         return retry.run(arguments)
     if not arguments or arguments[0] in ("--help", "-h"):
         print("Usage: scripts/release.sh VERSION [--dry] [--legacy-merge]\n"
-              "       scripts/release.sh --retry-from vX.Y.Z X.Y.(Z+1) --fix COMMIT [--fix COMMIT ...]\n"
+              "       scripts/release.sh --retry-from vX.Y.Z X.Y.(Z+1) --fix COMMIT [--fix COMMIT ...] [--notes-file PATH]\n"
               "Retry fixes must already be on origin/main. Work happens in a disposable worktree;\n"
               "release/X.Y is pushed directly, checked by Tests, and tagged only when green.\n"
-              "Notes reuse the failed tag's approved notes, renamed to the new version, plus each fix's subject.")
+              "Notes reuse the failed tag's approved notes, renamed to the new version, plus each fix's subject;\n"
+              "a patch of a published release passes --notes-file with notes for the fixes only.")
         return 0 if arguments else 2
     version = arguments[0]
     if not state_path(version).exists() and git("branch", "--show-current") != "main":
