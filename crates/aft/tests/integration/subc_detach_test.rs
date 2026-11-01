@@ -1049,9 +1049,7 @@ impl ModuleProcess {
         stderr_path: &Path,
     ) -> Self {
         use std::os::unix::process::CommandExt;
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = crate::test_helpers::aft_binary::aft_binary();
         let mut command = Command::new(binary);
         command
             .args([std::ffi::OsStr::new("--subc"), conn_path.as_os_str()])
@@ -1159,9 +1157,7 @@ impl ModuleProcess {
             }
             None => Stdio::null(),
         };
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = crate::test_helpers::aft_binary::aft_binary();
         let mut command = Command::new(binary);
         command
             .arg("--subc")
@@ -1417,23 +1413,25 @@ async fn bind_route_as_at_epoch(
     )
     .expect("write project config");
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            harness.to_string(),
-            SESSION_ID.to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new(harness.to_string(), SESSION_ID.to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     send_frame(
         stream,
@@ -1662,4 +1660,221 @@ fn assert_process_alive(pid: u32, label: &str) {
 
 pub(super) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
+}
+
+// These binds exercise the wire without a real daemon's scope admission policy:
+// AFT must accept caller-owned scope metadata and keep trust tied to the bind principal.
+fn scope_project_bind_034(project: &Path) -> Value {
+    json!({
+        "op": "route.bind", "route_channel": ROUTE_CHANNEL, "epoch": 1,
+        "target": {"kind": "tool_provider", "module_id": "aft"},
+        "identity": {"harness": "opencode", "session": SESSION_ID},
+        "principal": {"kind": "direct"},
+        "scope": {
+            "owner": {"kind": "direct"}, "ref": "caller-owned",
+            "scope_epoch": 1, "kind": "head", "owner_authorized": false,
+            "workdir": project,
+        },
+    })
+}
+
+fn scope_project_case_034(
+    make_bind: impl FnOnce(&Path, &Path) -> Value,
+    bind_error: Option<&str>,
+    rootless: bool,
+) {
+    // Each case starts a full AFT process. Serialize these fixtures so the
+    // connection deadline measures one startup, not competing module startups.
+    static CASES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = CASES.lock().unwrap_or_else(|error| error.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        std::fs::write(project.path().join("marker.txt"), "scope_project_034_marker\n").unwrap();
+        std::fs::write(decoy.path().join("marker.txt"), "wrong_legacy_project\n").unwrap();
+        let listener = write_connection_file(conn_dir.path()).await;
+        let stderr_path = storage.path().join("scope-project-module.stderr");
+        let mut module = ModuleProcess::spawn_with_stderr(
+            &conn_dir.path().join("subc-connection.json"),
+            config_home.path(),
+            data_home.path(),
+            Some(&stderr_path),
+        );
+        let mut stream = accept_module_with_diagnostics(&listener, &mut module.child, &stderr_path).await;
+        let bind = make_bind(project.path(), decoy.path());
+        send_frame(&mut stream, Frame::build(FrameType::Request, control_flags(), 0, 0, 10, serde_json::to_vec(&bind).unwrap()).unwrap()).await;
+        let ack = read_frame_timeout(&mut stream, "scope project bind").await;
+        assert_eq!((ack.header.channel, ack.header.corr), (0, 10));
+        if let Some(code) = bind_error {
+            assert_eq!(ack.header.ty, FrameType::Error, "{}", frame_body(&ack));
+            let error: Value = serde_json::from_slice(&ack.body).unwrap();
+            assert_eq!(error["code"], code);
+            assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
+            assert_eq!(error["detail"]["cause"], "invalid_workdir");
+            assert_eq!(error["detail"]["source"], "scope_workdir");
+        } else {
+            assert_eq!(ack.header.ty, FrameType::Response, "{}", frame_body(&ack));
+            for (corr, body) in [
+                (20, json!({"name":"read", "preset":"head", "arguments":{"path":"marker.txt"}})),
+                (21, json!({"name":"grep", "preset":"head", "arguments":{"pattern":"scope_project_034_marker", "path":"."}})),
+            ] {
+                send_frame(&mut stream, Frame::build(FrameType::Request, Flags::new(false, Priority::Interactive, false), ROUTE_CHANNEL, 1, corr, serde_json::to_vec(&body).unwrap()).unwrap()).await;
+                let reply = read_frame_timeout(&mut stream, "scope project tool").await;
+                assert_eq!(reply.header.corr, corr);
+                if rootless {
+                    assert_eq!(reply.header.ty, FrameType::Error);
+                    let error: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(error["code"], "project_required");
+                    assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
+                    assert_eq!(error["detail"]["requirement"], "absolute_non_root_project_directory");
+                    assert!(error["detail"]["cause"].is_string());
+                } else {
+                    assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
+                    assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
+                    assert!(frame_body(&reply).contains("scope_project_034_marker"), "{}", frame_body(&reply));
+                    if corr == 21 {
+                        assert!(frame_body(&reply).contains("marker.txt"), "{}", frame_body(&reply));
+                    }
+                    assert!(!frame_body(&reply).contains("wrong_legacy_project"));
+                }
+            }
+            if rootless {
+                for (corr, op) in [(22, "tool.catalog"), (23, "role.describe")] {
+                    send_frame(&mut stream, Frame::build(FrameType::Request, Flags::new(false, Priority::Interactive, false), ROUTE_CHANNEL, 1, corr, serde_json::to_vec(&json!({"op":op})).unwrap()).unwrap()).await;
+                    let reply = read_frame_timeout(&mut stream, "project-free metadata").await;
+                    assert_eq!(reply.header.ty, FrameType::Response, "{}", frame_body(&reply));
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    if op == "tool.catalog" { assert!(body["tools"].as_array().is_some_and(|tools| !tools.is_empty()), "{body}"); }
+                    else { assert!(body.is_object()); }
+                }
+            }
+        }
+        send_connection_goodbye(&mut stream).await;
+        assert!(module.wait_for_exit("scope project shutdown").success());
+    });
+}
+
+#[test]
+fn subc_034_project_free_scoped_bind_reads_and_greps_workdir_without_core_approval() {
+    scope_project_case_034(|project, _| scope_project_bind_034(project), None, false);
+}
+
+#[test]
+fn subc_034_project_matching_legacy_scoped_bind_reads_and_greps_as_before() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["identity"]["project_root"] = json!(project);
+            bind["scope"]["owner_authorized"] = json!(true);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_mismatching_legacy_scoped_bind_uses_workdir() {
+    scope_project_case_034(
+        |project, decoy| {
+            let mut bind = scope_project_bind_034(project);
+            bind["identity"]["project_root"] = json!(decoy);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_relative_scope_workdir_is_refused_before_canonicalization() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            // This relative directory exists in every AFT test process's working
+            // directory. Canonicalizing before validation would wrongly accept it.
+            bind["scope"]["workdir"] = json!(".");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        Some("invalid_workdir"),
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_empty_scope_workdir_is_refused() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["scope"]["workdir"] = json!("");
+            bind
+        },
+        Some("invalid_workdir"),
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind["scope"].as_object_mut().unwrap().remove("workdir");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_project_free_route_refuses_files_but_serves_catalog() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind
+        },
+        None,
+        true,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_legacy_root_keeps_serving_files() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind["identity"]["project_root"] = json!(project);
+            bind
+        },
+        None,
+        false,
+    );
+}
+
+#[test]
+fn subc_034_project_unscoped_slash_refuses_read_and_grep_but_serves_catalog() {
+    scope_project_case_034(
+        |project, _| {
+            let mut bind = scope_project_bind_034(project);
+            bind.as_object_mut().unwrap().remove("scope");
+            bind["identity"]["project_root"] = json!("/");
+            bind
+        },
+        None,
+        true,
+    );
 }

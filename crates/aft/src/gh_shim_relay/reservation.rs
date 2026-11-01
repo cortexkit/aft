@@ -76,7 +76,7 @@ fn opening_refusal(error: TransportError, expected: &ScopeSelector) -> Refusal {
 impl SubcRelayTransport {
     pub(super) async fn reserve_scoped(
         &self,
-        project: &str,
+        _project: &str,
         session: &str,
         scope: &ScopeStamp,
         body: Value,
@@ -99,11 +99,7 @@ impl SubcRelayTransport {
         let target = subc_protocol::RouteTarget::ToolProvider {
             module_id: PLEXUS_MODULE_ID.into(),
         };
-        let identity = subc_protocol::BindIdentity::new(
-            if project.is_empty() { "/" } else { project }.to_string(),
-            "aft-gh-relay",
-            session.to_string(),
-        );
+        let identity = subc_protocol::BindIdentity::new("aft-gh-relay", session.to_string());
         let selector = scope_selector(scope);
         let key =
             route_lease_key(&consumer, &target, &identity, Some(&selector)).map_err(|_| {

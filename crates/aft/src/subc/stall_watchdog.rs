@@ -823,23 +823,28 @@ mod tests {
     fn frame_loop_context_names_control_operation_root_and_session() {
         use super::super::*;
         let metrics = DispatchPathMetrics::new();
-        let request = ModuleControlRequest::RouteBind {
-            route_channel: 125,
-            epoch: 1,
-            target: subc_protocol::RouteTarget::ToolProvider {
-                module_id: "aft".to_string(),
-            },
-            identity: subc_protocol::BindIdentity::new(
-                PathBuf::from("/isolated/root"),
-                "runner".to_string(),
-                "sidekick-session".to_string(),
-            ),
-            principal: None,
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(PathBuf::from("/isolated/root"));
+
+            bind
         };
         let frame = Frame::build(
             FrameType::Request,
@@ -851,7 +856,7 @@ mod tests {
         )
         .unwrap();
         metrics.mark_frame_loop_frame(&frame);
-        metrics.mark_frame_loop_control(&request, &frame);
+        metrics.mark_frame_loop_control(&serde_json::from_value(request).unwrap(), &frame);
         let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
         let _held = diagnostics.hold();
         metrics.mark_frame_loop_wait(
@@ -1372,23 +1377,28 @@ mod tests {
         });
         held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let root = fixture._storage.path().to_path_buf();
-        let request = ModuleControlRequest::RouteBind {
-            route_channel: 125,
-            epoch: 1,
-            target: subc_protocol::RouteTarget::ToolProvider {
-                module_id: "aft".to_string(),
-            },
-            identity: subc_protocol::BindIdentity::new(
-                root.clone(),
-                "runner".to_string(),
-                "sidekick-session".to_string(),
-            ),
-            principal: None,
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: None,
-            role_versions: None,
-            call_mode: None,
+        let request = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(root.clone());
+
+            bind
         };
         let frame = Frame::build(
             FrameType::Request,

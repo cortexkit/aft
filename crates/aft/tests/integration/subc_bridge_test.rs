@@ -46,6 +46,9 @@ use super::helpers::ReleaseOnDrop;
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
+// Consumer route opens require numeric daemon versions of at least 0.39.0.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 pub(super) struct FakeDaemonInput {
     pub(super) listener: TcpListener,
     pub(super) key: Vec<u8>,
@@ -1834,7 +1837,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),
-        daemon_ver: "subc-test".to_string(),
+        daemon_ver: FAKE_DAEMON_VERSION.to_string(),
     };
     // The connection-file contract rejects writable shared parents, even
     // when a permissive runner umask gives its temporary directories 0775.
@@ -2001,7 +2004,7 @@ where
             key: key.clone(),
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "subc-test".to_string(),
+            daemon_ver: FAKE_DAEMON_VERSION.to_string(),
         },
     )
     .expect("write connection file");
@@ -2094,7 +2097,7 @@ async fn complete_initial_attach(
         &mut stream,
         key,
         daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -2239,7 +2242,7 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
                     key: input.key.clone(),
                     daemon_id: input.daemon_id,
                     pid: std::process::id(),
-                    daemon_ver: "subc-test-replacement".to_string(),
+                    daemon_ver: "0.39.1".to_string(),
                 },
             )
             .expect("rewrite connection file");
@@ -3238,7 +3241,7 @@ fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),
-        daemon_ver: "subc-test".to_string(),
+        daemon_ver: FAKE_DAEMON_VERSION.to_string(),
     };
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
@@ -3523,23 +3526,25 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
 
-    let mut request = serde_json::to_value(ModuleControlRequest::RouteBind {
-        route_channel: 11,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root1.clone(),
-            "opencode".to_string(),
-            "session-11".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let mut request = serde_json::to_value({
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 11,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("opencode".to_string(), "session-11".to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root1.clone());
+
+        bind
     })
     .expect("route bind body");
     // The control request is internally tagged (`op`), so the bind fields sit
@@ -4186,7 +4191,7 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),
-        daemon_ver: "subc-test".to_string(),
+        daemon_ver: FAKE_DAEMON_VERSION.to_string(),
     };
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
@@ -4258,7 +4263,7 @@ async fn drive_s1_rejection_daemon(
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -4288,23 +4293,25 @@ async fn drive_s1_rejection_daemon(
     .await;
 
     // An mcp:* front binds a route with a CLEAN config (no marker).
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.clone(),
-            "mcp:generic".to_string(),
-            "s1-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let bind = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 1,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("mcp:generic".to_string(), "s1-session".to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.clone());
+
+        bind
     };
     send_frame(
         &mut stream,
@@ -4394,7 +4401,7 @@ fn subc_registers_not_ready_and_noop_warmer_flips_ready_without_live_roots_query
         key: key.clone(),
         daemon_id,
         pid: std::process::id(),
-        daemon_ver: "subc-test".to_string(),
+        daemon_ver: FAKE_DAEMON_VERSION.to_string(),
     };
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
@@ -4459,7 +4466,7 @@ async fn drive_readiness_daemon(
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -4546,23 +4553,25 @@ async fn drive_readiness_daemon(
     assert_ne!(flip_corrs[0], flip_corrs[1], "each retry is a new request");
 
     // Sessions bind as before.
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.clone(),
-            "mcp:generic".to_string(),
-            "readiness-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let bind = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 1,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("mcp:generic".to_string(), "readiness-session".to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.clone());
+
+        bind
     };
     send_frame(
         &mut stream,
@@ -4649,7 +4658,7 @@ pub(super) async fn open_fake_daemon_session_with_ops(
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -8702,7 +8711,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -8825,7 +8834,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -8953,7 +8962,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         &mut consumer_stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(30),
     )
     .await
@@ -9004,8 +9013,10 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         route_open_body["consumer_identity"],
         json!({ "module_id": "aft", "launch_nonce": "test-launch-nonce" })
     );
-    assert_eq!(route_open_body["identity"]["project_root"], json!(root1));
-    assert_eq!(route_open_body["identity"]["harness"], "opencode");
+    assert_eq!(
+        route_open_body["identity"],
+        json!({ "harness": "opencode", "session": "session-1" })
+    );
     send_frame(
         &mut consumer_stream,
         Frame::build_with_version(
@@ -9168,6 +9179,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
 struct FakeStatusHolder {
     consumer_stream: tokio::net::TcpStream,
     revision: u64,
+    scope: String,
 }
 
 impl FakeStatusHolder {
@@ -9186,7 +9198,7 @@ impl FakeStatusHolder {
             &mut consumer_stream,
             key,
             daemon_id,
-            "subc-test",
+            FAKE_DAEMON_VERSION,
             Duration::from_secs(5),
         )
         .await
@@ -9197,8 +9209,15 @@ impl FakeStatusHolder {
         let route_open = read_raw_inventory_frame(&mut consumer_stream, "route.open").await;
         let route_open_body: Value =
             serde_json::from_slice(&route_open.body).expect("route.open request body");
-        assert_eq!(route_open_body["identity"]["project_root"], json!(root));
-        assert_eq!(route_open_body["identity"]["harness"], "opencode");
+        assert_eq!(route_open_body["op"], "route.open");
+        assert_eq!(
+            route_open_body["target"],
+            json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+        );
+        assert_eq!(
+            route_open_body["identity"],
+            json!({ "harness": "opencode", "session": "session-1" })
+        );
         reply_to(
             &mut consumer_stream,
             &route_open,
@@ -9208,6 +9227,7 @@ impl FakeStatusHolder {
         Self {
             consumer_stream,
             revision: 0,
+            scope: format!("project:{}", root.to_string_lossy()),
         }
     }
 
@@ -9228,6 +9248,8 @@ impl FakeStatusHolder {
         let publish_body: Value =
             serde_json::from_slice(&publish.body).expect("status.publish request body");
         assert_eq!(publish_body["method"], "status.publish");
+        // The publish names its project scope; management route identity no longer does.
+        assert_eq!(publish_body["params"]["scope"], self.scope);
         self.revision += 1;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9297,7 +9319,7 @@ async fn open_status_bar_module(input: &FakeDaemonInput) -> tokio::net::TcpStrea
         &mut stream,
         &input.key,
         &input.daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -11723,23 +11745,28 @@ async fn send_route_bind_with_elicitation_capability(
 ) {
     write_bind_project_config(root, &minimal_bind_doc());
 
-    let body = ModuleControlRequest::RouteBind {
-        route_channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root.to_path_buf(),
-            "runner".to_string(),
-            format!("elicitation-session-{route_channel}"),
-        ),
-        principal: Some(subc_mcp_principal()),
-        consumer_capabilities: Some(vec!["elicitation".to_string()]),
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let body = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new(
+                "runner".to_string(),
+                format!("elicitation-session-{route_channel}"),
+            ),
+            principal: Some(subc_mcp_principal()),
+            consumer_capabilities: Some(vec!["elicitation".to_string()]),
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     send_frame(
         stream,
@@ -12782,7 +12809,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         &mut stream,
         &key,
         &daemon_id,
-        "subc-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -12811,23 +12838,25 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
     )
     .await;
 
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: 1,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(
-            root,
-            "fed:".to_string(),
-            "fed-malformed-session".to_string(),
-        ),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let bind = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 1,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new("fed:".to_string(), "fed-malformed-session".to_string()),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root);
+
+        bind
     };
     send_frame(
         &mut stream,
@@ -13790,24 +13819,26 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         7,
         subc_protocol::scope::ScopeKind::Head,
     );
-    send_control_request(
-        &mut stream,
-        340,
-        ModuleControlRequest::RouteBind {
+    send_control_request(&mut stream, 340, {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: 6,
             epoch: 1,
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: BindIdentity::new(root1.clone(), "opencode", "census-scoped"),
+            identity: BindIdentity::new("opencode", "census-scoped"),
             principal: Some(owner),
             scope: Some(stamp),
             consumer_capabilities: None,
             admission_facts: Default::default(),
             role_versions: None,
             call_mode: None,
-        },
-    )
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root1.clone());
+
+        bind
+    })
     .await;
     expect_route_bind_ack(&mut stream, 340).await;
     send_management_request(&mut stream, 2, 341, json!({"op":"memory.census"})).await;
@@ -14734,10 +14765,10 @@ async fn poll_manifest_callgraph_until_ready(
     }
 }
 
-async fn send_control_request(
+async fn send_control_request<T: serde::Serialize>(
     stream: &mut tokio::net::TcpStream,
     corr: u64,
-    request: ModuleControlRequest,
+    request: T,
 ) {
     send_frame(
         stream,
@@ -14792,17 +14823,14 @@ async fn send_management_route_bind_with_harness(
     harness: &str,
     principal: Option<Principal>,
 ) {
-    send_control_request(
-        stream,
-        corr,
-        ModuleControlRequest::RouteBind {
+    send_control_request(stream, corr, {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel,
             epoch: 1,
             target: RouteTarget::ManagementSurface {
                 module_id: "aft".to_string(),
             },
             identity: BindIdentity::new(
-                identity_root.to_path_buf(),
                 harness.to_string(),
                 "management-route-must-not-register-session".to_string(),
             ),
@@ -14812,8 +14840,12 @@ async fn send_management_route_bind_with_harness(
             scope: None,
             role_versions: None,
             call_mode: None,
-        },
-    )
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(identity_root.to_path_buf());
+
+        bind
+    })
     .await;
 }
 
@@ -15000,19 +15032,25 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
     // production; keeping it asserts it's harmlessly ignored.
     write_bind_project_config(root, &doc);
 
-    let request = ModuleControlRequest::RouteBind {
-        route_channel,
-        epoch,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".to_string(),
-        },
-        identity: BindIdentity::new(root.to_path_buf(), harness.to_string(), session.to_string()),
-        principal,
-        consumer_capabilities,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity::new(harness.to_string(), session.to_string()),
+            principal,
+            consumer_capabilities,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.to_path_buf());
+
+        bind
     };
     send_frame(
         stream,

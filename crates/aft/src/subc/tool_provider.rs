@@ -5057,19 +5057,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stamp.attributes.flow_id.as_deref(), Some("flow-1"));
-        let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
-            route_channel: 1,
-            epoch: 1,
-            target: subc_protocol::RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new("/tmp/project", "runner", "session"),
-            principal: Some(subc_protocol::Principal::Direct),
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: Some(stamp.clone()),
-            role_versions: None,
-            call_mode: None,
+        let bind = {
+            let mut bind =
+                serde_json::to_value(subc_protocol::session::ModuleControlRequest::RouteBind {
+                    route_channel: 1,
+                    epoch: 1,
+                    target: subc_protocol::RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("runner", "session"),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: Some(stamp.clone()),
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!("/tmp/project");
+
+            bind
         };
         let decoded: subc_protocol::session::ModuleControlRequest =
             serde_json::from_slice(&serde_json::to_vec(&bind).unwrap()).unwrap();

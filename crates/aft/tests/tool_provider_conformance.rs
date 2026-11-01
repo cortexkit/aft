@@ -840,8 +840,8 @@ fn provider_command_uses_existing_fixture_cwd_and_xdg_directories() {
     if let Some(binary) = std::env::var_os("NEXTEST_BIN_EXE_aft") {
         if std::env::var_os("AFT_TEST_AFT_BINARY").is_none() {
             assert_eq!(
-                command.get_program(),
-                binary,
+                aft_binary::source_binary().as_os_str(),
+                binary.as_os_str(),
                 "use nextest's relocated executable"
             );
         }
@@ -1024,7 +1024,14 @@ impl Harness for Subject {
         let mut guard = ChildGuard(Some(child));
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
-            .map_err(harness_error)?
+            .map_err(|error| {
+                let status = guard.0.as_mut().unwrap().try_wait();
+                let stderr = std::fs::read_to_string(root.join("daemon.stderr"))
+                    .unwrap_or_else(|read| format!("cannot read provider stderr: {read}"));
+                HarnessError::new(format!(
+                    "provider connection deadline: {error}; child status={status:?}; stderr:\n{stderr}"
+                ))
+            })?
             .map_err(harness_error)?;
         authenticate_server(
             &mut stream,
@@ -3149,37 +3156,43 @@ async fn bind_route_stamped_with_mode(
     let wire = handle.wire.clone();
     let channel = wire.next_channel.fetch_add(1, Ordering::SeqCst);
     let corr = wire.corr();
-    let bind = ModuleControlRequest::RouteBind {
-        route_channel: channel,
-        epoch: 1,
-        target: RouteTarget::ToolProvider {
-            module_id: "aft".into(),
-        },
-        identity: BindIdentity::new(project, harness, session),
-        principal: Some(decode_principal(&stamp.principal)?),
-        consumer_capabilities,
-        admission_facts: None,
-        scope: stamp
-            .scope
-            .as_ref()
-            .map(|scope| {
-                Ok(subc_protocol::scope::ScopeStamp::new(
-                    decode_principal(&scope.owner)?,
-                    scope.scope_ref.clone(),
-                    scope.scope_epoch,
-                    subc_protocol::scope::ScopeKind::Head,
-                )
-                .with_owner_authorized(true)
-                .with_attributes(
-                    subc_protocol::scope::ScopeAttributes::new().with_flow_id(
-                        (mode == Some(cortexkit_role_tool_provider::CallMode::Flow))
-                            .then(|| "mode-flow".into()),
-                    ),
-                ))
-            })
-            .transpose()?,
-        role_versions,
-        call_mode: mode,
+    let bind = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: 1,
+            target: RouteTarget::ToolProvider {
+                module_id: "aft".into(),
+            },
+            identity: BindIdentity::new(harness, session),
+            principal: Some(decode_principal(&stamp.principal)?),
+            consumer_capabilities,
+            admission_facts: None,
+            scope: stamp
+                .scope
+                .as_ref()
+                .map(|scope| {
+                    Ok(subc_protocol::scope::ScopeStamp::new(
+                        decode_principal(&scope.owner)?,
+                        scope.scope_ref.clone(),
+                        scope.scope_epoch,
+                        subc_protocol::scope::ScopeKind::Head,
+                    )
+                    .with_owner_authorized(true)
+                    .with_attributes(
+                        subc_protocol::scope::ScopeAttributes::new().with_flow_id(
+                            (mode == Some(cortexkit_role_tool_provider::CallMode::Flow))
+                                .then(|| "mode-flow".into()),
+                        ),
+                    ))
+                })
+                .transpose()?,
+            role_versions,
+            call_mode: mode,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(project);
+
+        bind
     };
     let mut reply = wire.expect(0, corr);
     wire.send(

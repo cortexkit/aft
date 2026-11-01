@@ -948,19 +948,25 @@ mod tests {
             module_id: "basal".into(),
         });
         assert_eq!(trust_for_bind("basal", &basal), BindTrust::Untrusted);
-        let bind = |channel, principal, scope| ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: 1,
-            target: RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new(&root, "basal", "flow-diagnostics"),
-            principal,
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope,
-            role_versions: None,
-            call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
+        let bind = |channel, principal, scope| {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: 1,
+                target: RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new("basal", "flow-diagnostics"),
+                principal,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope,
+                role_versions: None,
+                call_mode: Some(subc_protocol::call_mode::CallMode::Flow),
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&root);
+
+            bind
         };
 
         let mut invalid_scopes = vec![None, Some(scope(ScopeKind::Head))];
