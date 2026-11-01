@@ -1,12 +1,13 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/rerank/synapse.rs"
   ],
   "slices": [
     "subc-034-project-from-scope"
   ],
-  "note": "Subconscious 0.34 protocol move: project folder from the scope stamp. No search ranking code changes."
+  "note": "Subconscious 0.34 protocol move: project folder from the scope stamp. The only ranking-fence file touched is commands/semantic_search/rerank/synapse.rs, changed only in its #[cfg(test)] fake Synapse daemon (it now reports daemon version 0.39.0 and tolerates a reset connection at a frame boundary). No product code in the fence changes, so ranked rows must remain byte-identical to the committed reference."
 }
