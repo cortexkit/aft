@@ -776,7 +776,12 @@ fn handle_inspect_payload(
     // replaced by the legacy scanner's store.
     let v3_routed = tier2_enabled && ctx.callgraph_views_enabled();
     let routed_store = if tier2_enabled && (ctx.checkout_query_runtime_active() || v3_routed) {
-        ctx.callgraph_store_for_query_without_wait()
+        request_deadline.map_or_else(
+            || ctx.callgraph_store_for_query_without_wait(),
+            |deadline| {
+                ctx.callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP))
+            },
+        )
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
     };
@@ -1569,7 +1574,8 @@ fn handle_inspect_deferred_with_clock(
                 // Resolve call-graph availability before diagnostics can end the
                 // request. Response finalization must report the same outcome
                 // even if no background scan is submitted.
-                let _ = ctx.callgraph_store_for_query_without_wait();
+                let _ = ctx
+                    .callgraph_store_for_ops_until(deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP));
             }
             // Queueing instead of sharing a response keeps request-specific scopes,
             // phase logs, and terminals independent while bounding expensive work to

@@ -11266,20 +11266,33 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_capped(None)
+    }
+
+    /// Keep inspect's graph wait inside its request budget. Retain the checkout
+    /// wait outcome so inspect can name files whose edits are not in the graph.
+    pub(crate) fn callgraph_store_for_ops_until(&self, deadline: Instant) -> CallgraphStoreAccess {
+        if Instant::now() >= deadline {
+            return CallgraphStoreAccess::Building;
+        }
+        self.callgraph_store_for_ops_capped(Some(deadline))
+    }
+
+    fn callgraph_store_for_ops_capped(&self, deadline: Option<Instant>) -> CallgraphStoreAccess {
         let active = self
             .checkout_query_runtime
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        self.callgraph_store_for_ops_with_wait(
-            if active {
-                crate::views::contracts::CALLGRAPH_QUERY_WAIT
-            } else {
-                self.callgraph_build_wait_window()
-            },
-            true,
-            None,
-        )
+        let wait = if active {
+            crate::views::contracts::CALLGRAPH_QUERY_WAIT
+        } else {
+            self.callgraph_build_wait_window()
+        };
+        let wait = deadline.map_or(wait, |deadline| {
+            wait.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        self.callgraph_store_for_ops_with_wait(wait, true, None)
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
