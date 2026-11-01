@@ -755,6 +755,68 @@ fn confined_handler_golden_vectors() {
     }
 }
 
+#[test]
+fn confined_glob_count_shape_preserves_checked_and_partial_contracts() {
+    fn shape(response: &Response, denied: bool) {
+        let mut expected = std::collections::BTreeSet::from([
+            "text",
+            "complete",
+            "no_files_matched_scope",
+            "skipped_foreign_mounts",
+            "files",
+            "total",
+            "truncated",
+            "walk_truncated",
+            "index",
+            "fallback",
+            "files_list_envelope",
+        ]);
+        if denied {
+            expected.insert("skipped_denied");
+        }
+        let actual = response
+            .data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected, "{}", response.data);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["walk_truncated"], true);
+        assert!(response.data["files_list_envelope"]["causes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("walk")));
+    }
+    let f = Fixture::new();
+    let checked =
+        crate::grep_executor::with_walk_limit(0, || f.call("glob", arguments("glob", ".")));
+    shape(&checked, false);
+    assert_eq!(checked.data["total"], 0);
+    for number in 0..101 {
+        std::fs::write(
+            f.pin.join(format!("candidate-{number:03}.rs")),
+            "fn candidate() {}\n",
+        )
+        .unwrap();
+    }
+    let unchecked = f.call("glob", arguments("glob", "."));
+    shape(&unchecked, false);
+    assert_eq!(unchecked.data["total"], Value::Null);
+    assert_eq!(unchecked.data["files"].as_array().unwrap().len(), 100);
+    assert_eq!(unchecked.data["files_list_envelope"]["total"]["value"], 100);
+
+    let denied = Fixture::new();
+    denied
+        .ctx
+        .update_config(|config| config.sandbox.read_deny = vec![denied.pin.join("only.rs")]);
+    let response = denied.call("glob", arguments("glob", "."));
+    shape(&response, true);
+    assert_eq!(response.data["total"], Value::Null);
+    assert!(response.data["skipped_denied"].as_u64().unwrap() > 0);
+}
+
 /// Records a finished bash task owned by the fixture's "designer" session,
 /// with its output stored outside the pinned root, and returns its paths.
 fn owned_task_output(f: &Fixture) -> crate::bash_background::persistence::TaskPaths {

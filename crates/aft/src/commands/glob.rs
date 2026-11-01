@@ -324,6 +324,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let total = admitted_count.saturating_add(presence.unexamined);
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
+    let confined = crate::context::confinement::active();
+    let safe_confined_total = all_candidates_checked
+        && !presence_budget_exhausted
+        && crate::context::confinement::denied_count() == 0;
+    let walk_truncated = walk_truncated || (confined && !safe_confined_total);
 
     let mut body = serde_json::json!({
         "text": format_glob_text(&files, pattern, &project_root, result_truncated),
@@ -331,13 +336,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-        "total": (all_candidates_checked && !walk_truncated).then_some(total),
+        "total": (all_candidates_checked && if confined { safe_confined_total } else { !walk_truncated }).then_some(total),
         "truncated": result_truncated,
     });
     if !query_walks.is_empty() {
         body["query_walk"] = serde_json::json!(query_walks);
     }
-    if !all_candidates_checked || walk_truncated {
+    if !confined && (!all_candidates_checked || walk_truncated) {
         body["total_lower_bound"] = serde_json::json!(total);
         body["admitted_count"] = serde_json::json!(admitted_count);
         body["candidate_count"] = serde_json::json!(candidate_count);
@@ -419,7 +424,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let envelope = crate::list_surfaces::glob::build_glob_envelope_with_time_limit(
         rendered_count,
-        total,
+        if confined && !safe_confined_total {
+            admitted_count
+        } else {
+            total
+        },
         result_truncated,
         walk_truncated,
         walk_time_limit_reached,
