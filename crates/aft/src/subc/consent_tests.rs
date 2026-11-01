@@ -2028,6 +2028,7 @@ async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted:
         let rx1 = f
             .send_tool(&f.worker, "read", json!({"path": a}), 901, read_dispatch)
             .await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 3).await;
         (rx1, rx2)
     } else {
         let rx1 = f.send_read(&f.worker, &a, 901).await;
