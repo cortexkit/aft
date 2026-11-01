@@ -6119,6 +6119,14 @@ mod tests {
             "a bounded query must join installation, not report a consumed completion as building"
         );
         assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+        // A ready graph must remain usable even by zero-wait readers while
+        // another thread owns completion-installation coordination.
+        let _no_wait = crate::context::override_callgraph_build_wait_ms_for_test(&ctx, 0);
+        let _install = ctx.callgraph_store_install.lock();
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            crate::context::CallgraphStoreAccess::Ready(_)
+        ));
     }
 
     #[test]
