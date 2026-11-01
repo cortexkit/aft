@@ -5221,6 +5221,69 @@ fn base_successor_rebind_keeps_filled_answers_vouched_without_a_subscription() {
     assert!(query(&runtime, "alpha").complete());
 }
 
+#[test]
+fn steady_semantic_passes_bind_for_new_base_readiness_not_unchanged_work() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[
+            ("a.rs", "pub fn alpha_ready() -> u8 { 1 }\n"),
+            ("b.rs", "pub fn beta_ready() -> u8 { 2 }\n"),
+            ("c.rs", "pub fn gamma_ready() -> u8 { 3 }\n"),
+        ],
+    );
+    let _watcher = steady_watcher(root.path());
+    let runtime = open(storage.path(), "scope", root.path());
+    let model = Model::default();
+    let binds = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&binds);
+    *lock(&runtime.before_bind_verify) = Some(Box::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+    }));
+    let one_file = FillBudget {
+        max_files: 1,
+        ..FillBudget::default()
+    };
+    // open() already verified the files. Each pass marks one base file's vectors
+    // ready in a new manifest; binding again lets this checkout see that update.
+    for pass in 0..3 {
+        let before = runtime.installed().generation().resident_key();
+        let before_binds = binds.load(Ordering::SeqCst);
+        runtime.driver().take_reconcile_work();
+        let started = Instant::now();
+        let report = runtime
+            .refresh(one_file, &mut |texts| model.embed(texts))
+            .unwrap();
+        let work = runtime.driver().take_reconcile_work();
+        assert_eq!(report.installed, 1, "{report:?}");
+        assert_eq!(runtime.base_successor_count(), pass + 1);
+        assert_ne!(runtime.installed().generation().resident_key(), before);
+        let count = binds.load(Ordering::SeqCst) - before_binds;
+        eprintln!("SEMANTIC_BIND_MEASUREMENT phase=base_successor pass={} source_edits=0 new_base=1 binds={} walks={} reads={} wall_ms={:.3}",
+            pass, count, work.walks, work.reads, started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(count, 1);
+    }
+    assert_eq!(pending_semantic(&runtime), 0);
+    let generation = runtime.installed().generation().resident_key();
+    let embedded = model.texts();
+    let before_binds = binds.load(Ordering::SeqCst);
+    runtime.driver().take_reconcile_work();
+    let started = Instant::now();
+    for _ in 0..10 {
+        let report = refresh(&runtime, &model);
+        assert_eq!(report.installed, 0, "{report:?}");
+    }
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(binds.load(Ordering::SeqCst), before_binds);
+    assert_eq!((work.walks, work.reads), (0, 0));
+    assert_eq!(runtime.installed().generation().resident_key(), generation);
+    assert_eq!(model.texts(), embedded);
+    assert!(query(&runtime, "alpha").complete());
+    eprintln!("SEMANTIC_BIND_MEASUREMENT phase=steady passes=10 new_base=0 binds=0 walks=0 reads=0 wall_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0);
+}
+
 /// A checkout without a steady watcher subscription (macOS, or a root whose
 /// watcher is not running) is the case where the driver's subscription check
 /// marks the checkout overflowed on every check. Searches read the installed
