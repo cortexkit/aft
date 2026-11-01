@@ -5,7 +5,9 @@ mod manifest;
 mod state;
 mod storage;
 
-use std::sync::{Arc, LazyLock, OnceLock};
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+use std::sync::LazyLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use parking_lot::{Condvar, Mutex, RwLock};

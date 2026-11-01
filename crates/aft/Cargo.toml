@@ -277,8 +277,8 @@ jsonc-parser = { version = "0.33", features = ["cst"] }
 
 [target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
 tree-sitter = { version = "=0.26.7", features = ["wasm"] }
-wasmtime = { version = "=36.0.6", default-features = false }
-wasmtime-c-api-impl = { version = "=36.0.6", default-features = false }
+wasmtime = { version = "=36.0.19", default-features = false, features = ["parallel-compilation"] }
+wasmtime-c-api-impl = { version = "=36.0.19", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

@@ -27,14 +27,6 @@ fn grammar_builtin_parity_against_slice_base() {
     }
     let bytes = serde_json::to_vec_pretty(&answers).unwrap();
     let oracle = fixtures.join("builtin-parity.json");
-    // Baseline capture is opt-in and runs only in an archived slice-base tree.
-    // Normal tests never regenerate their own expected answer.
-    if std::env::var("AFT_CAPTURE_BUILTIN_PARITY_BASE").as_deref()
-        == Ok("673767524be32971362be8127e2f758557c8f294")
-    {
-        std::fs::write(&oracle, &bytes).unwrap();
-        return;
-    }
     assert_eq!(
         bytes,
         std::fs::read(&oracle).unwrap(),

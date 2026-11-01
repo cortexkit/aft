@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
@@ -141,7 +141,8 @@ impl Storage {
     }
 }
 
-pub fn stored_path(root: &Path, manifest: &GrammarManifest) -> PathBuf {
+#[cfg(feature = "test-grammar-seams")]
+pub fn stored_path(root: &std::path::Path, manifest: &GrammarManifest) -> PathBuf {
     root.join("grammars")
         .join(format!("{}.wasm", manifest.sha256))
 }

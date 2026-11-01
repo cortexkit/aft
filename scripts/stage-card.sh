@@ -173,6 +173,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
   mkdir -p "$GRAMMAR_SMOKE/storage/grammars" "$GRAMMAR_SMOKE/home" "$GRAMMAR_SMOKE/config" "$GRAMMAR_SMOKE/cache" "$GRAMMAR_SMOKE/state" "$GRAMMAR_SMOKE/data" "$GRAMMAR_SMOKE/tmp"
   cp "crates/aft/tests/fixtures/grammars/$GRAMMAR_HASH.wasm" "$GRAMMAR_SMOKE/storage/grammars/$GRAMMAR_HASH.wasm"
   if ! sandbox-exec -p '(version 1) (allow default) (deny network*)' env \
+      -u AFT_STORAGE_DIR -u AFT_CACHE_DIR -u AFT_TEST_GRAMMAR_MANIFEST \
+      -u AFT_TEST_GRAMMAR_STORAGE -u AFT_TEST_GRAMMAR_QUERIES -u AFT_TEST_GRAMMAR_FAULT \
+      -u AFT_TEST_GRAMMAR_TRANSPORT_FILE -u AFT_TEST_GRAMMAR_CLOCK_FILE \
+      -u AFT_TEST_GRAMMAR_EXTRACTOR_VERSION \
       HOME="$GRAMMAR_SMOKE/home" XDG_CONFIG_HOME="$GRAMMAR_SMOKE/config" \
       XDG_CACHE_HOME="$GRAMMAR_SMOKE/cache" XDG_STATE_HOME="$GRAMMAR_SMOKE/state" \
       XDG_DATA_HOME="$GRAMMAR_SMOKE/data" TMPDIR="$GRAMMAR_SMOKE/tmp" \

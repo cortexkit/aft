@@ -66,9 +66,10 @@ jobs:
           import re
           features = Path('grammar-features.txt').read_text()
           assert 'wasmtime feature "cache"' not in features
+          assert 'wasmtime feature "component-model"' not in features
           dependencies = Path('grammar-dependencies.txt').read_text()
-          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.6'}
-          print('Wasmtime 36.0.6 only; cache feature absent')
+          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.19'}
+          print('Wasmtime 36.0.19 only; cache and component-model features absent')
           PY
 
   windows-arm64:
