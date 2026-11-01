@@ -452,7 +452,30 @@ fn materialize(
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    match link(source_path, destination) {
+    let started = std::time::Instant::now();
+    let trace = |phase: &str| {
+        if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
+            eprintln!(
+                "[aft-pin-image] pid={} phase={phase} elapsed_ms={}",
+                std::process::id(),
+                started.elapsed().as_millis()
+            );
+        }
+    };
+    trace("link_start");
+    let linked = link(source_path, destination);
+    if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
+        eprintln!(
+            "[aft-pin-image] pid={} link_result={linked:?} source={:?} destination_parent={:?}",
+            std::process::id(),
+            source.metadata().map(|m| (m.dev(), m.len())),
+            destination
+                .parent()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.dev())
+        );
+    }
+    match linked {
         Ok(()) => {
             let held = source.metadata()?;
             let linked = std::fs::metadata(destination)?;
@@ -475,6 +498,7 @@ fn materialize(
                 .write(true)
                 .create_new(true)
                 .open(destination)?;
+            trace("copy_start");
             // Cloned startup handles share a cursor. Positional reads let
             // concurrent task copies and later repairs read the complete image.
             use std::io::Write;
@@ -492,7 +516,10 @@ fn materialize(
                 output.write_all(&buffer[..count])?;
                 offset += count as u64;
             }
+            trace("copy_done");
+            trace("sync_start");
             output.sync_all()?;
+            trace("sync_done");
             output.set_permissions(std::fs::Permissions::from_mode(0o500))?;
         }
     }
