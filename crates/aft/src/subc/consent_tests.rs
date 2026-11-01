@@ -796,6 +796,20 @@ impl ConsentTransport for SharedFake {
             // Go through the real envelope encoder and decoder on both sides.
             let sent: Value = serde_json::from_slice(&encode(call.method, &call.params)?).unwrap();
             let params = sent["params"].clone();
+            if call.method == "consent.request"
+                && std::env::var_os("AFT_TEST_TRACE_CONSENT_REQUESTS").is_some()
+            {
+                let attempt = fake
+                    .calls("consent.request")
+                    .iter()
+                    .filter(|request| request["call_key"] == params["call_key"])
+                    .count()
+                    + 1;
+                eprintln!(
+                    "consent.request attempt={attempt} scope={} body={params}",
+                    json!(call.scope)
+                );
+            }
             let wait = Duration::from_millis(params["timeout_ms"].as_u64().unwrap_or(0));
             let end = Instant::now() + wait.min(call.timeout);
             let result = loop {
