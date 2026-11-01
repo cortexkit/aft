@@ -130,14 +130,18 @@ fn views_import_warm_symbol_donor_avoids_full_extraction() {
 }
 
 #[test]
-fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
+fn views_import_borrow_only_root_imports_family_without_changing_legacy() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let (_checkout, storage, root) = warm_fixture();
     let policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: LIMIT,
     };
     crate::root_cache::configure_artifact_access(&root, KEY, true);
-    assert!(crate::migration::views_background::BackgroundImport::start(
+    let legacy_text = storage.path().join("index").join(KEY).join("cache.bin");
+    let legacy_symbols = storage.path().join("symbols").join(KEY).join("symbols.bin");
+    let before_text = std::fs::read(&legacy_text).unwrap();
+    let before_symbols = std::fs::read(&legacy_symbols).unwrap();
+    let job = crate::migration::views_background::BackgroundImport::start(
         storage.path(),
         KEY,
         &root,
@@ -145,7 +149,12 @@ fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
         Arc::new(|| true),
         crate::cold_build_limiter::global_limiter(),
     )
-    .is_none());
+    .expect("borrow-only roots may import into the v3 family");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while job.is_building() {
+        assert!(Instant::now() < deadline, "family import did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
     let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
         storage.path().to_path_buf(),
         KEY.into(),
@@ -154,18 +163,37 @@ fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
         policy,
         None,
     );
-    assert!(matches!(
-        crate::migration::v3_ledger::run_v3_import(&request, None),
-        Err(crate::migration::v3_import::V3ImportError::Store(
-            crate::blob_store::v3::Error::Refused("legacy_import_borrow_only")
-        ))
-    ));
-    crate::root_cache::configure_artifact_access(&root, KEY, false);
+    let report = crate::migration::v3_ledger::run_v3_import(&request, None).unwrap();
+    for artifact in [
+        crate::migration::v3_import::LegacyArtifact::Trigram,
+        crate::migration::v3_import::LegacyArtifact::Symbols,
+    ] {
+        assert!(
+            matches!(
+                report.outcomes[&artifact],
+                crate::migration::v3_ledger::ArtifactOutcome::AlreadyComplete(
+                    crate::migration::per_checkout::ImportState::Done
+                )
+            ),
+            "{report:?}"
+        );
+    }
+    assert_eq!(std::fs::read(legacy_text).unwrap(), before_text);
+    assert_eq!(std::fs::read(legacy_symbols).unwrap(), before_symbols);
+}
+
+#[test]
+fn views_import_unbound_roots_do_not_start_imports() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    crate::root_cache::configure_artifact_access(&root, KEY, true);
     assert!(crate::migration::views_background::BackgroundImport::start(
         storage.path(),
         KEY,
         &root,
-        policy,
+        crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT
+        },
         Arc::new(|| false),
         crate::cold_build_limiter::global_limiter(),
     )
