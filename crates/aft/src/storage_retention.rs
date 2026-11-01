@@ -5517,7 +5517,8 @@ fn checkout_idle_policy_path(paths: &StoragePaths, root: &Path) -> PathBuf {
 
 /// Update the last-use time for every active view in a checkout, including
 /// views the current call does not read. One busy checkout writes at most
-/// once a minute; changing its timeout is persisted immediately.
+/// once a minute; changing its timeout is persisted immediately unless a
+/// previous failure is backing off. Lock contention leaves the touch pending.
 pub(crate) fn touch_view_checkout(
     paths: &StoragePaths,
     family: &str,
@@ -5525,8 +5526,13 @@ pub(crate) fn touch_view_checkout(
     hours: u32,
     now: u64,
 ) -> io::Result<()> {
+    #[derive(Clone, Copy)]
+    enum Attempt {
+        Written { at: u64, hours: u32 },
+        Failed { at: u64 },
+    }
     type Key = (PathBuf, PathBuf, String, PathBuf);
-    type Stamp = Arc<Mutex<Option<(u64, u32)>>>;
+    type Stamp = Arc<Mutex<Option<Attempt>>>;
     static WRITTEN: OnceLock<Mutex<HashMap<Key, Stamp>>> = OnceLock::new();
     let key = (
         paths.durable.clone(),
@@ -5541,30 +5547,46 @@ pub(crate) fn touch_view_checkout(
         .entry(key)
         .or_default()
         .clone();
-    let mut written = stamp.lock().unwrap_or_else(|e| e.into_inner());
-    if written.is_some_and(|(last, policy)| policy == hours && now >= last && now - last < 60_000) {
+    // Another request may already be doing the touch. Do not wait behind its
+    // registry or filesystem I/O on the request path.
+    let mut attempt = match stamp.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+    };
+    let recent = |at| now >= at && now - at < 60_000;
+    if attempt.is_some_and(|attempt| match attempt {
+        Attempt::Written { at, hours: policy } => policy == hours && recent(at),
+        Attempt::Failed { at } => recent(at),
+    }) {
         return Ok(());
     }
-    let policy = checkout_idle_policy_path(paths, root);
-    let registry_path = paths
-        .artifacts
-        .join("blobs/v3")
-        .join(family)
-        .join("members.sqlite");
-    if registry_path.try_exists()? {
-        let v3 = |e: crate::blob_store::v3::Error| io::Error::other(e.to_string());
-        let lock = crate::blob_store::v3::ReservationLock::acquire_until(
-            &paths.artifacts,
-            Instant::now() + PASS_BUDGET,
-        )
-        .map_err(v3)?;
-        let mut registry = crate::blob_store::v3::RegistryWriter::open_for_barrier(
-            &paths.artifacts,
-            family,
-            &lock,
-        )
-        .map_err(v3)?;
-        registry.with_barrier(|tx| {
+    let result = (|| -> io::Result<bool> {
+        #[cfg(test)]
+        test_hook(&paths.artifacts, "views-checkout-touch-attempt");
+        let policy = checkout_idle_policy_path(paths, root);
+        let registry_path = paths
+            .artifacts
+            .join("blobs/v3")
+            .join(family)
+            .join("members.sqlite");
+        if registry_path.try_exists()? {
+            let v3 = |e: crate::blob_store::v3::Error| io::Error::other(e.to_string());
+            let lock = match crate::blob_store::v3::ReservationLock::acquire_until(
+                &paths.artifacts,
+                Instant::now(),
+            ) {
+                Ok(lock) => lock,
+                Err(error) if reservation_lock_busy(&error) => return Ok(false),
+                Err(error) => return Err(v3(error)),
+            };
+            let mut registry = crate::blob_store::v3::RegistryWriter::open_for_barrier(
+                &paths.artifacts,
+                family,
+                &lock,
+            )
+            .map_err(v3)?;
+            registry.with_barrier(|tx| {
             tx.execute(
                 "UPDATE members SET last_bind_ms=MAX(last_bind_ms,?2) WHERE kind='view' AND root=?1 AND state='active'",
                 rusqlite::params![crate::blob_store::v3::encode_root(root), now],
@@ -5572,12 +5594,23 @@ pub(crate) fn touch_view_checkout(
             atomic_json(&policy, &hours)?;
             Ok(())
         }).map_err(v3)?;
-    } else {
-        // Configure can precede the first view registration. Do not create a
-        // v3 namespace just to remember the checkout's policy.
-        atomic_json(&policy, &hours)?;
+        } else {
+            // Configure can precede the first view registration. Do not create a
+            // v3 namespace just to remember the checkout's policy.
+            atomic_json(&policy, &hours)?;
+        }
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => *attempt = Some(Attempt::Written { at: now, hours }),
+        Ok(false) => {}
+        Err(error) => {
+            // The caller logs this error. Suppress both another attempt and
+            // another warning until the checkout's next one-minute window.
+            *attempt = Some(Attempt::Failed { at: now });
+            return Err(error);
+        }
     }
-    *written = Some((now, hours));
     Ok(())
 }
 
@@ -14668,6 +14701,133 @@ mod v3_collector_tests {
         let kept = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_600_000);
         assert_eq!(kept.removed_roots, 0, "{kept:?}");
         assert_eq!(member_scopes(&storage), ["graph", "text"]);
+    }
+
+    fn checkout_activity_context(temp: &Path) -> (crate::context::AppContext, PathBuf) {
+        let root = temp.join("worker");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(temp.join("storage")),
+            ..Default::default()
+        };
+        config.views.enabled = true;
+        config.views.idle_checkout_hours = 1;
+        config.indexes.semantic = false;
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        (ctx, root)
+    }
+
+    #[test]
+    fn views_idle_checkout_note_request_skips_a_held_reservation_lock_without_waiting() {
+        let _env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, root) = checkout_activity_context(temp.path());
+        let paths = ctx.storage_paths();
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let _space = v3::set_free_space_for_test(&paths.artifacts, u64::MAX, u64::MAX / 2);
+        v3::publish(&paths.artifacts, &family, 1 << 20, None, |publication| {
+            publication
+                .registry
+                .register_member("text", "view", Some(&root))?;
+            publication.registry.with_barrier(|tx| {
+                tx.execute("UPDATE members SET last_bind_ms=1", [])?;
+                Ok(())
+            })
+        })
+        .unwrap();
+        let lock = ReservationLock::acquire(&paths.artifacts).unwrap();
+        let started = Instant::now();
+        let (_, logs) = crate::logging::capture_log_lines(|| ctx.note_request());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "note_request waited for the family lock: {elapsed:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("views checkout activity:")),
+            "{logs:?}"
+        );
+        let ledger = v3::LedgerReader::open_existing(&paths.artifacts, &family).unwrap();
+        let last_used = || {
+            ledger
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT last_bind_ms FROM members WHERE scope='text'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            last_used(),
+            1,
+            "contention must leave the durable touch pending"
+        );
+        drop(lock);
+        ctx.note_request();
+        assert!(
+            last_used() > 1,
+            "the next request must retry the skipped touch immediately"
+        );
+        assert!(checkout_idle_policy_path(&paths, &root).exists());
+    }
+
+    #[test]
+    fn views_idle_checkout_failed_touches_debounce_attempts_and_warnings() {
+        let _env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, root) = checkout_activity_context(temp.path());
+        let paths = ctx.storage_paths();
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let policy = checkout_idle_policy_path(&paths, &root);
+        let blocked = policy.parent().unwrap();
+        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        fs::write(blocked, b"not a directory").unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = attempts.clone();
+        let _hook = observe_test_hook(
+            &paths.artifacts,
+            Arc::new(move |step| {
+                if step == "views-checkout-touch-attempt" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..5 {
+                ctx.note_request();
+            }
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("views checkout activity:"))
+                .count(),
+            1,
+            "{logs:?}"
+        );
+        let later = crate::pins::now_ms() + 60_000;
+        assert!(touch_view_checkout(&paths, &family, &root, 1, later).is_err());
+        for offset in [1, 20_000, 59_999] {
+            touch_view_checkout(&paths, &family, &root, 2, later + offset).unwrap();
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "even a policy change must respect failure backoff"
+        );
+        fs::remove_file(blocked).unwrap();
+        touch_view_checkout(&paths, &family, &root, 2, later + 60_000).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(read_json::<u32>(&policy).unwrap(), 2);
     }
 
     #[test]
