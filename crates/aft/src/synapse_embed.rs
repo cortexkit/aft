@@ -573,6 +573,8 @@ pub(crate) mod pause_test_support {
         run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
     ) -> T {
         use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+        // The real client sends project-free management opens only to daemon 0.39+.
+        const FAKE_DAEMON_VERSION: &str = "0.39.0";
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("connection.json");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -591,7 +593,7 @@ pub(crate) mod pause_test_support {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "synapse-test".into(),
+                daemon_ver: FAKE_DAEMON_VERSION.into(),
             },
         )
         .unwrap();
@@ -605,13 +607,16 @@ pub(crate) mod pause_test_support {
                 tokio::time::timeout(Duration::from_secs(60), async move {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(2)).await.unwrap();
+                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, FAKE_DAEMON_VERSION, Duration::from_secs(2)).await.unwrap();
                     let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":[{
                         "module_id":"synapse","module_version":"1","roles":[{"role":"management_surface",
                         "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"}],
                         "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]})).await;
-                    let route = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    let route = subc_transport::read_frame(&mut stream).await.unwrap().expect("project-free Synapse route.open");
+                    let route_body: Value = serde_json::from_slice(&route.body).unwrap();
+                    assert_eq!(route_body["op"], "route.open");
+                    assert!(route_body["identity"].get("project_root").is_none());
                     respond(&mut stream, &route, json!({"op":"route.open","route_channel":7,"route_epoch":1})).await;
                     while let Some(request) = subc_transport::read_frame(&mut stream).await.unwrap() {
                         let value: Value = serde_json::from_slice(&request.body).unwrap();

@@ -15,6 +15,8 @@ use tokio::net::TcpStream;
 const MIB: u64 = 1024 * 1024;
 const ROUTE_CHANNEL: u16 = 42;
 const ROUTE_EPOCH: u32 = 7;
+// Project-free management opens require a daemon reporting at least 0.39.0.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
 
 fn aft_binary() -> PathBuf {
     std::env::var_os("AFT_TEST_AFT_BINARY")
@@ -55,7 +57,7 @@ impl FakeManagementSurfaceDaemon {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "profile-memory-test".to_string(),
+                daemon_ver: FAKE_DAEMON_VERSION.to_string(),
             },
         )
         .expect("write fake daemon connection file");
@@ -103,7 +105,7 @@ async fn drive_profile_memory_daemon(
         &mut stream,
         &key,
         &daemon_id,
-        "profile-memory-test",
+        FAKE_DAEMON_VERSION,
         Duration::from_secs(5),
     )
     .await
@@ -147,6 +149,7 @@ async fn drive_profile_memory_daemon(
     assert!(route_open_body["identity"]["session"]
         .as_str()
         .is_some_and(|session| session.starts_with("aft-profile-")));
+    assert!(route_open_body["identity"].get("project_root").is_none());
     assert_eq!(
         route_open_body["consumer_identity"],
         json!({ "module_id": "aft", "launch_nonce": "profile-test-launch" })
