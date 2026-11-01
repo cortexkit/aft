@@ -1217,6 +1217,24 @@ class ReleaseRetryTests(PRFixture):
         self.assertEqual(self.git("rev-parse", "release/1.0"), released)
         self.assert_caller_unchanged(head)
 
+    def test_retry_accepts_a_commit_hook_trailer_on_the_bump(self) -> None:
+        # The fixture disables hooks, but a real checkout's prepare-commit-msg
+        # hook adds a Co-authored-by trailer to every commit, including the
+        # retry's own version bump. The lineage check must still accept it.
+        fixes = self.prepare_retry()
+        hooks = Path(self.temp.name) / "hooks"
+        hooks.mkdir()
+        hook = hooks / "prepare-commit-msg"
+        hook.write_text('#!/bin/sh\ngit interpret-trailers --in-place --if-exists doNothing '
+                        '--trailer "Co-authored-by: alfonso-aft <bot@example.invalid>" "$1"\n')
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks))
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        bump = self.git("show", "-s", "--format=%B", "v1.0.1^{commit}")
+        self.assertIn("Release-retry-from: v1.0.0", bump)
+        self.assertIn("Co-authored-by: alfonso-aft <bot@example.invalid>", bump)
+
     def test_retry_refuses_fix_not_on_main(self) -> None:
         self.prepare_retry()
         self.git("checkout", "-qb", "unlanded")
