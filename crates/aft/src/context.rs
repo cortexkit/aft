@@ -12624,6 +12624,14 @@ impl AppContext {
         self.lexical_view.lock().as_ref().unwrap().source_for_test()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn lexical_view_acquisitions_for_test(&self) -> usize {
+        self.lexical_view
+            .lock()
+            .as_ref()
+            .map_or(0, |view| view.acquisitions_for_test())
+    }
+
     #[cfg(test)]
     pub(crate) fn install_lexical_source_for_test(
         &self,

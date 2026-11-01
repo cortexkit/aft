@@ -351,6 +351,11 @@ impl LexicalView {
         self.source.clone()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn acquisitions_for_test(&self) -> usize {
+        self.acquisitions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Keep acquisition separate from the read projection so a source that
     /// verifies a saved generation can supply the same query snapshot.
     fn acquire(&self) -> Result<(Snapshot, Option<u64>), String> {
@@ -1922,6 +1927,119 @@ mod tests {
                 std::ffi::OsStr::new(expected)
             );
         }
+    }
+
+    /// Measure unchanged queries reusing the same cached view, and edits forcing
+    /// verification from disk. The test supplies healthy/missing watcher state
+    /// and lost-event notifications rather than relying on kernel event delivery.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in frozen-checkout lexical reuse measurement"]
+    fn measurement_lexical_reuse_frozen_checkout() {
+        let root = PathBuf::from(std::env::var_os("AFT_HOT_SPOT_CORPUS").expect("frozen corpus"));
+        assert!(root.join("crates/aft/src/views/trigram.rs").is_file());
+        let storage = tempfile::tempdir().unwrap();
+        let watcher = crate::watcher_backend::subscription::start(
+            &root,
+            crate::watcher_backend::InitialCoverage::Complete,
+        );
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(storage.path().to_path_buf());
+        config.views.enabled = true;
+        config.indexes.trigram = true;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.mark_subc_bound();
+        let family = ctx.memoized_artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &family, false);
+        assert!(
+            ctx.lexical_views_enabled(),
+            "views={} trigram={} heavy={} cache_unavailable={:?}",
+            ctx.config().views.enabled,
+            ctx.config().indexes.trigram,
+            ctx.heavy_root_work_allowed(),
+            ctx.cache_unavailable_reason(),
+        );
+        let snapshot = || ctx.lexical_view_snapshot("search").unwrap().unwrap();
+        let acquisitions = || ctx.lexical_view_acquisitions_for_test();
+        let cpu = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+        };
+        let cpu_started = cpu();
+        let started = std::time::Instant::now();
+        let first = snapshot().into_ready().unwrap();
+        assert!(
+            first.file_entries().len() > 1000,
+            "nonempty frozen AFT corpus required"
+        );
+        eprintln!("LEXICAL_REUSE_MEASUREMENT phase=cold files={} queries=1 wall_ms={:.3} thread_cpu_ms={:.3} binds={}",
+            first.file_entries().len(), started.elapsed().as_secs_f64() * 1000.0,
+            (cpu() - cpu_started) * 1000.0, acquisitions());
+        assert!(!first
+            .grep("CheckoutLexicalSource", true, &[], &[], &root, 10)
+            .unwrap()
+            .matches
+            .is_empty());
+        let source = ctx.lexical_source_for_test();
+        assert!(source.steady_revision().is_some());
+        let cpu_started = cpu();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(snapshot().is_ready());
+        }
+        eprintln!("LEXICAL_REUSE_MEASUREMENT phase=steady queries=100 wall_ms={:.3} thread_cpu_ms={:.3} binds={}",
+            started.elapsed().as_secs_f64() * 1000.0, (cpu() - cpu_started) * 1000.0, acquisitions());
+        assert_eq!(acquisitions(), 1);
+        assert!(Arc::ptr_eq(&source, &ctx.lexical_source_for_test()));
+
+        let probe = root.join("views_perf_reuse_probe.rs");
+        assert!(!probe.exists());
+        let matches = |needle: &str| {
+            snapshot()
+                .into_ready()
+                .unwrap()
+                .grep(needle, true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len()
+        };
+        fs::write(&probe, "fn visible_recorded_edit() {}\n").unwrap();
+        ctx.record_checkout_watcher_change(&probe);
+        assert_eq!(matches("visible_recorded_edit"), 1);
+        assert_eq!(acquisitions(), 2);
+        fs::write(&probe, "fn visible_unreported_edit() {}\n").unwrap();
+        crate::watcher_backend::subscription::gap(&root);
+        assert_eq!(matches("visible_unreported_edit"), 1);
+        assert_eq!(acquisitions(), 3);
+        assert_eq!(matches("visible_recorded_edit"), 0);
+        assert_eq!(acquisitions(), 3);
+        eprintln!("LEXICAL_REUSE_MEASUREMENT phase=edit_and_gap recorded_edit_binds=1 unreported_edit_gap_binds=1 stale_matches=0");
+
+        drop(watcher);
+        let before = acquisitions();
+        let cpu_started = cpu();
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(snapshot().is_ready());
+        }
+        eprintln!("LEXICAL_REUSE_MEASUREMENT phase=unwatched queries=5 wall_ms={:.3} thread_cpu_ms={:.3} binds={}",
+            started.elapsed().as_secs_f64() * 1000.0, (cpu() - cpu_started) * 1000.0, acquisitions() - before);
+        assert_eq!(acquisitions() - before, 5);
+        fs::remove_file(probe).unwrap();
     }
 
     /// With a steady watcher subscription and nothing recorded since the last

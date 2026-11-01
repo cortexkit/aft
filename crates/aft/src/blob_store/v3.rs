@@ -2329,6 +2329,38 @@ impl PlaneReader {
             |r| r.get(0),
         )?)
     }
+
+    /// Inspect liveness without opening a publication when every stored key is
+    /// already current. Missing keys retain their input order and duplicates.
+    /// Callers must hold a pin or live pin containing the keys so collection
+    /// cannot remove them between this check and their use.
+    pub(crate) fn touch_if_current(&self, keys: &[FamilyKey]) -> Result<Option<Vec<FamilyKey>>> {
+        let mut connection = self.database.connection()?;
+        let tx = connection.transaction()?;
+        let epoch: i64 = tx.query_row("SELECT gc_epoch FROM store_meta", [], |row| row.get(0))?;
+        let sql = if plane_layout(&tx)? == 1 {
+            "SELECT ref_epoch FROM blob_payloads WHERE full_key=?1"
+        } else {
+            "SELECT ref_epoch FROM blob_liveness WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
+        };
+        let mut missing = Vec::new();
+        let mut outdated = false;
+        {
+            let mut lookup = tx.prepare(sql)?;
+            for key in keys {
+                let stored: Option<i64> = lookup
+                    .query_row([key.as_bytes().as_slice()], |row| row.get(0))
+                    .optional()?;
+                match stored {
+                    Some(stored) => outdated |= stored < epoch,
+                    None => missing.push(*key),
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((!outdated).then_some(missing))
+    }
+
     pub fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .database

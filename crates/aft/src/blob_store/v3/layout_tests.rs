@@ -4,6 +4,53 @@ use crate::blob_store::{BlobPlane, BlobStore, FullKey};
 const FAMILY: &str = "0123456789abcdef";
 
 #[test]
+fn touch_if_current_reads_both_layouts_without_rewriting_rows() {
+    let _guard = tests::serial();
+    for old in [true, false] {
+        CREATE_3A_LAYOUT.set(old);
+        let root = tempfile::tempdir().unwrap();
+        let key = FamilyKey::new(FamilyPlane::Semantic, [7; 32]);
+        let absent = FamilyKey::new(FamilyPlane::Semantic, [8; 32]);
+        publish(root.path(), FAMILY, 1024, None, |p| {
+            p.put(&key, b"payload", 1)
+        })
+        .unwrap();
+        CREATE_3A_LAYOUT.set(false);
+        let reader =
+            PlaneReader::open_existing(root.path(), FAMILY, FamilyPlane::Semantic).unwrap();
+        assert_eq!(reader.touch_if_current(&[]).unwrap(), Some(vec![]));
+        assert_eq!(
+            reader
+                .touch_if_current(&[key, absent, key, absent])
+                .unwrap(),
+            Some(vec![absent, absent])
+        );
+        let c = Connection::open(plane_path(root.path(), FAMILY, FamilyPlane::Semantic).unwrap())
+            .unwrap();
+        c.execute("UPDATE store_meta SET gc_epoch=23", []).unwrap();
+        drop(c);
+        assert_eq!(reader.touch_if_current(&[key, absent]).unwrap(), None);
+        assert_eq!(
+            reader.touch_if_current(&[absent, absent]).unwrap(),
+            Some(vec![absent, absent])
+        );
+        publish(root.path(), FAMILY, 64 * 1024, None, |p| p.touch(&[key])).unwrap();
+        assert_eq!(reader.touch_if_current(&[key]).unwrap(), Some(vec![]));
+        let c = Connection::open(plane_path(root.path(), FAMILY, FamilyPlane::Semantic).unwrap())
+            .unwrap();
+        let sql = if old {
+            "UPDATE blob_payloads SET ref_epoch=24"
+        } else {
+            "UPDATE blob_liveness SET ref_epoch=24"
+        };
+        c.execute(sql, []).unwrap();
+        drop(c);
+        assert_eq!(reader.touch_if_current(&[key]).unwrap(), Some(vec![]));
+        assert_eq!(reader.get(&key).unwrap().unwrap(), b"payload");
+    }
+}
+
+#[test]
 fn new_plane_uses_rowid_layout_tag() {
     let _guard = tests::serial();
     let root = tempfile::tempdir().unwrap();
