@@ -92,7 +92,7 @@ struct Binding {
     waiting_sessions: std::collections::HashSet<String>,
     force: bool,
     next_probe_ms: u64,
-    wait_deadline: Instant,
+    wait_deadline: Option<Instant>,
     mode: crate::folder_admission::DetectionMode,
     fresh: bool,
     deadline_exhausted: bool,
@@ -150,10 +150,10 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
     }
     let mut probe = ctx.folder_admission().probe.lock();
     let mut binding = ctx.folder_admission().binding.lock();
-    if let Some(binding) = binding
-        .as_mut()
-        .filter(|b| Instant::now() >= b.wait_deadline)
-    {
+    if let Some(binding) = binding.as_mut().filter(|b| {
+        b.wait_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }) {
         binding.pending = true;
         binding.checking = false;
         binding.needs_apply = false;
@@ -736,7 +736,7 @@ fn install_bound_cache(ctx: &AppContext, config: Config, root: PathBuf, cache: C
         waiting_sessions: Default::default(),
         force: false,
         next_probe_ms: 0,
-        wait_deadline: Instant::now() + wait_budget(),
+        wait_deadline: None,
         mode,
         fresh: false,
         deadline_exhausted: false,
@@ -934,7 +934,7 @@ pub(crate) fn commit(
         binding.needs_apply = binding.pending;
         binding.mode = mode;
         if pending {
-            binding.wait_deadline = Instant::now() + wait_budget();
+            binding.wait_deadline = None;
             binding.fresh = true;
             binding.deadline_exhausted = false;
         }
@@ -981,7 +981,7 @@ pub(crate) fn commit(
         waiting_sessions: std::collections::HashSet::from([request.session().to_owned()]),
         force,
         next_probe_ms: 0,
-        wait_deadline: Instant::now() + wait_budget(),
+        wait_deadline: None,
         mode,
         fresh: true,
         deadline_exhausted: false,
@@ -1057,7 +1057,7 @@ pub(crate) fn arm_recheck(ctx: &AppContext) -> Option<RawRequest> {
             || state.workspace_allowed.load(Ordering::Acquire));
     binding.pending = !keep_serving;
     binding.fresh = false;
-    binding.wait_deadline = Instant::now() + wait_budget();
+    binding.wait_deadline = None;
     binding.checking = keep_serving;
     binding.needs_apply = !keep_serving;
     binding.needs_off_bind = !keep_serving;
@@ -1161,9 +1161,14 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     let input = state
         .binding
         .lock()
-        .as_ref()
+        .as_mut()
         .filter(|b| (b.pending || b.checking) && !b.needs_off_bind)
         .map(|b| {
+            // Configure only stages metadata work. Time spent before its first
+            // poll must not exhaust the bounded probe/wait without running it.
+            let deadline = *b
+                .wait_deadline
+                .get_or_insert_with(|| Instant::now() + wait_budget());
             (
                 b.root.clone(),
                 b.requested.clone(),
@@ -1174,7 +1179,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                         .is_some_and(|cache| cache.stamps.is_empty()),
                 b.checking,
                 b.fresh || b.force,
-                b.wait_deadline,
+                deadline,
                 b.mode,
             )
         });

@@ -156,6 +156,31 @@ fn folder_admission_timeout_is_incomplete_in_health_and_can_reconnect() {
 }
 
 #[test]
+fn folder_admission_idle_bind_does_not_consume_the_probe_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let storage = temp.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    crate::test_project::mark_project(&root).unwrap();
+    isolated(&root, || {
+        let ctx = context(&storage);
+        assert!(configure(&root, &storage, &ctx, false, false).success);
+        std::thread::sleep(admission::wait_budget() + Duration::from_millis(20));
+        assert_eq!(admission::probe_counts_for_test(&ctx), (0, 0));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !admission::poll_wait(&ctx) {
+            crate::provisional_identity_retry::drain_inline(&ctx);
+            assert!(std::time::Instant::now() < deadline, "probe did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            admission::snapshot(&ctx).unwrap()["classification"],
+            "project"
+        );
+    });
+}
+
+#[test]
 fn fresh_connect_rechecks_changed_evidence_without_cache_cooldown() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

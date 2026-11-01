@@ -8842,6 +8842,26 @@ impl AppContext {
             && self.database_runtime_state.load(Ordering::Acquire) == 1
     }
 
+    /// A standalone call released by folder admission still owes the database
+    /// readiness barrier that configure normally runs before tool dispatch.
+    /// Wait off the request loop and without a config pin or executor lease.
+    pub fn wait_for_standalone_database_runtime(
+        self: &Arc<Self>,
+        command: &str,
+        deadline: Instant,
+    ) {
+        if !self.database_runtime_pending(command) {
+            return;
+        }
+        crate::database_open::dispatch(self);
+        while self.database_runtime_pending(command) && Instant::now() < deadline {
+            if crate::executor::current_job_cancelled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// Wait outside executor admission. Register before checking state so an
     /// open completing between the check and await cannot lose its notification.
     pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {

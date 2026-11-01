@@ -1795,6 +1795,7 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let (tx, rx) = mpsc::sync_channel(1);
     let admitted_config =
         (!aft::folder_admission_runtime::request_waits(&req, &ctx)).then(|| ctx.config());
+    let database_command = attach_command.clone();
     let ask_route = aft::access_policy::capture_ask_route();
     thread::spawn(move || {
         let _ask_route = ask_route.install();
@@ -1806,6 +1807,12 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
                 }
                 thread::sleep(Duration::from_millis(2));
             }
+            // The SQLite open keeps its own bounded retry budget. Allow worker
+            // scheduling time as well, without retrying the tool operation.
+            ctx.wait_for_standalone_database_runtime(
+                &database_command,
+                std::time::Instant::now() + Duration::from_secs(15),
+            );
         }
         if aft::executor::current_job_cancelled() {
             let _ = tx.send(cancelled_deferred_response(&req.id, &req.command));
