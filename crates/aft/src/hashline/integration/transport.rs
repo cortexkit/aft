@@ -378,6 +378,9 @@ fn build_display_metadata(
 }
 
 fn line_diff_counts(before: &str, after: &str) -> (usize, usize) {
+    if before.is_empty() || after.is_empty() {
+        return (after.lines().count(), before.lines().count());
+    }
     use similar::ChangeTag;
     let diff = similar::TextDiff::from_lines(before, after);
     let mut additions = 0usize;

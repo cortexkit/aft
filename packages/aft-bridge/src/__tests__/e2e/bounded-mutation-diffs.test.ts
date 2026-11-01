@@ -31,7 +31,7 @@ interface MutationReply {
   failures?: { path: string; error: string }[];
 }
 
-const budget = 1024 * 1024;
+const budget = 8 * 1024 * 1024;
 
 describe("bounded mutation diffs through the real bridge", () => {
   let root: string;
@@ -144,8 +144,8 @@ describe("bounded mutation diffs through the real bridge", () => {
   }, 120_000);
 
   test("huge edit and write retain counts, while permission previews never mutate", async () => {
-    const original = "old\n".repeat(100_000);
-    const replacement = "new\n".repeat(100_000);
+    const original = "old\n".repeat(1_000_000);
+    const replacement = "new\n".repeat(1_000_000);
     const file = join(project, "edit.txt");
     await writeFile(file, original);
     for (const command of ["edit_match", "write", "apply_patch"]) {
@@ -171,12 +171,12 @@ describe("bounded mutation diffs through the real bridge", () => {
       expect(preview.preview_diff).toBeUndefined();
       expect(preview.metadata?.diff).toBeUndefined();
       if (command !== "apply_patch") {
-        expect(preview.diff?.additions).toBe(100_000);
-        expect(preview.diff?.deletions).toBe(100_000);
+        expect(preview.diff?.additions).toBe(1_000_000);
+        expect(preview.diff?.deletions).toBe(1_000_000);
         expect(preview.diff?.before).toBeUndefined();
         expect(preview.diff?.after).toBeUndefined();
       } else {
-        expect(preview.files?.[0].deletions).toBe(100_000);
+        expect(preview.files?.[0].deletions).toBe(1_000_000);
         expect(preview.files?.[0].type).toBe("delete");
       }
       expect(await readFile(file, "utf8")).toBe(original);
@@ -188,26 +188,26 @@ describe("bounded mutation diffs through the real bridge", () => {
       replace_all: true,
     });
     omitted(edited);
-    expect(edited.diff?.additions).toBe(100_000);
-    expect(edited.diff?.deletions).toBe(100_000);
+    expect(edited.diff?.additions).toBe(1_000_000);
+    expect(edited.diff?.deletions).toBe(1_000_000);
     expect(await readFile(file, "utf8")).toBe(replacement);
     const written = await send("write", { file, content: original });
     omitted(written);
-    expect(written.diff?.additions).toBe(100_000);
-    expect(written.diff?.deletions).toBe(100_000);
+    expect(written.diff?.additions).toBe(1_000_000);
+    expect(written.diff?.deletions).toBe(1_000_000);
     expect(await readFile(file, "utf8")).toBe(original);
   }, 120_000);
 
   test("many small Unicode and escaped patches share one aggregate reply budget", async () => {
-    const line = 'é🦀"\\\t\0'.repeat(3000);
+    const line = `é🦀"\\\t${"\0".repeat(70_000)}`;
     const hunks = Array.from(
-      { length: 20 },
+      { length: 12 },
       (_, index) => `*** Add File: file-${index}.txt\n+${line}`,
     );
     const patch = `*** Begin Patch\n${hunks.join("\n")}\n*** End Patch`;
     const preview = await send("apply_patch", { patch_text: patch, preview: true });
     omitted(preview);
-    expect(preview.files).toHaveLength(20);
+    expect(preview.files).toHaveLength(12);
     expect(preview.files?.some((file) => file.diff_omitted)).toBe(true);
     expect(await Bun.file(join(project, "file-0.txt")).exists()).toBe(false);
     const reply = await send("apply_patch", {
@@ -216,7 +216,7 @@ describe("bounded mutation diffs through the real bridge", () => {
     omitted(reply);
     expect(reply.complete).toBe(true);
     const files = reply.metadata?.files ?? [];
-    expect(files).toHaveLength(20);
+    expect(files).toHaveLength(12);
     expect(files.some((file) => file.patch?.includes('é🦀"\\\t\0'))).toBe(true);
     expect(files.some((file) => file.diff_omitted)).toBe(true);
     for (const [index, file] of files.entries()) {
@@ -228,22 +228,24 @@ describe("bounded mutation diffs through the real bridge", () => {
   }, 120_000);
 
   test("huge native additions and move-updates omit patches, not file results", async () => {
-    const before = "old\n".repeat(100_000);
-    const after = "new\n".repeat(100_000);
+    const content = "\0".repeat(800_000);
+    const before = `${content}\nold\n`;
+    const after = `${content}\nnew\n`;
     const added = await send("apply_patch", {
-      patch_text: `*** Begin Patch\n*** Add File: added.txt\n${"+old\n".repeat(100_000)}*** End Patch`,
+      patch_text: `*** Begin Patch\n*** Add File: added.txt\n+${content}\n+old\n*** End Patch`,
     });
     omitted(added);
     expect(added.metadata?.files?.[0].type).toBe("add");
-    expect(added.metadata?.files?.[0].additions).toBe(100_000);
+    expect(added.metadata?.files?.[0].additions).toBe(2);
     expect(await readFile(join(project, "added.txt"), "utf8")).toBe(before);
     const moved = await send("apply_patch", {
-      patch_text: `*** Begin Patch\n*** Update File: added.txt\n*** Move to: moved.txt\n@@\n${"-old\n".repeat(100_000)}${"+new\n".repeat(100_000)}*** End Patch`,
+      patch_text:
+        "*** Begin Patch\n*** Update File: added.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch",
     });
     omitted(moved);
     expect(moved.metadata?.files?.[0].type).toBe("move");
-    expect(moved.metadata?.files?.[0].additions).toBe(100_000);
-    expect(moved.metadata?.files?.[0].deletions).toBe(100_000);
+    expect(moved.metadata?.files?.[0].additions).toBe(1);
+    expect(moved.metadata?.files?.[0].deletions).toBe(1);
     expect(await Bun.file(join(project, "added.txt")).exists()).toBe(false);
     expect(await readFile(join(project, "moved.txt"), "utf8")).toBe(after);
   }, 120_000);
@@ -263,4 +265,51 @@ describe("bounded mutation diffs through the real bridge", () => {
     expect(applied.metadata?.files?.[0].patch).toBe(expected);
     expect(applied.diff_omitted).toBeUndefined();
   });
+
+  test("a one-line edit in a 5 MB file keeps its exact small diff", async () => {
+    const file = join(project, "large-source.txt");
+    const prefix = "same text\n".repeat(500_000);
+    const before = `${prefix}old\n`;
+    const after = `${prefix}new\n`;
+    expect(Buffer.byteLength(before)).toBeGreaterThanOrEqual(5_000_000);
+    await writeFile(file, before);
+    const reply = await send("edit_match", {
+      file,
+      match: "old",
+      replacement: "new",
+      include_diff: true,
+    });
+    expect(reply.success).toBe(true);
+    const expected = `Index: ${file}\n===================================================================\n--- ${file}\n+++ ${file}\n@@ -499998,4 +499998,4 @@\n same text\n same text\n same text\n-old\n+new\n`;
+    expect(reply.metadata?.diff).toBe(expected);
+    expect(reply.diff_omitted).toBeUndefined();
+    expect(reply.diff?.additions).toBe(1);
+    expect(reply.diff?.deletions).toBe(1);
+    expect(await readFile(file, "utf8")).toBe(after);
+  }, 120_000);
+
+  test("a full rewrite of a 300 KiB file keeps both exact patch copies", async () => {
+    const file = join(project, "rewrite.txt");
+    const oldLine = `${"a".repeat(95)}\n`;
+    const newLine = `${"b".repeat(95)}\n`;
+    const before = oldLine.repeat(3200);
+    const after = newLine.repeat(3200);
+    expect(Buffer.byteLength(before)).toBe(300 * 1024);
+    await writeFile(file, before);
+    const changes = `${`-${oldLine}`.repeat(3200)}${`+${newLine}`.repeat(3200)}`;
+    const reply = await send("apply_patch", {
+      patch_text: `*** Begin Patch\n*** Update File: rewrite.txt\n@@\n${changes}*** End Patch`,
+    });
+    expect(reply.success).toBe(true);
+    expect(reply.complete).toBe(true);
+    const expected = `Index: ${file}\n===================================================================\n--- ${file}\n+++ ${file}\n@@ -1,3200 +1,3200 @@\n${changes}`;
+    expect(reply.metadata?.diff).toBe(expected);
+    expect(reply.metadata?.files?.[0].patch).toBe(expected);
+    expect(reply.metadata?.files?.[0].additions).toBe(3200);
+    expect(reply.metadata?.files?.[0].deletions).toBe(3200);
+    expect(reply.diff_omitted).toBeUndefined();
+    expect(Buffer.byteLength(JSON.stringify(reply))).toBeGreaterThan(1024 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(reply))).toBeLessThan(budget);
+    expect(await readFile(file, "utf8")).toBe(after);
+  }, 120_000);
 });

@@ -2,8 +2,7 @@
 
 use std::io::{self, Write};
 
-pub(crate) const DIFF_WIRE_BUDGET: usize = 1024 * 1024;
-pub(crate) const DIFF_INPUT_LIMIT: usize = 4 * 1024 * 1024;
+pub(crate) const DIFF_WIRE_BUDGET: usize = 8 * 1024 * 1024;
 pub(crate) const DIFF_OMITTED_NOTICE: &str =
     "Diff omitted: too large to send. File results and line counts are complete.";
 
@@ -32,7 +31,7 @@ impl DiffBudget {
         after: &str,
         copies: usize,
     ) -> Option<String> {
-        self.render(before.len().saturating_add(after.len()), copies, |out| {
+        self.render(before, after, copies, |out| {
             let diff = crate::edit::construct_diff(before, after);
             write_patch(out, file, before == after, &diff)
         })
@@ -46,14 +45,13 @@ impl DiffBudget {
         diff: &'a similar::TextDiff<'a, 'a, 'a, str>,
         copies: usize,
     ) -> Option<String> {
-        self.render(before.len().saturating_add(after.len()), copies, |out| {
+        self.render(before, after, copies, |out| {
             write_patch(out, file, before == after, diff)
         })
     }
 
     pub(crate) fn contents(&mut self, before: &str, after: &str) -> bool {
-        let input = before.len().saturating_add(after.len());
-        if self.exhausted || input > DIFF_INPUT_LIMIT {
+        if self.exhausted {
             return false;
         }
         let cost = escaped_len(before)
@@ -69,16 +67,28 @@ impl DiffBudget {
 
     fn render(
         &mut self,
-        input: usize,
+        before: &str,
+        after: &str,
         copies: usize,
         generate: impl FnOnce(&mut WireWriter) -> io::Result<()>,
     ) -> Option<String> {
         assert!(copies > 0);
-        // Reject large sources before constructing a line diff or formatting it.
-        if self.exhausted || input > DIFF_INPUT_LIMIT {
+        if self.exhausted {
             return None;
         }
         let limit = (self.remaining / copies).saturating_sub(FIELD_OVERHEAD);
+        // A pure addition or deletion must send at least its escaped content.
+        // Modified files can have tiny patches regardless of their source size.
+        let pure_content = if before.is_empty() {
+            Some(after)
+        } else if after.is_empty() {
+            Some(before)
+        } else {
+            None
+        };
+        if pure_content.is_some_and(|content| !escaped_fits(content, limit)) {
+            return None;
+        }
         let mut out = WireWriter {
             bytes: Vec::new(),
             escaped: 0,
@@ -120,6 +130,20 @@ fn escaped_len(text: &str) -> usize {
         .iter()
         .map(|&byte| escaped_byte_len(byte))
         .sum()
+}
+
+fn escaped_fits(text: &str, limit: usize) -> bool {
+    if text.len() > limit {
+        return false;
+    }
+    let mut cost = 0;
+    for &byte in text.as_bytes() {
+        cost += escaped_byte_len(byte);
+        if cost > limit {
+            return false;
+        }
+    }
+    true
 }
 
 fn escaped_byte_len(byte: u8) -> usize {
@@ -212,12 +236,19 @@ mod tests {
 
     #[test]
     fn bounded_mutation_diff_preflight_does_not_invoke_generator() {
-        let mut budget = DiffBudget::default();
-        assert!(budget
-            .render(33_608_233, 2, |_| panic!(
-                "large input reached diff generation"
-            ))
-            .is_none());
+        let mut budget = DiffBudget {
+            remaining: 1024,
+            exhausted: false,
+        };
+        for content in ["x".repeat(1000), "\0".repeat(200)] {
+            for (before, after) in [("", content.as_str()), (content.as_str(), "")] {
+                assert!(budget
+                    .render(before, after, 2, |_| panic!(
+                        "oversized pure diff reached generation"
+                    ))
+                    .is_none());
+            }
+        }
         // A large file need not hide another file's small, useful patch.
         assert!(budget.patch("small", "a\n", "b\n", 2).is_some());
     }
@@ -230,7 +261,7 @@ mod tests {
         };
         let mut visited = 0;
         assert!(budget
-            .render(1, 2, |out| {
+            .render("before", "after", 2, |out| {
                 for _ in 0..1_000_000 {
                     visited += 1;
                     out.write_all(b"+\\\"\x00\n")?;
@@ -241,7 +272,9 @@ mod tests {
             .is_none());
         assert!(visited < 10, "rendered {visited} lines before stopping");
         assert!(budget
-            .render(1, 1, |_| panic!("exhausted budget generated another diff"))
+            .render("before", "after", 1, |_| panic!(
+                "exhausted budget generated another diff"
+            ))
             .is_none());
     }
 
@@ -252,7 +285,7 @@ mod tests {
         let mut files = Vec::new();
         let mut patches = Vec::new();
         let mut omitted = 0;
-        for index in 0..40 {
+        for index in 0..120 {
             if let Some(patch) = budget.patch("é\"\\.txt", "", &content, 2) {
                 assert!(patch.contains("é🦀"));
                 files.push(json!({"file": index, "patch": patch}));
@@ -262,11 +295,11 @@ mod tests {
                 omitted += 1;
             }
         }
-        assert!(omitted > 0 && omitted < 40);
+        assert!(omitted > 0 && omitted < 120);
         let wire =
             serde_json::to_vec(&json!({"files": files, "diff": patches.join("\n")})).unwrap();
         assert!(wire.len() <= DIFF_WIRE_BUDGET, "wire size {}", wire.len());
-        assert_eq!(files.len(), 40);
+        assert_eq!(files.len(), 120);
         for text in ["é🦀\"\\\t\r\0\n", "\u{1}\u{8}\u{c}"] {
             assert_eq!(
                 escaped_len(text),
