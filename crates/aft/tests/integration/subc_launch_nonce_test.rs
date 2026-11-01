@@ -8,7 +8,6 @@
 //! children it spawns (foreground, background and PTY) see neither variable
 //! and do not hold the pipe.
 
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
