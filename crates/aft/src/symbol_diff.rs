@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::commands::outline::symbol_to_entry;
-use crate::parser::{
-    detect_language, extract_symbols_from_tree, parse_source_with_cached_parser, LangId,
-};
+use crate::parser::{detect_language, extract_symbols_from_tree, parse_resolved_source, LangId};
 use crate::symbols::Symbol;
 
 /// Fixed statement carried by every range packet.
@@ -316,7 +314,7 @@ fn parse_symbols(
     lang: LangId,
 ) -> Option<BTreeMap<SymbolIdentity, Vec<ParsedSymbol>>> {
     let source = std::str::from_utf8(source).ok()?;
-    let tree = parse_source_with_cached_parser(path, source, lang).ok()?;
+    let (tree, lang) = parse_resolved_source(path, source, lang).ok()?;
     let symbols = extract_symbols_from_tree(source, &tree, lang).ok()?;
     let line_starts = line_start_offsets(source);
 
@@ -676,6 +674,25 @@ fn git_object_spec(sha: &str, path_bytes: &[u8]) -> OsString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_revision_symbols_use_each_blob_language() {
+        let old = b"int old_c_function(void);\n";
+        let new = b"template <typename T> class Widget { public: T run(T value); };\n";
+        let diff = super::symbol_diff_file(
+            crate::parser::LangId::C,
+            std::path::Path::new("widget.h"),
+            Some(old),
+            Some(new),
+        );
+        assert!(!diff.symbols_unavailable);
+        assert!(diff.added.iter().any(|symbol| symbol.name == "Widget"));
+        assert!(diff.added.iter().any(|symbol| symbol.name == "run"));
+        assert!(diff
+            .removed
+            .iter()
+            .any(|symbol| symbol.name == "old_c_function"));
+    }
+
     use std::fs;
     use std::path::Path;
     use std::process::Command;

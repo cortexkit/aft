@@ -343,7 +343,13 @@ impl DeadCodeFileAnalyzer {
             || needs_rust_attribute_entry_points
             || needs_rust_macro_token_refs;
         let tree = needs_tree
-            .then(|| self.parse_source(lang, &source))
+            .then(|| {
+                if file.extension().and_then(|ext| ext.to_str()) == Some("h") {
+                    crate::parser::parse_source_with_cached_parser(file, &source, lang).ok()
+                } else {
+                    self.parse_source(lang, &source)
+                }
+            })
             .flatten();
 
         let type_ref_names = if needs_type_refs {
