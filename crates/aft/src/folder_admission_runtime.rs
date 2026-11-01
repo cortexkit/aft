@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
@@ -28,10 +28,12 @@ pub(crate) struct State {
     allowed: Arc<AtomicBool>,
     workspace_allowed: Arc<AtomicBool>,
     bound: AtomicBool,
+    probe: parking_lot::Mutex<Option<ProbeTask>>,
+    refresh_watch: AtomicBool,
     #[cfg(test)]
-    probes: std::sync::atomic::AtomicUsize,
+    probes: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
-    cache_hits: std::sync::atomic::AtomicUsize,
+    cache_hits: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     probe_gate:
         parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -46,6 +48,8 @@ impl Default for State {
             allowed: Arc::new(AtomicBool::new(true)),
             workspace_allowed: Arc::new(AtomicBool::new(true)),
             bound: AtomicBool::new(false),
+            probe: Default::default(),
+            refresh_watch: AtomicBool::new(false),
             #[cfg(test)]
             probes: Default::default(),
             #[cfg(test)]
@@ -88,6 +92,77 @@ struct Binding {
     waiting_sessions: std::collections::HashSet<String>,
     force: bool,
     next_probe_ms: u64,
+    wait_deadline: Instant,
+    mode: crate::folder_admission::DetectionMode,
+    fresh: bool,
+    deadline_exhausted: bool,
+}
+
+struct ProbeTask {
+    generation: u64,
+    receiver: std::sync::mpsc::Receiver<ProbeResult>,
+}
+
+enum ProbeResult {
+    Complete(Cache, bool),
+    Wait(u64),
+    Exhausted,
+}
+
+pub fn wait_budget() -> Duration {
+    ProbeBudgets::default().time + Duration::from_millis(250)
+}
+
+pub fn waiting(ctx: &AppContext) -> bool {
+    reason(ctx).as_deref() == Some("folder_admission_pending")
+}
+
+pub fn request_waits(request: &RawRequest, ctx: &AppContext) -> bool {
+    waiting(ctx)
+        && !matches!(
+            request.command.as_str(),
+            "configure"
+                | "ping"
+                | "status"
+                | "health"
+                | "shutdown"
+                | "cancel_request"
+                | "get_capabilities"
+        )
+}
+
+/// Poll before taking a request's executor lease or configuration snapshot.
+/// Expiry is a conservative, incomplete decision, never a pending reply.
+pub fn poll_wait(ctx: &AppContext) -> bool {
+    if !waiting(ctx) {
+        return true;
+    }
+    let _ = resolve(ctx);
+    if !waiting(ctx) {
+        return true;
+    }
+    let mut probe = ctx.folder_admission().probe.lock();
+    let mut binding = ctx.folder_admission().binding.lock();
+    if let Some(binding) = binding
+        .as_mut()
+        .filter(|b| Instant::now() >= b.wait_deadline)
+    {
+        binding.pending = true;
+        binding.checking = false;
+        binding.needs_apply = false;
+        binding.decision = None;
+        *probe = None;
+    }
+    drop(binding);
+    drop(probe);
+    let _ = resolve(ctx);
+    !waiting(ctx)
+}
+
+pub async fn wait(ctx: &AppContext) {
+    while !poll_wait(ctx) {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,12 +219,27 @@ fn now_ms() -> u64 {
 }
 
 fn policy(config: &Config, root: &Path) -> String {
-    blake3::hash(
-        &serde_json::to_vec(&(POLICY_VERSION, config.project_detection.mode_for_root(root)))
-            .unwrap_or_default(),
-    )
-    .to_hex()
-    .to_string()
+    mode_policy(config.project_detection.mode_for_root(root))
+}
+
+fn mode_policy(mode: crate::folder_admission::DetectionMode) -> String {
+    blake3::hash(&serde_json::to_vec(&(POLICY_VERSION, mode)).unwrap_or_default())
+        .to_hex()
+        .to_string()
+}
+
+fn timeout_cache(
+    root: &Path,
+    _config: &Config,
+    mode: crate::folder_admission::DetectionMode,
+) -> Cache {
+    Cache {
+        relative_paths: false,
+        policy: mode_policy(mode),
+        checked_ms: now_ms(),
+        stamps: Vec::new(),
+        decision: crate::folder_admission::exhausted(root, mode, ProbeBudgets::default()),
+    }
 }
 
 fn cache_path(config: &Config, root: &Path) -> PathBuf {
@@ -501,16 +591,18 @@ pub(crate) fn admit_borrowed(
         crate::folder_admission::DetectionMode::Auto => {}
     }
     let cache = if let Some(cache) = raw.filter(|cache| {
-        intent_valid(cache, &config, root)
+        cache.decision.reason != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+            && intent_valid(cache, &config, root)
             && (cache.decision.classification == FolderClassification::Project
                 || now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS)
     }) {
         cache
     } else {
-        if load_raw(&config, root)
-            .as_ref()
-            .is_some_and(|cache| now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS)
-        {
+        if load_raw(&config, root).as_ref().is_some_and(|cache| {
+            cache.decision.reason
+                != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+                && now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS
+        }) {
             return Err("folder_admission_pending".into());
         }
         let decision = crate::folder_admission::probe(root, detection, ProbeBudgets::default());
@@ -541,7 +633,9 @@ pub(crate) fn admit_borrowed(
 pub fn standalone(root: &Path, config: &Config) -> Result<FolderAdmission, String> {
     let lock = root_probe_lock(root);
     let _probe = lock.lock();
-    if let Some(cache) = load_raw(config, root) {
+    if let Some(cache) = load_raw(config, root).filter(|cache| {
+        cache.decision.reason != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+    }) {
         if intent_valid(&cache, config, root)
             && (cache.decision.classification == FolderClassification::Project
                 || now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS)
@@ -612,6 +706,7 @@ pub(crate) fn install_probe_for_test(
 }
 
 fn install_bound_cache(ctx: &AppContext, config: Config, root: PathBuf, cache: Cache) {
+    let mode = cache.decision.override_mode;
     let request: RawRequest = serde_json::from_value(json!({"id": "standing-folder", "command": "configure", "project_root": root, "harness": "runner"})).expect("standing request");
     let project = cache.decision.classification == FolderClassification::Project;
     let state = ctx.folder_admission();
@@ -635,6 +730,10 @@ fn install_bound_cache(ctx: &AppContext, config: Config, root: PathBuf, cache: C
         waiting_sessions: Default::default(),
         force: false,
         next_probe_ms: 0,
+        wait_deadline: Instant::now() + wait_budget(),
+        mode,
+        fresh: false,
+        deadline_exhausted: false,
     });
     if !project {
         retire_index_planes(ctx);
@@ -777,6 +876,9 @@ pub(crate) fn prepare(
         }
         binding.decision.clone()?
     };
+    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+        return None;
+    }
     if !replay
         && (!intent_valid(&cache, config, root)
             || (cache.decision.classification == FolderClassification::NotProject
@@ -796,12 +898,20 @@ pub(crate) fn commit(
     pending: bool,
 ) {
     let state = ctx.folder_admission();
+    let mode = requested.project_detection.mode_for_root(root);
+    let mut active_probe = pending.then(|| state.probe.lock());
+    if let Some(probe) = active_probe.as_mut() {
+        **probe = None;
+    }
     let mut slot = state.binding.lock();
     state.bound.store(true, Ordering::Release);
     if let Some(binding) = slot
         .as_mut()
         .filter(|b| b.root == root && policy(&b.requested, root) == policy(&requested, root))
     {
+        if !pending && binding.deadline_exhausted {
+            return;
+        }
         binding.requested = requested;
         binding.request = request.clone();
         binding.generation = ctx.configure_generation();
@@ -816,6 +926,12 @@ pub(crate) fn commit(
             binding.configure_announced.clear();
         }
         binding.needs_apply = binding.pending;
+        binding.mode = mode;
+        if pending {
+            binding.wait_deadline = Instant::now() + wait_budget();
+            binding.fresh = true;
+            binding.deadline_exhausted = false;
+        }
         if pending {
             binding
                 .waiting_sessions
@@ -859,6 +975,10 @@ pub(crate) fn commit(
         waiting_sessions: std::collections::HashSet::from([request.session().to_owned()]),
         force,
         next_probe_ms: 0,
+        wait_deadline: Instant::now() + wait_budget(),
+        mode,
+        fresh: true,
+        deadline_exhausted: false,
     });
 }
 
@@ -930,6 +1050,8 @@ pub(crate) fn arm_recheck(ctx: &AppContext) -> Option<RawRequest> {
         && (state.allowed.load(Ordering::Acquire)
             || state.workspace_allowed.load(Ordering::Acquire));
     binding.pending = !keep_serving;
+    binding.fresh = false;
+    binding.wait_deadline = Instant::now() + wait_budget();
     binding.checking = keep_serving;
     binding.needs_apply = !keep_serving;
     binding.needs_off_bind = !keep_serving;
@@ -960,8 +1082,63 @@ pub(crate) enum ResolveResult {
     Stale,
 }
 
-/// Called only on maintenance, after configure acknowledged the selected root
-/// with indexes held off until the folder decision is available.
+fn probe_cache(
+    root: &Path,
+    config: &Config,
+    force: bool,
+    checking: bool,
+    fresh: bool,
+) -> ProbeResult {
+    let lock = root_probe_lock(root);
+    let Some(_guard) = lock.try_lock_for(ProbeBudgets::default().time) else {
+        return ProbeResult::Exhausted;
+    };
+    let raw = (!force)
+        .then(|| load_raw(config, root))
+        .flatten()
+        .filter(|cache| {
+            cache.decision.reason
+                != crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+        });
+    if !fresh {
+        if let Some(cache) = raw.as_ref().filter(|cache| {
+            cache.decision.policy_version == POLICY_VERSION
+                && cache.policy == policy(config, root)
+                && !intent_valid(cache, config, root)
+                && now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS
+        }) {
+            return ProbeResult::Wait(cache.checked_ms.saturating_add(RECHECK_MS));
+        }
+    }
+    if let Some(cache) = raw
+        .filter(|cache| !checking && intent_valid(cache, config, root))
+        .filter(|cache| {
+            cache.decision.classification != FolderClassification::NotProject
+                || now_ms().saturating_sub(cache.checked_ms) < RECHECK_MS
+        })
+    {
+        return ProbeResult::Complete(cache, true);
+    }
+    let mut decision =
+        crate::folder_admission::probe(root, &config.project_detection, ProbeBudgets::default());
+    let stamps = stamps(&decision);
+    if decision.reason != crate::folder_admission::AdmissionReason::SmallSourceTree {
+        decision.observed_directories.clear();
+    }
+    let cache = Cache {
+        policy: policy(config, root),
+        checked_ms: now_ms(),
+        stamps,
+        decision,
+        relative_paths: false,
+    };
+    persist(config, root, &cache);
+    ProbeResult::Complete(cache, false)
+}
+
+/// Poll the metadata worker after configure acknowledged the selected root.
+/// Requests wait outside executor/config leases; only the current generation
+/// may publish a result, and an overdue attempt becomes an incomplete decision.
 pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     let state = ctx.folder_admission();
     let input = state
@@ -974,11 +1151,18 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                 b.root.clone(),
                 b.requested.clone(),
                 b.generation,
-                b.force,
+                b.force
+                    || b.decision.as_ref().is_some_and(|cache| {
+                        cache.decision.reason
+                            == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted
+                    }),
                 b.checking,
+                b.fresh || b.force,
+                b.wait_deadline,
+                b.mode,
             )
         });
-    let Some((root, config, generation, force, checking)) = input else {
+    let Some((root, config, generation, force, checking, fresh, deadline, mode)) = input else {
         return state
             .binding
             .lock()
@@ -988,64 +1172,109 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                 ResolveResult::Ready(b.generation)
             });
     };
-    let probe_lock = root_probe_lock(&root);
-    let _probe = probe_lock.lock();
-    #[cfg(test)]
-    if let Some((started, release)) = state.probe_gate.lock().take() {
-        let _ = started.send(());
-        let _ = release.recv_timeout(Duration::from_secs(10));
-    }
-    let raw = (!force).then(|| load_raw(&config, &root)).flatten();
-    if let Some(cache) = raw.as_ref().filter(|c| {
-        c.decision.policy_version == POLICY_VERSION
-            && c.decision
-                .canonical_root
-                .as_deref()
-                .is_some_and(|saved| same_root(saved, &root))
-            && c.policy == policy(&config, &root)
-            && !intent_valid(c, &config, &root)
-            && now_ms().saturating_sub(c.checked_ms) < RECHECK_MS
-    }) {
-        if let Some(binding) = state
-            .binding
-            .lock()
-            .as_mut()
-            .filter(|b| b.generation == generation)
-        {
-            binding.next_probe_ms = cache.checked_ms.saturating_add(RECHECK_MS);
+    let mut task = state.probe.lock();
+    if let Some(binding) = state.binding.lock().as_ref() {
+        if binding.generation != generation {
+            return ResolveResult::Stale;
         }
-        return ResolveResult::Wait;
+        if !binding.pending && !binding.checking {
+            return if binding.needs_apply {
+                ResolveResult::Ready(binding.generation)
+            } else {
+                ResolveResult::Settled
+            };
+        }
     }
-    let cached = raw
-        .filter(|c| !checking && intent_valid(c, &config, &root))
-        .filter(|c| {
-            c.decision.classification != FolderClassification::NotProject
-                || now_ms().saturating_sub(c.checked_ms) < RECHECK_MS
-        });
-    #[cfg(test)]
-    if cached.is_some() {
-        state.cache_hits.fetch_add(1, Ordering::SeqCst);
+    if task
+        .as_ref()
+        .is_some_and(|task| task.generation != generation)
+    {
+        *task = None;
     }
-    let cache = cached.unwrap_or_else(|| {
+    if task.is_none() && Instant::now() < deadline {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        let worker_config = config.clone();
         #[cfg(test)]
-        state.probes.fetch_add(1, Ordering::SeqCst);
-        let mut decision = crate::folder_admission::probe(
-            &root,
-            &config.project_detection,
-            ProbeBudgets::default(),
-        );
-        let stamps = stamps(&decision);
-        if decision.reason != crate::folder_admission::AdmissionReason::SmallSourceTree {
-            decision.observed_directories.clear();
+        let gate = state.probe_gate.lock().take();
+        #[cfg(test)]
+        let child_env = crate::git_probe::capture_child_env_for_test();
+        #[cfg(test)]
+        let counts = (Arc::clone(&state.probes), Arc::clone(&state.cache_hits));
+        let _ = std::thread::Builder::new()
+            .name("aft-folder-probe".into())
+            .spawn(move || {
+                #[cfg(debug_assertions)]
+                delay_probe_for_test();
+                if Instant::now() >= deadline {
+                    let _ = sender.send(ProbeResult::Exhausted);
+                    return;
+                }
+                #[cfg(test)]
+                if let Some((started, release)) = gate {
+                    let _ = started.send(());
+                    let _ = release.recv_timeout(Duration::from_secs(10));
+                }
+                if Instant::now() >= deadline {
+                    let _ = sender.send(ProbeResult::Exhausted);
+                    return;
+                }
+                let work = || probe_cache(&worker_root, &worker_config, force, checking, fresh);
+                #[cfg(test)]
+                let result = crate::git_probe::with_captured_child_env_for_test(child_env, work);
+                #[cfg(not(test))]
+                let result = work();
+                #[cfg(test)]
+                match &result {
+                    ProbeResult::Complete(_, true) => {
+                        counts.1.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ProbeResult::Complete(_, false) => {
+                        counts.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                let result = if Instant::now() > deadline {
+                    ProbeResult::Exhausted
+                } else {
+                    result
+                };
+                let _ = sender.send(result);
+            });
+        *task = Some(ProbeTask {
+            generation,
+            receiver,
+        });
+    }
+    let result = task.as_ref().and_then(|task| task.receiver.try_recv().ok());
+    let mut cache = match result {
+        Some(ProbeResult::Complete(cache, cached)) => {
+            let _ = cached;
+            cache
         }
-        Cache {
-            policy: policy(&config, &root),
-            checked_ms: now_ms(),
-            stamps,
-            decision,
-            relative_paths: false,
+        Some(ProbeResult::Wait(until)) => {
+            *task = None;
+            if let Some(binding) = state
+                .binding
+                .lock()
+                .as_mut()
+                .filter(|b| b.generation == generation)
+            {
+                binding.next_probe_ms = until;
+            }
+            return ResolveResult::Wait;
         }
-    });
+        Some(ProbeResult::Exhausted) => timeout_cache(&root, &config, mode),
+        None if Instant::now() < deadline => return ResolveResult::Wait,
+        None => timeout_cache(&root, &config, mode),
+    };
+    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+        cache.decision.coverage.elapsed_ms = Instant::now()
+            .saturating_duration_since(deadline - wait_budget())
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+    }
     let mut slot = state.binding.lock();
     let Some(binding) = slot.as_mut().filter(|b| {
         b.generation == generation
@@ -1070,6 +1299,8 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     binding.needs_apply = !negative && !unchanged_project;
     binding.force = false;
     binding.decision = Some(cache.clone());
+    binding.deadline_exhausted =
+        cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted;
     let was_serving =
         state.allowed.load(Ordering::Acquire) || state.workspace_allowed.load(Ordering::Acquire);
     if negative
@@ -1094,7 +1325,20 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     };
     state.dirty.store(false, Ordering::Release);
     drop(slot);
-    persist(&config, &root, &cache);
+    *task = None;
+    drop(task);
+    if cache.decision.reason == crate::folder_admission::AdmissionReason::EvidenceBudgetExhausted {
+        let config = config.clone();
+        let root = root.clone();
+        let cache = cache.clone();
+        let _ = std::thread::Builder::new()
+            .name("aft-admission-cache".into())
+            .spawn(move || {
+                let lock = root_probe_lock(&root);
+                let _guard = lock.lock();
+                persist(&config, &root, &cache);
+            });
+    }
     if negative {
         retire_index_planes(ctx);
         if !ctx.replace_degraded_reason("folder_admission_pending", "folder_not_admitted") {
@@ -1109,8 +1353,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
             }
         }
     }
-    drop(state.watcher.lock().take());
-    ensure_metadata_watch(ctx);
+    state.refresh_watch.store(true, Ordering::Release);
     if negative || unchanged_project {
         ResolveResult::Settled
     } else {
@@ -1118,8 +1361,27 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     }
 }
 
+#[cfg(debug_assertions)]
+fn delay_probe_for_test() {
+    let delay = std::env::var_os("AFT_TEST_ADMISSION_DELAY_FILE")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .or_else(|| std::env::var("AFT_TEST_ADMISSION_DELAY_MS").ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if let Some(path) = std::env::var_os("AFT_TEST_ADMISSION_STARTED") {
+        let _ = std::fs::write(path, b"started");
+    }
+    std::thread::sleep(Duration::from_millis(delay));
+}
+
 pub(crate) fn ensure_metadata_watch(ctx: &AppContext) {
+    if std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1") {
+        return;
+    }
     let state = ctx.folder_admission();
+    if state.refresh_watch.swap(false, Ordering::AcqRel) {
+        drop(state.watcher.lock().take());
+    }
     if state.watcher.lock().is_some() || ctx.subc_unbound_quiesced() {
         return;
     }
@@ -1219,7 +1481,7 @@ pub(crate) fn wait_until_probe(ctx: &AppContext) -> Duration {
 
 pub fn refusal(ctx: &AppContext, id: &str, session: &str) -> Option<Response> {
     let reason = reason(ctx)?;
-    let message = notice(ctx, false, session).unwrap_or_default();
+    let message = notice(ctx, false, session).unwrap_or(OFF_TEXT);
     Some(Response::error_with_data(
         id,
         "folder_not_admitted",
@@ -1279,12 +1541,17 @@ pub fn decorate(ctx: &AppContext, response: &mut Response, configure: bool, sess
 }
 
 pub(crate) fn after_configure(ctx: &AppContext, request: &RawRequest) {
+    let mut exhausted = false;
     if let Some(binding) = ctx.folder_admission().binding.lock().as_mut() {
+        exhausted = binding.deadline_exhausted;
         binding.request = request.clone();
         binding.generation = ctx.configure_generation();
         if !binding.pending {
             binding.needs_apply = false;
         }
+    }
+    if exhausted {
+        retire_index_planes(ctx);
     }
 }
 

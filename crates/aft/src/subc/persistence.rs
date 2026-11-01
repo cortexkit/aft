@@ -27,6 +27,7 @@ fn carrier_precheck_failed(identity: &RouteIdentity, body: &Value) -> bool {
 pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
+    folder_waits: HashSet<(RouteChannel, u64)>,
     confinement_reads: Arc<tokio::sync::Semaphore>,
     launch_restores: Arc<tokio::sync::Semaphore>,
 }
@@ -36,6 +37,7 @@ impl Default for DatabaseWaits {
         Self {
             tasks: Default::default(),
             pending: Default::default(),
+            folder_waits: Default::default(),
             confinement_reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONFINEMENT_READS)),
             launch_restores: Arc::new(tokio::sync::Semaphore::new(MAX_CONFINEMENT_READS)),
         }
@@ -45,6 +47,74 @@ impl Default for DatabaseWaits {
 impl DatabaseWaits {
     pub(super) fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+
+    pub(super) fn has_folder_waits(&self) -> bool {
+        !self.folder_waits.is_empty()
+    }
+
+    /// Folder checks finish before the tool acquires an executor lease or
+    /// retains its configuration snapshot. The frame loop can still submit
+    /// the configuration update that makes the admitted folder ready.
+    pub(super) fn defer_folder(
+        &mut self,
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Executor,
+        writer: &WriterSender,
+        metrics: &Arc<DispatchPathMetrics>,
+    ) -> Result<(), DecodedFrame> {
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes.get(&route) else {
+            return Err(decoded);
+        };
+        let Some(ctx) = executor.actor_context(&identity.root) else {
+            return Err(decoded);
+        };
+        let Ok(body) = decoded.body() else {
+            return Err(decoded);
+        };
+        if !route_request_is_tool_call(body)
+            || carrier_precheck_failed(identity, body)
+            || matches!(
+                body.get("name").and_then(Value::as_str),
+                Some("status" | "aft_status")
+            )
+            || !crate::folder_admission_runtime::waiting(&ctx)
+        {
+            return Err(decoded);
+        }
+        if self.pending.len() >= MAX_WAITERS {
+            let frame = build_error_frame(
+                decoded.frame.header.ver,
+                route.channel,
+                route.epoch,
+                decoded.frame.header.corr,
+                decoded.frame.header.flags,
+                "busy",
+                a0_egress::BIND_BUSY_MESSAGE,
+            );
+            let writer = writer.clone();
+            let metrics = Arc::clone(metrics);
+            tokio::spawn(async move {
+                if let Ok(frame) = frame {
+                    let _ = send_reliable_writer_frame(&writer, &metrics, frame, "admission busy")
+                        .await;
+                }
+            });
+            return Ok(());
+        }
+        let key = (route, decoded.frame.header.corr);
+        let admission = AdmissionWait::from_decoded(&decoded, "tool.call");
+        let handle = self.tasks.spawn(async move {
+            crate::folder_admission_runtime::wait(&ctx).await;
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        self.folder_waits.insert(key);
+        Ok(())
     }
 
     /// Compare codemode candidates only after their own saved policies have
@@ -579,7 +649,7 @@ impl DatabaseWaits {
         Ok(())
     }
 
-    pub(super) async fn next(&mut self) -> DecodedFrame {
+    pub(super) async fn next_with_kind(&mut self) -> (DecodedFrame, bool) {
         loop {
             match self.tasks.join_next_with_id().await {
                 Some(Ok((id, decoded))) => {
@@ -597,7 +667,7 @@ impl DatabaseWaits {
                         continue;
                     }
                     self.pending.remove(&key);
-                    return decoded;
+                    return (decoded, self.folder_waits.remove(&key));
                 }
                 Some(Err(_)) => continue,
                 None => std::future::pending::<()>().await,
@@ -605,7 +675,13 @@ impl DatabaseWaits {
         }
     }
 
+    #[cfg(test)]
+    pub(super) async fn next(&mut self) -> DecodedFrame {
+        self.next_with_kind().await.0
+    }
+
     pub(super) fn cancel(&mut self, route: RouteChannel, corr: u64) -> Option<RequestFrameMeta> {
+        self.folder_waits.remove(&(route, corr));
         let (handle, meta) = self.pending.remove(&(route, corr))?;
         handle.abort();
         Some(meta.meta)
@@ -620,6 +696,7 @@ impl DatabaseWaits {
 
     pub(super) fn drain_for_module_drain(&mut self) -> Result<Vec<Frame>, SubcError> {
         self.tasks.abort_all();
+        self.folder_waits.clear();
         self.pending
             .drain()
             .map(|(_, (task, wait))| {

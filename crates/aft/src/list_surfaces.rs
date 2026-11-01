@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "git_probe.rs",
+        enclosing_item: "metadata_git_file",
+        location_or_primitive: "MAX_CONTROL_BYTES, take",
+        reason: "Bounded Git control metadata used for folder evidence, not an agent result list; oversized or unusual metadata falls back to bounded Git plumbing.",
+    },
+    ExclusionEntry {
         file: "folder_admission_runtime.rs",
         enclosing_item: "load_raw, persist",
         location_or_primitive: "CACHE_BYTES, take",
