@@ -1899,6 +1899,97 @@ fn audit10_outside_inspect_asks_then_runs_with_the_approval() {
     }
 }
 
+#[test]
+fn audit10_deferred_inspect_renews_a_when_requesting_b() {
+    let f = Fixture::new();
+    let mut config = Config {
+        project_root: Some(f.root.clone()),
+        storage_dir: Some(f._dir.path().join("inspect-renewal-store")),
+        ..Config::default()
+    };
+    config.backup.enabled = Some(false);
+    let ctx = std::sync::Arc::new(AppContext::new(
+        Box::new(crate::language::StubProvider),
+        config,
+    ));
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    let a = f.outside.join("a.rs");
+    let b = f.outside.join("b.rs");
+    let unrelated = f.outside.join("unrelated.rs");
+    std::fs::write(&a, "fn a() {}\n").unwrap();
+    std::fs::write(&b, "fn b() {}\n").unwrap();
+    std::fs::write(&unrelated, "fn unrelated() {}\n").unwrap();
+    let req = request("inspect", json!({"scope": [a, b], "sections": "todos"}));
+    let scope = plugin::Scope::new(&f.owner, "audit-session").for_tool("inspect", &Value::Null);
+    let asked_a = {
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: scope.clone(),
+            once: Vec::new(),
+        }));
+        run_inspect(&ctx, &req, true)
+    };
+    assert_eq!(asked_a.data["code"], "permission_required");
+    assert_eq!(asked_a.data["asks"][0]["path"], json!(a));
+    let token_a = asked_a.data["asks"][0]["grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut approved = scope.clone();
+    let once = plugin::claim(&mut approved, &[token_a.clone()]);
+    assert_eq!(once.len(), 1);
+    let asked_b = {
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: approved,
+            once,
+        }));
+        run_inspect(&ctx, &req, true)
+    };
+    assert_eq!(asked_b.data["code"], "permission_required");
+    assert_eq!(asked_b.data["asks"][0]["path"], json!(b));
+    let renewal = asked_b.data["permissions_continuation"].as_array();
+    assert!(
+        renewal.is_some_and(|ids| ids.len() == 1),
+        "deferred B ask must renew approved A: {:?}",
+        asked_b.data
+    );
+    let mut ids: Vec<String> = renewal
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_owned())
+        .collect();
+    assert_ne!(ids[0], token_a);
+    assert!(plugin::claim(&mut scope.clone(), &[token_a]).is_empty());
+    ids.push(
+        asked_b.data["asks"][0]["grant_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    let mut approved = scope.clone();
+    let once = plugin::claim(&mut approved, &ids);
+    assert_eq!(
+        once.len(),
+        2,
+        "A renewal and B approval must both be usable"
+    );
+    let ran = {
+        let _route = ask_route_guard(Some(AskRoute::Plugin {
+            scope: approved,
+            once,
+        }));
+        let refused_read = ctx
+            .validate_read_path("audit2", "audit-session", &unrelated)
+            .unwrap_err();
+        assert_eq!(refused_read.data["code"], "permission_required");
+        let refused_write = ctx.validate_write_location("audit2", &a).unwrap_err();
+        assert_eq!(refused_write.data["code"], "permission_required");
+        run_inspect(&ctx, &req, true)
+    };
+    assert!(ran.success, "{:?}", ran.data);
+    assert!(ran.data.get("code").is_none(), "{:?}", ran.data);
+    assert!(plugin::claim(&mut scope.clone(), &ids).is_empty());
+}
+
 /// A zoom batch whose entry names a file outside the project returns the
 /// engine's outside-access ask as the whole reply, not as one refused entry
 /// inside a successful batch, so the host can ask. Retried with the
