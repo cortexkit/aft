@@ -272,6 +272,9 @@ fn wait_for_unlock(path: &Path, remaining: &mut Duration) -> Result<bool, Strict
                 *remaining = remaining.saturating_sub(start.elapsed());
                 return Ok(saw_lock);
             }
+            // Windows can deny metadata access to a delete-pending lock until its last handle closes.
+            #[cfg(windows)]
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => saw_lock = true,
             Err(error) => return Err(StrictReason::Unreadable(error.kind())),
             Ok(_) => saw_lock = true,
         }
@@ -1172,6 +1175,17 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.raw_os_error(), Some(5));
         eprintln!("delete-pending index.lock metadata: {error:?}");
+
+        let options = ReadOptions {
+            lock_wait: Duration::from_millis(20),
+            ..ReadOptions::default()
+        };
+        let start = Instant::now();
+        assert_eq!(
+            read_index(&index(dir.path()), ObjectFormat::Sha1, options),
+            IndexRead::Strict(StrictReason::IndexLocked)
+        );
+        assert!(start.elapsed() >= options.lock_wait);
 
         let writer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
