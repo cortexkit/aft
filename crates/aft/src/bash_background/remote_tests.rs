@@ -3969,6 +3969,41 @@ async fn runon_restart_reattach_unknown_job_ends_the_first_watch() {
 }
 
 #[tokio::test]
+async fn runon_restart_reattach_relaxed_kill_withholds_the_recovery_worker() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.remote.as_mut().unwrap().terminal = Some(TerminalRecord::new(
+        id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unreachable,
+        },
+        1,
+        0,
+        0,
+    ));
+    write_task(&paths.json, &metadata).unwrap();
+    original.detach();
+    let restarted = registry();
+    let kill_id = task_id.clone();
+    let root = dir.path().to_path_buf();
+    let killer = restarted.clone();
+    let stopped =
+        tokio::task::spawn_blocking(move || killer.kill_relaxed(&kill_id, &root, &root).unwrap())
+            .await
+            .unwrap();
+    assert!(stopped.info.status.is_terminal(), "{stopped:?}");
+    // A saved refusal can permit a local fallback. A kill must record its
+    // stop without first starting the worker that could launch that fallback.
+    assert_eq!(remote_workers(&task_id), (0, 0));
+}
+
+#[tokio::test]
 async fn exec_remote_bash_keyed_restart_attaches_by_id_without_duplicates_or_gaps() {
     restart_uses_persisted_seq_without_duplicates_or_gaps(true).await;
 }

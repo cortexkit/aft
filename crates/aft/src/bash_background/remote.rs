@@ -3385,7 +3385,7 @@ impl BgTaskRegistry {
                 true
             };
             if let Ok(progress) = &result {
-                if first_attach_record && !matches!(progress, StreamProgress::AdmissionProgress) {
+                if first_attach_record && matches!(progress, StreamProgress::Record) {
                     if let Some(point) = stream.resume_point() {
                         crate::slog_info!(
                             "runon: remote attach succeeded task_id={} job_id={} attempt={}",

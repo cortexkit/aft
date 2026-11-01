@@ -9246,6 +9246,7 @@ impl BgTaskRegistry {
         task_id: &str,
         project_root: &Path,
         storage_dir: &Path,
+        resume_remote: bool,
         accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
@@ -9295,7 +9296,10 @@ impl BgTaskRegistry {
                 {
                     return None;
                 }
-                if self.restore_relaxed_task(metadata, resolved.paths).is_err() {
+                if self
+                    .restore_relaxed_task(metadata, resolved.paths, resume_remote)
+                    .is_err()
+                {
                     return None;
                 }
                 return self.task(task_id);
@@ -9388,7 +9392,10 @@ impl BgTaskRegistry {
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
-            if self.restore_relaxed_task(metadata, resolved.paths).is_err() {
+            if self
+                .restore_relaxed_task(metadata, resolved.paths, resume_remote)
+                .is_err()
+            {
                 return None;
             }
             return self.task(task_id);
@@ -9400,8 +9407,9 @@ impl BgTaskRegistry {
         &self,
         metadata: PersistedTask,
         paths: TaskPaths,
+        resume_remote: bool,
     ) -> Result<(), String> {
-        if metadata.remote.is_some() {
+        if resume_remote && metadata.remote.is_some() {
             // Registering a saved remote task is not enough: its worker must
             // attach to the runner. Session recovery shares one worker across
             // registries and lets an owner's pending pause reach it first.
@@ -9410,6 +9418,8 @@ impl BgTaskRegistry {
             self.start_watchdog();
             Ok(())
         } else {
+            // A kill lookup records cancellation immediately after restoration;
+            // it must not start a fallback command before recording that stop.
             self.insert_rehydrated_task(metadata, paths, true)
         }
     }
@@ -9466,7 +9476,7 @@ impl BgTaskRegistry {
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
         if let Some(task) =
-            self.status_relaxed_task(task_id, project_root, storage_dir, |metadata| {
+            self.status_relaxed_task(task_id, project_root, storage_dir, true, |metadata| {
                 metadata.session_id == session_id || metadata.scope.is_none()
             })
         {
@@ -9511,7 +9521,7 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
-            .status_relaxed_task(task_id, project_root, storage_dir, |metadata| {
+            .status_relaxed_task(task_id, project_root, storage_dir, false, |metadata| {
                 metadata.scope.is_none()
             })
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
