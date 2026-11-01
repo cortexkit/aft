@@ -1,4 +1,11 @@
-import { BridgeTransportUnavailableError, type VersionMismatchCallback } from "./bridge.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  type BridgeClock,
+  BridgeTransportUnavailableError,
+  BridgeTransportUnknownOutcomeError,
+  type VersionMismatchCallback,
+} from "./bridge.js";
+import { AftModuleUnavailableError, adaptToolError } from "./error-contract.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type {
@@ -16,7 +23,20 @@ const LIFECYCLE_STATE: unique symbol = Symbol.for(
 const RELEASE_LOCATION: unique symbol = Symbol.for(
   "@cortexkit/aft-bridge/location-release/v1",
 ) as never;
+const EXECUTE_LOCATION: unique symbol = Symbol.for(
+  "@cortexkit/aft-bridge/location-execute/v1",
+) as never;
 const OWNER_LOCK = "process-global-owner";
+const EXECUTION_DRAIN_TIMEOUT_MS = 5_000;
+
+export const LOCATION_RELOADED_NOT_SENT =
+  "This call was not sent because the AFT plugin reloaded; retry it.";
+
+type ExecutionClock = Pick<BridgeClock, "setTimeout" | "clearTimeout">;
+const EXECUTION_CLOCK: ExecutionClock = {
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+};
 
 type TransportMode = "standalone" | "subc";
 type PoolFactory = (options: AftTransportFactoryOptions) => Promise<AftTransportPool>;
@@ -24,6 +44,9 @@ type PoolFactory = (options: AftTransportFactoryOptions) => Promise<AftTransport
 export interface AcquireBridgeDependencies {
   /** Construction seam for lifecycle tests. Production always uses createAftTransportPool. */
   createPool?: PoolFactory;
+  /** Bounded finalizer drain; the clock seam lets tests expire it without sleeping. */
+  executionDrainTimeoutMs?: number;
+  executionClock?: ExecutionClock;
 }
 
 export interface BridgeLifecycleTopology {
@@ -80,6 +103,15 @@ type LifecycleGlobal = typeof globalThis & {
 
 interface ReleasableLocationPool extends AftTransportPool {
   [RELEASE_LOCATION](): Promise<void>;
+  [EXECUTE_LOCATION]<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+interface ExecutionHold {
+  dispatched: boolean;
+  finished: boolean;
+  taskId?: string;
+  error?: Error;
+  interrupt(error: Error): void;
 }
 
 function lifecycleState(): LifecycleState {
@@ -130,27 +162,109 @@ function assertLive(released: boolean): void {
 class LocationBridgeLease implements ReleasableLocationPool {
   private released = false;
   private releasePromise: Promise<void> | null = null;
+  private readonly execution = new AsyncLocalStorage<ExecutionHold>();
+  private readonly holds = new Set<ExecutionHold>();
+  private drained?: () => void;
 
   constructor(
     readonly directory: string,
     readonly mode: TransportMode,
     private readonly pool: AftTransportPool,
     private readonly releaseOwner: () => Promise<void>,
+    private readonly dependencies: AcquireBridgeDependencies,
   ) {}
 
+  [EXECUTE_LOCATION]<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.released) return Promise.reject(this.notSent());
+    let interrupt!: (error: Error) => void;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      interrupt = reject;
+    });
+    const hold: ExecutionHold = { dispatched: false, finished: false, interrupt };
+    this.holds.add(hold);
+    // Admission is synchronous. Async-local ownership follows the whole invocation,
+    // including permission waits and RPCs made after an earlier mutation answered.
+    return this.execution.run(hold, async () => {
+      try {
+        return await Promise.race([operation(), interrupted]);
+      } finally {
+        hold.finished = true;
+        this.holds.delete(hold);
+        if (this.holds.size === 0) this.drained?.();
+      }
+    });
+  }
+
+  private notSent(): Error {
+    return new AftModuleUnavailableError(LOCATION_RELOADED_NOT_SENT, undefined);
+  }
+
+  private interrupted(hold: ExecutionHold): Error {
+    return hold.dispatched
+      ? (adaptToolError(
+          "",
+          new BridgeTransportUnknownOutcomeError(
+            `The AFT plugin reloaded before this invocation finished.${
+              hold.taskId ? ` Background task: ${hold.taskId}.` : ""
+            }`,
+          ),
+        ) as Error)
+      : this.notSent();
+  }
+
+  private assertUsable(hold = this.execution.getStore()): void {
+    if (hold?.error) throw hold.error;
+    if (hold?.finished) throw this.interrupted(hold);
+    assertLive(this.released && !hold);
+  }
+
+  private dispatch<T>(operation: () => Promise<T>, hold = this.execution.getStore()): Promise<T> {
+    this.assertUsable(hold);
+    // Once an RPC is handed to a transport, teardown cannot prove it did not run.
+    if (hold) hold.dispatched = true;
+    return operation().then((result) => {
+      if (hold && result && typeof result === "object" && "task_id" in result) {
+        if (typeof result.task_id === "string") hold.taskId = result.task_id;
+      }
+      return result;
+    });
+  }
+
+  private transport(bridge: AftProjectTransport): AftProjectTransport {
+    const hold = this.execution.getStore();
+    // Guard escaped transports too: getBridge may precede a permission wait.
+    return new Proxy(bridge, {
+      get: (target, key) => {
+        if (key === "send") {
+          return (...args: Parameters<AftProjectTransport["send"]>) =>
+            this.dispatch(() => target.send(...args), hold);
+        }
+        if (key === "toolCall") {
+          return (...args: Parameters<AftProjectTransport["toolCall"]>) =>
+            this.dispatch(() => target.toolCall(...args), hold);
+        }
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
   getBridge(projectRoot: string): AftProjectTransport {
-    assertLive(this.released);
-    return this.pool.getBridge(projectRoot);
+    this.assertUsable();
+    return this.transport(this.pool.getBridge(projectRoot));
   }
 
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null {
-    if (this.released) return null;
-    return this.pool.getActiveBridgeForRoot(projectRoot);
+    if (this.released && !this.execution.getStore()) return null;
+    this.assertUsable();
+    const bridge = this.pool.getActiveBridgeForRoot(projectRoot);
+    return bridge ? this.transport(bridge) : null;
   }
 
   activeBridges(): AftProjectTransport[] {
-    if (this.released) return [];
-    return this.pool.activeBridges();
+    if (this.released && !this.execution.getStore()) return [];
+    this.assertUsable();
+    return this.pool.activeBridges().map((bridge) => this.transport(bridge));
   }
 
   toolCall(
@@ -160,32 +274,29 @@ class LocationBridgeLease implements ReleasableLocationPool {
     rawArgs?: ToolCallArguments,
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
-    assertLive(this.released);
-    return this.pool.toolCall(projectRoot, runtime, name, rawArgs, options);
+    return this.dispatch(() => this.pool.toolCall(projectRoot, runtime, name, rawArgs, options));
   }
 
   setConfigureOverride(key: string, value: unknown): void {
-    assertLive(this.released);
+    this.assertUsable();
     this.pool.setConfigureOverride(key, value);
   }
 
   reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
-    assertLive(this.released);
-    return this.pool.reconfigure(projectRoot, overrides);
+    return this.dispatch(() => this.pool.reconfigure(projectRoot, overrides));
   }
 
   replaceBinary(path: string): Promise<string> {
-    assertLive(this.released);
-    return this.pool.replaceBinary(path);
+    return this.dispatch(() => this.pool.replaceBinary(path));
   }
 
   closeSession(projectRoot: string, session: string): Promise<void> {
-    if (this.released) return Promise.resolve();
-    return this.pool.closeSession(projectRoot, session);
+    if (this.released && !this.execution.getStore()) return Promise.resolve();
+    return this.dispatch(() => this.pool.closeSession(projectRoot, session));
   }
 
   isShutdown(): boolean {
-    return this.released || this.pool.isShutdown();
+    return (this.released && !this.execution.getStore()) || this.pool.isShutdown();
   }
 
   shutdown(): Promise<void> {
@@ -199,9 +310,39 @@ class LocationBridgeLease implements ReleasableLocationPool {
   [RELEASE_LOCATION](): Promise<void> {
     if (this.releasePromise) return this.releasePromise;
     this.released = true;
-    this.releasePromise = this.releaseOwner();
+    this.releasePromise = this.drain().then(() => this.releaseOwner());
     return this.releasePromise;
   }
+
+  private async drain(): Promise<void> {
+    if (this.holds.size === 0) return;
+    const clock = this.dependencies.executionClock ?? EXECUTION_CLOCK;
+    let timer: ReturnType<ExecutionClock["setTimeout"]> | undefined;
+    try {
+      await new Promise<void>((resolve) => {
+        this.drained = resolve;
+        timer = clock.setTimeout(() => {
+          for (const hold of this.holds) {
+            hold.error = this.interrupted(hold);
+            hold.interrupt(hold.error);
+          }
+          resolve();
+        }, this.dependencies.executionDrainTimeoutMs ?? EXECUTION_DRAIN_TIMEOUT_MS);
+      });
+    } finally {
+      if (timer !== undefined) clock.clearTimeout(timer);
+      this.drained = undefined;
+    }
+  }
+}
+
+/** Admit one complete tool invocation on its original Location, before any await. */
+export function withLocationExecution<T>(
+  pool: AftTransportPool,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const execute = (pool as Partial<ReleasableLocationPool>)[EXECUTE_LOCATION];
+  return execute ? (execute.call(pool, operation) as Promise<T>) : operation();
 }
 
 /**
@@ -223,12 +364,18 @@ export async function acquireBridge(
     if (mode === "subc") {
       const pool = await createPool(options);
       let lease!: LocationBridgeLease;
-      lease = new LocationBridgeLease(directory, mode, pool, async () => {
-        await withLock(directory, async () => {
-          lifecycleState().subcLeases.delete(lease);
-          await pool.shutdown();
-        });
-      });
+      lease = new LocationBridgeLease(
+        directory,
+        mode,
+        pool,
+        async () => {
+          await withLock(directory, async () => {
+            lifecycleState().subcLeases.delete(lease);
+            await pool.shutdown();
+          });
+        },
+        dependencies,
+      );
       lifecycleState().subcLeases.add(lease);
       return lease;
     }
@@ -293,6 +440,7 @@ export async function acquireBridge(
             }),
           );
         },
+        dependencies,
       );
       const onVersionMismatch = options.poolOptions.onVersionMismatch;
       if (onVersionMismatch) owner.versionMismatchHandlers?.set(lease, onVersionMismatch);

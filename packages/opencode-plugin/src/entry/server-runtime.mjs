@@ -1,5 +1,5 @@
-import { acquireBridge, releaseBridge } from "@cortexkit/aft-bridge";
-import { Cause, Effect } from "effect";
+import { acquireBridge, releaseBridge, withLocationExecution } from "@cortexkit/aft-bridge";
+import { Cause, Effect, Exit, Scope } from "effect";
 
 import {
   applyToolSurfaceOverrides,
@@ -125,6 +125,7 @@ async function bootLocation(context, location, dependencies) {
     ...consumers.transportOptions,
     ...subcWakes?.handlers,
   });
+  consumers.withExecution = (operation) => withLocationExecution(pool, operation);
   environment.attach(pool);
   const toolContext = {
     pool,
@@ -239,19 +240,30 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
+      // Session ownership must outlive tool registration: a draining bash call
+      // can still record or kill a background task after the host unregisters it.
+      const sessionScope = yield* Effect.acquireRelease(
+        Scope.make(),
+        (scope) => Scope.close(scope, Exit.succeed(undefined)),
+      );
       // The host runs this program under Effect.ignoreCause, so a rejected boot
       // would otherwise leave the Location without AFT and without any log.
       // Interruption is the host disposing the Location mid-boot, not a failure.
       const runtime = yield* Effect.acquireRelease(
         Effect.promise(() => bootLocation(context, location, dependencies)),
         (runtime) => Effect.promise(async () => {
+          // Close admission immediately, but retain consumers until admitted calls
+          // finish: background spawn replies can still need their tracking RPCs.
+          const released = runtime.pool
+            ? dependencies.releaseBridge(runtime.pool)
+            : Promise.resolve();
           try {
             runtime.liveConfigReload?.stop();
           } finally {
             try {
-              runtime.consumers.dispose?.();
+              await released;
             } finally {
-              if (runtime.pool) await dependencies.releaseBridge(runtime.pool);
+              await runtime.consumers.dispose?.();
             }
           }
         }),
@@ -276,7 +288,9 @@ export function makeServerEffect(overrides = {}) {
 
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-      yield* registerV2SessionLifecycle(context, runtime.toolContext);
+      yield* registerV2SessionLifecycle(context, runtime.toolContext).pipe(
+        Effect.provideService(Scope.Scope, sessionScope),
+      );
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.

@@ -294,8 +294,10 @@ export type {
 export {
   acquireBridge,
   getBridgeLifecycleTopology,
+  LOCATION_RELOADED_NOT_SENT,
   releaseBridge,
   sampleBridgeLifecycleCensus,
+  withLocationExecution,
 } from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
 export {

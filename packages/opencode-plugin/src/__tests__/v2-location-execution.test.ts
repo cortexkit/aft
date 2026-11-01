@@ -1,11 +1,20 @@
 import { expect, test } from "bun:test";
-import { acquireBridge, type AftTransportPool, releaseBridge } from "@cortexkit/aft-bridge";
-import { Effect, Exit, Scope } from "effect";
+import {
+  type AcquireBridgeDependencies,
+  type AftProjectTransport,
+  type AftTransportPool,
+  acquireBridge,
+  BridgeTransportUnknownOutcomeError,
+  releaseBridge,
+} from "@cortexkit/aft-bridge";
+import { Effect, Exit, Scope, Stream } from "effect";
 import { makeServerEffect } from "../entry/server-runtime.mjs";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
-import { callToolCall } from "../tools/_shared.js";
+import { callBridge, callToolCall } from "../tools/_shared.js";
 import type { V2ProviderTool } from "../tools/definitions/v2.js";
+import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
+import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 
 function gate() {
   let open!: () => void;
@@ -15,20 +24,27 @@ function gate() {
   return { promise, open };
 }
 
-async function rig(boundary: "session" | "permission") {
+async function rig(
+  boundary: "session" | "permission" | "edit" | "bash",
+  dependencies: AcquireBridgeDependencies = {},
+) {
   _resetSubagentCacheForTest();
   const directory = process.cwd();
   const entered = gate();
   const resume = gate();
   const retiring = gate();
+  const continued = gate();
   const calls: string[] = [];
   let shutdowns = 0;
   let disposedConsumers = false;
-  const transport = {
-    send: async () => ({ success: true }),
-    toolCall: async (_session: unknown, name: string) => {
-      calls.push(name);
-      return { success: true, text: "written" };
+  const transport: AftProjectTransport = {
+    send: async (command) => {
+      calls.push(command);
+      return { success: true, task_id: "bash-held", status: "running" };
+    },
+    toolCall: async (_session, name, _args, options) => {
+      calls.push(options?.preview ? `${name}:preview` : name);
+      return { success: true, text: "written", preview_diff: "fixture diff" };
     },
     getCwd: () => directory,
     getCachedStatus: () => null,
@@ -56,6 +72,7 @@ async function rig(boundary: "session" | "permission") {
   };
   const location = await acquireBridge(directory, options, {
     createPool: async () => owner,
+    ...dependencies,
   });
   const tools = new Map<string, V2ProviderTool>();
   const pause = async () => {
@@ -63,19 +80,25 @@ async function rig(boundary: "session" | "permission") {
     await resume.promise;
   };
   const scope = await Effect.runPromise(Scope.make());
+  let toolContext!: PluginContext;
+  let lookups = 0;
   const host = {
     location: { directory },
+    event: { subscribe: () => Stream.never },
     permission: { assert: () => Effect.void },
     session: {
-      get: () => Effect.promise(async () => {
-        if (boundary === "session") await pause();
-        return {};
-      }),
+      get: () =>
+        Effect.promise(async () => {
+          lookups++;
+          if (boundary === "session") await pause();
+          return {};
+        }),
     },
     tool: {
-      transform: (register: (editor: any) => void) => Effect.sync(() => {
-        register({ add: (tool: V2ProviderTool) => tools.set(tool.name, tool), remove: () => {} });
-      }),
+      transform: (register: (editor: any) => void) =>
+        Effect.sync(() => {
+          register({ add: (tool: V2ProviderTool) => tools.set(tool.name, tool), remove: () => {} });
+        }),
     },
   };
   await Effect.runPromise(
@@ -101,20 +124,52 @@ async function rig(boundary: "session" | "permission") {
       },
       toolConsumers: () => ({
         requestPermission: pause,
-        dispose: () => { disposedConsumers = true; },
-      }),
-      buildToolMap: (ctx: PluginContext) => ({
-        write: {
-          description: "Fixture mutation",
-          args: {},
-          execute: async (_input: unknown, runtime: any) => {
-            if (boundary === "permission") {
-              await runtime.ask({ permission: "write", patterns: ["*"], always: [], metadata: {} });
-            }
-            return (await callToolCall(ctx, runtime, "write", { path: "test", content: "one" })).text;
-          },
+        dispose: () => {
+          disposedConsumers = true;
+        },
+        executeBash: async ({ context }: any) => {
+          // An older spawn epoch forces the real tracking helper's kill RPC.
+          const epoch = v2StopEpoch(host, context.sessionID) - 1;
+          await callBridge(toolContext, context, "bash", { command: "fixture" });
+          entered.open();
+          await resume.promise;
+          try {
+            await trackV2BackgroundTask(toolContext, context, "bash-held", epoch);
+          } finally {
+            continued.open();
+          }
+          return "started";
         },
       }),
+      buildToolMap: (ctx: PluginContext) => {
+        toolContext = ctx;
+        return {
+          edit: hoistedTools(ctx).edit,
+          bash: {
+            description: "Fixture composite bash",
+            args: {},
+            execute: async () => {
+              throw new Error("dedicated bash executor was bypassed");
+            },
+          },
+          write: {
+            description: "Fixture mutation",
+            args: {},
+            execute: async (_input: unknown, runtime: any) => {
+              if (boundary === "permission") {
+                await runtime.ask({
+                  permission: "write",
+                  patterns: ["*"],
+                  always: [],
+                  metadata: {},
+                });
+              }
+              return (await callToolCall(ctx, runtime, "write", { path: "test", content: "one" }))
+                .text;
+            },
+          },
+        };
+      },
       registerRpc: () => Effect.succeed({ dispose: async () => {} }),
       registerPromptHook: () => Effect.void,
       registerToolHooks: () => Effect.void,
@@ -122,33 +177,59 @@ async function rig(boundary: "session" | "permission") {
       startLiveConfigReload: () => ({ stop: () => {} }),
     })(host).pipe(Effect.provideService(Scope.Scope, scope)),
   );
-  const invoke = () => Effect.runPromise(tools.get("write")!.execute({}, {
-    sessionID: `reload-${boundary}`,
-    progress: () => Effect.void,
-  }));
+  const toolName = boundary === "bash" ? "shell" : boundary === "edit" ? "edit" : "write";
+  const invoke = () =>
+    Effect.runPromise(
+      tools
+        .get(toolName)!
+        .execute(boundary === "edit" ? { path: "test", appendContent: "one" } : {}, {
+          sessionID: `reload-${boundary}`,
+          progress: () => Effect.void,
+        }),
+    );
   const dispose = () => Effect.runPromise(Scope.close(scope, Exit.succeed(undefined)));
   return {
-    calls, entered, resume, retiring, invoke, dispose, location,
+    calls,
+    entered,
+    resume,
+    retiring,
+    continued,
+    invoke,
+    dispose,
+    location,
     disposedConsumers: () => disposedConsumers,
+    lookups: () => lookups,
     shutdowns: () => shutdowns,
     replace: () => acquireBridge(directory, options, { createPool: async () => owner }),
   };
 }
 
-for (const boundary of ["session", "permission"] as const) {
-  test(`V2 admitted write survives reload during ${boundary} lookup without replay`, async () => {
+for (const boundary of ["session", "permission", "edit", "bash"] as const) {
+  test(`V2 admitted tool survives reload at ${boundary} boundary without replay`, async () => {
     const r = await rig(boundary);
     let replacement: AftTransportPool | undefined;
-    const pending = r.invoke().then((value) => ({ value }), (error: unknown) => ({ error }));
+    const pending = r.invoke().then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    );
     await r.entered.promise;
     const disposal = r.dispose();
     try {
       await r.retiring.promise;
       replacement = await r.replace();
+      expect(r.disposedConsumers()).toBe(false);
       r.resume.open();
-      expect(await pending).toEqual({ value: { content: "written" } });
+      expect(await pending).toEqual({
+        value: { content: boundary === "bash" ? "started" : "written" },
+      });
       await disposal;
-      expect(r.calls).toEqual(["write"]);
+      expect(r.calls).toEqual(
+        boundary === "bash"
+          ? ["bash", "bash_kill"]
+          : boundary === "edit"
+            ? ["edit:preview", "edit"]
+            : ["write"],
+      );
       expect(r.shutdowns()).toBe(0);
       expect(r.disposedConsumers()).toBe(true);
     } finally {
@@ -164,8 +245,43 @@ test("V2 stale tool closure refuses after disposal without lookup or dispatch", 
   const r = await rig("session");
   r.resume.open();
   await r.dispose();
-  const error = await r.invoke().then(() => null, (error: unknown) => error);
+  const error = await r.invoke().then(
+    () => null,
+    (error: unknown) => error,
+  );
   expect(error).toMatchObject({ kind: "not_sent", code: "aft_module_unavailable" });
-  expect((error as Error).message).toBe("This call was not sent because the AFT plugin reloaded; retry it.");
+  expect((error as Error).message).toBe(
+    "This call was not sent because the AFT plugin reloaded; retry it.",
+  );
   expect(r.calls).toEqual([]);
+  expect(r.lookups()).toBe(0);
+});
+
+test("V2 composite bash interrupted after spawning reports unknown, never not-started", async () => {
+  let expire!: () => void;
+  const r = await rig("bash", {
+    executionClock: {
+      setTimeout(callback) {
+        expire = callback;
+        return 0;
+      },
+      clearTimeout() {},
+    },
+  });
+  const outcome = r.invoke().catch((error: unknown) => error);
+  await r.entered.promise;
+  const disposal = r.dispose();
+  await r.retiring.promise;
+  expect(r.calls).toEqual(["bash"]);
+  expire();
+  const error = await outcome;
+  expect(error).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+  expect(error).not.toMatchObject({ kind: "not_sent" });
+  expect((error as Error).message).toContain("outcome is UNKNOWN");
+  expect((error as Error).message).toContain("bash-held");
+  await disposal;
+  r.resume.open();
+  await r.continued.promise;
+  expect(r.calls).toEqual(["bash"]);
+  expect(r.shutdowns()).toBe(1);
 });
