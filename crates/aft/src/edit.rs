@@ -1368,25 +1368,9 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
 /// `metadata.diff`. Host wrappers may alternatively consume the `diff.before` /
 /// `diff.after` response fields and render their own patch, but returning the
 /// ready-to-display string keeps the bridge contract self-contained.
-pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
+pub fn build_unified_diff(file: &str, before: &str, after: &str) -> Option<String> {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
-    if before == after {
-        return format!(
-            "Index: {file}
-===================================================================
---- {file}
-+++ {file}
-"
-        );
-    }
-
-    let text_diff = construct_diff(before, after);
-    let patch = text_diff.unified_diff().header(file, file).to_string();
-    format!(
-        "Index: {file}
-===================================================================
-{patch}"
-    )
+    crate::mutation_diff::DiffBudget::default().patch(file, before, after, 1)
 }
 
 /// Reject an identity edit before writing or recording undo state.
@@ -1400,7 +1384,7 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
-    result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
+    attach_edit_diff(result, &serde_json::Value::Null, file, before, after);
 }
 
 /// Attach the standard preview diff fields to a command response payload.
@@ -1411,11 +1395,25 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
-    let (patch, info) = response_diff(params, file, before, after);
-    result["metadata"] = serde_json::json!({ "diff": patch });
+    let (patch, info) = response_diff(
+        &mut crate::mutation_diff::DiffBudget::default(),
+        params,
+        file,
+        before,
+        after,
+        2,
+    );
     result["preview"] = serde_json::json!(true);
     result["diff"] = info;
-    result["preview_diff"] = serde_json::json!(patch);
+    if let Some(patch) = patch {
+        result["metadata"] = serde_json::json!({ "diff": patch });
+        result["preview_diff"] = serde_json::json!(patch);
+    } else {
+        crate::mutation_diff::mark_omitted(result);
+    }
+    if result["diff"]["diff_omitted"] == true {
+        crate::mutation_diff::mark_omitted(result);
+    }
 }
 
 /// Longest a line diff may search for a minimal edit script. Past it,
@@ -1434,7 +1432,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
+pub(crate) fn construct_diff<'a>(
+    before: &'a str,
+    after: &'a str,
+) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
     if let Some(timeout) = DIFF_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
         return construct_diff_with_timeout(before, after, timeout);
@@ -1474,26 +1475,23 @@ fn diff_counts(before: &str, after: &str) -> (usize, usize) {
 }
 
 pub(crate) fn response_diff(
+    budget: &mut crate::mutation_diff::DiffBudget,
     params: &serde_json::Value,
     file: &str,
     before: &str,
     after: &str,
-) -> (String, serde_json::Value) {
+    copies: usize,
+) -> (Option<String>, serde_json::Value) {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     let diff = construct_diff(before, after);
     let (additions, deletions) = counts_from_diff(&diff);
-    let patch = if before == after {
-        build_unified_diff(file, before, after)
-    } else {
-        format!("Index: {file}\n===================================================================\n{}", diff.unified_diff().header(file, file))
-    };
-    let info = diff_info_from_counts(
-        before,
-        after,
-        additions,
-        deletions,
-        wants_diff_content(params),
-    );
+    let patch = budget.patch_from_diff(file, before, after, &diff, copies);
+    let full = wants_diff_content(params);
+    let content_fits = !full || budget.contents(before, after);
+    let mut info = diff_info_from_counts(before, after, additions, deletions, full && content_fits);
+    if patch.is_none() || !content_fits {
+        info["diff_omitted"] = serde_json::json!(true);
+    }
     (patch, info)
 }
 
@@ -1506,12 +1504,23 @@ pub(crate) fn attach_edit_diff(
     before: &str,
     after: &str,
 ) {
-    if wants_diff(params) {
-        let (patch, info) = response_diff(params, file, before, after);
-        result["metadata"] = serde_json::json!({ "diff": patch });
+    let (patch, info) = response_diff(
+        &mut crate::mutation_diff::DiffBudget::default(),
+        params,
+        file,
+        before,
+        after,
+        1,
+    );
+    let omitted = info["diff_omitted"] == true;
+    if wants_diff(params) || omitted {
         result["diff"] = info;
-    } else {
-        attach_mutation_diff(result, file, before, after);
+    }
+    if let Some(patch) = patch {
+        result["metadata"] = serde_json::json!({ "diff": patch });
+    }
+    if omitted {
+        crate::mutation_diff::mark_omitted(result);
     }
 }
 
@@ -2920,6 +2929,7 @@ mod tests {
             assert_eq!(
                 response.data["metadata"]["diff"],
                 build_unified_diff(path.to_str().unwrap(), "const value = 1;\n", final_text)
+                    .unwrap()
             );
             let reads = A03_HANDLER_READS.with(|count| count.get())
                 + crate::backup::capture_read_count(&path);

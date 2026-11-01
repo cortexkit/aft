@@ -145,6 +145,7 @@ pub mod lsp_hints;
 pub mod memory;
 pub mod migrate_storage;
 pub mod migration;
+pub(crate) mod mutation_diff;
 pub mod ndjson_text;
 #[cfg(test)]
 mod nested_worktree_tests;

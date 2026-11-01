@@ -2,6 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { formatEditSummary } from "../edit-summary.js";
 
 describe("formatEditSummary", () => {
+  test("bounded mutation diffs preserve counts and surface the producer's omission notice", () => {
+    expect(
+      formatEditSummary({
+        diff: { additions: 100_000, deletions: 90_000 },
+        diff_omitted: true,
+        diff_notice: "Producer omission notice.",
+      }),
+    ).toBe("Edited (+100000/-90000).\nProducer omission notice.");
+  });
+
   test("single find/replace reports counts only, no path/JSON", () => {
     expect(formatEditSummary({ replacements: 1, diff: { additions: 3, deletions: 2 } })).toBe(
       "Edited (+3/-2).",

@@ -39,6 +39,9 @@ export interface EditSummaryInput {
   reformatted?: { text?: string; extensive?: boolean };
   /** Diff counts. before/after content is intentionally ignored here. */
   diff?: { additions?: number; deletions?: number };
+  /** Optional UI diffs were omitted; operation outcomes and counts are retained. */
+  diff_omitted?: boolean;
+  diff_notice?: string;
 }
 
 /**
@@ -53,6 +56,11 @@ export interface EditSummaryInput {
  * inside a raw `"rolled_back":false` JSON field the agent had to parse.
  */
 export function formatEditSummary(data: EditSummaryInput): string {
+  const summary = formatEditHeadline(data);
+  return data.diff_omitted && data.diff_notice ? `${summary}\n${data.diff_notice}` : summary;
+}
+
+function formatEditHeadline(data: EditSummaryInput): string {
   // Rollback is the one case where "applied" would be a lie. The write was
   // reverted (typically because the result failed syntax validation), so the
   // file is unchanged and the agent must retry differently.
