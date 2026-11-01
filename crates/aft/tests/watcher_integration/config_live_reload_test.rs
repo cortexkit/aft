@@ -99,3 +99,95 @@ fn user_config_edit_applies_live() {
     fs::write(&user_config, r#"{ "bash": { "enabled": false } }"#).unwrap();
     wait_for_bash_disabled(&mut aft);
 }
+
+#[cfg(any(unix, windows))]
+fn config_symlink(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link).unwrap();
+}
+
+fn write_env_config(path: &Path, value: &str) {
+    fs::write(
+        path,
+        json!({ "bash": { "env": { "AFT_CONFIG_SYMLINK_TEST": value } } }).to_string(),
+    )
+    .unwrap();
+}
+
+fn bash_env(aft: &mut AftProcess) -> Value {
+    aft.send(
+        &json!({
+            "id": "live-reload-env",
+            "command": "bash",
+            "params": { "command": "printf '%s' \"$AFT_CONFIG_SYMLINK_TEST\"" }
+        })
+        .to_string(),
+    )
+}
+
+fn wait_for_bash_env(aft: &mut AftProcess, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = Value::Null;
+    while Instant::now() < deadline {
+        last = bash_env(aft);
+        if last["success"] == true && last.to_string().contains(expected) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("bash.env never became {expected}; last response: {last:?}");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn symlinked_user_config_target_edits_apply_live() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let home = dir.path().join("home");
+    let xdg = dir.path().join("xdg");
+    let dotfiles = dir.path().join("dotfiles");
+    for path in [&root, &home, &xdg.join("cortexkit"), &dotfiles] {
+        fs::create_dir_all(path).unwrap();
+    }
+    // The target deliberately has a different name and is outside the project
+    // and the link's directory. Its writes cannot wake either existing watch.
+    let target = dotfiles.join("settings.jsonc");
+    let user_config = xdg.join("cortexkit/aft.jsonc");
+    write_env_config(&target, "symlink-initial");
+    config_symlink(&target, &user_config);
+    let mut aft = AftProcess::spawn_with_real_watcher_env(&[
+        ("HOME", home.as_os_str()),
+        ("XDG_CONFIG_HOME", xdg.as_os_str()),
+    ]);
+    configure(&mut aft, &root, &user_config);
+    wait_for_bash_env(&mut aft, "symlink-initial");
+
+    write_env_config(&target, "symlink-edited");
+    wait_for_bash_env(&mut aft, "symlink-edited");
+
+    let replacement = dotfiles.join("save.jsonc");
+    write_env_config(&replacement, "symlink-atomic");
+    fs::rename(&replacement, &target).unwrap();
+    wait_for_bash_env(&mut aft, "symlink-atomic");
+    write_env_config(&target, "symlink-after-atomic");
+    wait_for_bash_env(&mut aft, "symlink-after-atomic");
+
+    fs::remove_file(&target).unwrap();
+    thread::sleep(Duration::from_millis(700));
+    assert!(bash_env(&mut aft).to_string().contains("symlink-after-atomic"));
+    write_env_config(&target, "symlink-recovered");
+    wait_for_bash_env(&mut aft, "symlink-recovered");
+
+    let other = dir.path().join("other-dotfiles");
+    fs::create_dir_all(&other).unwrap();
+    let other_target = other.join("alternate.jsonc");
+    write_env_config(&other_target, "symlink-retargeted");
+    fs::remove_file(&user_config).unwrap();
+    config_symlink(&other_target, &user_config);
+    wait_for_bash_env(&mut aft, "symlink-retargeted");
+    write_env_config(&other_target, "symlink-retarget-edit");
+    wait_for_bash_env(&mut aft, "symlink-retarget-edit");
+}

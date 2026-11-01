@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -217,6 +217,32 @@ describe("startLiveConfigReload", () => {
 });
 
 describe("watchAftConfigFiles", () => {
+  test("a symlink target edit reloads without an event in the link folder", async () => {
+    const dir = tempDir();
+    const configDir = join(dir, "cortexkit");
+    const dotfiles = join(dir, "dotfiles");
+    mkdirSync(configDir);
+    mkdirSync(dotfiles);
+    const file = join(configDir, "aft.jsonc");
+    const target = join(dotfiles, "settings.jsonc");
+    writeFileSync(target, "{}");
+    symlinkSync(target, file, "file");
+    let changes = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      writeFileSync(target, '{ "bash": { "env": { "TEST": "edited" } } }');
+      await waitUntil(() => changes >= 1, "symlink target edit reloaded");
+    } finally {
+      stop();
+    }
+  });
+
   test("an edit, and a config directory created later, call onChange", async () => {
     const dir = tempDir();
     const file = join(dir, ".cortexkit", "aft.jsonc");
