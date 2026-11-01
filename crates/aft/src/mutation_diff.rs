@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 
 pub(crate) const DIFF_WIRE_BUDGET: usize = 1024 * 1024;
-pub(crate) const DIFF_INPUT_LIMIT: usize = 256 * 1024;
+pub(crate) const DIFF_INPUT_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const DIFF_OMITTED_NOTICE: &str =
     "Diff omitted: too large to send. File results and line counts are complete.";
 

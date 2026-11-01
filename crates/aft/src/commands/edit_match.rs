@@ -1178,12 +1178,12 @@ fn handle_glob_edit_match_inner(
             &after,
             1,
         );
+        result["files"][index]["diff"] = counts;
         if let Some(patch) = patch {
             diff.push_str(&patch);
         } else {
             omitted = true;
             result["files"][index]["diff_omitted"] = serde_json::json!(true);
-            result["files"][index]["diff"] = counts;
         }
     }
     if !diff.is_empty() {

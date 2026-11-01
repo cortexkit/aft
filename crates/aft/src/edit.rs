@@ -1493,6 +1493,9 @@ pub(crate) fn response_diff(
     if patch.is_none() || !content_fits {
         info["diff_omitted"] = serde_json::json!(true);
     }
+    if full && !content_fits {
+        info["truncated"] = serde_json::json!(true);
+    }
     (patch, info)
 }
 
@@ -2730,17 +2733,20 @@ mod tests {
                 let params = serde_json::json!({"include_diff_content": full});
                 let mut actual = serde_json::json!({});
                 attach_preview_diff(&mut actual, &params, "golden.ts", &before, &after);
+                let content_omitted =
+                    full && (before.len() > 512 * 1024 || after.len() > 512 * 1024);
                 let info = if !full {
                     serde_json::json!({"additions": additions, "deletions": deletions})
                 } else if before.len() > 512 * 1024 || after.len() > 512 * 1024 {
-                    serde_json::json!({"additions": additions, "deletions": deletions, "truncated": true})
+                    serde_json::json!({"additions": additions, "deletions": deletions, "truncated": true, "diff_omitted": true})
                 } else {
                     serde_json::json!({"additions": additions, "deletions": deletions, "before": before, "after": after})
                 };
-                assert_eq!(
-                    actual,
-                    serde_json::json!({"metadata": {"diff": patch}, "preview": true, "diff": info, "preview_diff": patch})
-                );
+                let mut expected = serde_json::json!({"metadata": {"diff": patch}, "preview": true, "diff": info, "preview_diff": patch});
+                if content_omitted {
+                    crate::mutation_diff::mark_omitted(&mut expected);
+                }
+                assert_eq!(actual, expected);
                 let constructions = A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get());
                 eprintln!(
                     "A03 preview diff bytes={}/{}: constructions={constructions}",
@@ -2756,10 +2762,11 @@ mod tests {
                 let apply_params =
                     serde_json::json!({"include_diff": true, "include_diff_content": full});
                 attach_edit_diff(&mut applied, &apply_params, "golden.ts", &before, &after);
-                assert_eq!(
-                    applied,
-                    serde_json::json!({"metadata": {"diff": patch}, "diff": info})
-                );
+                let mut expected = serde_json::json!({"metadata": {"diff": patch}, "diff": info});
+                if content_omitted {
+                    crate::mutation_diff::mark_omitted(&mut expected);
+                }
+                assert_eq!(applied, expected);
                 assert_eq!(
                     A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get()),
                     1,

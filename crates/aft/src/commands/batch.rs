@@ -883,10 +883,11 @@ mod a03_tests {
             );
             let elapsed = start.elapsed();
             assert!(response.success, "{:?}", response);
-            let expected = format!("{}{}", "é\n".repeat(count), "z".repeat(1024 * 1024));
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
             assert_eq!(response.data["diff_omitted"], true);
             assert!(response.data["metadata"].get("diff").is_none());
+            assert_eq!(response.data["diff"]["additions"], count);
+            assert_eq!(response.data["diff"]["deletions"], count);
             let allocations = BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.get());
             eprintln!(
                 "A03 batch matches={count}: output allocations={allocations} elapsed={elapsed:?}"
