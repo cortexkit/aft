@@ -11693,7 +11693,10 @@ mod tests {
         let request: RawRequest =
             serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
                 .expect("status request");
-        let bound = Duration::from_millis(1_000);
+        // The probe stays blocked until released below, so a status or search
+        // that waited on it would never return. The bound only has to be far
+        // below that; 5 s leaves room for a loaded Windows runner (1.4 s seen).
+        let bound = Duration::from_secs(5);
 
         let started = std::time::Instant::now();
         let status = response_value(crate::commands::status::handle_status(&request, &ctx));

@@ -159,11 +159,6 @@ pub(crate) fn publication_durability_barrier() -> MutexGuard<'static, ()> {
 /// A payload format change must update the corresponding producer string in the
 /// same edit, because producer versions are components of content-address keys.
 pub const SEMANTIC_PAYLOAD_SCHEMA: u32 = 1;
-/// Not bumped when Go symbol extraction started emitting type aliases and
-/// separate ranges for specs in a grouped `type (...)` block: unchanged Go files
-/// keep their earlier semantic chunk boundaries until they are edited, because a
-/// bump here would re-embed every file in every project. The semantic index's
-/// chunking version was left unchanged for the same reason.
 pub const SEMANTIC_PRODUCER_VERSION: &str = "semantic-v1";
 pub const CALLGRAPH_PAYLOAD_SCHEMA: u32 = 1;
 pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v9-python-import-bindings";
@@ -292,24 +287,43 @@ pub struct SemanticKey {
     chunker_version: String,
     embed_template_version: String,
     model_fingerprint: String,
+    header_language: Option<&'static str>,
+}
+
+fn semantic_header_language(language: crate::parser::LangId) -> Option<&'static str> {
+    match language {
+        crate::parser::LangId::Cpp => Some("cpp"),
+        crate::parser::LangId::ObjC => Some("objc"),
+        _ => None,
+    }
 }
 
 impl SemanticKey {
-    /// Uses a saved source hash with the same canonical encoding as `from_bytes`.
+    /// Uses the same encoding as `from_bytes`; an unresolved header is a miss,
+    /// since a source hash alone cannot select its parsing language.
     pub(crate) fn from_source_hash(
         source_digest: [u8; 32],
         rel_path: &[u8],
         chunker_version: impl Into<String>,
         embed_template_version: impl Into<String>,
         model_fingerprint: impl Into<String>,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        let header_language = if rel_path.ends_with(b".h") {
+            semantic_header_language(crate::parser::language_for_content_hash(
+                std::path::Path::new("header.h"),
+                blake3::Hash::from(source_digest),
+            )?)
+        } else {
+            None
+        };
+        Some(Self {
             source_digest,
             rel_path: rel_path.to_vec(),
             chunker_version: chunker_version.into(),
             embed_template_version: embed_template_version.into(),
             model_fingerprint: model_fingerprint.into(),
-        }
+            header_language,
+        })
     }
 
     pub fn from_bytes(
@@ -319,12 +333,22 @@ impl SemanticKey {
         embed_template_version: impl Into<String>,
         model_fingerprint: impl Into<String>,
     ) -> Self {
+        let header_language = if rel_path.ends_with(b".h") {
+            crate::parser::detect_language_from_source(
+                std::path::Path::new("header.h"),
+                std::str::from_utf8(bytes).unwrap_or(""),
+            )
+            .and_then(semantic_header_language)
+        } else {
+            None
+        };
         Self {
             source_digest: *crate::views::io::source_hash(bytes).as_bytes(),
             rel_path: rel_path.to_vec(),
             chunker_version: chunker_version.into(),
             embed_template_version: embed_template_version.into(),
             model_fingerprint: model_fingerprint.into(),
+            header_language,
         }
     }
 
@@ -346,16 +370,22 @@ impl SemanticKey {
     }
 
     pub fn full_key(&self) -> FullKey {
+        let fields: [&[u8]; 7] = [
+            &self.source_digest,
+            &self.rel_path,
+            self.chunker_version.as_bytes(),
+            self.embed_template_version.as_bytes(),
+            self.model_fingerprint.as_bytes(),
+            b"header-language",
+            self.header_language.unwrap_or("").as_bytes(),
+        ];
+        // Preserve existing keys for non-headers and headers still parsed as C.
+        // Only headers whose extracted symbols can differ get a language field.
+        let field_count = if self.header_language.is_some() { 7 } else { 5 };
         full_key(
             BlobPlane::Semantic,
             b"aft/blob-store/semantic/v1",
-            &[
-                &self.source_digest,
-                &self.rel_path,
-                self.chunker_version.as_bytes(),
-                self.embed_template_version.as_bytes(),
-                self.model_fingerprint.as_bytes(),
-            ],
+            &fields[..field_count],
         )
     }
 
@@ -1128,6 +1158,128 @@ fn move_corrupt_database_aside(path: &Path) -> Result<PathBuf, BlobStoreError> {
 
 #[cfg(test)]
 mod tests {
+    fn main_semantic_key(bytes: &[u8], path: &[u8]) -> FullKey {
+        full_key(
+            BlobPlane::Semantic,
+            b"aft/blob-store/semantic/v1",
+            &[
+                crate::views::io::source_hash(bytes).as_bytes(),
+                path,
+                b"semantic-v1",
+                b"semantic-v1",
+                b"fixture-model",
+            ],
+        )
+    }
+
+    #[test]
+    fn h_header_invalidation_preserves_main_keys_except_changed_language() {
+        assert_eq!(SEMANTIC_PRODUCER_VERSION, "semantic-v1");
+        assert_eq!(
+            CALLGRAPH_PRODUCER_VERSION,
+            "callgraph-v9-python-import-bindings"
+        );
+        assert_eq!(
+            crate::views::callgraph::PRODUCER,
+            "ruled-callgraph-v13-python-import-bindings"
+        );
+        let c = b"int plain(void);\n";
+        let cpp = b"template <typename T> class Widget { public: T value(T x) { return x; } };\n";
+        let objc = b"@interface Greeter\n@property int value;\n@end\n";
+        for (bytes, path, changed) in [
+            (c.as_slice(), b"src/plain.h".as_slice(), false),
+            (cpp.as_slice(), b"src/widget.h".as_slice(), true),
+            (objc.as_slice(), b"src/greeter.h".as_slice(), true),
+            (
+                b"pub fn untouched() {}\n".as_slice(),
+                b"src/lib.rs".as_slice(),
+                false,
+            ),
+            (cpp.as_slice(), b"src/widget.hpp".as_slice(), false),
+            (objc.as_slice(), b"src/greeter.m".as_slice(), false),
+        ] {
+            let current = SemanticKey::for_current(bytes, path, "fixture-model");
+            let main = main_semantic_key(bytes, path);
+            assert_eq!(current.full_key() != main, changed, "{path:?}");
+            let from_hash = SemanticKey::from_source_hash(
+                *crate::views::io::source_hash(bytes).as_bytes(),
+                path,
+                "semantic-v1",
+                "semantic-v1",
+                "fixture-model",
+            )
+            .unwrap();
+            assert_eq!(current, from_hash);
+            if !changed {
+                assert_eq!(
+                    current.file_key_for_summary_format(1),
+                    full_key(
+                        BlobPlane::Semantic,
+                        b"aft/blob-store/semantic-summary-budget/v1",
+                        &[main.as_bytes(), &1_u32.to_le_bytes()]
+                    )
+                );
+            }
+        }
+        for (bytes, changed) in [
+            (c.as_slice(), false),
+            (cpp.as_slice(), true),
+            (objc.as_slice(), true),
+        ] {
+            let language = format!(
+                "{:?}",
+                crate::parser::detect_language_from_source(
+                    std::path::Path::new("header.h"),
+                    std::str::from_utf8(bytes).unwrap()
+                )
+                .unwrap()
+            )
+            .to_lowercase();
+            let current = CallgraphKey::for_current(bytes, &language).full_key();
+            let main = CallgraphKey::from_bytes(bytes, "c", "callgraph-v9-python-import-bindings")
+                .full_key();
+            assert_eq!(current != main, changed);
+            let mut entry = crate::views::snapshot::LiveEntry::new(
+                crate::views::snapshot::DiskState::of_bytes(bytes),
+                0,
+            );
+            let attachment = crate::views::callgraph::attach(&mut entry, bytes, &language).unwrap();
+            let main =
+                CallgraphKey::from_bytes(bytes, "c", "ruled-callgraph-v13-python-import-bindings")
+                    .full_key();
+            assert_eq!(
+                attachment.key != crate::blob_store::v2::FamilyKey::from(&main),
+                changed
+            );
+        }
+    }
+
+    #[test]
+    fn h_header_invalidation_hash_only_key_misses_until_language_is_known() {
+        let bytes = b"template <typename UnknownHeaderType> class UniqueHeaderCacheFixture {};\n";
+        let hash = *crate::views::io::source_hash(bytes).as_bytes();
+        assert!(SemanticKey::from_source_hash(
+            hash,
+            b"unknown.h",
+            "semantic-v1",
+            "semantic-v1",
+            "fixture-model"
+        )
+        .is_none());
+        let from_bytes = SemanticKey::for_current(bytes, b"unknown.h", "fixture-model");
+        assert_eq!(
+            SemanticKey::from_source_hash(
+                hash,
+                b"unknown.h",
+                "semantic-v1",
+                "semantic-v1",
+                "fixture-model"
+            )
+            .unwrap(),
+            from_bytes
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1144,7 +1296,8 @@ mod tests {
                 "chunker",
                 "template",
                 "model",
-            );
+            )
+            .unwrap();
             let from_bytes =
                 SemanticKey::from_bytes(&bytes, b"src/example.rs", "chunker", "template", "model");
             assert_eq!(from_hash, from_bytes);

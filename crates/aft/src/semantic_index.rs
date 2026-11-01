@@ -5,7 +5,7 @@ use crate::config::{
 };
 use crate::context::SemanticIndexStatus;
 use crate::fs_lock;
-use crate::parser::{detect_language, extract_symbols_from_tree, parse_source_with_cached_parser};
+use crate::parser::{extract_symbols_from_tree, language_for_extension, parse_resolved_source};
 use crate::search_index::{
     cache_relative_path, cached_path_under_root_with_memo, ParentCanonicalizationMemo,
 };
@@ -17,6 +17,7 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
@@ -1662,6 +1663,7 @@ pub struct SemanticIndexFingerprint {
 }
 
 fn default_chunking_version() -> u32 {
+    // Fingerprints without an explicit version predate header resolution.
     2
 }
 
@@ -1676,6 +1678,9 @@ struct StoredSemanticIdentity {
     fingerprint: SemanticIndexFingerprint,
     #[serde(default, skip_serializing_if = "legacy_summary_budget")]
     file_summary_budget_limited: bool,
+    /// Artifact-only migration state, not part of model or vector identity.
+    #[serde(default)]
+    header_languages_resolved: bool,
 }
 
 fn legacy_summary_budget(limited: &bool) -> bool {
@@ -2266,6 +2271,102 @@ fn is_private_non_loopback_ip(ip: &std::net::IpAddr) -> bool {
         return false;
     }
     crate::url_fetch::is_private_or_reserved_ip(*ip)
+}
+
+/// Prefix that multimodal embedding deployments parse as an image payload.
+///
+/// NVIDIA's `*embed*` deployments are VLM-backed: any `input` string containing
+/// `data:<image-mime>;base64` — anywhere in the string, with or without a valid
+/// payload — is parsed as an image part. When the deployment has no VLM serving
+/// enabled the whole request is rejected with HTTP 400 (`image inputs require
+/// VLM serving to be enabled on this server`) or a base64 decode error, which
+/// fails every row in the batch and, with it, the entire semantic build.
+///
+/// Source code legitimately contains the prefix, for example
+/// `f"data:image/png;base64,{encode(image)}"` or a docstring naming the format,
+/// so this cannot be left to the repository's contents.
+const IMAGE_DATA_URI_PREFIX: &str = "data:image/";
+
+/// Neutralized form of [`IMAGE_DATA_URI_PREFIX`]. It keeps the mime type legible
+/// to the embedder while no longer matching the `data:<mime>;base64` grammar
+/// those parsers look for.
+const NEUTRALIZED_IMAGE_DATA_URI_PREFIX: &str = "data-uri:image/";
+
+/// Rewrite image data-URI prefixes so a remote embedder cannot mistake chunk
+/// text for an image input. Borrows the input when nothing needs rewriting, so
+/// the common case costs one substring scan and no allocation.
+///
+/// Only `data:image/` is rewritten. Other media types are left byte-identical:
+/// `data:text/plain;base64,...` and `data:application/json;base64,...` are
+/// accepted by those same deployments, and uppercase mime types do not match
+/// their parser.
+fn neutralize_image_data_uris(text: &str) -> Cow<'_, str> {
+    if !text.contains(IMAGE_DATA_URI_PREFIX) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace(IMAGE_DATA_URI_PREFIX, NEUTRALIZED_IMAGE_DATA_URI_PREFIX))
+}
+
+#[cfg(test)]
+mod image_data_uri_tests {
+    use super::neutralize_image_data_uris;
+    use std::borrow::Cow;
+
+    #[test]
+    fn borrows_text_without_an_image_data_uri() {
+        let text = "fn encode(image: &Tensor) -> String { image.base64() }";
+        let sanitized = neutralize_image_data_uris(text);
+        assert!(matches!(sanitized, Cow::Borrowed(_)));
+        assert_eq!(sanitized, text);
+    }
+
+    #[test]
+    fn rewrites_a_template_literal_from_source_code() {
+        let text = "image_url=f\"data:image/png;base64,{tensor_to_base64_string(image)}\"";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "image_url=f\"data-uri:image/png;base64,{tensor_to_base64_string(image)}\""
+        );
+    }
+
+    #[test]
+    fn rewrites_every_occurrence_in_the_row() {
+        let text = "a=data:image/png;base64,AAA b=data:image/jpeg;base64,BBB";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "a=data-uri:image/png;base64,AAA b=data-uri:image/jpeg;base64,BBB"
+        );
+    }
+
+    #[test]
+    fn rewrites_a_docstring_mention_without_payload() {
+        let text = "Data URI string (e.g., 'data:image/png;base64,...').";
+        assert_eq!(
+            neutralize_image_data_uris(text),
+            "Data URI string (e.g., 'data-uri:image/png;base64,...')."
+        );
+    }
+
+    #[test]
+    fn leaves_non_image_data_uris_untouched() {
+        for text in [
+            "data:text/plain;base64,AAAA",
+            "data:application/json;base64,e30=",
+            "data:audio/wav;base64,AAAA",
+        ] {
+            let sanitized = neutralize_image_data_uris(text);
+            assert!(matches!(sanitized, Cow::Borrowed(_)), "{text}");
+            assert_eq!(sanitized, text);
+        }
+    }
+
+    #[test]
+    fn leaves_uppercase_mime_untouched() {
+        // The backend parsers are case-sensitive; rewriting this would only
+        // churn bytes the backend already accepts.
+        let text = "data:IMAGE/PNG;base64,AAAA";
+        assert_eq!(neutralize_image_data_uris(text), text);
+    }
 }
 
 fn build_openai_embeddings_endpoint(base_url: &str) -> String {
@@ -3681,8 +3782,15 @@ impl SemanticEmbeddingModel {
             } => {
                 let expected_text_count = texts.len();
                 let endpoint = build_openai_embeddings_endpoint(base_url);
+                // Chunk text is arbitrary file content, so neutralize image
+                // data-URI prefixes before they reach a backend that may parse
+                // them as an image part. See `neutralize_image_data_uris`.
+                let sanitized_texts: Vec<Cow<'_, str>> = texts
+                    .iter()
+                    .map(|text| neutralize_image_data_uris(text))
+                    .collect();
                 let body = serde_json::json!({
-                    "input": texts,
+                    "input": sanitized_texts,
                     "model": model,
                 });
 
@@ -8201,6 +8309,7 @@ impl SemanticIndex {
             serde_json::to_string(&StoredSemanticIdentity {
                 fingerprint: fingerprint.clone(),
                 file_summary_budget_limited: self.persisted_summary_budget(),
+                header_languages_resolved: true,
             })
             .ok()
         })
@@ -8335,6 +8444,12 @@ impl SemanticIndex {
                 Some(serde_json::Value::Bool(limited)) => limited,
                 Some(_) => return Err("invalid stored summary-budget marker".to_string()),
             };
+            // Header migration state is not model identity. Keeping it in this
+            // comparison would reject valid append scans and force full reads.
+            match fields.remove("header_languages_resolved") {
+                None | Some(serde_json::Value::Bool(_)) => {}
+                Some(_) => return Err("invalid stored header-language marker".to_string()),
+            }
             let expected: serde_json::Value = serde_json::from_str(expected_fingerprint)
                 .map_err(|error| format!("invalid expected semantic identity: {error}"))?;
             if stored != expected || limited != expected_summary_budget {
@@ -9855,30 +9970,35 @@ impl SemanticIndex {
             || version == SEMANTIC_INDEX_VERSION_V5
             || version == SEMANTIC_INDEX_VERSION_V6
             || version == SEMANTIC_INDEX_VERSION_V7;
-        let (fingerprint, summary_budget_limited) = if has_fingerprint_field {
-            let fingerprint_len = read_u32_stream(&mut reader)? as usize;
-            if total_len
-                .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
-            {
-                return Err("unexpected end of data reading fingerprint".to_string());
-            }
-            if fingerprint_len == 0 {
-                (None, false)
+        let (fingerprint, summary_budget_limited, header_languages_resolved) =
+            if has_fingerprint_field {
+                let fingerprint_len = read_u32_stream(&mut reader)? as usize;
+                if total_len
+                    .is_some_and(|len| reader.bytes_read().saturating_add(fingerprint_len) > len)
+                {
+                    return Err("unexpected end of data reading fingerprint".to_string());
+                }
+                if fingerprint_len == 0 {
+                    (None, false, false)
+                } else {
+                    let mut raw = vec![0u8; fingerprint_len];
+                    read_exact_stream(
+                        &mut reader,
+                        &mut raw,
+                        "unexpected end of data reading fingerprint",
+                    )?;
+                    let raw = String::from_utf8_lossy(&raw).to_string();
+                    let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
+                        .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
+                    (
+                        Some(stored.fingerprint),
+                        stored.file_summary_budget_limited,
+                        stored.header_languages_resolved,
+                    )
+                }
             } else {
-                let mut raw = vec![0u8; fingerprint_len];
-                read_exact_stream(
-                    &mut reader,
-                    &mut raw,
-                    "unexpected end of data reading fingerprint",
-                )?;
-                let raw = String::from_utf8_lossy(&raw).to_string();
-                let stored: StoredSemanticIdentity = serde_json::from_str(&raw)
-                    .map_err(|error| format!("invalid semantic fingerprint: {error}"))?;
-                (Some(stored.fingerprint), stored.file_summary_budget_limited)
-            }
-        } else {
-            (None, false)
-        };
+                (None, false, false)
+            };
 
         // File mtimes
         let mtime_count = read_u32_stream(&mut reader)? as usize;
@@ -10068,30 +10188,45 @@ impl SemanticIndex {
             .keys()
             .any(|path| !file_sizes.contains_key(path));
         let bytes_read = reader.bytes_read();
-        Ok((
-            Self {
-                entries,
-                file_mtimes,
-                file_sizes,
-                any_missing_sizes,
-                file_hashes,
-                dimension,
-                fingerprint,
-                summary_budget_limited,
-                project_root: current_canonical_root.to_path_buf(),
-                deferred_files: HashSet::new(),
-                shared_base: None,
-                tombstones: HashSet::new(),
-                view_runs: Vec::new(),
-                dirty_paths: Arc::new(Mutex::new(None)),
-                persistence: Arc::new(Mutex::new(None)),
-                last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-                skipped_rows: 0,
-                #[cfg(test)]
-                removal_retain_passes: 0,
-            },
-            bytes_read,
-        ))
+        let mut index = Self {
+            entries,
+            file_mtimes,
+            file_sizes,
+            any_missing_sizes,
+            file_hashes,
+            dimension,
+            fingerprint,
+            summary_budget_limited,
+            project_root: current_canonical_root.to_path_buf(),
+            deferred_files: HashSet::new(),
+            shared_base: None,
+            tombstones: HashSet::new(),
+            view_runs: Vec::new(),
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(None)),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows: 0,
+            #[cfg(test)]
+            removal_retain_passes: 0,
+        };
+        if index.fingerprint.is_some() && !header_languages_resolved {
+            // Older artifacts extracted every .h as C. Discard only headers
+            // whose current language changes, preserving every other vector
+            // and the model fingerprint. Refresh then fills these files only.
+            let changed_headers = index
+                .indexed_paths()
+                .into_iter()
+                .filter(|path| {
+                    path.extension().and_then(|ext| ext.to_str()) == Some("h")
+                        && matches!(
+                            crate::parser::detect_language(path),
+                            Some(crate::parser::LangId::Cpp | crate::parser::LangId::ObjC)
+                        )
+                })
+                .collect::<Vec<_>>();
+            index.invalidate_files(&changed_headers);
+        }
+        Ok((index, bytes_read))
     }
 }
 
@@ -10625,7 +10760,8 @@ fn collect_semantic_file_uncached(
         if !is_semantic_indexed_extension(file) {
             return Err(SemanticCollectError::UnsupportedExtension);
         }
-        let lang = detect_language(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
+        let lang =
+            language_for_extension(file).ok_or(SemanticCollectError::UnsupportedExtension)?;
 
         let mut indexed_metadata = IndexedFileMetadata {
             mtime,
@@ -10678,14 +10814,15 @@ pub fn collect_file_chunks_for_census(
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
     }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    let lang =
+        language_for_extension(file).ok_or_else(|| "unsupported file extension".to_string())?;
     if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_SEMANTIC_FILE_BYTES) {
         return Ok((Vec::new(), Vec::new()));
     }
 
     let source = crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
-    let tree =
-        parse_source_with_cached_parser(file, &source, lang).map_err(|error| error.to_string())?;
+    let (tree, lang) =
+        parse_resolved_source(file, &source, lang).map_err(|error| error.to_string())?;
     let symbols =
         extract_symbols_from_tree(&source, &tree, lang).map_err(|error| error.to_string())?;
     let today = symbols_to_chunks(file, &symbols, &source, project_root);
@@ -10698,7 +10835,8 @@ fn collect_file_chunks(project_root: &Path, file: &Path) -> Result<Vec<SemanticC
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
     }
-    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    let lang =
+        language_for_extension(file).ok_or_else(|| "unsupported file extension".to_string())?;
     // OOM backstop: skip oversized files before the read + parse (tracked with
     // zero chunks by the caller, so freshness won't re-read them every refresh).
     if fs::metadata(file).is_ok_and(|m| m.len() > MAX_SEMANTIC_FILE_BYTES) {
@@ -10736,10 +10874,9 @@ fn collect_file_chunks_from_source_timed(
     #[cfg(test)]
     LANE_PAUSE_CHUNK_CALLS.with(|count| count.set(count.get() + 1));
     let parse_started = Instant::now();
-    let tree_result =
-        parse_source_with_cached_parser(file, source, lang).map_err(|error| error.to_string());
+    let tree_result = parse_resolved_source(file, source, lang).map_err(|error| error.to_string());
     phases.parse += parse_started.elapsed();
-    let tree = tree_result?;
+    let (tree, lang) = tree_result?;
 
     let extract_started = Instant::now();
     let symbols_result =
@@ -11195,7 +11332,7 @@ fn chunk_view_file_uncached(
     if !is_semantic_indexed_extension(&file) {
         return Ok(None);
     }
-    let Some(lang) = detect_language(&file) else {
+    let Some(lang) = language_for_extension(&file) else {
         return Ok(None);
     };
     if bytes.len() as u64 > MAX_SEMANTIC_FILE_BYTES {
@@ -11510,6 +11647,194 @@ pub(crate) use tests::saved_pre_budget_summary_fixture;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_marker_preserves_non_header_incremental_append_scan() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = project.path().join("lib.rs");
+        write_rust_file(&file, "before_change");
+        let mut files = vec![file.clone()];
+        // Keep a one-file update below the background compaction threshold.
+        for ordinal in 1..16 {
+            let stable = project.path().join(format!("stable_{ordinal}.rs"));
+            write_rust_file(&stable, &format!("unchanged_{ordinal}"));
+            files.push(stable);
+        }
+        let mut index = build_test_index(project.path(), &files);
+        let fingerprint = SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        );
+        index.set_fingerprint(fingerprint.clone());
+        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
+        let data_path = storage
+            .path()
+            .join("semantic/header-marker-scan/semantic.bin");
+        let before_bytes = fs::metadata(&data_path).unwrap().len() as usize;
+        assert!(
+            index
+                .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
+                .unwrap()
+                < before_bytes
+        );
+        let mut incompatible = fingerprint.clone();
+        incompatible.model.push_str("-different");
+        assert!(SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            index.persistence_snapshot().unwrap(),
+            &incompatible.as_string(),
+            index.dimension(),
+            false
+        )
+        .is_err());
+        assert!(SemanticIndex::scan_artifact_for_append(
+            &data_path,
+            index.persistence_snapshot().unwrap(),
+            &fingerprint.as_string(),
+            index.dimension(),
+            true
+        )
+        .is_err());
+        write_rust_file(&file, "after_change");
+        index
+            .refresh_stale_files(
+                project.path(),
+                &files,
+                &mut test_vector_for_texts,
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(index.write_to_disk(storage.path(), "header-marker-scan"));
+        assert!(
+            index.last_append_read_bytes_for_test() < before_bytes,
+            "a non-header refresh must use the bounded append scan, not structural fallback"
+        );
+        assert_eq!(index.persistence_snapshot().unwrap().segment_count, 1);
+        assert!(index
+            .append_scan_bytes_for_test(storage.path(), "header-marker-scan")
+            .is_some());
+    }
+
+    #[test]
+    fn h_header_invalidation_legacy_semantic_reembeds_only_changed_headers_once() {
+        let root = tempfile::tempdir().unwrap();
+        let files = [
+            root.path().join("plain.h"),
+            root.path().join("widget.h"),
+            root.path().join("lib.rs"),
+        ];
+        fs::write(&files[0], "int plain(void);\n").unwrap();
+        fs::write(&files[1], "template <typename T>\nclass Widget {\npublic:\n    T value(T x) {\n        return x;\n    }\n};\n").unwrap();
+        fs::write(&files[2], "pub fn untouched() {\n    let x = 1;\n}\n").unwrap();
+        let mut index = build_test_index(root.path(), &files);
+        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(
+            &SemanticBackendConfig::default(),
+            index.dimension(),
+        ));
+        let fingerprint = index.fingerprint().unwrap().as_string();
+        let preserved = |index: &SemanticIndex| {
+            index
+                .entry_vectors_for_test()
+                .into_iter()
+                .filter(|(file, _, _)| file != &files[1])
+                .map(|(file, name, vector)| ((file, name), vector))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = preserved(&index);
+        let mut bytes = index.to_bytes();
+        let length = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&bytes[13..13 + length]).unwrap();
+        identity
+            .as_object_mut()
+            .unwrap()
+            .remove("header_languages_resolved");
+        let identity = serde_json::to_vec(&identity).unwrap();
+        bytes.splice(13..13 + length, identity.iter().copied());
+        bytes[9..13].copy_from_slice(&(identity.len() as u32).to_le_bytes());
+        let mut loaded = SemanticIndex::from_bytes(&bytes, root.path()).unwrap();
+        assert_eq!(preserved(&loaded), before);
+        assert_eq!(loaded.fingerprint().unwrap().as_string(), fingerprint);
+        assert!(loaded.recorded_file_freshness(&files[1]).is_none());
+        assert!(loaded.recorded_file_freshness(&files[0]).is_some());
+        let mut embedded = Vec::new();
+        loaded
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |texts: Vec<String>| {
+                    embedded.extend(texts.clone());
+                    test_vector_for_texts(texts)
+                },
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(!embedded.is_empty());
+        assert!(
+            embedded.iter().all(|text| text.contains("widget.h")),
+            "{embedded:?}"
+        );
+        assert_eq!(preserved(&loaded), before);
+        let mut current = SemanticIndex::from_bytes(&loaded.to_bytes(), root.path()).unwrap();
+        assert_eq!(current.fingerprint().unwrap().as_string(), fingerprint);
+        let summary = current
+            .refresh_stale_files(
+                root.path(),
+                &files,
+                &mut |_| panic!("current artifacts must not re-embed"),
+                8,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        assert!(summary.is_noop());
+    }
+
+    #[test]
+    fn h_header_invalidation_keeps_main_semantic_fingerprint() {
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "fixture-model".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            ..SemanticBackendConfig::default()
+        };
+        let current = SemanticIndexFingerprint::for_config_dimension(&config, 3);
+        let main = SemanticIndexFingerprint {
+            backend: "openai_compatible".to_string(),
+            model: "fixture-model".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            dimension: 3,
+            chunking_version: 2,
+            embed_text_caps: EmbedTextCaps::default(),
+            synapse_fingerprint: None,
+            synapse_table_epoch: None,
+            synapse_equivalent_to: Vec::new(),
+        };
+        assert_eq!(current.as_string().as_bytes(), main.as_string().as_bytes());
+    }
+
+    #[test]
+    fn h_header_view_chunking_uses_snapshot_language() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Path::new("widget.h");
+        fs::write(root.path().join(path), "int old_c_symbol(void);\n").unwrap();
+        let source =
+            b"namespace api {\nclass Widget {\npublic:\n    int value() {\n        return 42;\n    }\n};\n}\n";
+        let chunks = chunk_view_file_uncached(root.path(), path, source, EmbedTextCaps::default())
+            .unwrap()
+            .unwrap();
+        assert!(
+            chunks.iter().any(|chunk| chunk.name == "Widget"),
+            "{chunks:?}"
+        );
+        assert!(
+            chunks.iter().any(|chunk| chunk.name == "value"),
+            "{chunks:?}"
+        );
+        assert!(!chunks.iter().any(|chunk| chunk.name == "old_c_symbol"));
+    }
+
     fn no_pause_checkpoint_fixture(
         files: usize,
         symbols: usize,
@@ -17868,6 +18193,35 @@ public class Greeter {
         assert!(error.contains("HTTP 400 Bad Request"), "{error}");
         assert!(error.contains("model not found"), "{error}");
         assert!(!error.contains(ROW_TOO_LONG_MARKER_PREFIX), "{error}");
+    }
+
+    #[test]
+    fn openai_compatible_request_neutralizes_image_data_uris_on_the_wire() {
+        // Checks what reaches the server, so the test fails if the embedding
+        // request sends chunk text without neutralizing image data URIs.
+        let server = OverflowEmbeddingServer::rejecting_oversize(1_000_000);
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+
+        let vectors = model
+            .embed(vec![
+                "x = \"data:image/png;base64,AAAA\"".to_string(),
+                "plain chunk".to_string(),
+            ])
+            .unwrap();
+
+        assert_eq!(vectors.len(), 2);
+        let inputs: Vec<String> = server.requests().into_iter().flatten().collect();
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert!(
+            inputs.iter().all(|input| !input.contains("data:image/")),
+            "{inputs:?}"
+        );
+        assert!(
+            inputs[0].contains("data-uri:image/png;base64,AAAA"),
+            "{inputs:?}"
+        );
+        assert_eq!(inputs[1], "plain chunk");
     }
 
     #[test]

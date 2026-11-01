@@ -998,15 +998,9 @@ pub(crate) fn run_v3_import_while(
     }
     validate_legacy_key(&request.legacy_key)
         .map_err(|_| V3ImportError::InvalidKey(request.legacy_key.clone()))?;
+    // Imports only read legacy donors. Destination writes use v3 publication's
+    // leases and reservations, including when a linked checkout borrows donors.
     let ledger = V3Ledger::new(&request.storage, &request.family)?;
-    if !crate::root_cache::ArtifactAccess::for_root(&request.root).allows_write(
-        &request.family,
-        &request.storage.join("blobs/v3").join(&request.family),
-    ) {
-        return Err(V3ImportError::Store(v3::Error::Refused(
-            "legacy_import_borrow_only",
-        )));
-    }
     let owner = ClaimOwner::new();
     let _active = ActiveClaim::register(&owner);
     let mut run = Run {

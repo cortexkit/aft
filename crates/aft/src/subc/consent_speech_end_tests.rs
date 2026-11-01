@@ -284,6 +284,22 @@ async fn audit_failed_speech_end_write_fences_received_approval_before_actor_adm
         crate::db::access_grants::list(&db.lock().unwrap(), &access_grants::policy_scope_key(&run))
             .unwrap();
     let entries_while_blocked = END_FENCE_READ_DISPATCHES.load(Ordering::SeqCst);
+    // The background cleanup retries the failing scope-end write on its own
+    // schedule, so its first failed attempt can land just after the gate
+    // completes. Wait for it while the fault is still active; this still fails
+    // if no attempt is ever made.
+    wait_for(|| {
+        end_control
+            .control
+            .metrics
+            .scope_descriptions
+            .lock()
+            .unwrap()
+            .cleanup_health()["failed_attempts"]
+            .as_u64()
+            .is_some_and(|attempts| attempts >= 1)
+    })
+    .await;
     let health_while_failing = end_control
         .control
         .metrics

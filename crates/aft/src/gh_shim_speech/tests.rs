@@ -53,6 +53,15 @@ fn approved_unavailable_template_is_exact() {
 }
 
 #[test]
+fn approved_owner_unresolved_template_is_exact() {
+    assert_eq!(OWNER_UNRESOLVED_TEXT, "this command's bot-write permission cannot be verified ({reason}): this session has no verified head scope yet; retry in a minute, and tell the operator if it repeats.");
+    assert_eq!(
+        Refusal::new(Code::AuthorityUnavailable, "owner_unresolved").text(),
+        "this command's bot-write permission cannot be verified (owner_unresolved): this session has no verified head scope yet; retry in a minute, and tell the operator if it repeats.",
+    );
+}
+
+#[test]
 fn approved_ended_template_is_exact() {
     assert_eq!(ENDED_TEXT, "the {scope_role} this command started from has ended ({reason}), so it can no longer write as the bot; start the command again from a live session.");
 }

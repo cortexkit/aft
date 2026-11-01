@@ -352,6 +352,39 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "agent-file-tools"):
                     exec(script, {})
 
+    def test_crate_size_check_finds_multi_package_archives_and_checks_every_copy(self):
+        script = inline_python(self.rehearsal, "Check packaged crate sizes")
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            target = Path(temporary)
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "agent-file-tools")]
+            metadata = json.dumps({"target_directory": str(target), "packages": packages})
+            with mock.patch("subprocess.check_output", return_value=metadata):
+                copies = []
+                for folder in ("tmp-crate", "tmp-registry"):
+                    directory = target / "package" / folder
+                    directory.mkdir(parents=True)
+                    for package in packages:
+                        archive = directory / f"{package['name']}-{package['version']}.crate"
+                        archive.write_bytes(b"crate")
+                        if package["name"] == "agent-file-tools":
+                            copies.append(archive)
+                exec(script, {})
+                with copies[-1].open("wb") as archive:
+                    archive.truncate(10 * 1024 * 1024)
+                with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
+                    exec(script, {})
+                for archive in copies:
+                    archive.unlink()
+                (target / "package" / "agent-file-tools-0.1.0.crate").write_bytes(b"stale")
+                with self.assertRaisesRegex(AssertionError, "missing packaged crates: agent-file-tools"):
+                    exec(script, {})
+                for archive in target.rglob("*.crate"):
+                    archive.unlink()
+                with self.assertRaisesRegex(AssertionError, "missing packaged crates:.*aft-secret-rules.*aft-tokenizer.*agent-file-tools"):
+                    exec(script, {})
+
     def test_tag_canceller_catches_first_failure_and_timeouts_without_waiting_for_other_builds(self):
         job = self.jobs["cancel-failed-tag-builds"]
         self.assertEqual(job["if"], TAG_PUBLISH_GUARD)

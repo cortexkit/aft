@@ -365,6 +365,7 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
+                            let directory_arrival = is_directory_arrival(&event);
                             if event.paths.iter().any(|path| {
                                 super::cookie::is_cookie_path(path)
                                     || (counters.bash_changes.get().is_some()
@@ -474,6 +475,14 @@ impl ProjectWatcher {
                             // The kernel reports this path itself, so the
                             // enumeration need not.
                             new_directory_files.forget(&event.paths);
+                            // Files found during watch registration must still arrive
+                            // before cookie acknowledgments. Tag directories too so
+                            // bounded recovery and pending reporting match other platforms.
+                            let event = if directory_arrival {
+                                event.set_info(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)
+                            } else {
+                                event
+                            };
                             if tx.send(Ok(event)).is_err() {
                                 return;
                             }
@@ -623,6 +632,22 @@ impl PendingNewDirectoryFiles {
             event = event.add_path(path);
         }
         event
+    }
+}
+
+fn is_directory_arrival(event: &Event) -> bool {
+    match event.kind {
+        EventKind::Create(CreateKind::Folder) => true,
+        EventKind::Modify(ModifyKind::Name(mode)) if mode != RenameMode::From => {
+            // A paired rename names the source first and the destination last.
+            // Inspecting the source could misclassify an ordinary file rename
+            // if that old name has already been reused for a directory.
+            event.paths.last().is_some_and(|path| {
+                std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            })
+        }
+        _ => false,
     }
 }
 
@@ -2258,6 +2283,32 @@ pub(super) mod tests {
         assert_eq!(scan, NewDirectoryScan::Complete);
         assert!(watched.contains(&late_dir), "{watched:?}");
         assert_eq!(pending.take_event().paths, vec![late_file]);
+    }
+
+    #[test]
+    fn inotify_directory_arrival_does_not_swallow_file_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("directory");
+        let file = temp.path().join("file.rs");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, b"source").unwrap();
+        assert!(is_directory_arrival(
+            &Event::new(EventKind::Create(CreateKind::Folder))
+                .add_path(temp.path().join("already-gone"))
+        ));
+        assert!(is_directory_arrival(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                .add_path(directory.clone())
+        ));
+        assert!(!is_directory_arrival(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                .add_path(directory.clone())
+        ));
+        assert!(!is_directory_arrival(
+            &Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(directory)
+                .add_path(file)
+        ));
     }
 
     #[test]

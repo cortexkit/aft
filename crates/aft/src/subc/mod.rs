@@ -1436,10 +1436,7 @@ pub(crate) fn recovered_bash_frame(
         1,
         control_flags(),
         &result,
-        wire::ToolResponsePolicy {
-            trust: BindTrust::FirstParty,
-            tool_result_body: true,
-        },
+        wire::ToolResponsePolicy::for_retention(),
     )
     .ok()?;
     projected.frame = Frame::build_with_version(
@@ -1480,6 +1477,9 @@ pub(crate) fn project_held_ledger_result(
                 BindTrust::Untrusted
             },
             tool_result_body: true,
+            // This is a stored terminal body, not delivery to a route. Late
+            // readers and keyed replays apply their own recipient policy.
+            model_only: false,
         },
         None,
         source.map(|source| source.to_vec()),
@@ -7850,6 +7850,7 @@ async fn handle_route_bind_completion(
         .cloned()
     {
         let runtime = tokio::runtime::Handle::current();
+        let consent_executor = Arc::clone(executor);
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -7864,7 +7865,9 @@ async fn handle_route_bind_completion(
                     Ok(()) => {
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
-                        consent::reattach(ctx, &identity, &runtime);
+                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                            consent::reattach(&ctx, &identity, &runtime);
+                        }
                         Response::success("scope-bind", json!({}))
                     }
                     Err(error) => {
@@ -13202,6 +13205,70 @@ pub(crate) mod test_support {
             "inspect must still produce its terminal: {:?}",
             terminal.data
         );
+    }
+
+    #[test]
+    fn bounded_scoped_inspect_abandoned_discovery_releases_reader_for_rebind() {
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("inspect-abandoned-discovery");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        executor.register_actor(root.clone(), ctx.clone());
+        let held_manager = ctx.lsp();
+        let inspect_ctx = ctx.clone();
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            "inspect-abandoned-discovery".into(),
+            "inspect",
+            Box::new(move |_| {
+                let request = serde_json::from_value(json!({
+                    "id": "inspect-abandoned-discovery", "command": "inspect",
+                    "scope": "README.md", "sections": "diagnostics"
+                }))
+                .unwrap();
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::inspect::handle_inspect_deferred(&request, inspect_ctx)
+                else {
+                    panic!("inspect must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("inspect-abandoned-discovery", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(1));
+        if pending.is_err() {
+            drop(held_manager);
+            panic!("inspect discovery kept the executor reader while waiting for the LSP manager");
+        }
+        let mut pending = pending.unwrap();
+        // Both route abandonment and CANCEL reach this same cancellation token.
+        executor.cancel_job(&root, &cancellation);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let terminal = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled discovery did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(terminal.data["inspect_terminal"], "interrupted");
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-after-abandoned-discovery".into(),
+            Box::new(|_| Response::success("subc-bind-after-abandoned-discovery", json!({}))),
+        );
+        assert!(
+            bind.recv_timeout(Duration::from_secs(1))
+                .expect("the released request no longer holds an executor reader")
+                .success
+        );
+        drop(held_manager);
     }
 
     #[test]
