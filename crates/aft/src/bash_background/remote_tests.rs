@@ -3730,7 +3730,7 @@ async fn runon_restart_first_watch_reattaches(watch_before_replay: bool, relaxed
     let root_id = crate::path_identity::ProjectRootId::from_path(&project).unwrap();
     assert!(executor.register_actor(root_id.clone(), ctx.clone()));
     let bind_request = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({
-        "id": "restart-runner-bind",
+        "id": "subc-bind-restart-runner",
         "command": "configure",
         "project_root": project,
         "storage_dir": root.path().join("storage"),
