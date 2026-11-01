@@ -13,7 +13,11 @@ pub fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err("grammar smoke storage directory must be absolute".into());
     }
     #[cfg(feature = "test-grammar-seams")]
-    let download = args.next().is_some_and(|s| s == "--download");
+    let download = match args.next() {
+        Some(flag) if flag == "--download" => true,
+        Some(_) => return Err("unexpected grammar smoke argument".into()),
+        None => false,
+    };
     if args.next().is_some() {
         return Err("unexpected grammar smoke argument".into());
     }

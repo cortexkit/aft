@@ -494,6 +494,7 @@ pub(crate) fn language_id(language: &str) -> Option<LangId> {
         "swift" => LangId::Swift,
         "php" => LangId::Php,
         "lua" => LangId::Lua,
+        "luau" => LangId::Luau,
         "perl" => LangId::Perl,
         "yaml" => LangId::Yaml,
         "pascal" => LangId::Pascal,

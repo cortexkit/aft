@@ -8,6 +8,7 @@ mod context_storage_test;
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 
+mod grammar_builtin_parity_test;
 mod grammar_loader_test;
 mod helpers;
 
