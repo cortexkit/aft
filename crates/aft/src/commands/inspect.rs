@@ -1427,6 +1427,16 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     force_restrict: bool,
     reply_deadline: Option<Instant>,
 ) -> DispatchOutcome {
+    handle_inspect_deferred_with_clock(req, ctx, force_restrict, reply_deadline, Instant::now)
+}
+
+fn handle_inspect_deferred_with_clock(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    force_restrict: bool,
+    reply_deadline: Option<Instant>,
+    _now: impl Fn() -> Instant + Send + 'static,
+) -> DispatchOutcome {
     if req.worker_session() {
         ctx.disable_rust_cargo_for_worker();
     }
@@ -7909,6 +7919,122 @@ mod fresh_payload_tests {
 
 #[cfg(test)]
 mod deferred_terminal_tests {
+    mod inspect_request_deadline_tests {
+        use super::*;
+
+        fn fixture() -> (tempfile::TempDir, Arc<AppContext>, RawRequest) {
+            let root = tempfile::tempdir().unwrap();
+            for name in ["one.rs", "two.rs"] {
+                std::fs::write(root.path().join(name), "fn main() {}\n").unwrap();
+            }
+            let ctx = deferred_test_context(root.path());
+            let mut request = inspect_request("inspect-request-deadline");
+            request.params = serde_json::json!({"scope": ["one.rs", "two.rs"]});
+            (root, ctx, request)
+        }
+
+        fn assert_capped(ctx: Arc<AppContext>, request: &RawRequest) -> Response {
+            let start = Instant::now();
+            let clock = Arc::new(Mutex::new(start));
+            let now = clock.clone();
+            let DispatchOutcome::Deferred(mut pending) =
+                handle_inspect_deferred_with_clock(request, ctx.clone(), false, None, move || {
+                    *now.lock().unwrap()
+                })
+            else {
+                panic!("inspect must be deferred")
+            };
+            let cancellation = pending.cancellation.clone().unwrap();
+            assert!((pending.poll)(&ctx).is_none());
+            *clock.lock().unwrap() = start + Duration::from_secs(20);
+            let response = (pending.poll)(&ctx)
+                .expect("inspect must answer while the producer is still held, before the 25s client deadline");
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["inspect_terminal"], "partial");
+            assert_eq!(response.data["complete"], false);
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("PARTIAL — "));
+            assert!(cancellation.cancel_requested_before_commit());
+            assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+            response
+        }
+
+        #[test]
+        fn inspect_request_deadline_caps_scoped_and_unscoped_below_client() {
+            let (_root, ctx, mut request) = fixture();
+            for params in [serde_json::json!({}), request.params.clone()] {
+                request.params = params;
+                let deadline = InspectRequestDeadline::for_request(&request, &ctx.config());
+                assert!(deadline.budget <= Duration::from_secs(20));
+                assert_eq!(
+                    deadline.terminal_at - deadline.work_at,
+                    Duration::from_secs(5)
+                );
+            }
+        }
+
+        #[test]
+        fn inspect_request_deadline_held_language_server_names_both_files() {
+            let (_root, ctx, mut request) = fixture();
+            let held = ctx.lsp();
+            for sections in [None, Some("diagnostics")] {
+                if let Some(sections) = sections {
+                    request.params["sections"] = serde_json::json!(sections);
+                }
+                let response = assert_capped(ctx.clone(), &request);
+                let gaps = response.data["summary"]["diagnostics"]["gaps"]
+                    .as_array()
+                    .unwrap();
+                for file in ["one.rs", "two.rs"] {
+                    assert!(gaps.iter().any(|gap| {
+                        gap["file"] == file && gap["reason"] ==
+                        crate::inspect::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON
+                    }));
+                }
+            }
+            drop(held);
+        }
+
+        #[test]
+        fn inspect_request_deadline_held_tier2_current_analysis_is_partial() {
+            let (_root, ctx, mut request) = fixture();
+            request.params["sections"] = serde_json::json!("dead_code");
+            let manager = ctx.inspect_manager();
+            manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+            manager.hold_in_flight_lock_for_test(|| {
+                let response = assert_capped(ctx.clone(), &request);
+                assert_eq!(response.data["summary"]["dead_code"]["complete"], false);
+                assert!(response.data["summary"]["dead_code"].get("count").is_none());
+                assert_eq!(
+                    response.data["summary"]["diagnostics"]["status"],
+                    "not_requested"
+                );
+            });
+            manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
+        }
+
+        #[test]
+        fn inspect_request_deadline_unscoped_callgraph_stays_building() {
+            let (_root, ctx, mut request) = fixture();
+            request.params = serde_json::json!({});
+            let (_sender, receiver) = crossbeam_channel::unbounded();
+            *ctx.callgraph_store_rx().lock() = Some(receiver);
+            let manager = ctx.inspect_manager();
+            manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
+            manager.hold_in_flight_lock_for_test(|| {
+                let response = assert_capped(ctx.clone(), &request);
+                for category in ["dead_code", "unused_exports", "duplicates", "cycles"] {
+                    assert_eq!(response.data["summary"][category]["complete"], false);
+                    assert!(response.data["summary"][category].get("count").is_none());
+                }
+                assert!(ctx.callgraph_cold_build_active());
+            });
+            manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, false);
+        }
+    }
+
     #[test]
     #[ignore = "cold linked-worktree profile; requires AFT_INSPECT_COLD_PROFILE_OUTPUT"]
     fn inspect_cold_workspace_profile() {
