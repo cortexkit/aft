@@ -22,7 +22,6 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, harness: &str
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
-    aft.wait_for_folder_admission();
 }
 
 fn configured_aft(project: &Path, storage: &Path, harness: &str) -> AftProcess {

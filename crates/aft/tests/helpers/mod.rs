@@ -872,6 +872,20 @@ impl AftProcess {
         self.configure(project_root)
     }
 
+    /// Finish project setup before testing a tool that must not run against
+    /// initializing persistence. Database-lifecycle fixtures use the configure
+    /// acknowledgement directly instead.
+    pub fn wait_for_project_ready(&mut self) {
+        self.wait_for_folder_admission();
+        let response = self.send(
+            r#"{"id":"fixture-database-ready","command":"db_get_host_state","key":"fixture-readiness"}"#,
+        );
+        assert_eq!(
+            response["success"], true,
+            "database setup failed: {response}"
+        );
+    }
+
     /// The configure acknowledgement precedes the folder decision. Fixtures
     /// testing tools rather than the acknowledgement must wait until the folder
     /// decision is complete.

@@ -188,6 +188,7 @@ fn commit_all(root: &Path, message: &str) {
 
 fn init_repo(root: &Path, files: &[(&str, String)]) {
     std::fs::create_dir_all(root).unwrap();
+    crate::test_helpers::project::mark_project(root).unwrap();
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "parent@example.test"]);
     git(root, &["config", "user.name", "Parent Test"]);
@@ -410,12 +411,13 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
         }
         assert!(
             Instant::now() < deadline,
-            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}; cache_unavailable={:?}",
+            "child trigram index never persisted: {}; enabled={}; key={:?}; degraded={:?}; cache_unavailable={:?}; folder={}",
             root.display(),
             ctx.config().indexes.trigram,
             ctx.cached_artifact_cache_key(root),
             ctx.degraded_reasons(),
             ctx.cache_unavailable_reason(),
+            ctx.build_status_snapshot()["folder"],
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -1568,9 +1570,9 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
     let root = base.join("projects");
     let storage = base.join("storage");
     for index in 0..66 {
-        // Discovery needs only the `.git` marker; these children never built
-        // an index.
-        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+        let child = root.join(format!("repo-{index:02}"));
+        std::fs::create_dir_all(child.join(".git")).unwrap();
+        crate::test_helpers::project::mark_project(&child).unwrap();
     }
     let parent = configure(&root, &storage, config_doc(true, TRIGRAM_ONLY, None));
     let session = parent_session(&parent);

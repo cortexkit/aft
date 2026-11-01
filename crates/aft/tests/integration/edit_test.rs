@@ -74,6 +74,7 @@ fn inline_lsp_diagnostics_fixture_with_status(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    aft.wait_for_project_ready();
 
     (dir, file, aft)
 }
