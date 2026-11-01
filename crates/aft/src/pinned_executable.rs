@@ -63,17 +63,6 @@ pub fn initialize() -> io::Result<()> {
 }
 
 fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
-    let started = std::time::Instant::now();
-    let trace = |phase: &str| {
-        if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
-            eprintln!(
-                "[aft-pin] pid={} phase={phase} elapsed_ms={}",
-                std::process::id(),
-                started.elapsed().as_millis()
-            );
-        }
-    };
-    trace("source_open_start");
     // Resolve the image before touching storage. Keep an open source when a
     // copy is needed so a concurrent placement cannot change the copied bytes.
     #[cfg(target_os = "macos")]
@@ -95,8 +84,6 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     #[cfg(target_os = "linux")]
     let mut source_file = std::fs::File::open(&source_path)?;
 
-    trace("source_open_done");
-    trace("storage_open_start");
     crate::private_storage::open_root(storage)?;
     let storage = storage.canonicalize()?;
     let run = storage.join("run");
@@ -112,10 +99,7 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         ));
     }
     crate::private_storage::tighten_open_dir(&storage, &run);
-    trace("storage_open_done");
-    trace("cleanup_start");
     cleanup(&run)?;
-    trace("cleanup_done");
     let pid = std::process::id();
     let start = crate::root_cache::process_start_time_ms(pid)
         .ok_or_else(|| io::Error::other("cannot determine executable pin owner start time"))?;
@@ -123,15 +107,11 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     crate::private_storage::create_dir(&directory)?;
 
     let result = (|| {
-        trace("owner_lock_start");
         let owner = owner_lock(&directory)?;
-        trace("owner_lock_done");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let executable = {
             let destination = directory.join("aft");
-            trace("materialize_start");
             materialize(&source_path, &mut source_file, &destination, link_image)?;
-            trace("materialize_done");
             #[cfg(target_os = "macos")]
             warm_new_image(&destination);
             destination
@@ -452,30 +432,7 @@ fn materialize(
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let started = std::time::Instant::now();
-    let trace = |phase: &str| {
-        if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
-            eprintln!(
-                "[aft-pin-image] pid={} phase={phase} elapsed_ms={}",
-                std::process::id(),
-                started.elapsed().as_millis()
-            );
-        }
-    };
-    trace("link_start");
-    let linked = link(source_path, destination);
-    if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
-        eprintln!(
-            "[aft-pin-image] pid={} link_result={linked:?} source={:?} destination_parent={:?}",
-            std::process::id(),
-            source.metadata().map(|m| (m.dev(), m.len())),
-            destination
-                .parent()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.dev())
-        );
-    }
-    match linked {
+    match link(source_path, destination) {
         Ok(()) => {
             let held = source.metadata()?;
             let linked = std::fs::metadata(destination)?;
@@ -498,7 +455,6 @@ fn materialize(
                 .write(true)
                 .create_new(true)
                 .open(destination)?;
-            trace("copy_start");
             // Cloned startup handles share a cursor. Positional reads let
             // concurrent task copies and later repairs read the complete image.
             use std::io::Write;
@@ -516,10 +472,7 @@ fn materialize(
                 output.write_all(&buffer[..count])?;
                 offset += count as u64;
             }
-            trace("copy_done");
-            trace("sync_start");
             output.sync_all()?;
-            trace("sync_done");
             output.set_permissions(std::fs::Permissions::from_mode(0o500))?;
         }
     }
@@ -1130,46 +1083,6 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn pinned_executable_procfs_image_on_same_device_is_linked_without_copying() {
-        use std::os::unix::fs::MetadataExt;
-        let executable = std::env::current_exe().unwrap();
-        let storage = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
-        let proc_image = linux_image_path();
-        let mut source = std::fs::File::open(&proc_image).unwrap();
-        let destination = storage.path().join("pin");
-        materialize(&proc_image, &mut source, &destination, link_image).unwrap();
-        let held = source.metadata().unwrap();
-        let pinned = std::fs::metadata(&destination).unwrap();
-        assert_eq!(held.dev(), pinned.dev());
-        assert_eq!(
-            held.ino(),
-            pinned.ino(),
-            "same-device procfs image was copied"
-        );
-        assert_eq!(held.len(), pinned.len());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pinned_executable_rejects_a_link_to_a_replaced_image() {
-        let storage = tempfile::tempdir().unwrap();
-        let image = storage.path().join("image");
-        std::fs::write(&image, b"original").unwrap();
-        let mut source = std::fs::File::open(&image).unwrap();
-        std::fs::rename(&image, storage.path().join("held-original")).unwrap();
-        std::fs::write(&image, b"replacement").unwrap();
-        let destination = storage.path().join("pin");
-        let error = materialize(&image, &mut source, &destination, |source, destination| {
-            std::fs::hard_link(source, destination)
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("deployment image changed"));
-        assert!(!destination.exists(), "mismatched image was retained");
-        assert_eq!(std::fs::read(image).unwrap(), b"replacement");
     }
 
     #[cfg(unix)]

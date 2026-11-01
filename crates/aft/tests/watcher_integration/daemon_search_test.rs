@@ -72,7 +72,7 @@ impl Daemon {
             .to_string(),
         )
         .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_aft"))
+        let child = Command::new(crate::test_helpers::aft_binary::aft_binary())
             .args(["--subc"])
             .arg(&connection)
             .env("HOME", state)

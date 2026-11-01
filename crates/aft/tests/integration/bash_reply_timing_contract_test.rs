@@ -1111,9 +1111,7 @@ impl ModuleProcess {
     fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path, env: &[(&str, &str)]) -> Self {
         use std::os::unix::process::CommandExt;
 
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = crate::test_helpers::aft_binary::aft_binary();
         let mut command = Command::new(binary);
         command
             .arg("--subc")

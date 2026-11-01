@@ -840,8 +840,8 @@ fn provider_command_uses_existing_fixture_cwd_and_xdg_directories() {
     if let Some(binary) = std::env::var_os("NEXTEST_BIN_EXE_aft") {
         if std::env::var_os("AFT_TEST_AFT_BINARY").is_none() {
             assert_eq!(
-                command.get_program(),
-                binary,
+                aft_binary::source_binary().as_os_str(),
+                binary.as_os_str(),
                 "use nextest's relocated executable"
             );
         }
