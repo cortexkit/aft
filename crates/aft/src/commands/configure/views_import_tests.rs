@@ -258,6 +258,7 @@ fn views_import_building_retries_callgraph_without_load_failures_then_answers() 
     let _serial = crate::blob_store::v3::serial_for_test();
     let (_checkout, storage, root) = warm_fixture();
     let ctx = query_context(&root, storage.path());
+    ctx.set_harness(crate::harness::Harness::Opencode);
     let mut config = (*ctx.config()).clone();
     config.indexes.callgraph = true;
     ctx.set_config(config);

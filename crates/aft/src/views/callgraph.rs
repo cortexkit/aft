@@ -1087,6 +1087,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_uses_reader_backoff_until_it_finishes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
+            &root,
+            1 << 20,
+            &storage.join("index").join("donor-reuse"),
+        );
+        let limiter = crate::cold_build_limiter::isolated_limiter(1);
+        let slot = limiter.try_acquire().unwrap();
+        let graph = CallgraphView::new_with_import(
+            root,
+            crate::root_cache::StoragePaths::same(&storage),
+            "donor-reuse".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+            Arc::new(|| true),
+            limiter,
+        )
+        .unwrap();
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
+        assert_eq!(error.reason, "legacy text and symbol import building");
+        assert!(error.busy);
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            let error = graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .unwrap_err();
+            assert_eq!(error.reason, "legacy text and symbol import building");
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            assert!(graph.reader_with_clock(|| now).is_err());
+        }
+        drop(slot);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while graph.legacy_import.as_ref().unwrap().is_building() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "legacy import did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        now += std::time::Duration::from_secs(30);
+        let ready = graph.reader_with_clock(|| now).unwrap();
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
+    }
+
+    #[test]
     fn older_callgraph_view_producer_rebuilds_but_newer_and_corrupt_views_fail_loudly() {
         use super::super::manifest_v2::{GenerationName, Producers, PublishV2};
         let _serial = crate::blob_store::v3::serial_for_test();
