@@ -45,6 +45,9 @@ const INSPECT_REQUEST_CAP: Duration = Duration::from_secs(20);
 /// Leave time to assemble and send the final response inside the request cap,
 /// as well as headroom between the cap and the client's deadline.
 const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
+// Final diagnostics must leave time to verify that the inspected files did not
+// change, rather than making every slow producer also leave freshness unknown.
+const INSPECT_STAT_VERIFICATION_MARGIN: Duration = Duration::from_secs(1);
 
 struct ParsedScope {
     job: JobScope,
@@ -88,6 +91,18 @@ impl InspectRequestDeadline {
 
     fn work_at(self) -> Instant {
         self.work_at
+    }
+
+    fn diagnostics_deadline(self) -> Instant {
+        self.diagnostics_deadline_at(Instant::now())
+    }
+
+    fn diagnostics_deadline_at(self, now: Instant) -> Instant {
+        self.work_at
+            - self
+                .work_at
+                .saturating_duration_since(now)
+                .min(INSPECT_STAT_VERIFICATION_MARGIN)
     }
 
     fn phase_deadline(self, phase_limit: Duration) -> Instant {
@@ -1058,7 +1073,7 @@ fn handle_inspect_payload(
                 not_applicable,
                 expected_producers,
                 indexing_gaps,
-                request_deadline.map(InspectRequestDeadline::work_at),
+                request_deadline.map(InspectRequestDeadline::diagnostics_deadline),
                 rust_checks.take().unwrap_or_default(),
             )
         } else if category.is_tier2() {
@@ -8083,6 +8098,24 @@ mod deferred_terminal_tests {
                     Duration::from_secs(5)
                 );
             }
+        }
+
+        #[test]
+        fn inspect_request_deadline_reserves_final_stat_verification() {
+            let (_root, ctx, request) = fixture();
+            let start = Instant::now();
+            let deadline = InspectRequestDeadline::for_request_at(&request, &ctx.config(), start);
+            assert_eq!(deadline.work_at(), start + Duration::from_secs(15));
+            assert_eq!(
+                deadline.diagnostics_deadline_at(start),
+                start + Duration::from_secs(14)
+            );
+            let nearly_done = start + Duration::from_millis(14_500);
+            assert_eq!(deadline.diagnostics_deadline_at(nearly_done), nearly_done);
+            assert!(
+                deadline.diagnostics_deadline_at(start + Duration::from_secs(20))
+                    <= deadline.work_at()
+            );
         }
 
         #[test]
