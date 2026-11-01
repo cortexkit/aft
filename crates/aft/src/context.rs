@@ -5179,9 +5179,9 @@ pub(crate) fn checkout_view_callgraph_access(
     match reader {
         Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
         Some(Err(error)) if error.completion_busy => CallgraphStoreAccess::Building,
-        // Transient contention while opening a view (a locked derived
-        // database or ledger) says nothing about the graph. Report SQLite's
-        // busy error, which every caller presents as busy/pending with a retry.
+        // Pending verification and transient contention say nothing about the
+        // graph's validity. Use the existing busy error, which every caller
+        // presents as busy/pending with a retry.
         Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -12812,6 +12812,15 @@ impl AppContext {
                 borrow.checked_at = now;
                 return Some(Ok(store.clone()));
             }
+        }
+        if callgraph_copies::needs_producer_rebuild(
+            &storage.artifacts,
+            family,
+            policy,
+            &borrow.scope,
+        ) {
+            guard.take();
+            return None;
         }
         borrow.checked_at = now;
         Some(
