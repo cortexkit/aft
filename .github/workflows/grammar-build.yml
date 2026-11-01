@@ -36,8 +36,8 @@ jobs:
 
   publish:
     needs: build
-    # Dispatches on unreviewed branches can verify, but cannot publish.
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Pushes are restricted to main above; pull requests and dispatches only verify.
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:

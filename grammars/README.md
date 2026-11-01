@@ -52,8 +52,8 @@ notices with the corpus and grammar artifacts.
 
 ## Publication
 
-Pull requests verify without write credentials. Only a push on `main` that
-changes `grammars/luau.pin.json`, or a manual dispatch on `main`, can publish.
+Pull requests and manual dispatches verify without write credentials. Only a
+push on `main` that changes `grammars/luau.pin.json` can publish.
 The separate publication job receives only the verified artifact bundle and
 uses a narrowly scoped GitHub token; compilation never receives that token.
 
