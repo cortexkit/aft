@@ -217,7 +217,7 @@ fn views_import_semantic_prefill_borrower_uses_family_ledger() {
             max_file_size: LIMIT,
         },
         status: Arc::new(std::sync::RwLock::new(SemanticIndexStatus::Disabled)),
-        drivers: crate::views::semantic_runtime::InstalledDriver::default(),
+        drivers: crate::views::first_load::InstalledDriver::default(),
         schedule: crate::views::semantic_runtime::FillSchedule {
             root,
             quiet_window: Duration::ZERO,
