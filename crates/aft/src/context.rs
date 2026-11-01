@@ -9078,10 +9078,39 @@ impl AppContext {
 
     pub fn note_request(&self) {
         *self.last_request_at.lock() = Instant::now();
+        let config = self.config();
+        if config.views.enabled && config.project_root.is_some() {
+            let root = crate::root_cache::canonical_root(config.project_root.as_deref().unwrap());
+            let family = self.memoized_artifact_cache_key(&root);
+            if let Err(error) = crate::storage_retention::touch_view_checkout(
+                &self.storage_paths(),
+                &family,
+                &root,
+                config.views.idle_checkout_hours,
+                crate::pins::now_ms(),
+            ) {
+                crate::slog_warn!("views checkout activity: {error}");
+            }
+        }
     }
 
     pub fn last_request_at(&self) -> Instant {
         *self.last_request_at.lock()
+    }
+
+    /// A non-waiting snapshot for the frame-loop reaper. If the request
+    /// timestamp or configuration lock is contended, defer release.
+    pub(crate) fn try_views_idle_request(&self) -> Option<(Instant, u32)> {
+        let config = try_read_unpoisoned(&self.config)?;
+        config
+            .views
+            .enabled
+            .then(|| {
+                self.last_request_at
+                    .try_lock()
+                    .map(|stamp| (*stamp, config.views.idle_checkout_hours))
+            })
+            .flatten()
     }
 
     #[cfg(test)]
@@ -9133,6 +9162,7 @@ impl AppContext {
         let config = self.config();
         let root_changed = previous_root.as_deref() != config.project_root.as_deref();
         self.refresh_project_applicability(config, root_changed);
+        self.note_request();
     }
 
     /// Refreshes the project snapshot on one worker. Batches arriving during a
@@ -15085,7 +15115,7 @@ impl AppContext {
         &self,
         include_pending: bool,
     ) -> Option<ArtifactEvictionBlocker> {
-        self.try_artifact_eviction_blocker_for_root(include_pending, None)
+        self.try_artifact_eviction_blocker_for_root(include_pending, None, false)
     }
 
     pub(crate) fn try_artifact_eviction_blocker_for_deleted_root(
@@ -15093,16 +15123,17 @@ impl AppContext {
         include_pending: bool,
         root: &crate::path_identity::ProjectRootId,
     ) -> Option<ArtifactEvictionBlocker> {
-        self.try_artifact_eviction_blocker_for_root(include_pending, Some(root))
+        self.try_artifact_eviction_blocker_for_root(include_pending, Some(root), false)
     }
 
     fn try_artifact_eviction_blocker_for_root(
         &self,
         include_pending: bool,
         deleted_root: Option<&crate::path_identity::ProjectRootId>,
+        allow_standing: bool,
     ) -> Option<ArtifactEvictionBlocker> {
         use ArtifactEvictionBlocker as Blocker;
-        if self.standing_artifact_exempt.load(Ordering::Acquire) {
+        if !allow_standing && self.standing_artifact_exempt.load(Ordering::Acquire) {
             return Some(Blocker::StandingRoot);
         }
         let semantic_refresh_in_flight = match try_read_unpoisoned(&self.semantic_index_status) {
@@ -15231,7 +15262,13 @@ impl AppContext {
     /// when eviction is unsafe or a lock was contended; the reaper retries on
     /// its next sweep.
     pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
-        self.try_evict_idle_artifacts_for_root(None)
+        self.try_evict_idle_artifacts_for_root(None, false)
+    }
+
+    /// A standing checkout's views can age out too. The caller must exclude
+    /// in-flight actor work before releasing its resident registrations.
+    pub(crate) fn try_release_idle_checkout_views(&self) -> bool {
+        self.try_evict_idle_artifacts_for_root(None, true)
     }
 
     /// Deleted-root reclamation uses the same root-scoped task gate both before
@@ -15241,15 +15278,16 @@ impl AppContext {
         &self,
         root: &crate::path_identity::ProjectRootId,
     ) -> bool {
-        self.try_evict_idle_artifacts_for_root(Some(root))
+        self.try_evict_idle_artifacts_for_root(Some(root), false)
     }
 
     fn try_evict_idle_artifacts_for_root(
         &self,
         deleted_root: Option<&crate::path_identity::ProjectRootId>,
+        allow_standing: bool,
     ) -> bool {
         if self
-            .try_artifact_eviction_blocker_for_root(true, deleted_root)
+            .try_artifact_eviction_blocker_for_root(true, deleted_root, allow_standing)
             .is_some()
         {
             return false;
@@ -15294,6 +15332,9 @@ impl AppContext {
         let Some(mut callgraph_view) = self.callgraph_view.try_lock() else {
             return false;
         };
+        let Some(mut callgraph_borrow) = self.callgraph_borrow.try_lock() else {
+            return false;
+        };
         let Some(mut lexical_retry) = self.lexical_load_retry.try_lock() else {
             return false;
         };
@@ -15326,6 +15367,7 @@ impl AppContext {
             // so the views drop on the release thread too.
             lexical_view.take(),
             callgraph_view.take(),
+            callgraph_borrow.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -15338,6 +15380,7 @@ impl AppContext {
             refresh_worker,
             lexical_view,
             callgraph_view,
+            callgraph_borrow,
             lexical_retry,
             callgraph_retry,
         ));

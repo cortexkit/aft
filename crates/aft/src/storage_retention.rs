@@ -5508,6 +5508,112 @@ fn v3_root_missing(root: &Path) -> bool {
     matches!(fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
+fn checkout_idle_policy_path(paths: &StoragePaths, root: &Path) -> PathBuf {
+    paths.durable.join("retention/views-idle").join(format!(
+        "{}.json",
+        crate::path_identity::project_scope_key(root)
+    ))
+}
+
+/// Update the last-use time for every active view in a checkout, including
+/// views the current call does not read. One busy checkout writes at most
+/// once a minute; changing its timeout is persisted immediately unless a
+/// previous failure is backing off. Lock contention leaves the touch pending.
+pub(crate) fn touch_view_checkout(
+    paths: &StoragePaths,
+    family: &str,
+    root: &Path,
+    hours: u32,
+    now: u64,
+) -> io::Result<()> {
+    #[derive(Clone, Copy)]
+    enum Attempt {
+        Written { at: u64, hours: u32 },
+        Failed { at: u64 },
+    }
+    type Key = (PathBuf, PathBuf, String, PathBuf);
+    type Stamp = Arc<Mutex<Option<Attempt>>>;
+    static WRITTEN: OnceLock<Mutex<HashMap<Key, Stamp>>> = OnceLock::new();
+    let key = (
+        paths.durable.clone(),
+        paths.artifacts.clone(),
+        family.to_owned(),
+        root.to_owned(),
+    );
+    let stamp = WRITTEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone();
+    // Another request may already be doing the touch. Do not wait behind its
+    // registry or filesystem I/O on the request path.
+    let mut attempt = match stamp.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+    };
+    let recent = |at| now >= at && now - at < 60_000;
+    if attempt.is_some_and(|attempt| match attempt {
+        Attempt::Written { at, hours: policy } => policy == hours && recent(at),
+        Attempt::Failed { at } => recent(at),
+    }) {
+        return Ok(());
+    }
+    let result = (|| -> io::Result<bool> {
+        #[cfg(test)]
+        test_hook(&paths.artifacts, "views-checkout-touch-attempt");
+        let policy = checkout_idle_policy_path(paths, root);
+        let registry_path = paths
+            .artifacts
+            .join("blobs/v3")
+            .join(family)
+            .join("members.sqlite");
+        if registry_path.try_exists()? {
+            let v3 = |e: crate::blob_store::v3::Error| io::Error::other(e.to_string());
+            let lock = match crate::blob_store::v3::ReservationLock::acquire_until(
+                &paths.artifacts,
+                Instant::now(),
+            ) {
+                Ok(lock) => lock,
+                Err(error) if reservation_lock_busy(&error) => return Ok(false),
+                Err(error) => return Err(v3(error)),
+            };
+            let mut registry = crate::blob_store::v3::RegistryWriter::open_for_barrier(
+                &paths.artifacts,
+                family,
+                &lock,
+            )
+            .map_err(v3)?;
+            registry.with_barrier(|tx| {
+            tx.execute(
+                "UPDATE members SET last_bind_ms=MAX(last_bind_ms,?2) WHERE kind='view' AND root=?1 AND state='active'",
+                rusqlite::params![crate::blob_store::v3::encode_root(root), now],
+            )?;
+            atomic_json(&policy, &hours)?;
+            Ok(())
+        }).map_err(v3)?;
+        } else {
+            // Configure can precede the first view registration. Do not create a
+            // v3 namespace just to remember the checkout's policy.
+            atomic_json(&policy, &hours)?;
+        }
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => *attempt = Some(Attempt::Written { at: now, hours }),
+        Ok(false) => {}
+        Err(error) => {
+            // The caller logs this error. Suppress both another attempt and
+            // another warning until the checkout's next one-minute window.
+            *attempt = Some(Attempt::Failed { at: now });
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn v3_member(tx: &rusqlite::Transaction<'_>, scope: &str) -> rusqlite::Result<Option<V3Member>> {
     use rusqlite::OptionalExtension;
     tx.query_row(
@@ -5881,8 +5987,23 @@ fn v3_mark_idle_evicting(
     observed: &V3Member,
     view_dir: &Path,
 ) -> rusqlite::Result<V3IdleStep> {
+    if let Some(held) = v3_idle_hold(tx, observed, view_dir)? {
+        return Ok(held);
+    }
+    tx.execute(
+        "UPDATE members SET state=?2 WHERE scope=?1",
+        rusqlite::params![observed.scope, crate::views::registry::STATE_EVICTING],
+    )?;
+    Ok(V3IdleStep::Evicting)
+}
+
+fn v3_idle_hold(
+    tx: &rusqlite::Transaction<'_>,
+    observed: &V3Member,
+    view_dir: &Path,
+) -> rusqlite::Result<Option<V3IdleStep>> {
     let Some(current) = v3_member(tx, &observed.scope)? else {
-        return Ok(V3IdleStep::Held);
+        return Ok(Some(V3IdleStep::Held));
     };
     if current.kind != "view"
         || current.state != "active"
@@ -5890,7 +6011,7 @@ fn v3_mark_idle_evicting(
         || current.root != observed.root
         || current.view_dir != observed.view_dir
     {
-        return Ok(V3IdleStep::Held);
+        return Ok(Some(V3IdleStep::Held));
     }
     // Worker pointer publication can outlive the reservation lock. Its intent
     // protects the worker even when the insertion marker lives in its base.
@@ -5901,22 +6022,73 @@ fn v3_mark_idle_evicting(
             |row| row.get::<_, bool>(0),
         )?
     {
-        return Ok(V3IdleStep::Held);
+        return Ok(Some(V3IdleStep::Held));
     }
     match v3_member_protected(tx, &current.scope, view_dir) {
-        Ok(true) => return Ok(V3IdleStep::Held),
-        Err(reason) => return Ok(V3IdleStep::Unknown(reason)),
+        Ok(true) => return Ok(Some(V3IdleStep::Held)),
+        Err(reason) => return Ok(Some(V3IdleStep::Unknown(reason))),
         Ok(false) => {}
     }
     let _files = crate::db::file_identity::filesystem_guard();
     if crate::db::file_identity::has_open_connections_under(view_dir) {
-        return Ok(V3IdleStep::Held);
+        return Ok(Some(V3IdleStep::Held));
     }
-    tx.execute(
-        "UPDATE members SET state=?2 WHERE scope=?1",
-        rusqlite::params![current.scope, crate::views::registry::STATE_EVICTING],
-    )?;
-    Ok(V3IdleStep::Evicting)
+    Ok(None)
+}
+
+/// Recheck checkout-wide activity and holds in the eviction transaction.
+/// Keeping the entire checkout when any member is borrowed also keeps a main
+/// checkout's published graph available to its worktree readers.
+fn v3_mark_checkout_idle_evicting(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &StoragePaths,
+    family: &str,
+    observed: &V3Member,
+    root: &Path,
+    now: u64,
+) -> crate::blob_store::v3::Result<Option<V3IdleStep>> {
+    let hours = match read_json::<u32>(&checkout_idle_policy_path(paths, root)) {
+        Ok(hours) => hours.max(1),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::config::DEFAULT_VIEWS_IDLE_CHECKOUT_HOURS
+        }
+        Err(error) => return Ok(Some(V3IdleStep::Unknown(error.to_string()))),
+    };
+    let members = tx.prepare(
+        "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members WHERE kind='view' AND root=?1 AND state='active'",
+    )?.query_map([observed.root.as_deref()], v3_member_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let last_used = members
+        .iter()
+        .map(|member| member.last_bind_ms)
+        .max()
+        .unwrap_or(now);
+    if now.saturating_sub(last_used) < u64::from(hours) * 60 * 60 * 1000 {
+        return Ok(None);
+    }
+    if tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM reservations WHERE state='reserved')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Ok(Some(V3IdleStep::Held));
+    }
+    let _files = crate::db::file_identity::filesystem_guard();
+    for member in &members {
+        let expected = crate::blob_store::v3::view_dir(&paths.artifacts, family, &member.scope)?;
+        if Path::new(&member.view_dir) != expected {
+            return Ok(Some(V3IdleStep::Unknown(
+                "unexpected view directory".into(),
+            )));
+        }
+        if let Some(held) = v3_idle_hold(tx, member, &expected)? {
+            return Ok(Some(held));
+        }
+    }
+    Ok(Some(v3_mark_idle_evicting(
+        tx,
+        observed,
+        Path::new(&observed.view_dir),
+    )?))
 }
 
 /// The v3 ledger charges one namespace, including view directories and shared
@@ -6066,6 +6238,24 @@ fn collect_v3_family(
     report: &mut SweepReport,
     bounds: V3Bounds,
 ) -> io::Result<V3Visit> {
+    collect_v3_family_at(
+        paths,
+        family,
+        cancelled,
+        report,
+        bounds,
+        crate::pins::now_ms(),
+    )
+}
+
+fn collect_v3_family_at(
+    paths: &StoragePaths,
+    family: &str,
+    cancelled: &dyn Fn() -> bool,
+    report: &mut SweepReport,
+    bounds: V3Bounds,
+    now: u64,
+) -> io::Result<V3Visit> {
     use crate::blob_store::v3::{Measurement, RegistryWriter, ReservationLock};
     let v3 = |error: crate::blob_store::v3::Error| io::Error::other(error.to_string());
     // Family data: the artifact root. Root bindings: the durable root.
@@ -6185,6 +6375,39 @@ fn collect_v3_family(
             domain.skipped_live += 1;
             continue;
         };
+        if !v3_root_missing(&root) {
+            #[cfg(test)]
+            test_hook(storage, "v3-checkout-idle-before-recheck");
+            let step = registry
+                .with_barrier(|tx| {
+                    v3_mark_checkout_idle_evicting(tx, paths, family, &member, &root, now)
+                })
+                .map_err(v3)?;
+            if let Some(step) = step {
+                match step {
+                    V3IdleStep::Held => domain.skipped_protected += 1,
+                    V3IdleStep::Unknown(reason) => report_v3_idle_unknown(
+                        &view_dir,
+                        &io::Error::other(reason),
+                        report,
+                        &mut domain,
+                    ),
+                    V3IdleStep::Evicting => {
+                        let bytes = retention_tree_bytes(&view_dir, deadline).ok();
+                        let measured = v3_finish_eviction(
+                            storage,
+                            &mut registry,
+                            &member.scope,
+                            &view_dir,
+                            deadline,
+                        )?;
+                        record_v3_removal(&mut domain, bytes);
+                        owed |= measured == Measurement::Owed;
+                    }
+                }
+                continue;
+            }
+        }
         let eligibility = if v3_root_missing(&root) {
             missing_root_eligibility(durable, &root, member.last_bind_ms)
         } else {
@@ -6311,6 +6534,17 @@ fn collect_v3_family(
     }
     record_v3_domain(report, "views/v3", &domain);
     Ok(V3Visit::Done)
+}
+
+#[cfg(test)]
+pub(crate) fn sweep_checkout_views_at_for_test(
+    paths: &StoragePaths,
+    family: &str,
+    now: u64,
+) -> SweepReport {
+    let mut report = SweepReport::default();
+    collect_v3_family_at(paths, family, &|| false, &mut report, V3Bounds::PASS, now).unwrap();
+    report
 }
 
 fn record_v3_domain(report: &mut SweepReport, name: &str, domain: &DomainReport) {
@@ -14404,6 +14638,287 @@ mod v3_collector_tests {
     }
 
     #[test]
+    fn views_idle_checkout_hours_one_evicts_all_members_but_not_the_shared_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = bound_root(temp.path(), &storage, "main");
+        let own = [
+            "main.text",
+            "main.symbol",
+            "main.semantic",
+            "main.callgraph",
+        ];
+        let mut members = own
+            .iter()
+            .map(|scope| (*scope, "view", Some(root.as_path())))
+            .collect::<Vec<_>>();
+        members.push(("shared-base", "base", None));
+        seed(&storage, &members);
+        for (scope, _, _) in &members {
+            fill_view_dir(&view_dir(&storage, scope));
+        }
+        let paths = StoragePaths::same(&storage);
+        let used = crate::pins::now_ms();
+        touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
+        let before = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_599_999);
+        assert_eq!(before.removed_roots, 0, "{before:?}");
+        assert_eq!(member_scopes(&storage).len(), 5);
+        let after = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_600_000);
+        assert!(after.errors.is_empty(), "{after:?}");
+        assert_eq!(after.removed_roots, 4, "{after:?}");
+        assert_eq!(member_scopes(&storage), ["shared-base"]);
+        assert!(view_dir(&storage, "shared-base").join("data.bin").exists());
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn views_idle_checkout_activity_is_checkout_wide_and_debounced() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = bound_root(temp.path(), &storage, "worker");
+        seed(
+            &storage,
+            &[
+                ("text", "view", Some(&root)),
+                ("graph", "view", Some(&root)),
+            ],
+        );
+        let paths = StoragePaths::same(&storage);
+        let used = crate::pins::now_ms();
+        touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
+        for offset in [1, 20_000, 59_999] {
+            touch_view_checkout(&paths, FAMILY, &root, 1, used + offset).unwrap();
+        }
+        with_registry(&storage, |tx| {
+            assert_eq!(
+                tx.query_row("SELECT MAX(last_bind_ms) FROM members", [], |r| r
+                    .get::<_, u64>(0))?,
+                used
+            );
+            Ok(())
+        });
+        touch_view_checkout(&paths, FAMILY, &root, 1, used + 60_000).unwrap();
+        let kept = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_600_000);
+        assert_eq!(kept.removed_roots, 0, "{kept:?}");
+        assert_eq!(member_scopes(&storage), ["graph", "text"]);
+    }
+
+    fn checkout_activity_context(temp: &Path) -> (crate::context::AppContext, PathBuf) {
+        let root = temp.join("worker");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(temp.join("storage")),
+            ..Default::default()
+        };
+        config.views.enabled = true;
+        config.views.idle_checkout_hours = 1;
+        config.indexes.semantic = false;
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        (ctx, root)
+    }
+
+    #[test]
+    fn views_idle_checkout_note_request_skips_a_held_reservation_lock_without_waiting() {
+        let _env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, root) = checkout_activity_context(temp.path());
+        let paths = ctx.storage_paths();
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let _space = v3::set_free_space_for_test(&paths.artifacts, u64::MAX, u64::MAX / 2);
+        v3::publish(&paths.artifacts, &family, 1 << 20, None, |publication| {
+            publication
+                .registry
+                .register_member("text", "view", Some(&root))?;
+            publication.registry.with_barrier(|tx| {
+                tx.execute("UPDATE members SET last_bind_ms=1", [])?;
+                Ok(())
+            })
+        })
+        .unwrap();
+        let lock = ReservationLock::acquire(&paths.artifacts).unwrap();
+        let started = Instant::now();
+        let (_, logs) = crate::logging::capture_log_lines(|| ctx.note_request());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "note_request waited for the family lock: {elapsed:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("views checkout activity:")),
+            "{logs:?}"
+        );
+        let ledger = v3::LedgerReader::open_existing(&paths.artifacts, &family).unwrap();
+        let last_used = || {
+            ledger
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT last_bind_ms FROM members WHERE scope='text'",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            last_used(),
+            1,
+            "contention must leave the durable touch pending"
+        );
+        drop(lock);
+        ctx.note_request();
+        assert!(
+            last_used() > 1,
+            "the next request must retry the skipped touch immediately"
+        );
+        assert!(checkout_idle_policy_path(&paths, &root).exists());
+    }
+
+    #[test]
+    fn views_idle_checkout_failed_touches_debounce_attempts_and_warnings() {
+        let _env = crate::test_env::hermetic_git_env_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, root) = checkout_activity_context(temp.path());
+        let paths = ctx.storage_paths();
+        let family = ctx.memoized_artifact_cache_key(&root);
+        let policy = checkout_idle_policy_path(&paths, &root);
+        let blocked = policy.parent().unwrap();
+        fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        fs::write(blocked, b"not a directory").unwrap();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let observed = attempts.clone();
+        let _hook = observe_test_hook(
+            &paths.artifacts,
+            Arc::new(move |step| {
+                if step == "views-checkout-touch-attempt" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for _ in 0..5 {
+                ctx.note_request();
+            }
+        });
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.contains("views checkout activity:"))
+                .count(),
+            1,
+            "{logs:?}"
+        );
+        let later = crate::pins::now_ms() + 60_000;
+        assert!(touch_view_checkout(&paths, &family, &root, 1, later).is_err());
+        for offset in [1, 20_000, 59_999] {
+            touch_view_checkout(&paths, &family, &root, 2, later + offset).unwrap();
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "even a policy change must respect failure backoff"
+        );
+        fs::remove_file(blocked).unwrap();
+        touch_view_checkout(&paths, &family, &root, 2, later + 60_000).unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(read_json::<u32>(&policy).unwrap(), 2);
+    }
+
+    #[test]
+    fn views_idle_checkout_rechecks_pin_reader_database_and_session_holds() {
+        for hold in [
+            "pin", "reader", "database", "session", "late-pin", "late-use",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = temp.path().join("storage");
+            let root = bound_root(temp.path(), &storage, "main");
+            seed(
+                &storage,
+                &[
+                    ("main.text", "view", Some(&root)),
+                    ("main.callgraph", "view", Some(&root)),
+                ],
+            );
+            let graph = view_dir(&storage, "main.callgraph");
+            fill_view_dir(&graph);
+            let paths = StoragePaths::same(&storage);
+            let used = crate::pins::now_ms();
+            touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
+            let pin = (hold == "pin").then(|| write_pin(&graph, "g1", live_owner()));
+            let reader = (hold == "reader")
+                .then(|| crate::root_cache::ReadMarker::create(&graph, "g1").unwrap());
+            let database = (hold == "database").then(|| {
+                crate::db::file_identity::IdentityConnection::open(
+                    graph.join("graph.sqlite"),
+                    "idle checkout test",
+                )
+                .unwrap()
+            });
+            if hold == "session" {
+                let owner = live_owner();
+                with_registry(&storage, |tx| {
+                    tx.execute(
+                        "INSERT INTO view_sessions VALUES('in-flight','main.callgraph',?1,?2,0)",
+                        rusqlite::params![owner.pid, owner.start_time],
+                    )?;
+                    Ok(())
+                });
+            }
+            let late_graph = graph.clone();
+            let late_paths = paths.clone();
+            let hook = observe_test_hook(
+                &storage,
+                Arc::new(move |step| {
+                    if step == "v3-checkout-idle-before-recheck" {
+                        if hold == "late-pin" {
+                            write_pin(&late_graph, "g1", live_owner());
+                        }
+                        if hold == "late-use" {
+                            // The sweep already owns the reservation lock. Simulate
+                            // a request committed just before that lock was taken.
+                            let path = late_paths
+                                .artifacts
+                                .join("blobs/v3")
+                                .join(FAMILY)
+                                .join("members.sqlite");
+                            let connection = rusqlite::Connection::open(path).unwrap();
+                            connection
+                                .execute("UPDATE members SET last_bind_ms=?1", [used + 3_600_000])
+                                .unwrap();
+                        }
+                    }
+                }),
+            );
+            let report = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_600_000);
+            assert_eq!(report.removed_roots, 0, "{hold}: {report:?}");
+            assert_eq!(
+                member_scopes(&storage),
+                ["main.callgraph", "main.text"],
+                "{hold}"
+            );
+            drop((hook, reader, database));
+            if let Some(pin) = pin {
+                fs::remove_file(pin).unwrap();
+            }
+            if hold == "late-pin" {
+                fs::remove_file(crate::pins::pin_paths(&graph, "g1").0).unwrap();
+            }
+            with_registry(&storage, |tx| {
+                tx.execute("DELETE FROM view_sessions", [])?;
+                Ok(())
+            });
+            let released = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 7_200_000);
+            assert_eq!(released.removed_roots, 2, "{hold}: {released:?}");
+        }
+    }
+
+    #[test]
     fn v3_budget_evicts_idle_live_roots_lru_and_stops_at_budget() {
         let temp = tempfile::tempdir().unwrap();
         let temp = fs::canonicalize(temp.path()).unwrap();
@@ -14421,10 +14936,14 @@ mod v3_collector_tests {
             .collect::<Vec<_>>();
         seed(&storage, &members);
         with_registry(&storage, |tx| {
-            for (scope, bound) in [("z-oldest", 10), ("b-middle", 20), ("a-newest", 30)] {
+            for (scope, age) in [
+                ("z-oldest", 30_000),
+                ("b-middle", 20_000),
+                ("a-newest", 10_000),
+            ] {
                 tx.execute(
                     "UPDATE members SET last_bind_ms=?2 WHERE scope=?1",
-                    rusqlite::params![scope, bound],
+                    rusqlite::params![scope, crate::pins::now_ms() - age],
                 )?;
             }
             Ok(())
@@ -14685,7 +15204,7 @@ mod v3_collector_tests {
         // Every member was bound long ago except "recent".
         with_registry(&storage, |tx| {
             tx.execute(
-                "UPDATE members SET last_bind_ms=0 WHERE scope!='recent'",
+                "UPDATE members SET last_bind_ms=0 WHERE scope NOT IN ('recent','one-pass')",
                 [],
             )?;
             Ok(())
@@ -14753,6 +15272,17 @@ mod v3_collector_tests {
 
         fs::create_dir_all(&roots["reappeared"]).unwrap();
         fs::remove_dir(&roots["one-pass"]).unwrap();
+        with_registry(&storage, |tx| {
+            tx.execute(
+                "UPDATE members SET last_bind_ms=?1 WHERE scope='reappeared'",
+                [crate::pins::now_ms()],
+            )?;
+            tx.execute(
+                "UPDATE members SET last_bind_ms=0 WHERE scope='one-pass'",
+                [],
+            )?;
+            Ok(())
+        });
         let second = pass(&storage);
         assert!(pinned.load(Ordering::SeqCst), "the recheck hook never ran");
         assert_eq!(second.removed_roots, 2, "{second:?}");
