@@ -367,8 +367,8 @@ pub(crate) mod tests {
                         else {
                             // Withhold the reply until the client has timed out, then detect any retry.
                             tokio::time::sleep(Duration::from_millis(300)).await;
-                            if let Ok(frame) = tokio::time::timeout(Duration::from_millis(50), subc_transport::read_frame(&mut stream)).await {
-                                assert!(frame.unwrap().is_none(), "unexpected retry on route");
+                            if let Ok(has_byte) = tokio::time::timeout(Duration::from_millis(50), crate::synapse_embed::pause_test_support::has_next_frame_byte(&stream)).await {
+                                assert!(!has_byte, "unexpected retry on route");
                             }
                             assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
                         }

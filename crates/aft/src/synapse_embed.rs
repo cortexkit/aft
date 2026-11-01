@@ -618,7 +618,8 @@ pub(crate) mod pause_test_support {
                     assert_eq!(route_body["op"], "route.open");
                     assert!(route_body["identity"].get("project_root").is_none());
                     respond(&mut stream, &route, json!({"op":"route.open","route_channel":7,"route_epoch":1})).await;
-                    while let Some(request) = subc_transport::read_frame(&mut stream).await.unwrap() {
+                    while has_next_frame_byte(&stream).await {
+                        let request = subc_transport::read_frame(&mut stream).await.unwrap().expect("complete Synapse request after its first byte");
                         let value: Value = serde_json::from_slice(&request.body).unwrap();
                         let now = clock.load(Ordering::SeqCst);
                         let mut requests = recorded.lock().unwrap();
@@ -653,6 +654,31 @@ pub(crate) mod pause_test_support {
         let result = run(config, requests);
         server.join().unwrap();
         result
+    }
+
+    /// A closed Windows TCP peer can report reset instead of EOF. Probe only at
+    /// frame boundaries: once any byte arrives, the caller must decode the whole
+    /// frame, so a truncated request or retry cannot be mistaken for shutdown.
+    pub(crate) async fn has_next_frame_byte(stream: &tokio::net::TcpStream) -> bool {
+        match stream.peek(&mut [0u8; 1]).await {
+            Ok(count) => count != 0,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => false,
+            Err(error) => panic!("probe fake daemon frame boundary: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_boundary_probe_keeps_truncated_frames_visible() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        client.write_all(&[0x53]).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert!(has_next_frame_byte(&server).await);
+        assert!(subc_transport::read_frame(&mut server).await.is_err());
     }
 
     async fn respond(
