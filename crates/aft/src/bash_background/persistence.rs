@@ -1,3 +1,13 @@
+#[path = "scope_records.rs"]
+mod scope_records;
+use scope_records::read_task_file;
+#[cfg(target_os = "linux")]
+pub(crate) use scope_records::{
+    discover_storage_task_records, reread_storage_task_record, StorageTaskRecordCursor,
+    TaskRecordRef, TASK_SCOPE_RECORD_MAX_BYTES,
+};
+pub use scope_records::{read_task_at, write_task};
+
 #[cfg(unix)]
 use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
@@ -1931,6 +1941,8 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_scope_runtime_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) memory_policy: Option<super::memory_limit::MemoryPolicy>,
     /// Missing job-wide output ranges, independent of execution outcome.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2103,6 +2115,7 @@ impl PersistedTask {
             lifecycle_scope: None,
             remote: None,
             execution_note: None,
+            task_scope_runtime_ms: None,
             memory_policy: None,
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),
@@ -2287,6 +2300,7 @@ impl From<BashTaskRow> for PersistedTask {
             lifecycle_scope: None,
             remote: None,
             execution_note: None,
+            task_scope_runtime_ms: None,
             memory_policy: None,
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),
@@ -2405,6 +2419,21 @@ pub fn validate_task_id(task_id: &str) -> io::Result<()> {
     }
 }
 
+pub(crate) fn is_harness_store_name(name: &str) -> bool {
+    matches!(name, "opencode" | "pi" | "runner")
+        || name.starts_with("mcp--")
+        || name.starts_with("fed--")
+}
+
+#[cfg(unix)]
+pub(crate) fn task_store_root(session_dir: &Path) -> Option<&Path> {
+    let tasks = session_dir.parent()?;
+    if tasks.file_name()? != "bash-tasks" {
+        return None;
+    }
+    tasks.parent()
+}
+
 pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
     let session_hash = hash_session(session_id);
     let direct = storage_dir.join("bash-tasks").join(&session_hash);
@@ -2438,6 +2467,192 @@ pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
         return harness_matches.remove(0);
     }
     direct
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod scope_record_tests {
+    use super::*;
+
+    fn record(store: &Path, session: &str, id: &str, terminal: bool) {
+        let task = create_task_layout(store, session, id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            session.into(),
+            "sleep 60".into(),
+            store.into(),
+            None,
+            None,
+            false,
+            false,
+        );
+        if terminal {
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+        }
+        write_task_at(&task, &metadata).unwrap();
+    }
+
+    #[test]
+    fn task_scope_record_scan_covers_sessions_and_harnesses() {
+        let root = tempfile::tempdir().unwrap();
+        let stores = [
+            root.path().to_owned(),
+            root.path().join("opencode"),
+            root.path().join("pi"),
+            root.path().join("runner"),
+            root.path().join("mcp--fixture"),
+            root.path().join("fed--fixture"),
+        ];
+        let mut expected = std::collections::BTreeSet::new();
+        for (i, store) in stores.iter().enumerate() {
+            for j in 0..2 {
+                let id = format!("bash-{:016x}", expected.len() + 1);
+                record(store, &format!("store-{i}-session-{j}"), &id, i != 1);
+                expected.insert(id);
+            }
+            assert!(store.join("bash-tasks").is_dir());
+        }
+        let mut cursor = StorageTaskRecordCursor::new(root.path()).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sessions = std::collections::BTreeSet::new();
+        loop {
+            let batch = discover_storage_task_records(root.path(), &mut cursor).unwrap();
+            assert!(batch.entries_scanned <= 128 && batch.records.len() <= 128);
+            for row in batch.records {
+                sessions.insert(row.session_dir);
+                assert!(seen.insert(row.task_id));
+            }
+            if batch.finished {
+                break;
+            }
+        }
+        assert_eq!(seen, expected);
+        assert!(sessions
+            .iter()
+            .any(|path| path.starts_with(root.path().join("opencode/bash-tasks"))));
+        let store = &stores[1];
+        let mut cursor = StorageTaskRecordCursor::new(store).unwrap();
+        let mut count = 0;
+        loop {
+            let batch = discover_storage_task_records(store, &mut cursor).unwrap();
+            count += batch.records.len();
+            if batch.finished {
+                break;
+            }
+        }
+        assert_eq!(
+            count, 2,
+            "harness root ascended outside its ownership boundary"
+        );
+    }
+
+    #[test]
+    fn task_scope_record_scan_budget_resumes() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..300 {
+            record(root.path(), "budget", &format!("bash-{i:016x}"), true);
+            std::fs::write(
+                session_tasks_dir(root.path(), "budget").join(format!("invalid-{i}")),
+                "",
+            )
+            .unwrap();
+        }
+        let mut cursor = StorageTaskRecordCursor::new(root.path()).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut entries = 0;
+        let mut calls = 0;
+        loop {
+            let batch = discover_storage_task_records(root.path(), &mut cursor).unwrap();
+            calls += 1;
+            assert!(batch.entries_scanned <= 128 && batch.records.len() <= 128);
+            entries += batch.entries_scanned;
+            for row in batch.records {
+                assert!(seen.insert(row.task_id));
+            }
+            if batch.finished {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 300);
+        assert!(
+            entries >= 600 && calls >= 5,
+            "invalid entries did not consume budget"
+        );
+    }
+
+    #[test]
+    fn task_scope_record_scan_skips_oversized_body() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "bash-0000000000000001";
+        record(root.path(), "oversized", id, true);
+        let task = resolve_task(root.path(), "oversized", id).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&task.paths.json)
+            .unwrap()
+            .write_all(&vec![b' '; 1_048_576])
+            .unwrap();
+        work_counts::reset();
+        let mut cursor = StorageTaskRecordCursor::new(root.path()).unwrap();
+        let mut rows = Vec::new();
+        let mut oversized = 0;
+        loop {
+            let batch = discover_storage_task_records(root.path(), &mut cursor).unwrap();
+            oversized += batch.skipped_oversized;
+            rows.extend(batch.records);
+            if batch.finished {
+                break;
+            }
+        }
+        assert!(
+            rows.is_empty(),
+            "oversized record body granted scope ownership"
+        );
+        assert_eq!(oversized, 1);
+        assert!(cursor.rejected_task_ids.contains(id));
+        assert_eq!(
+            work_counts::get().metadata_reads,
+            0,
+            "oversized record body was read"
+        );
+    }
+
+    #[test]
+    fn task_scope_record_scan_refuses_foreign_or_unreadable_records() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let corrupt = "bash-0000000000000001";
+        let symlink = "bash-0000000000000002";
+        let duplicate = "bash-0000000000000003";
+        record(root.path(), "safe", corrupt, true);
+        let task = resolve_task(root.path(), "safe", corrupt).unwrap();
+        std::fs::write(&task.paths.json, "corrupt").unwrap();
+        record(foreign.path(), "foreign", symlink, true);
+        std::os::unix::fs::symlink(
+            session_tasks_dir(foreign.path(), "foreign").join(symlink),
+            session_tasks_dir(root.path(), "safe").join(symlink),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(foreign.path(), root.path().join("opencode")).unwrap();
+        record(root.path(), "safe", duplicate, true);
+        record(root.path(), "other", duplicate, false);
+        let mut cursor = StorageTaskRecordCursor::new(root.path()).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            let batch = discover_storage_task_records(root.path(), &mut cursor).unwrap();
+            rows.extend(batch.records);
+            if batch.finished {
+                break;
+            }
+        }
+        rows.retain(|row| !cursor.rejected_task_ids.contains(&row.task_id));
+        assert!(rows.is_empty(), "unsafe record granted ownership");
+        assert!(cursor.rejected_task_ids.contains(corrupt));
+        assert!(cursor.rejected_task_ids.contains(duplicate));
+    }
 }
 
 pub fn task_paths(storage_dir: &Path, session_id: &str, task_id: &str) -> io::Result<TaskPaths> {
@@ -2601,6 +2816,14 @@ pub fn resolve_uninitialized_task_layout(
 ) -> io::Result<ResolvedTask> {
     validate_task_id(task_id)?;
     let session = Arc::new(PinnedDir::open(session_dir)?);
+    resolve_task_layout_from_session(session, task_id)
+}
+
+fn resolve_task_layout_from_session(
+    session: Arc<PinnedDir>,
+    task_id: &str,
+) -> io::Result<ResolvedTask> {
+    let session_dir = session.path();
     let directory = session.open_dir_at(OsStr::new(task_id));
     let flat_name = OsString::from(format!("{task_id}.json"));
     let flat = open_metadata_through_replacement(&session, &flat_name);
@@ -3029,80 +3252,6 @@ pub(crate) fn task_temp_quiescent(metadata: &PersistedTask) -> bool {
     }
     // A spawn that failed before releasing a child has no process group.
     metadata.child_pid.is_none() && metadata.pgid.is_none()
-}
-
-pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
-    let name = match task.paths.layout {
-        TaskLayout::Directory => OsString::from(METADATA_FILE),
-        TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
-    };
-    let mut file = open_metadata_through_replacement(&task.dirs.control, &name)?;
-    let metadata = read_task_file(&mut file, &task.dirs.control.path().join(&name))?;
-    if metadata.task_id != task.paths.task_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "background task metadata identity does not match its layout name",
-        ));
-    }
-    Ok(metadata)
-}
-
-fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
-    #[cfg(test)]
-    work_counts::record_read();
-    file.seek(SeekFrom::Start(0))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    // Ordinary records need only the typed decode, not an allocated Value
-    // tree followed by the same parse again. On decode failure, still check
-    // the version before returning that error: future formats may have a
-    // different shape and must be refused, not quarantined as corrupt tasks.
-    #[cfg(test)]
-    work_counts::record_parse();
-    let decoded = decode_persisted_task(&content);
-    let version = match &decoded {
-        Ok(task) => Some(u64::from(task.schema_version)),
-        Err(_) => {
-            #[cfg(test)]
-            work_counts::record_parse();
-            serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|value| value.get("schema_version")?.as_u64())
-        }
-    };
-    crate::persisted_format::gate(
-        crate::persisted_format::PersistedStore::BashTask,
-        path,
-        path,
-        version,
-    )
-    .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
-    let task = decoded.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if !matches!(task.schema_version, 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "unsupported background task schema_version {} (expected 2, 3, 4, 5, 6, or {SCHEMA_VERSION})",
-                task.schema_version
-            ),
-        ));
-    }
-    validate_task_id(&task.task_id)?;
-    Ok(task)
-}
-
-pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
-    crate::production_storage::refuse_write(path)?;
-    validate_task_id(&task.task_id)?;
-    if let Some(parent) = path.parent() {
-        crate::private_storage::create_dir_all(parent)?;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dir = PinnedDir::open(parent)?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "metadata path has no name"))?;
-    write_task_in_dir(&dir, name, task, ReplaceSync::for_task(task))
 }
 
 pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Result<()> {

@@ -1433,7 +1433,7 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
         "fallback lost the cap from its submitted request"
     );
     drop(state);
-    let (_, _, _, _, saved_cap) =
+    let (_, _, _, _, saved_cap, _) =
         crate::sandbox_spawn::restore_local_launch(&saved_layout, &saved_digest).unwrap();
     assert_eq!(
         saved_cap,
@@ -6565,200 +6565,7 @@ fn persist_accepted_with_snapshot_cap(
     command: &str,
     memory_limit_mib: Option<u64>,
 ) -> (BgTaskRegistry, String, TaskPaths) {
-    let registry = registry();
-    let layout = allocate_task_layout(dir, "session").unwrap();
-    let task_id = layout.paths.task_id.clone();
-    let shell = resolve_posix_shell();
-    let environment = BTreeMap::from([(
-        std::ffi::OsString::from("ORIGINAL_PLAN"),
-        std::ffi::OsString::from("host-proof"),
-    )]);
-    let prepared = crate::sandbox_spawn::prepare_task_payload(
-        &layout,
-        command.as_bytes(),
-        dir,
-        dir,
-        &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
-        &shell,
-        &environment,
-    )
-    .unwrap();
-    let plan = SpawnPlan::Host {
-        shell_path: shell.clone(),
-        environment,
-    }
-    .with_prepared_task(prepared);
-    let digest = crate::sandbox_spawn::save_local_launch(
-        &plan,
-        dir,
-        dir,
-        &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
-        &shell,
-        false,
-        memory_limit_mib,
-    )
-    .unwrap();
-    let mut metadata = PersistedTask::starting(
-        task_id.clone(),
-        "session".into(),
-        command.into(),
-        dir.into(),
-        Some(dir.into()),
-        Some(30000),
-        true,
-        false,
-    );
-    metadata.status = BgTaskStatus::Running;
-    metadata.execution_note = Some("ran remotely on ck-motor".into());
-    metadata.remote = Some(RemoteTask {
-        submission: None,
-        accepted_platform: None,
-        explicit_runon: false,
-        connection_file: Some(connection),
-        harness: "runner".into(),
-        session: "session".into(),
-        requested_platform: None,
-        requested_vcpus: None,
-        requested_network: false,
-        granted_network: false,
-        accepted: true,
-        started: None,
-        job_id: None,
-        last_seq: None,
-        gap_recovery: None,
-        undelivered_output: Vec::new(),
-        stdout_len: 0,
-        stderr_len: 0,
-        unknown_len: 0,
-        cancel_requested: false,
-        cancel_pending: false,
-        owner_pause_cancel: None,
-        terminal: None,
-        pre_start_refusal: None,
-        fallback_digest: Some(digest),
-        env_not_forwarded: None,
-        queue_position: None,
-        queue_wait_ms: None,
-        output_received: false,
-        retry: None,
-        output_incomplete: None,
-        workspace_holder: None,
-        return_paths: Vec::new(),
-        returned_files: None,
-        return_first_seq: None,
-        return_staging: Default::default(),
-        return_max_bytes: exec::return_max_bytes(),
-        return_cap_retried: false,
-        expired_gap_unverified: Vec::new(),
-    });
-    let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
-    write_task_at(&layout, &metadata).unwrap();
-    registry
-        .insert_rehydrated_task(metadata, layout.paths.clone(), false)
-        .unwrap();
-    let task = registry.task(&task_id).unwrap();
-    task.state.lock().unwrap().io_handles = Some(handles);
-    let mut sink = TaskSink::new(&registry, task).unwrap();
-    sink.accepted(&Accepted::new(id(), 1)).unwrap();
-    (registry, task_id, layout.paths)
-}
-
-fn restarted_context(dir: &Path) -> crate::context::AppContext {
-    restarted_context_with_runon(dir, true)
-}
-
-fn finished_remote_for_cancel(
-    dir: &Path,
-    connection: PathBuf,
-    record: TerminalRecord,
-) -> (BgTaskRegistry, String, TaskPaths) {
-    let (registry, task_id, paths) =
-        persist_accepted_with_snapshot(dir, connection, "printf remote");
-    let task = registry.task(&task_id).unwrap();
-    task.state.lock().unwrap().metadata.scope = Some(owner_scope("unknown-outcome"));
-    let verdict = exec::grade(&record);
-    TaskSink::new(&registry, task.clone())
-        .unwrap()
-        .terminal(&record, &verdict)
-        .unwrap();
-    registry.remote_terminal(&task, verdict, None);
-    (registry, task_id, paths)
-}
-
-fn cancel_requests(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
-    daemon
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, body)| body["method"] == "exec.cancel")
-        .map(|(_, body)| body.clone())
-        .collect()
-}
-
-fn delivered_unknown_restart_fixture(
-    dir: &Path,
-    connection: PathBuf,
-    expired: bool,
-) -> (String, TaskPaths, crate::context::AppContext) {
-    let storage = dir.join("store");
-    let namespace = storage.join("opencode");
-    let project = dir.join("project");
-    fs::create_dir_all(&namespace).unwrap();
-    fs::create_dir_all(&project).unwrap();
-    let (registry, task, paths) =
-        finished_remote_for_cancel(&namespace, connection, cancel_unknown_terminal());
-    registry.detach();
-    drop(registry);
-    let mut metadata = read_task(&paths.json).unwrap();
-    metadata.project_root = Some(project.clone());
-    metadata.workdir = project.clone();
-    metadata.harness = Some("opencode".into());
-    metadata.scope.as_mut().unwrap().scope_epoch = 9;
-    metadata.completion_delivered = true;
-    if expired {
-        metadata.started_at = 0;
-    }
-    write_task(&paths.json, &metadata).unwrap();
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        crate::config::Config {
-            project_root: Some(project.clone()),
-            storage_dir: Some(storage),
-            harness: Some(crate::harness::Harness::Opencode),
-            ..Default::default()
-        },
-    );
-    ctx.bash_background()
-        .set_harness(crate::harness::Harness::Opencode);
-    ctx.bash_background()
-        .replay_session_for_project(&namespace, "session", &project)
-        .unwrap();
-    assert!(
-        !ctx.bash_background().holds_task(&task),
-        "project replay must skip the delivered terminal"
-    );
-    (task, paths, ctx)
-}
-
-async fn kill_restarted_unknown(
-    ctx: crate::context::AppContext,
-    task: String,
-    session: &str,
-    scope: Option<subc_protocol::scope::ScopeStamp>,
-) -> crate::protocol::Response {
-    let request = crate::protocol::RawRequest {
-        id: "restart-unknown-kill".into(),
-        command: "bash_kill".into(),
-        lsp_hints: None,
-        session_id: Some(session.into()),
-        params: serde_json::json!({"task_id": task}),
-    };
-    tokio::task::spawn_blocking(move || {
-        super::super::with_scope_spawn(scope, || crate::commands::bash_kill::handle(&request, &ctx))
-    })
-    .await
-    .unwrap()
+    persist_accepted_with_snapshot_scope(dir, connection, command, memory_limit_mib, false, 86400)
 }
 
 #[tokio::test]
@@ -7204,12 +7011,18 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
         } else {
             let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
             let remote = task.state.lock().unwrap().metadata.remote.clone().unwrap();
-            let (plan, shell_path, env, linux_scope, memory_limit_mib) =
-                crate::sandbox_spawn::restore_local_launch(
-                    &layout,
-                    remote.fallback_digest.as_deref().unwrap(),
-                )
-                .unwrap();
+            let (
+                plan,
+                shell_path,
+                env,
+                linux_scope,
+                memory_limit_mib,
+                linux_scope_max_runtime_secs,
+            ) = crate::sandbox_spawn::restore_local_launch(
+                &layout,
+                remote.fallback_digest.as_deref().unwrap(),
+            )
+            .unwrap();
             let request = exec::build_request(
                 dir.path(),
                 dir.path(),
@@ -7229,6 +7042,7 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
                             shell_path,
                             env,
                             linux_scope,
+                            linux_scope_max_runtime_secs,
                             memory_limit_mib,
                             capture_pipeline: false,
                         },
@@ -18289,3 +18103,105 @@ async fn agent_commands_runon_never_declares_a_local_root() {
     );
     connection.stop().await;
 }
+
+fn restarted_context(dir: &Path) -> crate::context::AppContext {
+    restarted_context_with_runon(dir, true)
+}
+
+fn finished_remote_for_cancel(
+    dir: &Path,
+    connection: PathBuf,
+    record: TerminalRecord,
+) -> (BgTaskRegistry, String, TaskPaths) {
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir, connection, "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    task.state.lock().unwrap().metadata.scope = Some(owner_scope("unknown-outcome"));
+    let verdict = exec::grade(&record);
+    TaskSink::new(&registry, task.clone())
+        .unwrap()
+        .terminal(&record, &verdict)
+        .unwrap();
+    registry.remote_terminal(&task, verdict, None);
+    (registry, task_id, paths)
+}
+
+fn cancel_requests(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.cancel")
+        .map(|(_, body)| body.clone())
+        .collect()
+}
+
+fn delivered_unknown_restart_fixture(
+    dir: &Path,
+    connection: PathBuf,
+    expired: bool,
+) -> (String, TaskPaths, crate::context::AppContext) {
+    let storage = dir.join("store");
+    let namespace = storage.join("opencode");
+    let project = dir.join("project");
+    fs::create_dir_all(&namespace).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let (registry, task, paths) =
+        finished_remote_for_cancel(&namespace, connection, cancel_unknown_terminal());
+    registry.detach();
+    drop(registry);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.project_root = Some(project.clone());
+    metadata.workdir = project.clone();
+    metadata.harness = Some("opencode".into());
+    metadata.scope.as_mut().unwrap().scope_epoch = 9;
+    metadata.completion_delivered = true;
+    if expired {
+        metadata.started_at = 0;
+    }
+    write_task(&paths.json, &metadata).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.clone()),
+            storage_dir: Some(storage),
+            harness: Some(crate::harness::Harness::Opencode),
+            ..Default::default()
+        },
+    );
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Opencode);
+    ctx.bash_background()
+        .replay_session_for_project(&namespace, "session", &project)
+        .unwrap();
+    assert!(
+        !ctx.bash_background().holds_task(&task),
+        "project replay must skip the delivered terminal"
+    );
+    (task, paths, ctx)
+}
+
+async fn kill_restarted_unknown(
+    ctx: crate::context::AppContext,
+    task: String,
+    session: &str,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+) -> crate::protocol::Response {
+    let request = crate::protocol::RawRequest {
+        id: "restart-unknown-kill".into(),
+        command: "bash_kill".into(),
+        lsp_hints: None,
+        session_id: Some(session.into()),
+        params: serde_json::json!({"task_id": task}),
+    };
+    tokio::task::spawn_blocking(move || {
+        super::super::with_scope_spawn(scope, || crate::commands::bash_kill::handle(&request, &ctx))
+    })
+    .await
+    .unwrap()
+}
+
+#[path = "remote_scope_tests.rs"]
+mod scope_tests;
+use scope_tests::persist_accepted_with_snapshot_scope;

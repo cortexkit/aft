@@ -15,6 +15,7 @@ pub mod pty_runtime;
 pub mod registry;
 pub(crate) mod shell_metadata;
 pub(crate) mod store_writes;
+pub(crate) mod task_scope;
 mod temp_cleanup;
 pub(crate) mod viewed_task;
 pub mod watch_lines;
@@ -1369,6 +1370,11 @@ pub(crate) fn spawn_with_secrets(
     {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
+    ctx.bash_background().configure_task_scope_runtime(
+        ctx.is_daemon_mode(),
+        Duration::from_secs(config.bash.linux_scope_max_runtime_secs),
+    );
+    env.remove(registry::LINUX_SCOPE_ENV);
     enter_runon_phase("sandbox_preflight");
     let task_kind = if pty {
         SandboxTaskKind::BashPty
@@ -1602,6 +1608,7 @@ pub(crate) fn spawn_with_secrets(
             notify_on_completion,
             compressed,
             project_root.clone(),
+            config.bash.linux_scope,
         )
     });
     #[cfg(not(unix))]
@@ -1647,6 +1654,7 @@ pub(crate) fn spawn_with_secrets(
             notify_on_completion,
             compressed,
             project_root,
+            config.bash.linux_scope,
         )
     };
     #[cfg(unix)]

@@ -4483,29 +4483,6 @@ enum ModuleLoopExit {
     SkipSearchFlush,
 }
 
-/// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
-/// owns an isolated current-thread tokio runtime on a dedicated, explicitly
-/// sized stack for the async transport. The caller joins that thread.
-/// Returns `Err` (fail-loud) on any connect/auth/protocol failure — we never
-/// fall back to the standalone loop, to avoid split-brain index state.
-pub fn run_subc_mode(
-    connection_file_path: &Path,
-    ctx: Arc<AppContext>,
-    executor: Arc<Executor>,
-    dispatch: DispatchFn,
-    user_config_path: Option<PathBuf>,
-) -> Result<(), SubcError> {
-    perf_sweep::initialize();
-    run_subc_mode_with_probe(
-        connection_file_path,
-        ctx,
-        executor,
-        dispatch,
-        user_config_path,
-        None,
-    )
-}
-
 /// Production-wire test entry with an owned health-publication rendezvous.
 #[doc(hidden)]
 pub fn run_subc_mode_for_test_with_health_rollup_probe(
@@ -4637,6 +4614,11 @@ fn run_subc_mode_on_runtime_thread(
         if crate::launch_nonce::current().is_some() {
             crate::agent_commands::enable(&storage_dir);
         }
+        let base_task_scope_runtime = Some((
+            ctx.bash_background().clone(),
+            Duration::from_secs(ctx.config().bash.linux_scope_max_runtime_secs),
+            ctx.storage_dir(),
+        ));
         drop(ctx);
         // Saved paused tasks may still owe their runner a cancel; send those
         // now rather than when (if ever) their projects bind again.
@@ -4652,7 +4634,7 @@ fn run_subc_mode_on_runtime_thread(
         );
         let (read_half, write_half) = tokio::io::split(stream);
         heap_module_future(|| {
-            run_module_loop(
+            run_module_loop_with_task_scopes(
                 read_half,
                 write_half,
                 connection_file_path,
@@ -4664,6 +4646,7 @@ fn run_subc_mode_on_runtime_thread(
                 tool_response_body_limit,
                 lifecycle_probe,
                 &storage_dir,
+                base_task_scope_runtime,
                 // The exit phase below takes and shuts down every root's servers.
                 QuiescedLsp::LeaveForExitSweep,
                 Some(dispatch_path_metrics),
@@ -5250,18 +5233,16 @@ async fn drain_pending_route_bind_completions(
     Ok(drained)
 }
 
-// Construct the large protocol future in a separate stack frame, then keep its
-// state on the heap while polling. Native Windows main threads have a smaller
-// default stack than Rust worker threads, and must still handle ordinary calls.
-#[inline(never)]
-fn heap_module_future<F: std::future::Future>(build: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    Box::pin(build())
-}
+#[path = "task_scope_runtime.rs"]
+mod task_scope_runtime;
+use task_scope_runtime::heap_module_future;
+#[cfg(test)]
+use task_scope_runtime::run_module_loop;
+pub use task_scope_runtime::run_subc_mode;
 
-/// ModuleHello → HelloAck → control/route loop. Runs until the daemon closes
-/// the connection (EOF), sends channel-0 Goodbye, or a fatal mutating executor
-/// response requests whole-connection teardown.
-async fn run_module_loop<R, W>(
+/// Runs the `ModuleHello` → `HelloAck` sequence and the control/route loop.
+/// Stops on connection EOF, channel-0 Goodbye, or an executor response that requests whole-connection teardown.
+async fn run_module_loop_with_task_scopes<R, W>(
     mut read: R,
     mut write: W,
     connection_file_path: &Path,
@@ -5273,6 +5254,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    base_task_scope_runtime: Option<(crate::bash_background::BgTaskRegistry, Duration, PathBuf)>,
     connection_end_lsp: QuiescedLsp,
     runtime_metrics: Option<Arc<DispatchPathMetrics>>,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
@@ -5350,6 +5332,13 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
+    if let Some((registry, max_runtime, storage_dir)) = base_task_scope_runtime.as_ref() {
+        registry.configure_task_scope_runtime(
+            shared_app.subc_connection_file().is_some(),
+            *max_runtime,
+        );
+        registry.start_task_scope_cleanup(storage_dir);
+    }
     #[cfg(test)]
     let dispatch_path_metrics = watchdog_test
         .as_ref()
@@ -23051,7 +23040,7 @@ mod compile_fence_tests {
     fn frame_loop_contains_no_direct_stderr_io() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")
@@ -23405,7 +23394,7 @@ mod writer_setup_tests {
             .unwrap();
         assert!(!reader.contains("tool_received"));
         let loop_source = source
-            .split("async fn run_module_loop<R, W>(")
+            .split("async fn run_module_loop_with_task_scopes<")
             .nth(1)
             .unwrap()
             .split("fn classify_connection_end")

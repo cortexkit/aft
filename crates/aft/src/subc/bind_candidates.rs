@@ -502,7 +502,7 @@ mod tests {
     fn candidate_interception_precedes_all_admission_and_ready_frames_precede_new_ingress() {
         let source = include_str!("mod.rs");
         let body = source
-            .split_once("async fn run_module_loop<")
+            .split_once("async fn run_module_loop_with_task_scopes<")
             .unwrap()
             .1
             .split_once("fn classify_connection_end(")
