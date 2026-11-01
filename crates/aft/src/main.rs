@@ -1542,8 +1542,7 @@ fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
     let _publication_gate = aft::executor::standalone_request_gate();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
-    let (watcher_pending, callgraph_pending) =
-        aft::response_finalize::query_pending(ctx, &req.command);
+    let (watcher_pending, callgraph_pending) = standalone_reads::query_pending(ctx, &req.command);
     let mut response = dispatch_command(req, ctx);
     aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
     aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
@@ -1907,10 +1906,7 @@ fn dispatch_outcome_on_route(
     // snapshot even if a live config reload publishes while it runs.
     let _config_pin = ctx.pin_config();
     aft::commands::tool_call::register_dispatch(dispatch);
-    let command = tool_call_name(&req)
-        .unwrap_or(&req.command)
-        .strip_prefix("aft_")
-        .unwrap_or_else(|| tool_call_name(&req).unwrap_or(&req.command));
+    let command = standalone_reads::request_command(&req);
     if let Some(lane) = aft::executor::parallel_tool_lane(command) {
         // Earlier mutations finish inline. If an edit offloads validation, the
         // frame loop holds later reads until that edit's reply is delivered.

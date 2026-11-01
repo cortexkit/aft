@@ -945,6 +945,11 @@ pub fn drain_search_index_events(ctx: &AppContext) {
 }
 
 pub fn drain_callgraph_store_events(ctx: &AppContext) {
+    // A waiting query owns consumption through installation. Maintenance must
+    // yield, not steal its event or hold the frame loop behind the query wait.
+    let Some(_install) = ctx.callgraph_store_install.try_lock() else {
+        return;
+    };
     let (
         latest,
         denied,
@@ -6058,6 +6063,62 @@ mod tests {
                     .is_some(),
             "a later operation must be able to retry the callgraph build"
         );
+    }
+
+    #[test]
+    fn callgraph_query_wait_joins_in_flight_drain_installation() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(project_root.clone());
+        let key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &key, false);
+        let store = CallGraphStore::open(ctx.callgraph_store_dir(), project_root).unwrap();
+        store.cold_build(&[source]).unwrap();
+        let token = ctx.mark_callgraph_store_force_rebuild("replace published store");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        ctx.note_callgraph_store_rx_generation(ctx.configure_generation());
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store,
+            fulfilled_force_token: Some(token),
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drop(tx);
+        let _wait = crate::context::override_callgraph_build_wait_ms_for_test(&ctx, 10_000);
+        let (reached, release) = install_artifact_drain_commit_gate_for_test(&ctx);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_callgraph_store_events(&drain_ctx));
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let query_ctx = Arc::clone(&ctx);
+        let query = std::thread::spawn(move || {
+            result_tx.send(query_ctx.callgraph_store_for_ops()).unwrap();
+        });
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        let result =
+            early.unwrap_or_else(|_| result_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        query.join().unwrap();
+        assert!(
+            matches!(result, crate::context::CallgraphStoreAccess::Ready(_)),
+            "a bounded query must join installation, not report a consumed completion as building"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
     }
 
     #[test]

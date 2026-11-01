@@ -5,6 +5,7 @@ use aft::executor::{Executor, ExecutorConfig, JobCancellation, Lane};
 use aft::path_identity::ProjectRootId;
 use aft::protocol::{RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +17,52 @@ const LANE_CAP: usize = 256;
 /// was never queued, so retrying is safe.
 const STANDALONE_READS_BUSY: &str =
     "Too many calls are waiting on this project; retry after some finish.";
+
+type QueryPending = (bool, Option<aft::context::CallgraphUnappliedChanges>);
+
+struct PreparedQuery {
+    context: usize,
+    command: String,
+    pending: QueryPending,
+}
+
+thread_local! {
+    static PREPARED_QUERY: RefCell<Option<PreparedQuery>> = const { RefCell::new(None) };
+}
+
+struct PreparedQueryScope(Option<PreparedQuery>);
+
+impl PreparedQueryScope {
+    fn install(prepared: PreparedQuery) -> Self {
+        Self(PREPARED_QUERY.with(|slot| slot.replace(Some(prepared))))
+    }
+}
+
+impl Drop for PreparedQueryScope {
+    fn drop(&mut self) {
+        PREPARED_QUERY.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
+pub(super) fn request_command(req: &RawRequest) -> &str {
+    let command = super::tool_call_name(req).unwrap_or(&req.command);
+    command.strip_prefix("aft_").unwrap_or(command)
+}
+
+pub(super) fn query_pending(ctx: &AppContext, command: &str) -> QueryPending {
+    PREPARED_QUERY
+        .with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|prepared| {
+                prepared.context == ctx as *const AppContext as usize && prepared.command == command
+            }) {
+                slot.take().map(|prepared| prepared.pending)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| aft::response_finalize::query_pending(ctx, command))
+}
 
 pub(super) struct StandaloneReads {
     executor: Arc<Executor>,
@@ -101,6 +148,17 @@ impl StandaloneReads {
         let ask_route = aft::access_policy::capture_ask_route();
         let worker_session = req.session_id.clone();
         let worker_ctx = Arc::clone(ctx);
+        // The frame loop has just applied its bounded pre-read drains. Capture
+        // pending watcher and callgraph changes before maintenance resumes:
+        // even an empty watcher drain is conservatively pending while in
+        // flight. Wrapped tools consume this snapshot in their inner dispatch,
+        // not in the tool_call envelope.
+        let query_command = request_command(&req);
+        let prepared = PreparedQuery {
+            context: Arc::as_ptr(ctx) as usize,
+            command: query_command.to_owned(),
+            pending: aft::response_finalize::query_pending(ctx, query_command),
+        };
         #[cfg(test)]
         let probe = self.probe.clone();
         self.executor.submit_tool_call_with_completion(
@@ -115,6 +173,7 @@ impl StandaloneReads {
                 let _publication = aft::executor::install_standalone_scope(worker_ctx);
                 let _ask_route = ask_route.install();
                 let _config = ctx.pin_config_to(config);
+                let _prepared = PreparedQueryScope::install(prepared);
                 if expired(deadline) {
                     return deadline_response(&req.id);
                 }
@@ -406,6 +465,71 @@ mod tests {
             for response in finish(&ctx, &mut pending) {
                 assert!(response.success, "{response:?}");
                 assert!(response.data.to_string().contains(symbol), "{response:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_reads_capture_gaps_before_the_frame_loop_resumes_draining() {
+        for wrapped in [false, true] {
+            for already_pending in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let file = root.path().join("fixture.rs");
+                std::fs::write(&file, "fn marker() {}\n").unwrap();
+                let ctx = fixture(root.path());
+                let (tx, rx) = crossbeam_channel::unbounded();
+                *ctx.watcher_rx().lock() = Some(rx);
+                if already_pending {
+                    tx.send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![file]))
+                        .unwrap();
+                }
+                let mut reads = StandaloneReads::new();
+                let gate = Arc::new((Mutex::new(false), Condvar::new()));
+                let release = Release(Arc::clone(&gate));
+                let (reached_tx, reached_rx) = mpsc::channel();
+                reads.probe = Some(Arc::new(move |_| {
+                    reached_tx.send(()).unwrap();
+                    let mut released = gate.0.lock().unwrap();
+                    while !*released {
+                        released = gate.1.wait(released).unwrap();
+                    }
+                }));
+                let params = serde_json::json!({"pattern":"marker", "path":"fixture.rs"});
+                let req = if wrapped {
+                    request(
+                        "query",
+                        "tool_call",
+                        serde_json::json!({
+                            "name":"grep", "arguments":params
+                        }),
+                    )
+                } else {
+                    request("query", "grep", params)
+                };
+                let mut pending = PendingResponses::default();
+                register(
+                    &mut pending,
+                    super::super::dispatch_outcome(req, &ctx, &reads),
+                );
+                reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                // An empty receiver held by maintenance used to look pending
+                // only because the worker captured watcher-change state after
+                // admission. Real pending events must still be disclosed.
+                let watcher = ctx.watcher_rx().lock();
+                drop(release);
+                let responses = finish(&ctx, &mut pending);
+                drop(watcher);
+                assert_eq!(responses.len(), 1);
+                let response = &responses[0];
+                assert!(response.success, "{response:?}");
+                assert_eq!(
+                    response
+                        .data
+                        .to_string()
+                        .contains("Watcher changes pending:"),
+                    already_pending,
+                    "wrapped={wrapped}: {response:?}"
+                );
             }
         }
     }
