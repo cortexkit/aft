@@ -1,0 +1,12 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Semantic touch skips publication when rows are current; fenced semantic_search/mod.rs changes are opt-in test measurement only; benchmark readiness harness fix keeps scored replies byte-identical Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
