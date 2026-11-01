@@ -17,6 +17,7 @@ function gate() {
 
 async function rig(boundary: "session" | "permission") {
   _resetSubagentCacheForTest();
+  const directory = process.cwd();
   const entered = gate();
   const resume = gate();
   const retiring = gate();
@@ -29,7 +30,7 @@ async function rig(boundary: "session" | "permission") {
       calls.push(name);
       return { success: true, text: "written" };
     },
-    getCwd: () => "/fixture/reload",
+    getCwd: () => directory,
     getCachedStatus: () => null,
     cacheStatusSnapshot: () => {},
   };
@@ -53,7 +54,7 @@ async function rig(boundary: "session" | "permission") {
     poolOptions: {},
     configOverrides: {},
   };
-  const location = await acquireBridge("/fixture/reload", options, {
+  const location = await acquireBridge(directory, options, {
     createPool: async () => owner,
   });
   const tools = new Map<string, V2ProviderTool>();
@@ -63,7 +64,7 @@ async function rig(boundary: "session" | "permission") {
   };
   const scope = await Effect.runPromise(Scope.make());
   const host = {
-    location: { directory: "/fixture/reload" },
+    location: { directory },
     permission: { assert: () => Effect.void },
     session: {
       get: () => Effect.promise(async () => {
@@ -130,7 +131,7 @@ async function rig(boundary: "session" | "permission") {
     calls, entered, resume, retiring, invoke, dispose, location,
     disposedConsumers: () => disposedConsumers,
     shutdowns: () => shutdowns,
-    replace: () => acquireBridge("/fixture/reload", options, { createPool: async () => owner }),
+    replace: () => acquireBridge(directory, options, { createPool: async () => owner }),
   };
 }
 
