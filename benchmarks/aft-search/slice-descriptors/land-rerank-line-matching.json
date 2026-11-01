@@ -1,0 +1,13 @@
+{
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs"
+  ],
+  "note": "MatchingSource::best_line skips lines whose score upper bound cannot beat the current best (ties keep the earlier line) and stops at a perfect score; candidate_text gains a cost-phase probe. The chosen line, ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
