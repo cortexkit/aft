@@ -4,6 +4,25 @@ use super::*;
 pub use super::download::{DownloadFailure, Response, Transport};
 pub use super::storage::{stored_path, StorageFault};
 
+pub fn publish_verified_artifact(
+    root: &std::path::Path,
+    manifest: &GrammarManifest,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if !super::storage::verified(manifest, bytes) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "test grammar failed verification",
+        ));
+    }
+    super::storage::Storage {
+        root: root.to_path_buf(),
+        fault: StorageFault::None,
+    }
+    .publish(manifest, bytes)
+    .map(|_| ())
+}
+
 pub struct TestOptions {
     pub manifest: GrammarManifest,
     pub storage_root: std::path::PathBuf,
