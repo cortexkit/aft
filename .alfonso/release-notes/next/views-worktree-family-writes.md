@@ -1,0 +1,1 @@
+- With views enabled, linked worktrees can reuse the main checkout's older indexes without spurious read-only write warnings or rebuilding the same content.

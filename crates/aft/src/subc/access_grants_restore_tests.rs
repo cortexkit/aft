@@ -22,6 +22,14 @@ fn in_isolated_process(test: &str) -> bool {
     false
 }
 
+fn runner_text(body: &Value, is_error: bool) -> &str {
+    assert_eq!(body["isError"], is_error, "{body}");
+    assert!(body.get("structuredContent").is_none(), "{body}");
+    body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("runner reply has no model-facing text: {body}"))
+}
+
 struct WireRestore {
     daemon: tokio::io::DuplexStream,
     module: Option<std::thread::JoinHandle<Result<ModuleLoopExit, SubcError>>>,
@@ -256,7 +264,10 @@ async fn grants_future_write_target_survives_revive_and_creates_directory() {
         .await;
     let revived = wire.reply(99, Duration::from_secs(5)).await.unwrap();
     let revived: Value = serde_json::from_slice(&revived.body).unwrap();
-    assert_eq!(revived["structuredContent"]["success"], true, "{revived}");
+    assert!(
+        runner_text(&revived, false).contains("checkout content"),
+        "{revived}"
+    );
     assert!(!target.exists(), "revival must not create the destination");
     wire.call_tool_with_deadline(
         100,
@@ -269,7 +280,7 @@ async fn grants_future_write_target_survives_revive_and_creates_directory() {
     .await;
     let reply = wire.reply(100, Duration::from_secs(5)).await.unwrap();
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+    runner_text(&body, false);
     assert_eq!(
         std::fs::read_to_string(target.join("created.txt")).unwrap(),
         "created"
@@ -301,10 +312,11 @@ async fn grants_restore_cannot_extend_caller_start_deadline() {
         !marker.exists(),
         "command started after its caller's deadline: {body}"
     );
-    assert_eq!(
-        body["structuredContent"]["code"], "bash_start_deadline",
-        "{body}"
-    );
+    // The sentence names whichever startup step ran out of time; every
+    // variant says the command was not started. This route declares no
+    // result format, so a runner gets no typed code here, only the text.
+    let text = runner_text(&body, true);
+    assert!(text.contains("command was not started"), "{text}");
 }
 
 #[test]
@@ -435,8 +447,10 @@ async fn grants_stalled_restore_allows_checkout_read() {
     drop(stall);
     wire.stop().await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
-    assert!(body.to_string().contains("checkout content"), "{body}");
+    assert!(
+        runner_text(&body, false).contains("checkout content"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -475,8 +489,10 @@ async fn grants_stalled_restore_allows_independently_granted_read() {
     drop(stall);
     wire.stop().await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
-    assert!(body.to_string().contains("independent content"), "{body}");
+    assert!(
+        runner_text(&body, false).contains("independent content"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -529,17 +545,14 @@ async fn grants_stalled_restore_runs_bash_with_reduced_profile() {
     wire.stop().await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert!(ran, "checkout bash did not run: {body}");
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
-    let notices = body["structuredContent"]["unrestored_grants"]
-        .as_array()
-        .expect("structured grant notice");
-    let grant = notices
-        .iter()
-        .find(|grant| grant["path"] == json!(target))
-        .unwrap();
-    assert_eq!(grant["mode"], "write");
-    assert_eq!(grant["retryable"], true);
-    let text = body["content"][0]["text"].as_str().unwrap();
+    let text = runner_text(&body, false);
+    assert!(
+        text.contains(&format!(
+            "{} (write: temporarily unavailable; may be retried; retryable=true)",
+            target.display()
+        )),
+        "{text}"
+    );
     assert!(text.starts_with("Unrestored launch grants:"), "{text}");
     assert!(text.contains(&target.display().to_string()), "{text}");
     assert!(text.contains("temporarily unavailable"), "{text}");
@@ -575,20 +588,14 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
     let first = wire.reply(100, Duration::from_secs(15)).await.unwrap();
     let first: Value = serde_json::from_slice(&first.body).unwrap();
     assert!(marker.exists(), "{first}");
-    assert_eq!(first["structuredContent"]["success"], true, "{first}");
-    let notices = first["structuredContent"]["unrestored_grants"]
-        .as_array()
-        .unwrap();
-    let missing = notices
-        .iter()
-        .find(|grant| grant["path"] == json!(target))
-        .unwrap();
-    assert_eq!(missing["mode"], "write");
-    assert_eq!(missing["retryable"], false, "{first}");
-    assert!(first["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("no longer exists"));
+    let text = runner_text(&first, false);
+    assert!(
+        text.contains(&format!(
+            "{} (write: no longer exists; retryable=false)",
+            target.display()
+        )),
+        "{text}"
+    );
     assert_eq!(wire.ctx.launch_grant_state.probe_count(&target), 1);
 
     std::fs::create_dir(&target).unwrap();
@@ -604,9 +611,9 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
     let second = wire.reply(102, Duration::from_secs(15)).await.unwrap();
     let second: Value = serde_json::from_slice(&second.body).unwrap();
     assert!(marker.exists(), "{second}");
-    assert_eq!(second["structuredContent"]["success"], true, "{second}");
+    let text = runner_text(&second, false);
     assert!(
-        second["structuredContent"]["unrestored_grants"].is_null(),
+        !text.contains("Unrestored launch grants:"),
         "notice must appear once: {second}"
     );
     assert_eq!(
@@ -617,13 +624,11 @@ async fn grants_deleted_target_is_not_reprobed_or_regranted() {
     wire.call(103).await;
     let read = wire.reply(103, Duration::from_secs(3)).await.unwrap();
     let read: Value = serde_json::from_slice(&read.body).unwrap();
-    assert_eq!(
-        read["structuredContent"]["code"], "grants_unavailable",
-        "{read}"
-    );
-    assert_eq!(
-        read["structuredContent"]["detail"]["retryable"], false,
-        "{read}"
+    let text = runner_text(&read, true);
+    assert!(text.contains(&target.display().to_string()), "{text}");
+    assert!(
+        text.contains("no longer exists; this saved grant cannot be restored"),
+        "{text}"
     );
     let next_epoch = at_epoch(&wire.revived, 9);
     restore_launch(&next_epoch, &wire.ctx, "worker").unwrap();
@@ -802,11 +807,10 @@ async fn grants_stalled_restore_refuses_within_deadline_without_partial_grants()
     wire.stop().await;
     let reply = reply.expect("stalled launch restoration did not refuse within its deadline");
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    let response = &body["structuredContent"];
-    assert_eq!(response["success"], false, "{body}");
-    assert_eq!(response["code"], "grants_unavailable", "{body}");
-    assert_eq!(response["detail"]["retryable"], true, "{body}");
-    assert_eq!(response["detail"]["path"], json!(target), "{body}");
+    let text = runner_text(&body, true);
+    assert!(text.contains("launch grant"), "{text}");
+    assert!(text.contains(&target.display().to_string()), "{text}");
+    assert!(text.contains("retry after the path recovers"), "{text}");
 }
 
 #[tokio::test]
@@ -832,8 +836,10 @@ async fn grants_stalled_restore_retries_after_path_recovers() {
     wire.call(102).await;
     let recovered = wire.reply(102, Duration::from_secs(3)).await.unwrap();
     let body: Value = serde_json::from_slice(&recovered.body).unwrap();
-    assert_eq!(body["structuredContent"]["success"], true, "{body}");
-    assert!(body.to_string().contains("granted content"), "{body}");
+    assert!(
+        runner_text(&body, false).contains("granted content"),
+        "{body}"
+    );
     let db = wire.ctx.db().unwrap();
     let grants = store::list(&db.lock().unwrap(), &scope_key(&wire.revived)).unwrap();
     assert_eq!(grants.len(), 2);
@@ -851,7 +857,7 @@ async fn grants_stalled_restore_retries_after_path_recovers() {
     let refused =
         refused.expect("the stalled attempt never refused, so recovery was not a fresh admission");
     let body: Value = serde_json::from_slice(&refused.body).unwrap();
-    let response = &body["structuredContent"];
-    assert_eq!(response["code"], "grants_unavailable", "{body}");
-    assert_eq!(response["detail"]["retryable"], true, "{body}");
+    let text = runner_text(&body, true);
+    assert!(text.contains("launch grant"), "{text}");
+    assert!(text.contains("retry after the path recovers"), "{text}");
 }

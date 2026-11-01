@@ -90,7 +90,10 @@ fn test_objc_outline_zoom_extensions_and_search_index() {
 
     assert_eq!(detect_language(Path::new("Greeter.m")), Some(LangId::ObjC));
     assert_eq!(detect_language(Path::new("Mixed.mm")), Some(LangId::ObjC));
-    assert_eq!(detect_language(Path::new("Header.h")), Some(LangId::C));
+    assert_eq!(
+        detect_language(&project.path().join("Header.h")),
+        Some(LangId::ObjC)
+    );
 
     let provider = TreeSitterProvider::new();
     let symbols = provider

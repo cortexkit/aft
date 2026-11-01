@@ -1,0 +1,1 @@
+- Reconnecting a project no longer rereads every old background-task record left from before per-harness task folders; the check that already prevented migrating them now runs first.

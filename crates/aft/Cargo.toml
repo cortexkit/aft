@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.63.3"
+version = "0.63.4"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -9,6 +9,10 @@ keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 rust-version.workspace = true
+# crates.io refuses uploads over 10 MiB. Integration suites and their fixtures
+# are only needed in this repository, so they stay out of the published crate;
+# the release workflow's packaging check guards the limit.
+exclude = ["tests/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
 # Aggregate integration suites avoid linking one executable per source file.
 # Explicit targets leave fixture/descriptor paths stable without autodiscovery.
 autotests = false
@@ -179,10 +183,10 @@ oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.3" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.63.4" }
 # The placeholder grammar, key-location rules and audit record AFT's vault
 # seam speaks. AFT owns the crate; basal links it later.
-secret-rules = { path = "../secret-rules", version = "0.63.3", package = "aft-secret-rules" }
+secret-rules = { path = "../secret-rules", version = "0.63.4", package = "aft-secret-rules" }
 zeroize = "1"
 bytes = "1"
 http-body-util = "0.1"
@@ -241,7 +245,7 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.13.0"
+cortexkit-role-tool-provider = "=0.13.3"
 cortexkit-role-agent-data = "=0.2.3"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"

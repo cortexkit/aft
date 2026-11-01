@@ -426,7 +426,7 @@ impl PinnedDir {
             .filter(|component| !matches!(component, std::path::Component::RootDir))
             .map(|component| component.as_os_str().to_os_string())
             .collect();
-        let mut stack = vec![Self::open(Path::new("/"))?];
+        let mut stack = vec![Self::open_with_access(Path::new("/"), true)?];
         let mut followed = 0;
         while let Some(name) = pending.pop_front() {
             if name == "." || name.is_empty() {
@@ -439,7 +439,7 @@ impl PinnedDir {
                 continue;
             }
             let current = stack.last().expect("walk keeps the root");
-            match current.repair_child(&name) {
+            match current.repair_child_with_access(&name, true) {
                 Ok(child) => stack.push(child),
                 Err(error) if repair_leaf_error(&error) => {
                     let Some(target) = current.system_symlink_target(&name)? else {
@@ -464,7 +464,23 @@ impl PinnedDir {
                 Err(error) => return Err(error),
             }
         }
-        Ok(stack.pop().expect("walk keeps the root"))
+        #[allow(unused_mut)]
+        let mut directory = stack.pop().expect("walk keeps the root");
+        #[cfg(target_os = "linux")]
+        {
+            // Only ancestors use O_PATH. Upgrade the selected directory via
+            // its descriptor, not its pathname, so reads/fsync keep working
+            // without racing a replacement of any checked ancestor.
+            directory.file = openat_file(
+                directory.file.as_raw_fd(),
+                &directory.path,
+                OsStr::new("."),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            )?;
+            validate_directory_handle(&directory.file)?;
+        }
+        Ok(directory)
     }
 
     /// The target of `name` when it is a symlink no unprivileged process can
@@ -526,12 +542,20 @@ impl PinnedDir {
         Ok(Some(OsString::from_vec(buffer)))
     }
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_access(path, false)
+    }
+
+    fn open_with_access(path: &Path, _traversal_only: bool) -> io::Result<Self> {
         #[cfg(test)]
         work_counts::record_open();
         #[cfg(unix)]
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(if _traversal_only {
+                crate::private_storage::ancestor_dir_flags()
+            } else {
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            })
             .open(path)?;
         #[cfg(windows)]
         let file = OpenOptions::new()
@@ -726,6 +750,10 @@ impl PinnedDir {
     }
 
     pub(crate) fn repair_child(&self, name: &OsStr) -> io::Result<Self> {
+        self.repair_child_with_access(name, false)
+    }
+
+    fn repair_child_with_access(&self, name: &OsStr, _traversal_only: bool) -> io::Result<Self> {
         let mut components = Path::new(name).components();
         if !matches!(components.next(), Some(std::path::Component::Normal(_)))
             || components.next().is_some()
@@ -751,7 +779,14 @@ impl PinnedDir {
         }
         #[cfg(unix)]
         {
-            self.open_dir_at(name)
+            self.open_dir_at_with_flags(
+                name,
+                if _traversal_only {
+                    crate::private_storage::ancestor_dir_flags()
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+                },
+            )
         }
         #[cfg(windows)]
         {
@@ -1207,15 +1242,17 @@ impl PinnedDir {
 
     #[cfg(unix)]
     fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
-        #[cfg(test)]
-        work_counts::record_open();
-        let file = openat_file(
-            self.file.as_raw_fd(),
-            &self.path,
+        self.open_dir_at_with_flags(
             name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        )?;
+        )
+    }
+
+    #[cfg(unix)]
+    fn open_dir_at_with_flags(&self, name: &OsStr, flags: libc::c_int) -> io::Result<Self> {
+        #[cfg(test)]
+        work_counts::record_open();
+        let file = openat_file(self.file.as_raw_fd(), &self.path, name, flags, 0)?;
         validate_directory_handle(&file)?;
         Ok(Self {
             file,
@@ -2795,7 +2832,11 @@ const METADATA_OPEN_ATTEMPTS: u32 = 8;
 /// would then rename a live task's whole bundle away just because its metadata
 /// was being written at that moment.
 fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Result<File> {
-    retry_artifact_read(|| dir.open_file(name, false))
+    retry_artifact_read(|| {
+        #[cfg(test)]
+        work_counts::record_metadata_open();
+        dir.open_file(name, false)
+    })
 }
 
 /// Retry a complete read attempt so validation never reuses an unlinked handle.
@@ -2984,6 +3025,8 @@ fn write_task_at_with(
     metadata: &PersistedTask,
     sync: ReplaceSync,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    work_counts::record_metadata_write();
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -4899,6 +4942,8 @@ pub(crate) mod work_counts {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct Counts {
         pub opens: usize,
+        pub metadata_opens: usize,
+        pub metadata_writes: usize,
         pub metadata_reads: usize,
         pub parses: usize,
         pub marker_reads: usize,
@@ -4928,6 +4973,12 @@ pub(crate) mod work_counts {
 
     pub(crate) fn record_open() {
         record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_metadata_open() {
+        record(|counts| counts.metadata_opens += 1);
+    }
+    pub(crate) fn record_metadata_write() {
+        record(|counts| counts.metadata_writes += 1);
     }
     pub(crate) fn record_sync() {
         record(|counts| counts.syncs += 1);

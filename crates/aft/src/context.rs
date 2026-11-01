@@ -318,7 +318,7 @@ thread_local! {
 thread_local! {
     static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::search_index::SearchIndexSnapshot, String>)>> =
+    static LEXICAL_QUERY_SNAPSHOTS: std::cell::RefCell<Vec<(usize, Result<crate::views::trigram::LexicalViewSnapshot, String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The call-graph reader each pinned request acquired from its checkout
     /// view, so every graph read in one request answers from one generation.
@@ -1131,19 +1131,39 @@ pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 /// Add reporting guidance only when a view-load failure becomes an agent reply.
 /// Health and logs retain the loader's raw error.
 pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String {
+    let error = error.to_string();
+    if crate::views::trigram::bind_is_busy(&error) {
+        return error;
+    }
     format!("{error}\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.")
+}
+
+/// Render a prepared lexical load diagnostic without treating contention as
+/// an internal failure. No other index or filesystem walk answers in its place.
+pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::protocol::Response {
+    if crate::views::trigram::bind_is_busy(&message) {
+        crate::protocol::Response::error_with_data(
+            id,
+            "busy",
+            message,
+            serde_json::json!({"retryable": true}),
+        )
+    } else {
+        crate::protocol::Response::error(id, "internal_error", message)
+    }
 }
 
 /// Error-level log throttle: one line per project and plane per minute.
 /// Repeats inside the window are counted and reported on the next emission.
-const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The most recent checkout view load failure of a project. Planes are the
 /// query planes a failed load serves: `trigram` for the lexical view behind
 /// grep, glob and aft_search, `callgraph` for the graph behind navigation,
-/// zoom and inspect. Semantic lane failures stay lane-level (the lane reports
-/// `unavailable` with its cause and the query continues lexically), so they
-/// are not load failures here.
+/// zoom and inspect, and `semantic` when a built semantic view cannot serve
+/// or score a query. The semantic lane still answers `unavailable` with its
+/// cause and the query continues lexically; health counts the failure too.
+/// Pending fill coverage is normal progress and is not counted.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ViewLoadFailure {
     pub plane: String,
@@ -1157,6 +1177,25 @@ pub struct ViewLoadFailure {
     pub total: u64,
     pub last_at_ms: u64,
 }
+
+/// A checkout over `views.callgraph_copies` reading another checkout's
+/// published call graph (see `views::callgraph_copies`).
+struct CallgraphBorrow {
+    /// The borrowed checkout's call-graph member scope and root.
+    scope: String,
+    target_root: PathBuf,
+    /// When admission decided to borrow. It decides again after
+    /// [`CALLGRAPH_READMIT_AFTER`], so a borrower takes a free slot.
+    decided_at: Instant,
+    /// The open reader and the generation it reads.
+    reader: Option<(String, Arc<ReadonlyCallGraphStore>)>,
+    /// When the borrowed checkout's published generation was last compared
+    /// with the open reader's.
+    checked_at: Instant,
+}
+
+const CALLGRAPH_READMIT_AFTER: Duration = Duration::from_secs(60);
+const CALLGRAPH_BORROW_RECHECK_AFTER: Duration = Duration::from_secs(1);
 
 /// Per-project checkout view load health. Counts every load attempt the
 /// queries actually made (grep, glob, aft_search binds for the lexical view;
@@ -1174,7 +1213,7 @@ struct ViewLoadHealth {
 /// Bucket a view load error into a stable short cause. I/O failures already
 /// name their path and operation; verification and manifest problems name
 /// what mismatches or is missing; the full text stays in the recorded error.
-fn view_load_cause(error: &str) -> &'static str {
+pub(crate) fn view_load_cause(error: &str) -> &'static str {
     let error = error.to_lowercase();
     if error.contains("busy") {
         "busy"
@@ -1277,8 +1316,9 @@ pub struct RootHealthSnapshot {
     pub views: Option<ViewHealthSnapshot>,
     /// Checkout view loads that failed for this project since this process
     /// started, keyed `"plane:cause"` (for example `"trigram:unavailable"`
-    /// or `"callgraph:busy"). A failed load fails the query that attempted
-    /// it; there is no fallback walk or legacy-index answer. Kept as history:
+    /// or `"callgraph:io"`). Busy loads are retried, not counted. A failed load
+    /// fails the query that attempted it; there is no fallback walk or
+    /// legacy-index answer. Kept as history:
     /// a later successful load clears the degraded flag but never resets these.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub view_load_failures: BTreeMap<String, u64>,
@@ -1823,6 +1863,12 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_after_gitignore_since_last_rescan: u64,
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
+    /// Shared arrival recovery on every platform. Linux also registers new
+    /// watches and reports files found there before acknowledging watcher cookies.
+    pub(crate) directory_arrivals_total: u64,
+    pub(crate) directory_subtree_walks_total: u64,
+    pub(crate) directory_empty_total: u64,
+    pub(crate) directory_walk_fallbacks_total: u64,
     pub(crate) overflows_total: u64,
     pub(crate) watch_lost_races_total: u64,
     pub(crate) overflows_during_rescan: u64,
@@ -1860,6 +1906,12 @@ pub(crate) struct WatcherCounters {
     paths_after_gitignore_since_last_rescan: AtomicU64,
     paths_dispatched_total: AtomicU64,
     paths_dispatched_since_last_rescan: AtomicU64,
+    directory_arrivals_total: AtomicU64,
+    directory_subtree_walks_total: AtomicU64,
+    directory_empty_total: AtomicU64,
+    directory_walk_fallbacks_total: AtomicU64,
+    directory_arrivals_in_flight: AtomicUsize,
+    directory_files_unflushed: AtomicBool,
     overflows_total: AtomicU64,
     watch_lost_races_total: AtomicU64,
     overflows_during_rescan: AtomicU64,
@@ -1890,7 +1942,58 @@ pub(crate) struct WatcherRescanInterval {
     pub(crate) raw_events: u64,
 }
 
+pub(crate) struct DirectoryArrivalGuard<'a>(&'a WatcherCounters);
+
+impl Drop for DirectoryArrivalGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .directory_arrivals_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl WatcherCounters {
+    pub(crate) fn note_directory_arrival(&self) {
+        self.directory_arrivals_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn directory_arrival_guard(&self) -> DirectoryArrivalGuard<'_> {
+        self.directory_arrivals_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        DirectoryArrivalGuard(self)
+    }
+
+    pub(crate) fn note_directory_walk(&self) {
+        self.directory_subtree_walks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_empty_directory(&self) {
+        self.directory_empty_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_directory_walk_fallback(&self) {
+        self.directory_walk_fallbacks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_directory_files_queued(&self) {
+        self.directory_files_unflushed
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_directory_files_queued(&self) {
+        self.directory_files_unflushed
+            .store(false, Ordering::Release);
+    }
+
+    fn query_delivery_pending(&self) -> bool {
+        self.directory_arrivals_in_flight.load(Ordering::Acquire) > 0
+            || self.directory_files_unflushed.load(Ordering::Acquire)
+            || self.dispatch_backlog() > 0
+    }
+
     pub(crate) fn note_overflow_ignore_relevance(&self, relevant: bool) {
         self.overflow_ignore_evidence
             .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
@@ -1959,6 +2062,7 @@ impl WatcherCounters {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.clear_directory_files_queued();
     }
 
     pub(crate) fn unflushed_paths(&self) -> BTreeSet<PathBuf> {
@@ -2200,6 +2304,14 @@ impl WatcherCounters {
                 .paths_after_gitignore_since_last_rescan
                 .load(Ordering::Relaxed),
             paths_dispatched_total: self.paths_dispatched_total.load(Ordering::Relaxed),
+            directory_arrivals_total: self.directory_arrivals_total.load(Ordering::Relaxed),
+            directory_subtree_walks_total: self
+                .directory_subtree_walks_total
+                .load(Ordering::Relaxed),
+            directory_empty_total: self.directory_empty_total.load(Ordering::Relaxed),
+            directory_walk_fallbacks_total: self
+                .directory_walk_fallbacks_total
+                .load(Ordering::Relaxed),
             paths_dispatched_since_last_rescan: self
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),
@@ -4681,8 +4793,15 @@ pub struct AppContext {
     view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
     lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
+    lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    /// Set while this checkout is over `views.callgraph_copies` and reads
+    /// another checkout's published call graph instead of building its own.
+    callgraph_borrow: parking_lot::Mutex<Option<CallgraphBorrow>>,
+    callgraph_construction_retry: parking_lot::Mutex<
+        crate::views::contracts::LoadRetry<crate::views::callgraph::CallgraphViewError>,
+    >,
     callgraph_view_read_diagnostics: parking_lot::Mutex<CallgraphViewReadDiagnostics>,
     /// Checkout view load failures of this project (see [`ViewLoadHealth`]).
     /// Read by the health snapshot; written by every query that loads a view.
@@ -4701,6 +4820,7 @@ pub struct AppContext {
     view_disk_limits_next_ms: AtomicU64,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
+    callgraph_corpus_memo: parking_lot::Mutex<Option<Arc<crate::callgraph_store::CorpusMemo>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
     #[cfg(test)]
@@ -5058,10 +5178,10 @@ pub(crate) fn checkout_view_callgraph_access(
 ) -> CallgraphStoreAccess {
     match reader {
         Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
+        Some(Err(error)) if error.completion_busy => CallgraphStoreAccess::Building,
         // Transient contention while opening a view (a locked derived
-        // database, or another driver finishing the shared base) says nothing
-        // about the graph. Report SQLite's busy error, which every caller
-        // already presents as busy/pending with a retry.
+        // database or ledger) says nothing about the graph. Report SQLite's
+        // busy error, which every caller presents as busy/pending with a retry.
         Some(Err(error)) if error.busy => CallgraphStoreAccess::Error(CallGraphStoreError::Sqlite(
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
@@ -5105,6 +5225,27 @@ enum CallgraphBuildAdmission {
     Started,
     CapacityDeferred,
     NotStarted,
+}
+
+fn retry_changed_callgraph_corpus<T>(
+    mut build: impl FnMut() -> std::result::Result<T, CallGraphStoreError>,
+) -> std::result::Result<T, CallGraphStoreError> {
+    // A writer may change source files while a cold build is reading them.
+    // Retry immediately with a fresh inventory and content hashes, but release
+    // the worker after three attempts so an edited root cannot monopolize a slot.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match build() {
+            Err(error) if error.is_corpus_change() && attempts < 3 => {
+                crate::slog_info!(
+                    "callgraph corpus changed during cold build; restarting attempt {} of 3",
+                    attempts + 1
+                );
+            }
+            result => return result,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -5591,8 +5732,11 @@ impl AppContext {
             view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
+            lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_borrow: parking_lot::Mutex::new(None),
+            callgraph_construction_retry: parking_lot::Mutex::new(Default::default()),
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
                 CallgraphViewReadDiagnostics::default(),
             ),
@@ -5603,6 +5747,7 @@ impl AppContext {
             view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
+            callgraph_corpus_memo: parking_lot::Mutex::new(None),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
             #[cfg(test)]
@@ -5991,17 +6136,40 @@ impl AppContext {
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
-        let (view_load_failures, view_load_failure_last) = match self.view_load_health.try_lock() {
-            Some(health) => (
-                health
-                    .by_cause
-                    .iter()
-                    .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
-                    .collect(),
-                health.last.clone(),
-            ),
-            None => return RootHealthSummary::busy(),
-        };
+        let (mut view_load_failures, mut view_load_failure_last): (BTreeMap<String, u64>, _) =
+            match self.view_load_health.try_lock() {
+                Some(health) => (
+                    health
+                        .by_cause
+                        .iter()
+                        .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
+                        .collect(),
+                    health.last.clone(),
+                ),
+                None => return RootHealthSummary::busy(),
+            };
+        // A parent folder's worker reads its children's views itself; their
+        // failures are recorded under the parent root and reported here too.
+        if config.views.enabled {
+            if let Some(root) = config.project_root.as_deref() {
+                match crate::views::parent::try_child_load_failures(root) {
+                    Some(Some((counts, last))) => {
+                        view_load_failures.extend(counts);
+                        if last.as_ref().is_some_and(|last| {
+                            view_load_failure_last
+                                .as_ref()
+                                .is_none_or(|own: &ViewLoadFailure| {
+                                    own.last_at_ms <= last.last_at_ms
+                                })
+                        }) {
+                            view_load_failure_last = last;
+                        }
+                    }
+                    Some(None) => {}
+                    None => return RootHealthSummary::busy(),
+                }
+            }
+        }
         let search_index = match self.search_index.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -6896,6 +7064,9 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        let _ = self
+            .subc_lifecycle
+            .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
         crate::provisional_identity_retry::cancel(self);
         self.release_view_publication_cache();
         crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
@@ -7082,6 +7253,9 @@ impl AppContext {
         let mut current = self.callgraph_build_key.lock();
         let equivalent = current.as_deref() == Some(key.as_str());
         *current = Some(key);
+        if !equivalent {
+            self.callgraph_corpus_memo.lock().take();
+        }
         equivalent
     }
 
@@ -7205,17 +7379,18 @@ impl AppContext {
     /// pending too, even while the channel itself is momentarily empty.
     pub fn watcher_query_has_pending_changes(&self) -> bool {
         let activity = self.watcher_drain_activity.load(Ordering::Acquire);
-        // Dispatch sends held events before clearing the backlog count. Read
-        // that count first so a handoff cannot hide events from both probes.
-        let backlog_pending = match self.watcher_counters.try_read() {
-            Ok(counters) => counters.dispatch_backlog() > 0,
+        // Directory discovery publishes children to the flush window before
+        // ending its pending guard; dispatch publishes before clearing that
+        // window or its backlog. Read these stages before the channel below.
+        let intake_pending = match self.watcher_counters.try_read() {
+            Ok(counters) => counters.query_delivery_pending(),
             Err(std::sync::TryLockError::Poisoned(counters)) => {
-                counters.into_inner().dispatch_backlog() > 0
+                counters.into_inner().query_delivery_pending()
             }
             // Contended: assume events may be held, as the probes below do.
             Err(std::sync::TryLockError::WouldBlock) => true,
         };
-        backlog_pending
+        intake_pending
             || self.watcher_drain_has_work()
             || self.watcher_drains_in_flight.load(Ordering::Acquire) > 0
             || self.watcher_drain_activity.load(Ordering::Acquire) != activity
@@ -9079,9 +9254,16 @@ impl AppContext {
                     ) {
                         Ok(walk) => walk,
                         Err(error) => {
-                            crate::slog_warn!(
-                                "language-server applicability walk stopped early: {error:?}"
-                            );
+                            // Entry-limit failures are logged by the cache once
+                            // per retry, not on every lookup during backoff.
+                            if !matches!(
+                                error,
+                                crate::lsp::manager::ApplicabilityResolutionError::EntryLimitReached { .. }
+                            ) {
+                                crate::slog_warn!(
+                                    "language-server applicability walk stopped early: {error:?}"
+                                );
+                            }
                             if current() {
                                 let mut lsp = manager.lock();
                                 if current() {
@@ -9250,6 +9432,9 @@ impl AppContext {
         if !next.views.enabled || project_root_changed {
             self.lexical_view.lock().take();
             self.callgraph_view.lock().take();
+            self.callgraph_borrow.lock().take();
+            *self.lexical_load_retry.lock() = Default::default();
+            *self.callgraph_construction_retry.lock() = Default::default();
         }
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
@@ -9577,6 +9762,7 @@ impl AppContext {
             changed
         };
         if root_changed {
+            self.callgraph_corpus_memo.lock().take();
             let mut tier2 = self
                 .status_bar_tier2
                 .write()
@@ -9773,6 +9959,9 @@ impl AppContext {
     /// time, marks the project degraded until the next successful load, and
     /// logs at error level at most once a minute per plane.
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
+        if crate::views::trigram::bind_is_busy(error) {
+            return;
+        }
         let cause = view_load_cause(error);
         let now = Instant::now();
         let (count, suppressed) = {
@@ -10409,6 +10598,16 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
+    pub(crate) fn callgraph_corpus_memo(&self) -> Weak<crate::callgraph_store::CorpusMemo> {
+        let mut memo = self.callgraph_corpus_memo.lock();
+        // Work already admitted before unbind may finish, but must not recreate
+        // a memo for a root whose binding has been released.
+        if self.subc_lifecycle.unbound_hint.load(Ordering::Acquire) {
+            return Weak::new();
+        }
+        Arc::downgrade(memo.get_or_insert_with(Default::default))
+    }
+
     /// Whether a refresh the store must apply before answering as current is
     /// still outstanding.
     #[cfg(test)]
@@ -10775,29 +10974,37 @@ impl AppContext {
         };
         // Let the store walk directly into its staging table. Keeping discovery
         // inside the builder prevents a second corpus-sized path inventory here.
-        let (store, _stats) = crate::callgraph_store::with_publish_epoch(
+        let built = crate::callgraph_store::with_publish_epoch(
             persist_epoch_flag.clone(),
             persist_epoch,
             || {
-                if force_token.is_some() {
-                    CallGraphStore::force_cold_build_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                } else {
-                    CallGraphStore::ensure_built_with_lease_chunked(
-                        callgraph_dir.clone(),
-                        project_root.clone(),
-                        &[],
-                        self.config().callgraph_chunk_size,
-                    )
-                    .map(|(store, _stats)| (store, ()))
-                }
+                crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                    retry_changed_callgraph_corpus(|| {
+                        if force_token.is_some() {
+                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        } else {
+                            CallGraphStore::ensure_built_with_lease_chunked(
+                                callgraph_dir.clone(),
+                                project_root.clone(),
+                                &[],
+                                self.config().callgraph_chunk_size,
+                            )
+                            .map(|(store, _stats)| (store, ()))
+                        }
+                    })
+                })
             },
-        )?;
+        );
+        let (store, _stats) = match built {
+            Err(error) if error.is_corpus_change() => return Ok(None),
+            result => result?,
+        };
         drop(store);
 
         let reopened = CallGraphStore::open_readonly(callgraph_dir, project_root);
@@ -11485,7 +11692,9 @@ impl AppContext {
         }
 
         if !build_in_flight {
-            match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
+            match crate::callgraph_store::with_corpus_memo(self.callgraph_corpus_memo(), || {
+                CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root)
+            }) {
                 Ok(Some(suspension)) => return CallgraphStoreAccess::Suspended(suspension),
                 Ok(None) => {}
                 Err(error) => return CallgraphStoreAccess::Error(error),
@@ -11919,6 +12128,7 @@ impl AppContext {
         self.callgraph_cold_build_spawn_count
             .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
+        let corpus_memo = self.callgraph_corpus_memo();
         let test_hooks = crate::callgraph_store::CallgraphBackgroundTestHooks::capture();
 
         std::thread::spawn(move || {
@@ -11943,35 +12153,35 @@ impl AppContext {
                         crate::callgraph_store::with_publish_epoch(
                             persist_epoch_flag.clone(),
                             persist_epoch,
-                            || match work {
-                                CallgraphBackgroundWork::LegacyMigration => {
-                                    CallGraphStore::migrate_legacy_with_lease(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                    )
-                                }
-                                CallgraphBackgroundWork::ForceRebuild(_) => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::force_cold_build_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
-                                CallgraphBackgroundWork::Ensure => {
-                                    let files = crate::callgraph::walk_project_files(&project_root)
-                                        .collect::<Vec<_>>();
-                                    CallGraphStore::ensure_built_with_lease_chunked(
-                                        callgraph_dir.clone(),
-                                        project_root.clone(),
-                                        &files,
-                                        chunk_size,
-                                    )
-                                    .map(|(store, _)| Some(store))
-                                }
+                            || {
+                                crate::callgraph_store::with_corpus_memo(corpus_memo, || {
+                                    retry_changed_callgraph_corpus(|| match work {
+                                        CallgraphBackgroundWork::LegacyMigration => {
+                                            CallGraphStore::migrate_legacy_with_lease(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                            )
+                                        }
+                                        CallgraphBackgroundWork::ForceRebuild(_) => {
+                                            CallGraphStore::force_cold_build_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                        CallgraphBackgroundWork::Ensure => {
+                                            CallGraphStore::ensure_built_with_lease_chunked(
+                                                callgraph_dir.clone(),
+                                                project_root.clone(),
+                                                &[],
+                                                chunk_size,
+                                            )
+                                            .map(|(store, _)| Some(store))
+                                        }
+                                    })
+                                })
                             },
                         )
                     });
@@ -12034,6 +12244,15 @@ impl AppContext {
                             reason
                         );
                         settlement.denied(reason);
+                    }
+                    Err(error) if error.is_corpus_change() => {
+                        // Dropping the worker's settlement sends a Settled
+                        // build event, which query operations report as
+                        // Building. Later demand gets a fresh retry budget
+                        // once the editing burst subsides.
+                        crate::slog_info!(
+                            "callgraph corpus still changing after 3 attempts; build deferred"
+                        );
                     }
                     Err(error) => {
                         crate::slog_warn!("callgraph store background work failed: {}", error);
@@ -12380,6 +12599,7 @@ impl AppContext {
         &self,
         source: Arc<dyn crate::views::trigram::LexicalSnapshotSource>,
     ) {
+        *self.lexical_load_retry.lock() = Default::default();
         let root = self.canonical_cache_root();
         let family = self.memoized_artifact_cache_key(&root);
         *self.lexical_view.lock() =
@@ -12400,7 +12620,7 @@ impl AppContext {
     pub(crate) fn lexical_view_snapshot(
         &self,
         tool: &str,
-    ) -> Option<Result<crate::search_index::SearchIndexSnapshot, String>> {
+    ) -> Option<Result<crate::views::trigram::LexicalViewSnapshot, String>> {
         if !self.lexical_views_enabled() {
             return None;
         }
@@ -12424,34 +12644,36 @@ impl AppContext {
         // can take long on a cold or loaded machine, and other queries may
         // wait behind them. None of it is this request's read, so it does not
         // spend the request's filesystem deadline.
-        let acquired = crate::bounded_io::excluding_wait(|| {
-            let view = {
-                let mut slot = self.lexical_view.lock();
-                if !slot
-                    .as_ref()
-                    .is_some_and(|view| view.matches(&root, &storage, &family, policy))
-                {
-                    match crate::views::trigram::LexicalView::new(root, storage, family, policy) {
-                        Ok(view) => *slot = Some(Arc::new(view)),
-                        Err(error) => return Err(error),
-                    }
-                }
-                slot.as_ref().unwrap().clone()
-            };
-            self.record_checkout_pending_watcher_gap();
-            Ok(view.snapshot())
+        let result = crate::bounded_io::excluding_wait(|| {
+            self.lexical_load_retry.lock().run(
+                Instant::now,
+                |error| crate::views::trigram::bind_is_busy(error),
+                || {
+                    let view = {
+                        let mut slot = self.lexical_view.lock();
+                        if !slot
+                            .as_ref()
+                            .is_some_and(|view| view.matches(&root, &storage, &family, policy))
+                        {
+                            match crate::views::trigram::LexicalView::new_with_import(
+                                root,
+                                storage,
+                                family,
+                                policy,
+                                self.views_import_control(),
+                                self.cold_build_limiter(),
+                            ) {
+                                Ok(view) => *slot = Some(Arc::new(view)),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        slot.as_ref().unwrap().clone()
+                    };
+                    self.record_checkout_pending_watcher_gap();
+                    view.snapshot()
+                },
+            )
         });
-        let result = match acquired {
-            Ok(result) => result,
-            Err(error) => {
-                // A failed load fails the query: no fallback walk or legacy
-                // index may answer for a checkout view. The error text is
-                // returned unchanged; the counter, degraded flag and log are
-                // recorded here.
-                self.note_view_load_failure("trigram", &error);
-                return Some(Err(error));
-            }
-        };
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
                 snapshots
@@ -12459,7 +12681,7 @@ impl AppContext {
                     .push((self.config_pin_key(), result.clone()))
             });
         }
-        if result.is_ok() && tool != "bind" {
+        if result.as_ref().is_ok_and(|snapshot| snapshot.is_ready()) && tool != "bind" {
             let index = match tool {
                 "grep" => 0,
                 "glob" => 1,
@@ -12468,10 +12690,129 @@ impl AppContext {
             self.lexical_routes[index].fetch_add(1, Ordering::Relaxed);
         }
         match &result {
-            Ok(_) => self.note_view_load_success(),
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
+                self.note_view_load_success()
+            }
+            Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
             Err(error) => self.note_view_load_failure("trigram", error),
         }
         Some(result)
+    }
+
+    /// This checkout's current file identities (size and content hash by
+    /// relative path) from its lexical view, when that view is ready.
+    pub(crate) fn lexical_file_identities(
+        &self,
+    ) -> Option<std::collections::HashMap<String, (u64, blake3::Hash)>> {
+        match self.lexical_view_snapshot("bind")? {
+            Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)) => {
+                Some(snapshot.live_file_identities())
+            }
+            _ => None,
+        }
+    }
+
+    /// When this checkout is over `views.callgraph_copies`, the reader of the
+    /// call graph it borrows; `None` when it builds its own view. Admission
+    /// is decided again once a minute. A failed admission builds the
+    /// checkout's own view, as before the limit existed, and logs why.
+    fn borrowed_callgraph_view_reader(
+        &self,
+        root: &Path,
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        policy: crate::blob_store::v2::TrigramPolicy,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
+        use crate::views::callgraph_copies::{self, Admission};
+        let now = Instant::now();
+        let readmit =
+            self.callgraph_borrow.lock().as_ref().is_none_or(|borrow| {
+                now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER
+            });
+        if readmit {
+            let admission = callgraph_copies::admit(
+                storage,
+                family,
+                policy,
+                root,
+                self.config().views.callgraph_copies,
+                || self.lexical_file_identities(),
+            );
+            let mut borrow = self.callgraph_borrow.lock();
+            match admission {
+                Ok(Admission::Own) => {
+                    borrow.take();
+                    return None;
+                }
+                Ok(Admission::Borrow {
+                    root: target_root,
+                    scope,
+                }) => {
+                    let reader = borrow
+                        .take()
+                        .filter(|current| current.scope == scope)
+                        .and_then(|current| current.reader);
+                    *borrow = Some(CallgraphBorrow {
+                        scope,
+                        target_root,
+                        decided_at: now,
+                        reader,
+                        checked_at: now,
+                    });
+                }
+                Err(reason) => {
+                    crate::slog_warn!(
+                        "views callgraph copy admission failed root={}: {reason}",
+                        root.display()
+                    );
+                    borrow.take();
+                    return None;
+                }
+            }
+        }
+        let mut guard = self.callgraph_borrow.lock();
+        let borrow = guard.as_mut()?;
+        if let Some((generation, store)) = &borrow.reader {
+            if now.duration_since(borrow.checked_at) < CALLGRAPH_BORROW_RECHECK_AFTER
+                || callgraph_copies::published_generation(&storage.artifacts, family, &borrow.scope)
+                    .as_deref()
+                    == Some(generation.as_str())
+            {
+                borrow.checked_at = now;
+                return Some(Ok(store.clone()));
+            }
+        }
+        borrow.checked_at = now;
+        Some(
+            match callgraph_copies::open_published(
+                &storage.artifacts,
+                family,
+                policy,
+                &borrow.scope,
+                root,
+            ) {
+                Ok((store, generation)) => {
+                    let store = Arc::new(store);
+                    borrow.reader = Some((generation, store.clone()));
+                    Ok(store)
+                }
+                Err((reason, busy)) => Err(crate::views::callgraph::CallgraphViewError {
+                    reason,
+                    busy,
+                    completion_busy: false,
+                }),
+            },
+        )
+    }
+
+    /// The checkout whose call graph this one reads, and the open reader,
+    /// while this checkout is over `views.callgraph_copies`.
+    pub(crate) fn borrowed_callgraph_view(&self) -> Option<(PathBuf, Arc<ReadonlyCallGraphStore>)> {
+        let borrow = self.callgraph_borrow.lock();
+        let borrow = borrow.as_ref()?;
+        let (_, store) = borrow.reader.as_ref()?;
+        Some((borrow.target_root.clone(), store.clone()))
     }
 
     /// Executed v3 lexical acquisitions, ordered as grep, glob, aft_search.
@@ -12490,7 +12831,8 @@ impl AppContext {
     /// (lexical, call graph and semantic) rather than the content-addressed
     /// v1 view or the legacy stores. Such a root runs none of the legacy
     /// views-on writers: no v1 view publication or import, no v1 blob puts
-    /// and no legacy semantic import. An explicitly installed checkout query
+    /// and no import into the old semantic runtime. Compatible pre-view caches
+    /// may still be imported into v3 on background workers. A checkout query
     /// runtime keeps the older route.
     pub(crate) fn views_route_root(&self) -> bool {
         let config = self.config();
@@ -12499,6 +12841,13 @@ impl AppContext {
             && self.heavy_root_work_allowed()
             && self.cache_unavailable_reason().is_none()
             && !self.checkout_query_runtime_active()
+    }
+
+    pub(crate) fn views_import_control(&self) -> crate::migration::v3_ledger::ImportControl {
+        let lifecycle = self.subc_lifecycle_admission();
+        let generation = self.configure_generation_flag();
+        let expected = generation.load(Ordering::Acquire);
+        Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
     pub(crate) fn callgraph_view_is_ready(&self) -> bool {
@@ -12513,6 +12862,7 @@ impl AppContext {
         &self,
         source: Arc<dyn crate::views::callgraph::CallgraphReaderSource>,
     ) {
+        *self.callgraph_construction_retry.lock() = Default::default();
         let root = self.canonical_cache_root();
         let family = self.memoized_artifact_cache_key(&root);
         *self.callgraph_view.lock() = Some(Arc::new(
@@ -12571,13 +12921,52 @@ impl AppContext {
             max_file_size: config.search_index_max_file_size,
         };
         let family = self.memoized_artifact_cache_key(&root);
+        let own_view_bound = self
+            .callgraph_view
+            .lock()
+            .as_ref()
+            .is_some_and(|view| view.matches(&root, &storage, &family, policy));
+        if !own_view_bound {
+            if let Some(borrowed) =
+                self.borrowed_callgraph_view_reader(&root, &storage, &family, policy)
+            {
+                if pinned_config_for(self.config_pin_key()).is_some() {
+                    CALLGRAPH_QUERY_READERS.with(|readers| {
+                        readers
+                            .borrow_mut()
+                            .push((self.config_pin_key(), borrowed.clone()))
+                    });
+                }
+                match &borrowed {
+                    Ok(_) => self.note_view_load_success(),
+                    Err(error) if !error.busy => {
+                        self.note_view_load_failure("callgraph", &error.reason)
+                    }
+                    Err(_) => {}
+                }
+                return Some(borrowed);
+            }
+        }
         let view = {
             let mut slot = self.callgraph_view.lock();
             if !slot
                 .as_ref()
                 .is_some_and(|view| view.matches(&root, &storage, &family, policy))
             {
-                match crate::views::callgraph::CallgraphView::new(root, storage, family, policy) {
+                match self.callgraph_construction_retry.lock().run(
+                    Instant::now,
+                    |error| error.busy,
+                    || {
+                        crate::views::callgraph::CallgraphView::new_with_import(
+                            root,
+                            storage,
+                            family,
+                            policy,
+                            self.views_import_control(),
+                            self.cold_build_limiter(),
+                        )
+                    },
+                ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
                         // Like the lexical view, a failed callgraph load fails
@@ -12610,6 +12999,19 @@ impl AppContext {
     /// Executed v3 call-graph acquisitions (one per pinned request).
     pub fn callgraph_view_route_count(&self) -> u64 {
         self.callgraph_view_routes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_load_retry_due_for_test(&self) {
+        if let Some((deadline, _)) = &mut self.lexical_load_retry.lock().pending {
+            *deadline = Instant::now();
+        }
+        if let Some((deadline, _)) = &mut self.callgraph_construction_retry.lock().pending {
+            *deadline = Instant::now();
+        }
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.retry_due_for_test();
+        }
     }
 
     /// Files a views-routed symbol prewarm served from or stored into the
@@ -14634,6 +15036,8 @@ impl AppContext {
             return false;
         }
 
+        self.callgraph_corpus_memo.lock().take();
+
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
         }
@@ -14658,6 +15062,9 @@ impl AppContext {
         // generation.
         self.lexical_view.lock().take();
         self.callgraph_view.lock().take();
+        self.callgraph_borrow.lock().take();
+        *self.lexical_load_retry.lock() = Default::default();
+        *self.callgraph_construction_retry.lock() = Default::default();
         self.borrowed_index_cache.lock().clear();
         self.clear_semantic_refresh_worker();
         *self.semantic_embedding_model.lock() = None;
@@ -14852,6 +15259,9 @@ impl AppContext {
         let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
             return false;
         };
+        let Some(mut corpus_memo) = self.callgraph_corpus_memo.try_lock() else {
+            return false;
+        };
         let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
             return false;
         };
@@ -14876,6 +15286,22 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
+        // A views-routed root's lexical and call-graph views hold installed
+        // snapshots, the call graph's open reader and v3 member protection.
+        // Releasing them here, as evict_idle_artifacts does, lets storage
+        // retention evict an idle root's views for disk budget.
+        let Some(mut lexical_view) = self.lexical_view.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_view) = self.callgraph_view.try_lock() else {
+            return false;
+        };
+        let Some(mut lexical_retry) = self.lexical_load_retry.try_lock() else {
+            return false;
+        };
+        let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
+            return false;
+        };
         // Publication memoization can be discarded independently of resident
         // artifact handles, including when the semantic lane remains busy.
         if !self.try_release_view_publication_cache() {
@@ -14886,24 +15312,36 @@ impl AppContext {
             return false;
         }
         callgraph_store.take();
+        corpus_memo.take();
         search_index.take();
         semantic_index.take();
         borrowed_index_cache.clear();
         backup.release_memory();
+        *lexical_retry = Default::default();
+        *callgraph_retry = Default::default();
         let released = (
             embedding_model.take(),
             refresh_events.take(),
             refresh_requests.take(),
             refresh_worker.take(),
+            // Dropping a view can close its reader and unbind its generation,
+            // so the views drop on the release thread too.
+            lexical_view.take(),
+            callgraph_view.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
         self.invalidate_semantic_refresh_probe();
         drop((
+            corpus_memo,
             embedding_model,
             refresh_events,
             refresh_requests,
             refresh_worker,
+            lexical_view,
+            callgraph_view,
+            lexical_retry,
+            callgraph_retry,
         ));
         // Native session destruction can wait for ORT. Keep it, and worker
         // channel teardown, off the daemon's frame loop.
@@ -18987,6 +19425,7 @@ mod callgraph_store_for_ops_tests {
         assert!(detail.contains("database is locked"), "{detail}");
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
+        ctx.view_load_retry_due_for_test();
         assert!(matches!(
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Ready(_)
@@ -20559,6 +20998,133 @@ mod callgraph_store_for_ops_tests {
         query.join().expect("callgraph query thread");
     }
 
+    #[test]
+    fn callgraph_corpus_retry_restarts_inventory_changes_but_not_lookup_bugs() {
+        let mut attempts = 0;
+        let result = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CallGraphStoreError::CorpusInventoryChanged(None))
+            } else {
+                Ok("fresh inventory")
+            }
+        });
+        assert_eq!(result.unwrap(), "fresh inventory");
+        assert_eq!(attempts, 2);
+
+        let mut attempts = 0;
+        let result: std::result::Result<(), _> = retry_changed_callgraph_corpus(|| {
+            attempts += 1;
+            Err(CallGraphStoreError::CorpusSnapshotMissing(PathBuf::from(
+                "missing.rs",
+            )))
+        });
+        assert!(matches!(
+            result,
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
+        let connection =
+            rusqlite::Connection::open(ctx.callgraph_store_dir().join("build-breaker.sqlite"))
+                .unwrap();
+        let charges: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(zero_credit_deaths + credited_deaths + in_build_burn_ms), 0)
+                 FROM breaker_records WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            charges, 0,
+            "ordinary edits must not charge the death breaker"
+        );
+        let attempts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM breaker_attempts WHERE domain = 'callgraph_cold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, published_attempts,
+            "only the existing successful-publication attempt may remain; cancelled attempts must be retired"
+        );
+    }
+
+    #[test]
+    fn scheduled_callgraph_retries_an_edit_with_a_fresh_corpus_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::fs::write(path, "pub fn after_edit_marker() {}\n").unwrap();
+                }
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        let event = events.recv_timeout(Duration::from_secs(30)).unwrap();
+        let store = match event {
+            CallGraphStoreBuildEvent::Ready { store, .. } => store,
+            _ => panic!("the scheduled worker settled without publishing the edited corpus"),
+        };
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(store.nodes_matching("after_edit_marker").unwrap().len(), 1);
+        assert!(store.nodes_matching("a_marker").unwrap().is_empty());
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 1);
+        drop(store);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn scheduled_callgraph_churn_budget_settles_as_building_without_breaker_deaths() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        crate::callgraph_store::set_cold_build_extract_observer(Some(Arc::new(move |paths| {
+            if let Some(path) = paths
+                .iter()
+                .find(|path| path.file_name().unwrap() == "a.rs")
+            {
+                let version = observed.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(path, format!("pub fn changing_{version}() {{}}\n")).unwrap();
+            }
+        })));
+        let (ctx, _project, _storage, _root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(60));
+        crate::callgraph_store::set_cold_build_extract_observer(None);
+        release.send(()).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(30)).unwrap(),
+            CallGraphStoreBuildEvent::Settled
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_callgraph_churn_was_not_charged(&ctx, 0);
+        let _wait = callgraph_build_wait_ms(&ctx, 10_000);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        assert_callgraph_churn_was_not_charged(&ctx, 1);
+    }
+
     /// Schedules a callgraph cold build held at its start gate, with the
     /// given abandon grace, and returns the context, project root, the gate
     /// release, and a clone of the build's event receiver.
@@ -20859,7 +21425,10 @@ mod callgraph_store_for_ops_tests {
                         callgraph: true,
                     },
                     callgraph_chunk_size: 1,
-                    views: crate::config::ViewsConfig { enabled: true },
+                    views: crate::config::ViewsConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
                     ..Config::default()
                 },
             );
@@ -21160,6 +21729,7 @@ mod callgraph_store_for_ops_tests {
             "callers: persisted callgraph store is busy; retry shortly"
         );
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = fixture.callers();
         assert!(response.success, "{:#}", response.data);
     }
@@ -21221,6 +21791,7 @@ mod callgraph_store_for_ops_tests {
         );
 
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = inspect();
         assert!(response.success, "{:#}", response.data);
         assert!(
@@ -21280,6 +21851,7 @@ mod callgraph_store_for_ops_tests {
         );
         // Once the database is free again the same zoom reads the graph.
         drop(busy);
+        fixture.ctx.view_load_retry_due_for_test();
         let response = zoom();
         assert!(response.success, "{:#}", response.data);
         assert!(
@@ -22150,6 +22722,9 @@ mod status_emitter_tests {
 
     #[test]
     fn status_counts_do_not_acquire_a_held_lsp_manager() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
@@ -22164,9 +22739,10 @@ mod status_emitter_tests {
                 kind: crate::lsp::registry::ServerKind::Rust,
                 root: PathBuf::from("/proj"),
             },
-            PathBuf::from("/proj/main.rs"),
+            file.clone(),
             vec![],
         );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         let (client, mut fleet_rx) = crate::fleet_status::FleetStatusClient::dial_channel(2);
         ctx.install_fleet_status_client(Some(client));
         let mut first = String::from("first");
@@ -22797,14 +23373,14 @@ mod view_load_health_tests {
             snapshot.view_load_failures.get("trigram:unavailable"),
             Some(&2)
         );
-        assert_eq!(snapshot.view_load_failures.get("callgraph:busy"), Some(&1));
+        assert!(!snapshot.view_load_failures.contains_key("callgraph:busy"));
         let last = snapshot
             .view_load_failure_last
             .as_ref()
             .expect("last failure");
         assert_eq!(last.plane, "trigram");
         assert_eq!(last.cause, "unavailable");
-        assert_eq!((last.count, last.total), (2, 3));
+        assert_eq!((last.count, last.total), (2, 2));
         assert!(degraded(&ctx));
         // The health report carries the same map and last error.
         let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
@@ -23016,14 +23592,18 @@ mod status_bar_tests {
 
     #[test]
     fn diagnostics_counts_are_unknown_until_project_applicability_exists() {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         ctx.lsp()
             .diagnostics_store_mut_for_test()
             .publish_with_kind(
                 crate::lsp::registry::ServerKind::Rust,
-                PathBuf::from("/fixture/main.rs"),
+                file.clone(),
                 Vec::new(),
             );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
         assert_eq!(
             (
                 ctx.status_bar_count_values().errors,
@@ -23229,7 +23809,9 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false); // populate so the bar surfaces
 
-        let file = std::path::PathBuf::from("/proj/gone.ts");
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("gone.ts");
+        std::fs::write(&file, "const value = 1;\n").unwrap();
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test().publish(
@@ -23250,6 +23832,7 @@ mod status_bar_tests {
                     source: None,
                 }],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
 
         // Bar reflects the live warm-set error.
@@ -23269,8 +23852,11 @@ mod status_bar_tests {
 
         let ctx = ctx();
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
-        let root = std::path::PathBuf::from("/proj");
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::Rust,
             root,
@@ -23294,6 +23880,7 @@ mod status_bar_tests {
                 file.clone(),
                 vec![diagnostic(DiagnosticSeverity::Error, "settled error")],
             );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!((counts.errors, counts.warnings), (1, 0));
@@ -23312,6 +23899,7 @@ mod status_bar_tests {
                     None,
                     true,
                 );
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         let counts = ctx.status_bar_counts().expect("populated");
         assert_eq!(
@@ -23341,15 +23929,13 @@ mod status_bar_tests {
         use crate::lsp::roots::ServerKey;
 
         let ctx = ctx();
-        let root = if cfg!(windows) {
-            std::path::PathBuf::from(r"C:\proj")
-        } else {
-            std::path::PathBuf::from("/proj")
-        };
+        let fixture = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(fixture.path());
         ctx.set_canonical_cache_root(root.clone());
         ctx.update_status_bar_tier2(Some(0), Some(0), Some(0), Some(0), false);
 
         let file = root.join("aft.jsonc");
+        std::fs::write(&file, "{}\n").unwrap();
         let key = ServerKey {
             kind: ServerKind::TypeScript,
             root: root.clone(),
@@ -23372,6 +23958,7 @@ mod status_bar_tests {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
                 .publish(key.clone(), file.clone(), vec![env]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,
@@ -23382,7 +23969,8 @@ mod status_bar_tests {
         {
             let mut lsp = ctx.lsp();
             lsp.diagnostics_store_mut_for_test()
-                .publish(key, file, vec![]);
+                .publish(key, file.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&file);
         }
         assert_eq!(
             ctx.status_bar_count_values().errors,
@@ -25202,5 +25790,52 @@ mod worker_rust_cargo_policy_tests {
                 "a repeated worker call waited for the LSP manager lock"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod directory_arrival_pending_tests {
+    use super::*;
+
+    #[test]
+    fn watcher_directory_discovery_pending_survives_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let counters = ctx.watcher_counters();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        let discovery = counters.directory_arrival_guard();
+        assert!(ctx.watcher_query_has_pending_changes());
+        counters.note_directory_files_queued();
+        drop(discovery);
+        assert!(ctx.watcher_query_has_pending_changes());
+        tx.send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            root.path().join("new.rs"),
+        ]))
+        .unwrap();
+        counters.clear_unflushed_paths();
+        assert!(
+            ctx.watcher_query_has_pending_changes(),
+            "dispatch must take over before discovery stops being pending"
+        );
+        ctx.watcher_rx()
+            .lock()
+            .as_ref()
+            .unwrap()
+            .try_recv()
+            .unwrap();
+        assert!(!ctx.watcher_query_has_pending_changes());
+        let empty_probe = counters.directory_arrival_guard();
+        drop(empty_probe);
+        assert!(
+            !ctx.watcher_query_has_pending_changes(),
+            "an empty arrival leaves no pending files"
+        );
     }
 }

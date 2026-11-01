@@ -2,9 +2,16 @@
 """Keep landing CI fast and publication bound to shipped-profile E2E artifacts."""
 
 import importlib.util
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
+import tempfile
+import textwrap
 import tomllib
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,10 +25,27 @@ COVERED = {
     "win32-x64": ("x86_64-pc-windows-msvc", "tests/windows-e2e/run.ps1", "target/x86_64-pc-windows-msvc/release/aft.exe"),
     "linux-x64": ("x86_64-unknown-linux-gnu", "docker run --rm --platform linux/amd64",  "target/x86_64-unknown-linux-gnu/release/aft"),
 }
+PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")
+TAG_PUBLISH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
 
 
 def commands(job):
     return "\n".join(step.get("run", "") for step in job["steps"])
+
+
+def inline_python(job, name):
+    run = next(step["run"] for step in job["steps"] if step.get("name") == name)
+    lines = run.strip().splitlines()
+    assert lines[0] == "python3 - <<'PY'" and lines[-1] == "PY", name
+    # The lightweight workflow parser strips block-scalar indentation. Preserve
+    # the real Python indentation when executing the workflow's inline scripts.
+    source = (ROOT / ".github/workflows/release.yml").read_text()
+    block = re.search(
+        rf"(?ms)^      - name: {re.escape(name)}\n.*?^          python3 - <<'PY'\n(.*?)^          PY$",
+        source,
+    )
+    assert block is not None, name
+    return compile(textwrap.dedent(block[1]), f"release.yml: {name}", "exec")
 
 
 class NativeReleaseWorkflowTests(unittest.TestCase):
@@ -58,11 +82,11 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertTrue(required.issubset(jobs[name]["needs"]))
                 self.assertIn("gate", jobs[name]["needs"])
-                self.assertEqual(jobs[name]["if"], "github.event_name != 'workflow_dispatch'")
+                self.assertEqual(jobs[name]["if"], TAG_PUBLISH_GUARD)
         for platform, (target, harness, binary) in COVERED.items():
             with self.subTest(platform=platform):
                 build = jobs[f"build-{platform}"]
-                self.assertGreaterEqual(int(build["timeout-minutes"]), 120)
+                self.assertGreater(int(build["timeout-minutes"]), 0)
                 self.assertIn("build --release", commands(build))
                 self.assertNotIn("select-native-release-artifact", commands(build))
                 self.assertIn("pack-binary", commands(build))
@@ -160,6 +184,249 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                         f"version-sync.mjs must keep {name}'s version in lockstep",
                     )
         self.assertTrue(seen, "agent-file-tools has no path dependencies; the check found nothing")
+
+
+class ReleaseRehearsalWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = parser.parse_workflow(str(ROOT / ".github/workflows/release.yml"))
+        self.jobs = self.workflow["jobs"]
+        self.rehearsal = self.jobs["rehearse-publish"]
+
+    def test_nightly_reuses_dispatch_builds_without_the_tag_ci_gate(self):
+        self.assertEqual(self.workflow["on"]["schedule"], [{"cron": "17 2 * * *"}])
+        self.assertIn("workflow_dispatch", self.workflow["on"])
+        self.assertEqual(self.workflow["on"]["push"], {"tags": ["v*"]})
+        self.assertEqual(self.jobs["gate"]["if"], "github.event_name == 'push'")
+        self.assertEqual(
+            self.rehearsal["if"],
+            "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+        )
+        required = {name for name in self.jobs if name.startswith(("build-", "e2e-"))}
+        self.assertEqual(set(self.rehearsal["needs"]), required)
+        self.assertNotIn("gate", self.rehearsal["needs"])
+        for name in required:
+            with self.subTest(job=name):
+                self.assertNotIn("if", self.jobs[name])
+                self.assertNotIn("continue-on-error", self.jobs[name])
+        self.assertEqual(self.rehearsal["permissions"], {"contents": "read", "actions": "read"})
+        self.assertNotIn("secrets.", json.dumps(self.rehearsal))
+
+    def test_schedule_and_dispatch_skip_every_external_publication_step(self):
+        external_jobs = set()
+        for name, job in self.jobs.items():
+            for step in job.get("steps", []):
+                run = step.get("run", "")
+                publishes = any(
+                    "--dry-run" not in line
+                    for line in re.findall(r"(?m)^\s*(?:cargo|npm) publish\b[^\n]*", run)
+                )
+                mutates_release = re.search(r"\b(?:gh release (?:create|upload|edit)|git (?:push|tag))\b", run)
+                external_action = "github-releases-to-discord@" in step.get("uses", "")
+                if publishes or mutates_release or external_action:
+                    external_jobs.add(name)
+                    with self.subTest(job=name, step=step.get("name")):
+                        expected = ("success() && " if name == "discord-announce" else "") + TAG_PUBLISH_GUARD
+                        self.assertEqual(job.get("if"), expected)
+        self.assertEqual(external_jobs, {"publish-crates", "publish-npm", "github-release", "discord-announce"})
+
+    def test_all_jobs_have_explicit_budgets_and_builds_have_measured_headroom(self):
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                self.assertGreater(int(job["timeout-minutes"]), 0)
+                self.assertLessEqual(int(job["timeout-minutes"]), 360)
+        peaks = {
+            "darwin-arm64": 16.4, "darwin-x64": 18.3,
+            "linux-arm64": 27.2, "linux-x64": 25.4,
+            "win32-arm64": 100.5, "win32-x64": 48.7,
+        }
+        for platform, minutes in peaks.items():
+            with self.subTest(platform=platform):
+                self.assertGreaterEqual(int(self.jobs[f"build-{platform}"]["timeout-minutes"]), 2 * minutes)
+
+    def test_scheduled_internal_transfers_have_short_retention(self):
+        uploads = []
+        for job in self.jobs.values():
+            if "github.event_name == 'push'" in job.get("if", ""):
+                continue
+            uploads.extend(step for step in job.get("steps", []) if step.get("uses") == "actions/upload-artifact@v4")
+        self.assertGreater(len(uploads), 0)
+        for step in uploads:
+            with self.subTest(artifact=step["with"]["name"]):
+                self.assertEqual(step["with"]["retention-days"], "${{ github.event_name == 'schedule' && 2 || 90 }}")
+
+    def test_crates_dry_run_selects_all_siblings_together_and_verifies_them(self):
+        steps = self.rehearsal["steps"]
+        sync = next(step["run"] for step in steps if step.get("name") == "Set an unpublished rehearsal version")
+        self.assertIn("-rehearsal.${process.env.GITHUB_RUN_NUMBER}.${process.env.GITHUB_RUN_ATTEMPT}", sync)
+        self.assertIn('node scripts/version-sync.mjs "$version"', sync)
+        self.assertIn("cargo update -w", sync)
+        self.assertNotIn("--offline", sync)
+        self.assertIn("dtolnay/rust-toolchain@stable", [step.get("uses") for step in steps])
+        publish = next(step["run"] for step in steps if step.get("name") == "Rehearse crates.io publishing")
+        self.assertEqual(
+            publish,
+            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p agent-file-tools",
+        )
+        self.assertNotIn("--no-verify", publish)
+        names = [step.get("name") for step in steps]
+        self.assertLess(names.index("Rehearse crates.io publishing"), names.index("Check packaged crate sizes"))
+
+    def test_npm_rehearsal_prepares_the_same_ten_packages_and_tested_binaries(self):
+        published = self.jobs["publish-npm"]
+        def transfers(job):
+            return [step["with"] for step in job["steps"] if step.get("uses") == "actions/download-artifact@v4"]
+        self.assertEqual(transfers(self.rehearsal), transfers(published))
+        for platform in COVERED:
+            name = {"darwin-arm64": "macOS", "win32-x64": "Windows", "linux-x64": "Linux"}[platform]
+            step_name = f"Verify tested {name} binary for npm"
+            real = next(step["run"] for step in published["steps"] if step.get("name") == step_name)
+            dry = next(step["run"] for step in self.rehearsal["steps"] if step.get("name") == step_name)
+            self.assertEqual(dry, real)
+        run = commands(self.rehearsal)
+        self.assertIn("bun run --cwd packages/aft-bridge build", run)
+        self.assertIn("bun run --filter '*' build", run)
+        self.assertIn("node scripts/validate-packages.mjs", run)
+        self.assertIn("--candidate --require-platform-artifacts", run)
+        pack = next(step["run"] for step in self.rehearsal["steps"] if step.get("name") == "Rehearse every npm package")
+        expected = [f"./packages/npm/{platform}" for platform in PLATFORMS]
+        expected += [f"./packages/{package}" for package in ("aft-bridge", "opencode-plugin", "pi-plugin", "aft-cli")]
+        # Execute the actual loops with a shell function instead of calling npm.
+        result = subprocess.run(["bash", "-e", "-c", 'npm() { printf "%s %s %s\\n" "$1" "$2" "$3"; };\n' + pack], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"pack --dry-run {package}" for package in expected])
+
+    def test_glibc_audit_uses_both_cross_release_outputs(self):
+        for platform, target in (("linux-x64", "x86_64-unknown-linux-gnu"), ("linux-arm64", "aarch64-unknown-linux-gnu")):
+            job = self.jobs[f"build-{platform}"]
+            self.assertIn(f"cross build --release --target {target}", commands(job))
+            cross = next(step for step in job["steps"] if step.get("name") == "Install cross")
+            self.assertEqual(cross["with"]["tool"], "cross@0.2.5")
+        script = inline_python(self.rehearsal, "Audit Linux glibc floor")
+        below_floor = "  1: 0 0 FUNC GLOBAL DEFAULT UND f@GLIBC_2.2.5\n  2: 0 0 FUNC GLOBAL DEFAULT UND g@GLIBC_2.23"
+        with mock.patch("subprocess.check_output", side_effect=[below_floor, below_floor]) as readelf:
+            exec(script, {})
+        self.assertEqual(readelf.call_args_list, [
+            mock.call(["readelf", "--dyn-syms", "--wide", f"packages/npm/{platform}/bin/aft"], text=True)
+            for platform in ("linux-x64", "linux-arm64")
+        ])
+
+    def test_glibc_audit_rejects_above_floor_on_either_architecture_and_empty_symbols(self):
+        script = inline_python(self.rehearsal, "Audit Linux glibc floor")
+        good = "  1: 0 0 FUNC GLOBAL DEFAULT UND f@GLIBC_2.23"
+        for index, platform in enumerate(("linux-x64", "linux-arm64")):
+            for version in ("2.24", "2.28", "2.100", "PRIVATE"):
+                with self.subTest(platform=platform, version=version):
+                    outputs = [good] * index + [f"  1: 0 0 FUNC GLOBAL DEFAULT UND statx@GLIBC_{version}"]
+                    with mock.patch("subprocess.check_output", side_effect=outputs):
+                        with self.assertRaisesRegex(SystemExit, f"{platform} requires GLIBC_{version}"):
+                            exec(script, {})
+        with mock.patch("subprocess.check_output", return_value=""):
+            with self.assertRaisesRegex(SystemExit, "no required GLIBC versions"):
+                exec(script, {})
+        with mock.patch("subprocess.check_output", side_effect=subprocess.CalledProcessError(1, "readelf")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                exec(script, {})
+
+    def test_crate_size_check_accepts_small_archives_and_rejects_limit_or_missing_crates(self):
+        script = inline_python(self.rehearsal, "Check packaged crate sizes")
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            target = Path(temporary)
+            directory = target / "package"
+            directory.mkdir()
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "agent-file-tools")]
+            files = [directory / f"{package['name']}-{package['version']}.crate" for package in packages]
+            for file in files:
+                file.write_bytes(b"crate")
+            metadata = json.dumps({"target_directory": str(target), "packages": packages})
+            with mock.patch("subprocess.check_output", return_value=metadata):
+                exec(script, {})
+                for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
+                    with self.subTest(size=size):
+                        with files[-1].open("wb") as archive:
+                            archive.truncate(size)
+                        with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
+                            exec(script, {})
+                files[-1].unlink()
+                with self.assertRaisesRegex(AssertionError, "agent-file-tools"):
+                    exec(script, {})
+
+    def test_crate_size_check_finds_multi_package_archives_and_checks_every_copy(self):
+        script = inline_python(self.rehearsal, "Check packaged crate sizes")
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            target = Path(temporary)
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "agent-file-tools")]
+            metadata = json.dumps({"target_directory": str(target), "packages": packages})
+            with mock.patch("subprocess.check_output", return_value=metadata):
+                copies = []
+                for folder in ("tmp-crate", "tmp-registry"):
+                    directory = target / "package" / folder
+                    directory.mkdir(parents=True)
+                    for package in packages:
+                        archive = directory / f"{package['name']}-{package['version']}.crate"
+                        archive.write_bytes(b"crate")
+                        if package["name"] == "agent-file-tools":
+                            copies.append(archive)
+                exec(script, {})
+                with copies[-1].open("wb") as archive:
+                    archive.truncate(10 * 1024 * 1024)
+                with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
+                    exec(script, {})
+                for archive in copies:
+                    archive.unlink()
+                (target / "package" / "agent-file-tools-0.1.0.crate").write_bytes(b"stale")
+                with self.assertRaisesRegex(AssertionError, "missing packaged crates: agent-file-tools"):
+                    exec(script, {})
+                for archive in target.rglob("*.crate"):
+                    archive.unlink()
+                with self.assertRaisesRegex(AssertionError, "missing packaged crates:.*aft-secret-rules.*aft-tokenizer.*agent-file-tools"):
+                    exec(script, {})
+
+    def test_tag_canceller_catches_first_failure_and_timeouts_without_waiting_for_other_builds(self):
+        job = self.jobs["cancel-failed-tag-builds"]
+        self.assertEqual(job["if"], TAG_PUBLISH_GUARD)
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["permissions"]["actions"], "write")
+        self.assertGreater(int(job["timeout-minutes"]), max(int(self.jobs[f"build-{platform}"]["timeout-minutes"]) for platform in PLATFORMS))
+        self.assertEqual(job["steps"][0]["env"]["GH_TOKEN"], "${{ github.token }}")
+        script = inline_python(job, "Watch builds and cancel on failure")
+        environment = {"GITHUB_REPOSITORY": "cortexkit/aft", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
+        for conclusion in ("failure", "timed_out", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                pages = [{"jobs": [
+                    {"name": "Build Linux x64", "status": "completed", "conclusion": conclusion},
+                    {"name": "Build Windows ARM64", "status": "in_progress", "conclusion": None},
+                ]}]
+                with mock.patch.dict(os.environ, environment), \
+                     mock.patch("subprocess.check_output", side_effect=[json.dumps(pages)]) as api, \
+                     mock.patch("subprocess.run") as cancel, mock.patch("time.sleep") as sleep, \
+                     mock.patch("builtins.print"):
+                    namespace = {}
+                    exec(script, namespace)
+                self.assertEqual(namespace["build_names"], {job["name"] for name, job in self.jobs.items() if name.startswith("build-")})
+                self.assertIn("repos/cortexkit/aft/actions/runs/123/attempts/2/jobs?per_page=100", api.call_args.args[0])
+                self.assertIn("--paginate", api.call_args.args[0])
+                cancel.assert_called_once_with(["gh", "run", "cancel", "123", "--repo", "cortexkit/aft"], check=True)
+                sleep.assert_not_called()
+
+    def test_tag_canceller_waits_for_all_builds_and_exits_on_success(self):
+        script = inline_python(self.jobs["cancel-failed-tag-builds"], "Watch builds and cancel on failure")
+        environment = {"GITHUB_REPOSITORY": "cortexkit/aft", "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "2"}
+        complete = [
+            {"name": job["name"], "status": "completed", "conclusion": "success"}
+            for name, job in self.jobs.items() if name.startswith("build-")
+        ]
+        pending = json.dumps([{"jobs": complete[:1]}])
+        done = json.dumps([{"jobs": complete[:3]}, {"jobs": complete[3:]}])
+        with mock.patch.dict(os.environ, environment), \
+             mock.patch("subprocess.check_output", side_effect=[pending, done]), \
+             mock.patch("subprocess.run") as cancel, mock.patch("time.sleep") as sleep:
+            exec(script, {})
+        sleep.assert_called_once_with(30)
+        cancel.assert_not_called()
 
 
 if __name__ == "__main__":

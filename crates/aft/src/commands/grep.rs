@@ -289,7 +289,10 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
     if result.index_sources_unavailable {
-        return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
+        return crate::context::view_load_error_response(
+            &req.id,
+            result.index_read_gaps.join("; "),
+        );
     }
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     #[cfg(test)]

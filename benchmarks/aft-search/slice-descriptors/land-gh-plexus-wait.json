@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-plexus-wait"
+  ],
+  "note": "GitHub shim relay: a sent bot write waits 160 s for Plexus's reply; one bounded pre-send retry on outage. No changed path matches RANKING_FENCE_PREFIXES."
+}

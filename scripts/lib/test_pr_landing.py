@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -108,13 +109,20 @@ if a[:2] == ['pr', 'merge']:
         s['merged'] = True; s['merge_oid'] = oid
     persist(); sys.exit(0)
 if a[:2] == ['run', 'list']:
-    oid = s.get('merge_oid', '0'*40)
-    answer([{'databaseId': 99, 'headSha': oid, 'headBranch': 'main', 'event': 'push',
-             'status': 'completed', 'conclusion': 'success', 'attempt': 1,
-             'url': 'https://github.com/example/repo/actions/runs/99'}])
+    oid = g('rev-parse', 'HEAD') if s.get('retry_branch') else s.get('merge_oid', '0'*40)
+    runs = [{'databaseId': 99, 'headSha': oid, 'headBranch': s.get('retry_branch', 'main'), 'event': 'push',
+              'status': s.get('push_status', 'completed'), 'conclusion': s.get('push_conclusion', 'success'), 'attempt': 1,
+              'url': 'https://github.com/example/repo/actions/runs/99'}]
+    if s.get('queue_run'):
+        runs.append({'databaseId': 98, 'headSha': 'f'*40 if s.get('queue_wrong_sha') else oid,
+                     'headBranch': 'gh-readonly-queue/main/pr-7-fixture', 'event': 'merge_group',
+                     'status': 'completed', 'conclusion': 'success', 'attempt': 1,
+                     'url': 'https://github.com/example/repo/actions/runs/98'})
+    answer(runs)
 if a[:2] == ['run', 'view']:
-    answer({'jobs': [{'name': 'Landing policy', 'status': 'completed',
-                     'conclusion': 'failure' if s.get('failed_required') else 'success'}]})
+    queue = a[2] == '98'
+    answer({'jobs': [] if queue and s.get('queue_missing') else [{'name': 'Landing policy', 'status': 'completed',
+                      'conclusion': 'failure' if s.get('failed_required') or (queue and s.get('queue_red')) else 'success'}]})
 if not a or a[0] != 'api': raise SystemExit('unhandled fake gh: '+str(a))
 endpoint = next((x for x in a[1:] if x.startswith('repos/')), '')
 if endpoint.endswith('/check-runs?per_page=100'):
@@ -142,6 +150,9 @@ def pull_request_fields(q):
     return fields
 if 'graphql' in a:
     q = a[a.index('-f')+1]
+    if 'branchProtectionRules' in q:
+        answer({'data': {'repository': {'branchProtectionRules': {'pageInfo': {'hasNextPage': False},
+                'nodes': s.get('classic_release_rules', [])}}}})
     if 'pullRequest(' in q:
         # GitHub rejects the whole query when a selected field does not exist
         # (for example the REST-only `mergeable_state`); answer the same way.
@@ -256,6 +267,8 @@ if '/protection/required_status_checks' in endpoint:
 if endpoint.endswith('/rules/branches/main'):
     if s.get('rules_failure'): raise SystemExit('HTTP 403: rules unavailable')
     answer(s.get('branch_rules', []))
+if '/rules/branches/release%2F' in endpoint:
+    answer(s.get('release_rules', []))
 if '/pulls?' in endpoint:
     listed = [pr()] if s.get('exists') else []
     if s.get('abandoned') and 'state=all' in endpoint:
@@ -294,7 +307,9 @@ raise SystemExit('unhandled fake endpoint: '+endpoint)
 
 class PRFixture(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix="aft-pr-landing-")
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix="aft-pr-landing-", dir=scratch)
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.repo = root / "repo"
@@ -314,7 +329,7 @@ class PRFixture(unittest.TestCase):
         Path(self.env["HOME"]).mkdir()
         for file in ("merge-pr.sh", "land-pr.sh", "landing-policy.py", "merge-queue-search.py",
                      "release.sh", "release-ci-gate.sh", "lib/land_pr.py", "lib/landing_policy.py",
-                     "lib/release_queue.py", "lib/operator-gh.sh"):
+                      "lib/release_queue.py", "lib/release_retry.py", "lib/operator-gh.sh"):
             dest = self.repo / "scripts" / file
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "scripts" / file, dest)
@@ -323,7 +338,7 @@ class PRFixture(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "benchmarks/aft-search" / file, dest)
         watch = self.repo / "scripts/watch-ci.sh"
-        watch.write_text('#!/usr/bin/env bash\nset -euo pipefail\n[[ "$WATCH_CI_EVENT" == push && "$WATCH_CI_BRANCH" == main ]]\nprintf "%s\\n" "$1" > "$(dirname "$PR_TEST_STATE")/watched-oid"\n')
+        watch.write_text('#!/usr/bin/env bash\nset -euo pipefail\n[[ "$WATCH_CI_EVENT" == push ]]\nprintf "%s\\n" "$1" > "$(dirname "$PR_TEST_STATE")/watched-oid"\nif [[ "${PR_TEST_WATCH_BLOCK:-}" == 1 ]]; then sleep 30; fi\n')
         watch.chmod(0o755)
         (self.repo / "scripts/release-gate-v049.mjs").write_text("// Fixture publication gate driven by the fake node executable.\n")
         self.git("init", "-qb", "main")
@@ -332,7 +347,7 @@ class PRFixture(unittest.TestCase):
         self.git("config", "commit.gpgsign", "false")
         self.git("config", "tag.gpgsign", "false")
         self.git("config", "core.hooksPath", "/dev/null")
-        (self.repo / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+        (self.repo / ".gitignore").write_text("__pycache__/\n*.pyc\ntarget/\n")
         for package in ("aft-bridge", "opencode-plugin", "pi-plugin"):
             path = self.repo / "packages" / package / "package.json"
             path.parent.mkdir(parents=True)
@@ -362,6 +377,12 @@ class PRFixture(unittest.TestCase):
         node.write_text(f"#!{sys.executable}\n" + r'''
 import json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
+if '--snapshot-dir' not in args:
+    if args[0] == 'scripts/version-sync.mjs':
+        for path in pathlib.Path('packages').glob('*/package.json'):
+            value = json.loads(path.read_text()); value['version'] = args[1]
+            path.write_text(json.dumps(value))
+    sys.exit(0)
 state = pathlib.Path(os.environ['PR_TEST_STATE'])
 head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 with state.with_suffix('.calls').open('a') as f:
@@ -374,6 +395,10 @@ else:
     assert json.loads(record.read_text())['source_oid'] == head
 ''')
         node.chmod(0o755)
+        for tool in ('bun', 'cargo'):
+            path = bin_dir / tool
+            path.write_text('#!/usr/bin/env bash\nexit "${PR_TEST_TOOL_EXIT:-0}"\n')
+            path.chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
         self.env["AFT_GH_SHIMS_DIR"] = str(bin_dir)
 
@@ -1047,15 +1072,19 @@ class ReleaseQueueTests(PRFixture):
         self.git("commit", "-qm", "release: v1.0.1\n\n" + COAUTHOR)
         subprocess.run([sys.executable, str(helper), "checkpoint", "1.0.1"], cwd=self.repo,
                        env=self.env, check=True, capture_output=True)
+        self.release_head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
 
     def test_release_tags_final_merge_oid_and_resumes_same_pr(self) -> None:
         self.prepare()
-        source = self.git("rev-parse", "HEAD")
+        source = self.release_head
         result = self.run_script("release.sh", "1.0.1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         final = self.git("rev-list", "-n", "1", "v1.0.1")
         self.assertNotEqual(final, source)
         self.assertEqual(final, self.git("rev-parse", "origin/main"))
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assertEqual(self.git("status", "--porcelain"), "")
         publication = [call for call in self.calls() if call["args"][0] == "node"]
         self.assertEqual(len(publication), 2)
         self.assertTrue(all(call["source_oid"] == final for call in publication))
@@ -1072,6 +1101,277 @@ class ReleaseQueueTests(PRFixture):
         self.assertIn("Landing policy", result.stderr)
         exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/tags/v1.0.1"], cwd=self.repo)
         self.assertNotEqual(exists.returncode, 0)
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_matching_queue_run_tags_without_watching_main_push(self) -> None:
+        self.prepare()
+        self.write_state(queue_run=True, push_status="in_progress", push_conclusion="")
+        result = self.run_script("release.sh", "1.0.1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.state_path.parent / "watched-oid").exists())
+        self.assertEqual(self.git("rev-list", "-n", "1", "v1.0.1"), self.git("rev-parse", "origin/main"))
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+
+    def test_terminated_release_restores_caller_and_stops_before_tagging(self) -> None:
+        self.prepare()
+        head = self.git("rev-parse", "HEAD")
+        process = subprocess.Popen(["bash", str(self.repo / "scripts/release.sh"), "1.0.1"],
+                                   cwd=self.repo, env={**self.env, "PR_TEST_WATCH_BLOCK": "1"},
+                                   text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            watched = self.state_path.parent / "watched-oid"
+            while not watched.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(watched.exists(), "release did not reach the injected CI wait")
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 130, stdout + stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(self.git("tag", "--list", "v1.0.1"), "")
+
+    def assert_queue_falls_back(self, condition: str) -> None:
+        self.prepare()
+        self.write_state(queue_run=True, **{condition: True})
+        result = self.run_script("release.sh", "1.0.1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        watched = self.state_path.parent / "watched-oid"
+        self.assertEqual(watched.read_text().strip(), self.git("rev-parse", "origin/main"))
+
+    def test_wrong_queue_sha_waits_for_main_push(self) -> None:
+        self.assert_queue_falls_back("queue_wrong_sha")
+
+    def test_missing_queue_context_waits_for_main_push(self) -> None:
+        self.assert_queue_falls_back("queue_missing")
+
+    def test_red_queue_context_waits_for_main_push(self) -> None:
+        self.assert_queue_falls_back("queue_red")
+
+
+class ReleaseRetryTests(PRFixture):
+    def prepare_retry(self) -> list[str]:
+        self.git("checkout", "-q", "main")
+        notes = self.repo / ".alfonso/release-notes/v1.0.0.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("# v1.0.0\n\nOriginal approved notes for 1.0.0.\n")
+        workflows = self.repo / ".github/workflows"
+        workflows.mkdir()
+        (workflows / "tests.yml").write_text('on:\n  push:\n    branches:\n      - main\n      - "release/**"\n')
+        (workflows / "release.yml").write_text("# Fixture fetch: +refs/heads/release/*:refs/remotes/origin/release/*\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "approved release inputs")
+        self.git("tag", "-a", "v1.0.0", "-m", "failed release")
+        self.failed = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", "origin", "main", "v1.0.0")
+        fixes = []
+        for name in ("fix-one", "unrelated-main", "fix-two"):
+            (self.repo / name).write_text(name + "\n")
+            self.git("add", name)
+            self.git("commit", "-qm", name)
+            if name != "unrelated-main":
+                fixes.append(self.git("rev-parse", "HEAD"))
+        self.git("push", "-q", "origin", "main")
+        self.write_state(retry_branch="release/1.0")
+        return fixes
+
+    def retry(self, fixes: list[str], *extra: str) -> subprocess.CompletedProcess:
+        args = ["--retry-from", "v1.0.0", "1.0.1"]
+        for fix in fixes:
+            args.extend(("--fix", fix))
+        return self.run_script("release.sh", *args, *extra)
+
+    def assert_caller_unchanged(self, head: str) -> None:
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("worktree", "list", "--porcelain").count("worktree "), 1)
+
+    def test_retry_picks_only_named_main_fixes_and_reuses_notes(self) -> None:
+        fixes = self.prepare_retry()
+        head = self.git("rev-parse", "HEAD")
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        released = self.git("rev-list", "-n", "1", "v1.0.1")
+        self.assertEqual(released, self.git("rev-parse", "origin/release/1.0"))
+        self.assertEqual(len(self.git("rev-list", f"{self.failed}..{released}").splitlines()), 3)
+        files = self.git("ls-tree", "--name-only", released).splitlines()
+        self.assertIn("fix-one", files)
+        self.assertIn("fix-two", files)
+        self.assertNotIn("unrelated-main", files)
+        for pick, original in zip(self.git("rev-list", "--reverse", f"{self.failed}..{released}").splitlines(), fixes):
+            self.assertIn(f"(cherry picked from commit {original})", self.git("show", "-s", "--format=%B", pick))
+        self.assertEqual(self.git("show", f"{released}:.alfonso/release-notes/v1.0.1.md"),
+                         "# v1.0.1\n\nOriginal approved notes for 1.0.1.\n\n" +
+                         "\n".join(f"- {name} ({fix[:12]})" for name, fix in zip(("fix-one", "fix-two"), fixes)))
+        self.assert_caller_unchanged(head)
+        again = self.retry(fixes)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(self.git("rev-parse", "release/1.0"), released)
+        self.assert_caller_unchanged(head)
+
+    def test_retry_accepts_a_commit_hook_trailer_on_the_bump(self) -> None:
+        # The fixture disables hooks, but a real checkout's prepare-commit-msg
+        # hook adds a Co-authored-by trailer to every commit, including the
+        # retry's own version bump. The lineage check must still accept it.
+        fixes = self.prepare_retry()
+        hooks = Path(self.temp.name) / "hooks"
+        hooks.mkdir()
+        hook = hooks / "prepare-commit-msg"
+        hook.write_text('#!/bin/sh\ngit interpret-trailers --in-place --if-exists doNothing '
+                        '--trailer "Co-authored-by: alfonso-aft <bot@example.invalid>" "$1"\n')
+        hook.chmod(0o755)
+        self.git("config", "core.hooksPath", str(hooks))
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        bump = self.git("show", "-s", "--format=%B", "v1.0.1^{commit}")
+        self.assertIn("Release-retry-from: v1.0.0", bump)
+        self.assertIn("Co-authored-by: alfonso-aft <bot@example.invalid>", bump)
+
+    def test_retry_refuses_fix_not_on_main(self) -> None:
+        self.prepare_retry()
+        self.git("checkout", "-qb", "unlanded")
+        self.git("commit", "--allow-empty", "-qm", "not on main")
+        fix = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        head = self.git("rev-parse", "HEAD")
+        result = self.retry([fix])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not already on origin/main", result.stderr)
+        self.assert_caller_unchanged(head)
+
+    def test_retry_refuses_dirty_caller(self) -> None:
+        fixes = self.prepare_retry()
+        (self.repo / "unrelated-main").write_text("uncommitted\n")
+        result = self.retry(fixes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("working tree is not clean", result.stderr)
+        self.assertEqual(self.git("branch", "--show-current"), "main")
+        self.assertEqual((self.repo / "unrelated-main").read_text(), "uncommitted\n")
+
+    def test_retry_ci_failure_restores_caller_without_tag(self) -> None:
+        fixes = self.prepare_retry()
+        self.write_state(failed_required=True)
+        head = self.git("rev-parse", "HEAD")
+        result = self.retry(fixes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Landing policy", result.stderr)
+        self.assert_caller_unchanged(head)
+        self.assertEqual(self.git("tag", "--list", "v1.0.1"), "")
+
+    def test_retry_refuses_protection_without_changing_settings(self) -> None:
+        fixes = self.prepare_retry()
+        self.write_state(release_rules=[{"type": "merge_queue"}])
+        head = self.git("rev-parse", "HEAD")
+        result = self.retry(fixes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("merge_queue", result.stderr)
+        self.assert_caller_unchanged(head)
+        self.assertFalse(any(call["args"][:2] == ["pr", "merge"] for call in self.calls()))
+
+    def test_retry_stops_when_release_push_ci_is_not_enabled(self) -> None:
+        fixes = self.prepare_retry()
+        workflow = self.repo / ".github/workflows/tests.yml"
+        workflow.write_text("on:\n  push:\n    branches:\n      - main\n")
+        self.git("add", str(workflow))
+        self.git("commit", "-qm", "disable release push CI")
+        fixes.append(self.git("rev-parse", "HEAD"))
+        self.git("push", "-q", "origin", "main")
+        head = self.git("rev-parse", "HEAD")
+        result = self.retry(fixes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tests.yml must enable release/**", result.stderr)
+        self.assert_caller_unchanged(head)
+
+    def gate(self, oid: str) -> subprocess.CompletedProcess:
+        return self.run_script("release-ci-gate.sh", oid, env={"GITHUB_REPOSITORY": "example/repo"})
+
+    def test_retry_gate_refuses_code_hidden_in_version_bump(self) -> None:
+        fixes = self.prepare_retry()
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.git("checkout", "-q", "release/1.0")
+        (self.repo / "hidden-code").write_text("not a version change\n")
+        self.git("add", "hidden-code")
+        self.git("commit", "--amend", "--no-edit", "-q")
+        bad = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/release/1.0", bad)
+        self.git("checkout", "-q", "main")
+        rejected = self.gate(bad)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("files other than versions and notes", rejected.stderr)
+
+    def test_retry_gate_refuses_forged_cherry_pick_trailer(self) -> None:
+        fixes = self.prepare_retry()
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commits = self.git("rev-list", "--reverse", f"{self.failed}..release/1.0").splitlines()
+        self.git("checkout", "--detach", "-q", commits[0])
+        (self.repo / "fix-one").write_text("forged implementation\n")
+        self.git("add", "fix-one")
+        self.git("commit", "--amend", "--no-edit", "-q")
+        self.git("cherry-pick", commits[1], commits[2])
+        bad = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/release/1.0", bad)
+        self.git("checkout", "-q", "main")
+        rejected = self.gate(bad)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("not an unchanged cherry-pick", rejected.stderr)
+
+    def test_retry_gate_refuses_base_tag_that_differs_from_origin(self) -> None:
+        fixes = self.prepare_retry()
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        released = self.git("rev-parse", "release/1.0")
+        self.git("tag", "-f", "v1.0.0", "main")
+        rejected = self.gate(released)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("differs from its remote peeled SHA", rejected.stderr)
+
+    def test_retry_notes_file_replaces_the_renamed_notes(self) -> None:
+        fixes = self.prepare_retry()
+        head = self.git("rev-parse", "HEAD")
+        notes = Path(self.temp.name) / "patch-notes.md"
+        notes.write_text("# v1.0.1\n\nFixes two regressions in 1.0.0.\n")
+        result = self.retry(fixes, "--notes-file", str(notes))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        released = self.git("rev-list", "-n", "1", "v1.0.1")
+        self.assertEqual(self.git("show", f"{released}:.alfonso/release-notes/v1.0.1.md"),
+                         "# v1.0.1\n\nFixes two regressions in 1.0.0.")
+        self.assert_caller_unchanged(head)
+
+    def test_retry_refuses_an_empty_notes_file(self) -> None:
+        fixes = self.prepare_retry()
+        notes = Path(self.temp.name) / "empty-notes.md"
+        notes.write_text("\n")
+        result = self.retry(fixes, "--notes-file", str(notes))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--notes-file is empty", result.stderr)
+        self.assertNotIn("v1.0.1", self.git("tag", "--list"))
+
+    def test_retry_can_continue_from_a_failed_retry_tag(self) -> None:
+        fixes = self.prepare_retry()
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        prior = self.git("rev-parse", "release/1.0")
+        (self.repo / "third-fix").write_text("fix for the next attempt\n")
+        self.git("add", "third-fix")
+        self.git("commit", "-qm", "third fix")
+        fix = self.git("rev-parse", "HEAD")
+        self.git("push", "-q", "origin", "main")
+        next_attempt = self.run_script("release.sh", "--retry-from", "v1.0.1", "1.0.2", "--fix", fix)
+        self.assertEqual(next_attempt.returncode, 0, next_attempt.stdout + next_attempt.stderr)
+        released = self.git("rev-list", "-n", "1", "v1.0.2")
+        self.assertEqual(len(self.git("rev-list", f"{prior}..{released}").splitlines()), 2)
+        self.assertIn("- third fix", self.git("show", f"{released}:.alfonso/release-notes/v1.0.2.md"))
+        self.assert_caller_unchanged(fix)
 
 
 if __name__ == "__main__":

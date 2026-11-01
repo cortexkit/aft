@@ -141,10 +141,24 @@ fn pin_directories(storage: &Path) -> Vec<PathBuf> {
 
 fn copy_and_warm_aft(destination: &Path) {
     std::fs::copy(crate::test_helpers::aft_binary::aft_binary(), destination).unwrap();
-    let probe = Command::new(destination)
-        .args(["gh-shim", "--shim-version"])
-        .output()
-        .unwrap();
+    // On Linux, a sibling test forking while `fs::copy` still had the new file
+    // open for writing hands that descriptor to its child until the child
+    // execs, and executing the copy meanwhile fails with ETXTBSY. The window is
+    // short and owned by another test's fork, so retry only that error.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let probe = loop {
+        match Command::new(destination)
+            .args(["gh-shim", "--shim-version"])
+            .output()
+        {
+            Err(error)
+                if error.raw_os_error() == Some(26) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => break result.unwrap(),
+        }
+    };
     assert!(probe.status.success(), "{probe:?}");
     assert!(
         String::from_utf8_lossy(&probe.stdout).contains("\"shim_version\""),
@@ -264,13 +278,33 @@ async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_de
         }
     };
     let pinned_metadata = pinned_image.metadata().unwrap();
+    // Linux pins the server's own inode. macOS pins a separate file with the
+    // same bytes, so the running server keeps a single name: the privacy
+    // controls name a program by whichever link the kernel reports.
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(
         (pinned_metadata.dev(), pinned_metadata.ino()),
         (original.dev(), original.ino()),
         "the initial shim must reference the server's original inode"
     );
     #[cfg(target_os = "macos")]
-    assert!(pinned_image.starts_with(&storage));
+    {
+        assert!(pinned_image.starts_with(&storage));
+        assert_ne!(
+            pinned_metadata.ino(),
+            original.ino(),
+            "the pin is a hard link"
+        );
+        assert_eq!(
+            std::fs::metadata(&deploy).unwrap().nlink(),
+            1,
+            "the server's image gained a second name"
+        );
+        assert_eq!(
+            std::fs::read(&pinned_image).unwrap(),
+            std::fs::read(&deploy).unwrap()
+        );
+    }
 
     std::fs::rename(&marker, &deploy).unwrap();
     let decoy = Command::new(&deploy).output().unwrap();
@@ -338,6 +372,16 @@ async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_de
         pins,
         "clean exit removed another daemon's pin"
     );
+
+    // Repair must use the open startup image, not the replacement executable
+    // now occupying the deployment pathname.
+    std::fs::remove_dir_all(&first_pin).unwrap();
+    let repaired = foreground(&mut aft, "gh --shim-version").await;
+    assert_eq!(repaired["status"], "completed", "{repaired:?}");
+    let output = repaired["output"].as_str().unwrap();
+    assert!(output.contains("\"shim_version\""), "{repaired:?}");
+    assert!(!output.contains("REPLACEMENT_IMAGE"), "{repaired:?}");
+    assert_eq!(std::fs::read_link(&gh).unwrap(), pinned_image);
 
     // A crash cannot run exit cleanup; the next daemon must reclaim its pin.
     aft.module.child.kill().unwrap();

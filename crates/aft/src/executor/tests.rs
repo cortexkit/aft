@@ -27,6 +27,9 @@ fn ok(id: impl Into<String>) -> Response {
     Response::success(id, serde_json::json!({"ok": true}))
 }
 
+#[path = "stale_write_tests.rs"]
+mod stale_write;
+
 #[cfg(unix)]
 #[test]
 fn blocked_file_read_releases_root_reader_and_executor_slot() {

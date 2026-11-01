@@ -243,6 +243,9 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Read source file ---
     let mut captures = HashMap::new();
+    let mut versions = HashMap::new();
+    let mut source_version =
+        edit::mutation::Version::existing(source_path, std::sync::Arc::from([]));
     let source_content = match CapturedRegularFile::read_text(source_path) {
         Ok(Some((capture, source))) => {
             captures.insert(source_path.to_path_buf(), capture);
@@ -258,6 +261,9 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, error));
         }
     };
+
+    source_version.set_bytes(std::sync::Arc::from(source_content.as_bytes()));
+    versions.insert(source_path.to_path_buf(), source_version);
 
     // --- Extract symbol text from source ---
     let raw_start_byte = edit::line_col_to_byte(
@@ -321,6 +327,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Read destination file (may not exist yet) ---
+    let mut dest_version = if dest_path.exists() {
+        edit::mutation::Version::existing(dest_path, std::sync::Arc::from([]))
+    } else {
+        edit::mutation::Version::missing(dest_path)
+    };
     let dest_content = if dest_path.exists() {
         match CapturedRegularFile::read_text(dest_path) {
             Ok(Some((capture, content))) => {
@@ -336,6 +347,10 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         String::new()
     };
+    if dest_path.exists() {
+        dest_version.set_bytes(std::sync::Arc::from(dest_content.as_bytes()));
+    }
+    versions.insert(dest_path.to_path_buf(), dest_version);
 
     // Prepare new destination content
     let new_dest = append_symbol_to_dest(&dest_content, &dest_symbol_text);
@@ -430,6 +445,8 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         if !consumer_file.exists() {
             continue;
         }
+        let mut version =
+            edit::mutation::Version::existing(consumer_file, std::sync::Arc::from([]));
         let (consumer_content, consumer_capture) =
             match CapturedRegularFile::read_text(consumer_file) {
                 Ok(Some((capture, content))) => (content, Some(capture)),
@@ -451,6 +468,8 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             &project_root,
         ) {
             Ok(Some(rewritten)) => {
+                version.set_bytes(std::sync::Arc::from(consumer_content.as_bytes()));
+                versions.insert(consumer_file.clone(), version);
                 if let Some(capture) = consumer_capture {
                     captures.insert(consumer_file.clone(), capture);
                 }
@@ -490,6 +509,20 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Create checkpoint (D105) ---
+    let mut paths: Vec<_> = versions.keys().cloned().collect();
+    paths.sort();
+    for path in &paths {
+        edit::mutation::before_check(path);
+    }
+    let refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    let locks = edit::mutation::lock_files(&refs);
+    let admissions =
+        std::cell::RefCell::new(paths.into_iter().zip(locks).collect::<HashMap<_, _>>());
+    for (path, version) in &versions {
+        if let Err(error) = version.check(path) {
+            return Response::error(&req.id, error.code(), error.to_string());
+        }
+    }
     let checkpoint_name = format!("move_symbol-{symbol_name}-{op_id}");
     {
         let mut all_files: Vec<PathBuf> = vec![source_path.to_path_buf()];
@@ -578,12 +611,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // 1. Write source file (symbol removed)
     let tool_policy = &crate::sandbox_spawn::ToolLaunchPolicy::for_request(ctx);
-    match edit::write_format_validate_deferred(
+    match edit::write_format_validate_admitted(
         tool_policy,
         &source_path,
         &new_source,
         &ctx.config(),
         &req.params,
+        false,
+        &|| {
+            admissions.borrow_mut().remove(source_path);
+        },
     ) {
         // A rolled-back write means the result was invalid syntax and the file
         // was reverted (symbol NOT removed). Continuing would add the symbol to
@@ -627,12 +664,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 2. Write destination file (symbol added)
-    match edit::write_format_validate_deferred(
+    match edit::write_format_validate_admitted(
         tool_policy,
         &dest_path,
         &new_dest,
         &ctx.config(),
         &req.params,
+        false,
+        &|| {
+            admissions.borrow_mut().remove(dest_path);
+        },
     ) {
         // CRITICAL: the source already had the symbol removed. If the
         // destination write is rolled back (invalid syntax — e.g. moving
@@ -703,12 +744,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // 3. Write consumer files (imports rewritten)
     let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
-        match edit::write_format_validate_deferred(
+        match edit::write_format_validate_admitted(
             tool_policy,
             &path,
             new_content,
             &ctx.config(),
             &req.params,
+            false,
+            &|| {
+                admissions.borrow_mut().remove(path);
+            },
         ) {
             // A rolled-back consumer rewrite leaves the move half-applied (this
             // consumer still imports from the old location while others were

@@ -16,6 +16,11 @@ pub(crate) const IDENTITY_TEXT: &str = "this command's bot identity no longer ma
 pub(crate) const POLICY_TEXT: &str = "this GitHub write is not allowed by the routing policy the command started under, or by the current one ({reason}); use a permitted operation, or ask the operator to update the policy and start the command again.";
 pub(crate) const TEMPORARY_TEXT: &str = "bot writes from background commands are briefly unavailable ({reason}); retry in a few seconds.";
 pub(crate) const UNAVAILABLE_TEXT: &str = "this command's bot-write permission cannot be verified ({reason}); start the command again from a live session, and tell the operator if it repeats.";
+// `owner_unresolved` means the session's route has no verified head scope yet.
+// A plugin keeps asking core for that scope until it arrives, so the same
+// session can retry; a worker codemode run never gets one, which "tell the
+// operator if it repeats" covers.
+pub(crate) const OWNER_UNRESOLVED_TEXT: &str = "this command's bot-write permission cannot be verified ({reason}): this session has no verified head scope yet; retry in a minute, and tell the operator if it repeats.";
 pub(crate) const ENDED_TEXT: &str = "the {scope_role} this command started from has ended ({reason}), so it can no longer write as the bot; start the command again from a live session.";
 pub(crate) const UNKNOWN_TEXT: &str = "AFT could not confirm that the {scope_role} this command started from is still active ({reason}); retry in a minute.";
 pub(crate) const REVOCATION_NOT_DURABLE: &str = "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
@@ -80,6 +85,8 @@ pub(crate) struct Refusal {
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,
     pub(crate) detail: Option<String>,
+    // Internal transport provenance, never part of the public refusal.
+    pub(crate) retry_before_send: bool,
 }
 
 /// Keep diagnostics out of the agent-facing refusal. Callers must supply only
@@ -104,6 +111,7 @@ impl Refusal {
             reason: reason.into(),
             role: None,
             detail: None,
+            retry_before_send: false,
         }
     }
 
@@ -113,6 +121,7 @@ impl Refusal {
             reason: reason.into(),
             role: Some(role),
             detail: None,
+            retry_before_send: false,
         }
     }
 
@@ -128,6 +137,7 @@ impl Refusal {
                 | "reservation_timeout"
                 | "route_closed"
                 | "relay_unavailable" => TEMPORARY_TEXT,
+                "owner_unresolved" => OWNER_UNRESOLVED_TEXT,
                 _ => UNAVAILABLE_TEXT,
             },
             Code::ScopeEnded => ENDED_TEXT,

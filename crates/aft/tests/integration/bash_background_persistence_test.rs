@@ -1129,7 +1129,7 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
 }
 
 #[test]
-fn foreign_harness_replay_retires_missing_layout_once() {
+fn foreign_harness_replay_preserves_missing_layout_until_owner_retires_once() {
     init_test_logger();
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -1149,17 +1149,36 @@ fn foreign_harness_replay_retires_missing_layout_once() {
     let conn = Arc::new(Mutex::new(
         aft::db::open(&storage.path().join("aft.db")).unwrap(),
     ));
-    aft::db::bash_tasks::upsert_bash_task(
-        &conn.lock().unwrap(),
-        &metadata.to_bash_task_row("pi", &paths).unwrap(),
-    )
-    .unwrap();
+    let stored_row = metadata.to_bash_task_row("pi", &paths).unwrap();
+    aft::db::bash_tasks::upsert_bash_task(&conn.lock().unwrap(), &stored_row).unwrap();
     let registry = registry();
     registry.set_harness(aft::harness::Harness::Opencode);
     registry.set_db_pool(Arc::clone(&conn));
     for _ in 0..5 {
         registry
             .replay_session_for_project(storage.path(), "current-session", project.path())
+            .unwrap();
+    }
+    let untouched_row =
+        aft::db::bash_tasks::get_bash_task(&conn.lock().unwrap(), "pi", "retired-session", task_id)
+            .unwrap()
+            .expect("another harness must leave the missing-layout row for its owner");
+    assert_eq!(untouched_row.metadata, stored_row.metadata);
+    assert_eq!(untouched_row.status, stored_row.status);
+    assert_eq!(
+        untouched_row.completion_delivered,
+        stored_row.completion_delivered
+    );
+    let foreign_logs = take_logs();
+    assert!(
+        !foreign_logs.iter().any(|line| line.contains(task_id)),
+        "another harness must not report or retire the task: {foreign_logs:?}"
+    );
+
+    registry.set_harness(aft::harness::Harness::Pi);
+    for _ in 0..5 {
+        registry
+            .replay_session_for_project(storage.path(), "pi-current-session", project.path())
             .unwrap();
     }
     assert!(
@@ -1171,7 +1190,7 @@ fn foreign_harness_replay_retires_missing_layout_once() {
         )
         .unwrap()
         .is_none(),
-        "retirement must delete the stored harness's row, not the current route's row"
+        "the owning harness must retire its missing-layout row"
     );
     let warnings = take_logs()
         .into_iter()
@@ -1223,7 +1242,10 @@ fn replay_delete_failure_keeps_later_live_tasks_and_retries_orphan() {
         )
         .unwrap();
         let replayer = registry();
-        replayer.set_harness(aft::harness::Harness::Opencode);
+        // Both the orphan and the live task belong to Pi. Replay from another Pi
+        // session so the injected orphan-delete failure tests retry and continued
+        // live-task recovery, not cross-harness access.
+        replayer.set_harness(aft::harness::Harness::Pi);
         replayer.set_db_pool(Arc::clone(&conn));
         if resident {
             write_task(&paths.json, &orphan).unwrap();

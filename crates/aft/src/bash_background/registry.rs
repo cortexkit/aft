@@ -1140,25 +1140,32 @@ impl ProjectReplayBatch<'_> {
     pub(crate) fn replay_session_for_project(
         self,
         storage_dir: &Path,
+        harness: &Harness,
         session_id: &str,
         project_root: &Path,
     ) -> Result<(), String> {
-        self.registry
-            .replay_session_for_project(storage_dir, session_id, project_root)
+        self.registry.replay_session_in_harness(
+            storage_dir,
+            session_id,
+            Some(project_root),
+            Some(&harness.storage_segment()),
+        )
     }
 
     pub(crate) fn continue_project_replay(
         self,
         storage_dir: &Path,
+        harness: &Harness,
         session_id: &str,
         project_root: &Path,
         retry_due_failures: bool,
     ) -> Result<bool, String> {
-        self.registry.continue_project_replay(
+        self.registry.continue_project_replay_in_harness(
             storage_dir,
             session_id,
             project_root,
             retry_due_failures,
+            Some(&harness.storage_segment()),
         )
     }
 }
@@ -1376,6 +1383,8 @@ pub(crate) struct RegistryInner {
     #[cfg(test)]
     reclaim_kill_attempts: AtomicUsize,
     #[cfg(test)]
+    completion_processing_attempts: AtomicUsize,
+    #[cfg(test)]
     reclaim_kill_noop: AtomicBool,
     /// Finished tasks whose scratch directory is kept on disk until its
     /// delete time, keyed by task id. See `scratch_retention`.
@@ -1417,7 +1426,7 @@ pub(crate) struct RegistryInner {
     /// check that a held foreground bash call's periodic task checks build none.
     #[cfg(test)]
     pub(crate) snapshots_built: AtomicU64,
-    /// Name of the thread the once-per-process persisted GC ran on. Lets the
+    /// Name of the thread the per-storage-root persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
     persisted_gc_thread: Mutex<Option<String>>,
@@ -1921,6 +1930,10 @@ pub(crate) struct BgTaskState {
     /// clear (see `finish_terminal_transition`) instead of sending a notice
     /// built before any check.
     pub(crate) descendant_sample_pending: bool,
+    /// Reclamation found no saved process identity still in the terminal
+    /// task's group. A stale descendant list, or a reused group number, must
+    /// not retain the deleted root. Rechecked after a registry restart.
+    root_reclaim_group_unowned: bool,
     /// True while a kill has released this lock to signal and reap the
     /// process group. That kill owns the terminal transition until it clears
     /// the flag: the watchdog must not declare the task dead without an exit
@@ -2010,6 +2023,8 @@ impl BgTaskRegistry {
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 reclaim_kill_attempts: AtomicUsize::new(0),
+                #[cfg(test)]
+                completion_processing_attempts: AtomicUsize::new(0),
                 #[cfg(test)]
                 reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
@@ -3074,6 +3089,19 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        self.post_terminal_transition_with_token_policy(
+            task,
+            emit_frame,
+            CompletionTokenPolicy::Count,
+        )
+    }
+
+    fn post_terminal_transition_with_token_policy(
+        &self,
+        task: &Arc<BgTask>,
+        emit_frame: bool,
+        token_policy: CompletionTokenPolicy,
+    ) -> Result<(), String> {
         #[cfg(unix)]
         self.stop_secret_proxy(&task.task_id);
         self.settle_memory_accounting(task)?;
@@ -3129,7 +3157,7 @@ impl BgTaskRegistry {
                 .sample_task_process_group(task)
                 .is_some_and(|listing| !listing.is_clean());
         if !survivors_at_exit {
-            let result = self.finish_terminal_transition(task, emit_frame);
+            let result = self.finish_terminal_transition(task, emit_frame, token_policy);
             self.inner.terminal_transition.notify_waiters();
             return result;
         }
@@ -3145,7 +3173,9 @@ impl BgTaskRegistry {
             .spawn(move || {
                 std::thread::sleep(Duration::from_millis(300));
                 let settled = registry.sample_task_process_group(&task);
-                if let Err(error) = registry.finish_terminal_transition(&task, emit_frame) {
+                if let Err(error) =
+                    registry.finish_terminal_transition(&task, emit_frame, token_policy)
+                {
                     crate::slog_warn!(
                         "failed to finish background task {} after descendant sampling: {error}",
                         task.task_id
@@ -3191,6 +3221,7 @@ impl BgTaskRegistry {
         &self,
         task: &Arc<BgTask>,
         emit_frame: bool,
+        token_policy: CompletionTokenPolicy,
     ) -> Result<(), String> {
         if let Err(error) = self.cleanup_terminal_task_temp(task) {
             crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
@@ -3236,6 +3267,7 @@ impl BgTaskRegistry {
             None,
             emit_frame,
             cache.as_ref(),
+            token_policy,
         );
         release_terminal_io_handles(task);
         Ok(())
@@ -3557,6 +3589,45 @@ impl BgTaskRegistry {
                 self.settle_recovered_call(&metadata, &task.paths, row);
             }
         }
+    }
+
+    /// Persist the result of a program's shell call in the call ledger after
+    /// its initial tool reply hands off the still-running task. Flush an
+    /// already-terminal task as well, so a racing completion cannot be lost.
+    pub(crate) fn hold_running_call(
+        &self,
+        task_id: &str,
+        body: &[u8],
+        include_structured: bool,
+    ) -> Result<bool, String> {
+        let key = self
+            .task_call_key(task_id)
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?
+            .clone()
+            .ok_or_else(|| "Call ledger is unavailable".to_owned())?;
+        let publish = {
+            let conn = pool
+                .lock()
+                .map_err(|_| "Call ledger database mutex is poisoned".to_owned())?;
+            crate::db::call_ledger::hold_running(
+                &conn,
+                &crate::db::call_ledger::Key {
+                    carrier: key.requester,
+                    call_key: key.key,
+                },
+                task_id,
+                body,
+                include_structured,
+            )
+            .map_err(|error| error.to_string())?
+        };
+        self.settle_detached_call(task_id);
+        Ok(publish)
     }
 
     fn delete_gc_task_from_db(&self, metadata: &PersistedTask) {
@@ -5161,7 +5232,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5218,6 +5289,10 @@ impl BgTaskRegistry {
             (spawn_plan.with_prepared_task(prepared), task)
         };
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -5437,6 +5512,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -5608,7 +5684,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -5671,6 +5747,10 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        if !spawn_plan.is_native_launcher() {
+            crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+                .map_err(|error| format!("failed to retain task startup image: {error}"))?;
+        }
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -5882,6 +5962,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
@@ -6069,7 +6150,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         hard_kill: super::HardKill,
         memory_limit_mib: Option<u64>,
         storage_dir: PathBuf,
@@ -6089,6 +6170,8 @@ impl BgTaskRegistry {
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let layout_cleanup = UncommittedLayout::new(&task_layout);
+        crate::pinned_executable::retain_task_environment(&task_layout.paths.io_dir, &mut env)
+            .map_err(|error| format!("failed to retain task startup image: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
         let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
@@ -6247,6 +6330,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
@@ -6531,12 +6615,31 @@ impl BgTaskRegistry {
 
     /// Continue only the saved disk walk. The configure tail schedules one
     /// batch at a time, releasing recovery guards and locks between batches.
+    #[cfg(test)]
     pub(crate) fn continue_project_replay(
         &self,
         storage_dir: &Path,
         session_id: &str,
         project_root: &Path,
         retry_due_failures: bool,
+    ) -> Result<bool, String> {
+        let harness = self.db_harness_for_session(session_id);
+        self.continue_project_replay_in_harness(
+            storage_dir,
+            session_id,
+            project_root,
+            retry_due_failures,
+            harness.as_deref(),
+        )
+    }
+
+    fn continue_project_replay_in_harness(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: &Path,
+        retry_due_failures: bool,
+        harness: Option<&str>,
     ) -> Result<bool, String> {
         if self.project_replay_pending(storage_dir, project_root) {
             // Only a continuation resumed by a later maintenance tick may retry
@@ -6553,7 +6656,7 @@ impl BgTaskRegistry {
                     cursor.retry_due_failures();
                 }
             }
-            self.replay_session_batch(storage_dir, session_id, Some(project_root), true)?;
+            self.replay_session_batch(storage_dir, session_id, Some(project_root), true, harness)?;
         }
         Ok(self.project_replay_pending(storage_dir, project_root))
     }
@@ -6657,8 +6760,8 @@ impl BgTaskRegistry {
         task_id: &str,
         task_harness: Option<&str>,
     ) -> bool {
-        // Project replay reads all harnesses. Delete under the row's own
-        // namespace, not the route that happened to discover the orphan.
+        // Keep deletion tied to the persisted owner even if the root's
+        // configured harness has changed since the replay was scheduled.
         let harness = task_harness
             .map(str::to_owned)
             .or_else(|| self.db_harness_for_session(originating_session_id));
@@ -6783,7 +6886,18 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
-        self.replay_session_batch(storage_dir, session_id, project_root, false)
+        let harness = self.db_harness_for_session(session_id);
+        self.replay_session_in_harness(storage_dir, session_id, project_root, harness.as_deref())
+    }
+
+    fn replay_session_in_harness(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: Option<&Path>,
+        harness: Option<&str>,
+    ) -> Result<(), String> {
+        self.replay_session_batch(storage_dir, session_id, project_root, false, harness)
     }
 
     fn replay_session_batch(
@@ -6792,6 +6906,7 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
         continuation: bool,
+        harness: Option<&str>,
     ) -> Result<(), String> {
         // Held for the whole call: from here on this session's task directory is
         // being rewritten, and the persisted GC below sweeps the same storage
@@ -6836,7 +6951,7 @@ impl BgTaskRegistry {
         let database_replay = if continuation {
             None
         } else {
-            self.replay_session_from_db(session_id, project_root)
+            self.replay_session_from_db(session_id, project_root, harness)
         };
         // A failed task-list query means every later acknowledgement lookup on
         // this pool would fail for the same reason. Remember that across the
@@ -7027,6 +7142,21 @@ impl BgTaskRegistry {
             }
         };
 
+        // A shared root can have records for several harnesses. Reject foreign
+        // metadata before recovery guards, retirement or quarantine use this
+        // replay's harness directory, including records found by disk fallback.
+        let tasks = tasks
+            .into_iter()
+            .filter(|metadata| {
+                harness.is_none_or(|harness| {
+                    metadata
+                        .harness
+                        .as_deref()
+                        .is_none_or(|owner| owner == harness)
+                })
+            })
+            .collect::<Vec<_>>();
+
         // A project-scoped replay restores tasks from sessions other than the
         // one being bound, so guard those directories too before the loop
         // touches them.
@@ -7188,6 +7318,15 @@ impl BgTaskRegistry {
                 &metadata.task_id,
                 || read_task_at(&resolved),
             ) {
+                Ok(disk)
+                    if harness.is_some_and(|harness| {
+                        disk.harness
+                            .as_deref()
+                            .is_some_and(|owner| owner != harness)
+                    }) =>
+                {
+                    continue
+                }
                 Ok(disk)
                     if disk.task_id == metadata.task_id
                         && disk.session_id == metadata.session_id =>
@@ -7457,7 +7596,7 @@ impl BgTaskRegistry {
         }
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
-            return self.restore_claimed_remote_task(metadata, paths);
+            return self.restore_claimed_remote_task(metadata, paths, false);
         }
         // A finished remote task can still owe its runner a cancellation (an
         // owner pause marks the task finished before its worker sends it).
@@ -7626,6 +7765,7 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
         project_root: Option<&Path>,
+        harness: Option<&str>,
     ) -> Option<Result<Vec<PersistedTask>, String>> {
         let pool = self
             .inner
@@ -7633,30 +7773,22 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self.db_harness_for_session(session_id)?;
+        let harness = harness?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
         };
         let rows = if let Some(project_root) = project_root {
             let project_key = crate::path_identity::project_scope_key(project_root);
-            // Disk discovery skips every DB-owned task, so recover this
-            // project's indexed rows from every harness sharing the store.
-            crate::db::bash_tasks::bash_task_harnesses(&conn).and_then(|harnesses| {
-                let mut rows = Vec::new();
-                for harness in harnesses {
-                    rows.extend(
-                        crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
-                            &conn,
-                            &harness,
-                            &project_key,
-                        )?,
-                    );
-                }
-                Ok(rows)
-            })
+            // Resolve only rows owned by the harness whose task directory this
+            // replay scans. A different harness's missing path is not a lost task.
+            crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                &conn,
+                harness,
+                &project_key,
+            )
         } else {
-            crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, session_id)
+            crate::db::bash_tasks::list_bash_tasks_for_session(&conn, harness, session_id)
         };
         Some(
             rows.map(|rows| rows.into_iter().map(PersistedTask::from).collect())
@@ -9162,11 +9294,15 @@ impl BgTaskRegistry {
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
+    // Remote restoration starts a worker, so reject an out-of-scope match
+    // before registering it rather than leaving that check to the caller.
     fn status_relaxed_task(
         &self,
         task_id: &str,
         project_root: &Path,
         storage_dir: &Path,
+        resume_remote: bool,
+        accept: impl Fn(&PersistedTask) -> bool,
     ) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
         let canonical_project = canonicalized_path(project_root);
@@ -9184,6 +9320,7 @@ impl BgTaskRegistry {
                                 .map(canonicalized_path)
                                 .as_deref()
                                 == Some(canonical_project.as_path())
+                                && accept(&state.metadata)
                         })
                         .unwrap_or(false);
                     return matches_project.then_some(task);
@@ -9197,8 +9334,25 @@ impl BgTaskRegistry {
                 if disk.task_id != metadata.task_id || disk.session_id != metadata.session_id {
                     return None;
                 }
+                // Remote output and its replay cursor commit to disk together;
+                // the database row can still describe an older checkpoint.
+                let metadata = if disk.remote.is_some() || metadata.remote.is_some() {
+                    disk
+                } else {
+                    metadata
+                };
+                if !accept(&metadata)
+                    || metadata
+                        .project_root
+                        .as_deref()
+                        .map(canonicalized_path)
+                        .as_deref()
+                        != Some(canonical_project.as_path())
+                {
+                    return None;
+                }
                 if self
-                    .insert_rehydrated_task(metadata, resolved.paths, true)
+                    .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                     .is_err()
                 {
                     return None;
@@ -9274,6 +9428,9 @@ impl BgTaskRegistry {
             if metadata_project.as_deref() != Some(canonical_project.as_path()) {
                 continue;
             }
+            if !accept(&metadata) {
+                continue;
+            }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
                     .lock_state()
@@ -9285,12 +9442,13 @@ impl BgTaskRegistry {
                             .map(canonicalized_path)
                             .as_deref()
                             == Some(canonical_project.as_path())
+                            && accept(&state.metadata)
                     })
                     .unwrap_or(false);
                 return matches_project.then_some(task);
             }
             if self
-                .insert_rehydrated_task(metadata, resolved.paths, true)
+                .restore_relaxed_task(metadata, resolved.paths, resume_remote)
                 .is_err()
             {
                 return None;
@@ -9298,6 +9456,33 @@ impl BgTaskRegistry {
             return self.task(task_id);
         }
         None
+    }
+
+    fn restore_relaxed_task(
+        &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        resume_remote: bool,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        if !resume_remote && metadata.remote.is_some() && !metadata.is_terminal() {
+            // Kill settlement also needs a worker, but its cancellation must
+            // be durable before the worker can consider a local fallback.
+            self.restore_claimed_remote_task(metadata, paths, true)?;
+            self.start_watchdog();
+            return Ok(());
+        }
+        if resume_remote && metadata.remote.is_some() {
+            // Registering a saved remote task is not enough: its worker must
+            // attach to the runner. Session recovery shares one worker across
+            // registries and lets an owner's pending pause reach it first.
+            let session_id = metadata.session_id.clone();
+            self.rehydrate_resolved_task(metadata, paths, &session_id)?;
+            self.start_watchdog();
+            Ok(())
+        } else {
+            self.insert_rehydrated_task(metadata, paths, true)
+        }
     }
 
     fn lookup_relaxed_task_from_db(
@@ -9351,7 +9536,11 @@ impl BgTaskRegistry {
         .and_then(Result::ok)
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
-        if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+        if let Some(task) =
+            self.status_relaxed_task(task_id, project_root, storage_dir, true, |metadata| {
+                metadata.session_id == session_id || metadata.scope.is_none()
+            })
+        {
             if task.session_id != session_id
                 && task
                     .lock_state()
@@ -9393,7 +9582,9 @@ impl BgTaskRegistry {
         storage_dir: &Path,
     ) -> Result<BgTaskSnapshot, RegistryError> {
         let task = self
-            .status_relaxed_task(task_id, project_root, storage_dir)
+            .status_relaxed_task(task_id, project_root, storage_dir, false, |metadata| {
+                metadata.scope.is_none()
+            })
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         if task
             .lock_state()
@@ -10136,14 +10327,30 @@ impl BgTaskRegistry {
                 reclaim_root_paths_match(&task.project_root, &canonical_root, cfg!(windows))
             })
             .filter_map(|task| {
-                let sample_missing = {
+                let terminal_group = {
                     let state = task.lock_state().ok()?;
-                    state.metadata.status.is_terminal()
-                        && state.metadata.pgid.is_some()
-                        && state.metadata.live_descendants.is_none()
+                    // The first sampler may still be discovering owned group
+                    // members after the leader exited. Let it save identities
+                    // before deciding that the task no longer owns the group.
+                    if state.metadata.status.is_terminal() && state.descendant_sample_pending {
+                        return None;
+                    }
+                    (cfg!(unix)
+                        && state.metadata.status.is_terminal()
+                        && state.metadata.pgid.is_some())
+                    .then(|| state.metadata.clone())
                 };
-                if sample_missing {
-                    self.sample_task_process_group(&task);
+                if let Some(metadata) = terminal_group {
+                    // Completion-time samples can outlive the processes they
+                    // describe. Check saved identities before resampling: a
+                    // reused group number must not authorize killing its new
+                    // occupants or keep this deleted root alive.
+                    let pgid = metadata.pgid.expect("terminal group has a pgid");
+                    if finished_group_is_still_the_tasks(&metadata, pgid) {
+                        self.sample_task_process_group(&task);
+                    } else {
+                        task.lock_state().ok()?.root_reclaim_group_unowned = true;
+                    }
                 }
                 let needs_reclaim = {
                     let state = task.lock_state().ok()?;
@@ -11633,11 +11840,19 @@ impl BgTaskRegistry {
         if !task.terminal_persist_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
+        #[cfg(test)]
+        TERMINAL_PERSIST_AFTER_DIRTY_CHECK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         let mut db = DeferredDbWrites::new(self, task);
         let state = task
             .lock_state()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.metadata.is_terminal() {
+        // Another retry or scratch-cleanup write may have succeeded after
+        // the fast check above. Dirty state is changed under this same lock.
+        if task.terminal_persist_dirty.load(Ordering::SeqCst) && state.metadata.is_terminal() {
             self.persist_task_locked(task, &state.metadata, &mut db)?;
             task.terminal_persist_dirty.store(false, Ordering::SeqCst);
         }
@@ -11852,9 +12067,8 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
-        // Remember the end before taking the task snapshot. A dispatch already
-        // queued on another thread may register its process after this pass.
+    /// Fence approvals before asynchronous scope cleanup can block or fail.
+    pub(crate) fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
         self.inner
             .revoked_scopes
             .lock()
@@ -11864,6 +12078,36 @@ impl BgTaskRegistry {
                 scope.scope_ref.clone(),
                 scope.scope_epoch,
             ));
+    }
+
+    /// Serialize the final approval/dispatch check with confirmed scope ends.
+    /// Callers hold the owning database lock first; the closure must not take
+    /// task-state locks. Scope-end insertion itself never takes the database lock.
+    pub(crate) fn with_live_scope<T>(
+        &self,
+        scope: &subc_protocol::scope::ScopeStamp,
+        run: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let revoked = self
+            .inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if revoked.contains(&(
+            serde_json::to_string(&scope.owner).expect("principal is JSON"),
+            scope.scope_ref.clone(),
+            scope.scope_epoch,
+        )) {
+            None
+        } else {
+            Some(run())
+        }
+    }
+
+    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        // Remember the end before taking the task snapshot. A dispatch already
+        // queued on another thread may register its process after this pass.
+        self.fence_scope_end(scope);
         #[cfg(unix)]
         {
             let mut proxies = self
@@ -12276,11 +12520,14 @@ impl BgTaskRegistry {
     /// recorded through either registry reaches the one state every worker
     /// check reads, and it starts no worker of its own while the owner holds
     /// the task or a worker runs.
+    /// A kill records its cancellation in that shared task before permitting
+    /// a recovery worker to start, so recovery cannot launch a local fallback.
     #[cfg(unix)]
     fn restore_claimed_remote_task(
         &self,
         metadata: PersistedTask,
         paths: TaskPaths,
+        cancel_before_resume: bool,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let canonical_project_root = canonicalized_path(
@@ -12302,10 +12549,13 @@ impl BgTaskRegistry {
                 claim.adopters.push(Arc::downgrade(&self.inner));
                 let held = claim.held;
                 let publishes = self.register_claimed_task(&task)?;
+                let resume_allowed =
+                    !cancel_before_resume || self.record_remote_cancel_owed(&task, false)?;
                 // The owner's worker stopped without finishing the task: run
                 // it here, unless this registry is itself holding tasks for a
                 // pause, which must reach a task before its worker does.
-                if !held
+                if resume_allowed
+                    && !held
                     && !self.holds_remote_workers()
                     && !task.remote_worker_running.load(Ordering::Acquire)
                     && !task.is_terminal()
@@ -12323,6 +12573,9 @@ impl BgTaskRegistry {
         let task = self
             .task(&task_id)
             .ok_or_else(|| format!("{task_id}: restored remote task missing"))?;
+        if cancel_before_resume && !self.record_remote_cancel_owed(&task, false)? {
+            return Ok(());
+        }
         let held = self.hold_remote_worker(&task_id);
         if !self.inner.saved_task_recovery.load(Ordering::Acquire) {
             *task
@@ -12646,7 +12899,8 @@ impl BgTaskRegistry {
     /// `metadata.live_descendants` and `live_descendants_omitted` still do. A
     /// terminal group with no sample also waits for the kill worker to sample
     /// it; terminal status can be visible before descendant sampling finishes.
-    /// The kill path refreshes those samples after signaling. A cached routing
+    /// The kill worker checks saved process identities before refreshing those
+    /// samples, releasing groups no longer owned by the task. A cached routing
     /// identity avoids filesystem calls or process enumeration on the frame loop.
     pub(crate) fn try_has_reclaimable_tasks_for_root(
         &self,
@@ -12738,6 +12992,8 @@ impl BgTaskRegistry {
         }
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
+        let terminal_already_delivered =
+            metadata.status.is_terminal() && metadata.completion_delivered;
         #[cfg(test)]
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
@@ -12765,7 +13021,7 @@ impl BgTaskRegistry {
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.finished_at.map(started_instant_from_unix_millis)),
-            terminal_notification_routed: Mutex::new(false),
+            terminal_notification_routed: Mutex::new(terminal_already_delivered),
             notice_registry: Mutex::new(None),
             exit_marker_probe: Mutex::new(Default::default()),
             #[cfg(unix)]
@@ -12804,6 +13060,7 @@ impl BgTaskRegistry {
                 child_exit_observed: false,
                 descendant_sampling_started: false,
                 descendant_sample_pending: false,
+                root_reclaim_group_unowned: false,
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
@@ -13556,7 +13813,11 @@ impl BgTaskRegistry {
         if terminalized {
             #[cfg(test)]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
-            self.post_terminal_transition(&task, true)?;
+            self.post_terminal_transition_with_token_policy(
+                &task,
+                true,
+                CompletionTokenPolicy::Skip,
+            )?;
         } else {
             self.check_group_after_kill(&task);
         }
@@ -13565,7 +13826,10 @@ impl BgTaskRegistry {
             // Another publisher may have set the terminal state without yet
             // queuing its notification, or deferred it for descendant sampling.
             // A terminal kill reply must not outrun the session's completion.
-            self.finish_terminal_transition(&task, true)?;
+            // Removing a project root also kills surviving descendants of
+            // already-completed commands; skip statistics even when their
+            // terminal status stays Completed or Failed.
+            self.finish_terminal_transition(&task, true, CompletionTokenPolicy::Skip)?;
             self.inner.terminal_transition.notify_waiters();
         }
         snapshot.kill_signaled = kill_signaled;
@@ -13907,7 +14171,14 @@ impl BgTaskRegistry {
         if metadata.status.is_terminal() && !metadata.completion_delivered {
             let cache =
                 paths.and_then(|paths| self.render_terminal_output_from_paths(metadata, paths));
-            self.enqueue_completion_from_parts(metadata, None, paths, emit_frame, cache.as_ref());
+            self.enqueue_completion_from_parts(
+                metadata,
+                None,
+                paths,
+                emit_frame,
+                cache.as_ref(),
+                CompletionTokenPolicy::Count,
+            );
         }
     }
 
@@ -13931,17 +14202,8 @@ impl BgTaskRegistry {
         paths: Option<&TaskPaths>,
         emit_frame: bool,
         terminal_render: Option<&TerminalOutputCache>,
+        token_policy: CompletionTokenPolicy,
     ) {
-        // Only the terminal-state guard prevents double-recording here. The
-        // `completion_delivered` flag is NOT used to gate compression-event
-        // recording, because `mark_terminal` flips `completion_delivered=true`
-        // immediately for tasks with `notify_on_completion=false` (foreground
-        // bash polled via `bash_status`, which is the common case). Pre-emptive
-        // delivery flagging is correct for the push-frame queue (suppresses
-        // duplicate user-visible notifications) but would silently skip the
-        // database insert below. Compression event recording is idempotent at
-        // the DB layer (unique on harness+session+task_id), so re-entry is
-        // safe; the dedupe-by-queue check stays for the push frame side.
         if !metadata.status.is_terminal() {
             return;
         }
@@ -13958,9 +14220,19 @@ impl BgTaskRegistry {
                     paths,
                     emit_frame,
                     terminal_render,
+                    token_policy,
                 );
             }
             NoticeTarget::Nowhere => return,
+        }
+
+        let owner = self.task(&metadata.task_id);
+        if owner.as_ref().is_some_and(|task| {
+            task.terminal_notification_routed
+                .lock()
+                .is_ok_and(|routed| *routed)
+        }) {
+            return;
         }
 
         let owned_buffer = if buffer.is_none() && metadata.mode != BgMode::Pty {
@@ -14030,11 +14302,29 @@ impl BgTaskRegistry {
                     saved.bash_output_list_envelope,
                 )
             };
+        // Rendering may call an external compressor, so do not hold the
+        // publication mutex across it. Recheck afterwards: a concurrent kill
+        // can publish while the original completion is being rendered.
+        let mut routed = owner
+            .as_ref()
+            .and_then(|task| task.terminal_notification_routed.lock().ok());
+        if let Some(routed) = routed.as_mut() {
+            if **routed {
+                return;
+            }
+            **routed = true;
+        }
+        #[cfg(test)]
+        self.inner
+            .completion_processing_attempts
+            .fetch_add(1, Ordering::SeqCst);
+
         let token_counts = self.completion_token_counts(
             metadata,
             buffer,
             paths,
             render.map(|render| render.output_preview.as_str()),
+            token_policy,
         );
         let completion = BgCompletion {
             changed_files: self.changed_files_report(&metadata.task_id),
@@ -14057,31 +14347,12 @@ impl BgTaskRegistry {
             live_descendants_summary: live_descendants_summary(metadata),
         };
 
-        // Record the compression event BEFORE the push-frame dedupe. Event
-        // recording has its own idempotency at the DB layer (unique key on
-        // harness+session+task_id), so it's safe to attempt for every
-        // terminal-state finalize. Critically, this path runs even when
-        // `completion_delivered=true` was pre-set by `mark_terminal` for
-        // foreground bash (`notify_on_completion=false`) — which is the common
-        // case for OpenCode/Pi `bash` tool calls. Previously this code lived
-        // after the dedupe guard and never fired for foreground tasks, which
-        // meant compression accounting was effectively dead for >99% of
-        // real-world bash usage.
+        // Account once per registered task, including foreground tasks whose
+        // delivery flag is preset to suppress notices. Queue delivery/acks and
+        // restart replay are separate from this in-process publication fence;
+        // the database also deduplicates compression events across restarts.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
-        // Kill can finish a transition whose original publisher is still doing
-        // unlocked work. Route once under a separate mutex: queue dedupe alone
-        // cannot protect watches after their in-memory control flags are cleared.
-        let owner = self.task(&metadata.task_id);
-        let mut routed = owner
-            .as_ref()
-            .and_then(|task| task.terminal_notification_routed.lock().ok());
-        if let Some(routed) = routed.as_mut() {
-            if **routed {
-                return;
-            }
-            **routed = true;
-        }
         // A session ack can arrive through another root actor. Reconcile with
         // the shared rows before task-local watch flags decide terminal routing.
         self.sync_memory_watches_from_persistence(&metadata.task_id);
@@ -14166,10 +14437,17 @@ impl BgTaskRegistry {
                 compressed_bytes,
             ),
             _ => {
-                crate::slog_warn!(
-                    "compression event skipped for {}: token counts unavailable (likely spill file missing or unreadable)",
-                    metadata.task_id
-                );
+                if token_counts.intentionally_skipped {
+                    crate::slog_debug!(
+                        "compression event skipped for {}: token counting disabled for cancellation or reclamation",
+                        metadata.task_id
+                    );
+                } else {
+                    crate::slog_warn!(
+                        "compression event skipped for {}: token counts unavailable (likely spill file missing or unreadable)",
+                        metadata.task_id
+                    );
+                }
                 return;
             }
         };
@@ -14478,9 +14756,22 @@ impl BgTaskRegistry {
         buffer: Option<&BgBuffer>,
         paths: Option<&TaskPaths>,
         rendered_output: Option<&str>,
+        token_policy: CompletionTokenPolicy,
     ) -> CompletionTokenCounts {
-        if metadata.mode == BgMode::Pty {
-            return CompletionTokenCounts::skipped();
+        // Cancellation output is incomplete and its compression savings are not
+        // useful statistics. Cleaning up a deleted project root can kill many
+        // tasks in one pass: tokenizing each tail delays later kills and notices.
+        if matches!(token_policy, CompletionTokenPolicy::Skip)
+            || metadata.mode == BgMode::Pty
+            || matches!(
+                metadata.status,
+                BgTaskStatus::Killed | BgTaskStatus::TimedOut
+            )
+        {
+            return CompletionTokenCounts {
+                intentionally_skipped: true,
+                ..CompletionTokenCounts::skipped()
+            };
         }
 
         let raw = match buffer {
@@ -15723,12 +16014,19 @@ fn stream_starts_like_json(buffer: &BgBuffer, stream: StreamKind) -> bool {
         .is_some_and(|ch| matches!(ch, '{' | '[' | '"' | '-' | '0'..='9' | 't' | 'f' | 'n'))
 }
 
+#[derive(Clone, Copy)]
+enum CompletionTokenPolicy {
+    Count,
+    Skip,
+}
+
 struct CompletionTokenCounts {
     original_tokens: Option<u32>,
     compressed_tokens: Option<u32>,
     original_bytes: Option<i64>,
     compressed_bytes: Option<i64>,
     tokens_skipped: bool,
+    intentionally_skipped: bool,
 }
 
 impl CompletionTokenCounts {
@@ -15739,6 +16037,7 @@ impl CompletionTokenCounts {
             original_bytes: None,
             compressed_bytes: None,
             tokens_skipped: true,
+            intentionally_skipped: false,
         }
     }
 }
@@ -15900,6 +16199,7 @@ fn completion_counts_for_text(
         original_bytes: Some(raw_output.len() as i64),
         compressed_bytes: Some(compressed_output.len() as i64),
         tokens_skipped: false,
+        intentionally_skipped: false,
     }
 }
 
@@ -16018,6 +16318,11 @@ type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_PERSIST_AFTER_DIRTY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The remote cancellation outcome `bash.kill_scope` reports for a stopped
@@ -16776,6 +17081,7 @@ impl BgTask {
     fn state_needs_root_reclaim(state: &BgTaskState) -> bool {
         !state.metadata.status.is_terminal()
             || (cfg!(unix)
+                && !state.root_reclaim_group_unowned
                 && state.metadata.pgid.is_some()
                 && (state
                     .metadata
@@ -17714,6 +18020,111 @@ mod tests {
         assert_eq!(counts.original_bytes, Some(3));
         assert_eq!(counts.compressed_bytes, Some(8));
         assert_eq!(calls, ["raw", "rendered"]);
+    }
+
+    #[test]
+    fn completion_token_counts_skip_kills_but_preserve_normal_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = allocate_task_layout(root.path(), "session").unwrap();
+        fs::write(&layout.paths.stdout, "hello world").unwrap();
+        fs::write(&layout.paths.stderr, "").unwrap();
+        // This test is only about the counting policy, so read the files by
+        // exact path. The registered lookup re-resolves the task layout from
+        // its saved metadata, which this fixture never writes.
+        let buffer = BgBuffer::new(layout.paths.stdout.clone(), layout.paths.stderr.clone());
+        let mut metadata = PersistedTask::starting(
+            layout.paths.task_id.clone(),
+            "session".into(),
+            "printf 'hello world'".into(),
+            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        let registry = BgTaskRegistry::default();
+        for (status, skipped) in [
+            (BgTaskStatus::Completed, false),
+            (BgTaskStatus::Failed, false),
+            (BgTaskStatus::Killed, true),
+            (BgTaskStatus::TimedOut, true),
+        ] {
+            metadata.status = status;
+            let counts = registry.completion_token_counts(
+                &metadata,
+                Some(&buffer),
+                None,
+                None,
+                CompletionTokenPolicy::Count,
+            );
+            assert_eq!(counts.tokens_skipped, skipped, "{:?}", metadata.status);
+            assert_eq!(counts.original_tokens, (!skipped).then_some(2));
+            assert_eq!(counts.compressed_tokens, (!skipped).then_some(2));
+            assert_eq!(counts.original_bytes, (!skipped).then_some(11));
+            assert_eq!(counts.compressed_bytes, (!skipped).then_some(11));
+
+            // Removing a project root can reach an already-terminal task with
+            // live children; a memory-limit kill uses Failed rather than Killed.
+            let counts = registry.completion_token_counts(
+                &metadata,
+                Some(&buffer),
+                None,
+                None,
+                CompletionTokenPolicy::Skip,
+            );
+            assert!(counts.tokens_skipped);
+            assert_eq!(counts.original_tokens, None);
+            assert_eq!(counts.compressed_tokens, None);
+        }
+    }
+
+    #[test]
+    fn completion_missing_token_counts_only_warn_when_expected() {
+        let registry = BgTaskRegistry::default();
+        let mut metadata = PersistedTask::starting(
+            "bash-0000000000000100".into(),
+            "session".into(),
+            "true".into(),
+            PathBuf::from("."),
+            None,
+            None,
+            true,
+            false,
+        );
+        for (status, policy, level) in [
+            (BgTaskStatus::Killed, CompletionTokenPolicy::Count, "DEBUG "),
+            (
+                BgTaskStatus::TimedOut,
+                CompletionTokenPolicy::Count,
+                "DEBUG ",
+            ),
+            (BgTaskStatus::Failed, CompletionTokenPolicy::Skip, "DEBUG "),
+            (
+                BgTaskStatus::Completed,
+                CompletionTokenPolicy::Skip,
+                "DEBUG ",
+            ),
+            (
+                BgTaskStatus::Completed,
+                CompletionTokenPolicy::Count,
+                "WARN ",
+            ),
+        ] {
+            metadata.status = status;
+            let counts = registry.completion_token_counts(&metadata, None, None, None, policy);
+            let (_, lines) = crate::logging::capture_log_lines(|| {
+                registry.record_compression_event_if_applicable(&metadata, &counts);
+            });
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].starts_with(level), "{lines:?}");
+        }
+
+        let counts = completion_counts_for_text("raw", None, |_| None);
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            registry.record_compression_event_if_applicable(&metadata, &counts);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("WARN "), "{lines:?}");
     }
 
     #[test]
@@ -19376,6 +19787,17 @@ mod tests {
         assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
         assert!(registry.task_for_session(task_id, session).is_some());
         assert!(registry.drain_completions().is_empty());
+        registry.kill(task_id, session).unwrap();
+        registry.kill(task_id, session).unwrap();
+        assert_eq!(
+            registry
+                .inner
+                .completion_processing_attempts
+                .load(Ordering::SeqCst),
+            0,
+            "a delivered task recovered for status must not be finalized again"
+        );
+        assert!(registry.drain_completions().is_empty());
         registry.detach();
     }
 
@@ -19705,7 +20127,51 @@ mod tests {
     }
 
     #[test]
-    fn project_replay_restores_indexed_live_tasks_from_other_harnesses() {
+    fn project_replay_uses_scheduled_harness_after_root_harness_changes() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let namespace = storage.path().join("opencode");
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+        registry
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        let session = "scheduled-opencode-replay";
+        let task_id = "bash-000000000000c11d";
+        write_running_project_task(&namespace, project.path(), session, task_id);
+        let paths = task_paths(&namespace, session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.harness = Some("opencode".into());
+        metadata.child_pid = None;
+        metadata.completion_has_env_secrets = Some(false);
+        metadata.completion_has_non_ticket_env_secrets = Some(false);
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.exit, "19").unwrap();
+        crate::db::bash_tasks::upsert_bash_task(
+            &db.lock().unwrap(),
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+
+        // A later bind changes the shared root's fallback before the queued
+        // opencode replay runs. The replay still belongs to its saved harness.
+        registry.set_harness(Harness::Runner);
+        registry
+            .claim_project_replay_batch()
+            .unwrap()
+            .replay_session_for_project(&namespace, &Harness::Opencode, session, project.path())
+            .unwrap();
+        let completions = registry.drain_completions_for_session(Some(session));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].task_id, task_id);
+        assert_eq!(completions[0].status, BgTaskStatus::Failed);
+        assert_eq!(completions[0].exit_code, Some(19));
+        assert_eq!(read_task(&paths.json).unwrap().exit_code, Some(19));
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_ignores_indexed_tasks_from_other_harnesses() {
         let storage = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let (registry, db, _) = registry_with_db_and_frames(storage.path());
@@ -19738,14 +20204,21 @@ mod tests {
         )
         .unwrap();
         let rows = registry
-            .replay_session_from_db(session, Some(project.path()))
+            .replay_session_from_db(session, Some(project.path()), Some("opencode"))
             .unwrap()
             .unwrap();
         assert_eq!(
             rows.len(),
-            1,
-            "the DB project filter must exclude unrelated live rows before recovery"
+            0,
+            "the DB namespace filter must exclude another harness's project rows"
         );
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task_for_session(task_id, session).is_none());
+        assert!(registry.task_for_session(other_task, session).is_none());
+
+        registry.set_harness(Harness::Pi);
         registry
             .replay_session_for_project(storage.path(), session, project.path())
             .unwrap();
@@ -22554,6 +23027,11 @@ mod tests {
             snapshot.info.status_reason.as_deref(),
             Some(ROOT_RECLAIMED_REASON)
         );
+        let completions = registry.pending_completions_for_session("session");
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].tokens_skipped);
+        assert_eq!(completions[0].original_tokens, None);
+        assert_eq!(completions[0].compressed_tokens, None);
         let persisted = read_task(
             &registry
                 .task_json_path(&task_id, "session")
@@ -24615,6 +25093,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn completion_kill_skips_tokens_without_changing_output() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(
+            &registry,
+            dir.path(),
+            "printf 'hello world'; touch ready; exec sleep 60",
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("ready").exists() {
+            assert!(Instant::now() < deadline, "child did not write its output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snapshot = registry.kill(&task_id, "session").unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1);
+        assert!(completions[0].tokens_skipped);
+        assert_eq!(completions[0].original_tokens, None);
+        assert_eq!(completions[0].compressed_tokens, None);
+        assert_eq!(completions[0].output_preview, "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn kill_completion_waits_for_a_term_trapped_descendant_to_exit() {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
@@ -25044,6 +25547,9 @@ mod tests {
             "kill must queue the completion before returning"
         );
         assert_eq!(first[0].status, BgTaskStatus::Completed);
+        assert!(first[0].tokens_skipped);
+        assert_eq!(first[0].original_tokens, None);
+        assert_eq!(first[0].compressed_tokens, None);
         assert_eq!(
             second.len(),
             1,
@@ -25087,6 +25593,14 @@ mod tests {
         registry.kill(&task_id, "session").unwrap();
         assert!(completions_for(&registry, &task_id).is_empty());
         assert_eq!(pattern_match_frames(&frames).len(), 1);
+        assert_eq!(
+            registry
+                .inner
+                .completion_processing_attempts
+                .load(Ordering::SeqCst),
+            1,
+            "repeated terminal kills must not repeat completion accounting"
+        );
     }
 
     #[cfg(any(unix, windows))]
@@ -27329,6 +27843,23 @@ mod tests {
             .replay_session_for_project(storage.path(), "session", storage.path())
             .unwrap();
         assert!(replay.drain_completions().is_empty());
+        let untouched =
+            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
+                .unwrap()
+                .unwrap();
+        assert!(untouched.completion_delivered);
+        assert!(
+            !serde_json::from_str::<PersistedTask>(&untouched.metadata)
+                .unwrap()
+                .completion_delivered,
+            "another harness must not rewrite the task's acknowledgement snapshot"
+        );
+
+        replay.set_harness(Harness::Pi);
+        replay
+            .replay_session_for_project(storage.path(), "session", storage.path())
+            .unwrap();
+        assert!(replay.drain_completions().is_empty());
         let checkpoint =
             crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "pi", "session", &task_id)
                 .unwrap()
@@ -27339,7 +27870,7 @@ mod tests {
                 .completion_delivered
         );
         assert!(replay
-            .replay_session_from_db("session", Some(storage.path()))
+            .replay_session_from_db("session", Some(storage.path()), Some("pi"))
             .unwrap()
             .unwrap()
             .is_empty());

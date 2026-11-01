@@ -13,7 +13,7 @@ use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::cache::Tier1FileMemo;
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language_from_source, grammar_for, LangId};
 
 const MAX_LINES_PER_FILE: usize = 100_000;
 const MAX_ITEMS: usize = 100;
@@ -175,7 +175,7 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
     };
 
     let file = display_file_path(project_root, path);
-    let items = match detect_language(path) {
+    let items = match detect_language_from_source(path, &source) {
         Some(language) => scan_parser_comments(path, language, &source, &file),
         None => scan_lexical_comments(&source, &file),
     };
@@ -228,6 +228,12 @@ fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("release delayed TODO parser");
         }
+    }
+    if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
+        if crate::executor::current_job_cancelled() || !path.is_file() {
+            return None;
+        }
+        return crate::parser::parse_source_with_cached_parser(path, source, language).ok();
     }
     TODOS_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();

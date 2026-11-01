@@ -1436,10 +1436,7 @@ pub(crate) fn recovered_bash_frame(
         1,
         control_flags(),
         &result,
-        wire::ToolResponsePolicy {
-            trust: BindTrust::FirstParty,
-            tool_result_body: true,
-        },
+        wire::ToolResponsePolicy::for_retention(),
     )
     .ok()?;
     projected.frame = Frame::build_with_version(
@@ -1462,6 +1459,38 @@ pub(crate) fn recovered_bash_frame(
         outcome,
         tool_result_body,
     ))
+}
+
+pub(crate) fn project_held_ledger_result(
+    frame: &crate::db::call_ledger::RecordedFrame,
+    source: Option<&[u8]>,
+    include_structured: bool,
+) -> Result<crate::db::call_ledger::RecordedFrame, String> {
+    let frame = Frame::build(frame.ty, control_flags(), 1, 1, 1, frame.body.clone())
+        .map_err(|error| error.to_string())?;
+    let mut outgoing = WriterFrame::retained_tool_response_with_source(
+        frame,
+        wire::ToolResponsePolicy {
+            trust: if include_structured {
+                BindTrust::FirstParty
+            } else {
+                BindTrust::Untrusted
+            },
+            tool_result_body: true,
+            // This is a stored terminal body, not delivery to a route. Late
+            // readers and keyed replays apply their own recipient policy.
+            model_only: false,
+        },
+        None,
+        source.map(|source| source.to_vec()),
+    );
+    outgoing
+        .project_tool_result()
+        .map_err(|error| error.to_string())?;
+    Ok(crate::db::call_ledger::RecordedFrame {
+        ty: outgoing.header.ty,
+        body: outgoing.frame.body,
+    })
 }
 
 #[derive(Debug)]
@@ -1589,6 +1618,8 @@ struct RouteIdentityData {
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
+    held_reply: bool,
+    held_update: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -5422,6 +5453,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+    let gh_relay_requests = gh_relay_wait::Requests::default();
     let pending_deferred_setups = Arc::new(PendingDeferredSetups::default());
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
@@ -6171,6 +6203,8 @@ where
                                 &dispatch_path_metrics,
                                 true,
                                 gh_relay_route_scopes(&routes,&speech),
+                                &gh_relay_requests,
+                                module_drain.is_active(),
                             );
                             Ok(())
                         } else if management_routes.contains_key(&route) {
@@ -6264,6 +6298,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if gh_relay_requests.cancel(channel, corr) {
+                            continue;
+                        }
                         if ledger_edge.cancel(channel, corr) {
                             continue;
                         }
@@ -6382,6 +6419,7 @@ where
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
                                  module_drain.begin(until);
+                                 gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
                                     quiesced_reported: false,
@@ -7812,6 +7850,7 @@ async fn handle_route_bind_completion(
         .cloned()
     {
         let runtime = tokio::runtime::Handle::current();
+        let consent_executor = Arc::clone(executor);
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -7826,7 +7865,9 @@ async fn handle_route_bind_completion(
                     Ok(()) => {
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
-                        consent::reattach(ctx, &identity, &runtime);
+                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                            consent::reattach(&ctx, &identity, &runtime);
+                        }
                         Response::success("scope-bind", json!({}))
                     }
                     Err(error) => {
@@ -8589,6 +8630,12 @@ async fn handle_control_request(
                 .as_ref()
                 .is_some_and(|capabilities| capabilities.iter().any(|c| c == "elicitation"));
             let tool_result_body = result_body::accepts(consumer_capabilities.as_deref());
+            let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
+                consumer_capabilities.as_deref(),
+            );
+            let held_reply = consumer_capabilities
+                .as_ref()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
             log::info!(
                 "subc attach: route {} harness={} principal={} trust={} elicitation={}",
                 route_channel,
@@ -8679,6 +8726,8 @@ async fn handle_control_request(
                 },
                 consumer_elicitation_capable,
                 tool_result_body,
+                held_reply,
+                held_update,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -9268,9 +9317,11 @@ fn gh_relay_route_scopes(
     scopes
 }
 
-/// Run a gh shim relay request on its own task. The relay makes up to two
-/// network calls (prefrontal, then plexus); running them here keeps the subc frame
-/// loop free, and the relay holds no lock across them.
+mod gh_relay_wait;
+
+/// Run the relay off-loop, retaining ownership of its terminal frame even when
+/// cancellation or drain interrupts the provider wait.
+#[allow(clippy::too_many_arguments)]
 fn spawn_gh_relay(
     tx: &WriterSender,
     frame: &Frame,
@@ -9278,7 +9329,10 @@ fn spawn_gh_relay(
     metrics: &Arc<DispatchPathMetrics>,
     first_party: bool,
     route_scopes: crate::gh_shim_relay::RouteScopes,
+    requests: &gh_relay_wait::Requests,
+    draining: bool,
 ) {
+    let mut wait = requests.register(frame, draining);
     let tx = tx.clone();
     let frame = frame.clone();
     let relay = Arc::clone(relay);
@@ -9296,7 +9350,8 @@ fn spawn_gh_relay(
             .unwrap_or_default()
             .to_string();
         let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
-        let reply = crate::gh_shim_relay::relay(
+        let relay_log = |line: &str| log::info!("{line}");
+        let relay_call = crate::gh_shim_relay::relay(
             &relay.transport,
             crate::gh_shim_relay::RelayCall {
                 operation: &operation,
@@ -9304,26 +9359,10 @@ fn spawn_gh_relay(
                 first_party,
                 route_scopes: &route_scopes,
             },
-            &|line| log::info!("{line}"),
-        )
-        .await;
-        let body = json!({
-            "op": operation,
-            "status": if reply.ok { "ok" } else { "error" },
-            "data": reply.data,
-        });
-        let Ok(body) = serde_json::to_vec(&body) else {
-            return;
-        };
-        let Ok(response) = Frame::build_with_version(
-            frame.header.ver,
-            FrameType::Response,
-            frame.header.flags,
-            frame.header.channel,
-            frame.header.epoch,
-            frame.header.corr,
-            body,
-        ) else {
+            &relay_log,
+        );
+        let response = gh_relay_wait::terminal(&frame, &operation, &mut wait, relay_call).await;
+        let Ok(response) = response else {
             return;
         };
         if let Err(error) =
@@ -10244,6 +10283,25 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if identity_for_run.run_owner.is_some() {
+                if let Err(response) = tool_provider::check_program_scope(
+                    ctx,
+                    &request_id_for_force,
+                    &identity_for_run,
+                ) {
+                    return response;
+                }
+                if let Some(key) = ledger_key.as_ref().filter(|_| approved_io_window.is_some()) {
+                    if let Err(response) = tool_provider::begin_approved_call(
+                        ctx,
+                        key,
+                        &request_id_for_force,
+                        &identity_for_run,
+                    ) {
+                        return response;
+                    }
+                }
+            }
             if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
                 if let Some(args) = arguments.as_object_mut() {
                     args.remove("permissions_granted");
@@ -10451,7 +10509,9 @@ async fn hold_for_consent(
         access_grants::ask_route(&plain_run.identity),
         crate::access_policy::AskRoute::Elicitation { .. }
     );
-    let reply_deadline = if elicitation {
+    let reply_deadline = if plain_run.identity.run_owner.is_some() {
+        consent::program_reply_deadline()
+    } else if elicitation {
         plain_run.reply_deadline
     } else {
         plain_run.io_budget.deadline
@@ -10468,8 +10528,22 @@ async fn hold_for_consent(
         active: Arc::clone(active_tool_calls),
         connection_cancel: connection_cancel.clone(),
         drain: module_drain.clone(),
+        ledger_key: plain_run.ledger_key.clone(),
+        shell_claim: None,
     };
-    let rerun = |ask_route| {
+    if plain_run.identity.run_owner.is_some() && plain_run.ledger_key.is_some() {
+        if consent::persist_permission_hold(&held).await.is_err() {
+            return Some((response, text));
+        }
+        let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
+            .await
+            .is_err()
+        {
+            return None;
+        }
+    }
+    let rerun = |ask_route, _shell| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
         // Start the renewed allowance when the executor admits the approved
         // work. Queueing after approval must not spend its filesystem budget.
@@ -10501,12 +10575,24 @@ async fn hold_for_consent(
                     &format_context,
                 ),
             };
-            (response, text)
+            Some((response, text))
         }
     };
     let result = if elicitation {
-        standalone::run_with_elicitation(held, (response, text), rerun, writer, metrics, ver, flags)
-            .await
+        standalone::run_with_elicitation(
+            held,
+            (response, text),
+            |route| async move {
+                rerun(route, Vec::<String>::new())
+                    .await
+                    .expect("file reruns do not hand off tasks")
+            },
+            writer,
+            metrics,
+            ver,
+            flags,
+        )
+        .await
     } else {
         consent::run_with_consent(held, (response, text), rerun).await
     };
@@ -11365,9 +11451,14 @@ async fn handle_tool_call_with_capabilities(
             )?;
             return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_some() {
-            // An untrusted head's shell call asks its consumer first; a
-            // program's run route has nobody to put that question to.
+        if matches!(bind_trust, BindTrust::Untrusted)
+            && matches!(
+                access_grants::ask_route(&identity),
+                crate::access_policy::AskRoute::Unavailable
+            )
+        {
+            // Worker programs and programs without held replies cannot carry
+            // an untrusted shell approval through the consent service.
             let error = subc_protocol::ErrorBody::new(
                 crate::access_policy::PERMISSION_ASK_UNAVAILABLE,
                 "this shell call needs an approval, and a codemode program can't ask for it",
@@ -11375,7 +11466,7 @@ async fn handle_tool_call_with_capabilities(
             .with_detail(json!({"permission": "bash", "resource": bare_name}));
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        if matches!(bind_trust, BindTrust::Untrusted) {
+        if matches!(bind_trust, BindTrust::Untrusted) && identity.run_owner.is_none() {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,
                 identity.project_root.as_path(),
@@ -13117,6 +13208,70 @@ pub(crate) mod test_support {
     }
 
     #[test]
+    fn bounded_scoped_inspect_abandoned_discovery_releases_reader_for_rebind() {
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("inspect-abandoned-discovery");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        executor.register_actor(root.clone(), ctx.clone());
+        let held_manager = ctx.lsp();
+        let inspect_ctx = ctx.clone();
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            "inspect-abandoned-discovery".into(),
+            "inspect",
+            Box::new(move |_| {
+                let request = serde_json::from_value(json!({
+                    "id": "inspect-abandoned-discovery", "command": "inspect",
+                    "scope": "README.md", "sections": "diagnostics"
+                }))
+                .unwrap();
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::inspect::handle_inspect_deferred(&request, inspect_ctx)
+                else {
+                    panic!("inspect must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("inspect-abandoned-discovery", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(1));
+        if pending.is_err() {
+            drop(held_manager);
+            panic!("inspect discovery kept the executor reader while waiting for the LSP manager");
+        }
+        let mut pending = pending.unwrap();
+        // Both route abandonment and CANCEL reach this same cancellation token.
+        executor.cancel_job(&root, &cancellation);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let terminal = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled discovery did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(terminal.data["inspect_terminal"], "interrupted");
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-after-abandoned-discovery".into(),
+            Box::new(|_| Response::success("subc-bind-after-abandoned-discovery", json!({}))),
+        );
+        assert!(
+            bind.recv_timeout(Duration::from_secs(1))
+                .expect("the released request no longer holds an executor reader")
+                .success
+        );
+        drop(held_manager);
+    }
+
+    #[test]
     fn deferred_inspect_honors_the_shared_request_deadline() {
         let _serial = crate::commands::inspect::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
@@ -13511,6 +13666,8 @@ pub(crate) mod test_support {
                 principal_id: Some("reserved:broca".into()),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14790,6 +14947,8 @@ pub(crate) mod test_support {
                 }),
             },
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -19905,6 +20064,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20037,6 +20198,8 @@ mod tests {
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
+            held_reply: false,
+            held_update: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -22799,6 +22962,104 @@ mod tests {
         format!("Opens:\n{}", lines.join("\n"))
     }
 
+    /// Capture waits without taking the locks an open or a worker may be stuck
+    /// holding. Other roots' unfinished opens matter because the dedicated
+    /// database-open thread serves them in order.
+    fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let database = match slot.try_lock() {
+            Some(slot) => format!(
+                "epoch={} committed_age_ms={} running={} pending={:?} ready_for={:?}",
+                slot.epoch,
+                slot.committed_at.elapsed().as_millis(),
+                slot.running,
+                slot.pending.as_ref().map(|request| (
+                    request.epoch,
+                    request.dispatched_at.map(|at| at.elapsed().as_millis()),
+                    &request.storage_root,
+                )),
+                slot.ready_for,
+            ),
+            None => "database-open slot locked (attach/publication may be in progress)".into(),
+        };
+        let opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root || open.finished_at.is_none())
+            .map(|open| {
+                format!(
+                    "root={} lane={:?} age_ms={} queued_ms={:?} finished={} floor_ms={} open_ms={} outcome={:?}",
+                    open.root.display(), open.runner, open.started_at.elapsed().as_millis(),
+                    open.dispatched_at.map(|at| open.started_at.saturating_duration_since(at).as_millis()),
+                    open.finished_at.is_some(), open.floor_check.as_millis(), open.open.as_millis(), open.outcome,
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "database: {database}; opens: {opens:?}; root jobs (None means scheduler locked): {:?}; barriers: {:?}; dispatch: {:?}",
+            executor.try_root_job_snapshots(&fixture.root, None),
+            executor.try_bind_blocker_snapshot(&fixture.root, "subc-41-7"),
+            executor.try_dispatch_liveness_snapshot(),
+        )
+    }
+
+    struct RebindWaitDiagnostics<'a>(&'a Executor, &'a ConfiguredRoot);
+
+    impl Drop for RebindWaitDiagnostics<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "rebind wait failure: {}",
+                    rebind_wait_diagnostics(self.0, self.1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_wait_diagnostics_name_active_job_without_waiting_on_database_slot() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Executor::new();
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = executor.submit_async(
+            fixture.root.clone(),
+            Lane::Mutating,
+            "held-rebind-writer".into(),
+            Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                Response::success("held-rebind-writer", json!({}))
+            }),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (slot, _) = fixture.ctx.database_open_slot();
+        let locked = slot.lock();
+        // The job snapshot is a non-blocking read; while the scheduler holds
+        // its lock it reports None, by design. Retry while the slot stays
+        // held, so the assertions below check what the snapshot names rather
+        // than lock timing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let diagnostic = loop {
+            let diagnostic = rebind_wait_diagnostics(&executor, &fixture);
+            if diagnostic.contains("held-rebind-writer") || std::time::Instant::now() >= deadline {
+                break diagnostic;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(locked);
+        release_tx.send(()).unwrap();
+        assert!(writer.blocking_recv().unwrap().success);
+        for expected in [
+            "database-open slot locked",
+            "held-rebind-writer",
+            "lane: Mutating",
+            "started_age_ms:",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+    }
+
     /// A rebind can put a working root back into "initializing": here the
     /// rebind points the root at a different storage directory, and neither
     /// the post-reply dispatch nor the configure tail runs (the tail stands in
@@ -22811,6 +23072,9 @@ mod tests {
         let executor = Arc::new(Executor::new());
         let fixture = ConfiguredRoot::new(&executor);
         let _reap = ReapContextChildren(Arc::clone(&fixture.ctx));
+        // Diagnose panics inside database_wire_tool as well as failed response
+        // assertions. Run before child cleanup on unwind.
+        let _diagnostics = RebindWaitDiagnostics(&executor, &fixture);
         fixture.ctx.mark_subc_bound();
         start_post_ack_database_open(&executor, &fixture.root);
         assert!(
@@ -22858,6 +23122,11 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(other_storage.path().join("aft.db").is_file());
+        eprintln!(
+            "rebind bash completed in {}ms; {}",
+            started.elapsed().as_millis(),
+            rebind_wait_diagnostics(&executor, &fixture),
+        );
     }
 
     #[test]

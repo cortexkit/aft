@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "e2e-checkrun-filter-all"
+  ],
+  "note": "CI workflow only: the OpenCode 2 E2E job lists every check run when it looks up its own. No search code."
+}

@@ -278,10 +278,13 @@ pub fn disclose_borrowed_answer(
 /// callgraph answers come from this checkout's own data: the owner checkout,
 /// a per-checkout query runtime, a checkout's v3 view or a pinned per-HEAD view.
 pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
-    if !ctx.shared_artifacts_read_only()
-        || ctx.checkout_query_runtime_active()
-        || ctx.callgraph_views_enabled()
-    {
+    if ctx.checkout_query_runtime_active() {
+        return None;
+    }
+    if ctx.callgraph_views_enabled() {
+        return view_borrowed_callgraph(ctx);
+    }
+    if !ctx.shared_artifacts_read_only() {
         return None;
     }
     if ctx.config().views.enabled
@@ -325,6 +328,55 @@ pub fn borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
         edits_in,
         differing_files: differing,
     })
+}
+
+/// With views on, a checkout over `views.callgraph_copies` reads another
+/// checkout's published call graph (`views::callgraph_copies`). The graph's
+/// files come from that reader and this checkout's from its lexical view, so
+/// the comparison reads no tree.
+fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
+    let (owner, store) = ctx.borrowed_callgraph_view()?;
+    let checkout_root = canonical(&ctx.config().project_root.clone()?);
+    let owner = canonical(&owner);
+    let differing = store.file_identities().ok().and_then(|graph| {
+        let checkout = crate::views::callgraph::callgraph_inputs(ctx.lexical_file_identities()?);
+        Some(compare_with_graph(
+            &graph,
+            checkout,
+            &checkout_root,
+            Some(&owner),
+            MAX_DISK_HASHES,
+            Some(&views_graph_key),
+        ))
+    });
+    let owner_head = checkout_head(&owner);
+    let checkout_head = checkout_head(&checkout_root);
+    let complete_list = differing
+        .as_ref()
+        .filter(|differing| differing.complete)
+        .map(|differing| differing.files.as_slice());
+    let edits_in = complete_list.and_then(|differing| {
+        let same_head = matches!(
+            (&owner_head, &checkout_head),
+            (Some(owner), Some(checkout)) if owner == checkout
+        );
+        (same_head && !differing.is_empty())
+            .then(|| locate_edits(&checkout_root, differing))
+            .flatten()
+    });
+    Some(BorrowedCallgraph {
+        owner_head,
+        owner_checkout: Some(owner),
+        checkout_head,
+        changed_files: complete_list.map(<[String]>::len),
+        edits_in,
+        differing_files: differing,
+    })
+}
+
+/// [`compare_with_graph`]'s key mapping for a views call graph.
+pub(crate) fn views_graph_key(path: &str, source: blake3::Hash) -> Option<blake3::Hash> {
+    crate::views::callgraph::graph_key(path.as_bytes(), source)
 }
 
 enum Owner {
@@ -412,6 +464,7 @@ fn files_differing_from_borrowed_graph(
         checkout_root,
         owner_root,
         MAX_DISK_HASHES,
+        None,
     ))
 }
 
@@ -474,12 +527,18 @@ impl DiskHasher {
 ///
 /// When the disk-read budget runs out the comparison stops and returns the
 /// files found so far, marked incomplete.
-fn compare_with_graph(
+///
+/// A views call graph does not store source hashes: each file row holds the
+/// file's call-graph blob key and size 0. For such a graph pass `graph_key`,
+/// which turns a path and source hash into the key the graph stores, and the
+/// graph's files are compared by that key alone.
+pub(crate) fn compare_with_graph(
     graph: &HashMap<String, FileIdentity>,
     checkout: HashMap<String, FileIdentity>,
     checkout_root: &Path,
     owner_root: Option<&Path>,
     max_disk_hashes: usize,
+    graph_key: Option<&dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>>,
 ) -> DifferingFiles {
     let mut hasher = DiskHasher {
         remaining: max_disk_hashes,
@@ -490,6 +549,7 @@ fn compare_with_graph(
         checkout,
         checkout_root,
         owner_root,
+        graph_key,
         &mut hasher,
         &mut differing,
     )
@@ -506,6 +566,7 @@ fn collect_differing(
     mut checkout: HashMap<String, FileIdentity>,
     checkout_root: &Path,
     owner_root: Option<&Path>,
+    graph_key: Option<&dyn Fn(&str, blake3::Hash) -> Option<blake3::Hash>>,
     hasher: &mut DiskHasher,
     differing: &mut Vec<String>,
 ) -> Result<(), BudgetSpent> {
@@ -516,13 +577,22 @@ fn collect_differing(
     graph_paths.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (relative, &expected) in graph_paths {
         let path = checkout_root.join(relative);
-        let same = match checkout.remove(relative) {
-            Some((size, hash)) => hasher.same_content(expected, size, hash, &path)?,
-            None => match fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    hasher.same_content(expected, metadata.len(), zero, &path)?
-                }
-                _ => false,
+        let same = match graph_key {
+            Some(key_of) => {
+                let source = match checkout.remove(relative) {
+                    Some((_, hash)) if hash != zero => Some(hash),
+                    _ => hasher.hash(&path)?,
+                };
+                source.and_then(|source| key_of(relative, source)) == Some(expected.1)
+            }
+            None => match checkout.remove(relative) {
+                Some((size, hash)) => hasher.same_content(expected, size, hash, &path)?,
+                None => match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        hasher.same_content(expected, metadata.len(), zero, &path)?
+                    }
+                    _ => false,
+                },
             },
         };
         if !same {
@@ -1557,7 +1627,7 @@ mod tests {
             ("dist/out.ts", identity("built")),
         ]);
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
             known(&[])
         );
     }
@@ -1593,7 +1663,7 @@ mod tests {
         // unindexed.ts is in the graph but has no record in this checkout's
         // index; its file on disk is hashed instead and matches the graph.
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 8),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 8, None),
             known(&[
                 "src/added.ts",
                 "src/edited.ts",
@@ -1612,19 +1682,19 @@ mod tests {
         );
         let here = files(&[("src/a.ts", identity("aa"))]);
         assert_eq!(
-            compare_with_graph(&HashMap::new(), here, &checkout, None, 8),
+            compare_with_graph(&HashMap::new(), here, &checkout, None, 8, None),
             known(&["src/a.ts"])
         );
         let graph = files(&[("src/a.ts", identity("aa")), ("src/b.ts", identity("bb"))]);
         let here = files(&[("src/a.ts", unhashed("aa")), ("src/b.ts", unhashed("bb"))]);
         assert_eq!(
-            compare_with_graph(&graph, here.clone(), &checkout, Some(&owner), 2),
+            compare_with_graph(&graph, here.clone(), &checkout, Some(&owner), 2, None),
             known(&[])
         );
         // Past the budget the files found so far are kept, but the list is
         // marked incomplete so that no count is reported from it.
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 1),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 1, None),
             DifferingFiles {
                 files: Vec::new(),
                 complete: false
@@ -1633,7 +1703,7 @@ mod tests {
         let graph = files(&[("src/a.ts", identity("zz")), ("src/b.ts", identity("bb"))]);
         let here = files(&[("src/a.ts", identity("aa")), ("src/b.ts", unhashed("bb"))]);
         assert_eq!(
-            compare_with_graph(&graph, here, &checkout, Some(&owner), 0),
+            compare_with_graph(&graph, here, &checkout, Some(&owner), 0, None),
             DifferingFiles {
                 files: vec!["src/a.ts".to_string()],
                 complete: false

@@ -18,6 +18,7 @@ pub mod prune_legacy;
 pub mod v3_import;
 pub mod v3_ledger;
 pub mod v3_symbols;
+pub(crate) mod views_background;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -132,7 +133,7 @@ pub struct SemanticMigrationReport {
     pub skipped_rows: usize,
     /// Rows omitted because their path is invalid for, or outside, the current root.
     pub outside_root_rows: usize,
-    /// Rows omitted because source bytes were unreadable or no longer match the snapshot.
+    /// Rows omitted because source bytes changed, were unreadable, or need header-language extraction.
     pub stale_rows: usize,
     /// Semantic embedding work performed by this importer. Compatible imports are zero.
     pub reembedded_rows: usize,
@@ -407,6 +408,7 @@ pub fn import_legacy_semantic(
     let mut skipped_rows = 0;
     let mut outside_root_rows = 0;
     let mut stale_rows = 0;
+    let header_languages_resolved = parsed.header_languages_resolved;
     for file in parsed.files {
         if file.incomplete {
             skipped_rows += 1;
@@ -436,8 +438,20 @@ pub fn import_legacy_semantic(
                 continue;
             }
         };
+        // Matching bytes do not prove matching chunks when an old C-only header
+        // now resolves to another language. Never relabel those old vectors
+        // with the new language-specific key without re-extracting them.
         if file.content_hash.iter().all(|byte| *byte == 0)
             || blake3::hash(&source).as_bytes() != &file.content_hash
+            || (!header_languages_resolved
+                && rel_path.as_bytes().ends_with(b".h")
+                && matches!(
+                    crate::parser::detect_language_from_source(
+                        Path::new("header.h"),
+                        std::str::from_utf8(&source).unwrap_or("")
+                    ),
+                    Some(crate::parser::LangId::Cpp | crate::parser::LangId::ObjC)
+                ))
         {
             skipped_rows += 1;
             stale_rows += 1;
@@ -807,6 +821,7 @@ fn push_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
 
 struct ParsedLegacySnapshot {
     files: Vec<LegacyFile>,
+    header_languages_resolved: bool,
 }
 
 struct LegacyFile {
@@ -851,6 +866,14 @@ fn parse_legacy_snapshot(
     if !fingerprint_is_compatible(&fingerprint, configured_model_fingerprint) {
         return Err("model fingerprint or chunker version is incompatible".to_string());
     }
+    let header_languages_resolved = serde_json::from_str::<serde_json::Value>(&fingerprint)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("header_languages_resolved")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
 
     let metadata_count = reader.read_u32()? as usize;
     if metadata_count > MAX_LEGACY_ROWS {
@@ -932,7 +955,10 @@ fn parse_legacy_snapshot(
             entries_by_path.len()
         );
     }
-    Ok(ParsedLegacySnapshot { files })
+    Ok(ParsedLegacySnapshot {
+        files,
+        header_languages_resolved,
+    })
 }
 
 /// V8 appends a total and two path/count tables (provider refusal and context
@@ -980,10 +1006,12 @@ fn fingerprint_is_compatible(legacy: &str, configured: &str) -> bool {
     let Some(fields) = legacy.as_object_mut() else {
         return false;
     };
-    // Repair state is not model identity. Every other fingerprint field stays exact.
-    if let Some(marker) = fields.remove("file_summary_budget_limited") {
-        if !marker.is_boolean() {
-            return false;
+    // Artifact repair/migration state is not model identity. Every other field stays exact.
+    for key in ["file_summary_budget_limited", "header_languages_resolved"] {
+        if let Some(marker) = fields.remove(key) {
+            if !marker.is_boolean() {
+                return false;
+            }
         }
     }
     legacy == configured
@@ -1062,6 +1090,83 @@ impl<'a> LegacyReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h_header_invalidation_import_does_not_relabel_old_c_vectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let sources = [
+            ("plain.h", "int plain(void);\n"),
+            ("widget.h", "template <typename T>\nclass Widget {\npublic:\n    T value(T x) { return x; }\n};\n"),
+            ("greeter.h", "@interface Greeter\n@property int value;\n@end\n"),
+            ("lib.rs", "pub fn untouched() {}\n"),
+        ];
+        let files = sources
+            .iter()
+            .map(|(name, source)| {
+                let path = root.join(name);
+                fs::write(&path, source).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut index = crate::semantic_index::SemanticIndex::build(
+            &root,
+            &files,
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            64,
+        )
+        .unwrap();
+        let fingerprint = crate::semantic_index::SemanticIndexFingerprint {
+            dimension: 2,
+            chunking_version: 2,
+            ..Default::default()
+        };
+        index.set_fingerprint(fingerprint.clone());
+        for current in [false, true] {
+            let request = SemanticMigrationRequest::for_root(
+                temp.path().join(if current { "current" } else { "legacy" }),
+                &root,
+                fingerprint.as_string(),
+            );
+            let mut bytes = index.to_bytes();
+            if !current {
+                let length = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+                let mut identity: serde_json::Value =
+                    serde_json::from_slice(&bytes[13..13 + length]).unwrap();
+                identity
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("header_languages_resolved");
+                let identity = serde_json::to_vec(&identity).unwrap();
+                bytes.splice(13..13 + length, identity.iter().copied());
+                bytes[9..13].copy_from_slice(&(identity.len() as u32).to_le_bytes());
+            }
+            let path = request.legacy_semantic_path();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            let report = import_legacy_semantic(&request).unwrap();
+            assert_eq!(report.imported_rows, if current { 4 } else { 2 });
+            assert_eq!(report.stale_rows, if current { 0 } else { 2 });
+            assert_eq!(report.reembedded_rows, 0);
+            let store = BlobStore::open(
+                &request.storage,
+                &request.family,
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            for (name, source) in sources {
+                let key = SemanticKey::for_current(
+                    source.as_bytes(),
+                    name.as_bytes(),
+                    fingerprint.as_string(),
+                )
+                .full_key();
+                let expected = current || name == "plain.h" || name == "lib.rs";
+                assert_eq!(store.get(&key).unwrap().is_some(), expected, "{name}");
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "views-default-prep"
+  ],
+  "note": "Views-on observability and idle release only. The one ranking-fence file is commands/semantic_search/mod.rs, where a views-on semantic view that cannot serve or score a query now also records a health failure; the reply, ranked rows and rendered text are unchanged. Views are off by default and the benchmark runs views off, so canonical ranked rows must stay byte-identical."
+}

@@ -120,7 +120,7 @@ pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
 #[cfg(test)]
 type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync + 'static;
 #[cfg(test)]
-type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
+pub(crate) type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -170,10 +170,35 @@ pub(crate) mod work_counts {
     use std::sync::{Mutex, OnceLock};
 
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static FINGERPRINT_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static GO_PACKAGE_BUILDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CANONICAL_PATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static REALPATHS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static WORKSPACE_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CORPUS_LOOKUPS: OnceLock<Mutex<HashMap<PathBuf, (usize, usize, u128)>>> =
+        OnceLock::new();
+
+    pub(super) fn note_corpus_lookup(path: &Path, realpaths: usize, elapsed_ns: u128) {
+        let mut counts = CORPUS_LOOKUPS.get_or_init(Default::default).lock().unwrap();
+        let entry = counts.entry(path.to_path_buf()).or_default();
+        entry.0 += 1;
+        entry.1 += realpaths;
+        entry.2 += elapsed_ns;
+    }
+
+    pub(super) fn corpus_lookups_under(root: &Path) -> Vec<(usize, usize, u128)> {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, counts)| *counts)
+            .collect()
+    }
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -204,6 +229,20 @@ pub(crate) mod work_counts {
         note(&PARSES, path);
     }
 
+    pub(super) fn note_fingerprint_read(path: &Path) {
+        note(&FINGERPRINT_READS, path);
+    }
+
+    pub(super) fn fingerprint_reads(path: &Path) -> usize {
+        FINGERPRINT_READS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn note_config_read(path: &Path) {
         note(&CONFIG_READS, path);
     }
@@ -218,6 +257,41 @@ pub(crate) mod work_counts {
 
     pub(crate) fn directory_reads_under(root: &Path) -> usize {
         under(&DIRECTORY_READS, root, None)
+    }
+
+    pub(crate) fn note_canonical_path(path: &Path) {
+        note(&CANONICAL_PATHS, path);
+    }
+
+    pub(crate) fn note_realpath(path: &Path) {
+        note(&REALPATHS, path);
+    }
+
+    pub(crate) fn realpaths_under(root: &Path) -> usize {
+        under(&REALPATHS, root, None)
+    }
+
+    pub(crate) fn note_workspace_directory(path: &Path) {
+        note(&WORKSPACE_DIRECTORIES, path);
+    }
+
+    pub(crate) fn filesystem_counts(root: &Path) -> (usize, usize, usize, usize) {
+        let paths = CANONICAL_PATHS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        let unique = paths.keys().filter(|path| path.starts_with(root)).count();
+        let calls = paths
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| count)
+            .sum();
+        (
+            calls,
+            unique,
+            under(&WORKSPACE_DIRECTORIES, root, None),
+            directory_reads_under(root),
+        )
     }
 
     pub(crate) fn note_go_package_build(path: &Path) {
@@ -254,12 +328,21 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
+        CORPUS_LOOKUPS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(root));
         for map in [
             &PARSES,
+            &FINGERPRINT_READS,
             &CONFIG_READS,
             &STAGING_READS,
             &DIRECTORY_READS,
             &GO_PACKAGE_BUILDS,
+            &CANONICAL_PATHS,
+            &REALPATHS,
+            &WORKSPACE_DIRECTORIES,
         ] {
             map.get_or_init(Default::default)
                 .lock()
@@ -1733,7 +1816,7 @@ fn notify_cold_build_slice_observer(stage: &'static str, completed: usize, total
 fn notify_cold_build_slice_observer(_stage: &'static str, _completed: usize, _total: usize) {}
 
 #[cfg(test)]
-fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
+pub(crate) fn set_cold_build_extract_observer(observer: Option<Arc<ColdBuildExtractObserver>>) {
     COLD_BUILD_EXTRACT_OBSERVER.with(|slot| *slot.borrow_mut() = observer);
 }
 
@@ -1774,6 +1857,8 @@ pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
 pub(crate) struct CallgraphBackgroundTestHooks {
     available_disk: Option<u64>,
     swap_observer: Option<Arc<ColdBuildSwapObserver>>,
+    #[cfg(test)]
+    extract_observer: Option<Arc<ColdBuildExtractObserver>>,
 }
 
 impl CallgraphBackgroundTestHooks {
@@ -1781,6 +1866,8 @@ impl CallgraphBackgroundTestHooks {
         Self {
             available_disk: MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()),
             swap_observer: COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone()),
+            #[cfg(test)]
+            extract_observer: COLD_BUILD_EXTRACT_OBSERVER.with(|slot| slot.borrow().clone()),
         }
     }
 
@@ -1788,6 +1875,8 @@ impl CallgraphBackgroundTestHooks {
         let previous = Self::capture();
         set_legacy_migration_available_disk_for_test(self.available_disk);
         set_cold_build_swap_observer(self.swap_observer);
+        #[cfg(test)]
+        set_cold_build_extract_observer(self.extract_observer);
         CallgraphBackgroundTestHooksGuard(previous)
     }
 }
@@ -2005,10 +2094,16 @@ pub enum CallGraphStoreError {
     },
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
+    CorpusSnapshotMissing(PathBuf),
+    CorpusInventoryChanged(Option<PathBuf>),
     StaleFiles(Vec<String>),
 }
 
 impl CallGraphStoreError {
+    pub(crate) fn is_corpus_change(&self) -> bool {
+        matches!(self, Self::CorpusInventoryChanged(_) | Self::StaleFiles(_))
+    }
+
     pub(crate) fn is_unreadable_database(&self) -> bool {
         matches!(
             self,
@@ -2062,6 +2157,21 @@ impl fmt::Display for CallGraphStoreError {
             ),
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
+            }
+            Self::CorpusSnapshotMissing(path) => write!(
+                formatter,
+                "callgraph corpus snapshot lookup invariant failed: {} was not admitted",
+                path.display()
+            ),
+            Self::CorpusInventoryChanged(path) => {
+                write!(
+                    formatter,
+                    "callgraph corpus inventory changed after admission"
+                )?;
+                if let Some(path) = path {
+                    write!(formatter, ": {} was added", path.display())?;
+                }
+                Ok(())
             }
             Self::StaleFiles(files) => {
                 write!(
@@ -4576,7 +4686,7 @@ mod health_stale_census_tests {
     }
 }
 
-/// Bound the work spent counting possible callers for an empty reverse graph.
+/// Bound the work spent counting unresolved possible callers.
 pub const UNRESOLVED_CALL_SITE_COUNT_LIMIT: usize = 1_000;
 
 const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
@@ -4588,26 +4698,56 @@ const UNRESOLVED_CALL_SITE_COUNT_SQL: &str = "
         WHERE r.status = 'unresolved'
           AND r.kind IN ('call', 'construction')
           AND f.lang = ?1
+          AND (?4 IS NULL OR r.short_name = ?4)
           AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
         LIMIT ?3
     )";
 
+const UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL: &str = "
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end
+        FROM refs r
+        JOIN files f ON f.path = r.caller_file
+        LEFT JOIN nodes n ON n.id = r.caller_node
+        WHERE r.status = 'unresolved'
+          AND r.kind IN ('call', 'construction')
+          AND f.lang = ?1
+          AND r.short_name = ?4
+          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))
+          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')
+        LIMIT ?3
+    )";
+
+#[cfg(test)]
 fn unresolved_call_site_count(
     conn: &Connection,
     language: LangId,
     include_tests: bool,
 ) -> Result<usize> {
-    Ok(conn
-        .prepare_cached(UNRESOLVED_CALL_SITE_COUNT_SQL)?
-        .query_row(
-            params![
-                lang_label(language),
-                include_tests,
-                UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64
-            ],
-            |row| row.get(0),
-        )?)
+    unresolved_call_site_count_filtered(conn, language, include_tests, None)
+}
+
+fn unresolved_call_site_count_filtered(
+    conn: &Connection,
+    language: LangId,
+    include_tests: bool,
+    name: Option<&str>,
+) -> Result<usize> {
+    let sql = if name.is_some() {
+        UNRESOLVED_NAMED_CALL_SITE_COUNT_SQL
+    } else {
+        UNRESOLVED_CALL_SITE_COUNT_SQL
+    };
+    Ok(conn.prepare_cached(sql)?.query_row(
+        params![
+            lang_label(language),
+            include_tests,
+            UNRESOLVED_CALL_SITE_COUNT_LIMIT as i64,
+            name
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 #[cfg(test)]
@@ -4618,7 +4758,7 @@ mod callgraph_unresolved_count_tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE files(path TEXT PRIMARY KEY, lang TEXT);
             CREATE TABLE nodes(id TEXT PRIMARY KEY, is_test INTEGER);
-            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT);
+            CREATE TABLE refs(ref_id TEXT, caller_file TEXT, caller_node TEXT, byte_start INTEGER, byte_end INTEGER, status TEXT, kind TEXT, short_name TEXT DEFAULT 'target');
             CREATE TABLE edges(ref_id TEXT, kind TEXT);
             INSERT INTO files VALUES ('lib.rs', 'rust');").unwrap();
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4641,7 +4781,7 @@ mod callgraph_unresolved_count_tests {
         let (conn, reads) = fixture();
         for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
             conn.execute(
-                "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call')",
                 params![i.to_string(), i as i64],
             )
             .unwrap();
@@ -4658,12 +4798,39 @@ mod callgraph_unresolved_count_tests {
     }
 
     #[test]
+    fn callgraph_named_unresolved_count_filters_before_the_sql_cap() {
+        let (conn, reads) = fixture();
+        for (name, offset) in [("other", 0), ("target", 10_000)] {
+            for i in 0..(UNRESOLVED_CALL_SITE_COUNT_LIMIT * 3) {
+                conn.execute(
+                    "INSERT INTO refs VALUES (?1, 'lib.rs', NULL, ?2, ?2+1, 'unresolved', 'call', ?3)",
+                    params![format!("{name}_{i}"), (offset + i) as i64, name],
+                ).unwrap();
+            }
+        }
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            1_000
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            1_000,
+            "unrelated names must not consume the cap, and matching rows must stop in SQL"
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("absent")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn callgraph_unresolved_count_preserves_site_identity_and_exclusions() {
         let (conn, _) = fixture();
         conn.execute_batch(
             "INSERT INTO files VALUES ('other.ts', 'typescript');
             INSERT INTO nodes VALUES ('test_node', 1);
-            INSERT INTO refs VALUES
+            INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES
                 ('a', 'lib.rs', NULL, 1, 2, 'unresolved', 'call'),
                 ('duplicate', 'lib.rs', NULL, 1, 2, 'unresolved', 'construction'),
                 ('b', 'lib.rs', NULL, 2, 3, 'unresolved', 'construction'),
@@ -4681,6 +4848,15 @@ mod callgraph_unresolved_count_tests {
         );
         assert_eq!(
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            3
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
             3
         );
         // Paths without enclosing nodes still use the shared test-file classifier.
@@ -4710,7 +4886,7 @@ mod callgraph_unresolved_count_tests {
             conn.execute("INSERT INTO files VALUES (?1, 'rust')", [path])
                 .unwrap();
             conn.execute(
-                "INSERT INTO refs VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
+                "INSERT INTO refs(ref_id, caller_file, caller_node, byte_start, byte_end, status, kind) VALUES (?1, ?2, NULL, 0, 1, 'unresolved', 'call')",
                 params![format!("test_{i}"), path],
             )
             .unwrap();
@@ -4721,6 +4897,15 @@ mod callgraph_unresolved_count_tests {
         );
         assert_eq!(
             unresolved_call_site_count(&conn, LangId::Rust, true).unwrap(),
+            21
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, false, Some("target"))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            unresolved_call_site_count_filtered(&conn, LangId::Rust, true, Some("target")).unwrap(),
             21
         );
     }
@@ -4803,6 +4988,18 @@ pub trait CallGraphRead {
     /// A count at the limit is a lower bound, not an exact total.
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         let _ = (language, include_tests);
+        Ok(0)
+    }
+    /// Count distinct (caller file, byte start, byte end) spans with this short
+    /// name, including bare imported calls. The test filter and SQL count limit
+    /// match the unnamed count.
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        let _ = (name, language, include_tests);
         Ok(0)
     }
     fn call_tree(
@@ -5422,6 +5619,7 @@ struct ProjectIndex<'a> {
     /// The lazy index overlays fresh caller extracts on stored rows. Its parent
     /// map and caller paths belong to that immutable snapshot, not the worker.
     lazy_module_parents: std::cell::OnceCell<HashMap<String, (String, String)>>,
+    lazy_inline_candidates: std::cell::OnceCell<RustInlineCandidates>,
     rust_caller_paths: RefCell<HashMap<String, Vec<String>>>,
     go_packages: RefCell<GoPackageMemo>,
     local_symbols: RefCell<CallerSymbolMemo>,
@@ -5578,6 +5776,7 @@ mod rust_module_work {
         pub parent_lookups: usize,
         pub parent_scans: usize,
         pub parent_file_visits: usize,
+        pub inline_file_visits: usize,
         pub caller_requests: usize,
         pub caller_walks: usize,
         pub parent_time: Duration,
@@ -5670,9 +5869,8 @@ mod rust_module_work {
 /// in-memory file set. Lookups return exactly what the scans return.
 #[derive(Clone, Debug, Default)]
 struct CrateScanMemo {
-    /// Rust files in path order, with the source prefix and module segments
-    /// the inline-module lookup compares against.
-    rust_files: Vec<(String, String, Vec<String>)>,
+    /// Module prefixes derived from Rust source-file paths, in scan order.
+    inline_candidates: RustInlineCandidates,
     /// For each declared module target, the smallest `(declaring file,
     /// module name)` pair, which is the scan's first match after sorting.
     module_parents: HashMap<String, (String, String)>,
@@ -5683,13 +5881,7 @@ impl CrateScanMemo {
         let mut rust_files = files
             .iter()
             .filter(|(_, index)| index.lang == Some(LangId::Rust))
-            .map(|(path, _)| {
-                (
-                    path.clone(),
-                    rust_src_prefix(path),
-                    rust_module_segments_for_rel(path),
-                )
-            })
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         rust_files.sort();
         let mut module_parents = HashMap::<String, (String, String)>::new();
@@ -5697,7 +5889,7 @@ impl CrateScanMemo {
             Self::note_module_parents(&mut module_parents, file, index);
         }
         Self {
-            rust_files,
+            inline_candidates: RustInlineCandidates::build(&rust_files),
             module_parents,
         }
     }
@@ -5932,12 +6124,27 @@ impl ResolverIndex for ProjectIndex<'_> {
         module_segments: &[String],
         short_name: &str,
     ) -> Option<(String, String)> {
-        match self.crate_scans() {
-            Some(memo) => {
-                self.inline_scoped_target_in(memo, caller_file, module_segments, short_name)
+        let candidates = match self.crate_scans() {
+            Some(memo) => &memo.inline_candidates,
+            None => {
+                #[cfg(test)]
+                if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
+                    return self.inline_scoped_target_by_scan(
+                        caller_file,
+                        module_segments,
+                        short_name,
+                    );
+                }
+                self.lazy_inline_candidates.get_or_init(|| {
+                    // Fresh caller extracts replace stored paths in this batch,
+                    // including files whose language or module layout changed.
+                    let mut paths = self.scan_paths(LazyDbFileIndexes::rust_files);
+                    paths.sort();
+                    RustInlineCandidates::build(&paths)
+                })
             }
-            None => self.inline_scoped_target_by_scan(caller_file, module_segments, short_name),
-        }
+        };
+        self.inline_scoped_target_in(candidates, caller_file, module_segments, short_name)
     }
 }
 
@@ -5982,9 +6189,8 @@ impl ProjectIndex<'_> {
             |file| self.file_index(file),
         )
     }
-    /// The eager crate-wide memo. Lazy indexes build their parent map
-    /// separately; resolving symbols inside inline Rust modules still scans
-    /// stored paths.
+    /// The eager crate-wide memo. Lazy indexes build their parent map and
+    /// inline candidate index separately from the current caller overlay.
     fn crate_scans(&self) -> Option<&CrateScanMemo> {
         #[cfg(test)]
         if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
@@ -6026,44 +6232,55 @@ impl ProjectIndex<'_> {
         parents.into_iter().next()
     }
 
-    /// `inline_scoped_target` from the memo. Same order as the scan: the
-    /// caller's own file first, then every other Rust file in path order.
+    /// Tries the caller first, then files whose path-derived module segments
+    /// prefix the requested module, in global path order. The candidate index
+    /// belongs to this eager or lazy resolver snapshot.
     fn inline_scoped_target_in(
         &self,
-        memo: &CrateScanMemo,
+        memo: &RustInlineCandidates,
         caller_file: &str,
         module_segments: &[String],
         short_name: &str,
     ) -> Option<(String, String)> {
-        let src_prefix = rust_src_prefix(caller_file);
-        let check =
-            |(file_path, file_prefix, file_module_segments): &(String, String, Vec<String>)| {
-                if *file_prefix != src_prefix || !module_segments.starts_with(file_module_segments)
-                {
-                    return None;
-                }
-                let scoped_segments = &module_segments[file_module_segments.len()..];
-                if scoped_segments.is_empty() {
-                    return None;
-                }
-                let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
-                self.node_for_symbol(file_path, &scoped_symbol)
-                    .map(|_| (file_path.clone(), scoped_symbol))
-            };
         let caller = memo
-            .rust_files
-            .binary_search_by(|entry| entry.0.as_str().cmp(caller_file))
-            .ok()
-            .map(|position| &memo.rust_files[position]);
+            .by_path
+            .get(caller_file)
+            .map(|ordinal| &memo.files[*ordinal]);
+        let fallback_prefix;
+        let src_prefix = if let Some(file) = caller {
+            file.src_prefix.as_str()
+        } else {
+            fallback_prefix = rust_src_prefix(caller_file);
+            &fallback_prefix
+        };
+        let check = |file: &RustInlineFile| {
+            #[cfg(test)]
+            rust_module_work::note(|work| work.inline_file_visits += 1);
+            if file.src_prefix != src_prefix
+                || !module_segments.starts_with(&file.module_segments)
+                || self.lang_for(&file.path) != Some(LangId::Rust)
+            {
+                return None;
+            }
+            let scoped_segments = &module_segments[file.module_segments.len()..];
+            if scoped_segments.is_empty() {
+                return None;
+            }
+            let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+            self.node_for_symbol(&file.path, &scoped_symbol)
+                .map(|_| (file.path.clone(), scoped_symbol))
+        };
         caller.and_then(check).or_else(|| {
-            memo.rust_files
-                .iter()
-                .filter(|entry| entry.0 != caller_file)
+            memo.eligible_files(src_prefix, module_segments)
+                .into_iter()
+                .map(|ordinal| &memo.files[ordinal])
+                .filter(|file| file.path != caller_file)
                 .find_map(check)
         })
     }
 
     /// `inline_scoped_target` by sorting and scanning every indexed path.
+    #[cfg(test)]
     fn inline_scoped_target_by_scan(
         &self,
         caller_file: &str,
@@ -6080,6 +6297,7 @@ impl ProjectIndex<'_> {
             file_paths.insert(0, caller);
         }
         for file_path in file_paths {
+            rust_module_work::note(|work| work.inline_file_visits += 1);
             // Path checks come before the language check so that a stored
             // file's index is loaded only when its module path can match.
             if rust_src_prefix(&file_path) != src_prefix {
@@ -6105,8 +6323,8 @@ impl ProjectIndex<'_> {
 }
 
 /// A cold-build resolver view that loads file indexes on demand. The bounded
-/// memo keeps repeated lookups cheap without making the heap proportional to an
-/// unbounded project corpus.
+/// file-index memo avoids retaining every file's symbols; the module-parent and
+/// physical-path indexes retain metadata proportional to the input paths.
 ///
 /// Instances are created only after extraction commits every `files`, `nodes`,
 /// `file_dependencies`, and structural `refs` input and the indexing fence moves
@@ -6141,11 +6359,75 @@ struct DiskIndexMemos {
     module_parents: RefCell<Option<Rc<HashMap<String, (String, String)>>>>,
     /// Every stored Rust file, in path order.
     rust_files: RefCell<Option<Rc<Vec<String>>>>,
+    /// Physical Rust module prefixes for this immutable resolution snapshot.
+    rust_inline_candidates: RefCell<Option<Rc<RustInlineCandidates>>>,
+    #[cfg(test)]
+    inline_candidate_visits: RefCell<Option<Vec<String>>>,
     /// The first SQLite error a resolver lookup hit. Lookups run inside
     /// resolution callbacks that cannot return errors, so the cold build
     /// checks this before committing each window; otherwise a failed read
     /// would be stored as "no target found" and published as ready.
     lookup_error: RefCell<Option<rusqlite::Error>>,
+}
+
+#[derive(Clone, Debug)]
+struct RustInlineFile {
+    path: String,
+    src_prefix: String,
+    module_segments: Vec<String>,
+}
+
+impl RustInlineFile {
+    fn new(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            src_prefix: rust_src_prefix(path),
+            module_segments: rust_module_segments_for_rel(path),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RustInlineCandidates {
+    files: Vec<RustInlineFile>,
+    by_path: HashMap<String, usize>,
+    by_prefix: HashMap<String, HashMap<Vec<String>, Vec<usize>>>,
+}
+
+impl RustInlineCandidates {
+    fn build(paths: &[String]) -> Self {
+        let mut index = Self::default();
+        for path in paths {
+            let file = RustInlineFile::new(path);
+            let ordinal = index.files.len();
+            index.by_path.insert(path.clone(), ordinal);
+            index
+                .by_prefix
+                .entry(file.src_prefix.clone())
+                .or_default()
+                .entry(file.module_segments.clone())
+                .or_default()
+                .push(ordinal);
+            index.files.push(file);
+        }
+        index
+    }
+
+    fn eligible_files(&self, src_prefix: &str, module_segments: &[String]) -> Vec<usize> {
+        let mut files = Vec::new();
+        if let Some(prefixes) = self.by_prefix.get(src_prefix) {
+            // An equal physical path has no inline suffix and is left to the
+            // module-file fallback. Only proper prefixes can contain the target.
+            for len in 0..module_segments.len() {
+                if let Some(ordinals) = prefixes.get(&module_segments[..len]) {
+                    files.extend_from_slice(ordinals);
+                }
+            }
+        }
+        // Prefix depth must not change the old global path-order preference.
+        files.sort_unstable();
+        files
+    }
 }
 
 impl DiskIndexMemos {
@@ -6235,9 +6517,10 @@ impl DiskProjectIndex<'_> {
         for (id, name, scoped_name, kind, exported, is_default_export) in node_rows {
             index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
         }
+        let disk = self.module_resolution_memo.disk_facts(self.project_root);
         let facts = FactPaths {
             root: self.project_root,
-            facts: &DiskFacts::new(self.project_root),
+            facts: &disk,
         };
         for raw in ref_rows {
             index.note_module_ref(
@@ -6373,6 +6656,60 @@ impl DiskProjectIndex<'_> {
         let files = Rc::new(files);
         *self.memos.rust_files.borrow_mut() = Some(Rc::clone(&files));
         files
+    }
+}
+
+impl DiskProjectIndex<'_> {
+    fn rust_inline_candidates(&self) -> Rc<RustInlineCandidates> {
+        if let Some(index) = self.memos.rust_inline_candidates.borrow().as_ref() {
+            return Rc::clone(index);
+        }
+        let index = Rc::new(RustInlineCandidates::build(&self.rust_files()));
+        *self.memos.rust_inline_candidates.borrow_mut() = Some(Rc::clone(&index));
+        index
+    }
+
+    fn indexed_inline_scoped_target(
+        &self,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)> {
+        let index = self.rust_inline_candidates();
+        let fallback_caller;
+        let caller = if let Some(ordinal) = index.by_path.get(caller_file) {
+            &index.files[*ordinal]
+        } else {
+            fallback_caller = RustInlineFile::new(caller_file);
+            &fallback_caller
+        };
+        let check = |file: &RustInlineFile| {
+            #[cfg(test)]
+            if let Some(visits) = self.memos.inline_candidate_visits.borrow_mut().as_mut() {
+                visits.push(file.path.clone());
+            }
+            if file.src_prefix != caller.src_prefix
+                || !module_segments.starts_with(&file.module_segments)
+            {
+                return None;
+            }
+            let scoped_segments = &module_segments[file.module_segments.len()..];
+            if scoped_segments.is_empty() {
+                return None;
+            }
+            let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+            self.node_for_symbol(&file.path, &scoped_symbol)
+                .map(|_| (file.path.clone(), scoped_symbol))
+        };
+        if let Some(target) = check(caller) {
+            return Some(target);
+        }
+        index
+            .eligible_files(&caller.src_prefix, module_segments)
+            .into_iter()
+            .map(|ordinal| &index.files[ordinal])
+            .filter(|file| file.path != caller_file)
+            .find_map(check)
     }
 }
 
@@ -6533,8 +6870,15 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         module_segments: &[String],
         short_name: &str,
     ) -> Option<(String, String)> {
+        if self.memoize_resolver_indexes {
+            return self.indexed_inline_scoped_target(caller_file, module_segments, short_name);
+        }
         let src_prefix = rust_src_prefix(caller_file);
         let check = |file_path: String| {
+            #[cfg(test)]
+            if let Some(visits) = self.memos.inline_candidate_visits.borrow_mut().as_mut() {
+                visits.push(file_path.clone());
+            }
             let file_module_segments = rust_module_segments_for_rel(&file_path);
             if rust_src_prefix(&file_path) != src_prefix
                 || !module_segments.starts_with(&file_module_segments)
@@ -6551,15 +6895,6 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         };
         if let Some(target) = check(caller_file.to_string()) {
             return Some(target);
-        }
-        if self.memoize_resolver_indexes {
-            // One path-ordered list for the whole pass instead of a scan of
-            // the files table per qualified call.
-            return self
-                .rust_files()
-                .iter()
-                .filter(|path| path.as_str() != caller_file)
-                .find_map(|path| check(path.clone()));
         }
         let paths = self.memos.record(
             self.conn
@@ -7225,27 +7560,27 @@ impl CallGraphStore {
             // staging write: a suspended root is refused before the process
             // spends anything, and a death during enumeration is attributable
             // to an admitted attempt. The breaker key needs the corpus
-            // fingerprint, so that one input is resolved by a standalone
-            // streaming walk first (sanctioned pre-admission work) - the
-            // inventory pass below recomputes it while staging; the staged
-            // value governs resume cursors, while the admission key stays
-            // pinned to the admitted fingerprint so a file racing the walk
-            // cannot detach the attempt from its breaker record.
-            let admission_fingerprint = corpus_fingerprint_for(project_root, files)?;
+            // fingerprint, so hash the sources before admission and retain
+            // their digests, not their bodies. Staging reuses those digests;
+            // extraction checks its actual bytes against them before parsing.
+            // A racing corpus aborts rather than labelling new rows with an
+            // old fingerprint. The attempt stays pinned to its admission key.
+            let corpus = corpus_snapshot_for(project_root, files)?;
             let breaker_key = crate::build_breaker::BreakerKey::new(
                 project_root.display().to_string(),
                 crate::build_breaker::BuildDomain::CallgraphCold,
-                admission_fingerprint,
+                corpus.fingerprint.clone(),
             );
-            match breaker
+            let attempt = match breaker
                 .admit(&breaker_key, 0)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                crate::build_breaker::BreakerAdmission::Admitted(_) => {
+                crate::build_breaker::BreakerAdmission::Admitted(attempt) => {
                     crate::logging::log_index_event(crate::logging::IndexEvent::from_scope(
                         crate::logging::IndexEventKind::BreakerAdmitted,
                         &scope,
                     ));
+                    attempt
                 }
                 crate::build_breaker::BreakerAdmission::Suspended(suspension) => {
                     crate::logging::log_index_event(
@@ -7258,12 +7593,41 @@ impl CallGraphStore {
                     failure_guard.disarm();
                     return Err(CallGraphStoreError::Suspended(suspension));
                 }
-            }
+            };
             ensure_cold_build_current("inventory", 0, 1)?;
-            let corpus_fingerprint = temp_store.stage_cold_build_file_inventory(files)?;
-            ensure_cold_build_current("inventory", 1, 1)?;
-            let stats = temp_store
-                .cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)?;
+            let extraction = (|| {
+                let corpus_fingerprint =
+                    temp_store.stage_cold_build_file_inventory_checked(files, Some(&corpus))?;
+                ensure_cold_build_current("inventory", 1, 1)?;
+                temp_store.cold_build_chunked_from_staged_inventory_with_resolution_memo(
+                    chunk_size,
+                    &corpus_fingerprint,
+                    COLD_BUILD_RESOLVE_WINDOW,
+                    &callgraph::ModuleResolutionMemo::default(),
+                    true,
+                    Some(&corpus),
+                )
+            })();
+            let stats = match extraction {
+                Err(error) if error.is_corpus_change() => {
+                    // File edits cancel an admitted attempt; they are neither
+                    // a process death nor a failed store. Keep prior crash
+                    // history, but retire this attempt before retrying.
+                    breaker
+                        .cancel_attempt(&breaker_key, &attempt.attempt_id)
+                        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+                    failure_guard.disarm();
+                    crate::logging::log_index_event(
+                        crate::logging::IndexEvent::from_scope(
+                            crate::logging::IndexEventKind::BuildCancelled,
+                            &scope,
+                        )
+                        .field("reason", "corpus_changed"),
+                    );
+                    return Err(error);
+                }
+                result => result?,
+            };
             let _ = temp_store.checkpoint_wal_truncate();
             temp_store.prepare_for_atomic_swap()?;
             (stats, breaker_key)
@@ -7714,17 +8078,30 @@ impl CallGraphStore {
     }
 
     fn stage_cold_build_file_inventory(&self, files: &[PathBuf]) -> Result<String> {
+        self.stage_cold_build_file_inventory_checked(files, None)
+    }
+
+    fn stage_cold_build_file_inventory_checked(
+        &self,
+        files: &[PathBuf],
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<String> {
         note_cold_build_phase("enumeration");
         if files.is_empty() {
-            self.stage_cold_build_file_inventory_from(callgraph::walk_project_files(
-                &self.project_root,
-            ))
+            self.stage_cold_build_file_inventory_from(
+                callgraph::walk_project_files(&self.project_root),
+                corpus,
+            )
         } else {
-            self.stage_cold_build_file_inventory_from(files.iter().cloned())
+            self.stage_cold_build_file_inventory_from(files.iter().cloned(), corpus)
         }
     }
 
-    fn stage_cold_build_file_inventory_from<I>(&self, paths: I) -> Result<String>
+    fn stage_cold_build_file_inventory_from<I>(
+        &self,
+        paths: I,
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<String>
     where
         I: IntoIterator<Item = PathBuf>,
     {
@@ -7755,7 +8132,11 @@ impl CallGraphStore {
             crate::cold_build_limiter::progress::advance(batch.len());
         }
 
-        staged_corpus_fingerprint(&conn, &self.project_root)
+        let fingerprint = staged_corpus_fingerprint(&conn, &self.project_root, corpus)?;
+        if corpus.is_some_and(|corpus| corpus.fingerprint != fingerprint) {
+            return Err(CallGraphStoreError::CorpusInventoryChanged(None));
+        }
+        Ok(fingerprint)
     }
 
     fn insert_staged_file_inventory_batch(
@@ -7791,6 +8172,7 @@ impl CallGraphStore {
             COLD_BUILD_RESOLVE_WINDOW,
             &module_resolution_memo,
             true,
+            None,
         )
     }
 
@@ -7827,6 +8209,7 @@ impl CallGraphStore {
             resolve_window.max(1),
             module_resolution_memo,
             memoize_resolver_indexes,
+            None,
         )
     }
 
@@ -7837,6 +8220,7 @@ impl CallGraphStore {
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
         memoize_resolver_indexes: bool,
+        corpus: Option<&CorpusSnapshot>,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
@@ -7920,7 +8304,7 @@ impl CallGraphStore {
 
                 let mut needs_extract = Vec::with_capacity(admitted_files);
                 for path in batch.paths {
-                    if !staged_content_matches(&conn, &self.project_root, &path)? {
+                    if !staged_content_matches(&conn, &self.project_root, &path, corpus)? {
                         needs_extract.push(path);
                     }
                 }
@@ -7943,8 +8327,12 @@ impl CallGraphStore {
                     // drop each bounded parse chunk while keeping one transaction and
                     // statement set for the whole outer batch.
                     for paths in needs_extract.chunks(batch_files.min(COLD_BUILD_PARSE_MAX_FILES)) {
-                        let build =
-                            pool.build_extracts(&self.project_root, paths, &extraction_memo);
+                        let build = pool.build_extracts(
+                            &self.project_root,
+                            paths,
+                            &extraction_memo,
+                            corpus,
+                        )?;
                         for extract in &build.extracts {
                             retained_callers.retain(&extract.rel_path, &extract.data);
                         }
@@ -8213,6 +8601,39 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         let total_changes_before = conn.total_changes();
+        let migrate_headers = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                [H_HEADER_LANGUAGE_META_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            != Some("1");
+        let mut refresh_inputs = changed_files.to_vec();
+        if migrate_headers {
+            // Existing stores used C for every header. Watcher events and
+            // unchanged timestamps cannot identify that extraction change.
+            let mut paths = conn.prepare("SELECT path FROM files WHERE substr(path, -2) = '.h'")?;
+            let headers = paths.query_map([], |row| row.get::<_, String>(0))?;
+            let mut included: HashSet<PathBuf> = changed_files
+                .iter()
+                .map(|path| {
+                    if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        self.project_root.join(path)
+                    }
+                })
+                .collect();
+            for path in headers {
+                let path = self.project_root.join(path?);
+                if included.insert(path.clone()) {
+                    refresh_inputs.push(path);
+                }
+            }
+        }
+        let changed_files = refresh_inputs.as_slice();
         // One module memo and one parse pool for every file this refresh
         // parses and every import it checks.
         let memo = callgraph::ModuleResolutionMemo::default();
@@ -8334,7 +8755,10 @@ impl CallGraphStore {
                 continue;
             }
 
-            if let Some(row) = &old_row {
+            if let Some(row) = old_row
+                .as_ref()
+                .filter(|_| !(migrate_headers && rel_path.ends_with(".h")))
+            {
                 let (verdict, source_identity) = source_stat::verify_file(&abs_path, row);
                 match verdict {
                     FreshnessVerdict::HotFresh => {
@@ -8676,6 +9100,11 @@ impl CallGraphStore {
         conn.configure_refresh_wal()?;
         self.refresh_wal.lock().unwrap().before_begin(&conn);
         let tx = conn.transaction()?;
+        if migrate_headers {
+            // The marker commits with the refreshed rows, including empty or
+            // deletion-only batches; failed/cancelled refreshes retry migration.
+            mark_header_languages_current(&tx)?;
+        }
         #[cfg(test)]
         {
             let payload_bytes =
@@ -9383,6 +9812,24 @@ impl CallGraphStore {
     }
 
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, None)
+    }
+
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.unresolved_call_site_count_matching(language, include_tests, Some(name))
+    }
+
+    fn unresolved_call_site_count_matching(
+        &self,
+        language: LangId,
+        include_tests: bool,
+        name: Option<&str>,
+    ) -> Result<usize> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
@@ -9395,7 +9842,7 @@ impl CallGraphStore {
                 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
         )?;
-        unresolved_call_site_count(&conn, language, include_tests)
+        unresolved_call_site_count_filtered(&conn, language, include_tests, name)
     }
 
     pub fn call_tree(
@@ -10180,6 +10627,14 @@ impl CallGraphRead for CallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         CallGraphStore::unresolved_call_site_count(self, language, include_tests)
     }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        CallGraphStore::unresolved_call_site_count_named(self, name, language, include_tests)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -10303,6 +10758,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         (**self).unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        (**self).unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
@@ -10428,6 +10891,15 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
         self.inner
             .unresolved_call_site_count(language, include_tests)
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        self.inner
+            .unresolved_call_site_count_named(name, language, include_tests)
     }
     fn call_tree(
         &self,
@@ -10907,6 +11379,37 @@ fn direct_call_site_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreC
     })
 }
 
+fn direct_callers_batch_sql(requested_values: &str) -> String {
+    // Joining the whole (nodes JOIN files) relation on the nullable side makes
+    // SQLite materialize every target node for each caller prefetch. Probe the
+    // target's primary key instead, but still hide nodes whose file is absent.
+    format!(
+        "WITH requested(target_file, target_symbol) AS (VALUES {requested_values})
+         SELECT e.target_file, e.target_symbol, e.line,
+                r.byte_start, r.byte_end, r.status, e.provenance,
+                src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
+                src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
+                src_file.lang,
+                tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
+                tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
+                tgt_file.lang, e.kind, src.is_test
+         FROM requested requested
+         JOIN edges e
+           ON e.target_file = requested.target_file
+          AND e.target_symbol = requested.target_symbol
+          AND e.kind IN ('call', 'callback_ref')
+         JOIN refs r ON r.ref_id = e.ref_id
+         JOIN nodes src ON src.id = e.source_node
+         JOIN files src_file ON src_file.path = src.file_path
+         LEFT JOIN nodes tgt
+             ON tgt.id = e.target_node
+            AND tgt.file_path IN (SELECT path FROM files)
+         LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path
+         ORDER BY e.target_file, e.target_symbol, e.source_node,
+                  r.byte_start, r.line, r.ref_id"
+    )
+}
+
 fn direct_callers_for_tuples(
     conn: &Connection,
     targets: &[(String, String)],
@@ -10924,29 +11427,7 @@ fn direct_callers_for_tuples(
             .map(|_| "(?, ?)")
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!(
-            "WITH requested(target_file, target_symbol) AS (VALUES {requested_values})
-             SELECT e.target_file, e.target_symbol, e.line,
-                    r.byte_start, r.byte_end, r.status, e.provenance,
-                    src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
-                    src.end_line, src.signature, src.exported, src.is_callgraph_entry_point,
-                    src_file.lang,
-                    tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
-                    tgt.end_line, tgt.signature, tgt.exported, tgt.is_callgraph_entry_point,
-                    tgt_file.lang, e.kind, src.is_test
-             FROM requested requested
-             JOIN edges e
-               ON e.target_file = requested.target_file
-              AND e.target_symbol = requested.target_symbol
-              AND e.kind IN ('call', 'callback_ref')
-             JOIN refs r ON r.ref_id = e.ref_id
-             JOIN nodes src ON src.id = e.source_node
-             JOIN files src_file ON src_file.path = src.file_path
-             LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
-                 ON tgt.id = e.target_node
-             ORDER BY e.target_file, e.target_symbol, e.source_node,
-                      r.byte_start, r.line, r.ref_id"
-        );
+        let sql = direct_callers_batch_sql(&requested_values);
         let bindings = chunk
             .iter()
             .flat_map(|(file, symbol)| [file.as_str(), symbol.as_str()]);
@@ -12849,6 +13330,15 @@ pub(crate) fn insert_meta(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO meta(k, v) VALUES('projection_write_revision', '0')",
         [],
     )?;
+    mark_header_languages_current(conn)?;
+    Ok(())
+}
+
+fn mark_header_languages_current(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, '1')",
+        [H_HEADER_LANGUAGE_META_KEY],
+    )?;
     Ok(())
 }
 
@@ -13059,7 +13549,115 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v21-rust-module-paths-and-function-references";
+const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
+
+const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
+
+#[cfg(test)]
+mod h_header_invalidation_tests {
+    use super::*;
+
+    #[test]
+    fn h_header_legacy_migration_is_targeted_atomic_and_once() {
+        assert_eq!(BUILD_OUTPUT_VERSION, "v22-python-import-bindings");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("root")).unwrap();
+        // Parse counters key files by the canonical path the store reads them
+        // through (`\\?\C:\...` with long names on Windows, `/private/var` on
+        // macOS), so the root they are counted under must be canonical too.
+        let root = std::fs::canonicalize(temp.path().join("root")).unwrap();
+        let files = [
+            root.join("plain.h"),
+            root.join("widget.h"),
+            root.join("main.rs"),
+        ];
+        std::fs::write(&files[0], "int plain(void);\n").unwrap();
+        std::fs::write(
+            &files[1],
+            "template <typename T> class Widget { public: T value(T x) { return x; } };\n",
+        )
+        .unwrap();
+        std::fs::write(&files[2], "pub fn untouched() {}\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        let fingerprint: String = {
+            let conn = store.conn.lock().unwrap();
+            let fingerprint = conn
+                .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                [H_HEADER_LANGUAGE_META_KEY],
+            )
+            .unwrap();
+            conn.execute("UPDATE files SET lang = 'c' WHERE path = 'widget.h'", [])
+                .unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_header_refresh BEFORE UPDATE ON files WHEN NEW.path = 'widget.h' BEGIN SELECT RAISE(ABORT, 'header refresh interrupted'); END;").unwrap();
+            fingerprint
+        };
+        let before = work_counts::parses_under(&root);
+        assert!(store.refresh_files_profiled(&[]).is_err());
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM meta WHERE k = ?1",
+                    [H_HEADER_LANGUAGE_META_KEY],
+                    |row| row.get::<_, String>(0)
+                )
+                .optional()
+                .unwrap(),
+                None
+            );
+            conn.execute_batch("DROP TRIGGER reject_header_refresh")
+                .unwrap();
+        }
+        let (stats, _) = store.refresh_files_profiled(&[]).unwrap();
+        assert_eq!(
+            work_counts::parses_under(&root) - before,
+            4,
+            "only two headers parsed on each attempt"
+        );
+        assert_eq!(
+            stats.changed_files.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["plain.h".to_string(), "widget.h".to_string()])
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT lang FROM files WHERE path = 'widget.h'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "cpp"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM meta WHERE k = ?1",
+                    [H_HEADER_LANGUAGE_META_KEY],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "1"
+            );
+            assert_eq!(
+                conn.query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+                fingerprint
+            );
+        }
+        let after = work_counts::parses_under(&root);
+        let (again, _) = store.refresh_files_profiled(&[]).unwrap();
+        assert!(again.changed_files.is_empty());
+        assert_eq!(work_counts::parses_under(&root), after);
+    }
+}
 
 fn staging_file_name(project_key: &str) -> String {
     format!("{project_key}.{BUILD_OUTPUT_VERSION}.staging.sqlite.tmp.resume")
@@ -13155,17 +13753,43 @@ fn increment_staged_extracted_bytes(tx: &Transaction<'_>, bytes: u64) -> Result<
     Ok(())
 }
 
-fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -> Result<bool> {
+fn staged_content_matches(
+    conn: &Connection,
+    project_root: &Path,
+    path: &Path,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<bool> {
     let rel_path = relative_path(project_root, path);
     let staged_hash = conn
-        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
-        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+        .prepare_cached("SELECT content_hash, size FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })
         .optional()?;
     // Fresh staging has no row to match. Reading and hashing those sources here
     // duplicates the extraction pass's I/O; only adopted committed rows need it.
-    let Some(staged_hash) = staged_hash else {
+    let Some((staged_hash, staged_size)) = staged_hash else {
         return Ok(false);
     };
+    if let Some(corpus) = corpus {
+        // Staging is only resumed when the fingerprint stored with the staged
+        // build (`STAGED_CORPUS_FINGERPRINT`) equals the current corpus
+        // fingerprint. That fingerprint is built from the full digest of every
+        // source, including those above the freshness hash cap, so a resumed
+        // staging already proves those large sources unchanged. Their persisted
+        // zero hash is only a sentinel, not a digest to compare here.
+        if staged_size > cache_freshness::CONTENT_HASH_SIZE_CAP
+            && staged_hash == hash_to_hex(cache_freshness::zero_hash())
+        {
+            return Ok(true);
+        }
+        return Ok(corpus
+            .required_file(project_root, path)?
+            .hash
+            .as_ref()
+            .ok()
+            .is_some_and(|hash| staged_hash == hash_to_hex(*hash)));
+    }
     #[cfg(test)]
     work_counts::note_staging_read(path);
     let Ok(source) = crate::project_content::read_to_string(path) else {
@@ -13278,14 +13902,30 @@ fn load_staged_file_batch(
     }
 }
 
-fn staged_corpus_fingerprint(conn: &Connection, project_root: &Path) -> Result<String> {
+fn staged_corpus_fingerprint(
+    conn: &Connection,
+    project_root: &Path,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<String> {
     let mut statement =
         conn.prepare_cached("SELECT path FROM staging_file_inventory ORDER BY path")?;
     let mut rows = statement.query([])?;
     let mut fingerprint = CorpusFingerprint::default();
     while let Some(row) = rows.next()? {
         let rel_path = row.get::<_, String>(0)?;
-        fingerprint.add_path(project_root, &project_root.join(rel_path));
+        let path = project_root.join(rel_path);
+        if let Some(corpus) = corpus {
+            let file = corpus
+                .file(project_root, &path)?
+                .ok_or_else(|| CallGraphStoreError::CorpusInventoryChanged(Some(path.clone())))?;
+            fingerprint.add_hash(
+                project_root,
+                &path,
+                file.hash.as_ref().map_err(String::as_str),
+            );
+        } else {
+            fingerprint.add_path(project_root, &path);
+        }
     }
     Ok(fingerprint.finish(project_root))
 }
@@ -14689,15 +15329,24 @@ impl BuildPool {
         project_root: &Path,
         files: &[PathBuf],
         memo: &callgraph::ModuleResolutionMemo,
-    ) -> BuildExtractsResult {
+        corpus: Option<&CorpusSnapshot>,
+    ) -> Result<BuildExtractsResult> {
         let extract_one =
-            |path: &PathBuf| match build_file_extract_with_memo(project_root, path, memo) {
-                Ok(extract) => Ok(extract),
+            |path: &PathBuf| match build_file_extract_in_corpus(project_root, path, memo, corpus) {
+                Ok(extract) => Ok(Ok(extract)),
+                Err(
+                    error @ (CallGraphStoreError::StaleFiles(_)
+                    | CallGraphStoreError::CorpusSnapshotMissing(_)),
+                ) => Err(error),
                 Err(error) => {
                     let abs_path = normalize_file_path(project_root, path)
                         .unwrap_or_else(|_| path.to_path_buf());
                     let rel_path = relative_path(project_root, &abs_path);
-                    let freshness = cache_freshness::collect(&abs_path).ok();
+                    let freshness = if let Some(corpus) = corpus {
+                        corpus.freshness(project_root, &abs_path)?
+                    } else {
+                        cache_freshness::collect(&abs_path).ok()
+                    };
                     let undecodable = is_undecodable_source(&error);
                     if undecodable {
                         log_undecodable_source(project_root, &rel_path);
@@ -14708,28 +15357,29 @@ impl BuildPool {
                             error
                         );
                     }
-                    Err(ExtractFailure {
+                    Ok(Err(ExtractFailure {
                         rel_path,
                         freshness,
                         undecodable,
-                    })
+                    }))
                 }
             };
-        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> = if files.len() <= 1 {
-            files.iter().map(extract_one).collect()
-        } else {
-            self.install(|| files.par_iter().map(extract_one).collect())
-        };
+        let results: Vec<Result<std::result::Result<FileExtract, ExtractFailure>>> =
+            if files.len() <= 1 {
+                files.iter().map(extract_one).collect()
+            } else {
+                self.install(|| files.par_iter().map(extract_one).collect())
+            };
 
         let mut extracts = Vec::new();
         let mut failures = Vec::new();
         for result in results {
-            match result {
+            match result? {
                 Ok(extract) => extracts.push(extract),
                 Err(failure) => failures.push(failure),
             }
         }
-        BuildExtractsResult { extracts, failures }
+        Ok(BuildExtractsResult { extracts, failures })
     }
 
     /// Resolver inputs of `rel_paths`, parsed in parallel. A file that no
@@ -14838,6 +15488,7 @@ fn resolution_caller_data(data: &FileCallData) -> FileCallData {
         symbol_metadata: data.symbol_metadata.clone(),
         default_export_symbol: data.default_export_symbol.clone(),
         import_block: data.import_block.clone(),
+        python_bindings: data.python_bindings.clone(),
         lang: data.lang,
     }
 }
@@ -14877,7 +15528,18 @@ fn resolution_caller_data_weight(rel_path: &str, data: &FileCallData) -> usize {
         .chain(data.exported_symbols.iter())
         .map(|name| ENTRY + name.len())
         .sum::<usize>();
-    ENTRY * 4 + rel_path.len() + imports + metadata + names
+    let python = data
+        .python_bindings
+        .iter()
+        .map(|binding| {
+            ENTRY
+                + binding
+                    .target
+                    .as_ref()
+                    .map_or(0, |(module, symbol)| module.len() + symbol.len())
+        })
+        .sum::<usize>();
+    ENTRY * 4 + rel_path.len() + imports + metadata + names + python
 }
 
 fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
@@ -14915,11 +15577,37 @@ fn build_file_extract_with_memo(
     path: &Path,
     memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<FileExtract> {
+    build_file_extract_in_corpus(project_root, path, memo, None)
+}
+
+fn build_file_extract_in_corpus(
+    project_root: &Path,
+    path: &Path,
+    memo: &callgraph::ModuleResolutionMemo,
+    corpus: Option<&CorpusSnapshot>,
+) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
     work_counts::note_parse(&abs_path);
-    let (source, freshness, source_identity) = source_stat::read_source(&abs_path)?;
+    let read = source_stat::read_source(&abs_path, |bytes| {
+        if let Some(corpus) = corpus {
+            corpus.verify_bytes(project_root, &abs_path, bytes)?;
+        }
+        Ok(())
+    });
+    let (source, freshness, source_identity) = match read {
+        Err(CallGraphStoreError::Io(error))
+            if corpus.is_some() && error.kind() != std::io::ErrorKind::InvalidData =>
+        {
+            let expected = &corpus.unwrap().required_file(project_root, &abs_path)?.hash;
+            if expected.as_ref().err() != Some(&error.to_string()) {
+                return Err(CallGraphStoreError::StaleFiles(vec![rel_path]));
+            }
+            return Err(CallGraphStoreError::Io(error));
+        }
+        result => result?,
+    };
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
     if lang == LangId::Rust {
@@ -14944,7 +15632,7 @@ fn build_file_extract_with_memo(
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
         .collect();
-    let disk = DiskFacts::new(project_root);
+    let disk = memo.disk_facts(project_root);
     let facts = FactPaths {
         root: project_root,
         facts: &disk,
@@ -16338,6 +17026,9 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         Some(LangId::Go) => {
             resolve_go_target(index, &caller_file, full_ref, short_name, caller_data)
         }
+        Some(LangId::Python) => {
+            resolve_python_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
+        }
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
         }
@@ -16747,6 +17438,37 @@ fn resolve_go_target<I: ResolverIndex>(
     };
     let target = index.go_symbol_target(caller_file, module, short_name)?;
     Some(("resolved".to_string(), target, short_name.to_string()))
+}
+
+fn resolve_python_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String, String)> {
+    if let Ok(binding_index) = caller_data
+        .python_bindings
+        .binary_search_by_key(&(raw.byte_start, raw.byte_end), |binding| {
+            (binding.byte_start, binding.byte_end)
+        })
+    {
+        let binding = &caller_data.python_bindings[binding_index];
+        let (module, symbol) = binding.target.as_ref()?;
+        let target_file = index.module_target(caller_file, module)?;
+        // An import names one module, never every same-named symbol in the project.
+        let node = index.node_for_symbol(&target_file, symbol)?;
+        // Bare-name lookup also finds methods; `from mod import f` requires
+        // the module-level function, not a class's same-named method.
+        if node != node_id(&target_file, "function", symbol) {
+            return None;
+        }
+        return index
+            .node_is_callable(&target_file, &node)
+            .then(|| ("resolved".to_string(), target_file, symbol.clone()));
+    }
+    resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
 fn resolve_js_ts_target<I: ResolverIndex>(
@@ -17808,6 +18530,7 @@ impl<'a> ProjectIndex<'a> {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             lazy_module_parents: std::cell::OnceCell::new(),
+            lazy_inline_candidates: std::cell::OnceCell::new(),
             rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
@@ -19941,10 +20664,8 @@ fn parse_dispatch_source(
     lang: LangId,
 ) -> Option<ParsedDispatchSource> {
     let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
-    let grammar = crate::parser::grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(&source, None)?;
+    let tree =
+        parse_source_with_cached_parser(&project_root.join(caller_file), &source, lang).ok()?;
     Some(ParsedDispatchSource { source, tree })
 }
 
@@ -23381,6 +24102,13 @@ fn module_ref_target(
         return rust_declared_module_target(project_root, caller_file, module_path, memo, facts);
     }
     let caller_path = project_root.join(caller_file);
+    if caller_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        return python_module_candidates(project_root, &caller_path, module_path)
+            .into_iter()
+            .find(|candidate| facts.is_file(candidate))
+            .map(|path| relative_path(project_root, &path))
+            .filter(|path| is_indexed(path));
+    }
     if Path::new(caller_file)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -23597,6 +24325,13 @@ fn module_dependencies_with_memo(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
+    if abs_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        // Keep missing candidates too, so creating a module rebinds its importers.
+        return python_module_candidates(project_root, abs_path, module_path)
+            .into_iter()
+            .map(|path| relative_path(project_root, &path))
+            .collect();
+    }
     let mut deps = rust_module_dependencies(project_root, abs_path, module_path, memo, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) =
@@ -23611,6 +24346,43 @@ fn module_dependencies_with_memo(
         }
     }
     deps
+}
+
+/// Absolute Python imports start at the analyzed project root. Relative dots
+/// walk package directories; neither form searches arbitrary same-named files
+/// or guesses runtime changes to sys.path.
+fn python_module_candidates(project_root: &Path, caller: &Path, module: &str) -> Vec<PathBuf> {
+    let dots = module.bytes().take_while(|byte| *byte == b'.').count();
+    let mut base = if dots == 0 {
+        project_root.to_path_buf()
+    } else {
+        let Some(parent) = caller.parent() else {
+            return Vec::new();
+        };
+        parent.to_path_buf()
+    };
+    for _ in 1..dots {
+        let Some(parent) = base.parent() else {
+            return Vec::new();
+        };
+        base = parent.to_path_buf();
+    }
+    if !base.starts_with(project_root) || (dots > 0 && base == project_root) {
+        return Vec::new();
+    }
+    let rest = &module[dots..];
+    if !rest.is_empty() {
+        for segment in rest.split('.') {
+            if segment.is_empty() || !segment.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+                return Vec::new();
+            }
+            base.push(segment);
+        }
+    } else if dots == 0 {
+        return Vec::new();
+    }
+    // A regular package takes precedence over a sibling module, as in Python.
+    vec![base.join("__init__.py"), base.with_extension("py")]
 }
 
 fn rust_module_dependencies(
@@ -23952,6 +24724,8 @@ thread_local! {
 fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     #[cfg(test)]
     CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(test)]
+    work_counts::note_realpath(path);
     std::fs::canonicalize(path)
 }
 
@@ -23959,10 +24733,11 @@ fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
 /// one. This keeps watcher deletion events in the same identity domain as the
 /// files indexed before the deletion.
 ///
-/// The resolver also calls this for every candidate it probes (`tsconfig.json`
-/// in each ancestor directory, `index.ts` beside each import), and most probes
-/// name a file that does not exist.
+/// Uncached resolver probes also call this (`tsconfig.json` in each ancestor
+/// directory, `index.ts` beside each import), and most name a missing file.
 fn canonicalize_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    work_counts::note_canonical_path(path);
     if let Ok(canonical) = fs_canonicalize(path) {
         return canonical;
     }
@@ -24094,25 +24869,257 @@ fn ref_id(parts: &[&str]) -> String {
 }
 
 fn callgraph_corpus_fingerprint(project_root: &Path) -> Result<String> {
-    let mut fingerprint = CorpusFingerprint::default();
-    for path in callgraph::walk_project_files(project_root) {
-        fingerprint.add_path(project_root, &path);
-    }
-    Ok(fingerprint.finish(project_root))
+    corpus_fingerprint_for(project_root, &[])
 }
 
 /// Pre-admission fingerprint over the same source set the staging inventory
-/// will consume: the walk when no explicit list is supplied, the list
-/// otherwise. Streaming accumulator - no staging writes, bounded memory.
+/// will consume. Only digests and change stamps are retained, never source bodies.
 fn corpus_fingerprint_for(project_root: &Path, files: &[PathBuf]) -> Result<String> {
-    if files.is_empty() {
-        return callgraph_corpus_fingerprint(project_root);
+    Ok(corpus_snapshot_for(project_root, files)?
+        .fingerprint
+        .clone())
+}
+
+#[derive(Clone)]
+struct CorpusFile {
+    hash: std::result::Result<blake3::Hash, String>,
+    stamp: Option<crate::views::NativeStat>,
+    observed_ns: u128,
+}
+
+struct CorpusSnapshot {
+    fingerprint: String,
+    files: HashMap<PathBuf, CorpusFile>,
+}
+
+/// One root's reusable digests. The root context owns this slot; background
+/// work receives only a weak reference so it cannot keep a released root warm.
+#[derive(Default)]
+pub(crate) struct CorpusMemo {
+    snapshot: Mutex<Option<(PathBuf, Arc<CorpusSnapshot>)>>,
+}
+
+thread_local! {
+    static CORPUS_MEMO: RefCell<std::sync::Weak<CorpusMemo>> = RefCell::new(std::sync::Weak::new());
+}
+
+pub(crate) fn with_corpus_memo<R>(memo: std::sync::Weak<CorpusMemo>, run: impl FnOnce() -> R) -> R {
+    struct Restore(std::sync::Weak<CorpusMemo>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORPUS_MEMO.with(|slot| *slot.borrow_mut() = std::mem::take(&mut self.0));
+        }
     }
+    let _restore = Restore(CORPUS_MEMO.with(|slot| slot.replace(memo)));
+    run()
+}
+
+impl CorpusSnapshot {
+    fn file(&self, project_root: &Path, path: &Path) -> Result<Option<&CorpusFile>> {
+        // Admission and lookups must share canonical absolute keys, even when
+        // the root retains a symlink, a Windows short name or a verbatim prefix.
+        #[cfg(test)]
+        let (started, before) = (Instant::now(), CANONICALIZE_CALLS.with(|calls| calls.get()));
+        let key = normalize_file_path(project_root, path)?;
+        #[cfg(test)]
+        work_counts::note_corpus_lookup(
+            &key,
+            CANONICALIZE_CALLS.with(|calls| calls.get()) - before,
+            started.elapsed().as_nanos(),
+        );
+        Ok(self.files.get(&key))
+    }
+
+    fn required_file(&self, project_root: &Path, path: &Path) -> Result<&CorpusFile> {
+        // Inventory changes are refused before extraction. A miss after that
+        // check is a lookup invariant failure, not evidence of changed bytes.
+        self.file(project_root, path)?
+            .ok_or_else(|| CallGraphStoreError::CorpusSnapshotMissing(path.to_path_buf()))
+    }
+
+    fn freshness(&self, project_root: &Path, path: &Path) -> Result<Option<FileFreshness>> {
+        let file = self.required_file(project_root, path)?;
+        let Ok(hash) = file.hash.as_ref() else {
+            return Ok(None);
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return Ok(None);
+        };
+        let Ok(mtime) = metadata.modified() else {
+            return Ok(None);
+        };
+        Ok(Some(FileFreshness {
+            size: metadata.len(),
+            mtime,
+            content_hash: if metadata.len() > cache_freshness::CONTENT_HASH_SIZE_CAP {
+                cache_freshness::zero_hash()
+            } else {
+                *hash
+            },
+        }))
+    }
+
+    fn verify_bytes(&self, project_root: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+        if self.required_file(project_root, path)?.hash.as_ref().ok() == Some(&blake3::hash(bytes))
+        {
+            return Ok(());
+        }
+        Err(CallGraphStoreError::StaleFiles(vec![path
+            .display()
+            .to_string()]))
+    }
+}
+
+fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<CorpusSnapshot>> {
+    let memo = CORPUS_MEMO.with(|slot| slot.borrow().clone());
+    let previous = memo.upgrade().and_then(|memo| {
+        memo.snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned")
+            .as_ref()
+            .filter(|(root, _)| root == project_root)
+            .map(|(_, snapshot)| Arc::clone(snapshot))
+    });
+    let mut sources = HashMap::new();
     let mut fingerprint = CorpusFingerprint::default();
-    for path in files {
-        fingerprint.add_path(project_root, path);
+    let paths: Box<dyn Iterator<Item = PathBuf> + '_> = if files.is_empty() {
+        Box::new(callgraph::walk_project_files(project_root))
+    } else {
+        Box::new(files.iter().cloned())
+    };
+    for path in paths {
+        let path = normalize_file_path(project_root, &path)?;
+        // A memo hit reuses a content digest, not a stat-based breaker key.
+        // Native identity and change time catch in-place rewrites that restore
+        // size/mtime. Unsupported filesystems conservatively rehash on probes.
+        let before = crate::views::NativeStat::read(&path).ok();
+        let cached = if let Some(corpus) = &previous {
+            corpus.file(project_root, &path)?
+        } else {
+            None
+        }
+        .filter(|file| {
+            file.stamp
+                .as_ref()
+                .zip(before.as_ref())
+                .is_some_and(|(old, current)| old.reusable(current, file.observed_ns))
+        });
+        let file = if let Some(file) = cached {
+            file.clone()
+        } else {
+            let hash = hash_file_bounded(&path).map_err(|error| error.to_string());
+            let after = crate::views::NativeStat::read(&path).ok();
+            CorpusFile {
+                stamp: (hash.is_ok() && before == after).then_some(after).flatten(),
+                hash,
+                observed_ns: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            }
+        };
+        fingerprint.add_hash(
+            project_root,
+            &path,
+            file.hash.as_ref().map_err(String::as_str),
+        );
+        sources.insert(path, file);
     }
-    Ok(fingerprint.finish(project_root))
+    let corpus = Arc::new(CorpusSnapshot {
+        fingerprint: fingerprint.finish(project_root),
+        files: sources,
+    });
+    if let Some(memo) = memo.upgrade() {
+        *memo
+            .snapshot
+            .lock()
+            .expect("corpus snapshot mutex poisoned") =
+            Some((project_root.to_path_buf(), Arc::clone(&corpus)));
+    }
+    Ok(corpus)
+}
+
+#[cfg(test)]
+mod corpus_memo_lifecycle_tests {
+    use super::*;
+    use crate::context::AppContext;
+
+    fn context() -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        )
+    }
+
+    #[test]
+    fn root_teardown_drops_corpus_snapshot_and_rebind_rehashes() {
+        for teardown in ["unbind", "idle", "try-idle", "configure", "root-change"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let source = root.join("main.ts");
+            std::fs::write(&source, "export function marker() {}\n").unwrap();
+            let ctx = context();
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.note_callgraph_build_key("first".to_string());
+            let memo = ctx.callgraph_corpus_memo();
+            let snapshot =
+                with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+            let fingerprint = snapshot.fingerprint.clone();
+            let cached = Arc::downgrade(&snapshot);
+            drop(snapshot);
+            assert!(cached.upgrade().is_some());
+
+            match teardown {
+                "unbind" => ctx.mark_subc_unbound(),
+                "idle" => assert!(ctx.evict_idle_artifacts()),
+                "try-idle" => assert!(ctx.try_evict_idle_artifacts()),
+                "configure" => assert!(!ctx.note_callgraph_build_key("different".to_string())),
+                "root-change" => ctx.set_canonical_cache_root(root.join("different-root")),
+                _ => unreachable!(),
+            }
+            assert!(memo.upgrade().is_none(), "{teardown} retained the memo");
+            assert!(
+                cached.upgrade().is_none(),
+                "{teardown} retained the snapshot"
+            );
+
+            // A worker's old weak scope cannot resurrect the released owner.
+            with_corpus_memo(memo.clone(), || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert!(memo.upgrade().is_none());
+            if teardown == "unbind" {
+                assert!(ctx.callgraph_corpus_memo().upgrade().is_none());
+            }
+            ctx.set_canonical_cache_root(root.clone());
+            ctx.mark_subc_bound();
+            work_counts::reset_under(&root);
+            let rebound = ctx.callgraph_corpus_memo();
+            with_corpus_memo(rebound, || {
+                assert_eq!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+            });
+            assert_eq!(
+                work_counts::fingerprint_reads(&source),
+                1,
+                "{teardown} rebind"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_root_context_releases_corpus_snapshot_without_a_global_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("main.ts"), "export function marker() {}\n").unwrap();
+        let ctx = context();
+        let memo = ctx.callgraph_corpus_memo();
+        let snapshot = with_corpus_memo(memo.clone(), || corpus_snapshot_for(&root, &[]).unwrap());
+        let cached = Arc::downgrade(&snapshot);
+        drop(snapshot);
+        drop(ctx);
+        assert!(memo.upgrade().is_none());
+        assert!(cached.upgrade().is_none());
+    }
 }
 
 #[derive(Default)]
@@ -24124,10 +25131,20 @@ struct CorpusFingerprint {
 
 impl CorpusFingerprint {
     fn add_path(&mut self, project_root: &Path, path: &Path) {
+        let hash = hash_file_bounded(path).map_err(|error| error.to_string());
+        self.add_hash(project_root, path, hash.as_ref().map_err(String::as_str));
+    }
+
+    fn add_hash(
+        &mut self,
+        project_root: &Path,
+        path: &Path,
+        hash: std::result::Result<&blake3::Hash, &str>,
+    ) {
         let mut record = blake3::Hasher::new();
         record.update(relative_path(project_root, path).as_bytes());
         record.update(&[0]);
-        match hash_file_bounded(path) {
+        match hash {
             Ok(content_hash) => record.update(content_hash.as_bytes()),
             // Encoding a missing file as a distinct record changes the corpus
             // fingerprint, so breaker state keyed to the previous corpus is not reused.
@@ -24165,6 +25182,8 @@ impl CorpusFingerprint {
 }
 
 fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
+    #[cfg(test)]
+    work_counts::note_fingerprint_read(path);
     let mut file = crate::project_content::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -24372,6 +25391,7 @@ mod refresh_worker_tests {
             symbol_metadata: HashMap::new(),
             default_export_symbol: None,
             import_block: crate::imports::ImportBlock::empty(),
+            python_bindings: Vec::new(),
             lang: LangId::TypeScript,
         };
         let index = DiskProjectIndex {
@@ -27949,6 +28969,166 @@ mod cold_build_insert_tests {
     }
 
     #[test]
+    fn direct_callers_batch_probes_targets_without_scanning_unrelated_nodes() {
+        let dir = tempdir().expect("temp dir");
+        let file = dir.path().join("main.ts");
+        let mut source =
+            String::from("export function target() {}\nexport function caller() { target(); }\n");
+        for i in 0..512 {
+            source.push_str(&format!("export function unrelated{i}() {{}}\n"));
+        }
+        fs::write(&file, source).expect("write fixture");
+        let store = CallGraphStore::open(dir.path().join("store"), dir.path().to_path_buf())
+            .expect("open store");
+        store.cold_build(&[file]).expect("cold build");
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = direct_callers_batch_sql("(?, ?)");
+        let mut stmt = conn.prepare(&sql).expect("prepare caller batch");
+        let calls = stmt
+            .query_map(params!["main.ts", "target"], direct_call_site_from_row)
+            .expect("query callers")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("caller rows");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].target.is_some());
+        assert!(
+            stmt.get_status(rusqlite::StatementStatus::FullscanStep) < 8,
+            "caller prefetch must not materialize the unrelated target nodes"
+        );
+    }
+
+    #[test]
+    fn direct_callers_batch_preserves_nullable_targets_and_order() {
+        let dir = tempdir().expect("temp dir");
+        let caller = dir.path().join("main.ts");
+        let target = dir.path().join("target.ts");
+        fs::write(
+            &caller,
+            "import { target } from './target';\nexport function caller() { target(); target(); }\n",
+        )
+        .expect("write caller");
+        fs::write(&target, "export function target() {}\n").expect("write target");
+        let store = CallGraphStore::open(dir.path().join("store"), dir.path().to_path_buf())
+            .expect("open store");
+        store.cold_build(&[caller, target]).expect("cold build");
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute(
+            "UPDATE edges SET kind = 'callback_ref' WHERE rowid = (SELECT MAX(rowid) FROM edges)",
+            [],
+        )
+        .expect("include callback reference");
+        let key = ("target.ts".to_owned(), "target".to_owned());
+        let absent = ("missing.ts".to_owned(), "missing".to_owned());
+        for missing in ["none", "file", "node", "null"] {
+            match missing {
+                "file" => {
+                    conn.execute("DELETE FROM files WHERE path = 'target.ts'", [])
+                        .expect("remove target file");
+                }
+                "node" => {
+                    conn.execute("UPDATE edges SET target_node = 'missing'", [])
+                        .expect("dangling target node");
+                }
+                "null" => {
+                    conn.execute("UPDATE edges SET target_node = NULL", [])
+                        .expect("null target node");
+                }
+                _ => {}
+            }
+            let expected = direct_callers_for_tuple(&conn, &key.0, &key.1)
+                .expect("original single-target join");
+            assert_eq!(expected.len(), 2);
+            assert_eq!(expected[0].target.is_some(), missing == "none");
+            let batch =
+                direct_callers_for_tuples(&conn, &[key.clone(), absent.clone(), key.clone()])
+                    .expect("caller batch");
+            assert_eq!(batch.len(), 2);
+            assert_eq!(batch[&key], expected, "nullable target: {missing}");
+            assert!(batch[&absent].is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires AFT_CALLERS_PREFETCH_STORE from a fixed real-source export"]
+    fn direct_callers_real_store_query_plan() {
+        let path = std::env::var("AFT_CALLERS_PREFETCH_STORE").expect("real store path");
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open real store read-only");
+        let (file, symbol, edges) = conn
+            .query_row(
+                "SELECT target_file, target_symbol, COUNT(*) FROM edges
+                 WHERE kind IN ('call', 'callback_ref')
+                 GROUP BY target_file, target_symbol ORDER BY COUNT(*) DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("widely called target");
+        let optimized = direct_callers_batch_sql("(?, ?)");
+        let original = optimized.replace(
+            "LEFT JOIN nodes tgt\n             ON tgt.id = e.target_node\n            AND tgt.file_path IN (SELECT path FROM files)\n         LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path",
+            "LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path) ON tgt.id = e.target_node",
+        );
+        assert_ne!(original, optimized, "reference must retain the old join");
+        let mut reports = Vec::new();
+        let mut reference = None;
+        for (variant, sql) in [("before", original), ("after", optimized)] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan")
+                .query_map(params![file, symbol], |row| row.get::<_, String>(3))
+                .expect("query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("plan rows");
+            let mut stmt = conn.prepare(&sql).expect("prepare real query");
+            let mut times = Vec::new();
+            let mut fullscan_steps = 0;
+            let mut vm_steps = 0;
+            let mut row_count = 0;
+            for run in 0..7 {
+                let started = Instant::now();
+                let calls = stmt
+                    .query_map(params![file, symbol], direct_call_site_from_row)
+                    .expect("query real callers")
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("real callers");
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+                if run == 0 {
+                    fullscan_steps = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
+                    vm_steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                }
+                row_count = calls.len();
+                if let Some(expected) = &reference {
+                    assert_eq!(&calls, expected, "real caller rows and order must match");
+                } else {
+                    reference = Some(calls);
+                }
+            }
+            reports.push(serde_json::json!({
+                "variant": variant, "sql": sql, "plan": plan, "rows": row_count,
+                "fullscan_steps": fullscan_steps, "vm_steps": vm_steps, "times_ms": times,
+            }));
+        }
+        let report = serde_json::json!({
+            "sqlite_version": rusqlite::version(), "file": file, "symbol": symbol,
+            "edges": edges, "queries": reports, "identical_rows": true,
+        });
+        println!("CALLER_PREFETCH_PLAN {report}");
+        if let Ok(path) = std::env::var("AFT_CALLERS_PREFETCH_REPORT") {
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&report).expect("serialize report"),
+            )
+            .expect("write real-store report");
+        }
+    }
+
+    #[test]
     fn callers_depth_boundary_batches_sqlite_counts() {
         const CALLER_COUNT: usize = 1_000;
 
@@ -28009,8 +29189,9 @@ mod cold_build_insert_tests {
         assert_eq!(result.total_callers, CALLER_COUNT);
         assert_eq!(caller_queries, 1);
         assert_eq!(boundary_queries, 3);
-        // Includes one readiness SELECT, which reads all readiness metadata at once.
-        assert_eq!(total_selects, 7);
+        // Readiness metadata and matching unresolved names each use one SELECT;
+        // the total stays constant as the number of callers grows.
+        assert_eq!(total_selects, 8);
     }
 
     #[test]
@@ -28692,6 +29873,207 @@ export function leaf() {}
     }
 
     #[test]
+    fn cold_build_reads_each_source_once_for_fingerprinting_and_preserves_rows() {
+        let dir = tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        for index in 0..256 {
+            fs::write(
+                src.join(format!("file{index}.ts")),
+                format!(
+                    "import {{ target as next }} from './file{}';\nexport function target() {{ next(); }}\n",
+                    (index + 1) % 256
+                ),
+            )
+            .unwrap();
+        }
+        let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        assert_eq!(files.len(), 256);
+        let reference = CallGraphStore::open(root.join(".reference"), root.clone()).unwrap();
+        reference.cold_build(&files).unwrap();
+        work_counts::reset_under(&root);
+        let opens = crate::project_content::Probe::new(&root);
+        let memo = Arc::new(CorpusMemo::default());
+        let (published, _) = with_corpus_memo(Arc::downgrade(&memo), || {
+            CallGraphStore::cold_build_with_lease_chunked(
+                root.join(".published"),
+                root.clone(),
+                &[],
+                32,
+            )
+            .unwrap()
+        });
+        let reads = files
+            .iter()
+            .map(|path| work_counts::fingerprint_reads(path))
+            .collect::<Vec<_>>();
+        let parses = work_counts::parses_under(&root);
+        let source_opens = opens
+            .paths()
+            .into_iter()
+            .filter(|path| files.contains(path))
+            .count();
+        let mut rows = 0;
+        for (table, excluded) in [
+            ("files", &["indexed_at"][..]),
+            ("nodes", &[][..]),
+            ("refs", &[][..]),
+            ("edges", &[][..]),
+            ("file_dependencies", &[][..]),
+            ("dispatch_hints", &[][..]),
+            ("backend_file_state", &["updated_at"][..]),
+        ] {
+            let expected = graph_table_rows_without(&reference, table, excluded);
+            rows += expected.len();
+            assert_eq!(
+                expected,
+                graph_table_rows_without(&published, table, excluded),
+                "stored rows for {table}"
+            );
+        }
+        incremental_parity::compare(&reference, &published).unwrap();
+        eprintln!(
+            "256-source fixture: fingerprint reads={} (per-file {}..={}), extraction parses={parses}, source opens={source_opens}, identical stored rows={rows}",
+            reads.iter().sum::<usize>(),
+            reads.iter().min().unwrap(),
+            reads.iter().max().unwrap(),
+        );
+        assert_eq!(parses, files.len());
+        assert_eq!(work_counts::max_parses_of_one_file_under(&root), 1);
+        assert_eq!(source_opens, 2 * files.len());
+        assert!(
+            reads.iter().all(|count| *count == 1),
+            "one fingerprint read per source"
+        );
+        #[cfg(any(unix, windows))]
+        {
+            work_counts::reset_under(&root);
+            let probe = crate::project_content::Probe::new(&root);
+            assert!(with_corpus_memo(Arc::downgrade(&memo), || {
+                CallGraphStore::cold_build_suspension(&root.join(".published"), &root)
+                    .unwrap()
+                    .is_none()
+            }));
+            assert!(files
+                .iter()
+                .all(|path| work_counts::fingerprint_reads(path) == 0));
+            assert!(!probe.paths().iter().any(|path| files.contains(path)));
+            eprintln!("256-source suspension probe after build: 0 source opens");
+        }
+    }
+
+    #[test]
+    fn corpus_snapshot_missing_lookup_is_not_a_byte_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        let source = b"export function entry() {}\n";
+        fs::write(&admitted, source).unwrap();
+        let corpus = corpus_snapshot_for(root, &[admitted]).unwrap();
+        let unadmitted = root.join("unadmitted.ts");
+        fs::write(&unadmitted, source).unwrap();
+
+        assert!(matches!(
+            corpus.verify_bytes(root, &unadmitted, source),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            corpus.freshness(root, &unadmitted),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+        assert!(matches!(
+            BuildPool::new().build_extracts(
+                root,
+                &[unadmitted],
+                &callgraph::ModuleResolutionMemo::default(),
+                Some(&corpus),
+            ),
+            Err(CallGraphStoreError::CorpusSnapshotMissing(_))
+        ));
+    }
+
+    #[test]
+    fn cold_build_inventory_changes_are_not_byte_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let admitted = root.join("admitted.ts");
+        fs::write(&admitted, "export function entry() {}\n").unwrap();
+        let corpus = corpus_snapshot_for(root, &[]).unwrap();
+        let store = CallGraphStore::open(root.join(".store"), root.to_path_buf()).unwrap();
+        let added = root.join("added.ts");
+        fs::write(&added, "export function leaf() {}\n").unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::CorpusInventoryChanged(Some(_))
+        ));
+
+        fs::remove_file(added).unwrap();
+        fs::remove_file(admitted).unwrap();
+        let error = store
+            .stage_cold_build_file_inventory_checked(&[], Some(&corpus))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallGraphStoreError::CorpusInventoryChanged(None)
+        ));
+    }
+
+    #[test]
+    fn cold_build_rejects_bytes_changed_after_admission_and_retries_changed_corpus() {
+        let dir = tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let source = root.join("main.ts");
+        let original = b"export function before() {}\n";
+        let changed = b"export function after_() {}\n";
+        fs::write(&source, original).unwrap();
+        let admitted = callgraph_corpus_fingerprint(&root).unwrap();
+        let edited = source.clone();
+        set_cold_build_extract_observer(Some(Arc::new(move |_| {
+            let mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&edited).unwrap());
+            fs::write(&edited, changed).unwrap();
+            filetime::set_file_mtime(&edited, mtime).unwrap();
+        })));
+        let store_dir = root.join(".store");
+        let result =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir.clone(), root.clone(), &[], 1);
+        set_cold_build_extract_observer(None);
+        assert!(matches!(result, Err(CallGraphStoreError::StaleFiles(_))));
+        assert!(CallGraphStore::needs_cold_build(&store_dir, &root).unwrap());
+        let staged = Connection::open(staging_path_for_test(&store_dir, &root)).unwrap();
+        assert_eq!(
+            staged_string(&staged, STAGED_CORPUS_FINGERPRINT)
+                .unwrap()
+                .as_deref(),
+            Some(admitted.as_str())
+        );
+        assert!(!database_ready(&staged).unwrap());
+        drop(staged);
+        let fresh = callgraph_corpus_fingerprint(&root).unwrap();
+        assert_ne!(admitted, fresh);
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &[], 1).unwrap();
+        assert_eq!(store.nodes_matching("after_").unwrap().len(), 1);
+        assert!(store.nodes_matching("before").unwrap().is_empty());
+        assert_eq!(
+            staged_string(&store.conn.lock().unwrap(), STAGED_CORPUS_FINGERPRINT)
+                .unwrap()
+                .as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    fn staging_path_for_test(store: &Path, root: &Path) -> PathBuf {
+        store.join(staging_file_name(
+            &project_key_for_store(store, root).unwrap(),
+        ))
+    }
+
+    #[test]
     fn cold_build_chunked_matches_unchunked_logical_rows() {
         let dir = tempdir().expect("temp dir");
         let project_root = fs::canonicalize(dir.path()).expect("canonical temp root");
@@ -28964,6 +30346,316 @@ export function leaf() {}
                 graph_table_rows(&memoized, table),
                 "memoized and bypassed disk indexes must produce byte-identical {table} rows"
             );
+        }
+    }
+
+    #[test]
+    fn cold_inline_index_preserves_scope_alias_fallback_and_negative_rows() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("project");
+        fs::create_dir_all(root.join("src/physical")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"inline-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+mod caller;
+mod physical;
+mod outer {
+    pub fn hit() {}
+    pub mod inner {
+        pub fn target() {}
+        pub fn run() { self::target(); super::hit(); crate::shared::target(); }
+    }
+}
+#[cfg(feature = "inline")]
+mod shared { pub fn target() {} }
+#[cfg(not(feature = "inline"))]
+mod shared;
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/caller.rs"),
+            r#"
+use crate::outer as alias;
+pub fn run() {
+    crate::outer::inner::target();
+    alias::inner::target();
+    crate::shared::target();
+    crate::physical::deep::target();
+    crate::missing::absent();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/shared.rs"), "pub fn target() {}\n").unwrap();
+        fs::write(
+            root.join("src/physical/mod.rs"),
+            "pub mod deep { pub fn target() {} }\n",
+        )
+        .unwrap();
+        let files: Vec<_> = [
+            "src/lib.rs",
+            "src/caller.rs",
+            "src/shared.rs",
+            "src/physical/mod.rs",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect();
+        let scan = CallGraphStore::open(dir.path().join("scan"), root.clone()).unwrap();
+        let indexed = CallGraphStore::open(dir.path().join("indexed"), root.clone()).unwrap();
+        let memo = callgraph::ModuleResolutionMemo::default();
+        scan.cold_build_chunked_with_disk_index_memo_for_test(&files, 2, 3, &memo, false)
+            .unwrap();
+        let memo = callgraph::ModuleResolutionMemo::default();
+        indexed
+            .cold_build_chunked_with_disk_index_memo_for_test(&files, 2, 3, &memo, true)
+            .unwrap();
+        for table in ["refs", "edges"] {
+            assert_eq!(
+                graph_table_rows(&scan, table),
+                graph_table_rows(&indexed, table),
+                "{table}"
+            );
+        }
+        for (file, symbol, caller, caller_symbol) in [
+            (
+                "src/lib.rs",
+                "outer::inner::target",
+                "src/lib.rs",
+                "outer::inner::run",
+            ),
+            (
+                "src/lib.rs",
+                "outer::hit",
+                "src/lib.rs",
+                "outer::inner::run",
+            ),
+            (
+                "src/lib.rs",
+                "shared::target",
+                "src/lib.rs",
+                "outer::inner::run",
+            ),
+            ("src/lib.rs", "outer::inner::target", "src/caller.rs", "run"),
+            ("src/lib.rs", "shared::target", "src/caller.rs", "run"),
+            (
+                "src/physical/mod.rs",
+                "deep::target",
+                "src/caller.rs",
+                "run",
+            ),
+        ] {
+            let sites = indexed.direct_callers_of(Path::new(file), symbol).unwrap();
+            assert!(
+                sites
+                    .iter()
+                    .any(|site| site.caller.file == caller && site.caller.symbol == caller_symbol),
+                "missing {file}:{symbol} from {caller}:{caller_symbol}: {sites:?}"
+            );
+        }
+        assert_eq!(
+            indexed
+                .direct_callers_of(Path::new("src/lib.rs"), "outer::inner::target")
+                .unwrap()
+                .iter()
+                .filter(|site| site.caller.file == "src/caller.rs")
+                .count(),
+            2,
+            "both the alias and crate path must resolve"
+        );
+        assert!(
+            indexed
+                .direct_callers_of(Path::new("src/shared.rs"), "target")
+                .unwrap()
+                .is_empty(),
+            "inline lookup must precede the module-file fallback"
+        );
+        let conn = indexed.conn.lock().unwrap();
+        let statuses: Vec<String> = conn
+            .prepare("SELECT status FROM refs WHERE callee_last_segment = 'absent'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses, ["unresolved"]);
+    }
+
+    #[test]
+    fn cold_inline_index_visits_only_eligible_files_in_path_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/a/deep")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn caller() {}\n").unwrap();
+        let mut files = vec![root.join("src/lib.rs")];
+        for path in [
+            "src/a.rs",
+            "src/a/mod.rs",
+            "src/a/deep.rs",
+            "src/a/deep/mod.rs",
+            "src/a/deep/exact.rs",
+            "other/src/lib.rs",
+            "src/unrelated.rs",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let source = if path == root.join("src/a.rs") || path == root.join("src/a/mod.rs") {
+                "pub mod deep { pub mod exact { pub fn pick() {} } }\n"
+            } else if path == root.join("src/a/deep.rs") {
+                "pub mod exact { pub fn pick() {} }\n"
+            } else {
+                "pub fn unrelated() {}\n"
+            };
+            fs::write(&path, source).unwrap();
+            files.push(path);
+        }
+        let store = CallGraphStore::open(root.join("store"), root.to_path_buf()).unwrap();
+        store.cold_build(&files).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let data = build_file_extract(root, &root.join("src/lib.rs"))
+            .unwrap()
+            .data;
+        let memos = DiskIndexMemos::default();
+        *memos.inline_candidate_visits.borrow_mut() = Some(Vec::new());
+        let module_memo = callgraph::ModuleResolutionMemo::default();
+        let index = DiskProjectIndex {
+            project_root: root,
+            conn: &conn,
+            caller_file: "src/lib.rs",
+            caller_data: &data,
+            workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+            module_resolution_memo: &module_memo,
+            memos: &memos,
+            memoize_resolver_indexes: true,
+        };
+        let segments: Vec<_> = ["a", "deep", "exact"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            index.inline_scoped_target("src/lib.rs", &segments, "missing"),
+            None
+        );
+        assert_eq!(
+            memos.inline_candidate_visits.borrow().as_ref().unwrap(),
+            &[
+                "src/lib.rs",
+                "src/a.rs",
+                "src/a/deep.rs",
+                "src/a/deep/mod.rs",
+                "src/a/mod.rs"
+            ]
+        );
+        assert_eq!(
+            index.inline_scoped_target("src/lib.rs", &segments, "pick"),
+            Some(("src/a.rs".into(), "deep::exact::pick".into())),
+            "global path order wins over prefix depth"
+        );
+        assert_eq!(
+            index.inline_scoped_target("src/a/mod.rs", &segments, "pick"),
+            Some(("src/a/mod.rs".into(), "deep::exact::pick".into())),
+            "caller wins over global path order"
+        );
+        let first = index.rust_inline_candidates();
+        assert!(
+            Rc::ptr_eq(&first, &index.rust_inline_candidates()),
+            "one prefix index per immutable snapshot"
+        );
+        let scan = DiskProjectIndex {
+            memoize_resolver_indexes: false,
+            ..index
+        };
+        memos
+            .inline_candidate_visits
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .clear();
+        assert_eq!(
+            scan.inline_scoped_target("src/lib.rs", &segments, "missing"),
+            None
+        );
+        assert_eq!(
+            memos
+                .inline_candidate_visits
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .len(),
+            8,
+            "the original scan also visits unrelated crates and non-prefix paths"
+        );
+
+        // Inspect-triggered refreshes use the lazy index; view joins use the
+        // eager one. Both must prune the same physical module prefixes.
+        let extracts = files
+            .iter()
+            .map(|path| {
+                let extract = build_file_extract(root, path).unwrap();
+                (extract.rel_path.clone(), extract)
+            })
+            .collect::<HashMap<_, _>>();
+        let empty = HashMap::new();
+        for eager in [false, true] {
+            let mut project = ProjectIndex::from_db_and_callers(
+                &conn,
+                root,
+                if eager { &extracts } else { &empty },
+                WorkspaceCratePrefixCache::default(),
+            );
+            if eager {
+                project.lazy = None;
+            }
+            let session = rust_module_work::Session::start(false);
+            assert_eq!(
+                project.inline_scoped_target("src/lib.rs", &segments, "missing"),
+                None
+            );
+            assert_eq!(session.finish().inline_file_visits, 5, "eager={eager}");
+            let session = rust_module_work::Session::start(false);
+            assert_eq!(
+                project.inline_scoped_target_by_scan("src/lib.rs", &segments, "missing"),
+                None
+            );
+            assert_eq!(session.finish().inline_file_visits, 8);
+            assert_eq!(
+                project.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                Some(("src/a.rs".into(), "deep::exact::pick".into()))
+            );
+            assert_eq!(
+                project.inline_scoped_target("src/a/mod.rs", &segments, "pick"),
+                Some(("src/a/mod.rs".into(), "deep::exact::pick".into()))
+            );
+            if !eager {
+                let path = root.join("src/a.rs");
+                let original = fs::read_to_string(&path).unwrap();
+                fs::write(&path, "pub fn replacement() {}\n").unwrap();
+                let replacement = build_file_extract(root, &path).unwrap();
+                let next_extracts = HashMap::from([(replacement.rel_path.clone(), replacement)]);
+                let next = ProjectIndex::from_db_and_callers(
+                    &conn,
+                    root,
+                    &next_extracts,
+                    WorkspaceCratePrefixCache::default(),
+                );
+                assert_eq!(
+                    next.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                    Some(("src/a/deep.rs".into(), "exact::pick".into())),
+                    "fresh extracts must replace stored symbols in a new snapshot"
+                );
+                assert_eq!(
+                    project.inline_scoped_target("src/lib.rs", &segments, "pick"),
+                    Some(("src/a.rs".into(), "deep::exact::pick".into())),
+                    "the previous snapshot retains its own index"
+                );
+                fs::write(path, original).unwrap();
+            }
         }
     }
 
@@ -29560,6 +31252,7 @@ export function leaf() {}
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,
                 import_block: ImportBlock::empty(),
+                python_bindings: Vec::new(),
                 lang: LangId::TypeScript,
             },
             nodes: vec![node.clone()],
@@ -32662,6 +34355,7 @@ mod reexport_resolution_tests {
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
             lazy_module_parents: std::cell::OnceCell::new(),
+            lazy_inline_candidates: std::cell::OnceCell::new(),
             rust_caller_paths: RefCell::default(),
             go_packages: RefCell::default(),
             local_symbols: RefCell::default(),
@@ -33752,6 +35446,65 @@ mod bounded_build_breaker_tests {
             CallGraphStore::cold_build_with_lease_chunked(fast_store, fast_root, &files, 1)
                 .expect_err("a suspended root must not report a perpetually building worker");
         assert!(matches!(refused, CallGraphStoreError::Suspended(_)));
+    }
+
+    #[test]
+    fn suspension_probe_reuses_content_fingerprint_but_not_a_rewritten_corpus() {
+        let memo = Arc::new(CorpusMemo::default());
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        let store_dir = temp.path().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        std::fs::write(&source, "export function before() {}\n").unwrap();
+        let fingerprint = with_corpus_memo(Arc::downgrade(&memo), || {
+            callgraph_corpus_fingerprint(&root).unwrap()
+        });
+        let mut reference = CorpusFingerprint::default();
+        reference.add_path(&root, &source);
+        assert_eq!(
+            fingerprint,
+            reference.finish(&root),
+            "preserve v2 breaker keys"
+        );
+        let key = BreakerKey::new(
+            root.display().to_string(),
+            BuildDomain::CallgraphCold,
+            fingerprint.clone(),
+        );
+        let breaker = BuildDeathBreaker::open(store_dir.join("build-breaker.sqlite")).unwrap();
+        for _ in 0..3 {
+            let BreakerAdmission::Admitted(attempt) = breaker.admit(&key, 0).unwrap() else {
+                panic!("unexpected early suspension");
+            };
+            breaker
+                .record_attributed_death(&key, &attempt.attempt_id, 0, 0)
+                .unwrap();
+        }
+        work_counts::reset_under(&root);
+        let probe = || {
+            with_corpus_memo(Arc::downgrade(&memo), || {
+                CallGraphStore::cold_build_suspension(&store_dir, &root).unwrap()
+            })
+        };
+        assert!(probe().is_some());
+        assert!(probe().is_some());
+        #[cfg(any(unix, windows))]
+        assert_eq!(work_counts::fingerprint_reads(&source), 0);
+
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&source).unwrap());
+        std::fs::write(&source, "export function after_() {}\n").unwrap();
+        filetime::set_file_mtime(&source, mtime).unwrap();
+        assert!(probe().is_none());
+        assert_ne!(callgraph_corpus_fingerprint(&root).unwrap(), fingerprint);
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease_chunked(store_dir, root, &[], 1).unwrap();
+        assert_eq!(store.nodes_matching("after_").unwrap().len(), 1);
+        assert!(
+            breaker.suspension(&key).unwrap().is_some(),
+            "a changed corpus must not reset the crashing corpus's history"
+        );
     }
 
     #[test]

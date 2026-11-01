@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-retry-trailers"
+  ],
+  "note": "Release retry lineage check accepts commit-hook trailers on the version bump. Release scripts only; no search code."
+}

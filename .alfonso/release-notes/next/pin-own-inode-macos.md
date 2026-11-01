@@ -1,0 +1,1 @@
+- On macOS, privacy prompts for commands AFT runs (such as access to a removable volume) name AFT's daemon at its one installed path, so allowing it once is remembered. Before, each background command could appear as a different "aft" and the prompt kept coming back.

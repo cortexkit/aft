@@ -38,6 +38,9 @@ const MAX_INSPECT_HEADER_PARTS: usize = 3;
 // producer leaves room for other categories and final freshness verification.
 // The cap avoids turning large configured budgets into equally long waits.
 const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
+// Scoped diagnostics are an interactive observation, not a workspace build.
+// Leave transport headroom even when the configured full-project budget is long.
+const SCOPED_INSPECT_REQUEST_CAP: Duration = Duration::from_secs(30);
 /// Reserve time inside the configured request budget for terminal assembly and
 /// egress. The server always answers before the client gives up: server work
 /// stops before `diagnostics_timeout_ms`, while the client waits for that budget
@@ -57,8 +60,16 @@ struct InspectRequestDeadline {
 }
 
 impl InspectRequestDeadline {
-    fn from_config(config: &crate::config::Config) -> Self {
-        Self::new(inspect_request_timeout(config), INSPECT_TERMINAL_MARGIN)
+    fn for_request(req: &RawRequest, config: &crate::config::Config) -> Self {
+        let budget = inspect_request_timeout(config);
+        Self::new(
+            if scope_was_provided(req.params.get("scope")) {
+                budget.min(SCOPED_INSPECT_REQUEST_CAP)
+            } else {
+                budget
+            },
+            INSPECT_TERMINAL_MARGIN,
+        )
     }
 
     fn new(budget: Duration, terminal_margin: Duration) -> Self {
@@ -272,8 +283,20 @@ impl Drop for DeferredInspectRootPermit {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct InspectRootStatSnapshot(Vec<(PathBuf, u64, SystemTime)>);
+#[derive(Debug)]
+struct InspectRootStatSnapshot(
+    Vec<(PathBuf, u64, SystemTime)>,
+    Arc<crate::inspect::inventory::InspectInventory>,
+    Vec<(PathBuf, blake3::Hash)>,
+);
+
+impl PartialEq for InspectRootStatSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0 && self.2 == other.2
+    }
+}
+
+impl Eq for InspectRootStatSnapshot {}
 
 fn capture_inspect_root_stats_until(
     root: &Path,
@@ -295,10 +318,16 @@ fn capture_inspect_root_stats_while(
     has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
+    #[cfg(test)]
+    let _profile = crate::inspect::walk_profile::Walk::start("freshness_listing");
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
-    for file in crate::callgraph::walk_project_files_while(root, move || walk_budget()) {
+    let inventory = Arc::new(crate::inspect::inventory::InspectInventory::collect(
+        root,
+        move || walk_budget(),
+    ));
+    for file in &inventory.sources {
         if !has_work_budget() {
             return Err(timeout_detail());
         }
@@ -306,7 +335,7 @@ fn capture_inspect_root_stats_while(
         INSPECT_STAT_CALLS.with(|count| count.set(count.get() + 1));
         match std::fs::metadata(&file) {
             Ok(metadata) => files.push((
-                file,
+                file.clone(),
                 metadata.len(),
                 metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             )),
@@ -327,7 +356,25 @@ fn capture_inspect_root_stats_while(
         return Err(timeout_detail());
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(InspectRootStatSnapshot(files))
+    // Manifest membership is shared with hash calculations during the request.
+    // Fence it too, so an added manifest cannot make a snapshot appear current.
+    let mut manifests = Vec::new();
+    for manifest in &inventory.manifests {
+        if !has_work_budget() {
+            return Err(timeout_detail());
+        }
+        let contents = std::fs::read(manifest).map_err(|error| {
+            format!(
+                "failed to stat {} during inspect verification: {error}",
+                manifest.display()
+            )
+        })?;
+        manifests.push((manifest.clone(), blake3::hash(&contents)));
+    }
+    if !has_work_budget() {
+        return Err(timeout_detail());
+    }
+    Ok(InspectRootStatSnapshot(files, inventory, manifests))
 }
 
 #[cfg(test)]
@@ -509,7 +556,17 @@ fn resolve_inspect_applicability(
         config,
         Some(deadline),
     )?;
-    let mut lsp = ctx.lsp();
+    let mut lsp = loop {
+        if inspect_cancellation_requested() || Instant::now() >= deadline {
+            return Err(ApplicabilityResolutionError::RequestDeadline {
+                root: project_root.to_path_buf(),
+            });
+        }
+        if let Some(lsp) = ctx.try_lsp() {
+            break lsp;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let snapshot = lsp.classify_applicable_servers(walk, config);
     if scoped_roots.is_none() {
         lsp.store_project_applicability(snapshot.clone());
@@ -549,7 +606,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
         ctx.disable_rust_cargo_for_worker();
     }
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
-    let deadline = InspectRequestDeadline::from_config(&ctx.config());
+    let deadline = InspectRequestDeadline::for_request(req, &ctx.config());
     let snapshot = match inspect_preflight(req, ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
@@ -603,6 +660,9 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
             phase_log,
             deadline,
         ),
+        Err(_) if inspect_cancellation_requested() => {
+            build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted)
+        }
         Err(error) => build_inspect_terminal(
             &req.id,
             &phase_log,
@@ -641,6 +701,7 @@ fn handle_inspect_payload(
     observed_stats: Option<&InspectRootStatSnapshot>,
     rust_checks: Vec<InspectRustCheck>,
 ) -> Response {
+    let _inventory = observed_stats.map(|stats| stats.1.install());
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
         Err(message) => return invalid_request(&req.id, message),
@@ -716,6 +777,25 @@ fn handle_inspect_payload(
         ctx.callgraph_store_for_ops()
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
+    };
+    // A checkout over `views.callgraph_copies` reads the main checkout's
+    // graph. Where its files differ, dead code and the other graph-backed
+    // categories would describe the main checkout's code, so they report the
+    // borrowed graph as unavailable instead.
+    let routed_store = match (&routed_store, v3_routed) {
+        (crate::context::CallgraphStoreAccess::Ready(_), true) => {
+            match crate::commands::callgraph_borrowed::borrowed_callgraph(ctx)
+                .filter(crate::commands::callgraph_borrowed::BorrowedCallgraph::can_differ)
+            {
+                Some(borrowed) => crate::context::CallgraphStoreAccess::Error(
+                    crate::callgraph_store::CallGraphStoreError::Unavailable(
+                        borrowed.summary_line(),
+                    ),
+                ),
+                None => routed_store,
+            }
+        }
+        _ => routed_store,
     };
     let checkout_routed = ctx.checkout_query_outcome().is_some() || v3_routed;
     // Why the v3 view could not serve, observed once from the access this
@@ -901,7 +981,9 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         let grant_scope = crate::access_policy::current_scope();
         let ask_route = crate::access_policy::capture_ask_route();
+        let inventory = crate::inspect::inventory::current(&snapshot.project_root);
         std::thread::spawn(move || {
+            let _inventory = inventory.as_ref().map(|inventory| inventory.install());
             let _ask_route = ask_route.install();
             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
@@ -1351,7 +1433,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
-    let mut deadline = InspectRequestDeadline::from_config(&ctx.config());
+    let mut deadline = InspectRequestDeadline::for_request(req, &ctx.config());
     if let Some(reply_deadline) = reply_deadline {
         deadline.terminal_at = deadline.terminal_at.min(reply_deadline);
         deadline.budget = deadline
@@ -1392,35 +1474,6 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
     let reports_diagnostics = scoped_roots.is_none() || diagnostics_selected(req);
-    let applicability = if !reports_diagnostics {
-        Ok(ApplicableServerSnapshot::default())
-    } else {
-        resolve_inspect_applicability(
-            &ctx,
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
-    let applicability = match applicability {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return deferred_response(
-                request_id,
-                build_inspect_terminal(
-                    &req.id,
-                    &phase_log,
-                    InspectTerminal::PhaseFailed {
-                        failed_phase: None,
-                        failure_reason: applicability_failure_reason(&error),
-                        failure_detail: Some(applicability_failure_detail(error)),
-                    },
-                ),
-            );
-        }
-    };
-
     let request = RawRequest {
         id: req.id.clone(),
         command: req.command.clone(),
@@ -1453,6 +1506,36 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
             let _config_pin = ctx.pin_config_to(admitted_config);
             let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
             let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            // Discovery can wait for the manager or walk a large scope. Run it
+            // outside executor setup so a slow manager cannot prevent another
+            // session from configuring the same project.
+            let applicability = if !reports_diagnostics {
+                Ok(ApplicableServerSnapshot::default())
+            } else {
+                resolve_inspect_applicability(
+                    &ctx,
+                    &snapshot.project_root,
+                    (!scope.roots.is_empty()).then_some(scope.roots.as_slice()),
+                    &snapshot.config,
+                    deadline.work_at(),
+                )
+            };
+            let applicability = match applicability {
+                Ok(applicability) => applicability,
+                Err(error) => {
+                    let terminal = if inspect_cancellation_requested() {
+                        InspectTerminal::Interrupted
+                    } else {
+                        InspectTerminal::PhaseFailed {
+                            failed_phase: None,
+                            failure_reason: applicability_failure_reason(&error),
+                            failure_detail: Some(applicability_failure_detail(error)),
+                        }
+                    };
+                    let _ = tx.send(build_inspect_terminal(&request.id, &phase_log, terminal));
+                    return;
+                }
+            };
             if ctx.checkout_query_runtime_active() {
                 // Resolve call-graph availability before diagnostics can end the
                 // request. Response finalization must report the same outcome
@@ -1518,6 +1601,7 @@ fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapsh
 }
 
 fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
+    let response = crate::access_policy::finish_current_plugin_response(response);
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let _ = tx.send(response);
     DispatchOutcome::Deferred(PendingResponse::from_receiver(
@@ -1761,6 +1845,9 @@ fn run_blocking_inspect_body(
     let reload_scope_roots = parse_scope(req, ctx, &project_root)
         .map(|scope| scope.roots)
         .unwrap_or_default();
+    let scoped_request =
+        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
+    let diagnostics_requested = !scoped_request || diagnostics_selected(req);
     for server in &start_outcomes.successful {
         ctx.lsp_reload_rust_workspace_if_manifests_changed(server, &reload_scope_roots);
     }
@@ -1789,24 +1876,19 @@ fn run_blocking_inspect_body(
         })
         .collect::<Vec<_>>();
     // Rust producers whose automatic checks are off are certified only by the
-    // cargo check inspect runs itself. Start it now, bounded by the same
-    // deadline as the wait below, so it runs while the servers settle instead
-    // of in what the wait leaves over; the diagnostics phase, whose deadline
-    // is never earlier, collects the outcome.
+    // cargo check inspect runs itself. Start it before category collection,
+    // so other scans and any root wait do not spend its analysis budget.
+    // The diagnostics phase collects the outcome under the shared deadline.
     let rust_checks = start_inspect_rust_checks(
         ctx,
         &start_outcomes.successful,
         deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
     );
-    // Give producers a bounded chance to settle before reading the warm store.
-    // The wait is root-level: producers publish while events are drained. A
-    // scoped request's per-file work happens later, in the diagnostics
-    // category, with its own share of the budget; that step also waits for
-    // rust-analyzer's `cargo check`, so only an unscoped request waits for
-    // it here.
-    let scoped_request =
-        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
-    let diagnostics_requested = !scoped_request || diagnostics_selected(req);
+    // Scoped files still need the producer's workspace-load verdict: a file
+    // report cannot reveal a failed metadata load, and provisional reports must
+    // survive an indexing timeout without becoming authoritative. Keep this
+    // wait inside the shared request cap; the later scoped sweep establishes
+    // current-content authority and waits for Rust's compiler check separately.
     let wait_outcome = if diagnostics_requested {
         wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request)
     } else {
@@ -2217,7 +2299,10 @@ fn finish_start_phases(
 fn applicability_failure_reason(error: &ApplicabilityResolutionError) -> &'static str {
     match error {
         ApplicabilityResolutionError::RequestDeadline { .. } => "inspect_request_timeout",
-        ApplicabilityResolutionError::RootUnreadable { .. } => "applicability_resolution_failed",
+        ApplicabilityResolutionError::RootUnreadable { .. }
+        | ApplicabilityResolutionError::EntryLimitReached { .. } => {
+            "applicability_resolution_failed"
+        }
     }
 }
 
@@ -2226,6 +2311,10 @@ fn applicability_failure_detail(error: ApplicabilityResolutionError) -> String {
         ApplicabilityResolutionError::RootUnreadable { root, reason } => {
             format!("cannot resolve {}: {reason}", root.display())
         }
+        ApplicabilityResolutionError::EntryLimitReached { root, entries } => format!(
+            "cannot resolve {}: applicability walk incomplete: entry limit {entries} reached",
+            root.display()
+        ),
         ApplicabilityResolutionError::RequestDeadline { root } => format!(
             "inspect_request_timeout: producer discovery for {} exceeded the shared request deadline",
             root.display()
@@ -5307,6 +5396,29 @@ fn invalid_request(id: &str, message: String) -> Response {
 }
 
 #[cfg(test)]
+mod lsp_applicability_failure_tests {
+    use super::*;
+
+    #[test]
+    fn entry_limit_preserves_incomplete_failure_response() {
+        let root = PathBuf::from("workspace");
+        let old_error = ApplicabilityResolutionError::RootUnreadable {
+            root: root.clone(),
+            reason: "applicability walk incomplete: entry limit 3 reached".into(),
+        };
+        let error = ApplicabilityResolutionError::EntryLimitReached { root, entries: 3 };
+        assert_eq!(
+            applicability_failure_reason(&error),
+            applicability_failure_reason(&old_error)
+        );
+        assert_eq!(
+            applicability_failure_detail(error),
+            applicability_failure_detail(old_error)
+        );
+    }
+}
+
+#[cfg(test)]
 mod runtime_note_tests {
     use super::*;
 
@@ -7798,6 +7910,160 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     #[test]
+    #[ignore = "real-checkout inspect walk and output measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
+    fn inspect_checkout_walk_profile() {
+        use crate::inspect::walk_profile;
+        let root =
+            std::fs::canonicalize(std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").unwrap())
+                .unwrap();
+        let output =
+            std::path::PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
+        let requested_scope = std::env::var("AFT_INSPECT_WALK_PROFILE_SCOPE")
+            .unwrap_or_else(|_| "crates/aft/src/inspect".to_string());
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(storage.path().to_path_buf());
+        config.views.enabled = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.inspect.tier2_pass_timeout_ms = 600_000;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let configure = RawRequest {
+            id: "inspect-profile-configure".to_string(),
+            command: "configure".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: serde_json::json!({
+                "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
+                "config": {
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": true},
+                    "views": {"enabled": false},
+                },
+            }),
+        };
+        let configured = crate::commands::configure::handle_configure(&configure, &ctx);
+        assert!(configured.success, "{}", configured.data);
+        ctx.inspect_manager()
+            .set_automatic_tier2_refresh_allowed(false);
+        // Seed heavy analyzers outside the command's per-phase deadline, so a
+        // large checkout measures cache reuse rather than timeout handling.
+        let snapshot = build_snapshot(&ctx).unwrap();
+        assert_eq!(
+            snapshot.project_root,
+            crate::inspect::job::canonicalize_normalized(&root)
+        );
+        assert!(snapshot.inspect_writer && snapshot.callgraph_writer);
+        start_on_demand_callgraph_for_inspect(&ctx, snapshot.config.as_ref());
+        let _ = ctx.callgraph_store_for_query_without_wait();
+        let scope = JobScope::for_project(root.clone());
+        for category in InspectCategory::active().iter().copied() {
+            eprintln!("inspect profile seed starting: {category}");
+            let outcome = if category.is_tier2() {
+                ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                )
+            } else if matches!(category, InspectCategory::Metrics | InspectCategory::Todos) {
+                ctx.inspect_manager().submit_category_until(
+                    snapshot.clone(),
+                    category,
+                    scope.clone(),
+                    Instant::now() + Duration::from_secs(900),
+                )
+            } else {
+                continue;
+            };
+            assert!(
+                matches!(outcome, JobOutcome::Fresh { .. }),
+                "{category}: {outcome:?}"
+            );
+            eprintln!("inspect profile seed completed: {category}");
+        }
+        let mut measurements = Vec::new();
+        for (name, scope) in [
+            ("unscoped", None),
+            ("scoped", Some(requested_scope.as_str())),
+        ] {
+            walk_profile::take();
+            let req = RawRequest {
+                id: name.to_string(),
+                command: "inspect".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: serde_json::json!({
+                    "sections": ["dead_code", "unused_exports", "duplicates", "cycles"],
+                    "scope": scope, "top_k": 100,
+                }),
+            };
+            let started = Instant::now();
+            let cpu = walk_profile::cpu_ms();
+            let response = run_blocking_inspect_body(
+                &req,
+                &ctx,
+                ApplicableServerSnapshot::default(),
+                false,
+                InspectPhaseLog::for_request(name.to_string()),
+                InspectRequestDeadline::new(Duration::from_secs(900), Duration::from_secs(1)),
+            );
+            let measurement = serde_json::json!({
+                "case": name, "ms": started.elapsed().as_secs_f64() * 1000.0,
+                "cpu_ms": walk_profile::cpu_ms() - cpu, "walks": walk_profile::take(),
+                "response": response.data,
+            });
+            eprintln!("inspect checkout profile {}", serde_json::to_string(&serde_json::json!({
+                "case": name, "ms": measurement["ms"], "cpu_ms": measurement["cpu_ms"], "walks": measurement["walks"],
+            })).unwrap());
+            assert!(response.success, "{measurement:#}");
+            let snapshot = build_snapshot(&ctx).unwrap();
+            let cache = ctx.inspect_manager().cache_for_snapshot(&snapshot).unwrap();
+            let mut measurement = measurement;
+            let caller_scope = scope.map_or_else(
+                || JobScope::for_project(root.clone()),
+                |relative| JobScope::from_roots(root.clone(), vec![root.join(relative)]),
+            );
+            for category in [
+                InspectCategory::DeadCode,
+                InspectCategory::UnusedExports,
+                InspectCategory::Duplicates,
+                InspectCategory::Cycles,
+            ] {
+                let aggregate = cache
+                    .latest_aggregate_any_hash(category)
+                    .unwrap()
+                    .expect("persisted category aggregate");
+                if category == InspectCategory::DeadCode {
+                    assert_eq!(
+                        aggregate["callgraph_available"], true,
+                        "dead-code comparison requires a real call graph"
+                    );
+                }
+                measurement["full_aggregates"][category.as_str()] = aggregate;
+                let outcome = ctx.inspect_manager().tier2_run_with_reuse_blocking_fresh(
+                    snapshot.clone(),
+                    category,
+                    caller_scope.clone(),
+                );
+                let JobOutcome::Fresh { payload } = outcome else {
+                    panic!("{category}: {outcome:?}");
+                };
+                measurement["job_aggregates"][category.as_str()] = payload;
+                assert!(
+                    measurement["response"]["summary"]
+                        .get(category.as_str())
+                        .is_some(),
+                    "{measurement:#}"
+                );
+            }
+            measurements.push(measurement);
+        }
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, serde_json::to_vec_pretty(&measurements).unwrap()).unwrap();
+    }
+    #[test]
     fn root_too_broad_inspect_refuses_snapshot() {
         let ctx = crate::context::AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -8255,6 +8521,30 @@ mod deferred_terminal_tests {
             .is_some_and(|phases| phases
                 .iter()
                 .all(|phase| phase["id"] != "stat_verification")));
+    }
+
+    #[test]
+    fn inspect_final_stat_verification_fences_shared_manifest_membership_and_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        let manifest = root.path().join("package.json");
+        std::fs::write(&manifest, "{\"main\":\"one.js\"}").unwrap();
+        let added = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(initial, added);
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&manifest).unwrap());
+        std::fs::write(&manifest, "{\"main\":\"two.js\"}").unwrap();
+        filetime::set_file_mtime(&manifest, mtime).unwrap();
+        let changed = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_ne!(
+            added, changed,
+            "same-size, same-mtime manifest edits are fenced"
+        );
+        std::fs::remove_file(&manifest).unwrap();
+        assert_eq!(
+            initial,
+            capture_inspect_root_stats_until(root.path(), None).unwrap()
+        );
     }
 
     #[test]

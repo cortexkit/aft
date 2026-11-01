@@ -78,34 +78,17 @@ const MAX_WALK_ENTRIES: usize = 200_000;
 /// `pins/` and `readers/`, then the generation directories under `readers/`.
 const MAX_WALK_DEPTH: usize = 3;
 
-/// The G4c storage gap a refused v3 admission reports. A refusal has no
-/// legacy fallback: the caller serves what v3 already holds and names the gap.
-pub const V3_HARD_LIMIT_GAP: &str = "storage_gap:v3_family_hard_limit";
-
-/// Why a v3 reservation was refused.
+/// Why a v3 reservation was refused. A refusal has no legacy fallback: the
+/// caller serves what v3 already holds and names the gap.
 #[derive(Debug)]
 pub enum V3Refusal {
-    /// Committed usage plus the request would cross the family hard limit.
-    HardLimit {
-        usage: u64,
-        request: u64,
-        limit: u64,
-    },
-    /// The ledger refused it (device floor, namespace budget) or failed.
+    /// The ledger refused it (the device free-space floor) or failed.
     Ledger(crate::blob_store::v3::Error),
 }
 
 impl fmt::Display for V3Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HardLimit {
-                usage,
-                request,
-                limit,
-            } => write!(
-                f,
-                "{V3_HARD_LIMIT_GAP}: {usage} used + {request} requested > {limit}"
-            ),
             Self::Ledger(error) => write!(f, "storage_gap:{error}"),
         }
     }
@@ -124,24 +107,18 @@ pub struct V3Admission {
 }
 
 impl DiskBudget {
-    /// Admits a v3 reservation of `request` bytes against this family's
-    /// limits: the hard limit refuses, the target (the payload budget) only
-    /// asks for a sweep. Usage is the ledger's committed usage (last covering
-    /// measurement, committed charges since, and every outstanding
-    /// reservation), so concurrent builds are charged before they write.
+    /// Admits a v3 reservation of `request` bytes. Only the ledger's device
+    /// free-space floor refuses: v3 sets no byte limit per family, since a
+    /// clone-sharing store's file sizes say little about the disk it uses.
+    /// Usage over the target (the payload budget) asks for a sweep. Usage is
+    /// the ledger's committed usage (last covering measurement, committed
+    /// charges since, and every outstanding reservation).
     pub fn admit_v3(
         &self,
         registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
         request: u64,
     ) -> Result<V3Admission, V3Refusal> {
         let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
-        if usage.saturating_add(request) > self.family_store_hard {
-            return Err(V3Refusal::HardLimit {
-                usage,
-                request,
-                limit: self.family_store_hard,
-            });
-        }
         let reservation = registry.reserve(request).map_err(V3Refusal::Ledger)?;
         Ok(V3Admission {
             reservation,
@@ -150,21 +127,13 @@ impl DiskBudget {
     }
 
     /// Extends an admitted reservation before writing past it, under the same
-    /// hard limit.
+    /// device floor.
     pub fn extend_v3(
         &self,
         registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
         admission: &V3Admission,
         additional: u64,
     ) -> Result<(), V3Refusal> {
-        let usage = registry.accounting().map_err(V3Refusal::Ledger)?.usage();
-        if usage.saturating_add(additional) > self.family_store_hard {
-            return Err(V3Refusal::HardLimit {
-                usage,
-                request: additional,
-                limit: self.family_store_hard,
-            });
-        }
         registry
             .extend(&admission.reservation, additional)
             .map_err(V3Refusal::Ledger)
@@ -1319,7 +1288,7 @@ fn enforce_with_schedule(
     options: EnforceOptions<'_>,
     scheduled: Option<bool>,
 ) -> Result<EnforcementReport, EvictionError> {
-    // V3 members and their namespace budget are collected by storage retention.
+    // V3 members are collected by storage retention.
     // A v3-only owner has no legacy registry connection to measure or evict.
     if registry.is_v3_only() {
         return Ok(EnforcementReport {

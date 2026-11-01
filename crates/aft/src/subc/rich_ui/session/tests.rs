@@ -44,6 +44,8 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
             principal_id: Some(id.into()),
         },
         consumer_elicitation_capable: true,
+        held_reply: false,
+        held_update: false,
         tool_result_body: true,
         disabled_tools: Arc::new(vec![]),
         scope: Some(

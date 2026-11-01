@@ -39,7 +39,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Why a file the sweep opened still has no report when the budget ran out.
 pub(crate) const NO_PUBLISH_REASON: &str =
-    "opened for analysis, but the server published no diagnostics within the inspect budget; retry aft_inspect";
+    super::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON;
 
 /// Why a scoped file is unknown when its document is open in a server, the
 /// file changed on disk since AFT last sent the server its text, and sending
@@ -79,6 +79,7 @@ pub(crate) fn producer_keys_for_file(
 /// cause and the summary can say how many files were examined.
 #[derive(Debug, Default)]
 pub(crate) struct ScopedSweep {
+    requested_content: HashMap<(PathBuf, ServerKey), [u8; 32]>,
     /// Explicit per-file results take precedence over that server's previously
     /// published diagnostics, even if the request failed. TypeScript results
     /// are used only for this sweep; Python pulls also update the diagnostics
@@ -104,11 +105,25 @@ pub(crate) struct ScopedSweep {
     /// Documents this sweep opened, to close once diagnostics are read.
     opened: Vec<(PathBuf, Vec<ServerKey>)>,
     pull_pause: Option<crate::lsp::manager::BackgroundDocumentPullPause>,
+    deadline: Option<Instant>,
 }
 
 impl ScopedSweep {
-    /// Close every document the sweep opened. Runs after the diagnostics
-    /// payload is built: the collected reports stay in the store.
+    pub(crate) fn revalidate_requested_reports(&mut self) {
+        for (key, result) in &mut self.requested_reports {
+            if result.is_ok()
+                && self.requested_content.get(key).is_none_or(|hash| {
+                    Some(*hash) != crate::lsp::document::file_content_hash(&key.0)
+                })
+            {
+                *result =
+                    Err(super::diagnostics_category::CURRENT_CONTENT_UNVERIFIED_REASON.into());
+            }
+        }
+    }
+    /// Close documents within the sweep's remaining budget. Documents left
+    /// open retain their synchronized versions, so the next request can resync
+    /// changes rather than treating the server's old text as current.
     pub(crate) fn close_opened(&mut self, ctx: &AppContext) {
         let opened = std::mem::take(&mut self.opened);
         if opened.is_empty() {
@@ -116,6 +131,9 @@ impl ScopedSweep {
         }
         let mut lsp = ctx.lsp();
         for (file, keys) in opened {
+            if cancellation_requested() || self.deadline.is_some_and(|at| Instant::now() >= at) {
+                break;
+            }
             if let Err(err) = lsp.close_inspect_documents(&file, &keys) {
                 crate::slog_debug!("scoped inspect could not close {}: {err}", file.display());
             }
@@ -162,7 +180,10 @@ pub(crate) fn sweep_scoped_files(
     producers: &[ServerKey],
     deadline: Instant,
 ) -> ScopedSweep {
-    let mut sweep = ScopedSweep::default();
+    let mut sweep = ScopedSweep {
+        deadline: Some(deadline),
+        ..ScopedSweep::default()
+    };
     let producers: HashSet<&ServerKey> = producers.iter().collect();
     if producers.is_empty() {
         return sweep;
@@ -364,6 +385,12 @@ pub(crate) fn sweep_scoped_files(
         let mut in_flight = Vec::new();
         let mut typescript_in_flight = Vec::new();
         for (file, key, epoch_before) in window {
+            if Instant::now() >= deadline || cancellation_requested() {
+                sweep
+                    .unanswered
+                    .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
+                continue;
+            }
             let mut lsp = ctx.lsp();
             if key.kind == ServerKind::TypeScript && !lsp.server_supports_pull_for_file(key, file) {
                 match lsp.begin_scoped_typescript_diagnostics(key, file, deadline) {
@@ -399,7 +426,15 @@ pub(crate) fn sweep_scoped_files(
         }
         for (file, key, request) in typescript_in_flight {
             let reply = request.wait();
-            let result = ctx.lsp().finish_scoped_typescript_diagnostics(reply);
+            let result =
+                ctx.lsp()
+                    .finish_scoped_typescript_diagnostics(reply)
+                    .map(|(hash, diagnostics)| {
+                        sweep
+                            .requested_content
+                            .insert((file.clone(), key.clone()), hash);
+                        diagnostics
+                    });
             sweep
                 .requested_reports
                 .insert((file, key), result.map_err(|error| error.to_string()));
@@ -578,15 +613,14 @@ pub(crate) fn sweep_scoped_files(
         } else {
             first_failure
         };
-        sweep.unanswered.insert(
-            file,
-            (
-                key,
-                format!(
-                    "the server did not answer the diagnostics request within the inspect budget ({failure}); retry aft_inspect"
-                ),
-            ),
-        );
+        let reason = if Instant::now() >= deadline {
+            NO_PUBLISH_REASON.to_string()
+        } else {
+            format!(
+                "the server did not answer the diagnostics request within the inspect budget ({failure}); retry aft_inspect"
+            )
+        };
+        sweep.unanswered.insert(file, (key, reason));
     }
 
     // rust-analyzer answers pulls with its own analysis and pushes its
@@ -603,6 +637,11 @@ pub(crate) fn sweep_scoped_files(
                 .requested_reports
                 .contains_key(&(file.clone(), key.clone()))
             {
+                if let Some(hash) = lsp.report_content_hash(&key, &file) {
+                    sweep
+                        .requested_content
+                        .insert((file.clone(), key.clone()), hash);
+                }
                 sweep.requested_reports.insert((file, key), Ok(diagnostics));
             }
         }

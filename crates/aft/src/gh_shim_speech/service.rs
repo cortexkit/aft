@@ -582,11 +582,20 @@ impl LaunchContext {
         };
         let result = handle.block_on(async {
             tokio::time::timeout(
-                Duration::from_secs(1).saturating_sub(started.elapsed()),
+                Duration::from_secs(6).saturating_sub(started.elapsed()),
                 async {
-                    let reply = self
-                        .service
-                        .read_bindings(&self.seed.project_root, &self.seed.session, agent)
+                    let mut retry = crate::gh_shim_relay::PreSendRetry::new(
+                        tokio::time::Instant::now()
+                            + Duration::from_secs(6).saturating_sub(started.elapsed()),
+                    );
+                    let reply = retry
+                        .run(|| {
+                            self.service.read_bindings(
+                                &self.seed.project_root,
+                                &self.seed.session,
+                                agent,
+                            )
+                        })
                         .await?;
                     parse_bindings(&desired, &facade_reply(&reply), agent)
                 },
@@ -885,7 +894,11 @@ impl Service {
         )
         .await
         .map_err(|_| binding_unverifiable("binding_read_timeout"))?
-        .map_err(|error| binding_unverifiable(format!("binding_read_transport: {error:?}")))
+        .map_err(|error| {
+            let mut refusal = binding_unverifiable(format!("binding_read_transport: {error:?}"));
+            refusal.retry_before_send = error.unreachable_before_send();
+            refusal
+        })
     }
     pub(crate) async fn reserve(
         &self,

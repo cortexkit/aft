@@ -202,17 +202,31 @@ fn real_probe_timeout_is_counted_and_once_only() {
 #[test]
 fn real_probe_error_is_counted_and_does_not_create_database() {
     let dir = tempfile::tempdir().unwrap();
-    let before = METRICS.probe_error.load(Ordering::Relaxed);
-    let job = HintJob::new(
-        "sqlite3 absent.db 'SELECT missing'",
-        dir.path(),
-        &HashMap::new(),
-        &SpawnPlan::Unsandboxed,
-        true,
-    );
-    assert!(job.finish("no such column: missing", Some(1)).is_none());
-    assert!(!dir.path().join("absent.db").exists());
-    assert!(METRICS.probe_error.load(Ordering::Relaxed) > before);
+    // The probe has a fixed 1.5 s budget. On a loaded CI runner starting the
+    // real sqlite3 can take longer, and that attempt counts as a timeout, not
+    // an error. A timeout proves nothing here, so try again with a fresh job;
+    // only an attempt that finishes in time decides the test.
+    for _ in 0..5 {
+        let errors = METRICS.probe_error.load(Ordering::Relaxed);
+        let timeouts = METRICS.probe_timeout.load(Ordering::Relaxed);
+        let job = HintJob::new(
+            "sqlite3 absent.db 'SELECT missing'",
+            dir.path(),
+            &HashMap::new(),
+            &SpawnPlan::Unsandboxed,
+            true,
+        );
+        assert!(job.finish("no such column: missing", Some(1)).is_none());
+        assert!(!dir.path().join("absent.db").exists());
+        if METRICS.probe_error.load(Ordering::Relaxed) > errors {
+            return;
+        }
+        assert!(
+            METRICS.probe_timeout.load(Ordering::Relaxed) > timeouts,
+            "the probe neither errored nor timed out"
+        );
+    }
+    panic!("the sqlite3 probe timed out on all 5 attempts, so its error path never ran");
 }
 
 #[test]

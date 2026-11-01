@@ -119,6 +119,37 @@ fn trigram_project_walk_skips_nested_worktrees() {
     );
 }
 
+/// A `.git` file is a linked worktree's or submodule's pointer to Git data,
+/// never project content. It used to be walked as a source file, so a linked
+/// worktree's views manifest had an entry its base lacked.
+#[test]
+fn project_walk_skips_git_pointer_files() {
+    let (_dir, fixture) = fixture();
+    for root in [&fixture.root, &fixture.worktree] {
+        let walked = relative_set(
+            root,
+            crate::search_index::project_walk_builder(root)
+                .build()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.depth() > 0)
+                .map(|entry| entry.into_path()),
+        );
+        assert!(
+            !walked
+                .iter()
+                .any(|path| path == ".git" || path.ends_with("/.git")),
+            "a .git entry was walked under {}: {walked:?}",
+            root.display()
+        );
+    }
+    assert!(
+        std::fs::metadata(fixture.worktree.join(".git"))
+            .unwrap()
+            .is_file(),
+        "the linked worktree's .git must be a file for this test to mean anything"
+    );
+}
+
 #[test]
 fn callgraph_walk_skips_nested_worktrees() {
     let (_dir, fixture) = fixture();
