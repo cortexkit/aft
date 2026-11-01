@@ -117,11 +117,15 @@ fn write_env_config(path: &Path, value: &str) {
 }
 
 fn bash_env(aft: &mut AftProcess) -> Value {
+    #[cfg(windows)]
+    let command = "Write-Host -NoNewline $env:SYMLINK_CONFIG_MARK";
+    #[cfg(not(windows))]
+    let command = "printf '%s' \"$SYMLINK_CONFIG_MARK\"";
     aft.send(
         &json!({
             "id": "live-reload-env",
             "command": "bash",
-            "params": { "command": "printf '%s' \"$SYMLINK_CONFIG_MARK\"" }
+            "params": { "command": command, "foreground_orchestrate": true, "wait": true }
         })
         .to_string(),
     )
@@ -132,7 +136,11 @@ fn wait_for_bash_env(aft: &mut AftProcess, expected: &str) {
     let mut last = Value::Null;
     while Instant::now() < deadline {
         last = bash_env(aft);
-        if last["success"] == true && last.to_string().contains(expected) {
+        if last["success"] == true
+            && last["output"]
+                .as_str()
+                .is_some_and(|output| output.contains(expected))
+        {
             return;
         }
         thread::sleep(Duration::from_millis(100));
@@ -177,8 +185,9 @@ fn symlinked_user_config_target_edits_apply_live() {
 
     fs::remove_file(&target).unwrap();
     thread::sleep(Duration::from_millis(700));
-    assert!(bash_env(&mut aft)
-        .to_string()
+    assert!(bash_env(&mut aft)["output"]
+        .as_str()
+        .unwrap()
         .contains("symlink-after-atomic"));
     write_env_config(&target, "symlink-recovered");
     wait_for_bash_env(&mut aft, "symlink-recovered");
@@ -215,6 +224,15 @@ fn symlinked_project_config_directory_target_edits_apply_live() {
     // AftProcess gives each child its own throwaway HOME and XDG directories.
     let mut aft = AftProcess::spawn_with_real_watcher();
     configure(&mut aft, &root, &user_config);
+    let trust = aft.send(
+        &json!({
+            "id": "trust-config-project",
+            "command": "trust_filter_project",
+            "params": { "project_root": root }
+        })
+        .to_string(),
+    );
+    assert_eq!(trust["success"], true, "trust failed: {trust:?}");
     wait_for_bash_env(&mut aft, "project-symlink-initial");
     write_env_config(&target, "project-symlink-edited");
     wait_for_bash_env(&mut aft, "project-symlink-edited");
