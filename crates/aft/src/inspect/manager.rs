@@ -978,6 +978,7 @@ fn deferred_view_key(root: &Path) -> PathBuf {
 }
 
 pub struct InspectManager {
+    file_progress: Arc<HashMap<InspectCategory, crate::run_tool_call::progress::FileProgress>>,
     deferred_view_refreshes: Mutex<HashMap<PathBuf, DeferredViewRefresh>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     dispatcher: InspectDispatcher,
@@ -1124,7 +1125,22 @@ impl InspectManager {
         let worker_caches = Arc::clone(&caches);
         let worker_writer_waits = Arc::clone(&cache_writer_waits);
         let worker_open_gates = Arc::clone(&cache_open_gates);
+        let file_progress: Arc<HashMap<_, _>> = Arc::new(
+            InspectCategory::active()
+                .iter()
+                .map(|category| {
+                    (
+                        *category,
+                        crate::run_tool_call::progress::FileProgress::default(),
+                    )
+                })
+                .collect(),
+        );
+        let worker_file_progress = file_progress.clone();
         let guarded_worker: InspectWorker = Arc::new(move |job| {
+            let _files = worker_file_progress
+                .get(&job.category)
+                .map(|progress| progress.enter());
             #[cfg(test)]
             if job.category == InspectCategory::Metrics {
                 let control = metrics_worker_control.lock().unwrap().clone();
@@ -1162,6 +1178,7 @@ impl InspectManager {
         });
         let dispatcher = InspectDispatcher::new(guarded_worker);
         Self {
+            file_progress,
             deferred_view_refreshes: Mutex::new(HashMap::new()),
             root_work_cancellation,
             result_rx: dispatcher.result_rx.clone(),
@@ -1668,12 +1685,19 @@ impl InspectManager {
         }
     }
 
-    pub(crate) fn work_progress(&self, category: InspectCategory) -> Option<String> {
+    pub(crate) fn work_progress(&self, category: InspectCategory) -> Option<(String, u64)> {
         self.builder_states
             .try_lock()
             .ok()?
             .get(&JobKey::for_project_category(category))
-            .map(|entry| entry.progress.clone())
+            .map(|entry| {
+                (
+                    entry.progress.clone(),
+                    self.file_progress
+                        .get(&category)
+                        .map_or(0, |progress| progress.completed()),
+                )
+            })
     }
 
     /// Keep unfinished analysis separate from current findings. Cached rows are
@@ -3244,9 +3268,25 @@ impl InspectManager {
             .oxc_facts_cache
             .lock()
             .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
+        let _files = self
+            .file_progress
+            .get(&job.category)
+            .map(|progress| progress.enter());
         analyze_files_with_cache(&job.project_root, files, options, &mut cache)
             .map(Some)
             .map_err(|message| format!("oxc analyze failed: {message}"))
+    }
+
+    fn scan_with_file_progress(
+        &self,
+        job: &InspectJob,
+        oxc: Option<&OxcEngineResult>,
+    ) -> InspectResult {
+        let _files = self
+            .file_progress
+            .get(&job.category)
+            .map(|progress| progress.enter());
+        run_tier2_scan(job, oxc)
     }
 
     pub fn tier2_run_with_reuse(
@@ -3345,7 +3385,7 @@ impl InspectManager {
             Ok(oxc) => oxc,
             Err(message) => return JobOutcome::Failed { message },
         };
-        let result = run_tier2_scan(&job, oxc.as_ref());
+        let result = self.scan_with_file_progress(&job, oxc.as_ref());
         // A view projection needs no inspect writer either. Persisting with the
         // temporary no-legacy-fallback config would also poison cache identity.
         let outcome = match result.outcome {
@@ -4016,7 +4056,8 @@ impl InspectManager {
         fill_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
         fill_job.scope_files = missing.clone();
         let oxc_result = self.oxc_result_for_scan(&fill_job, &fill_job.scope_files, &missing)?;
-        let filled = run_tier2_scan(&fill_job, oxc_result.as_ref())
+        let filled = self
+            .scan_with_file_progress(&fill_job, oxc_result.as_ref())
             .outcome
             .map_err(|message| {
                 format!("dead_code scan of files without facts failed: {message}")
@@ -4291,7 +4332,7 @@ impl InspectManager {
             );
             let oxc_result =
                 self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
-            let scan_result = run_tier2_scan(&scan_job, oxc_result.as_ref());
+            let scan_result = self.scan_with_file_progress(&scan_job, oxc_result.as_ref());
             phases.scan += scan_started.elapsed();
             phases.scanned_files += scan_files.len();
             let scan_success = scan_result.outcome.map_err(|message| {
@@ -4421,7 +4462,7 @@ impl InspectManager {
                     &rescan_job.scope_files,
                     &force_reparse_files,
                 )?;
-                let scan_result = run_tier2_scan(&rescan_job, oxc_result.as_ref());
+                let scan_result = self.scan_with_file_progress(&rescan_job, oxc_result.as_ref());
                 phases.scan += scan_started.elapsed();
                 phases.scanned_files += full_scan_files.len();
                 let scan_success = scan_result.outcome.map_err(|message| {

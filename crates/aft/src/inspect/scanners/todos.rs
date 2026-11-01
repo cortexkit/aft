@@ -65,6 +65,7 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
         );
     }
     memo.reserve_for_scan(job.scope_files.len());
+    let progress = crate::run_tool_call::progress::FileProgress::current();
     let per_file: Vec<FileScan> = job
         .scope_files
         .par_iter()
@@ -79,6 +80,11 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
             // TODO paths root-independent in the file memo; aggregation below
             // formats them relative to the root making this request.
             Some(memo.get_or_insert_with(path, |path| scan_file(path, Path::new(""))))
+        })
+        .inspect(|_| {
+            if let Some(progress) = &progress {
+                progress.finished();
+            }
         })
         .collect();
     if cancelled() {

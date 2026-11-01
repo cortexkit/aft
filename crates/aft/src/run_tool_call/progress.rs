@@ -1,6 +1,7 @@
 //! A call-scoped, non-blocking progress channel. Only completed work reports here;
 //! waiting and cancellation probes are deliberately not progress.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,47 @@ impl Progress {
 pub(crate) fn report() {
     if let Some(token) = crate::executor::current_job_cancellation() {
         token.report_progress();
+    }
+}
+
+thread_local! {
+    static FILES: std::cell::RefCell<Option<FileProgress>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Shared scanners outlive individual requests. Count their completed files so
+/// only requests waiting for that scanner can turn the counts into keepalive frames.
+#[derive(Clone, Default)]
+pub(crate) struct FileProgress(Arc<AtomicU64>);
+
+impl FileProgress {
+    pub(crate) fn current() -> Option<Self> {
+        FILES.with(|files| files.borrow().clone())
+    }
+
+    pub(crate) fn enter(&self) -> FileProgressGuard {
+        FileProgressGuard {
+            previous: FILES.with(|files| files.replace(Some(self.clone()))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn finished(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn completed(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) struct FileProgressGuard {
+    previous: Option<FileProgress>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for FileProgressGuard {
+    fn drop(&mut self) {
+        FILES.with(|files| files.replace(self.previous.take()));
     }
 }
 

@@ -581,6 +581,7 @@ fn run_dead_code_scan_body(
 
     let cancellation = crate::executor::current_job_cancellation();
     let canonical_paths = current_canonical_paths();
+    let progress = crate::run_tool_call::progress::FileProgress::current();
     let contributions = job
         .scope_files
         .par_iter()
@@ -603,6 +604,11 @@ fn run_dead_code_scan_body(
                     &mut file_analyzer,
                 )
             }))
+        })
+        .inspect(|_| {
+            if let Some(progress) = &progress {
+                progress.finished();
+            }
         })
         .collect::<Vec<_>>();
     if crate::executor::current_job_cancelled() {
