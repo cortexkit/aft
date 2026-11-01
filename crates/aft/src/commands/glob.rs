@@ -325,9 +325,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
     let confined = crate::context::confinement::active();
-    let safe_confined_total = all_candidates_checked
-        && !presence_budget_exhausted
-        && crate::context::confinement::denied_count() == 0;
+    let safe_confined_total = all_candidates_checked && !presence_budget_exhausted;
     let walk_truncated = walk_truncated || (confined && !safe_confined_total);
 
     let mut body = serde_json::json!({
