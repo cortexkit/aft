@@ -56,7 +56,7 @@ jobs:
       - name: Loader state and compile tests
         run: cargo test --locked -p agent-file-tools --lib -- grammar::tests::
       - name: Process restart and concurrent publication
-        run: cargo test --locked -p agent-file-tools --test integration -- grammar_loader
+        run: cargo test --locked -p agent-file-tools --test integration -- grammar_
       - name: No native disk cache and one Wasmtime version
         run: |
           cargo tree --locked -p agent-file-tools -e features > grammar-features.txt
@@ -67,7 +67,7 @@ jobs:
           features = Path('grammar-features.txt').read_text()
           assert 'wasmtime feature "cache"' not in features
           dependencies = Path('grammar-dependencies.txt').read_text()
-          assert set(re.findall(r'^wasmtime v([^ ]+)', dependencies, re.M)) == {'36.0.6'}
+          assert set(re.findall(r'^wasmtime v(\S+)', dependencies, re.M)) == {'36.0.6'}
           print('Wasmtime 36.0.6 only; cache feature absent')
           PY
 

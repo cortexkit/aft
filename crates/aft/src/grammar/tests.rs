@@ -114,7 +114,7 @@ fn grammar_state_messages_are_pinned() {
 
 #[test]
 fn grammar_unavailable_fields_and_wire_code() {
-    let (_, registry, clock, _) = setup([]);
+    let (_directory, registry, clock, _) = setup([]);
     let mut entry = registry.entry.lock();
     for state in [
         GrammarState::NotDownloaded,
@@ -264,7 +264,7 @@ fn grammar_stored_first_single_compile_rayon_and_lifetime() {
 #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 #[test]
 fn grammar_backoff_shared_failures_and_no_sixth_attempt() {
-    let (_, registry, clock, transport) =
+    let (_directory, registry, clock, transport) =
         setup([Hop::Error, success(), Hop::Error, success(), Hop::Error]);
     for attempt in 1..=5 {
         if attempt % 2 == 0 {
@@ -362,7 +362,7 @@ fn grammar_download_redirect_status_and_verification_table() {
             assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
         }
     }
-    let (_, registry, _, transport) = setup([
+    let (_directory, registry, _, transport) = setup([
         Hop::Response(302, Some("https://second.example/grammar".into()), vec![]),
         success(),
     ]);
@@ -619,4 +619,64 @@ fn grammar_deadline_and_partial_transport_errors_are_network_failures() {
         download::fetch(&PRODUCTION_MANIFEST, &PartialTransport).unwrap_err(),
         DownloadFailure::Network
     );
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[test]
+fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let durable = directory.path().join("durable");
+    let cache = directory.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let mut config = crate::config::Config {
+        storage_dir: Some(durable.clone()),
+        cache_dir: Some(cache.clone()),
+        ..Default::default()
+    };
+    assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+    let names = || {
+        let mut names = std::fs::read_dir(&durable)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = names();
+    let registry = GrammarRegistry::with_test_options(TestOptions {
+        manifest: PRODUCTION_MANIFEST.clone(),
+        storage_root: crate::root_cache::cache_root(&config),
+        clock: Arc::new(FakeClock::default()),
+        transport: Script::new([success()]),
+        queries: vec!["(chunk) @root".into()],
+        fault: StorageFault::None,
+    });
+    registry.request().unwrap_err();
+    settled(&registry);
+    registry.stored().unwrap();
+    assert!(stored_path(&cache.join("aft"), &PRODUCTION_MANIFEST).is_file());
+    assert!(!durable.join("grammars").exists());
+    assert_eq!(names(), before);
+    assert!(crate::root_cache::CACHE_DOMAINS.contains(&"grammars"));
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+#[test]
+fn grammar_storage_exhaustion_reports_last_storage_cause() {
+    let (_directory, registry, clock, transport) = setup((0..5).map(|_| success()));
+    registry.set_storage_fault(StorageFault::Publish);
+    for attempt in 0..5 {
+        assert_eq!(
+            registry.request().unwrap_err().state,
+            GrammarState::Downloading
+        );
+        settled(&registry);
+        clock.advance(30_000 << attempt);
+    }
+    let error = registry.request().unwrap_err();
+    assert_eq!(error.state, GrammarState::AttemptsExhausted);
+    assert_eq!(error.cause, Some(FailureCause::Storage));
+    assert_eq!(error.retry_after_ms, None);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 5);
+    assert_eq!(registry.compile_count(), 0);
 }

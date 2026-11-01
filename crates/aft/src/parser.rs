@@ -2340,18 +2340,6 @@ impl FileParser {
         &mut self,
         path: &Path,
     ) -> Result<(Arc<Vec<Symbol>>, bool, bool), AftError> {
-        // A shared symbol cache cannot opt a built-in-only context into a
-        // dynamic language after another context has populated that cache.
-        if !self.dynamic_languages && language_for_extension(path).is_none() {
-            return Err(AftError::InvalidRequest {
-                message: format!(
-                    "unsupported file extension: {}",
-                    path.extension()
-                        .and_then(|ext| ext.to_str())
-                        .unwrap_or("<none>")
-                ),
-            });
-        }
         // Bound contention retries without growing the stack. The last attempt
         // bypasses the symbol-cache snapshot and parses one coherent source read.
         for attempt in 0..=3 {
@@ -2361,6 +2349,18 @@ impl FileParser {
                 .map_err(|e| AftError::FileNotFound {
                     path: format!("{}: {}", path.display(), e),
                 })?;
+            // A shared symbol cache cannot opt a built-in-only context into a
+            // dynamic language after another context has populated that cache.
+            if !self.dynamic_languages && language_for_extension(path).is_none() {
+                return Err(AftError::InvalidRequest {
+                    message: format!(
+                        "unsupported file extension: {}",
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("<none>")
+                    ),
+                });
+            }
 
             // Snapshot the entry before checking the file: hashing a touched file must
             // not block cache writers. Refresh metadata only if the entry is unchanged.
@@ -9560,6 +9560,10 @@ mod tests {
     #[test]
     fn grammar_builtin_only_parser_rejects_dynamic_shared_cache_hits() {
         let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            FileParser::new().extract_symbols_shared(&directory.path().join("missing.luau")),
+            Err(AftError::FileNotFound { .. })
+        ));
         let path = directory.path().join("cached.luau");
         let source = "local function f() end";
         std::fs::write(&path, source).unwrap();
