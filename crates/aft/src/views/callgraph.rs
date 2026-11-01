@@ -1492,6 +1492,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn callgraph_copies_idle_checkout_keeps_borrowed_main_and_shared_base() {
+        use std::time::{Duration, Instant};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let worker = temp.path().join("worker");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worker.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worker = std::fs::canonicalize(worker).unwrap();
+        let paths = crate::root_cache::StoragePaths::same(&storage);
+        let family = "donor-reuse";
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let main_view = view(&main, &storage);
+        let expected = callers(&main_view.reader().unwrap(), "a.ts", "target");
+        assert!(!expected.is_empty());
+        let worker_view = view(&worker, &storage);
+        worker_view.reader().unwrap();
+        let scope = view_scope(&main);
+        let (borrowed, _) = super::super::callgraph_copies::open_published(
+            &storage, family, policy, &scope, &worker,
+        )
+        .unwrap();
+        let used = crate::pins::now_ms();
+        crate::storage_retention::touch_view_checkout(&paths, family, &main, 1, used).unwrap();
+        drop(main_view);
+        let due = used + 3_600_000;
+        let sweep =
+            || crate::storage_retention::sweep_checkout_views_at_for_test(&paths, family, due);
+        let kept = sweep();
+        assert_eq!(kept.removed_roots, 0, "{kept:?}");
+        assert_eq!(callers(&borrowed, "a.ts", "target"), expected);
+        let main_dir = crate::blob_store::v3::view_dir(&storage, family, &scope).unwrap();
+        assert!(main_dir.exists());
+        drop(borrowed);
+        // Resident-reader teardown writes its session end asynchronously. The
+        // clock stays fixed while the sweep waits for that actual hold to go.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while main_dir.exists() {
+            let report = sweep();
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert!(
+                Instant::now() < deadline,
+                "main checkout stayed held: {report:?}"
+            );
+            std::thread::yield_now();
+        }
+        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
+        let bases: Vec<String> = ledger
+            .read(|connection| {
+                Ok(connection
+                    .prepare("SELECT scope FROM members WHERE kind='base'")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert!(
+            !bases.is_empty(),
+            "the worker's shared commit base must survive"
+        );
+        assert_eq!(
+            callers(&worker_view.reader().unwrap(), "a.ts", "target"),
+            expected
+        );
+        let rebuilt = view(&main, &storage);
+        assert_eq!(
+            callers(&rebuilt.reader().unwrap(), "a.ts", "target"),
+            expected
+        );
+    }
+
     /// `views.callgraph_copies`: a worktree past the limit borrows the main
     /// checkout's graph while every copy is in use, and takes the place of a
     /// copy once that copy's checkout lets go of it. A limit of 0 always

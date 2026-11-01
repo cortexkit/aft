@@ -1673,7 +1673,7 @@ fn checkpoint(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn encode_root(root: &Path) -> Option<Vec<u8>> {
+pub(crate) fn encode_root(root: &Path) -> Option<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
