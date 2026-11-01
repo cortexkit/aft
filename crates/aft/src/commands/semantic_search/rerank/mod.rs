@@ -569,6 +569,7 @@ fn short_reason(reason: &str) -> String {
 /// are always kept whole. The result depends only on the project root, the
 /// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
+    let _cost = super::telemetry::CostPhase::start("candidate_text");
     let bytes = std::fs::read(&result.path).unwrap_or_default();
     let (raw_line, selected) = if let Some(range) = result.symbol_range {
         let start = floor_raw_boundary(&bytes, range.start.min(bytes.len()));

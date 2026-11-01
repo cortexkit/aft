@@ -5,6 +5,9 @@ MiniLM vectors, not inference timings. The optional identity-score HTTP reranker
 exercises candidate-text preparation, not cross-encoder inference. Neither
 fixture assesses search quality; run run_search_quality.py --mode evaluate
 separately to compare the real-query rows with their checked-in reference.
+Automatic code analysis is disabled so its changing status footer cannot alter
+captured search replies. Set AFT_TEST_DISABLE_FILE_WATCHER=1 when the corpus is
+frozen and full replies must not race with watcher maintenance.
 """
 from __future__ import annotations
 
@@ -128,6 +131,54 @@ def arguments(row):
     return result
 
 
+def watcher_pending(response):
+    body = response.get("structuredContent", response)
+    return any(gap.get("kind") == "watcher_pending" for gap in body.get("gaps", []))
+
+
+def settle_replies(broker, records, selected, concurrency, root):
+    """Capture warm replies after indexed file-change maintenance has caught up.
+
+    Replay every request after CPU measurement so embedding-cache counters are
+    comparable, then retry pending-file-change notices or remaining cache misses.
+    Keep every original reply and its latency; no response field is removed.
+    """
+    pending = {}
+    for record in records:
+        record["settled_full_response"] = record["full_response"]
+        pending[record["id"]] = record
+    attempts = 0
+    deadline = time.monotonic() + 30
+    while pending:
+        batch = list(pending.values())[:concurrency]
+        requests = []
+        for record in batch:
+            repeat, number = map(int, record["id"].split(":"))
+            requests.append({"id": record["id"], "channel": number % concurrency + 1,
+                             "corr": 1_000_000 + repeat * len(selected) + number,
+                             "name": "search", "arguments": selected[number]})
+        broker.send("batch", requests=requests)
+        for _ in batch:
+            reply = broker.read()
+            response = reply["response"]
+            body = response.get("structuredContent", response)
+            if response.get("isError") or body.get("success") is False:
+                raise RuntimeError(response)
+            captured = json.loads(json.dumps(response).replace(str(root), "<root>"))
+            record = pending[reply["id"]]
+            record.setdefault("settlement_attempts", []).append(captured)
+            record["settled_full_response"] = captured
+            attempts += 1
+            plan = body.get("structuredContent", body).get("plan", {})
+            if not watcher_pending(captured) and plan.get("embedding_calls", 0) == 0:
+                del pending[reply["id"]]
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"watcher reply settlement: {list(pending)}")
+        if pending:
+            time.sleep(.01)
+    return attempts
+
+
 def run(args):
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -138,22 +189,36 @@ def run(args):
     selected = []
     seen = set()
     for row in manifest["rows"]:
-        if row.get("excluded_reason") or len(row["query"].split()) < 4:
+        if row.get("excluded_reason") or (not args.all_queries and len(row["query"].split()) < 4):
             continue
         request = arguments(row)
         identity = json.dumps(request, sort_keys=True)
         if identity not in seen:
             selected.append(request)
             seen.add(identity)
+    if args.all_queries:
+        for row in manifest["rows"]:
+            if row.get("excluded_reason"):
+                continue
+            request = {"query": row["query"], "includeTests": row["include_tests"], "topK": 10}
+            if row.get("pattern", "").strip():
+                request["pattern"] = row["pattern"]
+            identity = json.dumps(request, sort_keys=True)
+            if identity not in seen:
+                selected.append(request)
+                seen.add(identity)
     selected = selected[:args.queries]
     assert len(selected) >= args.concurrency, len(selected)
     records = []
     cpu_by_repeat = []
-    with runtime_evidence_tree(tree) as root, \
+    # Scratch lives inside the checkout: give the copy its own Git root at the
+    # evidence commit rather than inheriting the build checkout's identity.
+    with runtime_evidence_tree(tree, views_enabled=True) as root, \
             vector_server(pack["vectors"], str(pack["embed_template_version"]), output / "vectors.log") as vectors, \
             rerank_server() as reranker:
         config = {
             "views": {"enabled": False},
+            "inspect": {"enabled": False},
             "indexes": {"trigram": True, "semantic": True, "callgraph": False},
             "lsp": {"auto_install": False},
             "semantic": {"backend": "openai_compatible", "model": FIXTURE_PROVIDER_MODEL,
@@ -177,7 +242,8 @@ def run(args):
         try:
             for channel in range(1, args.concurrency + 1):
                 broker.call("bind", channel=channel, root=str(root))
-            deadline = time.monotonic() + 1800
+            deadline = time.monotonic() + args.ready_timeout
+            previous = None
             while True:
                 ready = []
                 for channel in range(1, args.concurrency + 1):
@@ -185,6 +251,13 @@ def run(args):
                     if status.get("isError"):
                         raise RuntimeError(status)
                     status = status.get("structuredContent", status)
+                    if status.get("success") is False:
+                        raise RuntimeError(status)
+                    state = {name: status.get(name) for name in ("semantic_index", "search_index")}
+                    if state != previous:
+                        print("index_readiness:" + json.dumps(state), flush=True)
+                        (output / "readiness.json").write_text(json.dumps(status, indent=2))
+                        previous = state
                     if status.get("semantic_index", {}).get("status") == "failed":
                         raise RuntimeError(status)
                     ready.append(status.get("semantic_index", {}).get("status") == "ready"
@@ -194,12 +267,16 @@ def run(args):
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"index readiness: {status}")
                 time.sleep(.2)
+            watcher_disabled = os.environ.get("AFT_TEST_DISABLE_FILE_WATCHER") == "1"
+            if watcher_disabled:
+                assert status["runtime"]["live_watchers"] == 0, status["runtime"]
             cpu_start = cpu_seconds(broker.pid)
             for repeat in range(args.repeats):
                 repeat_cpu = cpu_seconds(broker.pid)
                 for offset in range(0, len(selected), args.concurrency):
                     batch = selected[offset:offset + args.concurrency]
                     broker.send("batch", requests=[{"id": f"{repeat}:{offset+i}", "channel": i + 1,
+                                                    "corr": 1_000_000 + repeat * len(selected) + offset + i,
                                                     "name": "search", "arguments": request}
                                                    for i, request in enumerate(batch)])
                     for _ in batch:
@@ -210,23 +287,28 @@ def run(args):
                         body = response.get("structuredContent", response)
                         if body.get("semantic_status") != "ready":
                             raise RuntimeError(f"semantic lane not served: {body}")
-                        # Preserve rows and text for a direct before/after check;
-                        # only the temporary corpus prefix differs between arms.
+                        # Keep all public fields for comparison; the comparator
+                        # also normalizes the independent process nonce.
                         record["response"] = json.loads(json.dumps(body).replace(str(root), "<root>"))
+                        record["full_response"] = json.loads(json.dumps(response).replace(str(root), "<root>"))
                         record["repeat"] = repeat
                         records.append(record)
                 cpu_by_repeat.append((cpu_seconds(broker.pid) - repeat_cpu) / len(selected))
             cpu = cpu_seconds(broker.pid) - cpu_start
+            measured_log_bytes = (output / "daemon.log").stat().st_size
+            settled_replays = (settle_replies(broker, records, selected, args.concurrency, root)
+                               if args.settle_replies else 0)
         finally:
             broker.close()
         if vectors.refused:
             raise RuntimeError(f"unknown embedding texts: {vectors.refused}")
     traces = []
-    for line in (output / "daemon.log").read_text().splitlines():
+    for line in (output / "daemon.log").read_bytes()[:measured_log_bytes].decode().splitlines():
         if line.startswith("AFT_SEARCH_COST "):
             traces.append(json.loads(line.removeprefix("AFT_SEARCH_COST ")))
     assert len(traces) == len(records), (len(traces), len(records))
     phases = defaultdict(list)
+    cpu_phases = defaultdict(list)
     per_repeat = [defaultdict(list) for _ in range(args.repeats)]
     for index, trace in enumerate(traces):
         totals = defaultdict(float)
@@ -235,12 +317,21 @@ def run(args):
         for name in ["embedding", "ann", "lexical", "exact_and_path", "fusion", "rerank", "snippet", "matching_line"]:
             phases[name].append(totals[name])
             per_repeat[index // len(selected)][name].append(totals[name])
+        cpu_totals = defaultdict(float)
+        for name, elapsed in trace["cpu_phases"]:
+            cpu_totals[name] += elapsed
+        for name, elapsed in cpu_totals.items():
+            cpu_phases[name].append(elapsed)
     result = {"concurrency": args.concurrency, "queries": selected, "rerank_fixture": args.rerank,
+              "watcher_disabled": watcher_disabled,
+              "settle_replies": args.settle_replies, "settled_replays": settled_replays,
               "ready_index": {name: status.get(name) for name in ("semantic_index", "search_index")},
               "cpu_seconds_per_query": cpu / len(records), "requests": len(records),
               "cpu_seconds_per_query_by_repeat": cpu_by_repeat,
               "latency_ms": distribution([row["latency_ms"] for row in records]),
               "phase_ms": {name: distribution(values) for name, values in phases.items()},
+              "cpu_phase_ms": {name: {**distribution(values), "total": sum(values)}
+                                for name, values in cpu_phases.items()},
               "phase_ms_by_repeat": [{name: distribution(values) for name, values in repeat.items()}
                                      for repeat in per_repeat],
               "exec_ms": distribution([row["total_ms"] for row in traces]),
@@ -254,8 +345,11 @@ if __name__ == "__main__":
     parser.add_argument("--binary", required=True)
     parser.add_argument("--broker", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--concurrency", type=int, choices=range(8, 17), default=8)
+    parser.add_argument("--concurrency", type=int, choices=[1, *range(8, 17)], default=8)
     parser.add_argument("--queries", type=int, default=24)
+    parser.add_argument("--all-queries", action="store_true", help="Include short queries and the original recorded requests too.")
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--ready-timeout", type=float, default=1800)
+    parser.add_argument("--settle-replies", action="store_true", help="Capture quiescent read-only replies after the timed workload.")
     parser.add_argument("--rerank", action="store_true")
     run(parser.parse_args())
