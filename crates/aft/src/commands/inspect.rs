@@ -38,6 +38,9 @@ const MAX_INSPECT_HEADER_PARTS: usize = 3;
 // producer leaves room for other categories and final freshness verification.
 // The cap avoids turning large configured budgets into equally long waits.
 const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
+// Scoped diagnostics are an interactive observation, not a workspace build.
+// Leave transport headroom even when the configured full-project budget is long.
+const SCOPED_INSPECT_REQUEST_CAP: Duration = Duration::from_secs(30);
 /// Reserve time inside the configured request budget for terminal assembly and
 /// egress. The server always answers before the client gives up: server work
 /// stops before `diagnostics_timeout_ms`, while the client waits for that budget
@@ -57,8 +60,16 @@ struct InspectRequestDeadline {
 }
 
 impl InspectRequestDeadline {
-    fn from_config(config: &crate::config::Config) -> Self {
-        Self::new(inspect_request_timeout(config), INSPECT_TERMINAL_MARGIN)
+    fn for_request(req: &RawRequest, config: &crate::config::Config) -> Self {
+        let budget = inspect_request_timeout(config);
+        Self::new(
+            if scope_was_provided(req.params.get("scope")) {
+                budget.min(SCOPED_INSPECT_REQUEST_CAP)
+            } else {
+                budget
+            },
+            INSPECT_TERMINAL_MARGIN,
+        )
     }
 
     fn new(budget: Duration, terminal_margin: Duration) -> Self {
@@ -545,7 +556,17 @@ fn resolve_inspect_applicability(
         config,
         Some(deadline),
     )?;
-    let mut lsp = ctx.lsp();
+    let mut lsp = loop {
+        if inspect_cancellation_requested() || Instant::now() >= deadline {
+            return Err(ApplicabilityResolutionError::RequestDeadline {
+                root: project_root.to_path_buf(),
+            });
+        }
+        if let Some(lsp) = ctx.try_lsp() {
+            break lsp;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let snapshot = lsp.classify_applicable_servers(walk, config);
     if scoped_roots.is_none() {
         lsp.store_project_applicability(snapshot.clone());
@@ -585,7 +606,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
         ctx.disable_rust_cargo_for_worker();
     }
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
-    let deadline = InspectRequestDeadline::from_config(&ctx.config());
+    let deadline = InspectRequestDeadline::for_request(req, &ctx.config());
     let snapshot = match inspect_preflight(req, ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
@@ -639,6 +660,9 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
             phase_log,
             deadline,
         ),
+        Err(_) if inspect_cancellation_requested() => {
+            build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted)
+        }
         Err(error) => build_inspect_terminal(
             &req.id,
             &phase_log,
@@ -1409,7 +1433,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
-    let mut deadline = InspectRequestDeadline::from_config(&ctx.config());
+    let mut deadline = InspectRequestDeadline::for_request(req, &ctx.config());
     if let Some(reply_deadline) = reply_deadline {
         deadline.terminal_at = deadline.terminal_at.min(reply_deadline);
         deadline.budget = deadline
@@ -1450,35 +1474,6 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
     let reports_diagnostics = scoped_roots.is_none() || diagnostics_selected(req);
-    let applicability = if !reports_diagnostics {
-        Ok(ApplicableServerSnapshot::default())
-    } else {
-        resolve_inspect_applicability(
-            &ctx,
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
-    let applicability = match applicability {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return deferred_response(
-                request_id,
-                build_inspect_terminal(
-                    &req.id,
-                    &phase_log,
-                    InspectTerminal::PhaseFailed {
-                        failed_phase: None,
-                        failure_reason: applicability_failure_reason(&error),
-                        failure_detail: Some(applicability_failure_detail(error)),
-                    },
-                ),
-            );
-        }
-    };
-
     let request = RawRequest {
         id: req.id.clone(),
         command: req.command.clone(),
@@ -1511,6 +1506,36 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
             let _config_pin = ctx.pin_config_to(admitted_config);
             let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
             let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+            // Discovery can wait for the manager or walk a large scope. Run it
+            // outside executor setup so a slow manager cannot prevent another
+            // session from configuring the same project.
+            let applicability = if !reports_diagnostics {
+                Ok(ApplicableServerSnapshot::default())
+            } else {
+                resolve_inspect_applicability(
+                    &ctx,
+                    &snapshot.project_root,
+                    (!scope.roots.is_empty()).then_some(scope.roots.as_slice()),
+                    &snapshot.config,
+                    deadline.work_at(),
+                )
+            };
+            let applicability = match applicability {
+                Ok(applicability) => applicability,
+                Err(error) => {
+                    let terminal = if inspect_cancellation_requested() {
+                        InspectTerminal::Interrupted
+                    } else {
+                        InspectTerminal::PhaseFailed {
+                            failed_phase: None,
+                            failure_reason: applicability_failure_reason(&error),
+                            failure_detail: Some(applicability_failure_detail(error)),
+                        }
+                    };
+                    let _ = tx.send(build_inspect_terminal(&request.id, &phase_log, terminal));
+                    return;
+                }
+            };
             if ctx.checkout_query_runtime_active() {
                 // Resolve call-graph availability before diagnostics can end the
                 // request. Response finalization must report the same outcome
@@ -1820,6 +1845,9 @@ fn run_blocking_inspect_body(
     let reload_scope_roots = parse_scope(req, ctx, &project_root)
         .map(|scope| scope.roots)
         .unwrap_or_default();
+    let scoped_request =
+        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
+    let diagnostics_requested = !scoped_request || diagnostics_selected(req);
     for server in &start_outcomes.successful {
         ctx.lsp_reload_rust_workspace_if_manifests_changed(server, &reload_scope_roots);
     }
@@ -1840,6 +1868,7 @@ fn run_blocking_inspect_body(
     let quiescence = start_outcomes
         .successful
         .iter()
+        .filter(|_| !scoped_request)
         .map(|server| {
             phase_log.start(InspectPhaseEntry::lsp(
                 InspectPhaseId::LspQuiescence,
@@ -1848,26 +1877,27 @@ fn run_blocking_inspect_body(
         })
         .collect::<Vec<_>>();
     // Rust producers whose automatic checks are off are certified only by the
-    // cargo check inspect runs itself. Start it now, bounded by the same
-    // deadline as the wait below, so it runs while the servers settle instead
-    // of in what the wait leaves over; the diagnostics phase, whose deadline
-    // is never earlier, collects the outcome.
+    // cargo check inspect runs itself. Start it before category collection,
+    // so other scans and any root wait do not spend its analysis budget.
+    // The diagnostics phase collects the outcome under the shared deadline.
     let rust_checks = start_inspect_rust_checks(
         ctx,
         &start_outcomes.successful,
         deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
     );
-    // Give producers a bounded chance to settle before reading the warm store.
-    // The wait is root-level: producers publish while events are drained. A
-    // scoped request's per-file work happens later, in the diagnostics
-    // category, with its own share of the budget; that step also waits for
-    // rust-analyzer's `cargo check`, so only an unscoped request waits for
-    // it here.
-    let scoped_request =
-        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
-    let diagnostics_requested = !scoped_request || diagnostics_selected(req);
-    let wait_outcome = if diagnostics_requested {
+    // Unscoped requests must settle the root before reading stored diagnostics.
+    // A scoped sweep opens its files and checks which reports describe their
+    // current content below.
+    // Waiting for workspace-wide publications before didOpen can spend the
+    // entire phase budget on a server which only analyzes opened documents.
+    let wait_outcome = if diagnostics_requested && !scoped_request {
         wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request)
+    } else if diagnostics_requested {
+        Ok((
+            ctx.lsp().drain_events().accepted_snapshots,
+            false,
+            Vec::new(),
+        ))
     } else {
         Ok((Vec::new(), false, Vec::new()))
     };

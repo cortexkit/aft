@@ -260,10 +260,28 @@ pub(crate) fn run_diagnostics_category(
     let mut explicit_checks_completed = HashSet::new();
     let mut explicit_reports = Vec::new();
     for check in rust_checks {
-        let wait = sweep_deadline.map_or(Duration::ZERO, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
-        });
-        match check.outcome.recv_timeout(wait) {
+        let outcome = loop {
+            if crate::executor::current_job_cancelled() {
+                return JobOutcome::Failed {
+                    message: "inspect request cancelled".into(),
+                };
+            }
+            let wait = sweep_deadline.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            match check
+                .outcome
+                .recv_timeout(wait.min(Duration::from_millis(50)))
+            {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if sweep_deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+                {
+                    continue
+                }
+                outcome => break outcome,
+            }
+        };
+        match outcome {
             Ok((Ok(()), _)) => {
                 explicit_checks_completed.insert(check.key);
             }
