@@ -702,6 +702,9 @@ fn file_window_token_found(reply: &Value, tool: &str, relative: &str, token: &st
                     row["snippet"]
                         .as_str()
                         .is_some_and(|snippet| snippet.contains(token))
+                        || row["line_text"]
+                            .as_str()
+                            .is_some_and(|line| line.contains(token))
                 }
         })
     })
