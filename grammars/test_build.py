@@ -74,7 +74,7 @@ class BuildTests(unittest.TestCase):
     def test_parsing_uses_isolated_wasm_cache_with_compilers_disabled(self):
         module = self.work / "module.wasm"
         module.write_bytes(b"exact module bytes")
-        with patch.object(build, "run", return_value="<chunk/>\n") as run:
+        with patch.object(build, "run", return_value='<sources><source name="input.luau"><chunk/></source></sources>') as run:
             build.parse("cli", module, "input.luau", cwd=self.work, env={})
         self.assertEqual(run.call_args.args[0], ["cli", "parse", "--wasm", "--xml", "input.luau"])
         self.assertEqual((self.work / "cache/luau.wasm").read_bytes(), b"exact module bytes")
@@ -100,6 +100,14 @@ class BuildTests(unittest.TestCase):
             with self.subTest(tree=tree), patch.object(build, "run", return_value=tree):
                 with self.assertRaises(ValueError):
                     build.parse("cli", module, "source", cwd=self.work, env={})
+
+    def test_tree_oracle_normalizes_only_checkout_path(self):
+        module = self.work / "module.wasm"
+        module.write_bytes(b"exact module bytes")
+        tree = '<sources><source name="/checkout/input.luau"><chunk srow="0"><identifier>x</identifier></chunk></source></sources>'
+        with patch.object(build, "run", return_value=tree):
+            actual = build.parse("cli", module, "/checkout/input.luau", cwd=self.work, env={})
+        self.assertEqual(actual, '<sources><source name="input.luau"><chunk srow="0"><identifier>x</identifier></chunk></source></sources>\n')
 
     def test_different_trees_fail(self):
         with self.assertRaisesRegex(ValueError, "differs"):

@@ -30,7 +30,9 @@ grammar or extension metadata is read.
 Both builds and the Zed grammar must parse the fixed `corpus/` inputs without
 errors. A, B and Zed must produce identical full XML trees, also equal to the
 checked-in XML oracles (including source positions, token text and anonymous
-nodes). `ifelseexpr.luau` is an unmodified real-project conformance test from
+tokens). Only the source wrapper's absolute checkout path is replaced by the
+file's basename; tree contents are never normalized. `ifelseexpr.luau` is an
+unmodified real-project conformance test from
 `luau-lang/luau` at `535f92589bdc304c8a2012d6cfad5e7b9faff2f7` (tag 0.701).
 `features.luau` adds types, methods, require forms and scanner delimiters. The
 corpus manifest records file hashes and provenance; corpus code is never run.

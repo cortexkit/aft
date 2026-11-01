@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tomllib
 import urllib.request
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "crates/aft/tests/fixtures/grammars"
@@ -106,7 +107,14 @@ def parse(cli, module, source, *, cwd, env):
     require_equal(cached.read_bytes(), data, "loaded WASM bytes")
     if not tree.strip() or "<ERROR" in tree or "<MISSING" in tree:
         raise ValueError(f"empty or invalid parse: {source}")
-    return tree
+    document = ET.fromstring(tree)
+    entries = document.findall("source")
+    if len(entries) != 1 or len(entries[0]) != 1 or entries[0][0].tag != "chunk":
+        raise ValueError("expected one Luau source tree")
+    require_equal(entries[0].get("name"), str(source), "parsed source path")
+    # The CLI embeds the checkout's absolute path, which is not part of the AST.
+    entries[0].set("name", Path(source).name)
+    return ET.tostring(document, encoding="unicode") + "\n"
 
 
 def manifest(pin, module, role):
@@ -197,6 +205,8 @@ def build(output, write_fixtures=False):
     cli.chmod(0o755)
     verifier_version = run([cli, "--version"], cwd=work, env=env).strip()
     empty = work / "parse"
+    if empty.exists():
+        shutil.rmtree(empty)
     (empty / "src").mkdir(parents=True, exist_ok=True)
     json_write(empty / "src/grammar.json", {"name": "luau"})
     json_write(empty / "tree-sitter.json", {"grammars": [{"name": "luau", "scope": "source.luau",
