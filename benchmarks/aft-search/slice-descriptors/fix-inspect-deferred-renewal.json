@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-deferred-renewal"
+  ],
+  "note": "aft_inspect's deferred outside-access ask now carries the renewal for files already approved. No search, ranking or query routing changes."
+}
