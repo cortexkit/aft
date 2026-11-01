@@ -8882,6 +8882,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     let storage_dir = root.join(".aft-test-storage");
     fs::create_dir_all(&root).expect("create project root");
     write_file(&root, "src/app.customts", "export const value = 1;\n");
+    crate::test_helpers::project::mark_project(&root).unwrap();
 
     let server_id = "needs-marker-ls";
     let ctx = AppContext::new(
@@ -8919,6 +8920,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         configure_response["success"], true,
         "configure failed: {configure_response:#}"
     );
+    crate::test_helpers::admission::settle(&ctx);
     ctx.lsp().override_binary(
         ServerKind::Custom(std::sync::Arc::from(server_id)),
         fake_server_path(),

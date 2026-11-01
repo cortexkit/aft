@@ -181,6 +181,33 @@ fn folder_admission_idle_bind_does_not_consume_the_probe_wait() {
 }
 
 #[test]
+fn folder_admission_pending_bind_cannot_acquire_a_shared_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let storage = temp.path().join("storage");
+    std::fs::create_dir_all(&root).unwrap();
+    crate::test_project::mark_project(&root).unwrap();
+    isolated(&root, || {
+        let ctx = context(&storage);
+        assert!(configure(&root, &storage, &ctx, false, false).success);
+        assert!(admission::pending(&ctx));
+        let key = "shared-before-admission";
+        let lease = crate::root_cache::WriterLease::acquire_shared_with_timeout(
+            crate::root_cache::RootCacheDomain::Callgraph,
+            &storage.join("callgraph").join(key),
+            key,
+            &root,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(
+            lease.is_none(),
+            "a pending root acquired shared write authority"
+        );
+    });
+}
+
+#[test]
 fn fresh_connect_rechecks_changed_evidence_without_cache_cooldown() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

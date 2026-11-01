@@ -98,6 +98,33 @@ fn admitted_child_aliases_are_not_reported_as_outside_projects() {
 }
 
 #[test]
+fn admitted_outside_names_are_rebased_from_the_observed_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    for name in ["a", "b"] {
+        git_init(&root.join(name));
+    }
+    std::fs::write(root.join("README.md"), "outside child projects\n").unwrap();
+    let mut admission = isolated(&root, || {
+        crate::folder_admission::probe(
+            &root,
+            &Default::default(),
+            crate::folder_admission::ProbeBudgets {
+                time: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+    });
+    let observed_root = root.join("a/..");
+    admission.canonical_root = Some(observed_root.clone());
+    admission.outside_paths = vec![observed_root.join("README.md")];
+    admission.coverage.workspace_complete = true;
+    let found = discovery_from_admission(&root, &admission, DEFAULT_MAX_CHILD_REPOS);
+    assert_eq!(found.children, vec![root.join("a"), root.join("b")]);
+    assert_eq!(found.outside, vec![root.join("README.md")]);
+}
+
+#[test]
 fn discovery_refuses_checkouts_and_folders_without_repositories() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();

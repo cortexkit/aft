@@ -204,6 +204,17 @@ fn discovery_from_admission(
         outside: Vec::new(),
     };
     let boundary = crate::watcher_filter::WatcherWalkBoundary::for_root(root);
+    // Admission paths use the routing root's spelling. Rebase their relative
+    // names onto the discovery root before recording gaps, without resolving
+    // a final symlink that must still be named as an outside entry.
+    let admission_path = |path: &Path| {
+        admission
+            .canonical_root
+            .as_deref()
+            .and_then(|base| path.strip_prefix(base).ok())
+            .map(|relative| root.join(relative))
+            .unwrap_or_else(|| path.to_path_buf())
+    };
     for candidate in &admission.child_roots {
         let child = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
         if !child.starts_with(root) || crate::project_content::is_excluded(&child) {
@@ -229,7 +240,7 @@ fn discovery_from_admission(
         found.repositories.push(child);
     }
     for path in &admission.outside_paths {
-        note_outside(&mut found, root, path);
+        note_outside(&mut found, root, &admission_path(path));
     }
     if !admission.coverage.workspace_complete {
         // Admission uses routing identities, while discovery returns filesystem
@@ -249,7 +260,7 @@ fn discovery_from_admission(
                 && !crate::path_identity::ProjectRootId::from_path(path)
                     .is_ok_and(|identity| discovered_roots.contains(&identity))
             {
-                note_outside(&mut found, root, path);
+                note_outside(&mut found, root, &admission_path(path));
             }
         }
     }

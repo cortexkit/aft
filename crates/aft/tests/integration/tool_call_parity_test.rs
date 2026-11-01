@@ -1299,6 +1299,7 @@ fn parity_cases() -> Vec<ParityCase> {
 
 fn create_fixture_project(root: &Path, glob_mtimes: GlobMtimeProfile) {
     fs::create_dir_all(root.join("src")).expect("create src dir");
+    crate::test_helpers::project::mark_project(root).unwrap();
     fs::create_dir_all(root.join("docs")).expect("create docs dir");
     fs::write(
         root.join("src/read.txt"),
@@ -1361,6 +1362,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
         }),
     );
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    aft.wait_for_project_ready();
 }
 
 fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) -> Value {
@@ -1429,6 +1431,36 @@ fn normalized_envelope(mut value: Value, project_root: &Path, cache_dir: &Path) 
     value
 }
 
+#[test]
+fn folder_admission_parity_normalizes_only_probe_clocks() {
+    let original = json!({"folder": {
+        "classification": "project", "reason": "root_marker", "observed_at_ms": 100,
+        "observed": {"eligible_source_files": 2},
+        "coverage": {"complete": false, "time_budget_ms": 100, "elapsed_ms": 1}
+    }});
+    let normalize = |value| normalized_envelope(value, Path::new("project"), Path::new("cache"));
+    let expected = normalize(original.clone());
+    let mut clocks = original.clone();
+    clocks["folder"]["observed_at_ms"] = json!(200);
+    clocks["folder"]["coverage"]["elapsed_ms"] = json!(5);
+    assert_eq!(normalize(clocks), expected);
+    let mut classification = original.clone();
+    classification["folder"]["classification"] = json!("not_project");
+    assert_ne!(normalize(classification), expected);
+    let mut count = original.clone();
+    count["folder"]["observed"]["eligible_source_files"] = json!(3);
+    assert_ne!(normalize(count), expected);
+    let mut budget = original.clone();
+    budget["folder"]["coverage"]["time_budget_ms"] = json!(200);
+    assert_ne!(normalize(budget), expected);
+    let mut missing_clock = original;
+    missing_clock["folder"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observed_at_ms");
+    assert_ne!(normalize(missing_clock), expected);
+}
+
 fn assert_lifecycle_census_presence(response: &Value) {
     for (section, fields) in [
         (
@@ -1473,6 +1505,20 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             }
         }
         Value::Object(map) => {
+            // Each process probes its own fixture. Keep every admission field
+            // and coverage count, but not the independent wall-clock samples.
+            if let Some(folder) = map.get_mut("folder").and_then(Value::as_object_mut) {
+                if let Some(stamp) = folder.get_mut("observed_at_ms") {
+                    *stamp = json!("<observed_at_ms>");
+                }
+                if let Some(elapsed) = folder
+                    .get_mut("coverage")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|coverage| coverage.get_mut("elapsed_ms"))
+                {
+                    *elapsed = json!("<elapsed_ms>");
+                }
+            }
             // Memory attribution is sampled independently in the direct and
             // tool_call processes. Preserve its schema and platform support
             // while masking volatile counts and allocator sampling readiness.

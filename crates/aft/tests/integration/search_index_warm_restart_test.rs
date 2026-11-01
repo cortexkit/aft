@@ -51,7 +51,7 @@ fn normalize_display_path(path: &str) -> String {
 }
 
 fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value {
-    send(
+    let response = send(
         aft,
         json!({
             "id": id,
@@ -62,7 +62,11 @@ fn configure_search_index(aft: &mut AftProcess, root: &Path, id: &str) -> Value 
                 "indexes": { "trigram": true, "semantic": false }
             })),
         }),
-    )
+    );
+    if response["success"] == true {
+        aft.wait_for_folder_admission();
+    }
+    response
 }
 
 fn status(aft: &mut AftProcess) -> Value {

@@ -555,6 +555,7 @@ fn inspect_engine_command_returns_lane_a_shape() {
         configure["success"], true,
         "configure should succeed: {configure:?}"
     );
+    aft.wait_for_project_ready();
 
     let response = aft.send(
         &json!({

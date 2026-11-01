@@ -728,6 +728,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
     let temp_dir = tempfile::tempdir().expect("create fixture");
     let project = temp_dir.path().join("project");
     fs::create_dir_all(&project).expect("create project");
+    crate::test_helpers::project::mark_project(&project).unwrap();
     fs::write(project.join("fake.toml"), "[project]\n").expect("write root marker");
     fs::write(project.join("main.fake"), "hello\n").expect("write fake source");
     fs::write(project.join("notes.txt"), "notes\n").expect("write read target");
@@ -852,7 +853,7 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
 
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
-    let project = tempfile::tempdir().expect("create standalone project");
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = tempfile::tempdir().expect("create standalone storage");
     let (base_url, query_started, release_query, embedding_server) = start_embedding_server();
     let mut aft = AftProcess::spawn();

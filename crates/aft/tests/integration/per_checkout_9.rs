@@ -1571,8 +1571,7 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
     let storage = base.join("storage");
     for index in 0..66 {
         let child = root.join(format!("repo-{index:02}"));
-        std::fs::create_dir_all(child.join(".git")).unwrap();
-        crate::test_helpers::project::mark_project(&child).unwrap();
+        init_repo(&child, &[]);
     }
     let parent = configure(&root, &storage, config_doc(true, TRIGRAM_ONLY, None));
     let session = parent_session(&parent);
@@ -1623,8 +1622,7 @@ fn slow_discovery_never_delays_the_bind() {
     let storage = base.join("storage");
     for index in 0..20 {
         let child = root.join(format!("repo-{index:02}"));
-        std::fs::create_dir_all(child.join(".git")).unwrap();
-        crate::test_helpers::project::mark_project(&child).unwrap();
+        init_repo(&child, &[]);
     }
     let discovery = aft::views::parent::hold_discovery_for_test(&root);
     let ctx = Arc::new(

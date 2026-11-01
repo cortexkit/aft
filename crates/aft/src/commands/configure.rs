@@ -5142,10 +5142,14 @@ fn handle_configure_inner(
         ctx.request_checkpoint_namespace(storage_dir, harness.clone());
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
+    // A pending or refused root has not established ownership of shared
+    // artifacts. Low-level store APIs must not grant shared write authority
+    // before admission and topology are known, even if the root is not yet
+    // recognized as a linked worktree.
     crate::root_cache::configure_artifact_access(
         &canonical_cache_root,
         &project_key,
-        is_worktree_bridge,
+        is_worktree_bridge || combined_root_off || identity_provisional,
     );
     ctx.set_cache_role(is_worktree_bridge, git_common_dir);
     let artifact_owner_lease = artifact_owner_claim.and_then(|claim| claim.lease);
