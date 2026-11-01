@@ -420,6 +420,7 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
     let src = project.join("src");
     let storage = temp_dir.path().join("storage");
     fs::create_dir_all(&src).expect("create project source directory");
+    crate::test_helpers::project::mark_project(&project).unwrap();
     fs::write(src.join("main.rs"), "fn main() {}\n").expect("write fixture source");
     for file_index in 0..2_000 {
         let mut source = String::with_capacity(1_500);

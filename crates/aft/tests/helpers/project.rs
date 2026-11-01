@@ -71,8 +71,9 @@ pub fn git_project_tempdir() -> tempfile::TempDir {
     directory
 }
 
-/// Preserve existing Git or workspace evidence; only bare tool fixtures need
-/// the extra marker. In particular, checked-in source fixtures stay untouched.
+/// Preserve existing Git or workspace evidence. Marker-free source fixtures
+/// need a project marker before test storage adds non-source files, so the
+/// resulting change in file proportions cannot change project detection.
 pub fn ensure_project(root: &Path) -> io::Result<()> {
     let decision = aft::folder_admission::probe(
         root,
@@ -82,7 +83,9 @@ pub fn ensure_project(root: &Path) -> io::Result<()> {
             ..Default::default()
         },
     );
-    if decision.classification == aft::folder_admission::FolderClassification::NotProject {
+    if decision.classification == aft::folder_admission::FolderClassification::NotProject
+        || decision.reason == aft::folder_admission::AdmissionReason::SmallSourceTree
+    {
         mark_project(root)?;
     }
     Ok(())

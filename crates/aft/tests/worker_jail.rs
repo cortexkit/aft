@@ -27,6 +27,8 @@ use tokio::net::{TcpListener, TcpStream};
 mod aft_binary;
 #[path = "helpers/executable_cache.rs"]
 mod executable_cache;
+#[path = "helpers/timeout_forensics.rs"]
+mod timeout_forensics;
 #[path = "helpers/worker_gh_read.rs"]
 mod worker_gh_read;
 
@@ -111,6 +113,12 @@ struct Jail {
 
 impl Drop for Jail {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "worker-jail module stacks:\n{}",
+                timeout_forensics::capture_stacks(self.child.id())
+            );
+        }
         let process_groups = sandbox_task_process_groups(&self.data);
         self.read_router.abort();
         let _ = self.child.kill();

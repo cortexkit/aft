@@ -1880,6 +1880,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         &ctx,
     );
     assert!(configured.success, "{configured:?}");
+    crate::test_helpers::admission::settle(&ctx);
     assert!(
         !ctx.callgraph_writer(),
         "worktree must remain borrow-only for legacy artifacts"
@@ -9939,6 +9940,7 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx
@@ -10062,6 +10064,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         ctx.lsp()
             .override_binary(ServerKind::Rust, fake_server_path());
         ctx.lsp()
@@ -10212,6 +10215,7 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         configure_fake_rust_lsp(&ctx);
         // Default fake startup is already quiescent; its check therefore begins
         // after workspace load. The warming variant settles only on didOpen,
