@@ -63,6 +63,17 @@ pub fn initialize() -> io::Result<()> {
 }
 
 fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
+    let started = std::time::Instant::now();
+    let trace = |phase: &str| {
+        if cfg!(debug_assertions) && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some() {
+            eprintln!(
+                "[aft-pin] pid={} phase={phase} elapsed_ms={}",
+                std::process::id(),
+                started.elapsed().as_millis()
+            );
+        }
+    };
+    trace("source_open_start");
     // Resolve the image before touching storage. Keep an open source when a
     // copy is needed so a concurrent placement cannot change the copied bytes.
     #[cfg(target_os = "macos")]
@@ -84,6 +95,8 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     #[cfg(target_os = "linux")]
     let mut source_file = std::fs::File::open(&source_path)?;
 
+    trace("source_open_done");
+    trace("storage_open_start");
     crate::private_storage::open_root(storage)?;
     let storage = storage.canonicalize()?;
     let run = storage.join("run");
@@ -99,7 +112,10 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
         ));
     }
     crate::private_storage::tighten_open_dir(&storage, &run);
+    trace("storage_open_done");
+    trace("cleanup_start");
     cleanup(&run)?;
+    trace("cleanup_done");
     let pid = std::process::id();
     let start = crate::root_cache::process_start_time_ms(pid)
         .ok_or_else(|| io::Error::other("cannot determine executable pin owner start time"))?;
@@ -107,11 +123,15 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     crate::private_storage::create_dir(&directory)?;
 
     let result = (|| {
+        trace("owner_lock_start");
         let owner = owner_lock(&directory)?;
+        trace("owner_lock_done");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let executable = {
             let destination = directory.join("aft");
+            trace("materialize_start");
             materialize(&source_path, &mut source_file, &destination, link_image)?;
+            trace("materialize_done");
             #[cfg(target_os = "macos")]
             warm_new_image(&destination);
             destination
