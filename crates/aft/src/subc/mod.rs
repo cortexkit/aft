@@ -7850,6 +7850,7 @@ async fn handle_route_bind_completion(
         .cloned()
     {
         let runtime = tokio::runtime::Handle::current();
+        let consent_executor = Arc::clone(executor);
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -7864,7 +7865,9 @@ async fn handle_route_bind_completion(
                     Ok(()) => {
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
-                        consent::reattach(ctx, &identity, &runtime);
+                        if let Some(ctx) = consent_executor.actor_context(&identity.root) {
+                            consent::reattach(&ctx, &identity, &runtime);
+                        }
                         Response::success("scope-bind", json!({}))
                     }
                     Err(error) => {

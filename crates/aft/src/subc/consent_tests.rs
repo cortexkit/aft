@@ -1749,6 +1749,136 @@ async fn consent_late_folder_approval_covers_a_later_file_without_another_ask() 
 
 #[cfg(unix)]
 #[tokio::test]
+async fn consent_late_folder_deny_refusal_and_once_grant_no_reusable_access() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for outcome in ["deny", "access_withdrawn", "allow_once"] {
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(100)));
+        let pending = f.read(&f.worker, &f.head_root, 7).await;
+        assert_eq!(code(&pending), "access_pending", "{pending}");
+        let request = &f.fake.calls("consent.request")[0];
+        f.fake.answer(
+            request["call_key"].as_str().unwrap(),
+            json!({"state": if outcome == "access_withdrawn" { "refused:access_withdrawn" } else { "settled" }, "outcome":outcome, "answered_by":"head"}),
+        );
+        let child = f.read(&f.worker, &f.head_root.join("shared.txt"), 8).await;
+        assert_eq!(code(&child), "access_pending", "{outcome}: {child}");
+        assert!(f.worker_grants().is_empty(), "{outcome}");
+        assert_eq!(f.fake.calls("consent.request").len(), 2);
+        if outcome == "allow_once" {
+            let original = f.settled_read(&f.worker, &f.head_root, 9).await;
+            assert!(text(&original).contains("shared.txt"), "{original}");
+            assert!(f.worker_grants().is_empty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_late_folder_approval_is_confined_to_its_scope_and_epoch() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &f.head_root, 7).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
+    );
+    for (corr, name, epoch) in [(8, "worker", 8), (9, "other-worker", 7)] {
+        let mut scope = stamp(name, "worker", Some("head"));
+        scope.scope_epoch = epoch;
+        let other = identity(&f.worker.project_root, Some(scope));
+        access_grants::register(&other, &f.ctx).unwrap();
+        let child = f.read(&other, &f.head_root.join("shared.txt"), corr).await;
+        assert_eq!(code(&child), "access_pending", "{child}");
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(
+            crate::db::access_grants::list(&conn, &access_grants::scope_key(&other))
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(f.worker_grants().is_empty());
+    let child = f.read(&f.worker, &f.head_root.join("shared.txt"), 10).await;
+    assert!(text(&child).contains("head-owned contents"), "{child}");
+    assert_eq!(f.fake.calls("consent.request").len(), 3);
+}
+
+#[cfg(unix)]
+fn reopen_consent_database(f: &Fixture) {
+    f.ctx.set_db(Arc::new(StdMutex::new(
+        crate::db::open(&f.dir.path().join("store").join("aft.db")).unwrap(),
+    )));
+    let scope = access_grants::scope_key(&f.worker);
+    REATTACHED
+        .lock()
+        .unwrap()
+        .remove(&(scope.owner, scope.scope_ref, scope.epoch));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_late_folder_approval_is_applied_on_restart_without_a_retry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &f.head_root, 7).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    install_test_transport(None);
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
+    );
+    reopen_consent_database(&f);
+    install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&f.fake)))));
+    reattach(&f.ctx, &f.worker, &tokio::runtime::Handle::current());
+    wait_for(|| !f.worker_grants().is_empty() && f.asks().is_empty()).await;
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["call_key"], request["call_key"]);
+    let child = f.read(&f.worker, &f.head_root.join("shared.txt"), 8).await;
+    assert!(text(&child).contains("head-owned contents"), "{child}");
+    assert_eq!(f.worker_grants().len(), 1);
+    assert_eq!(f.fake.calls("consent.request").len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_late_folder_approval_never_grants_an_ended_scope_on_restart() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    assert_eq!(
+        code(&f.read(&f.worker, &f.head_root, 7).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    {
+        let db = f.ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        crate::db::access_grants::end_scope_grants(&conn, &access_grants::scope_key(&f.worker))
+            .unwrap();
+    }
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    reopen_consent_database(&f);
+    reattach(&f.ctx, &f.worker, &tokio::runtime::Handle::current());
+    wait_for(|| f.asks().is_empty()).await;
+    assert!(f.worker_grants().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn consent_answer_within_the_budget_runs_the_held_call() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
