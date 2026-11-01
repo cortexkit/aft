@@ -1,0 +1,1 @@
+- A patch, edit or write whose diff is too large to send no longer loses its result: file results and line counts are kept, and only the oversized diff is left out.

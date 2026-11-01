@@ -867,7 +867,11 @@ mod a03_tests {
         let ctx = AppContext::new(Box::new(StubProvider), Config::default());
         let mut observed = Vec::new();
         for count in [1, 100, 2_000] {
-            let source = format!("{}{}", "TARGET\n".repeat(count), "z".repeat(1024 * 1024));
+            let source = format!(
+                "{}{}",
+                "TARGET\n".repeat(count),
+                "z".repeat(5 * 1024 * 1024)
+            );
             std::fs::write(&path, &source).unwrap();
             BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.set(0));
             let start = std::time::Instant::now();
@@ -883,11 +887,11 @@ mod a03_tests {
             );
             let elapsed = start.elapsed();
             assert!(response.success, "{:?}", response);
-            let expected = format!("{}{}", "é\n".repeat(count), "z".repeat(1024 * 1024));
-            assert_eq!(
-                response.data["metadata"]["diff"],
-                edit::build_unified_diff(path.to_str().unwrap(), &source, &expected)
-            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            assert_eq!(response.data["diff_omitted"], true);
+            assert!(response.data["metadata"].get("diff").is_none());
+            assert_eq!(response.data["diff"]["additions"], count);
+            assert_eq!(response.data["diff"]["deletions"], count);
             let allocations = BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.get());
             eprintln!(
                 "A03 batch matches={count}: output allocations={allocations} elapsed={elapsed:?}"
@@ -1054,6 +1058,7 @@ mod a03_tests {
                                 if existed { "const value = 1;\n" } else { "" },
                                 "const value = 2;\n"
                             )
+                            .unwrap()
                         );
                         let reads = edit::A03_HANDLER_READS.with(|count| count.get())
                             + crate::backup::capture_read_count(&path);
@@ -1220,9 +1225,9 @@ mod a03_measurements {
                     .map(|i| format!("after--{i:05}-{}\n", "y".repeat(49)))
                     .collect()
             };
+            let expected_count = if reversed { 19_999 } else { 20_000 };
             let baseline = similar::TextDiff::from_lines(&before, &after);
             let expected_patch = format!("Index: large.ts\n===================================================================\n{}", baseline.unified_diff().header("large.ts", "large.ts"));
-            let expected_count = if reversed { 19_999 } else { 20_000 };
             let start = std::time::Instant::now();
             let mut actual = serde_json::json!({});
             edit::attach_preview_diff(
@@ -1233,10 +1238,11 @@ mod a03_measurements {
                 &after,
             );
             let elapsed = start.elapsed();
-            assert_eq!(
-                actual,
-                serde_json::json!({"metadata": {"diff": expected_patch}, "preview": true, "preview_diff": expected_patch, "diff": {"additions": expected_count, "deletions": expected_count}})
-            );
+            assert!(actual.get("diff_omitted").is_none());
+            assert_eq!(actual["preview_diff"], expected_patch);
+            assert_eq!(actual["metadata"]["diff"], expected_patch);
+            assert_eq!(actual["diff"]["additions"], expected_count);
+            assert_eq!(actual["diff"]["deletions"], expected_count);
             eprintln!("A03 diff reversed={reversed} elapsed={elapsed:?}");
         }
     }

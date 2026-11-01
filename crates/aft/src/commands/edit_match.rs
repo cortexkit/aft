@@ -849,47 +849,61 @@ fn handle_glob_edit_match_inner(
 
     if edit::wants_preview(&req.params) {
         let mut preview_diff = String::new();
+        let mut budget = crate::mutation_diff::DiffBudget::default();
+        let mut omitted = false;
         let mut additions = 0usize;
         let mut deletions = 0usize;
         let files = pending
             .iter()
             .map(|edit| {
                 let (patch, diff) = edit::response_diff(
+                    &mut budget,
                     &serde_json::json!({"include_diff_content": true}),
                     &edit.file_str,
                     &edit.original_source,
                     &edit.new_source,
+                    2,
                 );
                 additions += diff.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 deletions += diff.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                preview_diff.push_str(&patch);
-                if !preview_diff.ends_with('\n') {
-                    preview_diff.push('\n');
+                omitted |= diff["diff_omitted"] == true;
+                if let Some(patch) = patch {
+                    preview_diff.push_str(&patch);
+                    if !preview_diff.ends_with('\n') {
+                        preview_diff.push('\n');
+                    }
                 }
-                serde_json::json!({
+                let mut file = serde_json::json!({
                     "file": edit.file_str,
                     "replacements": edit.count,
                     "diff": diff,
-                })
+                });
+                if file["diff"]["diff_omitted"] == true {
+                    file["diff_omitted"] = serde_json::json!(true);
+                }
+                file
             })
             .collect::<Vec<_>>();
 
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "ok": true,
-                "preview": true,
-                "files": files,
-                "total_replacements": total_replacements,
-                "total_files": total_files,
-                "diff": {
-                    "additions": additions,
-                    "deletions": deletions,
-                },
-                "preview_diff": preview_diff,
-                "metadata": { "diff": preview_diff },
-            }),
-        );
+        let mut result = serde_json::json!({
+            "ok": true,
+            "preview": true,
+            "files": files,
+            "total_replacements": total_replacements,
+            "total_files": total_files,
+            "diff": {
+                "additions": additions,
+                "deletions": deletions,
+            },
+        });
+        if !preview_diff.is_empty() {
+            result["preview_diff"] = serde_json::json!(preview_diff);
+            result["metadata"] = serde_json::json!({"diff": preview_diff});
+        }
+        if omitted {
+            crate::mutation_diff::mark_omitted(&mut result);
+        }
+        return Response::success(&req.id, result);
     }
 
     if pending
@@ -1151,15 +1165,33 @@ fn handle_glob_edit_match_inner(
         "format_skipped_count": format_skipped_count,
         "format_skip_reasons": format_skip_reasons,
     });
-    let diff = pending
-        .iter()
-        .map(|edit| {
-            let after =
-                std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
-            edit::build_unified_diff(&edit.file_str, &edit.original_source, &after)
-        })
-        .collect::<String>();
-    result["metadata"] = serde_json::json!({ "diff": diff });
+    let mut budget = crate::mutation_diff::DiffBudget::default();
+    let mut diff = String::new();
+    let mut omitted = false;
+    for (index, edit) in pending.iter().enumerate() {
+        let after = std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
+        let (patch, counts) = edit::response_diff(
+            &mut budget,
+            &serde_json::Value::Null,
+            &edit.file_str,
+            &edit.original_source,
+            &after,
+            1,
+        );
+        result["files"][index]["diff"] = counts;
+        if let Some(patch) = patch {
+            diff.push_str(&patch);
+        } else {
+            omitted = true;
+            result["files"][index]["diff_omitted"] = serde_json::json!(true);
+        }
+    }
+    if !diff.is_empty() {
+        result["metadata"] = serde_json::json!({ "diff": diff });
+    }
+    if omitted {
+        crate::mutation_diff::mark_omitted(&mut result);
+    }
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
     Response::success(&req.id, result)
 }

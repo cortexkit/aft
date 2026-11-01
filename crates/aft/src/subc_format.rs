@@ -384,7 +384,21 @@ pub(crate) fn format_response_unbounded(
             }
         }
     }
+    append_diff_notice(&mut text, data);
     text
+}
+
+fn append_diff_notice(text: &mut String, data: &Value) {
+    if data["diff_omitted"] == true {
+        if let Some(notice) = data["diff_notice"].as_str() {
+            if !text.lines().any(|line| line == notice) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(notice);
+            }
+        }
+    }
 }
 
 /// The first reply line of a `read`, `outline` or `zoom` that read a file at
@@ -1611,6 +1625,22 @@ mod edit_diagnostics_tests {
         let output = super::format_edit_response(&data);
         assert!(
             output.contains("diagnostics unknown (server not responding)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn bounded_mutation_diff_notice_keeps_agent_visible_counts() {
+        let data = serde_json::json!({
+            "diff": { "additions": 100_000, "deletions": 90_000 },
+            "diff_omitted": true,
+            "diff_notice": crate::mutation_diff::DIFF_OMITTED_NOTICE,
+        });
+        let mut output = super::format_edit_response(&data);
+        super::append_diff_notice(&mut output, &data);
+        assert!(output.starts_with("Edited (+100000/-90000)."), "{output}");
+        assert!(
+            output.contains(crate::mutation_diff::DIFF_OMITTED_NOTICE),
             "{output}"
         );
     }

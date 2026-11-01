@@ -7,6 +7,46 @@
   ],
   "entries": [
     {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 575,
+      "column": 36,
+      "token": "filePath",
+      "text": "files.push(json!({\"filePath\": path_string(&resolved_hunk.source.abs), \"type\": \"add\", \"additions\": counts[\"additions\"], \"deletions\": counts[\"deletions\"], \"diff_omitted\": patch.is_none()}));",
+      "location": "line 575, column 36",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Patch approval previews retain the existing per-file mutation metadata spelling when optional patch text is omitted."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 599,
+      "column": 36,
+      "token": "filePath",
+      "text": "files.push(json!({\"filePath\": path_string(&resolved_hunk.source.abs), \"type\": \"delete\", \"additions\": counts[\"additions\"], \"deletions\": counts[\"deletions\"], \"diff_omitted\": patch.is_none()}));",
+      "location": "line 599, column 36",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Patch approval previews retain the existing per-file mutation metadata spelling when optional patch text is omitted."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 645,
+      "column": 39,
+      "token": "filePath",
+      "text": "let mut file = json!({\"filePath\": path_string(&resolved_hunk.source.abs), \"type\": if resolved_hunk.move_dest.is_some() {\"move\"} else {\"update\"}, \"additions\": counts[\"additions\"], \"deletions\": counts[\"deletions\"], \"diff_omitted\": patch.is_none()});",
+      "location": "line 645, column 39",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Patch approval previews retain the existing per-file mutation metadata spelling when optional patch text is omitted."
+    },
+    {
+      "path": "packages/aft-bridge/src/__tests__/e2e/bounded-mutation-diffs.test.ts",
+      "token": "filePath",
+      "location": "file",
+      "class": "compatibility-fixture",
+      "reason": "The native bridge regression asserts existing per-file mutation metadata, not a new agent argument."
+    },
+    {
       "path": "benchmarks/codegraph-replication/src/drivers.ts",
       "line": 153,
       "column": 40,

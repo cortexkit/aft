@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::edit::build_unified_diff;
 use crate::hashline::apply::{FileClassification, MutationState};
 use crate::hashline::syntax::{HashlineRejection, HashlineRejectionCode, RejectionStage};
 use crate::hashline::transaction::{FileOutcome, FileRole, TransactionEnvelope};
@@ -83,6 +82,7 @@ const HASHLINE_STRUCTURED_KEYS: &[&str] = &[
 pub fn render_mutation_response(input: MutationRenderInput<'_>) -> Value {
     let envelope = input.envelope;
     let (diff, files_meta) = build_display_metadata(input.display_files, input.project_root);
+    let diff_omitted = files_meta.iter().any(|file| file["diff_omitted"] == true);
     let file_path = first_display_path(input.display_files, envelope);
     let output = render_agent_output(envelope);
     let title = render_title(envelope);
@@ -99,10 +99,15 @@ pub fn render_mutation_response(input: MutationRenderInput<'_>) -> Value {
         "all_failed": all_failed,
         "preview": envelope.preview,
         "metadata": {
-            "diff": diff,
             "files": files_meta,
         },
     });
+    if let Some(diff) = diff {
+        payload["metadata"]["diff"] = json!(diff);
+    }
+    if diff_omitted {
+        crate::mutation_diff::mark_omitted(&mut payload);
+    }
 
     if let Some(path) = file_path {
         payload["filePath"] = json!(path);
@@ -313,8 +318,9 @@ fn first_display_path(
 fn build_display_metadata(
     display_files: &[DisplayFileBytes],
     project_root: Option<&Path>,
-) -> (String, Vec<Value>) {
+) -> (Option<String>, Vec<Value>) {
     let mut files = Vec::with_capacity(display_files.len());
+    let mut budget = crate::mutation_diff::DiffBudget::default();
     for file in display_files {
         let before = String::from_utf8_lossy(&file.before);
         let after = if file.remove_file {
@@ -336,16 +342,20 @@ fn build_display_metadata(
         } else {
             "update"
         };
-        let patch = build_unified_diff(&file.requested_path, &before, &after);
+        let patch = budget.patch(&file.requested_path, &before, &after, 2);
         let (additions, deletions) = line_diff_counts(&before, &after);
         let mut entry = json!({
             "filePath": absolutize(project_root, &file.requested_path),
             "relativePath": relativize(project_root, &file.requested_path),
             "type": entry_type,
-            "patch": patch,
             "additions": additions,
             "deletions": deletions,
         });
+        if let Some(patch) = patch {
+            entry["patch"] = json!(patch);
+        } else {
+            entry["diff_omitted"] = json!(true);
+        }
         if let Some(src) = &file.move_from {
             entry["movePath"] = json!(src);
             // Spec: MV displays the destination diff and names the source.
@@ -359,10 +369,21 @@ fn build_display_metadata(
         .filter(|patch| !patch.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    let diff = if diff.is_empty() && files.iter().any(|file| file["diff_omitted"] == true) {
+        None
+    } else {
+        Some(diff)
+    };
     (diff, files)
 }
 
 fn line_diff_counts(before: &str, after: &str) -> (usize, usize) {
+    if before.is_empty() || after.is_empty() {
+        return (
+            crate::edit::diff_line_count(after),
+            crate::edit::diff_line_count(before),
+        );
+    }
     use similar::ChangeTag;
     let diff = similar::TextDiff::from_lines(before, after);
     let mut additions = 0usize;

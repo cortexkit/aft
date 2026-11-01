@@ -1368,25 +1368,10 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
 /// `metadata.diff`. Host wrappers may alternatively consume the `diff.before` /
 /// `diff.after` response fields and render their own patch, but returning the
 /// ready-to-display string keeps the bridge contract self-contained.
-pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
+/// Returns `None` when the encoded patch exceeds the reply's optional diff budget.
+pub fn build_unified_diff(file: &str, before: &str, after: &str) -> Option<String> {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
-    if before == after {
-        return format!(
-            "Index: {file}
-===================================================================
---- {file}
-+++ {file}
-"
-        );
-    }
-
-    let text_diff = construct_diff(before, after);
-    let patch = text_diff.unified_diff().header(file, file).to_string();
-    format!(
-        "Index: {file}
-===================================================================
-{patch}"
-    )
+    crate::mutation_diff::DiffBudget::default().patch(file, before, after, 1)
 }
 
 /// Reject an identity edit before writing or recording undo state.
@@ -1400,7 +1385,7 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
-    result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
+    attach_edit_diff(result, &serde_json::Value::Null, file, before, after);
 }
 
 /// Attach the standard preview diff fields to a command response payload.
@@ -1411,11 +1396,25 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
-    let (patch, info) = response_diff(params, file, before, after);
-    result["metadata"] = serde_json::json!({ "diff": patch });
+    let (patch, info) = response_diff(
+        &mut crate::mutation_diff::DiffBudget::default(),
+        params,
+        file,
+        before,
+        after,
+        2,
+    );
     result["preview"] = serde_json::json!(true);
     result["diff"] = info;
-    result["preview_diff"] = serde_json::json!(patch);
+    if let Some(patch) = patch {
+        result["metadata"] = serde_json::json!({ "diff": patch });
+        result["preview_diff"] = serde_json::json!(patch);
+    } else {
+        crate::mutation_diff::mark_omitted(result);
+    }
+    if result["diff"]["diff_omitted"] == true {
+        crate::mutation_diff::mark_omitted(result);
+    }
 }
 
 /// Longest a line diff may search for a minimal edit script. Past it,
@@ -1434,7 +1433,10 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
+pub(crate) fn construct_diff<'a>(
+    before: &'a str,
+    after: &'a str,
+) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
     if let Some(timeout) = DIFF_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
         return construct_diff_with_timeout(before, after, timeout);
@@ -1473,27 +1475,61 @@ fn diff_counts(before: &str, after: &str) -> (usize, usize) {
     counts_from_diff(&construct_diff(before, after))
 }
 
+/// Count the line tokens used by `similar`, including bare CR line endings.
+pub(crate) fn diff_line_count(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let mut count = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\r' || (byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r')) {
+            count += 1;
+        }
+    }
+    count
+        + usize::from(
+            bytes
+                .last()
+                .is_some_and(|&byte| !matches!(byte, b'\r' | b'\n')),
+        )
+}
+
 pub(crate) fn response_diff(
+    budget: &mut crate::mutation_diff::DiffBudget,
     params: &serde_json::Value,
     file: &str,
     before: &str,
     after: &str,
-) -> (String, serde_json::Value) {
+    copies: usize,
+) -> (Option<String>, serde_json::Value) {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
-    let diff = construct_diff(before, after);
-    let (additions, deletions) = counts_from_diff(&diff);
-    let patch = if before == after {
-        build_unified_diff(file, before, after)
+    let (patch, additions, deletions) = if before.is_empty() || after.is_empty() {
+        // Pure additions/deletions have exact counts without building a line diff,
+        // so the renderer can reject their oversized output before diffing.
+        (
+            budget.patch(file, before, after, copies),
+            diff_line_count(after),
+            diff_line_count(before),
+        )
     } else {
-        format!("Index: {file}\n===================================================================\n{}", diff.unified_diff().header(file, file))
+        let diff = construct_diff(before, after);
+        let (additions, deletions) = counts_from_diff(&diff);
+        (
+            budget.patch_from_diff(file, before, after, &diff, copies),
+            additions,
+            deletions,
+        )
     };
-    let info = diff_info_from_counts(
-        before,
-        after,
-        additions,
-        deletions,
-        wants_diff_content(params),
-    );
+    let full = wants_diff_content(params);
+    let content_fits = !full
+        || (before.len() <= FULL_DIFF_CONTENT_LIMIT
+            && after.len() <= FULL_DIFF_CONTENT_LIMIT
+            && budget.contents(before, after));
+    let mut info = diff_info_from_counts(before, after, additions, deletions, full && content_fits);
+    if patch.is_none() || !content_fits {
+        info["diff_omitted"] = serde_json::json!(true);
+    }
+    if full && !content_fits {
+        info["truncated"] = serde_json::json!(true);
+    }
     (patch, info)
 }
 
@@ -1506,12 +1542,23 @@ pub(crate) fn attach_edit_diff(
     before: &str,
     after: &str,
 ) {
-    if wants_diff(params) {
-        let (patch, info) = response_diff(params, file, before, after);
-        result["metadata"] = serde_json::json!({ "diff": patch });
+    let (patch, info) = response_diff(
+        &mut crate::mutation_diff::DiffBudget::default(),
+        params,
+        file,
+        before,
+        after,
+        1,
+    );
+    let omitted = info["diff_omitted"] == true;
+    if wants_diff(params) || omitted {
         result["diff"] = info;
-    } else {
-        attach_mutation_diff(result, file, before, after);
+    }
+    if let Some(patch) = patch {
+        result["metadata"] = serde_json::json!({ "diff": patch });
+    }
+    if omitted {
+        crate::mutation_diff::mark_omitted(result);
     }
 }
 
@@ -1551,6 +1598,8 @@ pub fn compute_diff_info(before: &str, after: &str) -> serde_json::Value {
     diff_info_from_counts(before, after, additions, deletions, true)
 }
 
+const FULL_DIFF_CONTENT_LIMIT: usize = 512 * 1024;
+
 fn diff_info_from_counts(
     before: &str,
     after: &str,
@@ -1562,8 +1611,7 @@ fn diff_info_from_counts(
         return serde_json::json!({"additions": additions, "deletions": deletions});
     }
     // For large files, skip sending full content to avoid bloating JSON
-    let size_limit = 512 * 1024; // 512KB
-    if before.len() > size_limit || after.len() > size_limit {
+    if before.len() > FULL_DIFF_CONTENT_LIMIT || after.len() > FULL_DIFF_CONTENT_LIMIT {
         serde_json::json!({
             "additions": additions,
             "deletions": deletions,
@@ -2681,6 +2729,77 @@ mod tests {
             .contains("+changed 0\n"));
     }
     #[test]
+    fn bounded_mutation_diff_pure_counts_match_line_diff() {
+        for content in [
+            "",
+            "a",
+            "a\n",
+            "\n",
+            "\r",
+            "\r\n",
+            "\ra\r",
+            "\na\n",
+            "\0é\nlast",
+            "\u{85}\u{2028}\u{2029}",
+        ] {
+            for (before, after) in [("", content), (content, "")] {
+                let expected = counts_from_diff(&construct_diff(before, after));
+                let (_, info) = response_diff(
+                    &mut crate::mutation_diff::DiffBudget::default(),
+                    &serde_json::Value::Null,
+                    "file.txt",
+                    before,
+                    after,
+                    2,
+                );
+                assert_eq!(info["additions"], expected.0);
+                assert_eq!(info["deletions"], expected.1);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_mutation_diff_pure_preflight_skips_line_diff_construction() {
+        let content = "\0".repeat(800_000) + "\n";
+        for (before, after, additions, deletions) in
+            [("", content.as_str(), 1, 0), (content.as_str(), "", 0, 1)]
+        {
+            A03_DIFF_CONSTRUCTIONS.with(|counter| counter.set(0));
+            let (patch, info) = response_diff(
+                &mut crate::mutation_diff::DiffBudget::default(),
+                &serde_json::Value::Null,
+                "file.txt",
+                before,
+                after,
+                2,
+            );
+            assert!(patch.is_none());
+            assert_eq!(info["additions"], additions);
+            assert_eq!(info["deletions"], deletions);
+            assert_eq!(A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get()), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_mutation_diff_omitted_full_content_does_not_spend_patch_budget() {
+        let mut budget = crate::mutation_diff::DiffBudget::default();
+        let content = "\0".repeat(600_000);
+        let (patch, info) = response_diff(
+            &mut budget,
+            &serde_json::json!({"include_diff_content": true}),
+            "file.txt",
+            &content,
+            &content,
+            2,
+        );
+        assert!(patch.is_some());
+        assert_eq!(info["truncated"], true);
+        assert!(budget
+            .patch("next.txt", "", &"\0".repeat(700_000), 1)
+            .is_some());
+    }
+
+    #[test]
     fn a03_diff_construction_bound_and_output_goldens() {
         // The goldens are the untimed diff; keep the time limit out of reach
         // so a loaded machine cannot make this test compare a coarser diff.
@@ -2720,17 +2839,20 @@ mod tests {
                 let params = serde_json::json!({"include_diff_content": full});
                 let mut actual = serde_json::json!({});
                 attach_preview_diff(&mut actual, &params, "golden.ts", &before, &after);
+                let content_omitted =
+                    full && (before.len() > 512 * 1024 || after.len() > 512 * 1024);
                 let info = if !full {
                     serde_json::json!({"additions": additions, "deletions": deletions})
                 } else if before.len() > 512 * 1024 || after.len() > 512 * 1024 {
-                    serde_json::json!({"additions": additions, "deletions": deletions, "truncated": true})
+                    serde_json::json!({"additions": additions, "deletions": deletions, "truncated": true, "diff_omitted": true})
                 } else {
                     serde_json::json!({"additions": additions, "deletions": deletions, "before": before, "after": after})
                 };
-                assert_eq!(
-                    actual,
-                    serde_json::json!({"metadata": {"diff": patch}, "preview": true, "diff": info, "preview_diff": patch})
-                );
+                let mut expected = serde_json::json!({"metadata": {"diff": patch}, "preview": true, "diff": info, "preview_diff": patch});
+                if content_omitted {
+                    crate::mutation_diff::mark_omitted(&mut expected);
+                }
+                assert_eq!(actual, expected);
                 let constructions = A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get());
                 eprintln!(
                     "A03 preview diff bytes={}/{}: constructions={constructions}",
@@ -2746,10 +2868,11 @@ mod tests {
                 let apply_params =
                     serde_json::json!({"include_diff": true, "include_diff_content": full});
                 attach_edit_diff(&mut applied, &apply_params, "golden.ts", &before, &after);
-                assert_eq!(
-                    applied,
-                    serde_json::json!({"metadata": {"diff": patch}, "diff": info})
-                );
+                let mut expected = serde_json::json!({"metadata": {"diff": patch}, "diff": info});
+                if content_omitted {
+                    crate::mutation_diff::mark_omitted(&mut expected);
+                }
+                assert_eq!(applied, expected);
                 assert_eq!(
                     A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get()),
                     1,
@@ -2920,6 +3043,7 @@ mod tests {
             assert_eq!(
                 response.data["metadata"]["diff"],
                 build_unified_diff(path.to_str().unwrap(), "const value = 1;\n", final_text)
+                    .unwrap()
             );
             let reads = A03_HANDLER_READS.with(|count| count.get())
                 + crate::backup::capture_read_count(&path);
