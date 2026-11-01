@@ -204,9 +204,23 @@ fn views_worktree_family_writes_publish_without_legacy_denial() {
     assert!(response.data.to_string().contains("workerCaller"));
     assert!(!response.data.to_string().contains("ownerCaller"));
     let scope = aft::path_identity::project_scope_key(&checkout);
-    assert!(aft::views::registry::view_dir(&storage, &scope)
-        .unwrap()
-        .join("CURRENT")
+    let family = ctx.memoized_artifact_cache_key(&checkout);
+    let view_dir = aft::blob_store::v3::view_dir(&storage, &family, &scope).unwrap();
+    let pointer = rusqlite::Connection::open_with_flags(
+        view_dir.join("pointer.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let generation: String = pointer
+        .query_row(
+            "SELECT generation FROM pointer WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!generation.is_empty());
+    assert!(view_dir
+        .join(format!("manifest-{generation}.json"))
         .is_file());
     let health = ctx.try_health_snapshot(&checkout);
     assert!(health.view_load_failures.is_empty(), "{health:?}");
