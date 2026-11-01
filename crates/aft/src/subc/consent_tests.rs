@@ -796,6 +796,20 @@ impl ConsentTransport for SharedFake {
             // Go through the real envelope encoder and decoder on both sides.
             let sent: Value = serde_json::from_slice(&encode(call.method, &call.params)?).unwrap();
             let params = sent["params"].clone();
+            if call.method == "consent.request"
+                && std::env::var_os("AFT_TEST_TRACE_CONSENT_REQUESTS").is_some()
+            {
+                let attempt = fake
+                    .calls("consent.request")
+                    .iter()
+                    .filter(|request| request["call_key"] == params["call_key"])
+                    .count()
+                    + 1;
+                eprintln!(
+                    "consent.request attempt={attempt} scope={} body={params}",
+                    json!(call.scope)
+                );
+            }
             let wait = Duration::from_millis(params["timeout_ms"].as_u64().unwrap_or(0));
             let end = Instant::now() + wait.min(call.timeout);
             let result = loop {
@@ -1938,6 +1952,46 @@ fn consent_covering_withdraw_log_names_grant_without_raw_path() {
 #[cfg(unix)]
 #[tokio::test]
 async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
+    folder_grant_settles_and_withdraws_covered_sibling(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_folder_grant_recovery_resends_the_unreceipted_sibling_key() {
+    folder_grant_settles_and_withdraws_covered_sibling(true).await;
+}
+
+#[cfg(unix)]
+fn assert_two_sibling_consent_asks(f: &Fixture, a: &Path, b: &Path) -> Vec<Value> {
+    let requests = f.fake.calls("consent.request");
+    let mut distinct = HashMap::new();
+    for request in &requests {
+        let key = request["call_key"].as_str().expect("consent call key");
+        if let Some(first) = distinct.insert(key, request) {
+            assert_eq!(first, request, "a resend must preserve the entire request");
+        }
+    }
+    assert_eq!(
+        distinct.len(),
+        2,
+        "exactly two distinct asks; consent.request attempts: {requests:#?}"
+    );
+    for path in [a, b] {
+        assert_eq!(
+            distinct
+                .values()
+                .filter(|request| request["paths"] == json!([path]))
+                .count(),
+            1,
+            "each read must have exactly one call key; requests: {requests:#?}"
+        );
+    }
+    assert_eq!(f.fake.state.lock().unwrap().asks.len(), 2, "two user cards");
+    requests
+}
+
+#[cfg(unix)]
+async fn folder_grant_settles_and_withdraws_covered_sibling(recover_unreceipted: bool) {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let _probe = DirectoryScopeProbeBudgetOverride::generous();
     let f = fixture(FakeCingulate::up());
@@ -1948,12 +2002,39 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
     let b = sub.join("b.txt");
     std::fs::write(&a, "a contents\n").unwrap();
     std::fs::write(&b, "b contents\n").unwrap();
-    let mut rx1 = f.send_read(&f.worker, &a, 901).await;
-    let mut rx2 = f.send_read(&f.worker, &b, 902).await;
-    wait_for(|| f.fake.calls("consent.request").len() >= 2).await;
-    let requests = f.fake.calls("consent.request");
-    assert_eq!(requests.len(), 2);
-    let key1 = requests[0]["call_key"].as_str().unwrap().to_string();
+    let (mut rx1, mut rx2) = if recover_unreceipted {
+        // An ask row is visible before its original waiter registers as live.
+        // A sibling arriving in that interval recovers the missing receipt by
+        // resending the saved request, not by creating another user card.
+        let grant = AccessGrant {
+            path: a.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let directory = scope_before_db(&grant).await;
+        let identity = f.worker.clone();
+        let arguments = json!({"path": a});
+        let prepared = with_db_handle(&scope_probe_call(&f, &a), move |db, ctx| {
+            prepare(
+                db, ctx, &identity, "read", &arguments, &grant, &directory, None,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(prepared, Prep::Ask(_)));
+        assert!(f.asks()[0].elicitation_id.is_none());
+        let rx2 = f.send_read(&f.worker, &b, 902).await;
+        wait_for(|| f.fake.calls("consent.request").len() == 2).await;
+        let rx1 = f
+            .send_tool(&f.worker, "read", json!({"path": a}), 901, read_dispatch)
+            .await;
+        wait_for(|| f.fake.calls("consent.request").len() >= 3).await;
+        (rx1, rx2)
+    } else {
+        let rx1 = f.send_read(&f.worker, &a, 901).await;
+        let rx2 = f.send_read(&f.worker, &b, 902).await;
+        (rx1, rx2)
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let records = f.asks();
@@ -1971,6 +2052,14 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // Recovery can resend a request before its first receipt is recorded.
+    // Count user asks by call key, while still rejecting a new key for either
+    // file, changed resend parameters, or an ask for an unrelated path.
+    let requests = assert_two_sibling_consent_asks(&f, &a, &b);
+    if recover_unreceipted {
+        assert_eq!(requests.len(), 3, "the missing receipt forces one resend");
+    }
+    let key1 = call_key_for_file(&requests, "a.txt");
     let before: std::collections::HashSet<String> = f
         .asks()
         .into_iter()
@@ -2007,6 +2096,7 @@ async fn consent_folder_grant_settles_and_withdraws_covered_sibling() {
         before.contains(withdrawn),
         "withdrawn ask was pending {withdrawn:?}"
     );
+    assert_two_sibling_consent_asks(&f, &a, &b);
 }
 
 /// Holds the reply for b.txt after Cingulate creates its card, before AFT can
