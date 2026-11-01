@@ -6106,6 +6106,95 @@ fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
     );
 }
 
+#[test]
+fn bounded_scoped_inspect_slow_server_returns_partial_before_transport_deadline() {
+    let (_temp, root, _lib) = single_crate_fixture("bounded-slow-inspect");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+
+    let started = Instant::now();
+    let response = scoped_diagnostics_inspect(&ctx, "bounded-slow-inspect", "src/lib.rs");
+    assert!(started.elapsed() < Duration::from_secs(30), "{response:#}");
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response.to_string().contains(
+            "no diagnostics for the current file content arrived in time; retry aft_inspect"
+        ),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() {
+    use aft::executor::{Executor, Lane};
+    use aft::path_identity::ProjectRootId;
+
+    let (_temp, root, _lib) = single_crate_fixture("bounded-abandoned-inspect");
+    let ctx = Arc::new(configured_context(&root));
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+    let signal = root.join("pull-started");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
+    let executor = Executor::new();
+    let root_id = ProjectRootId::from_path(&root).unwrap();
+    executor.register_actor(root_id.clone(), ctx.clone());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+        root_id.clone(),
+        Lane::SerialLspStatus,
+        "abandoned-inspect".into(),
+        "inspect",
+        Box::new(move |ctx| {
+            let response = handle_inspect_tool_call(
+                &request(json!({
+                    "id": "abandoned-inspect", "command": "inspect",
+                    "scope": "src/lib.rs", "sections": "diagnostics"
+                })),
+                ctx,
+            );
+            done_tx.send(response.clone()).unwrap();
+            response
+        }),
+    );
+    wait_for_path_event(&signal, "the language server's in-flight pull");
+    let bind = executor.submit(
+        root_id.clone(),
+        Lane::Mutating,
+        "subc-bind-after-abandon".into(),
+        Box::new(|_| aft::protocol::Response::success("subc-bind-after-abandon", json!({}))),
+    );
+    assert!(
+        bind.try_recv().is_err(),
+        "the active inspect must hold its reader"
+    );
+    // Route release and explicit CANCEL both signal this exact job token.
+    executor.cancel_job(&root_id, &cancellation);
+    let response = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("abandoned inspect stops without waiting for its diagnostics deadline");
+    assert_eq!(
+        response.data["inspect_terminal"], "interrupted",
+        "{response:?}"
+    );
+    assert!(
+        bind.recv_timeout(Duration::from_secs(2))
+            .expect("same-root bind proceeds after the abandoned reader exits")
+            .success
+    );
+}
+
 /// A compiler push after a cancelled pull does not answer rust-analyzer's
 /// native analysis request. Retry the pull and retain both sources.
 #[test]
