@@ -18434,7 +18434,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn parent_folder_last_route_close_stops_watcher_and_exclusion_retries() {
+    fn workspace_parent_last_route_close_releases_readers_and_rebinds_without_root_watcher() {
         let _env = crate::test_env::hermetic_git_env_guard();
         let _watcher = crate::test_env::with_project_watcher();
         let (dir, root) = test_root("parent-last-route");
@@ -18464,20 +18464,20 @@ mod tests {
         crate::test_admission::settle(&ctx);
         let parent = crate::views::parent::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
-        wait_for_watcher_count(&ctx, 1);
+        assert_eq!(
+            crate::folder_admission_runtime::snapshot(&ctx).unwrap()["classification"],
+            "workspace"
+        );
+        wait_for_watcher_count(&ctx, 0);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while counters
-            .snapshot()
-            .exclusion_planning
-            .is_none_or(|plan| plan.attempts < 2)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "backend must exercise exclusion retries"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert_eq!(
+            counters
+                .snapshot()
+                .exclusion_planning
+                .map_or(0, |plan| plan.attempts),
+            0,
+            "a workspace parent must not plan a recursive root watch"
+        );
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
@@ -18489,7 +18489,7 @@ mod tests {
         if !channels.contains_key(&root) {
             quiesce_unbound_root(&root, &mut roots, &executor);
         }
-        assert!(ctx.watcher_runtime_active());
+        assert!(!ctx.watcher_runtime_active());
         assert!(!parent.stopped());
         remove_root_channel(&mut channels, &root, route_key(8, 1));
         if !channels.contains_key(&root) {
@@ -18519,7 +18519,7 @@ mod tests {
         let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
-        wait_for_watcher_count(&ctx, 1);
+        wait_for_watcher_count(&ctx, 0);
         quiesce_unbound_root(&root, &mut roots, &executor);
         wait_for_watcher_count(&ctx, 0);
     }
