@@ -46,6 +46,16 @@ fn tool_call_matches_direct_spine_envelopes() {
 }
 
 #[test]
+fn tool_call_search_matches_direct_spine_envelopes() {
+    let cases: Vec<_> = parity_cases()
+        .into_iter()
+        .filter(|case| case.tool == "search")
+        .collect();
+    assert!(!cases.is_empty(), "search envelope cases must be exercised");
+    run_tool_call_parity(GlobMtimeProfile::Distinct, cases);
+}
+
+#[test]
 fn tool_call_glob_matches_direct_spine_with_equal_mtimes() {
     run_tool_call_parity(GlobMtimeProfile::Equal, vec![glob_parity_case()]);
 }

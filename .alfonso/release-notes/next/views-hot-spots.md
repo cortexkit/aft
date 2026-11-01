@@ -1,1 +1,1 @@
-Views reuse unchanged semantic chunk records without redundant storage writes, reducing CPU and disk work while indexes catch up after a restart.
+Views do less CPU and disk work while search indexes catch up after a restart, without changing search results.

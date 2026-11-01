@@ -14671,6 +14671,46 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in frozen-checkout ranking parse measurement"]
+    fn measurement_prose_identifier_frozen_checkout() {
+        let root = PathBuf::from(std::env::var_os("AFT_HOT_SPOT_CORPUS").expect("frozen corpus"));
+        let cpu = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+        };
+        for repeat in 0..3 {
+            let mut parser = crate::parser::FileParser::new();
+            let before = crate::parser::work_counters::tree_parses();
+            let cpu_started = cpu();
+            let started = std::time::Instant::now();
+            for (file, identifier) in [
+                ("crates/aft/src/views/semantic.rs", "SemanticPlane"),
+                ("crates/aft/src/fs_lock.rs", "LockGuard"),
+                ("crates/aft/src/context.rs", "AppContext"),
+                ("crates/aft/src/parser.rs", "FileParser"),
+                ("crates/aft/src/search_index.rs", "SearchIndex"),
+            ] {
+                assert!(identifier_has_code_reference(
+                    &root.join(file),
+                    identifier,
+                    &mut parser
+                ));
+            }
+            eprintln!("RANKING_PARSE_MEASUREMENT repeat={} files=5 tree_parses={} wall_ms={:.3} thread_cpu_ms={:.3}",
+                repeat, crate::parser::work_counters::tree_parses() - before,
+                started.elapsed().as_secs_f64() * 1000.0, (cpu() - cpu_started) * 1000.0);
+        }
+    }
+
     #[test]
     fn higher_scoring_file_summary_does_not_hide_lexical_winner_symbol() {
         let project = tempfile::tempdir().unwrap();
