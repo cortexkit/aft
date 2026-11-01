@@ -11654,7 +11654,17 @@ impl AppContext {
         // rather than answer from the store as it was before.
         if self.callgraph_catch_up.outstanding() {
             let deadline = Instant::now() + wait;
+            let mut progress = crate::run_tool_call::progress::BuildProgress::new(
+                self.config()
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(Path::new(".")),
+            );
             while self.callgraph_catch_up.outstanding() && Instant::now() < deadline {
+                if crate::executor::current_job_cancelled() {
+                    return CallgraphStoreAccess::Building;
+                }
+                progress.observe();
                 std::thread::sleep(Duration::from_millis(5).min(wait));
             }
             if self.callgraph_catch_up.outstanding() {
@@ -11836,8 +11846,24 @@ impl AppContext {
                 let Some(rx) = rx_ref.as_ref() else {
                     return CallgraphStoreAccess::Building;
                 };
+                let deadline = Instant::now() + wait;
+                let mut progress =
+                    crate::run_tool_call::progress::BuildProgress::new(&project_root);
+                let received = loop {
+                    if crate::executor::current_job_cancelled() {
+                        return CallgraphStoreAccess::Building;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let received = rx.recv_timeout(remaining.min(Duration::from_millis(50)));
+                    progress.observe();
+                    if !matches!(received, Err(crossbeam_channel::RecvTimeoutError::Timeout))
+                        || Instant::now() >= deadline
+                    {
+                        break received;
+                    }
+                };
                 (
-                    rx.recv_timeout(wait),
+                    received,
                     self.callgraph_store_rx_generation(),
                     self.callgraph_store_rx_epoch(),
                 )

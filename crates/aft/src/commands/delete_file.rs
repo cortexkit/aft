@@ -438,6 +438,7 @@ fn handle_delete_file_with_skip(
                     "details": resp.data,
                 })),
             }
+            crate::run_tool_call::progress::report();
         }
         if deleted.is_empty() && !skipped.is_empty() {
             let message = format!(

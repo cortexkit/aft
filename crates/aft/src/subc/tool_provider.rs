@@ -5333,6 +5333,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -6625,6 +6626,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -7321,6 +7323,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
@@ -7407,6 +7410,7 @@ pub(in crate::subc) mod route_tests {
                 worker_mode
             };
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
@@ -7529,6 +7533,7 @@ pub(in crate::subc) mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),

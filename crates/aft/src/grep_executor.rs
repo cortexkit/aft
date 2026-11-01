@@ -589,6 +589,7 @@ fn scope_has_files_unbounded(
     };
     let walker = builder.build();
     for (visited, entry) in walker.enumerate() {
+        crate::run_tool_call::progress::report();
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
             || Instant::now() >= deadline
             || crate::executor::current_job_cancelled()
@@ -1607,6 +1608,7 @@ pub(crate) fn source_first_fallback_walk_files(
         let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
         for entry in builder.build() {
             entries_visited += 1;
+            crate::run_tool_call::progress::report();
             if Instant::now() >= deadline {
                 walk_truncated = true;
                 walk_time_limit_reached = true;
@@ -2164,6 +2166,9 @@ fn fallback_grep_with_limits_counted(
                             Some(scan_deadline),
                             false,
                         );
+                        if let Some(token) = &job_cancellation {
+                            token.report_progress();
+                        }
                         if truncated.load(Ordering::Relaxed)
                             && total_matches.load(Ordering::Relaxed) >= stop_after
                         {

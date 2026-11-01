@@ -562,6 +562,7 @@ fn test_identity_data(root: &std::path::Path, stamp: ScopeStamp) -> super::Route
         consumer_elicitation_capable: false,
         held_reply: false,
         held_update: false,
+        call_keepalive: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope: Some(stamp),

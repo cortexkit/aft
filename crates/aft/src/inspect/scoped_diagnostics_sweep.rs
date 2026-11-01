@@ -158,6 +158,7 @@ fn pull_unlocked(
 ) -> Result<(PullFileOutcome, Option<Vec<StoredDiagnostic>>), crate::lsp::LspError> {
     let pull = ctx.lsp().begin_document_pull(key, file, deadline)?;
     let pull = pull.wait();
+    crate::run_tool_call::progress::report();
     let mut lsp = ctx.lsp();
     let outcome = lsp.finish_document_pull(pull);
     let diagnostics = matches!(
@@ -318,6 +319,7 @@ pub(crate) fn sweep_scoped_files(
                 continue;
             }
         };
+        crate::run_tool_call::progress::report();
         if !opened.is_empty() {
             sweep.opened.push((file.clone(), opened));
         }

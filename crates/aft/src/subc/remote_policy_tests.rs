@@ -757,6 +757,7 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
         consumer_elicitation_capable: false,
         held_reply: false,
         held_update: false,
+        call_keepalive: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         run_scope: OnceLock::new(),

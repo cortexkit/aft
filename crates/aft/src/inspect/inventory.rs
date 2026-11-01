@@ -241,7 +241,9 @@ impl InspectInventory {
                 source || manifest
             });
             let mut walker = builder.build();
-            while budget() && walker.next().is_some() {}
+            while budget() && walker.next().is_some() {
+                crate::run_tool_call::progress::report();
+            }
             drop(walker);
             let mut state = census.lock().unwrap();
             (

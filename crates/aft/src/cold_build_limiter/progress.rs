@@ -126,6 +126,11 @@ impl Entry {
     }
 
     fn advance(&mut self, done: u64, now: Instant) {
+        if done > self.done {
+            if let Some(token) = &self.cancellation {
+                token.report_progress();
+            }
+        }
         // At most one sample per second; no per-file allocation or growing
         // history. Keep the baseline before adding the new completed count.
         while self
@@ -392,6 +397,9 @@ pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
             if entry.phase != phase {
+                if let Some(token) = &entry.cancellation {
+                    token.report_progress();
+                }
                 entry.done = 0;
                 entry.samples.clear();
                 entry.samples.push_back((Instant::now(), 0));
@@ -407,7 +415,13 @@ pub(crate) fn phase(phase: &'static str, total: Option<usize>) {
 pub(crate) fn stage(stage: &'static str) {
     CURRENT.with(|current| {
         if let Some(entry) = current.borrow().as_ref() {
-            lock(entry).phase = stage;
+            let mut entry = lock(entry);
+            if entry.phase != stage {
+                entry.phase = stage;
+                if let Some(token) = &entry.cancellation {
+                    token.report_progress();
+                }
+            }
         }
     });
 }
@@ -462,6 +476,11 @@ pub(crate) fn embedded(chunks: usize) {
         if let Some(entry) = current.borrow().as_ref() {
             let mut entry = lock(entry);
             entry.chunks_embedded = Some(entry.chunks_embedded.unwrap_or(0) + chunks as u64);
+            if chunks > 0 {
+                if let Some(token) = &entry.cancellation {
+                    token.report_progress();
+                }
+            }
         }
     });
 }
@@ -474,6 +493,20 @@ pub(crate) fn cancel_token(key: usize) {
 }
 pub(crate) fn snapshot(warming_roots: u64) -> Snapshot {
     REGISTRY.snapshot(warming_roots, Instant::now())
+}
+
+/// Stable work counters only: queue age and lock waits must not look like work.
+pub(crate) fn work_for_root(root: &Path) -> Vec<(u64, &'static str, u64, Option<u64>)> {
+    let root = root.to_string_lossy();
+    lock(&REGISTRY.0)
+        .running
+        .iter()
+        .filter_map(|(id, entry)| {
+            let entry = lock(entry);
+            (entry.root == root && entry.kind.starts_with("callgraph ") && !entry.fallback)
+                .then_some((*id, entry.phase, entry.done, entry.chunks_embedded))
+        })
+        .collect()
 }
 
 /// Test fixtures observe only their unique root. The production census keeps

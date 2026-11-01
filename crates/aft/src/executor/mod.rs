@@ -563,6 +563,7 @@ pub struct JobCancellation {
 #[derive(Debug)]
 struct JobCancellationInner {
     state: AtomicU8,
+    progress: Mutex<Option<crate::run_tool_call::progress::Progress>>,
     wait_lock: Mutex<()>,
     wake: Condvar,
     #[cfg(test)]
@@ -579,6 +580,7 @@ impl JobCancellation {
         Self {
             inner: Arc::new(JobCancellationInner {
                 state: AtomicU8::new(JOB_CANCEL_STATE_PENDING),
+                progress: Mutex::new(None),
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
                 #[cfg(test)]
@@ -592,6 +594,27 @@ impl JobCancellation {
     pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
         self.root = Some(Arc::new(root.to_path_buf()));
         self
+    }
+
+    pub(crate) fn set_progress(&self, progress: crate::run_tool_call::progress::Progress) {
+        *self.inner.progress.lock() = Some(progress);
+    }
+
+    pub(crate) fn has_progress_channel(&self, key: usize) -> bool {
+        self.inner
+            .progress
+            .lock()
+            .as_ref()
+            .is_some_and(|progress| progress.key() == key)
+    }
+
+    pub(crate) fn report_progress(&self) {
+        if !self.cancel_already_requested() {
+            let progress = self.inner.progress.lock().clone();
+            if let Some(progress) = progress {
+                progress.report();
+            }
+        }
     }
 
     pub(crate) fn with_lifecycle(

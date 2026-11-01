@@ -252,6 +252,7 @@ pub fn analyze_files_with_cache(
     let mut cache_stats = OxcFactsCacheStats::default();
     let mut errors = Vec::new();
     let mut facts = Vec::with_capacity(files.len());
+    let progress = crate::run_tool_call::progress::FileProgress::current();
 
     for (idx, path) in files.iter().enumerate() {
         match cache.facts_for_file(
@@ -265,6 +266,9 @@ pub fn analyze_files_with_cache(
                 file: path.clone(),
                 message: format!("read: {error}"),
             }),
+        }
+        if let Some(progress) = &progress {
+            progress.finished();
         }
     }
 

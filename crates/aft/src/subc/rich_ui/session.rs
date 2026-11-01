@@ -183,6 +183,7 @@ fn effective_identity(
         consumer_elicitation_capable: false,
         held_reply: false,
         held_update: false,
+        call_keepalive: false,
         run_owner: None,
         run_scope: OnceLock::new(),
         made_tool_call: AtomicBool::new(true),
