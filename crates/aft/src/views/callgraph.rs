@@ -1500,6 +1500,9 @@ mod tests {
         let storage = temp.path().join("storage");
         let main = checkout(&temp.path().join("main"));
         setup_git(&main, &["init", "-q"]);
+        // Windows runners set core.autocrlf, which would check the linked
+        // worktree out with CRLF line endings and shift call-site byte offsets.
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
         setup_git(&main, &["add", "-A"]);
         setup_git(&main, &["commit", "-q", "-m", "fixture"]);
         let worker = temp.path().join("worker");
