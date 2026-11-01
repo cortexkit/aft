@@ -47,7 +47,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 
 struct Harness {
     daemon: tokio::io::DuplexStream,
-    module: std::thread::JoinHandle<Result<(), SubcError>>,
+    module: std::thread::JoinHandle<Result<ModuleLoopExit, SubcError>>,
     _dir: tempfile::TempDir,
     corr: u64,
     steps: std::sync::mpsc::Sender<(u64, bool)>,
@@ -109,16 +109,20 @@ impl Harness {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            identity: subc_protocol::BindIdentity::new(
-                root.as_path(),
-                "opencode",
-                "call-keepalive",
-            ),
+            identity: subc_protocol::BindIdentity::new("opencode", "call-keepalive"),
             principal: Some(Principal::Direct),
             consumer_capabilities: support
                 .then(|| vec![cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.to_owned()]),
             admission_facts: Default::default(),
-            scope: None,
+            scope: Some(
+                subc_protocol::scope::ScopeStamp::new(
+                    Principal::Direct,
+                    "call-keepalive",
+                    1,
+                    subc_protocol::scope::ScopeKind::Head,
+                )
+                .with_workdir(Some(root.as_path().to_string_lossy().into_owned())),
+            ),
             role_versions: None,
             call_mode: None,
         };
