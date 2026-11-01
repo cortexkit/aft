@@ -250,8 +250,11 @@ jobs:
             # A commit can carry more check runs than one page holds, and a
             # rerun job's check run is listed last, so walk every page. The
             # listing also lags the job's start by tens of seconds at times,
-            # so keep asking for up to two minutes.
-            if checks=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs?per_page=100" --jq '.check_runs[]'); then
+            # so keep asking for up to two minutes. filter=all: the default
+            # (latest) keeps one check run per name, so when another run has
+            # already finished this job on the same commit (the merge-queue
+            # run whose commit main's push run retests), it hides this one.
+            if checks=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs?per_page=100&filter=all" --jq '.check_runs[]'); then
               current=$(jq -c \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --arg job "OpenCode 2 (Linux Docker)" \
