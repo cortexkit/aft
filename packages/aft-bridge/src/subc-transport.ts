@@ -3154,31 +3154,19 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private promoteHostScope(session: string): void {
-    let upgraded = false;
     for (const record of this.sessions.values()) {
       const entry = record.routeEntry;
       if (record.identity.session !== session) continue;
       // Retirement stops new dispatches; the existing request counter defers closure of held waits.
-      if (entry?.handle && !entry.hostScope) {
-        upgraded = true;
-        this.retireHostToolRoute(record);
-      }
+      if (entry?.handle && !entry.hostScope) this.retireHostToolRoute(record);
       const sub = record.bgSub;
       if (!sub?.attachedRoute) continue;
-      upgraded = true;
       // The old subscription must finish closing before its normal attach path opens a scoped one.
       void sub.stop().then(() => {
         if (record.bgSub !== sub) return;
         record.bgSub = null;
         this.ensureBgSubscription(record.identity, record);
       });
-    }
-    const state = this.hostScopeCache.get(session);
-    if (upgraded && state?.unscopedReason && state.answer?.result === "scope") {
-      log(
-        `subc head scope: session=${session} route=upgraded from=unscoped ref=${state.answer.scope.ref.slice(0, 8)} epoch=${state.answer.scope.scopeEpoch}`,
-      );
-      state.unscopedReason = undefined;
     }
   }
 
@@ -3326,7 +3314,7 @@ export class SubcTransportPool implements AftTransportPool {
     return this.openScopedHostToolRoute(client, identity, record, entry, channel);
   }
 
-  private bindHostToolRoute(
+  private async bindHostToolRoute(
     client: SubcClientLike,
     identity: BindIdentity,
     channel: HostRouteChannel,
@@ -3337,10 +3325,27 @@ export class SubcTransportPool implements AftTransportPool {
       `subc head scope: session=${identity.session} bind=${scope ? "scoped" : "unscoped"} channel=${channel} root=${identity.project_root} reason=${reason}` +
         (scope ? ` ref=${scope.ref.slice(0, 8)} epoch=${scope.scopeEpoch}` : ""),
     );
-    return client.routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
-      consumerIdentity: this.consumerIdentity,
-      ...(scope ? { scope } : {}),
-    });
+    const route = await client.routeOpen(
+      { kind: "tool_provider", module_id: AFT_MODULE_ID },
+      identity,
+      {
+        consumerIdentity: this.consumerIdentity,
+        ...(scope ? { scope } : {}),
+      },
+    );
+    const state = this.hostScopeCache.get(identity.session);
+    if (
+      scope &&
+      state?.unscopedReason &&
+      state.answer?.result === "scope" &&
+      state.answer.scope === scope
+    ) {
+      log(
+        `subc head scope: session=${identity.session} route=upgraded from=unscoped ref=${scope.ref.slice(0, 8)} epoch=${scope.scopeEpoch}`,
+      );
+      state.unscopedReason = undefined;
+    }
+    return route;
   }
 
   private async openScopedHostToolRoute(
