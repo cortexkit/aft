@@ -231,6 +231,39 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     ctx
 }
 
+#[test]
+#[ignore = "manual cold-checkout timing with installed language servers"]
+fn scoped_inspect_cold_checkout_phase_timings() {
+    let root = PathBuf::from(std::env::var_os("AFT_INSPECT_REPRO_ROOT").expect("checkout root"));
+    let started = Instant::now();
+    let ctx = configured_context(&root);
+    eprintln!("configure_ms={}", started.elapsed().as_millis());
+    let started = Instant::now();
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "cold-checkout-timings", "command": "inspect", "worker_session": true,
+            "sections": "diagnostics",
+            "scope": ["crates/aft/src/commands/inspect.rs", "packages/opencode-plugin/src/tools/inspect.ts"]
+        }),
+    );
+    eprintln!(
+        "inspect_ms={} response={response:#}",
+        started.elapsed().as_millis()
+    );
+    for phase in inspect_phase_log_for_request("cold-checkout-timings")
+        .unwrap()
+        .records
+    {
+        eprintln!(
+            "phase={:?} duration_ms={:?} error={:?}",
+            phase.entry,
+            phase.duration_ms(),
+            phase.terminal_error
+        );
+    }
+}
+
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
     let (latest, disconnected) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
