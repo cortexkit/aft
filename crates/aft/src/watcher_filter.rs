@@ -3306,10 +3306,30 @@ mod tests {
         );
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            WatcherDispatchEvent::CookieObserved(cookie)
+            WatcherDispatchEvent::CookieObserved(cookie.clone())
         );
         assert_eq!(counters.snapshot().directory_subtree_walks_total, 1);
         assert_eq!(counters.snapshot().rescans_unknown_total, 0);
+        let vanished = root.join("crates/vanished");
+        std::fs::create_dir(&vanished).unwrap();
+        std::fs::remove_dir(&vanished).unwrap();
+        raw_tx.send(Ok(arrival(vanished.clone()))).unwrap();
+        std::fs::write(&cookie, b"").unwrap();
+        raw_tx
+            .send(Ok(notify::Event::new(notify::EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(cookie.clone())))
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::Paths(vec![vanished])
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            WatcherDispatchEvent::CookieObserved(cookie)
+        );
+        assert_eq!(counters.snapshot().directory_walk_fallbacks_total, 0);
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         worker.join().unwrap();

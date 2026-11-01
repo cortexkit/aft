@@ -1,1 +1,2 @@
 - Grep and search now discover files in directories moved into macOS or Windows projects without an intervening edit. Bounded checks of the arriving subtree avoid whole-project rebuilds for ordinary or empty directory creation; oversized, slow, or unreadable trees use the existing rescan path.
+- Late directory notifications for folders that have already vanished are handled as normal deletions, avoiding unnecessary rescans that could interrupt semantic refresh.

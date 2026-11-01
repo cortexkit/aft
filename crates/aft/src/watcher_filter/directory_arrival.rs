@@ -1,4 +1,4 @@
-//! Recover existing children of a directory introduced by one native event.
+//! Recover directory children, retaining deletion hints from late notifications.
 
 use super::*;
 
@@ -76,7 +76,7 @@ fn expand_with_limits(
         deadline,
         entries: 0,
     };
-    let mut files = Vec::new();
+    let mut changes = Vec::new();
     for path in paths {
         // Use the same root-relative rules as ordinary watcher paths before
         // opening a directory. The boundary also rejects symlinked parents.
@@ -93,7 +93,7 @@ fn expand_with_limits(
             continue;
         }
         config.counters.note_directory_arrival();
-        let result = scan(config, matcher, &path, &mut budget, &mut files);
+        let result = scan(config, matcher, &path, &mut budget, &mut changes);
         if let Err(reason) = result {
             return Err(Failure {
                 reason,
@@ -102,7 +102,7 @@ fn expand_with_limits(
             });
         }
     }
-    Ok(files)
+    Ok(changes)
 }
 
 fn scan(
@@ -110,7 +110,7 @@ fn scan(
     matcher: &SharedGitignore,
     arrival: &Path,
     budget: &mut Budget,
-    files: &mut Vec<PathBuf>,
+    changes: &mut Vec<PathBuf>,
 ) -> Result<(), &'static str> {
     let boundary = WatcherWalkBoundary::for_root(&config.project_root).ok_or("root_unavailable")?;
     let mut directories = VecDeque::from([arrival.to_path_buf()]);
@@ -119,10 +119,23 @@ fn scan(
         budget.check()?;
         match boundary.classify(&directory).0 {
             ExclusionPathKind::External => continue,
+            ExclusionPathKind::Absent => {
+                // Notifications can outlive a short-lived directory. Its absence
+                // is a normal deletion, not evidence that watcher coverage was lost.
+                changes.push(directory);
+                continue;
+            }
             ExclusionPathKind::LocalDirectory => {}
             _ => return Err("directory_unavailable"),
         }
-        let mut entries = exclusion_read_dir(&directory).map_err(|_| "read_error")?;
+        let mut entries = match exclusion_read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                changes.push(directory);
+                continue;
+            }
+            Err(_) => return Err("read_error"),
+        };
         // An empty arrival needs only this one-entry probe. Do not start a
         // subtree walk: any later file creation has its own native event.
         let mut entry = budget.next(&mut entries)?;
@@ -135,18 +148,38 @@ fn scan(
             config.counters.note_directory_walk();
         }
         while let Some(found) = entry {
-            let found = found.map_err(|_| "read_error")?;
-            let kind = found.file_type().map_err(|_| "read_error")?;
-            let path = found.path();
-            if kind.is_dir() && !kind.is_symlink() {
-                if !watcher_directory_is_ignored_by_matcher(matcher, &path, &config.project_root) {
-                    directories.push_back(path);
+            let found = match found {
+                Ok(found) => found,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    changes.push(directory.clone());
+                    break;
                 }
-            } else if kind.is_file()
-                && !kind.is_symlink()
-                && !watcher_path_is_ignored_by_matcher(matcher, &path, &config.project_root)
-            {
-                files.push(path);
+                Err(_) => return Err("read_error"),
+            };
+            let path = found.path();
+            let kind = match found.file_type() {
+                Ok(kind) => Some(kind),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    changes.push(path.clone());
+                    None
+                }
+                Err(_) => return Err("read_error"),
+            };
+            if let Some(kind) = kind {
+                if kind.is_dir() && !kind.is_symlink() {
+                    if !watcher_directory_is_ignored_by_matcher(
+                        matcher,
+                        &path,
+                        &config.project_root,
+                    ) {
+                        directories.push_back(path);
+                    }
+                } else if kind.is_file()
+                    && !kind.is_symlink()
+                    && !watcher_path_is_ignored_by_matcher(matcher, &path, &config.project_root)
+                {
+                    changes.push(path);
+                }
             }
             // Check before advancing even for ignored entries and directories;
             // counting only the files kept would leave wide trees unbounded.
@@ -246,10 +279,27 @@ mod tests {
     #[test]
     fn directory_arrival_failure_is_not_a_successful_partial_listing() {
         let (_temp, config, matcher) = fixture();
-        let error = expand(&config, &matcher, &[config.project_root.join("missing")]).unwrap_err();
+        let not_directory = config.project_root.join("not-a-directory");
+        fs::write(&not_directory, b"replacement file").unwrap();
+        let error = expand(&config, &matcher, &[not_directory]).unwrap_err();
         assert_eq!(error.reason, "directory_unavailable");
         error.report(&config);
         assert_eq!(config.counters.snapshot().directory_walk_fallbacks_total, 1);
+    }
+
+    #[test]
+    fn directory_arrival_that_vanished_is_a_normal_changed_path() {
+        let (_temp, config, matcher) = fixture();
+        let vanished = config.project_root.join("short-lived");
+        fs::create_dir(&vanished).unwrap();
+        fs::remove_dir(&vanished).unwrap();
+        assert_eq!(
+            expand(&config, &matcher, &[vanished.clone()]).unwrap(),
+            vec![vanished]
+        );
+        let counts = config.counters.snapshot();
+        assert_eq!(counts.directory_subtree_walks_total, 0);
+        assert_eq!(counts.directory_walk_fallbacks_total, 0);
     }
 
     #[cfg(unix)]

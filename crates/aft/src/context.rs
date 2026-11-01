@@ -1863,8 +1863,8 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_after_gitignore_since_last_rescan: u64,
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
-    /// Shared arrival recovery on macOS/Windows; Linux's watch-registration
-    /// enumeration remains in its own backend.
+    /// Shared arrival recovery on every platform. Linux also registers new
+    /// watches and reports files found there before acknowledging watcher cookies.
     pub(crate) directory_arrivals_total: u64,
     pub(crate) directory_subtree_walks_total: u64,
     pub(crate) directory_empty_total: u64,
