@@ -6164,7 +6164,7 @@ fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() 
                 })),
                 ctx,
             );
-            done_tx.send(response.clone()).unwrap();
+            done_tx.send(response.data.clone()).unwrap();
             response
         }),
     );
@@ -6176,7 +6176,10 @@ fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() 
         Box::new(|_| aft::protocol::Response::success("subc-bind-after-abandon", json!({}))),
     );
     assert!(
-        bind.try_recv().is_err(),
+        matches!(
+            bind.recv_timeout(Duration::ZERO),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ),
         "the active inspect must hold its reader"
     );
     // Route release and explicit CANCEL both signal this exact job token.
@@ -6184,10 +6187,7 @@ fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() 
     let response = done_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("abandoned inspect stops without waiting for its diagnostics deadline");
-    assert_eq!(
-        response.data["inspect_terminal"], "interrupted",
-        "{response:?}"
-    );
+    assert_eq!(response["inspect_terminal"], "interrupted", "{response:?}");
     assert!(
         bind.recv_timeout(Duration::from_secs(2))
             .expect("same-root bind proceeds after the abandoned reader exits")
