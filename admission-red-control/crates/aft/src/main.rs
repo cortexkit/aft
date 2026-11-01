@@ -1,0 +1,6241 @@
+mod cli;
+mod standalone_input;
+
+#[cfg(test)]
+#[path = "../tests/helpers/context_storage.rs"]
+mod context_storage;
+
+#[cfg(test)]
+#[path = "../tests/helpers/executable_cache.rs"]
+mod executable_cache;
+
+#[cfg(test)]
+mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static PROCESS_ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn process_env_lock() -> MutexGuard<'static, ()> {
+        PROCESS_ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+use aft::bash_background::BgTaskRegistry;
+use aft::config::Config;
+use aft::context::{App, AppContext, SemanticIndexStatus};
+use aft::log_ctx;
+use aft::lsp::child_registry::LspChildRegistry;
+use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
+use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
+use aft::runtime_registry::RuntimeRegistry;
+use standalone_input::{
+    HeldInput, InputBudget, InputFrame, OversizedLine, MAX_HELD_BYTES, MAX_HELD_ITEMS,
+    MAX_LINE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS,
+};
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::io::BufRead;
+use std::io::{self, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Exit status for a daemon connection that ended without a Goodbye. Non-zero so
+/// the supervisor respawns the module (it reads exit 0 as a stop request and
+/// never respawns), distinct from 1 (attach/auth failure) and 2 (usage).
+const SUBC_CONNECTION_LOST_EXIT_CODE: i32 = 3;
+/// Distinct from a lost connection so the supervisor's ledger separates "the
+/// daemon went away" from "a worker panicked"; both must respawn.
+const SUBC_ACTOR_FATAL_EXIT_CODE: i32 = 4;
+/// Cap on a request parse error's text in the log. serde's message is normally
+/// a short position report, but a type mismatch quotes the offending value.
+const PARSE_ERROR_LOG_BYTES: usize = 200;
+
+/// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
+/// when absent (standalone mode). The presence of the flag is the subc-mode
+/// gate; the value is the daemon's published connection-file path.
+fn parse_subc_arg(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            return args.next().map(std::path::PathBuf::from);
+        }
+        if let Some(raw) = arg.to_str().and_then(|a| a.strip_prefix("--subc=")) {
+            if !raw.is_empty() {
+                return Some(std::path::PathBuf::from(raw));
+            }
+        }
+    }
+    None
+}
+
+fn uses_subc_stderr(first_arg: Option<&str>, has_connection_file: bool) -> bool {
+    has_connection_file && !matches!(first_arg, Some("profile" | "warmup"))
+}
+
+#[cfg(test)]
+mod stderr_mode_tests {
+    use super::uses_subc_stderr;
+
+    #[test]
+    fn logger_mode_follows_transport_and_preserves_early_cli_precedence() {
+        assert!(uses_subc_stderr(Some("--subc"), true));
+        assert!(uses_subc_stderr(Some("--subc=connection.json"), true));
+        assert!(!uses_subc_stderr(None, false));
+        assert!(!uses_subc_stderr(Some("profile"), true));
+        assert!(!uses_subc_stderr(Some("warmup"), true));
+    }
+}
+
+/// Shared wait budget for durable-file and stderr flushing on error exits.
+const DURABLE_LOG_EXIT_FLUSH: Duration = Duration::from_secs(2);
+
+/// Flush the logs before `process::exit`, which skips every destructor
+/// and would otherwise drop the lines still queued for the log writer: the
+/// ones that explain the exit.
+fn exit_after_log_flush(code: i32) -> i32 {
+    let started = Instant::now();
+    aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    aft::logging::flush_stderr_on_exit(DURABLE_LOG_EXIT_FLUSH.saturating_sub(started.elapsed()));
+    aft::pinned_executable::cleanup_at_exit();
+    code
+}
+
+fn hold_process_storage_lease() -> Arc<aft::root_cache::ProcessStorageLease> {
+    let storage = aft::bash_background::storage_dir(None);
+    aft::root_cache::acquire_daemon_storage_lease(&storage).unwrap_or_else(|error| {
+        eprintln!(
+            "cannot acquire storage lease for {}: {error}",
+            storage.display()
+        );
+        std::process::exit(1);
+    })
+}
+
+#[cfg(debug_assertions)]
+fn storage_lease_exit_probe() {
+    let Some(path) =
+        std::env::var_os("AFT_TEST_STORAGE_LEASE_EXIT_PROBE").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    std::fs::write(&path, b"exit tail").expect("write storage lease exit probe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !path.with_extension("release").is_file() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn initialize_global_rayon_pool() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Names only help profiling, so never fail startup over them: if
+        // something already used Rayon, its unnamed pool keeps working.
+        if let Err(error) = rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("aft-rayon-{index}"))
+            .build_global()
+        {
+            eprintln!("aft: Rayon pool already started; its threads stay unnamed: {error}");
+        }
+    });
+}
+
+#[cfg(test)]
+mod rayon_thread_tests {
+    #[test]
+    fn global_rayon_worker_names() {
+        const CHILD: &str = "AFT_RAYON_NAME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::initialize_global_rayon_pool();
+            super::initialize_global_rayon_pool();
+            let names = rayon::broadcast(|_| {
+                assert!(rayon::current_thread_index().is_some());
+                std::thread::current().name().unwrap_or("").to_owned()
+            });
+            assert!(!names.is_empty());
+            for name in names {
+                assert!(name.starts_with("aft-rayon-"), "worker name: {name:?}");
+            }
+            return;
+        }
+
+        // Rayon cannot reset a process-global pool, so other parallel tests
+        // must not be able to initialize it before the startup hook is tested.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rayon_thread_tests::global_rayon_worker_names",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn main() {
+    // The subc daemon hands a supervised module its launch nonce through an
+    // inherited pipe (and, for now, an environment copy). Take it before
+    // anything else can run: this is the only moment the process has one
+    // thread and no children, so the pipe is read and closed and both
+    // variables are removed before any child (the login-shell PATH probe
+    // below included) could inherit them. Standalone mode has no nonce and
+    // never touches the descriptor.
+    let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
+    // Startup can stop before the logger exists. Opt-in test diagnostics go
+    // straight to stderr so the supervisor fixture can retain the last phase.
+    let trace_subc_startup = cfg!(debug_assertions)
+        && subc_connection_file.is_some()
+        && std::env::var_os("AFT_TEST_SUBC_STARTUP_TRACE").is_some();
+    let startup_started = Instant::now();
+    let startup_phase = |phase: &str| {
+        if trace_subc_startup {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "[aft-startup] pid={} phase={phase} elapsed_ms={}",
+                std::process::id(),
+                startup_started.elapsed().as_millis()
+            );
+        }
+    };
+    if subc_connection_file.is_some() {
+        startup_phase("nonce_capture_start");
+        aft::launch_nonce::capture_at_startup();
+        startup_phase("nonce_capture_done");
+        aft::pinned_executable::capture_at_startup();
+        startup_phase("executable_source_captured");
+    }
+
+    // Only the binary embeds the per-commit revision. Declare it before CLI
+    // dispatch or the subc HELLO can request the library's build provenance.
+    assert!(
+        aft::launch_nonce::initialize_binary_build_revision(option_env!("AFT_BUILD_GIT_SHA")),
+        "build provenance was already declared before binary startup"
+    );
+
+    // Record ORT_DYLIB_PATH as the spawner passed it, before anything in this
+    // process can export its own value: only a spawn-time value is an operator
+    // override of the ONNX Runtime library pin.
+    aft::ort_pin::capture_spawn_ort_dylib_path();
+
+    // `gh` is a compatibility entry point for the upstream GitHub CLI. Handle
+    // it before scanning AFT's global arguments; otherwise `gh --version` would
+    // be mistaken for AFT's own `--version` flag.
+    if aft::gh_shim::is_shim_invocation_from_env() {
+        std::process::exit(aft::gh_shim::run_from_env());
+    }
+
+    // Confinement must be installed before global argument scanning, logging,
+    // PATH discovery, or application threads. Target arguments such as
+    // `--version` belong to the command after `--`, not to AFT itself.
+    if std::env::args().nth(1).as_deref() == Some("sandbox-launch") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::sandbox_launch::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // The detached helper must not initialize PATH: it probes in its own
+    // process and writes a cache for a later serving process to apply.
+    if std::env::args().nth(1).as_deref() == Some("--probe-login-shell-path") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::probe_login_shell_path::parse_cache_path(args) {
+            Ok(cache_path) => {
+                if let Err(error) = aft::effective_path::refresh_login_shell_path_cache(&cache_path)
+                {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // `--formats` reports the highest on-disk format version of every store
+    // this build reads. Placement compares it with the storage root's reader
+    // floor, so it must stay side-effect free: no storage, no logging, no
+    // PATH probe.
+    if std::env::args().nth(1).as_deref() == Some("--formats") {
+        println!("{}", aft::persisted_format::formats_json());
+        return;
+    }
+
+    // Handle --version before starting the normal application.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("aft {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("migrate-storage") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match aft::migrate_storage::parse_cli_args(args) {
+            Ok(args) => {
+                let status = aft::migrate_storage::run_with_options(
+                    args,
+                    aft::migrate_storage::Options::default(),
+                );
+                std::process::exit(i32::from(status.code()));
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // The index command is a serial CLI handoff: it performs one finite
+    // snapshot and exits before logging, the App, runtime registry, or subc
+    // scheduler can establish any standing actor or future maintenance work.
+    if std::env::args().nth(1).as_deref() == Some("index") {
+        let _process_storage_lease = hold_process_storage_lease();
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        // Offline semantic collection can use Rayon. This branch exits without
+        // running the server's later process-environment mutations.
+        initialize_global_rayon_pool();
+        match cli::index::run(args) {
+            Ok(cli::index::IndexExit::Success) => return,
+            Ok(exit) => std::process::exit(exit.code()),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `aft setup` prints the feature plan (stdout must stay pure JSON) or
+    // writes the user's base choices, then exits. Like `index`, it runs
+    // before logging and never starts the application.
+    if std::env::args().nth(1).as_deref() == Some("setup") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::setup::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // `aft fix-config` is the configuration migration behind `aft doctor --fix`.
+    if std::env::args().nth(1).as_deref() == Some("fix-config") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::fix_config::run(args));
+    }
+    if std::env::args().nth(1).as_deref() == Some("clean-old-caches") {
+        std::process::exit(cli::clean_old_caches::run(
+            std::env::args_os().skip(2).collect(),
+        ));
+    }
+
+    // `aft backups purge` removes undo backups early. It runs before logging
+    // and the application start: it either hands the purge to the running
+    // daemon or performs it once and exits.
+    if std::env::args().nth(1).as_deref() == Some("backups") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::backups::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // `aft cache prune-legacy` is the only command that deletes legacy
+    // (pre-view) index sets. Like `backups`, it runs before logging and the
+    // application start, so it never opens a store it may be moving aside.
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::prune_legacy::run(args));
+    }
+
+    // Keep the lease outside every context and module-loop lifetime. It is
+    // acquired before any cache can be prepared and remains held until process
+    // exit; process::exit releases its kernel handle even when Rust skips Drop.
+    startup_phase("storage_lease_start");
+    let _process_storage_lease = hold_process_storage_lease();
+    startup_phase("storage_lease_done");
+
+    // Only the daemon's fixed deployment path can be replaced while it runs.
+    // Standalone hosts use versioned paths and need no persistent image copy.
+    // Pin before PATH discovery or application startup can launch children.
+    if subc_connection_file.is_some() {
+        startup_phase("executable_pin_start");
+        if let Err(error) = aft::pinned_executable::initialize() {
+            eprintln!("cannot pin the running AFT executable: {error}");
+            std::process::exit(1);
+        }
+        startup_phase("executable_pin_done");
+    }
+
+    // Daemon launches can miss user shell PATH entries. Initialize before any
+    // AFT threads or executors start so all subprocesses inherit one PATH.
+    startup_phase("path_start");
+    aft::effective_path::initialize_process_path();
+    startup_phase("path_done");
+
+    // A server process may itself have been spawned from a governed agent
+    // shell (nested daemons in tests and tooling). Shed inherited governance
+    // markers before threads start so children reflect THIS process's gates,
+    // not an outer daemon's. The gh-shim entry point above runs first and
+    // keeps its legitimate read of these markers.
+    aft::agent_child_env::scrub_inherited_process_markers();
+
+    // Environment capture and scrubbing must precede worker creation, while
+    // the named global pool must precede context construction and index work.
+    startup_phase("rayon_start");
+    initialize_global_rayon_pool();
+    startup_phase("rayon_done");
+
+    startup_phase("logging_start");
+    if uses_subc_stderr(
+        std::env::args().nth(1).as_deref(),
+        subc_connection_file.is_some(),
+    ) {
+        aft::logging::init_subc();
+    } else {
+        aft::logging::init();
+    }
+    startup_phase("logging_done");
+    aft::effective_path::log_startup_probe_result();
+
+    if std::env::args().nth(1).as_deref() == Some("profile") {
+        // Dispatched on every platform: `--memory` reads the daemon's census and
+        // has no OS dependency, and profile::run itself refuses CPU sampling
+        // where it is unsupported. A cfg gate here hid the memory view on
+        // Windows behind the sampler's refusal.
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::profile::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("warmup") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::warmup::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // subc daemon attach: `aft --subc <connection-file>` swaps the
+    // standalone NDJSON-over-stdin transport for the subc loopback-TCP client.
+    // Presence of --subc => subc mode; absence => standalone (the dormancy gate).
+    // Fail-loud on connect/auth failure — never silently downgrade to standalone
+    // (split-brain index state). tokio runs ONLY inside run_subc_mode.
+    if let Some(connection_file) = subc_connection_file {
+        aft::slog_info!("subc mode, pid {}", std::process::id());
+        aft::launch_nonce::log_capture_outcome();
+        // The supervised module holds the secret it authenticates to the
+        // daemon with, so it loads only an ONNX Runtime it could hash first
+        // (see ort_pin), never one found by bare name on the loader search path.
+        startup_phase("ort_pin_start");
+        aft::ort_pin::require_pinned_onnx_runtime();
+        startup_phase("ort_pin_done");
+        // A single AppContext serves the attached routes (N=1); subc tool calls
+        // are routed through the per-actor executor once the first route binds.
+        startup_phase("context_start");
+        let app = App::default_shared();
+        let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+        startup_phase("context_done");
+        // Tell the fleet backup service what this storage root holds; a
+        // failure is logged and never stops the module from attaching.
+        aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+        let executor = Arc::new(aft::executor::Executor::new());
+        install_subc_signal_handler(
+            Arc::clone(&executor),
+            Arc::clone(&ctx),
+            app.lsp_child_registry(),
+        );
+        // Resolve AFT's own CortexKit config home once at the boundary; it is
+        // threaded into the per-bind tier composition (W5). Under the gateway
+        // there is no plugin to relay on-disk config, so this is how a gateway
+        // user's aft.jsonc reaches AFT.
+        let user_config_path = aft::subc_config::cortexkit_user_config_path();
+        // AFT_TEST_HOLD_ORT_SECTION holds an ORT section open during shutdown,
+        // without loading ORT or relying on inference speed. Release builds
+        // ignore the environment variable.
+        #[cfg(debug_assertions)]
+        let _held_ort =
+            std::env::var_os("AFT_TEST_HOLD_ORT_SECTION").and_then(|_| aft::ort_lifecycle::enter());
+        startup_phase("module_runtime_start");
+        match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
+        {
+            Ok(()) => {
+                aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
+                // ORT work persists nothing needed by the next module. Close the
+                // ORT work gate without waiting and skip native teardown if work
+                // is active: waiting would only spend the restart budget.
+                aft::slog_info!(
+                    "subc exit phase=ort_quiesce active={} budget_ms=0 elapsed_ms={}",
+                    aft::ort_lifecycle::active_sections(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let native_idle = aft::ort_lifecycle::close_and_wait(Duration::ZERO);
+                aft::slog_info!(
+                    "subc exit phase=ort_done native_idle={} elapsed_ms={}",
+                    native_idle,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flush_wait = aft::subc::exit_log_flush_wait();
+                aft::slog_info!(
+                    "subc exit phase=log_flush budget_ms={} elapsed_ms={}",
+                    flush_wait.as_millis(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flushed = aft::logging::flush_durable_log(flush_wait);
+                // AFT_TEST_STDERR_EXIT_HOLD keeps every stderr line from here
+                // on queued until the stderr exit fence below starts, so a test
+                // can prove the fence delivers them rather than rely on the
+                // mirror thread happening to run first. Release builds ignore it.
+                #[cfg(debug_assertions)]
+                if std::env::var_os("AFT_TEST_STDERR_EXIT_HOLD").is_some() {
+                    aft::logging::hold_stderr_mirror_until_exit_fence();
+                }
+                aft::slog_info!(
+                    "subc exit phase=log_flush_done flushed={} elapsed_ms={}",
+                    flushed,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                // A bounded queue flush can expire on a slow writer. Take its
+                // sink and persist the terminal marker directly so later writes
+                // cannot rotate it away before either kind of process exit.
+                let terminal = format!(
+                    "subc exit phase=process_exit mode={} elapsed_ms={}",
+                    if native_idle {
+                        "return"
+                    } else {
+                        "skip_native_teardown"
+                    },
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
+                    aft::logging::write_stderr_diagnostic(&format!(
+                        "[aft] terminal log persistence failed: {error}; {terminal}\n"
+                    ));
+                }
+                #[cfg(debug_assertions)]
+                storage_lease_exit_probe();
+                // The stderr mirror has its own queue: a durable-file flush does
+                // not deliver the shutdown reason to redirected module stderr.
+                aft::logging::flush_stderr_on_exit(aft::subc::exit_log_flush_wait());
+                aft::pinned_executable::cleanup_at_exit();
+                if !native_idle {
+                    aft::ort_lifecycle::exit_without_native_teardown(0);
+                }
+                return;
+            }
+            // A lost connection is a restart request, not a failure to attach:
+            // the supervisor respawns any non-zero exit, and a distinct code keeps
+            // it separate from attach/auth failures in the supervisor's ledger.
+            Err(aft::subc::SubcError::ConnectionLost) => {
+                aft::slog_error!(
+                    "subc connection lost after attach; exiting for supervisor restart"
+                );
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(
+                    SUBC_CONNECTION_LOST_EXIT_CODE,
+                ));
+            }
+            Err(aft::subc::SubcError::ActorFatal) => {
+                aft::slog_error!(
+                    "executor actor went fatal after attach; exiting for supervisor restart"
+                );
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(SUBC_ACTOR_FATAL_EXIT_CODE));
+            }
+            Err(error) => {
+                aft::slog_error!("subc attach failed: {error}");
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(1));
+            }
+        }
+    }
+
+    aft::slog_info!("started, pid {}", std::process::id());
+
+    let app = App::default_shared();
+    let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+    // Same catalog as in subc mode, written before the first request.
+    aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
+    ctx.set_daemonless_query_mode(true);
+    let registry = RuntimeRegistry::standalone(app, ctx);
+    // P3-02 slice 2: signal handling aggregates all per-actor
+    // background registries; drain/dispatch multi-root routing remains later.
+    {
+        let bg_registries = signal_bg_registries(&registry);
+        let lsp_children = registry.app().lsp_child_registry();
+        install_signal_handler(bg_registries, lsp_children);
+    }
+
+    // Install bash output-compression closures per actor so each background
+    // registry captures its own filter registry and compress flag.
+    // Future P5 actor creation at attach must call this for each new actor.
+    for runtime in registry.iter() {
+        install_bash_compressor(runtime);
+    }
+
+    // P3-02: stdout/progress is a process service — N>1 must keep one
+    // shared sink so response and push frames do not interleave/corrupt.
+    let stdout_writer = registry.current().stdout_writer();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_from_push = Arc::clone(&shutdown_requested);
+    registry
+        .current()
+        .set_progress_sender(Some(Arc::new(Box::new(move |frame: PushFrame| {
+            let Ok(mut writer) = stdout_writer.lock() else {
+                aft::slog_error!("stdout push frame lock poisoned; shutting down bridge");
+                shutdown_from_push.store(true, Ordering::SeqCst);
+                return;
+            };
+            write_push_frame_or_request_shutdown(&mut *writer, &frame, &shutdown_from_push);
+        }))));
+
+    // Stdin is read by a dedicated thread that forwards lines through a
+    // channel. The main thread does recv_timeout so it wakes periodically
+    // even when no agent traffic is arriving — that periodic wake runs
+    // the drain_* functions so background-build channel events (e.g.
+    // SemanticIndexEvent::Ready) get processed and their status_changed
+    // push frames emitted. Without the wake, the sidebar can stay stuck
+    // on "loading" indefinitely until the next request happens to arrive.
+    //
+    // A deferred request's worker also wakes this loop through
+    // `deferred_wake_rx` once its response is ready, so the response is written
+    // straight away. The pending poll interval below is only a fallback for
+    // deferred responses whose producers do not send that wake.
+    const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
+    let pending_poll_interval = standalone_pending_poll_interval();
+    let mut pending = PendingResponses::default();
+    let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
+    let mut queued_lines = VecDeque::new();
+    let input_budget = InputBudget::new(MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS);
+    let reader_budget = Arc::clone(&input_budget);
+    let (line_tx, line_rx) = crossbeam_channel::bounded::<InputFrame>(MAX_RETAINED_ITEMS);
+    let (deferred_wake_tx, deferred_wake_rx) = crossbeam_channel::bounded::<()>(1);
+    // Holding a sender here keeps the wake channel connected for the whole
+    // loop even if the process-wide slot was already taken, so waiting on it
+    // can never spin on a disconnected receiver.
+    let _deferred_wake_keepalive = deferred_wake_tx.clone();
+    let _ = DEFERRED_RESPONSE_WAKER.set(deferred_wake_tx);
+    let mut graceful_stdin_shutdown = false;
+    // While an edit waits on its type checker (see
+    // `dispatch_with_offloaded_validation`), `validation_gate` holds that
+    // edit's request id. Only `is_served_during_pending_validation` commands
+    // are answered meanwhile; everything else is parked in `held_lines`, in
+    // arrival order, and replayed ahead of newer input once the edit's response
+    // has been written. This keeps file mutations strictly serialized: a second
+    // edit of the same file cannot start until the first one has finished.
+    let mut validation_gate: Option<String> = None;
+    let mut held_lines = HeldInput::new(MAX_HELD_BYTES, MAX_HELD_ITEMS);
+    const VALIDATION_GATE_POLL_INTERVAL: Duration = DRAIN_INTERVAL;
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        loop {
+            let (result, fatal) =
+                match standalone_input::read_bounded_line(&mut reader, MAX_LINE_BYTES) {
+                    Ok(Some(line)) => (line.result, false),
+                    Ok(None) => break,
+                    Err(error) => (Err(error), true),
+                };
+            let Some(frame) = reader_budget.admit(result) else {
+                break;
+            };
+            if line_tx.send(frame).is_err() || fatal {
+                break;
+            }
+        }
+    });
+
+    #[cfg(debug_assertions)]
+    if let Some(count) = std::env::var("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+    {
+        // Queue the fixture's entire initial burst before configure can start
+        // maintenance, rather than guessing when the stdin reader is scheduled.
+        for _ in 0..count {
+            match line_rx.recv() {
+                Ok(line) => queued_lines.push_back(line),
+                Err(_) => break,
+            }
+        }
+    }
+
+    loop {
+        if shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if validation_gate
+            .as_deref()
+            .is_some_and(|request_id| !pending.contains(request_id))
+        {
+            validation_gate = None;
+            while let Some(line) = held_lines.pop_back() {
+                queued_lines.push_front(line);
+            }
+        }
+        let gated = validation_gate.is_some();
+
+        let configure_pending = configure_maintenance.has_pending(registry.current());
+        let recv_timeout = if gated {
+            VALIDATION_GATE_POLL_INTERVAL
+        } else if configure_pending {
+            Duration::from_millis(100)
+        } else if pending.is_empty() {
+            DRAIN_INTERVAL
+        } else {
+            pending_poll_interval
+        };
+        let line_frame = if let Some(result) = queued_lines.pop_front() {
+            result
+        } else {
+            match wait_for_loop_input(&line_rx, &deferred_wake_rx, recv_timeout) {
+                LoopInput::Line(result) => result,
+                LoopInput::DeferredResponseReady => {
+                    // A deferred worker finished: write its response now
+                    // instead of at the next poll. Runtime drains keep their
+                    // own schedule (the timeout branches below).
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Timeout if gated => {
+                    // Runtime drains stay paused while the edit finishes,
+                    // exactly as they were while an edit ran inline; only the
+                    // edit's own deferred response is polled.
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Disconnected if gated => {
+                    // Stdin closed with requests still held behind the edit:
+                    // finish the edit and replay them before shutting down.
+                    let _ = deferred_wake_rx.recv_timeout(VALIDATION_GATE_POLL_INTERVAL);
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Timeout => {
+                    // Periodic drain so push frames flow even without requests.
+                    // The request-critical configure prefix runs before a cooperative
+                    // suffix step; storage-wide sweeps run on separate threads.
+                    let mut collect_queued = || collect_queued_lines(&line_rx, &mut queued_lines);
+                    if let Err(e) = drain_runtime_events_and_write_pending_cooperatively(
+                        &registry,
+                        &mut pending,
+                        &mut configure_maintenance,
+                        &mut collect_queued,
+                    ) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    {
+                        let now = std::time::Instant::now();
+                        let _ = aft::memory::spawn_allocator_slack_relief_if_due(now);
+                    }
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Disconnected => {
+                    // Human-readable reason line; the phase markers below cover the
+                    // shutdown sequence itself. protocol_test asserts this banner.
+                    aft::slog_info!("stdin closed, shutting down");
+                    graceful_stdin_shutdown = true;
+                    break;
+                }
+            }
+        };
+
+        let line = match &line_frame.result {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(response) = recoverable_stdin_error(e) {
+                    if let Err(error) = write_response(registry.current(), &response) {
+                        aft::slog_error!("stdout write error: {}", error);
+                        break;
+                    }
+                    continue;
+                }
+                aft::slog_error!("stdin read error: {}", e);
+                break;
+            }
+        };
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut shutdown_after_response = false;
+        let mut progress_request_id = None;
+        let response = match parse_transport_request(trimmed) {
+            Ok((req, handles_progress)) => {
+                if let Some(response) = duplicate_pending_response(&req, &pending) {
+                    Some(response)
+                } else {
+                    if gated && !is_served_during_pending_validation(&req.command) {
+                        if let Err(_refused) = held_lines.push(line_frame) {
+                            if let Err(error) = write_response(
+                                registry.current(),
+                                &input_queue_full_response(&req.id),
+                            ) {
+                                aft::slog_error!("stdout write error: {}", error);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if !gated {
+                        // The first request after each configure waits for the request-critical
+                        // prefix. The remaining project-runtime and indexing work stays
+                        // cooperative, so even ping runs before another suffix unit.
+                        configure_maintenance.drain_prefix(registry.current());
+                        if configure_maintenance.has_pending(registry.current()) {
+                            aft::runtime_drain::note_configure_maintenance_yield(
+                                queued_lines.len() + 1,
+                            );
+                        }
+                        // Install any completed search index before applying watcher changes.
+                        // These bounded, non-blocking drains let each request use the freshest
+                        // available index without waiting for configure maintenance.
+                        aft::logging::note_drain_slice();
+                        drain_non_configure_runtime_events(&registry);
+                    }
+                    let request_id = req.id.clone();
+                    let session_id = req.session().to_string();
+                    let command = req.command.clone();
+                    let attach_command = attach_command_for_request(&req);
+                    let session_id_for_log = req.session_id.clone();
+                    // Standalone requests share one selected runtime. The envelope
+                    // has no separate root selector, so do not infer a runtime from
+                    // a file path inside an individual tool's arguments.
+                    let runtime = registry.current();
+                    if handles_progress {
+                        runtime.record_request_handles_progress(&request_id);
+                    }
+                    progress_request_id = Some(request_id.clone());
+                    runtime.note_request();
+                    // Keep the request's configuration snapshot pinned through
+                    // standalone response finalization.
+                    let _request_pin = runtime.pin_config();
+                    let gates_on_validation = offloads_full_validation(&req, runtime);
+                    let dispatch_result = catch_unwind(AssertUnwindSafe(|| {
+                        log_ctx::with_session(session_id_for_log, || {
+                            dispatch_with_pending_admission(req, runtime, &mut pending)
+                        })
+                    }));
+                    match dispatch_result {
+                        Ok(DispatchOutcome::Immediate(mut response)) => {
+                            aft::response_finalize::finalize_response(
+                                &mut response,
+                                runtime,
+                                &session_id,
+                                &attach_command,
+                            );
+                            Some(response)
+                        }
+                        Ok(DispatchOutcome::Deferred(pending_response)) => {
+                            match pending
+                                .register(pending_response.with_admitted_config(runtime.config()))
+                            {
+                                Ok(()) => {
+                                    if gates_on_validation {
+                                        validation_gate = Some(request_id.clone());
+                                    }
+                                    None
+                                }
+                                Err(rejected) => {
+                                    if let Some(cancellation) = rejected.cancellation {
+                                        cancellation.request_cancel();
+                                    }
+                                    Some(duplicate_request_response(&request_id))
+                                }
+                            }
+                        }
+                        Err(payload) => {
+                            shutdown_after_response = true;
+                            Some(dispatch_panic_response(
+                                request_id,
+                                &command,
+                                payload.as_ref(),
+                            ))
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Never log the raw line: a malformed request can still carry
+                // bash command text, file contents for write/edit, or search
+                // queries. Length and a short hash are enough to correlate it
+                // with a copy the client kept. The parser error itself is
+                // bounded because serde can quote a mistyped value in it.
+                let error_text = aft::log_redact::aft_redactor(&e.to_string()).into_owned();
+                aft::slog_error!(
+                    "parse error: {} ({})",
+                    aft::log_redact::truncate_for_log(&error_text, PARSE_ERROR_LOG_BYTES),
+                    aft::log_redact::unlogged_input_summary(trimmed)
+                );
+                Some(Response::error(
+                    parse_error_request_id(trimmed),
+                    "parse_error",
+                    format!("failed to parse request: {}", e),
+                ))
+            }
+        };
+
+        if let Some(response) = response {
+            let result = write_response(registry.current(), &response);
+            if let Some(request_id) = progress_request_id {
+                registry
+                    .current()
+                    .clear_request_handles_progress(&request_id);
+            }
+            if let Err(e) = result {
+                aft::slog_error!("stdout write error: {}", e);
+                break;
+            }
+        }
+        let gated = validation_gate.is_some();
+        if !gated {
+            drain_configure_warning_events_for_registry(&registry);
+        }
+        if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+            aft::slog_error!("stdout write error: {}", e);
+            break;
+        }
+        if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
+        if gated {
+            // Background work resumes once the edit's response is written.
+            continue;
+        }
+
+        // One suffix unit per served request, whether or not more requests are
+        // queued. Yielding only on idle gaps starves the suffix under a steady
+        // request stream: an agent polling right after configure never left
+        // the 100 ms silence the idle branch waits for, so the project watcher
+        // (a suffix unit) never started and ignore-rule changes went unseen.
+        // Units are bounded by construction, and the cost lands after the
+        // response is written, so the served request's latency is unchanged.
+        if configure_maintenance.has_pending(registry.current()) {
+            configure_maintenance.drain_one(registry.current());
+        }
+        let queued = collect_queued_lines(&line_rx, &mut queued_lines);
+        if queued > 0 {
+            if configure_maintenance.has_pending(registry.current()) {
+                aft::runtime_drain::note_configure_maintenance_yield(queued);
+            }
+        } else {
+            drain_non_configure_runtime_events(&registry);
+        }
+    }
+
+    input_budget.close();
+    let shutdown_started = Instant::now();
+    aft::slog_info!(
+        "shutdown phase=begin graceful_stdin={}",
+        graceful_stdin_shutdown
+    );
+    pending.drain_on_shutdown_delivering(registry.current(), |mut resolved| {
+        aft::response_finalize::finalize_response(
+            &mut resolved.response,
+            registry.current(),
+            &resolved.session_id,
+            &resolved.attach_command,
+        );
+        if let Err(error) = write_response(registry.current(), &resolved.response) {
+            aft::slog_error!("stdout write error while emitting shutdown terminal: {error}");
+        }
+        registry
+            .current()
+            .clear_request_handles_progress(&resolved.response.id);
+    });
+    aft::slog_info!("shutdown phase=pending_responses_drained");
+    // Everything from here to exit fits in the exit budget measured from this
+    // point: the index flushes end by `flush_deadline`, then LSP shutdown
+    // takes at most its own budget.
+    let drained_at = Instant::now();
+    if graceful_stdin_shutdown {
+        // Only the natural stdin-EOF path flushes owner-side index deltas and
+        // queued callgraph refreshes. Signal, stdout-error, and panic teardown
+        // skip disk work so abrupt exits stay fast and avoid lock contention.
+        flush_indexes_on_graceful_shutdown(&registry, shutdown_started, drained_at);
+    }
+    aft::slog_info!("shutdown phase=runtime_cleanup_start");
+    let mut clients = Vec::new();
+    for runtime in registry.iter() {
+        clients.extend(runtime.lsp().take_all_clients());
+        runtime.bash_background().detach();
+    }
+    aft::lsp::manager::LspManager::shutdown_taken_clients(
+        clients,
+        registry.app().lsp_child_registry(),
+    );
+    aft::slog_info!("shutdown phase=runtime_cleanup_done");
+    aft::artifact_owner::shutdown_heartbeat_thread();
+    aft::slog_info!(
+        "shutdown phase=complete elapsed_ms={}",
+        shutdown_started.elapsed().as_millis()
+    );
+    aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    // A detached semantic worker may still be inside ONNX Runtime (creating its
+    // environment, loading the model, or embedding). Returning from main would
+    // run ORT's C++ static destructors underneath it and crash at exit, so wait
+    // for that native work to finish, or skip native teardown if it will not.
+    aft::ort_lifecycle::quiesce_before_return(0);
+}
+
+#[cfg(test)]
+fn drain_runtime_events(registry: &RuntimeRegistry) {
+    for runtime in registry.iter() {
+        aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
+        aft::runtime_drain::drain_configure_warning_events(runtime);
+        aft::config_live::drain_config_reload(runtime);
+        aft::runtime_drain::drain_search_index_events(runtime);
+        aft::runtime_drain::drain_callgraph_store_events(runtime);
+        aft::runtime_drain::drain_semantic_index_events(runtime);
+        aft::runtime_drain::drain_semantic_refresh_events(runtime);
+        aft::runtime_drain::drain_inspect_events(runtime);
+        aft::runtime_drain::drain_watcher_events(runtime);
+        aft::runtime_drain::drain_lsp_events(runtime);
+        aft::runtime_drain::shutdown_idle_lsp(runtime);
+    }
+    aft::logging::perf_tick(None);
+}
+
+fn drain_runtime_events_cooperatively(
+    registry: &RuntimeRegistry,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
+) {
+    // Standalone mode keeps this progress state with its runtime so deferred
+    // configure work resumes at the next step.
+    let runtime = registry.current();
+    if configure.has_pending(runtime) {
+        configure.drain_prefix(runtime);
+        let has_more = configure.has_pending(runtime) && configure.drain_one(runtime);
+        let queued = queued_requests();
+        if queued > 0 && has_more {
+            aft::runtime_drain::note_configure_maintenance_yield(queued);
+        }
+        if has_more || queued > 0 {
+            return;
+        }
+    }
+
+    drain_non_configure_runtime_events(registry);
+}
+
+fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
+    let runtime = registry.current();
+    // Preserve the dependency order: install finished search artifacts before
+    // watcher deltas, then advance the other build channels and diagnostics.
+    aft::runtime_drain::drain_configure_warning_events(runtime);
+    aft::config_live::drain_config_reload(runtime);
+    aft::runtime_drain::drain_search_index_events(runtime);
+    aft::runtime_drain::drain_callgraph_store_events(runtime);
+    aft::runtime_drain::drain_semantic_index_events(runtime);
+    aft::runtime_drain::drain_semantic_refresh_events(runtime);
+    aft::runtime_drain::drain_inspect_events(runtime);
+    aft::runtime_drain::drain_watcher_events(runtime);
+    aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
+    aft::runtime_drain::drain_lsp_events(runtime);
+    aft::runtime_drain::shutdown_idle_lsp(runtime);
+    aft::logging::perf_tick(None);
+    aft::runtime_drain::spawn_standalone_log_maintenance();
+    aft::db::write_ledger::maybe_spawn_fold(runtime.db());
+    aft::db::compression_events::maybe_spawn_retention(
+        runtime.db(),
+        Some(signal_bg_registries(registry)),
+    );
+}
+
+/// Default interval at which the standalone loop polls deferred responses that
+/// did not wake it.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn standalone_pending_poll_interval() -> Duration {
+    // Test seam: stretching the fallback poll lets a test prove that a deferred
+    // response is written because its worker woke the loop, not because the
+    // poll came round.
+    std::env::var("AFT_TEST_PENDING_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(PENDING_POLL_INTERVAL)
+}
+
+/// Wakes the standalone loop when a deferred worker has its response ready.
+/// It is set only by the standalone loop; elsewhere (the subc daemon, unit
+/// tests) waking is a no-op and those callers poll as before.
+static DEFERRED_RESPONSE_WAKER: std::sync::OnceLock<crossbeam_channel::Sender<()>> =
+    std::sync::OnceLock::new();
+
+fn wake_standalone_loop_for_deferred_response() {
+    if let Some(waker) = DEFERRED_RESPONSE_WAKER.get() {
+        // A full slot already holds an unread wake, and one wake makes the
+        // loop poll every pending response, so dropping this one loses nothing.
+        let _ = waker.try_send(());
+    }
+}
+
+/// What the standalone loop woke up for.
+enum LoopInput {
+    /// A line read from stdin.
+    Line(InputFrame),
+    /// A deferred worker finished and its response can be written.
+    DeferredResponseReady,
+    /// Nothing arrived within the wait; time for periodic work.
+    Timeout,
+    /// Stdin closed and every line it produced has been received.
+    Disconnected,
+}
+
+fn wait_for_loop_input(
+    line_rx: &crossbeam_channel::Receiver<InputFrame>,
+    deferred_wake_rx: &crossbeam_channel::Receiver<()>,
+    timeout: Duration,
+) -> LoopInput {
+    crossbeam_channel::select! {
+        recv(line_rx) -> line => match line {
+            Ok(line) => LoopInput::Line(line),
+            Err(_) => LoopInput::Disconnected,
+        },
+        recv(deferred_wake_rx) -> _ => LoopInput::DeferredResponseReady,
+        default(timeout) => LoopInput::Timeout,
+    }
+}
+
+fn collect_queued_lines(
+    line_rx: &crossbeam_channel::Receiver<InputFrame>,
+    queued_lines: &mut VecDeque<InputFrame>,
+) -> usize {
+    while let Ok(line) = line_rx.try_recv() {
+        queued_lines.push_back(line);
+    }
+    queued_lines.len()
+}
+
+#[cfg(test)]
+fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Deadline-bounded EOF index flush, shared by the transport and its regression tests.
+fn flush_indexes_on_graceful_shutdown(
+    registry: &RuntimeRegistry,
+    shutdown_started: Instant,
+    drained_at: Instant,
+) {
+    // Tests share the callgraph refresh worker, so one test must not drain another's job.
+    #[cfg(test)]
+    let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
+    let runtime = Arc::clone(registry.current());
+    aft::slog_info!("shutdown phase=search_index_flush_start");
+    let report = aft::context::flush_search_indexes_before(
+        &[runtime],
+        (Instant::now() + aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline),
+    );
+    aft::slog_info!(
+        "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
+        report.completed == 1,
+        report.flushed == 1,
+        shutdown_started.elapsed().as_millis()
+    );
+    aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
+    let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
+    aft::slog_info!(
+        "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
+        outcome.as_str(),
+        outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
+        shutdown_started.elapsed().as_millis()
+    );
+    if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
+        aft::slog_warn!(
+            "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
+            aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
+        );
+    }
+}
+
+fn drain_runtime_events_and_write_pending_cooperatively(
+    registry: &RuntimeRegistry,
+    pending: &mut PendingResponses,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
+) -> io::Result<usize> {
+    let ctx = registry.current();
+    let mut written = write_ready_pending(ctx, pending)?;
+    drain_runtime_events_cooperatively(registry, configure, queued_requests);
+    written += write_ready_pending(ctx, pending)?;
+    Ok(written)
+}
+
+fn write_ready_pending(ctx: &AppContext, pending: &mut PendingResponses) -> io::Result<usize> {
+    finalize_ready_pending(ctx, pending, |response| write_response(ctx, response))
+}
+
+#[cfg(test)]
+fn drain_runtime_events_and_write_pending_to_writer(
+    registry: &RuntimeRegistry,
+    pending: &mut PendingResponses,
+    writer: &mut impl Write,
+) -> io::Result<usize> {
+    let ctx = registry.current();
+    let mut written = write_ready_pending_to_writer(ctx, pending, writer)?;
+    drain_runtime_events(registry);
+    written += write_ready_pending_to_writer(ctx, pending, writer)?;
+    Ok(written)
+}
+
+#[cfg(test)]
+fn write_ready_pending_to_writer(
+    ctx: &AppContext,
+    pending: &mut PendingResponses,
+    writer: &mut impl Write,
+) -> io::Result<usize> {
+    finalize_ready_pending(ctx, pending, |response| {
+        write_response_to_writer(writer, response)
+    })
+}
+
+fn finalize_ready_pending(
+    ctx: &AppContext,
+    pending: &mut PendingResponses,
+    mut write: impl FnMut(&Response) -> io::Result<()>,
+) -> io::Result<usize> {
+    pending.poll_ready_with(ctx, |mut resolved| {
+        aft::response_finalize::finalize_response(
+            &mut resolved.response,
+            ctx,
+            &resolved.session_id,
+            &resolved.attach_command,
+        );
+        let result = write(&resolved.response);
+        ctx.clear_request_handles_progress(&resolved.response.id);
+        result
+    })
+}
+
+fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
+    for runtime in registry.iter() {
+        aft::runtime_drain::drain_configure_warning_events(runtime);
+    }
+}
+
+fn signal_bg_registries(registry: &RuntimeRegistry) -> Vec<BgTaskRegistry> {
+    registry
+        .iter()
+        .map(|runtime| runtime.bash_background().clone())
+        .collect()
+}
+
+fn install_bash_compressor(runtime: &AppContext) {
+    // Install bash output-compression closure on the BgTaskRegistry. The
+    // closure captures the shared filter-registry handle and the shared
+    // compress-flag (atomic) so the watchdog thread can compress without
+    // touching the rest of AppContext. The flag is updated from `configure`
+    // when `experimental.bash.compress` changes; the filter registry is
+    // updated when `reset_filter_registry` is called.
+    let filter_registry_handle = runtime.shared_filter_registry();
+    let compress_flag = runtime.bash_compress_flag();
+    runtime.bash_background().set_compressor_with_exit_code(
+        move |command: &str, output: String, exit_code: Option<i64>| {
+            if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return aft::compress::CompressionResult::new(output);
+            }
+            let registry_guard = match filter_registry_handle.read() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            aft::compress::compress_with_registry_exit_code(
+                command,
+                &output,
+                exit_code,
+                &registry_guard,
+            )
+        },
+    );
+}
+
+#[cfg(unix)]
+fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspChildRegistry) {
+    let signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]);
+    let Ok(mut signals) = signals else {
+        if let Err(error) = signals {
+            aft::slog_error!("failed to install signal handlers: {error}");
+        }
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            // Plugin restarts can SIGTERM the bridge while background bash jobs
+            // are still running. Detach first so child handles are not killed by
+            // Rust drop glue and can be rehydrated from disk.
+            for registry in &bg_registries {
+                registry.detach();
+            }
+            aft::artifact_owner::shutdown_heartbeat_thread();
+            // Kill LSP children synchronously before exit. Without this, LSP
+            // child processes (typescript-language-server, biome lsp-proxy,
+            // etc.) get orphaned to PID 1 because process::exit bypasses the
+            // graceful shutdown path that LspManager::shutdown_all uses on
+            // the natural stdin-closed exit. Graceful shutdown takes up to
+            // 5s per server (shutdown request + exit notification + poll),
+            // which is too slow for a signal handler — we SIGKILL instead.
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!("signal {}: killed {} LSP child process(es)", signal, killed);
+            }
+            aft::ort_lifecycle::exit_process(exit_after_log_flush(128 + signal));
+        }
+    });
+}
+
+#[cfg(unix)]
+fn install_subc_signal_handler(
+    executor: Arc<aft::executor::Executor>,
+    initial_ctx: Arc<AppContext>,
+    lsp_children: LspChildRegistry,
+) {
+    let signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+    ]);
+    let Ok(mut signals) = signals else {
+        if let Err(error) = signals {
+            aft::slog_error!("failed to install subc signal handlers: {error}");
+        }
+        return;
+    };
+
+    std::thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            // When this process is shutting down during a subc drain, it may
+            // receive SIGTERM before the async cleanup code runs. Detach each
+            // live actor's background registry now so any running bash
+            // subprocesses keep their task metadata and can be recovered after
+            // the process restarts.
+            let mut contexts = executor.actor_contexts();
+            if !contexts.iter().any(|ctx| Arc::ptr_eq(ctx, &initial_ctx)) {
+                contexts.push(Arc::clone(&initial_ctx));
+            }
+            for actor_ctx in &contexts {
+                actor_ctx.bash_background().detach();
+            }
+            aft::artifact_owner::shutdown_heartbeat_thread();
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!(
+                    "subc signal {}: killed {} LSP child process(es)",
+                    signal,
+                    killed
+                );
+            }
+            aft::ort_lifecycle::exit_process(exit_after_log_flush(128 + signal));
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_subc_signal_handler(
+    _executor: Arc<aft::executor::Executor>,
+    initial_ctx: Arc<AppContext>,
+    lsp_children: LspChildRegistry,
+) {
+    install_signal_handler(vec![initial_ctx.bash_background().clone()], lsp_children);
+}
+
+#[cfg(not(unix))]
+static WINDOWS_SIGNAL_REGISTRIES: std::sync::OnceLock<(Vec<BgTaskRegistry>, LspChildRegistry)> =
+    std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
+    const CTRL_C_EVENT: u32 = 0;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_LOGOFF_EVENT: u32 = 5;
+    const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+    if matches!(
+        ctrl_type,
+        CTRL_C_EVENT
+            | CTRL_BREAK_EVENT
+            | CTRL_CLOSE_EVENT
+            | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT
+    ) {
+        if let Some((bg_registries, lsp_children)) = WINDOWS_SIGNAL_REGISTRIES.get() {
+            for registry in bg_registries {
+                registry.detach();
+            }
+            aft::artifact_owner::shutdown_heartbeat_thread();
+            let killed = lsp_children.kill_all();
+            if killed > 0 {
+                aft::slog_info!(
+                    "windows console event {ctrl_type}: killed {killed} LSP child process(es)"
+                );
+            }
+        }
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+#[cfg(not(unix))]
+fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspChildRegistry) {
+    #[cfg(windows)]
+    {
+        let _ = WINDOWS_SIGNAL_REGISTRIES.set((bg_registries, lsp_children));
+        // SAFETY: registers a process-global console-control callback. The
+        // callback only uses cloneable registries stored in OnceLock.
+        let ok = unsafe { SetConsoleCtrlHandler(Some(windows_console_handler), 1) };
+        if ok == 0 {
+            aft::slog_error!("failed to install Windows console control handler");
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (bg_registries, lsp_children);
+    }
+}
+
+fn write_push_frame_or_request_shutdown(
+    writer: &mut impl Write,
+    frame: &PushFrame,
+    shutdown_requested: &AtomicBool,
+) {
+    if let Err(error) = write_push_frame(writer, frame) {
+        aft::slog_error!(
+            "stdout push frame write error: {}; shutting down bridge",
+            error
+        );
+        shutdown_requested.store(true, Ordering::SeqCst);
+    }
+}
+
+fn dispatch_panic_response(
+    request_id: impl Into<String>,
+    command: &str,
+    payload: &(dyn std::any::Any + Send),
+) -> Response {
+    let panic_message = panic_payload_message(payload);
+    aft::slog_error!(
+        "command '{}' panicked: {}; shutting down bridge",
+        command,
+        panic_message
+    );
+    Response::error(
+        request_id,
+        "internal_error",
+        format!("command '{command}' panicked: {panic_message}"),
+    )
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs inside `dispatch` after the request pinned its config snapshot.
+    static DISPATCH_CONFIG_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&AppContext)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn dispatch_config_probe_for_test(ctx: &AppContext) {
+    DISPATCH_CONFIG_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe(ctx);
+        }
+    });
+}
+
+fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    aft::access_policy::with_native_route(req, ctx, dispatch_on_route)
+}
+
+fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.worker_session() {
+        ctx.disable_rust_cargo_for_worker();
+    }
+    if ctx.claim_database_runtime_retry(&req.command) {
+        ctx.retry_database_runtime();
+    }
+    if let Some(response) = ctx.database_runtime_refusal(&req.id, &req.command) {
+        return response;
+    }
+    // Every read of `ctx.config()` in this request sees the snapshot published
+    // when it was admitted, so a live config reload switches over between
+    // requests, never in the middle of one (path restriction, sandbox).
+    let _config_pin = ctx.pin_config();
+    // A detached view publication commits only between standalone requests,
+    // never in the middle of one (uncontended in subc mode).
+    let _publication_gate = aft::executor::standalone_request_gate();
+    #[cfg(test)]
+    dispatch_config_probe_for_test(ctx);
+    let (watcher_pending, callgraph_pending) =
+        aft::response_finalize::query_pending(ctx, &req.command);
+    let mut response = dispatch_command(req, ctx);
+    aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
+    aft::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
+    aft::response_finalize::attach_callgraph_pending_gaps(
+        &mut response,
+        callgraph_pending.as_ref(),
+    );
+    // Every mutation this request made is on disk now; record what it left so
+    // a later undo can tell AFT's own result from a change made outside AFT.
+    ctx.backup().lock().record_post_mutation_states();
+    response
+}
+
+fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
+    aft::commands::tool_call::register_dispatch(dispatch);
+    // A parent folder session answers index-backed commands from its child
+    // repositories' own indexes (grep and glob fan out inside their handlers).
+    if let Some(response) = aft::folder_admission_runtime::route_index_command(&req, ctx) {
+        return response;
+    }
+    match req.command.as_str() {
+        "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
+        "version" => Response::success(
+            &req.id,
+            serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+        ),
+        "echo" => handle_echo(&req),
+        "tool_call" => aft::commands::tool_call::handle(&req, ctx),
+        // Registration never depends on runtime gates, so a registered bash
+        // tool or companion reports the gate instead of disappearing.
+        "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write"
+            if !ctx.config().bash.enabled =>
+        {
+            Response::error(
+                &req.id,
+                "bash_disabled",
+                "bash execution is disabled by configuration (bash.enabled: false)",
+            )
+        }
+        "inspect" if !ctx.config().inspect.enabled => Response::error(
+            &req.id,
+            "inspect_disabled",
+            "aft_inspect is disabled by configuration (inspect.enabled: false)",
+        ),
+        "bash" | "powershell" => aft::commands::bash::handle(&req, ctx),
+        "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
+        "bash_artifact_owned" => aft::commands::bash_artifact_owned::handle(&req, ctx),
+        "bash_owned_tasks" => aft::commands::bash_owned_tasks::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
+        "bash_unnotify" => aft::commands::bash_notify::handle_unnotify(&req, ctx),
+        "bash_promote" => aft::commands::bash_promote::handle(&req, ctx),
+        "bash_wait_detach" => aft::commands::bash_wait_detach::handle(&req, ctx),
+        "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
+        "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
+        "bash_write" => aft::commands::bash_write::handle(&req, ctx),
+        "db_get_state" => aft::commands::state::handle_db_get_state(&req, ctx),
+        "db_set_state" => aft::commands::state::handle_db_set_state(&req, ctx),
+        "db_get_host_state" => aft::commands::state::handle_db_get_host_state(&req, ctx),
+        "db_set_host_state" => aft::commands::state::handle_db_set_host_state(&req, ctx),
+        "outline" => aft::commands::outline::handle_outline(&req, ctx),
+        "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
+        "read" => aft::commands::read::handle_read(&req, ctx),
+        "undo" | "undo_preview"
+            if ctx.config().backup.enabled == Some(false)
+                && ctx
+                    .backup()
+                    .lock()
+                    .latest_skipped_reason_for_undo(req.session(), None)
+                    .is_none() =>
+        {
+            Response::error(
+                &req.id,
+                "backups_disabled",
+                "Backup tools are disabled by configuration.",
+            )
+        }
+        "edit_history" | "checkpoint" | "checkpoint_paths" | "restore_checkpoint"
+        | "list_checkpoints"
+            if ctx.config().backup.enabled == Some(false) =>
+        {
+            Response::error(
+                &req.id,
+                "backups_disabled",
+                "backups disabled by user config",
+            )
+        }
+        "undo" => aft::commands::undo::handle_undo(&req, ctx),
+        "undo_preview" => aft::commands::undo::handle_undo_preview(&req, ctx),
+        "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
+        "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
+        "checkpoint_paths" => aft::commands::checkpoint::handle_checkpoint_paths(&req, ctx),
+        "restore_checkpoint" => {
+            aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
+        }
+        "list_checkpoints" => aft::commands::list_checkpoints::handle_list_checkpoints(&req, ctx),
+        "safety_purge" => aft::commands::safety_purge::handle_safety_purge(&req, ctx),
+        "safety_purge_paths" => aft::commands::safety_purge::handle_safety_purge_paths(&req, ctx),
+        "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
+        "hashline_preflight" => aft::commands::hashline::handle_preflight(&req, ctx),
+        "hashline_edit" => aft::commands::hashline::handle_edit(&req, ctx),
+        "write" => aft::commands::write::handle_write(&req, ctx),
+        "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
+        "move_file" => aft::commands::move_file::handle_move_file(&req, ctx),
+        "edit_symbol" => aft::commands::edit_symbol::handle_edit_symbol(&req, ctx),
+        "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
+        "batch" => aft::commands::batch::handle_batch(&req, ctx),
+        "add_import" => aft::commands::add_import::handle_add_import(&req, ctx),
+        "remove_import" => aft::commands::remove_import::handle_remove_import(&req, ctx),
+        "organize_imports" => aft::commands::organize_imports::handle_organize_imports(&req, ctx),
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "view_token" => aft::commands::view_token::handle_view_token(&req, ctx),
+        "glob" => aft::commands::glob::handle_glob(&req, ctx),
+        "grep" => aft::commands::grep::handle_grep(&req, ctx),
+        "semantic_search" => {
+            if let Some(response) = wait_for_semantic_index_before_search(&req, ctx) {
+                response
+            } else {
+                aft::commands::semantic_search::handle_semantic_search(&req, ctx)
+            }
+        }
+        "status" => aft::commands::status::handle_status(&req, ctx),
+        "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
+        "trust_filter_project" => {
+            aft::commands::trust_filter_project::handle_trust_filter_project(&req, ctx)
+        }
+        "untrust_filter_project" => {
+            aft::commands::untrust_filter_project::handle_untrust_filter_project(&req, ctx)
+        }
+        "call_tree" => aft::commands::call_tree::handle_call_tree(&req, ctx),
+        "callers" => aft::commands::callers::handle_callers(&req, ctx),
+        "trace_to" => aft::commands::trace_to::handle_trace_to(&req, ctx),
+        "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
+        "impact" => aft::commands::impact::handle_impact(&req, ctx),
+        "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
+        "move_symbol" => aft::commands::move_symbol::handle_move_symbol(&req, ctx),
+        "extract_function" => aft::commands::extract_function::handle_extract_function(&req, ctx),
+        "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
+        "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
+        aft::commands::health_digest::HEALTH_DIGEST_OPERATION => {
+            aft::commands::health_digest::handle_health_digest(&req, ctx)
+        }
+        aft::commands::memory_census::MEMORY_CENSUS_OPERATION => {
+            aft::commands::memory_census::handle_memory_census(&req, ctx)
+        }
+        "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
+        "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
+        "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),
+        "ast_replace" => aft::commands::ast_replace::handle_ast_replace(&req, ctx),
+        "lsp_diagnostics" => aft::commands::lsp_diagnostics::handle_lsp_diagnostics(&req, ctx),
+        "lsp_inspect" => aft::commands::lsp_inspect::handle_lsp_inspect(&req, ctx),
+        "lsp_hover" => aft::commands::lsp_hover::handle_lsp_hover(&req, ctx),
+        "lsp_goto_definition" => {
+            aft::commands::lsp_goto_definition::handle_lsp_goto_definition(&req, ctx)
+        }
+        "lsp_find_references" => {
+            aft::commands::lsp_find_references::handle_lsp_find_references(&req, ctx)
+        }
+        "lsp_prepare_rename" => {
+            aft::commands::lsp_prepare_rename::handle_lsp_prepare_rename(&req, ctx)
+        }
+        "lsp_rename" => aft::commands::lsp_rename::handle_lsp_rename(&req, ctx),
+        // NOTE: "snapshot" must remain in the production binary because integration tests in
+        // crates/aft/tests/integration/ spawn the compiled binary as a subprocess and send
+        // "snapshot" commands through the stdin/stdout protocol. A #[cfg(test)] gate would
+        // only affect unit-test compilation and would not exclude this arm from the binary
+        // that integration tests execute. See: crates/aft/tests/integration/safety_test.rs
+        "snapshot" => handle_snapshot(&req, ctx),
+        _ => {
+            aft::slog_warn!("unknown command: {}", req.command);
+            Response::error(
+                &req.id,
+                "unknown_command",
+                format!("unknown command: {}", req.command),
+            )
+        }
+    }
+}
+
+fn attach_command_for_request(req: &RawRequest) -> String {
+    if req.command == "tool_call" {
+        req.params
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool_call")
+            .to_string()
+    } else {
+        req.command.clone()
+    }
+}
+
+fn tool_call_name(req: &RawRequest) -> Option<&str> {
+    (req.command == "tool_call")
+        .then(|| req.params.get("name").and_then(serde_json::Value::as_str))
+        .flatten()
+}
+
+fn deferred_tool_call_name(req: &RawRequest) -> Option<&str> {
+    let name = tool_call_name(req)?;
+    let bare_name = name.strip_prefix("aft_").unwrap_or(name);
+    (matches!(
+        bare_name,
+        "search" | "inspect" | "read" | "bash" | "powershell"
+    ) || aft::commands::lsp_navigation::is_lsp_navigation_command(bare_name))
+    .then_some(name)
+}
+
+fn is_semantic_search_request(req: &RawRequest) -> bool {
+    req.command == "semantic_search" || tool_call_name(req).is_some_and(|name| name == "search")
+}
+
+fn cancelled_deferred_response(request_id: &str, command: &str) -> Response {
+    Response::error(
+        request_id,
+        "request_cancelled",
+        format!("{command} request cancelled because its route closed."),
+    )
+}
+
+fn cancelled_semantic_search_response(request_id: &str) -> Response {
+    cancelled_deferred_response(request_id, "Search")
+}
+
+fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let request_id = req.id.clone();
+    let shutdown_request_id = request_id.clone();
+    let session_id = req.session().to_string();
+    let attach_command = attach_command_for_request(&req);
+    let shutdown_command = attach_command.clone();
+    let cancellation = aft::executor::JobCancellation::new();
+    let worker_cancellation = cancellation.clone();
+    let worker_session_id = req.session_id.clone();
+    let disconnected_request_id = request_id.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let admitted_config = ctx.config();
+    let ask_route = aft::access_policy::capture_ask_route();
+    thread::spawn(move || {
+        let _ask_route = ask_route.install();
+        let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
+        let _config_pin = ctx.pin_config_to(admitted_config);
+        let command = req.command.clone();
+        let id = req.id.clone();
+        complete_deferred_dispatch(
+            &id,
+            &command,
+            tx,
+            || log_ctx::with_session(worker_session_id, || dispatch(req, &ctx)),
+            wake_standalone_loop_for_deferred_response,
+        );
+    });
+
+    DispatchOutcome::Deferred(
+        PendingResponse::polling(
+            request_id,
+            session_id,
+            attach_command,
+            Box::new(move |_| match rx.try_recv() {
+                Ok(response) => Some(response),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
+                    &disconnected_request_id,
+                    "internal_error",
+                    "deferred request worker disconnected before producing a response",
+                )),
+            }),
+        )
+        .with_cancellation(cancellation)
+        .with_shutdown(Box::new(move |_| {
+            cancelled_deferred_response(&shutdown_request_id, &shutdown_command)
+        })),
+    )
+}
+
+fn complete_deferred_dispatch(
+    id: &str,
+    command: &str,
+    tx: mpsc::SyncSender<Response>,
+    work: impl FnOnce() -> Response,
+    wake: impl FnOnce(),
+) {
+    let _wake = CompletionWake(Some(wake));
+    // Disconnect before waking if anything after dispatch unexpectedly unwinds.
+    let tx = tx;
+    let response = catch_unwind(AssertUnwindSafe(work))
+        .unwrap_or_else(|payload| dispatch_panic_response(id, command, payload.as_ref()));
+    let _ = tx.send(response);
+}
+
+struct CompletionWake<W: FnOnce()>(Option<W>);
+
+impl<W: FnOnce()> Drop for CompletionWake<W> {
+    fn drop(&mut self) {
+        if let Some(wake) = self.0.take() {
+            wake();
+        }
+    }
+}
+
+fn cancel_request_target(req: &RawRequest) -> Option<&str> {
+    req.params
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            req.params
+                .get("params")
+                .and_then(|params| params.get("id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+}
+
+fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Response {
+    let Some(request_id) = cancel_request_target(req) else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "cancel_request: missing required string param 'id'",
+        );
+    };
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "cancelled": pending.cancel_request(request_id),
+            "request_id": request_id,
+        }),
+    )
+}
+
+fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    let mut deferred = None;
+    let response = aft::access_policy::with_native_route(req, ctx, |req, _| {
+        match dispatch_outcome_on_route(req, ctx) {
+            DispatchOutcome::Immediate(response) => response,
+            DispatchOutcome::Deferred(pending) => {
+                deferred = Some(pending);
+                Response::success("native-deferred", serde_json::json!({}))
+            }
+        }
+    });
+    deferred
+        .map(DispatchOutcome::Deferred)
+        .unwrap_or(DispatchOutcome::Immediate(response))
+}
+
+fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    if let Some(response) = aft::folder_admission_runtime::route_refusal(&req, ctx) {
+        return DispatchOutcome::Immediate(response);
+    }
+    if req.worker_session() {
+        ctx.disable_rust_cargo_for_worker();
+    }
+    // The request is admitted here: pin the published config so every handler
+    // below, and every worker thread a deferred handler starts, uses this
+    // snapshot even if a live config reload publishes while it runs.
+    let _config_pin = ctx.pin_config();
+    aft::commands::tool_call::register_dispatch(dispatch);
+    if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
+        return handle_dispatch_deferred(req, Arc::clone(ctx));
+    }
+    if req.command == "inspect" {
+        return aft::commands::inspect::handle_inspect_deferred(&req, Arc::clone(ctx));
+    }
+    if aft::commands::lsp_navigation::is_lsp_navigation_command(&req.command) {
+        return aft::commands::lsp_navigation::handle_lsp_navigation_deferred(
+            &req,
+            Arc::clone(ctx),
+        );
+    }
+    if matches!(req.command.as_str(), "bash" | "powershell") {
+        // A top-level bash request is a model's bash call sent straight from a
+        // plugin; the tool-call runner and subc reach the bash handler through
+        // `dispatch` and observe their own calls, so only this entry observes.
+        let repeat = aft::commands::bash_orchestrate::raw_bash_repeat(&req);
+        let outcome = if aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req) {
+            let spawn_response = aft::commands::bash::handle(&req, ctx);
+            aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response)
+        } else {
+            DispatchOutcome::Immediate(dispatch(req, ctx))
+        };
+        return repeat.observe_outcome(ctx, outcome);
+    }
+    if req.command == "read" {
+        return aft::commands::read::build_read_outcome(req, ctx);
+    }
+    if offloads_full_validation(&req, ctx) {
+        return dispatch_with_offloaded_validation(req, Arc::clone(ctx));
+    }
+    DispatchOutcome::Immediate(dispatch(req, ctx))
+}
+
+fn dispatch_with_pending_admission(
+    req: RawRequest,
+    ctx: &Arc<AppContext>,
+    pending: &mut PendingResponses,
+) -> DispatchOutcome {
+    if let Some(response) = duplicate_pending_response(&req, pending) {
+        return DispatchOutcome::Immediate(response);
+    }
+    if req.command == "cancel_request" {
+        DispatchOutcome::Immediate(handle_cancel_request(&req, pending))
+    } else {
+        dispatch_outcome(req, ctx)
+    }
+}
+
+fn duplicate_pending_response(req: &RawRequest, pending: &PendingResponses) -> Option<Response> {
+    pending
+        .contains(&req.id)
+        .then(|| duplicate_request_response(&req.id))
+}
+
+fn duplicate_request_response(id: &str) -> Response {
+    Response::error(
+        id,
+        "duplicate_request_id",
+        "request id is already pending on this connection",
+    )
+}
+
+/// Direct protocol commands that write through `edit::write_format_validate`
+/// and can therefore run the project type checker.
+fn is_validating_mutation_command(command: &str) -> bool {
+    matches!(
+        command,
+        "write"
+            | "edit_match"
+            | "edit_symbol"
+            | "batch"
+            | "apply_patch"
+            | "add_import"
+            | "remove_import"
+            | "organize_imports"
+            | "inline_symbol"
+            | "extract_function"
+            | "move_symbol"
+    )
+}
+
+/// Agent tool names (with or without the `aft_` prefix) that reach the
+/// commands above through `tool_call`.
+fn is_validating_mutation_tool(name: &str) -> bool {
+    let bare_name = name.strip_prefix("aft_").unwrap_or(name);
+    matches!(
+        bare_name,
+        "write" | "edit" | "apply_patch" | "import" | "refactor"
+    )
+}
+
+fn params_request_full_validation(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            (key == "validate" && value.as_str() == Some("full"))
+                || params_request_full_validation(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(params_request_full_validation),
+        _ => false,
+    }
+}
+
+/// True when a request is a file mutation that may block on the project type
+/// checker: `validate_on_edit: "full"` in config, or `validate: "full"`
+/// anywhere in its params (direct commands carry it at the top level,
+/// `tool_call` nests it under `arguments`).
+fn offloads_full_validation(req: &RawRequest, ctx: &AppContext) -> bool {
+    let mutation = if req.command == "tool_call" {
+        tool_call_name(req).is_some_and(is_validating_mutation_tool)
+    } else {
+        is_validating_mutation_command(&req.command)
+    };
+    mutation
+        && (ctx.config().validate_on_edit.as_deref() == Some("full")
+            || params_request_full_validation(&req.params))
+}
+
+/// Commands the standalone loop still answers while an offloaded edit waits on
+/// its type checker. They are cheap and never touch project files, so answering
+/// them before the edit's response cannot change what the edit wrote or
+/// reports. Every other request is held until the edit's response is written.
+fn is_served_during_pending_validation(command: &str) -> bool {
+    matches!(
+        command,
+        "status"
+            | "ping"
+            | "version"
+            | "cancel_request"
+            | "bash_drain_completions"
+            | "bash_ack_completions"
+    )
+}
+
+enum OffloadedEditEvent {
+    ValidationStarted,
+    Finished(thread::Result<Response>),
+}
+
+/// Run a file mutation on a worker thread, but keep the request loop blocked
+/// on it until its write, format and syntax check are done. Once the edit
+/// reaches the external type checker, return a deferred response so the loop
+/// can answer `status` and bash completion polls while the checker runs.
+///
+/// A mutation that never reaches the checker step (preview, request error,
+/// or `validate: "off"` overriding the config) completes before this function returns and
+/// is answered immediately, exactly like the inline path. A panic before the
+/// checker is re-raised on the loop thread so the existing dispatch-panic
+/// shutdown applies unchanged.
+fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let request_id = req.id.clone();
+    let session_id = req.session().to_string();
+    let attach_command = attach_command_for_request(&req);
+    let worker_session_id = req.session_id.clone();
+    let (tx, rx) = mpsc::channel::<OffloadedEditEvent>();
+    let started_tx = tx.clone();
+    let admitted_config = ctx.config();
+    let ask_route = aft::access_policy::capture_ask_route();
+    thread::spawn(move || {
+        let _ask_route = ask_route.install();
+        let _wake = CompletionWake(Some(wake_standalone_loop_for_deferred_response));
+        let tx = tx;
+        let _config_pin = ctx.pin_config_to(admitted_config);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            aft::edit::with_full_validation_start_hook(
+                Box::new(move || {
+                    let _ = started_tx.send(OffloadedEditEvent::ValidationStarted);
+                }),
+                || log_ctx::with_session(worker_session_id, || dispatch(req, &ctx)),
+            )
+        }));
+        let _ = tx.send(OffloadedEditEvent::Finished(result));
+    });
+
+    match rx.recv() {
+        Ok(OffloadedEditEvent::Finished(Ok(response))) => DispatchOutcome::Immediate(response),
+        Ok(OffloadedEditEvent::Finished(Err(payload))) => std::panic::resume_unwind(payload),
+        Ok(OffloadedEditEvent::ValidationStarted) => {
+            offloaded_validation_pending(request_id, session_id, attach_command, rx)
+        }
+        Err(mpsc::RecvError) => {
+            DispatchOutcome::Immediate(offloaded_edit_disconnected(&request_id))
+        }
+    }
+}
+
+fn offloaded_edit_disconnected(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "internal_error",
+        "edit worker disconnected before producing a response",
+    )
+}
+
+fn offloaded_edit_response(
+    request_id: &str,
+    command: &str,
+    event: Result<OffloadedEditEvent, mpsc::RecvError>,
+) -> Option<Response> {
+    match event {
+        Ok(OffloadedEditEvent::Finished(Ok(response))) => Some(response),
+        Ok(OffloadedEditEvent::Finished(Err(payload))) => {
+            let message = panic_payload_message(payload.as_ref());
+            aft::slog_error!(
+                "command '{}' panicked during validation: {}",
+                command,
+                message
+            );
+            Some(Response::error(
+                request_id,
+                "internal_error",
+                format!("command '{command}' panicked: {message}"),
+            ))
+        }
+        // The start hook is one-shot, so a second start event cannot arrive.
+        Ok(OffloadedEditEvent::ValidationStarted) => None,
+        Err(mpsc::RecvError) => Some(offloaded_edit_disconnected(request_id)),
+    }
+}
+
+fn offloaded_validation_pending(
+    request_id: String,
+    session_id: String,
+    attach_command: String,
+    rx: mpsc::Receiver<OffloadedEditEvent>,
+) -> DispatchOutcome {
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let poll_rx = Arc::clone(&rx);
+    let poll_request_id = request_id.clone();
+    let poll_command = attach_command.clone();
+    let shutdown_request_id = request_id.clone();
+    let shutdown_command = attach_command.clone();
+    DispatchOutcome::Deferred(
+        PendingResponse::polling(
+        request_id,
+        session_id,
+        attach_command,
+        Box::new(move |_| {
+            let rx = poll_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match rx.try_recv() {
+                Ok(event) => offloaded_edit_response(&poll_request_id, &poll_command, Ok(event)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    offloaded_edit_response(&poll_request_id, &poll_command, Err(mpsc::RecvError))
+                }
+            }
+        }),
+    )
+        // The file is already written; cancelling the checker would only hide
+        // its result, so the edit is not cancellable once deferred.
+        // At shutdown, wait for the checker (bounded by
+        // `type_checker_timeout_secs`) so the client still receives the real
+        // edit result instead of a cancellation for a write that happened.
+        .with_shutdown(Box::new(move |_| {
+            let rx = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if let Some(response) =
+                    offloaded_edit_response(&shutdown_request_id, &shutdown_command, rx.recv())
+                {
+                    return response;
+                }
+            }
+        })),
+    )
+}
+
+fn handle_echo(req: &RawRequest) -> Response {
+    match <EchoParams as serde::Deserialize>::deserialize(&req.params) {
+        Ok(params) => Response::success(&req.id, serde_json::json!({ "message": params.message })),
+        Err(e) => Response::error(
+            &req.id,
+            "invalid_request",
+            format!("echo: invalid params: {}", e),
+        ),
+    }
+}
+
+/// Optional readiness wait used by semantic-search test runs.
+fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
+    if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().indexes.semantic {
+        return None;
+    }
+
+    let timeout_ms = std::env::var("AFT_WAIT_FOR_SEMANTIC_READY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600_000);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        if aft::executor::current_job_cancelled() {
+            return Some(cancelled_semantic_search_response(&req.id));
+        }
+        aft::runtime_drain::drain_search_index_events(ctx);
+        aft::runtime_drain::drain_semantic_index_events(ctx);
+
+        match ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            SemanticIndexStatus::Ready { .. }
+            | SemanticIndexStatus::Disabled
+            | SemanticIndexStatus::Failed(_) => return None,
+            SemanticIndexStatus::Building { stage, .. } => {
+                if Instant::now() >= deadline {
+                    return Some(Response::error(
+                        &req.id,
+                        "semantic_index_timeout",
+                        format!(
+                            "semantic index did not become ready before semantic_search within {timeout_ms}ms (stage: {stage})"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let sleep_for = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        if let Some(cancellation) = aft::executor::current_job_cancellation() {
+            if cancellation.wait_for_cancellation(sleep_for) {
+                return Some(cancelled_semantic_search_response(&req.id));
+            }
+        } else {
+            thread::sleep(sleep_for);
+        }
+    }
+}
+
+/// Test-only command: snapshot a file into the backup store.
+///
+/// Params: `file` (string, required) — path to snapshot.
+/// Returns: `{ backup_id }`.
+fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
+    let file = match req.params.get("file").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "snapshot: missing required param 'file'",
+            );
+        }
+    };
+
+    let path = match ctx.validate_path(&req.id, std::path::Path::new(file)) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let path = path.as_path();
+    let mut backup = ctx.backup().lock();
+
+    match backup.snapshot(req.session(), path, "manual snapshot") {
+        Ok(id) => Response::success(&req.id, serde_json::json!({ "backup_id": id })),
+        Err(e) => Response::error(&req.id, e.code(), e.to_string()),
+    }
+}
+
+fn write_response(ctx: &AppContext, response: &Response) -> io::Result<()> {
+    let stdout_writer = ctx.stdout_writer();
+    let mut writer = stdout_writer
+        .lock()
+        .map_err(|_| io::Error::other("stdout writer lock poisoned"))?;
+    write_response_to_writer(&mut *writer, response)
+}
+
+fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io::Result<()> {
+    // A serialization failure must not leave a prefix before the next NDJSON frame.
+    let bytes = serde_json::to_vec(response)?;
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn parse_transport_request(line: &str) -> serde_json::Result<(RawRequest, bool)> {
+    let mut raw: serde_json::Value = serde_json::from_str(line)?;
+    let handles_progress = raw
+        .as_object_mut()
+        .and_then(|body| body.remove("handles_progress"))
+        .map(serde_json::from_value::<bool>)
+        .transpose()?
+        .unwrap_or(false);
+    serde_json::from_value(raw).map(|req| (req, handles_progress))
+}
+
+fn parse_error_request_id(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "_parse_error".to_string())
+}
+
+fn recoverable_stdin_error(error: &io::Error) -> Option<Response> {
+    if let Some(oversized) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<OversizedLine>())
+    {
+        return Some(Response::error(
+            "_parse_error",
+            "request_too_large",
+            oversized.to_string(),
+        ));
+    }
+    // The bounded reader drains the invalid line before admitting the next frame.
+    (error.kind() == io::ErrorKind::InvalidData)
+        .then(|| Response::error("_parse_error", "parse_error", "request is not valid UTF-8"))
+}
+
+fn input_queue_full_response(id: &str) -> Response {
+    Response::error(
+        id,
+        "request_queue_full",
+        "request queue is full while validation is pending; retry after the current edit finishes",
+    )
+}
+
+#[cfg(test)]
+mod mutation_index_membership_tests {
+    use super::*;
+
+    #[test]
+    fn ndjson_deletes_retire_index_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let deleted = root.join("deleted.ts");
+        std::fs::write(&deleted, "const value = 'deleted_token';\n").unwrap();
+        let ctx = AppContext::new(
+            aft::context::default_language_provider_factory(),
+            crate::context_storage::isolate(aft::config::Config {
+                project_root: Some(root.clone()),
+                ..aft::config::Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(aft::search_index::SearchIndex::build(&root));
+        let request: RawRequest = serde_json::from_str(
+            r#"{"id":"delete","command":"apply_patch","patch_text":"*** Begin Patch\n*** Delete File: deleted.ts\n*** End Patch"}"#,
+        ).unwrap();
+        let response = dispatch(request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(!deleted.exists());
+        let index = ctx.search_index().read().unwrap();
+        assert!(index
+            .as_ref()
+            .unwrap()
+            .glob("**/*", &root)
+            .iter()
+            .all(|path| path != &deleted));
+        drop(index);
+        let deleted = root.join("tool-deleted.ts");
+        std::fs::write(&deleted, "const value = 'deleted_token';\n").unwrap();
+        *ctx.search_index().write().unwrap() = Some(aft::search_index::SearchIndex::build(&root));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "delete-tool", "command": "delete_file", "file": deleted
+        }))
+        .unwrap();
+        let response = dispatch(request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(!deleted.exists());
+        let index = ctx.search_index().read().unwrap();
+        assert!(index
+            .as_ref()
+            .unwrap()
+            .glob("**/*", &root)
+            .iter()
+            .all(|path| path != &deleted));
+    }
+}
+
+#[cfg(test)]
+mod core_framing_tests {
+    use super::*;
+
+    #[test]
+    fn input_limit_refusals_preserve_error_envelope_and_correlation_rules() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            OversizedLine {
+                limit: MAX_LINE_BYTES,
+            },
+        );
+        let oversized = recoverable_stdin_error(&error).unwrap();
+        assert_eq!(oversized.id, "_parse_error");
+        assert_eq!(oversized.data["code"], "request_too_large");
+        assert_eq!(oversized.data["message"], "request exceeds the 64 MiB (67108864 bytes) input limit; split it into smaller requests");
+        assert!(!oversized.success);
+        let held = input_queue_full_response("held-id");
+        assert_eq!(held.id, "held-id");
+        assert_eq!(held.data["code"], "request_queue_full");
+        assert_eq!(held.data["message"], "request queue is full while validation is pending; retry after the current edit finishes");
+        assert_eq!(
+            serde_json::to_value(held)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn duplicate_pending_id_is_rejected_before_dispatch_across_sessions() {
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(aft::parser::TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let mut pending = PendingResponses::default();
+        pending
+            .register(PendingResponse::polling(
+                "shared-id".into(),
+                "first-session".into(),
+                "read".into(),
+                Box::new(|_| {
+                    Some(Response::success(
+                        "shared-id",
+                        serde_json::json!({"original":true}),
+                    ))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&dispatched);
+        DISPATCH_CONFIG_PROBE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_| {
+                observed.store(true, Ordering::SeqCst);
+            }))
+        });
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"shared-id","session_id":"second-session","command":"ping"}),
+        )
+        .unwrap();
+        let outcome = dispatch_with_pending_admission(request, &ctx, &mut pending);
+        DISPATCH_CONFIG_PROBE.with(|slot| slot.borrow_mut().take());
+        assert!(
+            !dispatched.load(Ordering::SeqCst),
+            "duplicate rejection must precede dispatch work"
+        );
+        let DispatchOutcome::Immediate(response) = outcome else {
+            panic!("duplicate must be refused immediately")
+        };
+        assert_eq!(response.data["code"], "duplicate_request_id");
+        assert_eq!(pending.poll_ready(&ctx)[0].response.data["original"], true);
+        let reused: RawRequest =
+            serde_json::from_value(serde_json::json!({"id":"shared-id","command":"ping"})).unwrap();
+        let DispatchOutcome::Immediate(reused) =
+            dispatch_with_pending_admission(reused, &ctx, &mut pending)
+        else {
+            panic!("ping is immediate")
+        };
+        assert!(reused.success, "an id may be reused after its terminal");
+    }
+
+    #[test]
+    fn offloaded_worker_wakes_loop_after_finishing() {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        DEFERRED_RESPONSE_WAKER
+            .set(wake_tx)
+            .expect("only this test installs the standalone waker");
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(aft::parser::TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"wake", "command":"echo", "message":"finished"}),
+        )
+        .unwrap();
+        let result = dispatch_with_offloaded_validation(req, ctx);
+        let DispatchOutcome::Immediate(response) = result else {
+            panic!("echo completes before validation")
+        };
+        assert_eq!(response.data["message"], "finished");
+        wake_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker completion must wake the loop");
+    }
+
+    #[test]
+    fn pending_finalization_retains_admission_config() {
+        let ctx = AppContext::new(
+            Box::new(aft::parser::TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store();
+        let mut pending = PendingResponses::default();
+        pending
+            .register(
+                PendingResponse::polling(
+                    "pinned".into(),
+                    "s".into(),
+                    "ping".into(),
+                    Box::new(|_| Some(Response::success("pinned", serde_json::json!({})))),
+                )
+                .with_admitted_config(ctx.config()),
+            )
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        ctx.update_config(|config| config.restrict_to_project_root = true);
+        finalize_ready_pending(&ctx, &mut pending, |_| {
+            assert!(
+                !ctx.config().restrict_to_project_root,
+                "finalization must use admission config"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(ctx.config().restrict_to_project_root);
+    }
+
+    #[test]
+    fn deferred_panic_delivers_detail_and_wakes() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let woke = std::cell::Cell::new(false);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            complete_deferred_dispatch(
+                "panic-id",
+                "search",
+                tx,
+                || panic!("worker detail"),
+                || woke.set(true),
+            )
+        }));
+        assert!(woke.get(), "panic completion must wake the loop");
+        let response = rx
+            .try_recv()
+            .expect("panic must produce a correlated response");
+        assert_eq!(response.id, "panic-id");
+        assert_eq!(response.data["code"], "internal_error");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("worker detail"));
+    }
+
+    #[test]
+    fn serialization_failure_leaves_writer_untouched() {
+        let mut writer = b"previous\n".to_vec();
+        let response = Response::success("bad", serde_json::json!([1, 2]));
+        assert!(write_response_to_writer(&mut writer, &response).is_err());
+        assert_eq!(writer, b"previous\n");
+        write_response_to_writer(
+            &mut writer,
+            &Response::success("good", serde_json::json!({})),
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&writer).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn malformed_request_preserves_only_string_id() {
+        assert_eq!(parse_error_request_id(r#"{"id":"mine"}"#), "mine");
+        assert_eq!(parse_error_request_id(r#"{"id":4}"#), "_parse_error");
+        assert_eq!(parse_error_request_id(r#"{"id":"mine""#), "_parse_error");
+    }
+
+    #[test]
+    fn invalid_utf8_line_recovers_before_next_request() {
+        let mut lines = io::Cursor::new(b"\xff\n{\"id\":\"ok\",\"command\":\"ping\"}\n").lines();
+        let error = lines.next().unwrap().unwrap_err();
+        let response =
+            recoverable_stdin_error(&error).expect("invalid UTF-8 must not terminate the loop");
+        assert!(!response.success);
+        let next: RawRequest = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(next.id, "ok");
+        assert!(recoverable_stdin_error(&io::Error::from(io::ErrorKind::BrokenPipe)).is_none());
+    }
+
+    #[test]
+    fn flattened_values_reproduction() {
+        assert!(serde_json::to_vec(&Response::success("null", serde_json::Value::Null)).is_ok());
+        assert!(serde_json::to_vec(&Response::success("array", serde_json::json!([]))).is_err());
+        assert!(
+            serde_json::to_vec(&Response::success("string", serde_json::json!("text"))).is_err()
+        );
+        let encoded = serde_json::to_string(&Response::success(
+            "outer",
+            serde_json::json!({"id":"inner","success":false}),
+        ))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["id"], "inner");
+        assert_eq!(parsed["success"], false);
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"echo", "command":"echo", "message": {"id":"inner"}}),
+        )
+        .unwrap();
+        let response = handle_echo(&req);
+        assert!(!response.success);
+        assert!(serde_json::to_vec(&response).is_ok());
+    }
+}
+
+fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, frame)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn global_gitignore_env_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(test)]
+mod pending_response_tests {
+    use super::{drain_runtime_events_and_write_pending_to_writer, write_ready_pending_to_writer};
+    use aft::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use aft::bash_background::registry::BgTaskSnapshot;
+    use aft::bash_background::BgTaskStatus;
+    use aft::config::Config;
+    use aft::context::{App, AppContext};
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
+    use aft::response_finalize::{
+        attach_bg_completions, finalize_response, PendingResponse, PendingResponses,
+    };
+    use aft::runtime_registry::RuntimeRegistry;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    struct FinalizeFixture {
+        _root: TempDir,
+        _storage: TempDir,
+        ctx: AppContext,
+    }
+
+    fn make_ctx_with_root(root: &Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store()
+    }
+
+    fn make_runtime_registry(root: &Path) -> RuntimeRegistry {
+        let app = App::default_shared();
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.to_path_buf()),
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
+        RuntimeRegistry::standalone(app, ctx)
+    }
+
+    fn install_pending_completion(
+        ctx: &AppContext,
+        storage: &Path,
+        root: &Path,
+        session_id: &str,
+        task_id: &str,
+    ) {
+        let paths = task_paths(storage, session_id, task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            session_id.to_string(),
+            "echo done".to_string(),
+            root.to_path_buf(),
+            Some(root.to_path_buf()),
+            None,
+            true,
+            true,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task(&paths.json, &metadata).unwrap();
+        std::fs::write(&paths.stdout, "done\n").unwrap();
+        ctx.bash_background()
+            .replay_session_for_project(storage, session_id, root)
+            .unwrap();
+    }
+
+    fn fixture_with_completion_and_status(session_id: &str, task_id: &str) -> FinalizeFixture {
+        let root = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        install_pending_completion(&ctx, storage.path(), root.path(), session_id, task_id);
+        ctx.update_status_bar_tier2(Some(3), Some(4), Some(5), Some(6), false);
+        FinalizeFixture {
+            _root: root,
+            _storage: storage,
+            ctx,
+        }
+    }
+
+    fn line_values(writer: &[u8]) -> Vec<serde_json::Value> {
+        let output = std::str::from_utf8(writer).unwrap();
+        output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    const WAIT_DETACH_COMMAND: &str = "sleep 1.5 && echo detached";
+    #[cfg(windows)]
+    const WAIT_DETACH_COMMAND: &str = "Start-Sleep -Milliseconds 1500; Write-Output detached";
+
+    fn wait_for_snapshot(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+        session_id: &str,
+        task_id: &str,
+        predicate: impl Fn(&BgTaskSnapshot) -> bool,
+    ) -> BgTaskSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(snapshot) =
+                ctx.bash_background()
+                    .status(task_id, session_id, Some(root), Some(storage), 1024)
+            {
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for snapshot for {task_id}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn finalize_response_matches_inline_finalizers() {
+        let session_id = "session-finalize";
+        let inline_fixture =
+            fixture_with_completion_and_status(session_id, "bash-0000000000000501");
+        let mut inline = Response::success("req-finalize", serde_json::json!({"value": true}));
+        attach_bg_completions(&mut inline, &inline_fixture.ctx, session_id, "read");
+
+        let helper_fixture =
+            fixture_with_completion_and_status(session_id, "bash-0000000000000501");
+        let mut helper = Response::success("req-finalize", serde_json::json!({"value": true}));
+        finalize_response(&mut helper, &helper_fixture.ctx, session_id, "read");
+
+        // Recovered previews include output-file pointers. Compare their content
+        // without treating the two fixtures' private storage roots as a mismatch.
+        let normalize = |response: &Response, storage: &Path| {
+            let mut value = serde_json::to_value(response).unwrap();
+            let preview = value["bg_completions"][0]["output_preview"]
+                .as_str()
+                .unwrap();
+            let root = storage.display().to_string();
+            assert!(
+                preview.contains(&root),
+                "recovery pointers missing: {preview}"
+            );
+            value["bg_completions"][0]["output_preview"] =
+                serde_json::json!(preview.replace(&root, "<storage>"));
+            value
+        };
+        assert_eq!(
+            normalize(&helper, helper_fixture._storage.path()),
+            normalize(&inline, inline_fixture._storage.path())
+        );
+        assert_eq!(
+            helper.data["bg_completions"][0]["task_id"],
+            "bash-0000000000000501"
+        );
+        assert!(helper.data.get("status_bar").is_none());
+    }
+
+    #[test]
+    fn pending_registry_writes_once_after_resolution_and_finalizes() {
+        let session_id = "session-registry";
+        let fixture = fixture_with_completion_and_status(session_id, "bash-0000000000000502");
+        let mut pending = PendingResponses::default();
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
+        pending
+            .register(PendingResponse::polling(
+                "pending-registry".to_string(),
+                session_id.to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
+                    if next <= 2 {
+                        None
+                    } else {
+                        Some(Response::success(
+                            "pending-registry",
+                            serde_json::json!({"ready": true}),
+                        ))
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+
+        let mut writer = Vec::new();
+        for expected_calls in 1..=2 {
+            assert_eq!(
+                write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+                0
+            );
+            assert!(writer.is_empty());
+            assert_eq!(poll_calls.load(Ordering::SeqCst), expected_calls);
+        }
+
+        assert_eq!(
+            write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        assert!(pending.is_empty());
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 3);
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-registry");
+        assert_eq!(
+            values[0]["bg_completions"][0]["task_id"],
+            "bash-0000000000000502"
+        );
+        assert!(values[0].get("status_bar").is_none());
+
+        assert_eq!(
+            write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
+        assert_eq!(line_values(&writer).len(), 1);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn wait_true_detach_signal_finalizes_early_and_keeps_completion_reminder() {
+        let root = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        let frames = Arc::new(Mutex::new(Vec::<PushFrame>::new()));
+        let frames_for_sender = Arc::clone(&frames);
+        ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
+            frames_for_sender.lock().unwrap().push(frame);
+        }))));
+        let session_id = "session-wait-detach";
+        let request = RawRequest {
+            id: "wait-detach".to_string(),
+            command: "bash".to_string(),
+            lsp_hints: None,
+            session_id: Some(session_id.to_string()),
+            params: serde_json::json!({
+                "command": WAIT_DETACH_COMMAND,
+                "timeout": 10_000,
+                "foreground_orchestrate": true,
+                "block_to_completion": true,
+                "wait": true,
+                "notify_on_completion": false,
+                "compressed": true,
+            }),
+        };
+        let spawn_response = aft::commands::bash::handle(&request, &ctx);
+        assert!(spawn_response.success);
+        assert_eq!(spawn_response.data["status"], serde_json::json!("running"));
+        let task_id = spawn_response.data["task_id"].as_str().unwrap().to_string();
+        let outcome =
+            aft::commands::bash_orchestrate::build_bash_outcome(&request, &ctx, spawn_response);
+        let mut pending = PendingResponses::default();
+        match outcome {
+            aft::response_finalize::DispatchOutcome::Deferred(pending_response) => {
+                pending
+                    .register(pending_response)
+                    .unwrap_or_else(|_| panic!("pending request id must be unique"));
+            }
+            aft::response_finalize::DispatchOutcome::Immediate(response) => {
+                panic!("expected deferred wait-mode bash, got immediate response: {response:?}");
+            }
+        }
+
+        let mut writer = Vec::new();
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
+        assert!(writer.is_empty());
+
+        let detach = super::dispatch(
+            RawRequest {
+                id: "wait-detach-signal".to_string(),
+                command: "bash_wait_detach".to_string(),
+                lsp_hints: None,
+                session_id: Some(session_id.to_string()),
+                params: serde_json::json!({}),
+            },
+            &ctx,
+        );
+        assert!(detach.success);
+        assert_eq!(detach.data["detached"], serde_json::json!(true));
+
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        let response = values.last().unwrap();
+        let output = response["output"].as_str().unwrap();
+        assert_eq!(response["id"], serde_json::json!("wait-detach"));
+        assert_eq!(response["status"], serde_json::json!("running"));
+        assert!(output.contains(&task_id));
+        assert!(output.contains("Detached because a user message arrived."));
+        assert!(output.contains("AFT kills this task at "), "{output}");
+        assert!(
+            output.contains("when it has run 10s (the `timeout` you passed)"),
+            "{output}"
+        );
+        // That detaching never extends an explicit timeout is asserted on the
+        // registry in commands::bash tests; its test-only accessor is not
+        // visible to this binary's tests.
+        assert!(pending.is_empty());
+
+        let running = wait_for_snapshot(
+            &ctx,
+            root.path(),
+            storage.path(),
+            session_id,
+            &task_id,
+            |snapshot| snapshot.info.status == BgTaskStatus::Running,
+        );
+        assert_eq!(running.info.status, BgTaskStatus::Running);
+
+        wait_for_snapshot(
+            &ctx,
+            root.path(),
+            storage.path(),
+            session_id,
+            &task_id,
+            |snapshot| snapshot.info.status.is_terminal(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let saw_completion = frames.lock().unwrap().iter().any(|frame| {
+                matches!(
+                    frame,
+                    PushFrame::BashCompleted(completion)
+                        if completion.task_id == task_id && completion.session_id == session_id
+                )
+            });
+            if saw_completion {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for completion reminder for {task_id}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn tick_drains_runtime_events_and_polls_pending() {
+        let root = TempDir::new().unwrap();
+        let registry = make_runtime_registry(root.path());
+        let drain_frames = Arc::new(AtomicUsize::new(0));
+        let frames_for_sender = Arc::clone(&drain_frames);
+        registry
+            .current()
+            .set_progress_sender(Some(Arc::new(Box::new(move |_| {
+                frames_for_sender.fetch_add(1, Ordering::SeqCst);
+            }))));
+        let generation = registry.current().advance_configure_generation();
+        registry
+            .current()
+            .configure_warnings_sender()
+            .send((
+                generation,
+                ConfigureWarningsFrame {
+                    frame_type: "configure_warnings",
+                    session_id: Some("session-drain".to_string()),
+                    project_root: root.path().display().to_string(),
+                    warnings: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        let mut pending = PendingResponses::default();
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
+        pending
+            .register(PendingResponse::polling(
+                "pending-drain".to_string(),
+                "session-drain".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    calls_for_poll.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            drain_runtime_events_and_write_pending_to_writer(&registry, &mut pending, &mut writer)
+                .unwrap(),
+            0
+        );
+        assert_eq!(drain_frames.load(Ordering::SeqCst), 1);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 2);
+        assert!(writer.is_empty());
+        assert!(!pending.is_empty());
+    }
+
+    #[test]
+    fn tick_flushes_ready_pending_before_runtime_maintenance() {
+        let root = TempDir::new().unwrap();
+        let registry = make_runtime_registry(root.path());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_drain = Arc::clone(&events);
+        registry
+            .current()
+            .set_progress_sender(Some(Arc::new(Box::new(move |_| {
+                events_for_drain.lock().unwrap().push("drain");
+            }))));
+        let generation = registry.current().advance_configure_generation();
+        registry
+            .current()
+            .configure_warnings_sender()
+            .send((
+                generation,
+                ConfigureWarningsFrame {
+                    frame_type: "configure_warnings",
+                    session_id: Some("session-order".to_string()),
+                    project_root: root.path().display().to_string(),
+                    warnings: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        let events_for_pending = Arc::clone(&events);
+        let mut pending = PendingResponses::default();
+        pending
+            .register(PendingResponse::polling(
+                "pending-order".to_string(),
+                "session-order".to_string(),
+                "bash".to_string(),
+                Box::new(move |_| {
+                    events_for_pending.lock().unwrap().push("pending");
+                    Some(Response::success("pending-order", serde_json::json!({})))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            drain_runtime_events_and_write_pending_to_writer(&registry, &mut pending, &mut writer)
+                .unwrap(),
+            1
+        );
+        assert_eq!(*events.lock().unwrap(), ["pending", "drain"]);
+        assert_eq!(line_values(&writer).len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn long_pending_response_is_polled_each_tick_without_writing_until_ready() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let mut pending = PendingResponses::default();
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
+        pending
+            .register(PendingResponse::polling(
+                "pending-long".to_string(),
+                "session-long".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    let next = calls_for_poll.fetch_add(1, Ordering::SeqCst) + 1;
+                    if next <= 50 {
+                        None
+                    } else {
+                        Some(Response::success(
+                            "pending-long",
+                            serde_json::json!({"ready_after_ticks": next}),
+                        ))
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let mut writer = Vec::new();
+
+        for expected_calls in 1..=50 {
+            assert_eq!(
+                write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+                0
+            );
+            assert!(writer.is_empty());
+            assert_eq!(poll_calls.load(Ordering::SeqCst), expected_calls);
+        }
+
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-long");
+        assert_eq!(values[0]["ready_after_ticks"], 51);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn multiple_pending_responses_resolve_independently() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let second_ready = Arc::new(AtomicBool::new(false));
+        let second_ready_for_poll = Arc::clone(&second_ready);
+        let mut pending = PendingResponses::default();
+        pending
+            .register(PendingResponse::polling(
+                "pending-ready".to_string(),
+                "session-multi".to_string(),
+                "read".to_string(),
+                Box::new(|_| {
+                    Some(Response::success(
+                        "pending-ready",
+                        serde_json::json!({"which": "ready"}),
+                    ))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        pending
+            .register(PendingResponse::polling(
+                "pending-later".to_string(),
+                "session-multi".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    if second_ready_for_poll.load(Ordering::SeqCst) {
+                        Some(Response::success(
+                            "pending-later",
+                            serde_json::json!({"which": "later"}),
+                        ))
+                    } else {
+                        None
+                    }
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["id"], "pending-ready");
+        assert!(!pending.is_empty());
+
+        second_ready.store(true, Ordering::SeqCst);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            1
+        );
+        let values = line_values(&writer);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[1]["id"], "pending-later");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn shutdown_drops_pending_without_polling_or_writing() {
+        let root = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(root.path());
+        let poll_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_poll = Arc::clone(&poll_calls);
+        let mut pending = PendingResponses::default();
+        pending
+            .register(PendingResponse::polling(
+                "pending-shutdown".to_string(),
+                "session-shutdown".to_string(),
+                "read".to_string(),
+                Box::new(move |_| {
+                    calls_for_poll.fetch_add(1, Ordering::SeqCst);
+                    Some(Response::success(
+                        "pending-shutdown",
+                        serde_json::json!({"should_not_write": true}),
+                    ))
+                }),
+            ))
+            .unwrap_or_else(|_| panic!("pending request id must be unique"));
+        let mut writer = Vec::new();
+
+        pending.drain_on_shutdown();
+        assert!(pending.is_empty());
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            write_ready_pending_to_writer(&ctx, &mut pending, &mut writer).unwrap(),
+            0
+        );
+        assert!(writer.is_empty());
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod deferred_semantic_search_tests {
+    use super::{
+        attach_command_for_request, deferred_tool_call_name, dispatch, dispatch_outcome,
+        handle_cancel_request, wait_for_semantic_index_before_search,
+        write_ready_pending_to_writer,
+    };
+    use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
+    use aft::context::{AppContext, SemanticIndexStatus};
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use aft::response_finalize::{finalize_response, DispatchOutcome, PendingResponses};
+    use aft::semantic_index::SemanticIndex;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct SemanticReadyWaitEnv;
+
+    impl Drop for SemanticReadyWaitEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("AFT_WAIT_FOR_SEMANTIC_READY");
+            std::env::remove_var("AFT_WAIT_FOR_SEMANTIC_READY_MS");
+        }
+    }
+
+    fn request(id: &str, command: &str, params: serde_json::Value) -> RawRequest {
+        RawRequest {
+            id: id.to_string(),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: Some("standalone-search-test".to_string()),
+            params,
+        }
+    }
+
+    #[test]
+    fn view_token_management_dispatch_reaches_the_default_off_guard() {
+        let storage = tempfile::tempdir().unwrap();
+        let context = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_owned()),
+                ..Default::default()
+            },
+        );
+        let response = super::dispatch_command(
+            request(
+                "token",
+                "view_token",
+                serde_json::json!({
+                    "root": storage.path().join("future"), "expected_tree": "a".repeat(40),
+                }),
+            ),
+            &context,
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["success"], false);
+        assert_eq!(wire["code"], "VIEW_TOKEN");
+        assert!(!storage.path().join("blobs").exists());
+    }
+
+    fn slow_search_request(id: &str) -> RawRequest {
+        request(
+            id,
+            "semantic_search",
+            serde_json::json!({
+                "query": "where does standalone search cancellation stop a remote request"
+            }),
+        )
+    }
+
+    fn semantic_context(root: &Path, base_url: String) -> Arc<AppContext> {
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.to_path_buf()),
+                    indexes: aft::config::IndexesConfig {
+                        trigram: false,
+                        semantic: true,
+                        callgraph: true,
+                    },
+                    semantic: SemanticBackendConfig {
+                        backend: SemanticBackend::OpenAiCompatible,
+                        model: "test-embedding".to_string(),
+                        base_url: Some(base_url),
+                        api_key_env: None,
+                        query_timeout_ms: 3_000,
+                        ..SemanticBackendConfig::default()
+                    },
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.to_path_buf(), 3));
+        ctx
+    }
+
+    fn start_slow_embedding_server(
+        response_delay: Duration,
+    ) -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow embedding server");
+        let addr = listener
+            .local_addr()
+            .expect("slow embedding server address");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            started_tx.send(()).expect("signal embedding request start");
+            thread::sleep(response_delay);
+            let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), started_rx, handle)
+    }
+
+    /// Embedding server that holds its reply until the test releases it, so a
+    /// test can observe what happens while a query embedding is in flight
+    /// without racing a timer.
+    fn start_gated_embedding_server() -> (
+        String,
+        mpsc::Receiver<()>,
+        mpsc::SyncSender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated embedding server");
+        let addr = listener
+            .local_addr()
+            .expect("gated embedding server address");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            started_tx.send(()).expect("signal embedding request start");
+            let _ = release_rx.recv();
+            let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), started_rx, release_tx, handle)
+    }
+
+    fn register_deferred(outcome: DispatchOutcome) -> PendingResponses {
+        let mut pending = PendingResponses::default();
+        match outcome {
+            DispatchOutcome::Deferred(response) => pending
+                .register(response)
+                .unwrap_or_else(|_| panic!("pending request id must be unique")),
+            DispatchOutcome::Immediate(response) => {
+                panic!("semantic search must be deferred, got {response:?}")
+            }
+        }
+        pending
+    }
+
+    fn wait_for_response(
+        ctx: &AppContext,
+        pending: &mut PendingResponses,
+    ) -> aft::protocol::Response {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(response) = pending.poll_ready(ctx).into_iter().next() {
+                return response.response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred search"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn deferred_search_keeps_sibling_status_latency_bounded() {
+        const EMBED_DELAY: Duration = Duration::from_millis(650);
+        let root = tempfile::tempdir().expect("create search project");
+
+        let (inline_url, _inline_started, inline_server) = start_slow_embedding_server(EMBED_DELAY);
+        let inline_ctx = semantic_context(root.path(), inline_url);
+        let inline_started_at = Instant::now();
+        let inline_response = dispatch(slow_search_request("inline-search"), &inline_ctx);
+        assert!(inline_response.success);
+        let inline_status = dispatch(
+            request("inline-status", "status", serde_json::json!({})),
+            &inline_ctx,
+        );
+        let inline_sibling_latency = inline_started_at.elapsed();
+        assert!(inline_status.success);
+        inline_server.join().expect("inline embedding server joins");
+
+        let (deferred_url, deferred_started, release_embedding, deferred_server) =
+            start_gated_embedding_server();
+        let deferred_ctx = semantic_context(root.path(), deferred_url);
+        let mut pending = register_deferred(dispatch_outcome(
+            slow_search_request("deferred-search"),
+            &deferred_ctx,
+        ));
+        deferred_started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deferred query embedding starts");
+        // The embedding server holds its reply until released below, so the
+        // query embedding is provably still in flight while status runs. If
+        // status waited behind it, status could only return after the query
+        // timeout gave up on the embedding, and by then the deferred search
+        // would have resolved, which the poll below would see.
+        let deferred_status = dispatch(
+            request("deferred-status", "status", serde_json::json!({})),
+            &deferred_ctx,
+        );
+        assert!(deferred_status.success);
+        assert!(
+            pending.poll_ready(&deferred_ctx).is_empty(),
+            "status must not wait behind the deferred query embedding"
+        );
+
+        eprintln!(
+            "standalone sibling status latency: inline={}ms",
+            inline_sibling_latency.as_millis(),
+        );
+        assert!(
+            inline_sibling_latency >= Duration::from_millis(500),
+            "inline control must include the slow query embedding"
+        );
+
+        release_embedding
+            .send(())
+            .expect("release the held query embedding");
+        let response = wait_for_response(&deferred_ctx, &mut pending);
+        assert!(response.success);
+        deferred_server
+            .join()
+            .expect("deferred embedding server joins");
+    }
+
+    #[test]
+    fn cancel_request_stops_deferred_query_embedding_and_resolves_cancelled() {
+        let root = tempfile::tempdir().expect("create search project");
+        let (base_url, started, server) = start_slow_embedding_server(Duration::from_millis(1_000));
+        let ctx = semantic_context(root.path(), base_url);
+        let mut pending = register_deferred(dispatch_outcome(
+            slow_search_request("cancelled-search"),
+            &ctx,
+        ));
+        started
+            .recv_timeout(Duration::from_secs(30))
+            .expect("query embedding starts");
+
+        let cancel_started_at = Instant::now();
+        let cancel = handle_cancel_request(
+            &request(
+                "cancel-command",
+                "cancel_request",
+                serde_json::json!({"params": {"id": "cancelled-search"}}),
+            ),
+            &mut pending,
+        );
+        assert!(cancel.success);
+        assert_eq!(cancel.data["cancelled"], true);
+        let response = wait_for_response(&ctx, &mut pending);
+        let cancel_latency = cancel_started_at.elapsed();
+        assert_eq!(response.id, "cancelled-search");
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "request_cancelled");
+        assert!(
+            cancel_latency < Duration::from_millis(300),
+            "cancellation must wake the query-embedding wait, not wait for the remote response"
+        );
+        server.join().expect("cancel embedding server joins");
+    }
+
+    #[test]
+    fn semantic_ready_harness_wait_wakes_on_cancellation() {
+        let _env_guard = super::test_env::process_env_lock();
+        std::env::set_var("AFT_WAIT_FOR_SEMANTIC_READY", "1");
+        std::env::set_var("AFT_WAIT_FOR_SEMANTIC_READY_MS", "5000");
+        let _wait_env = SemanticReadyWaitEnv;
+        let root = tempfile::tempdir().expect("create search project");
+        let ctx = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    project_root: Some(root.path().to_path_buf()),
+                    indexes: aft::config::IndexesConfig {
+                        trigram: false,
+                        semantic: true,
+                        callgraph: true,
+                    },
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "test_wait".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let cancellation = aft::executor::JobCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_ctx = Arc::clone(&ctx);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _installed = aft::executor::install_job_cancellation(worker_cancellation);
+            started_tx.send(()).expect("signal semantic wait start");
+            let response = wait_for_semantic_index_before_search(
+                &slow_search_request("cancelled-ready-wait"),
+                &worker_ctx,
+            )
+            .expect("cancelled wait returns a response");
+            response_tx
+                .send(response)
+                .expect("send cancelled wait response");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("semantic-ready wait starts");
+        thread::sleep(Duration::from_millis(20));
+        cancellation.request_cancel();
+        let response = response_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("cancellation wakes semantic-ready wait");
+        assert_eq!(response.data["code"], "request_cancelled");
+        worker.join().expect("semantic-ready waiter joins");
+    }
+
+    #[test]
+    fn every_bare_deferred_route_has_a_deferred_tool_call_wrapper() {
+        for name in [
+            "search",
+            "inspect",
+            "read",
+            "bash",
+            "powershell",
+            "lsp_hover",
+            "lsp_goto_definition",
+            "lsp_find_references",
+            "lsp_prepare_rename",
+        ] {
+            let req = request(
+                "deferred-route-audit",
+                "tool_call",
+                serde_json::json!({"name": name, "arguments": {}}),
+            );
+            assert_eq!(
+                deferred_tool_call_name(&req),
+                Some(name),
+                "bare deferred route {name} must defer its tool_call wrapper"
+            );
+        }
+
+        let prefixed = request(
+            "prefixed-inspect-route",
+            "tool_call",
+            serde_json::json!({"name": "aft_inspect", "arguments": {}}),
+        );
+        assert_eq!(deferred_tool_call_name(&prefixed), Some("aft_inspect"));
+    }
+
+    #[test]
+    fn deferred_tool_call_search_preserves_inline_response_bytes() {
+        let root = tempfile::tempdir().expect("create search project");
+        std::fs::write(
+            root.path().join("fixture.rs"),
+            "fn parity_needle() -> usize { 4 }\n",
+        )
+        .expect("write parity fixture");
+        let make_ctx = || {
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Config::default()
+                    }),
+                )
+                .with_test_checkpoint_store(),
+            )
+        };
+        let make_request = || {
+            request(
+                "parity-search",
+                "tool_call",
+                serde_json::json!({
+                    "name": "search",
+                    "arguments": {"query": "parity_needle.*"}
+                }),
+            )
+        };
+
+        aft::commands::tool_call::register_dispatch(dispatch);
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-search-test",
+            &inline_attach,
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred parity response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(deferred_bytes, inline_bytes);
+    }
+
+    #[test]
+    fn deferred_tool_call_inspect_preserves_inline_response_bytes() {
+        let root = tempfile::tempdir().expect("create inspect project");
+        std::fs::write(root.path().join("fixture.rs"), "fn inspect_parity() {}\n")
+            .expect("write parity fixture");
+        let make_ctx = || {
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(Config {
+                        project_root: Some(root.path().to_path_buf()),
+                        ..Config::default()
+                    }),
+                )
+                .with_test_checkpoint_store(),
+            )
+        };
+        let make_request = || {
+            request(
+                "parity-inspect",
+                "tool_call",
+                serde_json::json!({
+                    "name": "aft_inspect",
+                    "arguments": {"sections": ["todos"], "scope": "fixture.rs"}
+                }),
+            )
+        };
+
+        aft::commands::tool_call::register_dispatch(dispatch);
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-inspect-test",
+            &inline_attach,
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred inspect parity response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(deferred_bytes, inline_bytes);
+    }
+
+    /// Install a fast `tsc` stub that reports one TS2322 error for `target`.
+    #[cfg(unix)]
+    fn install_fast_tsc_stub(root: &Path, target: &Path) {
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).expect("create stub bin dir");
+        let stub = bin_dir.join("tsc");
+        crate::executable_cache::write_executable(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\nprintf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{}'\nexit 2\n",
+                target.display()
+            )
+            .as_bytes(),
+        )
+        .expect("write tsc stub");
+        // Pay first-exec cost (macOS assessment) outside the checker timeout.
+        let _ = std::process::Command::new(&stub)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status();
+    }
+
+    /// An edit whose type checker runs off the request thread must produce the
+    /// same response bytes as the inline edit it replaces.
+    #[cfg(unix)]
+    #[test]
+    fn offloaded_validation_preserves_inline_edit_response_bytes() {
+        let root = tempfile::tempdir().expect("create validation project");
+        std::fs::write(root.path().join("tsconfig.json"), "{}\n").expect("write tsconfig");
+        let target = root.path().join("parity.ts");
+        install_fast_tsc_stub(root.path(), &target);
+        let make_ctx = || {
+            let mut config = Config {
+                project_root: Some(root.path().to_path_buf()),
+                validate_on_edit: Some("full".to_string()),
+                ..Config::default()
+            };
+            config
+                .checker
+                .insert("typescript".to_string(), "tsc".to_string());
+            Arc::new(
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::context_storage::isolate(config),
+                )
+                .with_test_checkpoint_store(),
+            )
+        };
+        let make_request = || {
+            request(
+                "parity-write",
+                "write",
+                serde_json::json!({
+                    "file": target.display().to_string(),
+                    "content": "const x: number = \"oops\";\n",
+                }),
+            )
+        };
+
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-search-test",
+            &inline_attach,
+        );
+        assert_eq!(
+            inline_response.data["validation_errors"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "inline control must run the checker: {inline_response:?}"
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        std::fs::remove_file(&target).expect("reset parity target");
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for offloaded edit response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            String::from_utf8_lossy(&deferred_bytes),
+            String::from_utf8_lossy(&inline_bytes)
+        );
+    }
+
+    #[test]
+    fn only_validating_mutations_offload_the_checker() {
+        let full = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config {
+                    validate_on_edit: Some("full".to_string()),
+                    ..Config::default()
+                }),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let off = Arc::new(
+            AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let edit_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "edit", "arguments": {}}),
+        );
+        let prefixed_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "aft_import", "arguments": {}}),
+        );
+        let outline_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "outline", "arguments": {}}),
+        );
+        let param_full = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "write", "arguments": {"validate": "full"}}),
+        );
+        assert!(super::offloads_full_validation(&edit_tool, &full));
+        assert!(super::offloads_full_validation(&prefixed_tool, &full));
+        assert!(super::offloads_full_validation(
+            &request("t", "edit_match", serde_json::json!({})),
+            &full
+        ));
+        assert!(!super::offloads_full_validation(&outline_tool, &full));
+        assert!(!super::offloads_full_validation(
+            &request("t", "status", serde_json::json!({})),
+            &full
+        ));
+        assert!(!super::offloads_full_validation(&edit_tool, &off));
+        assert!(super::offloads_full_validation(&param_full, &off));
+    }
+}
+
+#[cfg(test)]
+mod signal_handler_tests {
+    use super::{signal_bg_registries, App, AppContext, Config, RuntimeRegistry};
+    use std::sync::Arc;
+
+    #[test]
+    fn signal_bg_registry_collection_includes_standalone_actor() {
+        let app = App::default_shared();
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                crate::context_storage::isolate(Config::default()),
+            )
+            .with_test_checkpoint_store(),
+        );
+        let storage = ctx
+            .config()
+            .storage_dir
+            .clone()
+            .expect("binary fixture storage is explicit");
+        assert!(storage.is_dir(), "binary fixture storage remains alive");
+        let registry = RuntimeRegistry::standalone(app, ctx);
+
+        assert_eq!(signal_bg_registries(&registry).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_search_index_tests {
+    use super::{
+        flush_indexes_on_graceful_shutdown, global_gitignore_env_test_lock, App, AppContext,
+        Config, RuntimeRegistry,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+
+    fn make_runtime_registry(root: &Path, storage: &Path) -> RuntimeRegistry {
+        let app = App::default_shared();
+        let ctx = Arc::new(
+            AppContext::from_app(
+                Arc::clone(&app),
+                Config {
+                    project_root: Some(root.to_path_buf()),
+                    storage_dir: Some(storage.to_path_buf()),
+                    ..Config::default()
+                },
+            )
+            .with_test_checkpoint_store(),
+        );
+        ctx.set_canonical_cache_root(std::fs::canonicalize(root).expect("canonical root"));
+        RuntimeRegistry::standalone(app, ctx)
+    }
+
+    fn install_resident_search_index(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+    ) -> (PathBuf, PathBuf) {
+        let canonical_root = std::fs::canonicalize(root).expect("canonical root");
+        let cache_dir = aft::search_index::resolve_cache_dir(&canonical_root, Some(storage));
+        let mut index = aft::search_index::SearchIndex::build(&canonical_root);
+        let git_head = index.stored_git_head().map(str::to_owned);
+        index.write_to_disk(&cache_dir, git_head.as_deref());
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        (canonical_root, cache_dir)
+    }
+
+    fn wait_for_next_directory_write_mtime(dir: &Path, baseline: SystemTime) {
+        let probe = dir.join("mtime-probe");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut counter = 0u64;
+        loop {
+            std::fs::write(&probe, counter.to_string()).expect("write mtime probe");
+            let modified = std::fs::metadata(&probe)
+                .expect("mtime probe metadata")
+                .modified()
+                .expect("mtime probe modified time");
+            if modified != baseline {
+                let _ = std::fs::remove_file(&probe);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a later directory write mtime"
+            );
+            counter += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn stable_global_gitignore_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        global_gitignore_env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_for_search_index_build_to_finish(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            aft::runtime_drain::drain_search_index_events(ctx);
+            if ctx
+                .search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the delayed search rebuild to publish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn graceful_shutdown_flushes_search_delta_to_disk() {
+        // Search cache reads validate the global git-ignore fingerprint stamped
+        // at write time. Keep HOME/XDG_CONFIG_HOME stable while this test writes
+        // and reloads cache.bin, because other bin tests temporarily redirect
+        // those environment variables to neutralize developer-global ignores.
+        let _global_gitignore_env_guard = stable_global_gitignore_env_guard();
+        let root = tempfile::tempdir().expect("root tempdir");
+        // Keep the configured root in its /tmp spelling on macOS. The explicit
+        // path must remain byte-identical across flush and readback.
+        let storage = if cfg!(target_os = "macos") {
+            tempfile::tempdir_in("/tmp").expect("/tmp storage tempdir")
+        } else {
+            tempfile::tempdir().expect("storage tempdir")
+        };
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old shutdown token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+        assert_eq!(
+            cache_dir,
+            storage
+                .path()
+                .join("index")
+                .join(aft::search_index::artifact_cache_key(&canonical_root)),
+            "explicit storage spelling must survive cache derivation"
+        );
+
+        std::fs::write(&file, "new shutdown token\n").expect("edit source");
+        {
+            let mut search_index = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            search_index
+                .as_mut()
+                .expect("resident search index")
+                .update_file(&file);
+        }
+
+        // The transport may abandon a slow flush at its exit deadline. This
+        // persistence test instead waits for the worker's completion message.
+        let report = aft::context::flush_search_indexes_before(
+            &[Arc::clone(ctx)],
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert_eq!(report.flushed, 1, "{report:?}");
+
+        let mut restored =
+            aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
+                .expect("load flushed search index");
+        restored.ready = true;
+        assert_eq!(
+            restored
+                .grep("new shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
+                .matches
+                .len(),
+            1,
+            "graceful shutdown should persist the edited file into cache.bin"
+        );
+        assert!(
+            restored
+                .grep("old shutdown token", true, &[], &[], &canonical_root, 10)
+                .unwrap()
+                .matches
+                .is_empty(),
+            "without the shutdown flush this test goes red because disk still holds the old base"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_waits_for_inflight_search_rebuild_before_flushing() {
+        let _global_gitignore_env_guard = stable_global_gitignore_env_guard();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old delayed shutdown token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+
+        std::fs::write(&file, "new delayed shutdown token\n").expect("edit source");
+        let (publish_reached_rx, shutdown_waiting_rx, publish_release_tx) =
+            aft::runtime_drain::install_search_rebuild_publish_gate_for_test();
+        aft::runtime_drain::spawn_search_corpus_refresh(ctx, canonical_root.clone(), ctx.config());
+        publish_reached_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("search rebuild reaches its publish gate");
+        assert!(
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "test should exercise graceful shutdown while a search rebuild is still in flight"
+        );
+
+        let release = std::thread::spawn(move || {
+            shutdown_waiting_rx
+                .recv_timeout(Duration::from_secs(12))
+                .expect("graceful shutdown waits for the in-flight rebuild");
+            publish_release_tx
+                .send(())
+                .expect("release search rebuild publish gate");
+        });
+        let report = aft::context::flush_search_indexes_before(
+            &[Arc::clone(ctx)],
+            Instant::now() + Duration::from_secs(30),
+        );
+        release.join().expect("publish gate release thread");
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert!(report.failed_roots.is_empty(), "{report:?}");
+
+        let mut restored =
+            aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
+                .expect("load search index after delayed rebuild flush");
+        restored.ready = true;
+        let new_matches = restored
+            .grep(
+                "new delayed shutdown token",
+                true,
+                &[],
+                &[],
+                &canonical_root,
+                10,
+            )
+            .unwrap()
+            .matches
+            .len();
+        let old_matches = restored
+            .grep(
+                "old delayed shutdown token",
+                true,
+                &[],
+                &[],
+                &canonical_root,
+                10,
+            )
+            .unwrap()
+            .matches
+            .len();
+        wait_for_search_index_build_to_finish(ctx);
+
+        assert_eq!(
+            new_matches, 1,
+            "graceful shutdown should wait for the in-flight rebuild to publish before flushing"
+        );
+        assert_eq!(
+            old_matches, 0,
+            "shutdown flush should not leave the old cache on disk"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_skips_read_only_search_flush() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let file = root.path().join("src.txt");
+        std::fs::write(&file, "old readonly token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (_canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+
+        std::fs::write(&file, "new readonly token\n").expect("edit source");
+        {
+            let mut search_index = ctx
+                .search_index()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            search_index
+                .as_mut()
+                .expect("resident search index")
+                .update_file(&file);
+        }
+        let cache_path = cache_dir.join("cache.bin");
+        let before = std::fs::metadata(&cache_path)
+            .expect("cache metadata before shutdown")
+            .modified()
+            .expect("cache mtime before shutdown");
+
+        ctx.set_cache_role(true, None);
+        wait_for_next_directory_write_mtime(&cache_dir, before);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+
+        let after = std::fs::metadata(&cache_path)
+            .expect("cache metadata after shutdown")
+            .modified()
+            .expect("cache mtime after shutdown");
+        assert_eq!(
+            before, after,
+            "worktree/read-only runtimes must not rewrite shared search artifacts on shutdown"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_skips_empty_search_delta() {
+        let root = tempfile::tempdir().expect("root tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        std::fs::write(root.path().join("src.txt"), "unchanged token\n").expect("write source");
+
+        let registry = make_runtime_registry(root.path(), storage.path());
+        let ctx = registry.current();
+        let (_canonical_root, cache_dir) =
+            install_resident_search_index(ctx, root.path(), storage.path());
+        let cache_path = cache_dir.join("cache.bin");
+        let before = std::fs::metadata(&cache_path)
+            .expect("cache metadata before shutdown")
+            .modified()
+            .expect("cache mtime before shutdown");
+
+        wait_for_next_directory_write_mtime(&cache_dir, before);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+
+        let after = std::fs::metadata(&cache_path)
+            .expect("cache metadata after shutdown")
+            .modified()
+            .expect("cache mtime after shutdown");
+        assert_eq!(
+            before, after,
+            "shutdown with no trigram delta should leave cache.bin untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watcher_filter_tests {
+    use super::{dispatch, dispatch_panic_response, write_push_frame_or_request_shutdown};
+    use aft::config::{BackupConfig, Config};
+    use aft::context::{
+        AppContext, CallgraphStoreAccess, SemanticIndexEvent, SemanticIndexStatus,
+        SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    };
+    use aft::harness::Harness;
+    use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use aft::lsp::registry::ServerKind;
+    use aft::lsp::roots::ServerKey;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
+    use aft::response_finalize::finalize_response;
+    use aft::runtime_drain::{
+        drain_semantic_refresh_events, drain_watcher_events_bounded,
+        record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
+        semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
+        semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_PATH_DRAIN_BATCH_CAP,
+    };
+
+    /// Apply every queued watcher event. One drain call applies a single slice
+    /// with a 250 ms budget, so on a slow runner it can stop before the later
+    /// index phases; production finishes the rest on later turns.
+    fn drain_watcher_events(ctx: &AppContext) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher drain never finished"
+            );
+        }
+    }
+    use aft::semantic_index::SemanticIndex;
+    use aft::watcher_filter::{
+        watcher_event_invalidates, FilteredWatcherPaths, WatcherDispatchEvent, WatcherFilterConfig,
+    };
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
+    };
+    use notify::EventKind;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Wait budget for an async dispatch (semantic-refresh request / status
+    /// frame) the worker produces on a freshly-spawned thread. The dispatch
+    /// thread does `spawn -> sleep(backoff) -> send`, so under CI load the
+    /// spawn-plus-wakeup latency can briefly exceed a tight budget. The wait
+    /// returns the instant the value arrives, so this is zero-cost on the happy
+    /// path. Negative waits (asserting absence) must stay short and are NOT
+    /// this const.
+    const RECV_DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn make_ctx_with_root(root: &std::path::Path) -> AppContext {
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store()
+    }
+
+    fn install_watcher_rx(ctx: &AppContext) -> crossbeam_channel::Sender<WatcherDispatchEvent> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(rx);
+        tx
+    }
+
+    fn watcher_paths_event(path: std::path::PathBuf) -> WatcherDispatchEvent {
+        WatcherDispatchEvent::Paths(vec![path])
+    }
+
+    fn filter_watcher_raw_paths<I>(ctx: &AppContext, raw_paths: I) -> FilteredWatcherPaths
+    where
+        I: IntoIterator<Item = std::path::PathBuf>,
+    {
+        let root = ctx
+            .canonical_cache_root_opt()
+            .or_else(|| ctx.config().project_root.clone())
+            .expect("test context has project root");
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let config = WatcherFilterConfig::new(root, ctx.git_common_dir());
+        aft::watcher_filter::filter_watcher_raw_paths_for_test(
+            &config,
+            &ctx.shared_gitignore(),
+            raw_paths,
+        )
+    }
+
+    // The callgraph store indexes every detected language (not just the trigram
+    // SOURCE_EXTENSIONS set), so its watcher refresh must too — otherwise edits
+    // to Java/C/C++/C#/Kotlin/Ruby/… serve stale call results until full rebuild.
+    #[test]
+    fn callgraph_watcher_gate_covers_all_indexed_languages() {
+        use std::path::Path;
+        for ok in [
+            "Foo.java",
+            "x.cpp",
+            "kernel.cu",
+            "shader.metal",
+            "y.c",
+            "Svc.cs",
+            "m.kt",
+            "a.rb",
+            "z.php",
+            "s.scala",
+            "C.sol",
+            "app.ts",
+            "main.rs",
+            "h.go",
+            "p.py",
+            "config.toml",
+        ] {
+            assert!(
+                watcher_path_is_callgraph_indexed(Path::new(ok)),
+                "{ok} should be callgraph-indexed"
+            );
+        }
+        // Genuinely-undetected extensions (detect_language → None). Note md/json/
+        // yaml/toml ARE detected (the store walks them at cold-build), so matching
+        // cold-build means they refresh too — refresh coverage == index coverage.
+        for skip in ["notes.txt", "image.png", "Cargo.lock", "data.csv"] {
+            assert!(
+                !watcher_path_is_callgraph_indexed(Path::new(skip)),
+                "{skip} should not be callgraph-indexed"
+            );
+        }
+    }
+
+    fn install_semantic_refresh_channels(
+        ctx: &AppContext,
+    ) -> (
+        crossbeam_channel::Receiver<SemanticRefreshRequest>,
+        crossbeam_channel::Sender<SemanticRefreshEvent>,
+    ) {
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let worker_slot: SemanticRefreshWorkerSlot =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        ctx.install_semantic_refresh_worker(request_tx, event_rx, worker_slot);
+        (request_rx, event_tx)
+    }
+
+    fn transient_embedding_error() -> String {
+        format!(
+            "{}backend unavailable",
+            aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
+        )
+    }
+
+    fn recv_files_request(
+        request_rx: &crossbeam_channel::Receiver<SemanticRefreshRequest>,
+    ) -> Vec<std::path::PathBuf> {
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic refresh request")
+        {
+            SemanticRefreshRequest::Files { paths } => paths,
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
+        }
+    }
+
+    fn status_frame_rx(ctx: &AppContext) -> std::sync::mpsc::Receiver<PushFrame> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(move |frame| {
+            let _ = tx.send(frame);
+        }))));
+        rx
+    }
+
+    fn recv_status_changed(rx: &std::sync::mpsc::Receiver<PushFrame>) -> serde_json::Value {
+        match rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("status_changed frame")
+        {
+            PushFrame::StatusChanged(frame) => frame.snapshot,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    fn err_diag(file: &std::path::Path) -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: file.to_path_buf(),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "boom".into(),
+            code: None,
+            source: None,
+        }
+    }
+
+    /// Shared serialization lock for tests that override the process-global
+    /// semantic retry-backoff environment variable. The semantic breaker itself
+    /// is per-AppContext; only the test seam remains process-global.
+    fn semantic_breaker_test_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_semantic_retry_backoff_ms<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+        let _guard = semantic_breaker_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("AFT_SEMANTIC_RETRY_BACKOFF_MS");
+        unsafe {
+            std::env::set_var("AFT_SEMANTIC_RETRY_BACKOFF_MS", ms.to_string());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("AFT_SEMANTIC_RETRY_BACKOFF_MS", value),
+                None => std::env::remove_var("AFT_SEMANTIC_RETRY_BACKOFF_MS"),
+            }
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Run `f` with global git-ignore discovery neutralized.
+    ///
+    /// `rebuild_gitignore` loads git's global excludes via the `ignore`
+    /// crate, which discovers them from TWO places: `core.excludesfile` in
+    /// `$HOME/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`), and the default
+    /// `$XDG_CONFIG_HOME/git/ignore` / `$HOME/.config/git/ignore` locations.
+    /// A developer machine commonly has one of these, so any "no project
+    /// ignore → None" baseline is only deterministic when BOTH discovery
+    /// roots point at an empty directory — neutralizing only
+    /// `XDG_CONFIG_HOME` still finds a `~/.gitconfig` `core.excludesfile`.
+    /// Serialized by the same process-local mutex used by search-cache tests:
+    /// otherwise a cache written while HOME points here can be rejected when it
+    /// is read after HOME is restored.
+    fn with_neutralized_global_gitignore<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = super::global_gitignore_env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        // SAFETY: serialized by LOCK above; restored immediately after `f`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("USERPROFILE", tmp.path());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[test]
+    fn watcher_drain_refreshes_open_callgraph_store() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let worker =
+            aft::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.to_path_buf());
+        let source = root.join("main.ts");
+        std::fs::write(
+            &source,
+            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(root.join("storage")),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_harness(Harness::Opencode);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.set_cache_role(false, None);
+        // The lease gate is fail-closed for unregistered roots, so grant this
+        // fixture writer capability the same way a real configure does.
+        aft::root_cache::configure_artifact_access(
+            root,
+            &aft::search_index::artifact_cache_key(root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+        let tx = install_watcher_rx(&ctx);
+        {
+            let store = ctx
+                .ensure_callgraph_store()
+                .unwrap()
+                .expect("store should build on demand");
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            assert_eq!(tree.children[0].name, "oldLeaf");
+        }
+
+        std::fs::write(
+            &source,
+            "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.to_path_buf());
+        tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
+        // If drain starts waiting for the write, this thread cannot release it.
+        // The supervisor's hang cap catches that deadlock without measuring CPU speed.
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let ctx_ref = &ctx;
+            scope.spawn(move || {
+                drain_watcher_events(ctx_ref);
+                done_tx.send(()).unwrap();
+            });
+            let drained = done_rx.recv_timeout(Duration::from_secs(60));
+            if drained.is_err() {
+                drop(release);
+                panic!("watcher drain waited for the callgraph store write");
+            }
+            held.recv_timeout(Duration::from_secs(60))
+                .expect("fixture worker never took the refresh");
+            let store = ctx
+                .callgraph_store()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            assert_eq!(
+                tree.children[0].name, "oldLeaf",
+                "the held worker must not publish early"
+            );
+            release.send(()).unwrap();
+        });
+
+        let store = {
+            let guard = ctx
+                .callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .map(std::sync::Arc::clone)
+                .expect("store remains open")
+        };
+        assert!(
+            worker.wait(Duration::from_secs(60)),
+            "fixture refresh worker hung"
+        );
+        let tree = store
+            .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+            .unwrap();
+        assert_eq!(
+            tree.children[0].name, "newLeaf",
+            "async callgraph refresh did not publish the changed edge"
+        );
+    }
+
+    /// An editor's atomic save (temporary file renamed over the original)
+    /// reaches the refresh worker like a write. While the worker has not
+    /// applied it, a call-graph answer still shows the old edge and must say
+    /// so with `complete: false` and a gap naming the file; once the refresh
+    /// lands, the new edge is served as a complete answer.
+    #[test]
+    fn pending_callgraph_refresh_marks_answers_incomplete_and_names_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let root = root.as_path();
+        let worker =
+            aft::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.to_path_buf());
+        let source = root.join("main.ts");
+        std::fs::write(
+            &source,
+            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.to_path_buf()),
+                storage_dir: Some(root.join("storage")),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_harness(Harness::Opencode);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.set_cache_role(false, None);
+        aft::root_cache::configure_artifact_access(
+            root,
+            &aft::search_index::artifact_cache_key(root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+        let tx = install_watcher_rx(&ctx);
+        ctx.ensure_callgraph_store()
+            .unwrap()
+            .expect("store should build on demand");
+        let call_tree = || {
+            dispatch(
+                serde_json::from_value(serde_json::json!({
+                    "id": "pending-call-tree",
+                    "command": "call_tree",
+                    "file": source,
+                    "symbol": "entry",
+                    "depth": 1,
+                }))
+                .unwrap(),
+                &ctx,
+            )
+        };
+        let before = call_tree();
+        assert_eq!(before.data["children"][0]["name"], "oldLeaf");
+        assert!(before.data.get("complete").is_none(), "{:?}", before.data);
+
+        let temporary = root.join(".main.ts.swp");
+        std::fs::write(
+            &temporary,
+            "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        std::fs::rename(&temporary, &source).unwrap();
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.to_path_buf());
+        // A rename-over reports both the vanished temporary file and the
+        // replaced original.
+        tx.send(WatcherDispatchEvent::Paths(vec![temporary, source.clone()]))
+            .unwrap();
+        drain_watcher_events(&ctx);
+        held.recv_timeout(Duration::from_secs(60))
+            .expect("fixture worker never took the refresh");
+        let pending = call_tree();
+        release.send(()).unwrap();
+        assert_eq!(
+            pending.data["children"][0]["name"], "oldLeaf",
+            "the held worker must not publish early"
+        );
+        assert_eq!(
+            pending.data["complete"], false,
+            "a stale answer must not look complete: {:?}",
+            pending.data
+        );
+        assert!(
+            pending.data["gaps"].as_array().is_some_and(|gaps| gaps
+                .iter()
+                .any(|gap| gap["kind"] == "callgraph_pending" && gap["path"] == "main.ts")),
+            "the pending gap must name the saved file: {:?}",
+            pending.data
+        );
+
+        assert!(
+            worker.wait(Duration::from_secs(60)),
+            "fixture refresh worker hung"
+        );
+        let after = call_tree();
+        assert_eq!(after.data["children"][0]["name"], "newLeaf");
+        assert!(
+            after.data.get("complete").is_none(),
+            "a refreshed answer is complete: {:?}",
+            after.data
+        );
+    }
+
+    #[test]
+    fn create_and_remove_invalidate() {
+        assert!(watcher_event_invalidates(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Remove(
+            RemoveKind::File
+        )));
+    }
+
+    #[test]
+    fn modify_data_invalidates() {
+        // The "actual file write" case — must invalidate.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Content)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Data(DataChange::Any)
+        )));
+    }
+
+    #[test]
+    fn modify_name_rename_invalidates() {
+        // Renames should invalidate the old path's cached state.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::To)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::From)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Both)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_writetime_invalidates() {
+        // mtime change implies real content edit on every supported platform.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_any_or_other_invalidates() {
+        // Catch-all "we can't tell what changed" — better to over-invalidate.
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Other)
+        )));
+    }
+
+    /// Regression: biome-lint reading every TS file under Linux atime triggers
+    /// notify `Modify(Metadata(AccessTime))` events. Treating those as
+    /// invalidations re-parses the entire symbol cache, search index, and
+    /// semantic index for every read-only lint pass — wasted work.
+    #[test]
+    fn modify_metadata_access_time_does_not_invalidate() {
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::AccessTime)
+        )));
+    }
+
+    #[test]
+    fn modify_metadata_permissions_ownership_extended_do_not_invalidate() {
+        // chmod / chown / xattrs don't change content.
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Permissions)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Ownership)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Extended)
+        )));
+    }
+
+    #[test]
+    fn access_events_do_not_invalidate() {
+        // Read syscalls cause an atime feedback loop on Linux when the watcher
+        // is watching a directory we read into.
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Open(AccessMode::Read)
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Read
+        )));
+        assert!(!watcher_event_invalidates(&EventKind::Access(
+            AccessKind::Close(AccessMode::Read)
+        )));
+    }
+
+    #[test]
+    fn other_event_kinds_do_not_invalidate() {
+        // `Other`, `Any` — we explicitly opt out of unknown event categories
+        // since the existing `Modify(_)` and `Modify(Metadata(Any))` arms
+        // already handle the meaningful catch-all cases.
+        assert!(!watcher_event_invalidates(&EventKind::Other));
+        assert!(!watcher_event_invalidates(&EventKind::Any));
+    }
+
+    #[test]
+    fn dispatch_panic_response_is_clear_internal_error() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+
+        let response = dispatch_panic_response("panic-id", "db_get_state", payload.as_ref());
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "internal_error");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("command 'db_get_state' panicked: boom"));
+    }
+
+    #[test]
+    fn dispatch_rejects_agent_safety_commands_when_backups_disabled() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        config.backup = BackupConfig {
+            enabled: Some(false),
+            ..BackupConfig::default()
+        };
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(config),
+        )
+        .with_test_checkpoint_store();
+        for command in [
+            "undo",
+            "undo_preview",
+            "edit_history",
+            "checkpoint",
+            "checkpoint_paths",
+            "restore_checkpoint",
+            "list_checkpoints",
+        ] {
+            let response = dispatch(
+                RawRequest {
+                    id: command.to_string(),
+                    command: command.to_string(),
+                    params: serde_json::json!({}),
+                    session_id: None,
+                    lsp_hints: None,
+                },
+                &ctx,
+            );
+            assert!(!response.success, "{command} unexpectedly succeeded");
+            assert_eq!(response.data["code"], "backups_disabled");
+        }
+    }
+
+    #[test]
+    fn push_frame_write_error_requests_shutdown() {
+        struct BrokenWriter;
+
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stdout closed",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let frame = PushFrame::ConfigureWarnings(ConfigureWarningsFrame::new("/repo", Vec::new()));
+
+        write_push_frame_or_request_shutdown(&mut BrokenWriter, &frame, &shutdown);
+
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn status_bar_line_skips_unchanged_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            let file = root.join("known.ts");
+            std::fs::write(&file, "").unwrap();
+            ctx.lsp()
+                .diagnostics_store_mut_for_test()
+                .publish(key, file.clone(), vec![]);
+            ctx.lsp().certify_diagnostic_content_for_test(&file);
+        }
+
+        // The bar rides in the agent-visible text, never as a `status_bar` field.
+        let with_text = |id: &str| Response::success(id, serde_json::json!({ "text": "body" }));
+        let mut first = with_text("one");
+        finalize_response(&mut first, &ctx, "session-status", "read");
+        assert_eq!(first.data["text"], "body\n\n[AFT E0 W0 | D1 U2 C3 | T4]");
+        assert!(first.data.get("status_bar").is_none());
+
+        let mut unchanged = with_text("two");
+        finalize_response(&mut unchanged, &ctx, "session-status", "read");
+        assert_eq!(unchanged.data["text"], "body");
+
+        ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
+        let mut changed = with_text("three");
+        finalize_response(&mut changed, &ctx, "session-status", "read");
+        assert_eq!(changed.data["text"], "body\n\n[AFT E0 W0 | D5 U2 C3 | T4]");
+    }
+
+    #[test]
+    fn configure_warning_drain_drops_stale_generation() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel();
+        ctx.set_progress_sender(Some(std::sync::Arc::new(Box::new(move |frame| {
+            let _ = frame_tx.send(frame);
+        }))));
+
+        let warnings_tx = ctx.configure_warnings_sender();
+        let current_generation = ctx.advance_configure_generation();
+        warnings_tx
+            .send((
+                current_generation - 1,
+                ConfigureWarningsFrame::new("/stale", Vec::new()),
+            ))
+            .unwrap();
+        warnings_tx
+            .send((
+                current_generation,
+                ConfigureWarningsFrame::new("/current", Vec::new()),
+            ))
+            .unwrap();
+
+        aft::runtime_drain::drain_configure_warning_events(&ctx);
+
+        let frame = frame_rx.try_recv().expect("current warning frame");
+        match frame {
+            PushFrame::ConfigureWarnings(frame) => {
+                assert_eq!(frame.project_root, "/current");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        assert!(frame_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn gitignore_write_rebuilds_before_filtering_same_batch_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let gitignore = root.join(".gitignore");
+        let ignored = root.join("foo.txt");
+        let kept = root.join("bar.txt");
+        std::fs::write(&ignored, "ignored").unwrap();
+        std::fs::write(&kept, "kept").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
+        assert!(ctx.gitignore().is_none());
+
+        std::fs::write(&gitignore, "foo.txt\n").unwrap();
+        with_neutralized_global_gitignore(|| ctx.rebuild_gitignore());
+        let changed =
+            filter_watcher_raw_paths(&ctx, vec![gitignore.clone(), ignored.clone(), kept.clone()]);
+
+        let gitignore = std::fs::canonicalize(gitignore).unwrap();
+        let ignored = std::fs::canonicalize(ignored).unwrap();
+        let kept = std::fs::canonicalize(kept).unwrap();
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.contains(&gitignore));
+        assert!(!changed.changed.contains(&ignored));
+        assert!(changed.changed.contains(&kept));
+    }
+
+    #[test]
+    fn infra_ignore_file_does_not_request_corpus_refresh_but_project_aftignore_does() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let infra_gitignore = root.join("node_modules").join("pkg").join(".gitignore");
+        std::fs::create_dir_all(infra_gitignore.parent().unwrap()).unwrap();
+        std::fs::write(&infra_gitignore, "dist/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![infra_gitignore]);
+
+        assert!(!changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+
+        let aftignore = root.join(".aftignore");
+        std::fs::write(&aftignore, "ignored/\n").unwrap();
+        let changed = filter_watcher_raw_paths(&ctx, vec![aftignore.clone()]);
+
+        let aftignore = std::fs::canonicalize(aftignore).unwrap();
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.contains(&aftignore));
+    }
+
+    #[test]
+    fn project_git_info_exclude_requests_corpus_refresh_without_indexing_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git_info = root.join(".git").join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        let exclude = git_info.join("exclude");
+        std::fs::write(&exclude, "ignored/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        let changed = filter_watcher_raw_paths(&ctx, vec![exclude]);
+
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+    }
+
+    #[test]
+    fn shared_git_info_exclude_requests_corpus_refresh_without_indexing_external_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let common = TempDir::new().unwrap();
+        let git_info = common.path().join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        let exclude = git_info.join("exclude");
+        std::fs::write(&exclude, "ignored/\n").unwrap();
+
+        let ctx = make_ctx_with_root(root);
+        ctx.set_cache_role(false, Some(common.path().to_path_buf()));
+        let changed = filter_watcher_raw_paths(&ctx, vec![exclude]);
+
+        assert!(changed.ignore_file_changed);
+        assert!(changed.changed.is_empty());
+    }
+
+    #[test]
+    fn semantic_index_disconnect_without_terminal_event_marks_failed() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
+        let (tx, rx) = crossbeam_channel::unbounded::<SemanticIndexEvent>();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "embedding".into(),
+            files: Some(1),
+            entries_done: Some(0),
+            entries_total: Some(1),
+        };
+        drop(tx);
+
+        aft::runtime_drain::drain_semantic_index_events(&ctx);
+
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert!(matches!(
+            &*ctx.semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Failed(message)
+                if message.contains("disconnected before reporting completion")
+        ));
+    }
+
+    #[test]
+    fn semantic_refresh_disconnect_after_started_cancels_refreshing_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+        event_tx
+            .send(SemanticRefreshEvent::Started {
+                paths: vec![file.clone()],
+            })
+            .unwrap();
+        drop(event_tx);
+
+        drain_semantic_refresh_events(&ctx);
+
+        assert!(ctx.semantic_refresh_event_rx().lock().is_none());
+        assert_eq!(
+            ctx.semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refreshing_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn watcher_overflow_rescan_reconciles_callgraph_store_instead_of_blocking() {
+        // Regression for the configure/bash timeout on OpenCode Desktop large
+        // repos (v0.39.1): a watcher overflow (RescanRequired) used to run the
+        // callgraph store's full cold_build SYNCHRONOUSLY inside
+        // drain_watcher_events — which runs on the single dispatch thread before
+        // every request — blocking configure/bash past the 30s transport
+        // timeout. The drain must never build inline. Lost events only mean
+        // missed edits, so the resident store keeps serving while a background
+        // reconcile compares it with the disk; no full rebuild is forced.
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "fn used() {}\nfn main() { used(); }\n").unwrap();
+        // Storage lives outside the project, as it does for real roots, so the
+        // store's own files are not part of the walked corpus.
+        let storage = TempDir::new().unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+
+        // Make a callgraph store resident (synchronous build of the 1-file repo).
+        let resident = ctx
+            .ensure_callgraph_store()
+            .expect("ensure callgraph store");
+        assert!(resident.is_some(), "callgraph store should be resident");
+        drop(resident);
+        assert!(ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some());
+
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
+            .unwrap();
+
+        drain_watcher_events(&ctx);
+
+        // The resident store keeps serving: it is the right store and only
+        // missed edits...
+        assert!(
+            ctx.callgraph_store()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "watcher overflow must keep the resident store while it reconciles"
+        );
+        // ...and the drain itself did NOT spawn a build (no inline cold_build on
+        // the dispatch thread).
+        assert!(
+            ctx.callgraph_store_rx().lock().is_none(),
+            "drain must not start a synchronous/inline callgraph build"
+        );
+        assert!(
+            ctx.pending_callgraph_store_force_token_for_test().is_none(),
+            "lost watcher events must be reconciled, not answered with a full rebuild"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while ctx.last_callgraph_reconcile().0 == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overflow never started a reconcile"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outcome = ctx.last_callgraph_reconcile().1.expect("reconcile outcome");
+        assert_eq!(outcome.reason, "watcher overflow");
+        assert_eq!(
+            outcome.action,
+            aft::callgraph_maintenance::CallgraphReconcileAction::Unchanged,
+            "nothing changed on disk, so the reconcile refreshes nothing"
+        );
+    }
+
+    /// Lost watcher events on a tree where three files changed must refresh
+    /// exactly those three files and leave the same edges a cold build of the
+    /// tree produces, without forcing a rebuild of the whole store.
+    #[test]
+    fn watcher_overflow_refreshes_exactly_the_edited_files() {
+        check_watcher_overflow_refresh(false);
+    }
+
+    #[test]
+    fn watcher_overflow_refresh_wait_ignores_parked_sibling() {
+        check_watcher_overflow_refresh(true);
+    }
+
+    fn check_watcher_overflow_refresh(park_sibling: bool) {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        // Storage lives outside the project, as it does for real roots, so the
+        // store's own files are not part of the walked corpus.
+        let storage = TempDir::new().unwrap();
+        let write = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        write("util.ts", "export function helper() { return 1; }\n");
+        write("extra.ts", "export function extra() { return 2; }\n");
+        write(
+            "a.ts",
+            "import { helper } from \"./util\";\nexport function a() { return helper(); }\n",
+        );
+        write(
+            "b.ts",
+            "import { a } from \"./a\";\nexport function b() { return a(); }\n",
+        );
+        write("c.ts", "export function c() { return 3; }\n");
+        write(
+            "d.ts",
+            "import { c } from \"./c\";\nexport function d() { return c(); }\n",
+        );
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+        let resident = ctx
+            .ensure_callgraph_store()
+            .expect("ensure callgraph store")
+            .expect("callgraph store should build on demand");
+        drop(resident);
+
+        // Three edits the watcher never reported: one changes a call target,
+        // one keeps its size but changes its bytes, and one is a new file.
+        let edited = [
+            write(
+                "a.ts",
+                "import { extra } from \"./extra\";\nexport function a() { return extra(); }\n",
+            ),
+            write("c.ts", "export function c() { return 4; }\n"),
+            write(
+                "e.ts",
+                "import { d } from \"./d\";\nexport function e() { return d(); }\n",
+            ),
+        ];
+        let expected_paths = edited
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::ZERO,
+            false,
+        );
+
+        let sibling = TempDir::new().unwrap();
+        let sibling_root = std::fs::canonicalize(sibling.path()).unwrap();
+        let sibling_source = sibling_root.join("sibling.ts");
+        let sibling_pending: aft::callgraph_store::PendingCallGraphStorePaths = Default::default();
+        if park_sibling {
+            std::fs::write(&sibling_source, "export function sibling() {}\n").unwrap();
+            aft::callgraph_store::set_callgraph_refresh_worker_test_open_failure(
+                sibling_root.clone(),
+                true,
+            );
+            // The shared worker processes this root first. Its failed open
+            // parks the paths before the overflow root's batch can start.
+            assert!(aft::callgraph_store::enqueue_callgraph_store_refresh(
+                storage.path().join("sibling-store"),
+                sibling_root.clone(),
+                vec![sibling_source.clone()],
+                sibling_pending.clone(),
+            ));
+        }
+
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.clone());
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
+            .unwrap();
+        drain_watcher_events(&ctx);
+
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            None,
+            "lost watcher events must be reconciled, not answered with a full rebuild"
+        );
+        held.recv_timeout(Duration::from_secs(20))
+            .expect("the reconcile never handed its changed paths to the refresh");
+        release.send(()).unwrap();
+        // A batch-start counter is not completion, and process-wide shutdown
+        // can report failure solely because another root has a parked refresh.
+        // Wait for this root's queue-idle notification before reading its edges.
+        assert!(
+            aft::callgraph_store::wait_for_process_callgraph_refresh_for_test(
+                &root,
+                Duration::from_secs(20)
+            ),
+            "the reconcile refresh should finish"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
+            expected_paths,
+            "the reconcile must refresh exactly the files that differ from the store"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
+
+        let refreshed = aft::callgraph_store::CallGraphStore::open_readonly(
+            ctx.callgraph_store_dir(),
+            root.clone(),
+        )
+        .expect("open refreshed store")
+        .expect("published store")
+        .edge_snapshot()
+        .expect("refreshed edges");
+        let cold_store = aft::callgraph_store::CallGraphStore::open(
+            storage.path().join("cold-store"),
+            root.clone(),
+        )
+        .expect("open cold store");
+        let files: Vec<_> = aft::callgraph::walk_project_files(&root).collect();
+        cold_store.cold_build(&files).expect("cold build");
+        let cold = cold_store.edge_snapshot().expect("cold edges");
+        assert_eq!(refreshed, cold, "reconciled edges must equal a cold build");
+
+        if park_sibling {
+            assert!(sibling_pending.lock().contains(&sibling_source));
+            // Only fixture cleanup shuts the worker down. A parked sibling
+            // intentionally makes a process-wide shutdown report incomplete.
+            assert!(
+                !aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                    Duration::from_secs(20)
+                )
+            );
+            aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&sibling_root);
+        }
+    }
+
+    #[test]
+    fn watcher_large_batch_refreshes_every_index_incrementally() {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                30
+            ),),
+            "a prior callgraph refresh worker should fully stop before this test"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let watcher_alias_dir = root.join("watcher-alias");
+        std::fs::create_dir(&watcher_alias_dir).unwrap();
+        let all_paths = (0..400)
+            .map(|index| root.join(format!("branch-{index:03}.ts")))
+            .collect::<Vec<_>>();
+        for (index, path) in all_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!("export function branchFile{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(tmp.path().join("storage")),
+                indexes: aft::config::IndexesConfig {
+                    trigram: true,
+                    semantic: true,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+
+        let resident = ctx
+            .ensure_callgraph_store()
+            .expect("ensure callgraph store")
+            .expect("callgraph store should build on demand");
+        let callgraph_generation = resident.sqlite_path().to_path_buf();
+        let search_index = aft::search_index::SearchIndex::build(&root);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_index);
+
+        let mut embed = |texts: Vec<String>| Ok(vec![vec![1.0, 0.0, 0.0]; texts.len()]);
+        let semantic_index = SemanticIndex::build(&root, &all_paths, &mut embed, 64)
+            .expect("build semantic fixture index");
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+
+        let changed_paths = all_paths[..300].to_vec();
+        for (index, path) in changed_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!(
+                    "export function switchedFile{index}() {{ return {}; }}\n",
+                    index + 1
+                ),
+            )
+            .unwrap();
+        }
+        let watcher_paths = changed_paths
+            .iter()
+            .map(|path| {
+                watcher_alias_dir
+                    .join("..")
+                    .join(path.file_name().expect("fixture file name"))
+            })
+            .collect::<Vec<_>>();
+        let expected_paths = watcher_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::ZERO,
+            false,
+        );
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(watcher_paths))
+            .unwrap();
+
+        // "Off the worker loop" is proven structurally below (the resident
+        // store survives the drain and the refresh lands on the seamed worker),
+        // not by timing the drain: a wall-clock bound flakes under a parallel
+        // test run while proving nothing the store identity check does not.
+        drain_watcher_events(&ctx);
+
+        let installed_after_drain = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("oversized refresh must keep the resident callgraph store");
+        assert!(
+            std::sync::Arc::ptr_eq(&resident, &installed_after_drain),
+            "oversized refresh must not write None over the resident store"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            None,
+            "ordinary watcher paths must not mint a force-rebuild token"
+        );
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert!(std::sync::Arc::ptr_eq(&resident, &store))
+            }
+            _ => panic!("resident store should remain ready without a cold-build decision"),
+        }
+        assert!(
+            ctx.search_index_rx()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "oversized paths must not escalate search to a corpus rebuild"
+        );
+        let search_matches = {
+            let search_index = ctx
+                .search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let search_index = search_index.as_ref().expect("resident search index");
+            assert!(
+                search_index.ready,
+                "search should stay resident while paths update incrementally"
+            );
+            search_index
+                .grep("switchedFile0", true, &[], &[], &root, 10)
+                .unwrap()
+                .matches
+                .len()
+        };
+        assert_eq!(
+            search_matches, 1,
+            "search must expose content refreshed through a non-canonical watcher path"
+        );
+        match request_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("semantic file refresh request")
+        {
+            SemanticRefreshRequest::Files { paths } => {
+                assert_eq!(
+                    paths.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                    expected_paths,
+                    "semantic incremental refresh must receive every changed path"
+                );
+            }
+            SemanticRefreshRequest::Corpus => {
+                panic!("oversized paths must not escalate semantic to a corpus refresh")
+            }
+        }
+
+        assert!(
+            aft::callgraph_store::wait_for_process_callgraph_refresh_for_test(
+                &root,
+                Duration::from_secs(30)
+            ),
+            "oversized callgraph refresh should finish"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
+            expected_paths,
+            "the callgraph refresh worker must cover every changed path"
+        );
+        // A time-sliced drain can enqueue more paths after the worker starts.
+        // Coalescing is opportunistic: coverage and store identity, not batch
+        // count, prove that all indexes were refreshed incrementally.
+        assert!(
+            aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0 > 0,
+            "watcher paths must reach refresh_files rather than a corpus rebuild"
+        );
+        let installed_after_refresh = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("incremental refresh must leave the store resident");
+        assert!(std::sync::Arc::ptr_eq(&resident, &installed_after_refresh));
+        assert_eq!(
+            installed_after_refresh.sqlite_path(),
+            callgraph_generation,
+            "incremental refresh must not replace the callgraph store generation"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    fn watcher_error_clears_receiver_and_marks_degraded() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::Error(
+                "watcher init failed".to_string(),
+            ))
+            .unwrap();
+
+        drain_watcher_events(&ctx);
+
+        assert!(ctx.watcher_rx().lock().is_none());
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"watcher_unavailable".to_string()));
+        let status = ctx.build_status_snapshot();
+        assert!(status["degraded"].as_bool().unwrap_or(false));
+        assert_eq!(
+            status["degraded_reasons"],
+            serde_json::json!(["watcher_unavailable"])
+        );
+    }
+
+    #[test]
+    fn project_root_deleted_control_drops_watcher_rx_and_marks_degraded() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ctx = make_ctx_with_root(&root);
+        ctx.set_canonical_cache_root(root);
+
+        let watcher_tx = install_watcher_rx(&ctx);
+        tmp.close().expect("delete project root");
+        watcher_tx.send(WatcherDispatchEvent::RootDeleted).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        assert!(ctx.watcher_rx().lock().is_none());
+        assert!(ctx
+            .degraded_reasons()
+            .contains(&"project_root_deleted".to_string()));
+    }
+
+    #[test]
+    fn watcher_semantic_refresh_includes_vue_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("App.vue");
+        std::fs::write(&file, "<script setup>const n = 1;</script>").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic refresh request")
+        {
+            SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file]),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
+        }
+    }
+
+    #[test]
+    fn watcher_rescan_required_coalesces_and_requests_one_corpus_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config {
+                project_root: Some(root.clone()),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
+                ..Config::default()
+            }),
+        )
+        .with_test_checkpoint_store();
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.rebuild_gitignore();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SemanticIndex::new(root, 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
+            .unwrap();
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
+            .unwrap();
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        match request_rx
+            .recv_timeout(RECV_DISPATCH_TIMEOUT)
+            .expect("semantic corpus refresh request")
+        {
+            SemanticRefreshRequest::Corpus => {}
+            SemanticRefreshRequest::Files { paths } => {
+                panic!("expected corpus refresh, got file refresh for {paths:?}")
+            }
+        }
+        assert!(request_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+    }
+
+    #[test]
+    fn transient_file_refresh_failure_requeues_retry_without_completing() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("lib.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+            let mut status = SemanticIndexStatus::ready();
+            status.add_refreshing_file(file.clone());
+            status.start_refreshing_file(file.clone());
+            *ctx.semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+
+            event_tx
+                .send(SemanticRefreshEvent::Failed {
+                    paths: vec![file.clone()],
+                    error: format!(
+                        "{}backend unavailable",
+                        aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
+                    ),
+                })
+                .unwrap();
+
+            drain_semantic_refresh_events(&ctx);
+
+            match request_rx
+                .recv_timeout(RECV_DISPATCH_TIMEOUT)
+                .expect("retry request")
+            {
+                SemanticRefreshRequest::Files { paths } => assert_eq!(paths, vec![file.clone()]),
+                SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
+            }
+            assert_eq!(
+                ctx.semantic_index_status()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .refreshing_count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn semantic_refresh_breaker_coalesces_open_retries_into_single_probe() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let files = (0..(BREAKER_TRIP_THRESHOLD + 2))
+            .map(|index| root.join(format!("file{index}.rs")))
+            .collect::<Vec<_>>();
+        for file in &files {
+            std::fs::write(file, "fn main() {}\n").unwrap();
+        }
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+
+            for file in files.iter().take(BREAKER_TRIP_THRESHOLD) {
+                event_tx
+                    .send(SemanticRefreshEvent::Failed {
+                        paths: vec![file.clone()],
+                        error: transient_embedding_error(),
+                    })
+                    .unwrap();
+            }
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(semantic_refresh_circuit_is_open(&ctx));
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
+
+            for file in files.iter().skip(BREAKER_TRIP_THRESHOLD) {
+                event_tx
+                    .send(SemanticRefreshEvent::Failed {
+                        paths: vec![file.clone()],
+                        error: transient_embedding_error(),
+                    })
+                    .unwrap();
+            }
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
+            let expected_probe_paths = files[(BREAKER_TRIP_THRESHOLD - 1)..].to_vec();
+            let pending = ctx.take_pending_semantic_index_paths();
+            assert_eq!(pending, expected_probe_paths);
+            ctx.add_pending_semantic_index_paths(pending);
+
+            // The timer runs on another thread: elapsed backoff alone does not
+            // prove it has published readiness. Wait for that publication before
+            // testing whether it makes completion draining eligible.
+            let ready_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ctx.semantic_refresh_probe_ready() {
+                assert!(
+                    std::time::Instant::now() < ready_by,
+                    "the scheduled breaker probe did not publish readiness within 5s"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                ctx.completion_drains_have_work(),
+                "a ready breaker probe must schedule completion draining without another event"
+            );
+            drain_semantic_refresh_events(&ctx);
+
+            let mut batches = Vec::new();
+            for _ in 0..BREAKER_TRIP_THRESHOLD {
+                batches.push(recv_files_request(&request_rx));
+            }
+            for file in files.iter().take(BREAKER_TRIP_THRESHOLD - 1) {
+                assert!(batches.contains(&vec![file.clone()]));
+            }
+            assert!(batches.contains(&expected_probe_paths));
+            assert!(request_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn transient_corpus_failure_probe_resumes_exact_files_without_recollecting_corpus() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+            event_tx
+                .send(SemanticRefreshEvent::CorpusFailed {
+                    paths: vec![root.join("slow.rs")],
+                    error: transient_embedding_error(),
+                })
+                .unwrap();
+
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(semantic_refresh_circuit_is_open(&ctx));
+            assert!(semantic_refresh_probe_is_scheduled_for_test(&ctx));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(matches!(
+                request_rx.recv_timeout(std::time::Duration::from_secs(1)),
+                Ok(SemanticRefreshRequest::Files { paths }) if paths == vec![root.join("slow.rs")]
+            ));
+            assert!(
+                request_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "recovery must send exactly one file-set refresh and never queue Corpus"
+            );
+        });
+    }
+
+    #[test]
+    fn semantic_refresh_circuit_breaker_is_per_app_context() {
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+        let ctx_a = make_ctx_with_root(root_a.path());
+        let ctx_b = make_ctx_with_root(root_b.path());
+
+        for _ in 0..BREAKER_TRIP_THRESHOLD {
+            record_semantic_refresh_transient_failure(&ctx_a, &transient_embedding_error());
+        }
+
+        assert!(semantic_refresh_circuit_is_open(&ctx_a));
+        assert_eq!(
+            semantic_refresh_transient_failure_count_for_test(&ctx_a),
+            BREAKER_TRIP_THRESHOLD
+        );
+        assert!(!semantic_refresh_circuit_is_open(&ctx_b));
+        assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx_b), 0);
+        assert!(!semantic_refresh_probe_is_scheduled_for_test(&ctx_b));
+    }
+
+    #[test]
+    fn semantic_refresh_success_resets_breaker_and_next_failure_starts_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let files = (0..(BREAKER_TRIP_THRESHOLD + 1))
+            .map(|index| root.join(format!("reset{index}.rs")))
+            .collect::<Vec<_>>();
+        for file in &files {
+            std::fs::write(file, "fn main() {}\n").unwrap();
+        }
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+
+            for file in files.iter().take(BREAKER_TRIP_THRESHOLD) {
+                event_tx
+                    .send(SemanticRefreshEvent::Failed {
+                        paths: vec![file.clone()],
+                        error: transient_embedding_error(),
+                    })
+                    .unwrap();
+            }
+            drain_semantic_refresh_events(&ctx);
+            assert!(semantic_refresh_circuit_is_open(&ctx));
+
+            // The pre-breaker failures each schedule a retry on an independent
+            // thread with the same backoff, so their arrival order at the channel
+            // is nondeterministic. Collect them and assert the set, not the order
+            // (matches the sibling breaker tests).
+            let mut retry_batches = Vec::new();
+            for _ in 0..(BREAKER_TRIP_THRESHOLD - 1) {
+                retry_batches.push(recv_files_request(&request_rx));
+            }
+            for file in files.iter().take(BREAKER_TRIP_THRESHOLD - 1) {
+                assert!(
+                    retry_batches.contains(&vec![file.clone()]),
+                    "missing retry for {file:?}; got {retry_batches:?}"
+                );
+            }
+
+            event_tx
+                .send(SemanticRefreshEvent::Completed {
+                    added_entries: Vec::new(),
+                    updated_metadata: Vec::new(),
+                    completed_paths: vec![files[BREAKER_TRIP_THRESHOLD - 1].clone()],
+                })
+                .unwrap();
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(!semantic_refresh_circuit_is_open(&ctx));
+            assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 0);
+
+            let fresh_file = files[BREAKER_TRIP_THRESHOLD].clone();
+            event_tx
+                .send(SemanticRefreshEvent::Failed {
+                    paths: vec![fresh_file.clone()],
+                    error: transient_embedding_error(),
+                })
+                .unwrap();
+            drain_semantic_refresh_events(&ctx);
+
+            assert!(!semantic_refresh_circuit_is_open(&ctx));
+            assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 1);
+            assert_eq!(recv_files_request(&request_rx), vec![fresh_file]);
+        });
+    }
+
+    #[test]
+    fn semantic_refresh_retry_attempt_cap_stashes_path_without_hot_timer() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("cap.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        with_semantic_retry_backoff_ms(1, || {
+            let ctx = make_ctx_with_root(&root);
+            let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
+            let error = transient_embedding_error();
+
+            for _ in 0..MAX_RETRY_ATTEMPTS {
+                assert!(schedule_semantic_refresh_retry(
+                    &ctx,
+                    vec![file.clone()],
+                    &error
+                ));
+                assert_eq!(recv_files_request(&request_rx), vec![file.clone()]);
+            }
+
+            assert!(schedule_semantic_refresh_retry(
+                &ctx,
+                vec![file.clone()],
+                &error
+            ));
+            assert!(request_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+            assert_eq!(ctx.take_pending_semantic_index_paths(), vec![file]);
+        });
+    }
+
+    #[test]
+    fn transient_corpus_failure_preserves_pending_semantic_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("pending.vue");
+        std::fs::write(&file, "<template />").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(root.clone(), 3));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "refreshing_corpus".into(),
+            files: Some(1),
+            entries_done: None,
+            entries_total: None,
+        };
+        ctx.add_pending_semantic_index_paths(vec![file.clone()]);
+        let (_request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
+
+        event_tx
+            .send(SemanticRefreshEvent::CorpusFailed {
+                paths: vec![file.clone()],
+                error: format!(
+                    "{}backend unavailable",
+                    aft::semantic_index::TRANSIENT_EMBEDDING_MARKER
+                ),
+            })
+            .unwrap();
+
+        drain_semantic_refresh_events(&ctx);
+
+        let pending = ctx.take_pending_semantic_index_paths();
+        assert_eq!(pending, vec![file]);
+        assert!(matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn watcher_stale_mark_emits_status_without_semantic_change() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "changed").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        // The bar renders only once every producer has reported; an empty
+        // diagnostics publish is a proven zero, not a fabricated one. It is
+        // published for a different file than the one the watcher touches:
+        // a change to a diagnosed file masks that file's report as stale,
+        // which would drop the only diagnostics producer and blank the bar
+        // for a reason unrelated to what this test pins.
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            let other = root.join("other.ts");
+            std::fs::write(&other, "").unwrap();
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, other.clone(), vec![]);
+            lsp.certify_diagnostic_content_for_test(&other);
+        }
+        // Every producer has now reported, so the legacy projection exists.
+        assert!(ctx.status_bar_counts().is_some());
+        let rx = status_frame_rx(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        let snapshot = recv_status_changed(&rx);
+        assert_eq!(
+            snapshot["status_bar"]["tier2_stale"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn watcher_diagnostics_clear_emits_status_without_semantic_change() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let file = root.join("gone.txt");
+        std::fs::write(&file, "deleted").unwrap();
+
+        let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), true);
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, file.clone(), vec![err_diag(&file)]);
+            lsp.certify_diagnostic_content_for_test(&file);
+        }
+        assert_eq!(ctx.status_bar_counts().unwrap().errors, 1);
+
+        std::fs::remove_file(&file).unwrap();
+        let rx = status_frame_rx(&ctx);
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx.send(watcher_paths_event(file)).unwrap();
+
+        drain_watcher_events(&ctx);
+
+        let snapshot = recv_status_changed(&rx);
+        assert!(snapshot["status_bar"].get("errors").is_none());
+        assert_eq!(ctx.status_bar_counts(), None);
+    }
+}
+
+#[cfg(test)]
+mod config_pin_tests {
+    use super::{dispatch, DISPATCH_CONFIG_PROBE};
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn dispatch_keeps_the_config_it_was_admitted_with() {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store();
+        assert!(!ctx.config().restrict_to_project_root);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_probe = Arc::clone(&seen);
+        DISPATCH_CONFIG_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |ctx: &AppContext| {
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+                // A live config reload publishes from another thread while
+                // this request is running.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        ctx.update_config(|config| config.restrict_to_project_root = true)
+                    });
+                });
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+            }));
+        });
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "pin",
+            "command": "ping",
+        }))
+        .unwrap();
+        let response = dispatch(request, &ctx);
+        DISPATCH_CONFIG_PROBE.with(|probe| probe.borrow_mut().take());
+
+        assert!(response.success);
+        assert_eq!(*seen.lock().unwrap(), vec![false, false]);
+        // The next request sees the publication.
+        assert!(ctx.config().restrict_to_project_root);
+    }
+}
