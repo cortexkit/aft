@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AsyncResource } from "node:async_hooks";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,6 +103,40 @@ function executionDeadline() {
 }
 
 describe("Location execution holds", () => {
+  test("unsolicited transport callbacks outlive a completed call without retaining its hold", async () => {
+    const pool = new FakePool();
+    let dispatches = 0;
+    pool.bridge.send = async () => {
+      dispatches++;
+      return { success: true };
+    };
+    const location = await acquireBridge("/fixture/transport-events", options(true), {
+      createPool: async () => pool,
+    });
+    let events!: AsyncResource;
+    await withLocationExecution(location, async () => {
+      events = new AsyncResource("fixture-transport-events");
+      return location.getBridge("/fixture/transport-events").send("read");
+    });
+    try {
+      expect(
+        await events.runInAsyncScope(() =>
+          location.getBridge("/fixture/transport-events").send("bash_ack"),
+        ),
+      ).toEqual({ success: true });
+      await releaseBridge(location);
+      expect(() =>
+        events.runInAsyncScope(() =>
+          location.getBridge("/fixture/transport-events").send("bash_ack"),
+        ),
+      ).toThrow(BridgeTransportUnavailableError);
+      expect(dispatches).toBe(2);
+    } finally {
+      events.emitDestroy();
+      await releaseBridge(location);
+    }
+  });
+
   for (const subc of [false, true]) {
     const mode = subc ? "subc" : "standalone";
 

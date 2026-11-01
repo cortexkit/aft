@@ -209,13 +209,21 @@ class LocationBridgeLease implements ReleasableLocationPool {
       : this.notSent();
   }
 
-  private assertUsable(hold = this.execution.getStore()): void {
+  private currentHold(): ExecutionHold | undefined {
+    const hold = this.execution.getStore();
+    // Transport event sources can inherit a call's async context and outlive its
+    // reply. Unsolicited events no longer belong to a completed call, but an
+    // interrupted call must still fence its late continuations.
+    return hold && (!hold.finished || hold.error) ? hold : undefined;
+  }
+
+  private assertUsable(hold = this.currentHold()): void {
     if (hold?.error) throw hold.error;
     if (hold?.finished) throw this.interrupted(hold);
     assertLive(this.released && !hold);
   }
 
-  private dispatch<T>(operation: () => Promise<T>, hold = this.execution.getStore()): Promise<T> {
+  private dispatch<T>(operation: () => Promise<T>, hold = this.currentHold()): Promise<T> {
     this.assertUsable(hold);
     // Once an RPC is handed to a transport, teardown cannot prove it did not run.
     if (hold) hold.dispatched = true;
@@ -228,7 +236,7 @@ class LocationBridgeLease implements ReleasableLocationPool {
   }
 
   private transport(bridge: AftProjectTransport): AftProjectTransport {
-    const hold = this.execution.getStore();
+    const hold = this.currentHold();
     // Guard escaped transports too: getBridge may precede a permission wait.
     return new Proxy(bridge, {
       get: (target, key) => {
@@ -252,14 +260,14 @@ class LocationBridgeLease implements ReleasableLocationPool {
   }
 
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null {
-    if (this.released && !this.execution.getStore()) return null;
+    if (this.released && !this.currentHold()) return null;
     this.assertUsable();
     const bridge = this.pool.getActiveBridgeForRoot(projectRoot);
     return bridge ? this.transport(bridge) : null;
   }
 
   activeBridges(): AftProjectTransport[] {
-    if (this.released && !this.execution.getStore()) return [];
+    if (this.released && !this.currentHold()) return [];
     this.assertUsable();
     return this.pool.activeBridges().map((bridge) => this.transport(bridge));
   }
@@ -288,12 +296,12 @@ class LocationBridgeLease implements ReleasableLocationPool {
   }
 
   closeSession(projectRoot: string, session: string): Promise<void> {
-    if (this.released && !this.execution.getStore()) return Promise.resolve();
+    if (this.released && !this.currentHold()) return Promise.resolve();
     return this.dispatch(() => this.pool.closeSession(projectRoot, session));
   }
 
   isShutdown(): boolean {
-    return (this.released && !this.execution.getStore()) || this.pool.isShutdown();
+    return (this.released && !this.currentHold()) || this.pool.isShutdown();
   }
 
   shutdown(): Promise<void> {
