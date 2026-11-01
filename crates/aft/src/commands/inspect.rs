@@ -1576,6 +1576,7 @@ fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapsh
 }
 
 fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
+    let response = crate::access_policy::finish_current_plugin_response(response);
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let _ = tx.send(response);
     DispatchOutcome::Deferred(PendingResponse::from_receiver(

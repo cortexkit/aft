@@ -1,0 +1,1 @@
+- `aft_inspect` on two or more files outside the project no longer fails with "refused again after it was approved" after the first approval (#1258; thanks @iceteaSA).
