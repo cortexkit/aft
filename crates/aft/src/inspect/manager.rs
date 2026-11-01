@@ -1668,6 +1668,14 @@ impl InspectManager {
         }
     }
 
+    pub(crate) fn work_progress(&self, category: InspectCategory) -> Option<String> {
+        self.builder_states
+            .try_lock()
+            .ok()?
+            .get(&JobKey::for_project_category(category))
+            .map(|entry| entry.progress.clone())
+    }
+
     /// Keep unfinished analysis separate from current findings. Cached rows are
     /// shown only inside a labelled stale result, never as a verified count.
     pub(crate) fn tier2_incomplete_payload(

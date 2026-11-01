@@ -446,6 +446,16 @@ struct DeleteProgress {
 }
 
 impl DeleteProgress {
+    fn removed(&mut self, directory: bool) {
+        if directory {
+            self.directories += 1;
+        } else {
+            self.files += 1;
+        }
+        if let Some(token) = &self.token {
+            token.report_progress();
+        }
+    }
     fn checkpoint(&mut self, path: &Path) -> Result<(), DeleteStopped> {
         #[cfg(test)]
         DELETE_OBSERVER.with(|observer| {
@@ -697,7 +707,7 @@ mod platform {
         drop(root_fd);
         progress.checkpoint(root)?;
         if remove_recorded_dir(&parent_fd, &name, root_entry)? {
-            progress.directories += 1;
+            progress.removed(true);
         }
         Ok(())
     }
@@ -784,13 +794,13 @@ mod platform {
                 drop(child_fd);
                 progress.checkpoint(&entry.path)?;
                 if remove_recorded_dir(dir_fd, &name, entry)? {
-                    progress.directories += 1;
+                    progress.removed(true);
                 }
             } else {
                 // unlinkat does not follow a leaf symlink, and without
                 // AT_REMOVEDIR refuses a directory swapped in since the check.
                 match unlink(dir_fd, &name, false) {
-                    Ok(()) => progress.files += 1,
+                    Ok(()) => progress.removed(false),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(stopped(&entry.path, e)),
                 }
@@ -1046,7 +1056,7 @@ mod platform {
         crate::commands::delete_file::count_unlink_for_test();
         dispose(&root_handle).map_err(|e| stopped(root, not_empty_reason(e)))?;
         drop(root_handle);
-        progress.directories += 1;
+        progress.removed(true);
         Ok(())
     }
 
@@ -1088,7 +1098,7 @@ mod platform {
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
                     dispose(&handle).map_err(|e| stopped(&entry.path, not_empty_reason(e)))?;
-                    progress.directories += 1;
+                    progress.removed(true);
                 }
                 NodeKind::Directory => return Err(replaced(&entry.path)),
                 _ if metadata.is_dir() && !is_link => return Err(replaced(&entry.path)),
@@ -1096,7 +1106,7 @@ mod platform {
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
                     dispose(&handle).map_err(|e| stopped(&entry.path, e))?;
-                    progress.files += 1;
+                    progress.removed(false);
                 }
             }
         }

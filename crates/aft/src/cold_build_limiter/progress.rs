@@ -476,6 +476,20 @@ pub(crate) fn snapshot(warming_roots: u64) -> Snapshot {
     REGISTRY.snapshot(warming_roots, Instant::now())
 }
 
+/// Stable work counters only: queue age and lock waits must not look like work.
+pub(crate) fn work_for_root(root: &Path) -> Vec<(u64, &'static str, u64, Option<u64>)> {
+    let root = root.to_string_lossy();
+    lock(&REGISTRY.0)
+        .running
+        .iter()
+        .filter_map(|(id, entry)| {
+            let entry = lock(entry);
+            (entry.root == root && entry.kind.starts_with("callgraph ") && !entry.fallback)
+                .then_some((*id, entry.phase, entry.done, entry.chunks_embedded))
+        })
+        .collect()
+}
+
 /// Test fixtures observe only their unique root. The production census keeps
 /// its cap, so a parallel test with many older jobs cannot hide a fixture's row.
 #[cfg(test)]
