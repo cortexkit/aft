@@ -2525,7 +2525,7 @@ mod ignore_rule_candidate_tests {
     use std::path::Path;
     use std::sync::{Arc, RwLock};
 
-    use super::scoped_coverage_candidates;
+    use super::{scoped_coverage_candidates, DiagnosticsCollection};
     use crate::config::Config;
     use crate::context::ignore_rules_fixture as fixture;
     use crate::inspect::job::{InspectSnapshot, JobScope};

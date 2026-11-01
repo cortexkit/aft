@@ -8032,8 +8032,7 @@ mod deferred_terminal_tests {
             let ctx = deferred_test_context(root.path());
             let mut request = inspect_request("inspect-request-deadline");
             request.session_id = Some("alfonso:bg_inspect-request-deadline".into());
-            request.params =
-                serde_json::json!({"scope": ["one.rs", "two.rs"], "worker_session": true});
+            request.params = serde_json::json!({"scope": ["one.rs", "two.rs"]});
             (root, ctx, request)
         }
 
@@ -8123,9 +8122,29 @@ mod deferred_terminal_tests {
         }
 
         #[test]
+        fn inspect_request_deadline_worker_policy_does_not_hold_setup() {
+            let (_root, ctx, mut request) = fixture();
+            request.params["worker_session"] = serde_json::json!(true);
+            let held = ctx.lsp();
+            let worker_ctx = ctx.clone();
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sender.send(assert_capped(worker_ctx, &request)).unwrap();
+            });
+            // The timeout only guards against a broken test setup. The worker
+            // advances the injected request clock without waiting for wall time.
+            let response = receiver.recv_timeout(Duration::from_secs(10)).expect(
+                "worker policy must not block setup behind the held language-server manager",
+            );
+            assert_eq!(response.data["inspect_terminal"], "partial");
+            drop(held);
+            worker.join().unwrap();
+        }
+
+        #[test]
         fn inspect_request_deadline_unscoped_callgraph_stays_building() {
             let (_root, ctx, mut request) = fixture();
-            request.params = serde_json::json!({"worker_session": true});
+            request.params = serde_json::json!({});
             let (_sender, receiver) = crossbeam_channel::unbounded();
             *ctx.callgraph_store_rx().lock() = Some(receiver);
             let manager = ctx.inspect_manager();
