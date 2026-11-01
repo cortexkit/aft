@@ -16,16 +16,22 @@ use crate::edit;
 use crate::protocol::{RawRequest, Response};
 
 #[cfg(test)]
+#[path = "delete_file_backed_tests.rs"]
+mod backed_tests;
+
+#[cfg(test)]
 #[derive(Default, Debug)]
 struct DeleteOperations {
     entries: usize,
     notifications: usize,
     unlinks: usize,
+    snapshots: usize,
 }
 
 #[cfg(test)]
 thread_local! {
     static DELETE_OPERATIONS: std::cell::RefCell<DeleteOperations> = Default::default();
+    static CAPTURE_CLOCK: std::cell::RefCell<Option<Box<dyn FnMut() -> std::time::Instant>>> = Default::default();
 }
 
 #[cfg(test)]
@@ -1212,9 +1218,19 @@ fn delete_directory(
     let mut backup_ids: Vec<String> = Vec::new();
     let mut backed_up_paths: Vec<PathBuf> = Vec::new();
     let description = "delete_file: pre-delete backup (directory contents)";
+    let backup_syncs = crate::durability::SyncGroup::new();
     // Entries are backed up in walk order: each directory before its
     // contents, and each hard link after the path whose content it shares.
     for entry in &manifest.entries {
+        if let Err(error) = crate::bounded_io::check_request_deadline(path, capture_now()) {
+            discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
+            return Err(Response::error(
+                &req.id,
+                crate::bounded_io::timeout_code(&error),
+                error.to_string(),
+            )
+            .into());
+        }
         if crate::executor::current_job_cancelled() {
             discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
             return Err(Response::error_with_data(
@@ -1225,6 +1241,8 @@ fn delete_directory(
             ).into());
         }
         let entry_path = entry.path.as_path();
+        #[cfg(test)]
+        DELETE_OPERATIONS.with(|ops| ops.borrow_mut().snapshots += 1);
         let display = entry_path.display().to_string();
         let snapshot = match entry.kind {
             NodeKind::Directory => ctx.backup().lock().snapshot_directory_with_op(
@@ -1282,6 +1300,28 @@ fn delete_directory(
                 .into());
             }
         }
+    }
+
+    if let Err(error) = crate::bounded_io::check_request_deadline(path, capture_now()) {
+        discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
+        return Err(Response::error(
+            &req.id,
+            crate::bounded_io::timeout_code(&error),
+            error.to_string(),
+        )
+        .into());
+    }
+    if let Err(error) = backup_syncs.finish() {
+        discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
+        return Err(Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: backup failed for '{}' inside '{}': {}",
+                original, original, error
+            ),
+        )
+        .into());
     }
 
     #[cfg(debug_assertions)]
@@ -1390,10 +1430,23 @@ fn inject_entry_for_tests(root: &Path) {
 }
 
 fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &[PathBuf]) {
+    // No source was removed for these snapshots. Discard needs no device-cache
+    // barrier: a crash may retain a pre-delete snapshot, but cannot lose source
+    // bytes. Successful undo still uses its normal durable completion commit.
+    let _discard_syncs = crate::durability::SyncGroup::new();
     let mut backup = ctx.backup().lock();
     for path in paths {
         backup.discard_latest_operation_entry_for_path(session, op_id, path);
     }
+}
+
+fn capture_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = CAPTURE_CLOCK.with(|clock| clock.borrow_mut().as_mut().map(|clock| clock()))
+    {
+        return now;
+    }
+    std::time::Instant::now()
 }
 
 /// Recursively delete a directory none of whose entries would be backed up

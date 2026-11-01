@@ -7,6 +7,115 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+#[derive(Default)]
+struct PendingSyncs {
+    devices: std::collections::BTreeMap<u64, (File, PathBuf)>,
+}
+
+#[cfg(unix)]
+thread_local! {
+    static SYNC_GROUP: std::cell::RefCell<Option<PendingSyncs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keep file and directory fsync ordering, but flush the device cache once per
+/// device at commit. In particular, macOS F_FULLFSYNC need not flush the same
+/// device after every file. The caller must finish the group before unlinking
+/// any source or acknowledging a durable backup. Dropping an unfinished group
+/// abandons its device barriers; it is only safe when no source was removed.
+pub(crate) struct SyncGroup {
+    #[cfg(unix)]
+    previous: Option<PendingSyncs>,
+    #[cfg(unix)]
+    active: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl SyncGroup {
+    pub(crate) fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            previous: SYNC_GROUP.with(|group| group.replace(Some(PendingSyncs::default()))),
+            #[cfg(unix)]
+            active: true,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(unix)]
+    fn detach(&mut self) -> PendingSyncs {
+        self.active = false;
+        SYNC_GROUP.with(|group| {
+            group
+                .replace(self.previous.take())
+                .expect("active sync group")
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        for (_, (file, path)) in self.detach().devices {
+            #[cfg(test)]
+            if FAIL_GROUP_SYNC.with(|fail| fail.replace(false)) {
+                return Err(io::Error::other("injected backup group sync failure"));
+            }
+            full_sync(&file, &path)?;
+        }
+        #[cfg(not(unix))]
+        let _ = &mut self;
+        Ok(())
+    }
+}
+
+impl Drop for SyncGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.active {
+            self.detach();
+        }
+    }
+}
+
+fn full_sync(file: &File, path: &Path) -> io::Result<()> {
+    file.sync_all()?;
+    #[cfg(test)]
+    FULL_SYNCS.with(|syncs| syncs.borrow_mut().push(path.to_path_buf()));
+    #[cfg(not(test))]
+    let _ = path;
+    Ok(())
+}
+
+fn ordered_sync(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    if SYNC_GROUP.with(|group| group.borrow().is_some()) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // fsync submits each file's data and metadata in publication order.
+        // The group's final full sync makes those submissions survive loss of
+        // the device's volatile write cache before deletion may begin.
+        loop {
+            // SAFETY: the borrowed File keeps this descriptor open for fsync.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let device = file.metadata()?.dev();
+        return SYNC_GROUP.with(|group| {
+            let mut group = group.borrow_mut();
+            let devices = &mut group.as_mut().expect("active sync group").devices;
+            if let std::collections::btree_map::Entry::Vacant(entry) = devices.entry(device) {
+                entry.insert((file.try_clone()?, path.to_path_buf()));
+            }
+            Ok(())
+        });
+    }
+    full_sync(file, path)
+}
+
 // Some binaries do not use every atomic-write durability option. Callers choose
 // whether private state needs no sync, file sync, or file plus directory sync.
 #[derive(Clone, Copy)]
@@ -91,7 +200,7 @@ pub(crate) fn before_temp_create(path: &Path) {
 }
 
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
-    file.sync_all()?;
+    ordered_sync(file, path)?;
     record(EventKind::FileSync, path);
     Ok(())
 }
@@ -116,7 +225,7 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()?;
+        ordered_sync(&File::open(path)?, path)?;
         record(EventKind::DirectorySync, path);
     }
     // Windows cannot open a directory as a regular File. Its rename uses
@@ -138,6 +247,9 @@ pub(crate) enum EventKind {
 
 #[cfg(test)]
 thread_local! {
+    #[cfg(unix)]
+    pub(crate) static FAIL_GROUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FULL_SYNCS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
@@ -149,6 +261,11 @@ thread_local! {
     static EVENTS: std::cell::RefCell<Vec<(EventKind, std::path::PathBuf)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+}
+
+#[cfg(test)]
+pub(crate) fn take_full_syncs() -> Vec<PathBuf> {
+    FULL_SYNCS.with(|syncs| std::mem::take(&mut *syncs.borrow_mut()))
 }
 
 #[inline]
