@@ -105,9 +105,31 @@ class NdjsonClient:
         storage_dir: Path,
         stderr_path: Path,
         model_env: Optional[Mapping[str, str]] = None,
+        *,
+        views_enabled: bool = False,
     ):
         env = os.environ.copy()
-        env["AFT_STORAGE_DIR"] = str(storage_dir)
+        # With views on, startup and configure must select the same store without
+        # an environment override. Separate home/data roots keep the client whose
+        # corpus embeddings are deliberately paused from borrowing the primary
+        # client's stored vectors. Views-off setup is unchanged for reference replay.
+        if views_enabled:
+            env.pop("AFT_STORAGE_DIR", None)
+            env.pop("AFT_CACHE_DIR", None)
+            for name, directory in {
+                "HOME": storage_dir / "home",
+                "XDG_CONFIG_HOME": storage_dir / "config",
+                "XDG_DATA_HOME": storage_dir / "data",
+                "XDG_CACHE_HOME": storage_dir / "cache",
+                "XDG_STATE_HOME": storage_dir / "state",
+                "XDG_RUNTIME_DIR": storage_dir / "runtime",
+            }.items():
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                env[name] = str(directory)
+            env["USERPROFILE"] = env["HOME"]
+            storage_dir = storage_dir / "data" / "cortexkit" / "aft"
+        else:
+            env["AFT_STORAGE_DIR"] = str(storage_dir)
         # An empty model cache by default: the pack replay must never find a
         # local model to fall back on. The live-model replay passes the
         # pre-provisioned cache and runtime instead; the proxy below still
@@ -119,6 +141,9 @@ class NdjsonClient:
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = "http://127.0.0.1:9"
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
         env.setdefault("RUST_LOG", "warn")
+        if views_enabled:
+            env.pop("AFT_STORAGE_DIR", None)
+            env.pop("AFT_CACHE_DIR", None)
         self.project_root = project_root
         self.storage_dir = storage_dir
         self._stderr = stderr_path.open("w+", encoding="utf-8")
@@ -230,55 +255,55 @@ class NdjsonClient:
             "reason": "standalone_ndjson_status_and_health_digest_do_not_expose_metrics.views_work",
         }
 
-    def wait_ready(self, timeout: float) -> None:
+    def wait_ready(self, timeout: float, *, readiness_request: Optional[Mapping[str, Any]] = None) -> None:
+        if self.views_enabled:
+            if readiness_request is None:
+                raise AftProtocolError("views_readiness_requires_public_request")
+            deadline = time.monotonic() + timeout
+            last: JsonObject = {}
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                status = self.call("status", timeout=remaining, cap_timeout=False)
+                if "views" not in status:
+                    raise AftProtocolError("views_runtime_not_enabled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                last = self.readiness_reply(readiness_request, remaining)
+                if full_views_coverage(last):
+                    return
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            raise AftProtocolError(f"views_runtime_not_ready:timeout={timeout}:reply={last}")
         deadline = time.monotonic() + timeout
         last: JsonObject = {}
-        last_views: Any = object()
-        while True:
-            if self.views_enabled:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.25:
-                    break
-                last = self.call("status", timeout=remaining, cap_timeout=False)
-            else:
-                if time.monotonic() >= deadline:
-                    break
-                last = self.call("status", timeout=min(30.0, timeout))
+        while time.monotonic() < deadline:
+            last = self.call("status", timeout=min(30.0, timeout))
             semantic = last.get("semantic_index", {})
             lexical = last.get("search_index", {})
             semantic_status = semantic.get("status") if isinstance(semantic, Mapping) else None
             lexical_status = lexical.get("status") if isinstance(lexical, Mapping) else None
             if semantic_status == "failed":
                 raise AftProtocolError(f"semantic_index_failed:{semantic}:{self.stderr_text()}")
-            views = last.get("views")
-            if self.views_enabled and views != last_views:
-                print(f"views_readiness:{json.dumps(views, sort_keys=True)}", flush=True)
-                last_views = views
-            if self.views_enabled and isinstance(views, Mapping) and views.get("failed_paths", 0) > 0:
-                raise AftProtocolError(f"views_runtime_failed:{views}")
-            # Standalone status has no `ready` flag; regard views as ready
-            # only when pinned and both pending and failed path counts are zero.
-            views_ready = (
-                not self.views_enabled
-                or (
-                    isinstance(views, Mapping)
-                    and views.get("pinned") is True
-                    and views.get("pending_paths") == 0
-                    and views.get("failed_paths") == 0
-                )
-            )
-            if semantic_status == "ready" and lexical_status == "ready" and views_ready:
-                if not self.views_enabled:
-                    settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
-                    if settled is not None:
-                        print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
+            if semantic_status == "ready" and lexical_status == "ready":
+                settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
+                if settled is not None:
+                    print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
                 return
-            if not self.views_enabled:
-                time.sleep(0.1)
-        if self.views_enabled:
-            print(f"views_readiness_timeout:{json.dumps(last, sort_keys=True)}", flush=True)
-            raise AftProtocolError(f"views_runtime_not_ready:timeout={timeout}:{last}")
+            time.sleep(0.1)
         raise AftProtocolError(f"index_ready_timeout:{last}:{self.stderr_text()}")
+
+    def readiness_reply(self, arguments: Mapping[str, Any], timeout: float) -> JsonObject:
+        # A v3 lexical view is loaded by a public query, not by status polling.
+        # Keep the reply intact: pending paths or any partial marker mean that
+        # ready-row replay must wait, even when both resident indexes say ready.
+        return self.call(
+            "tool_call",
+            {"session_id": "aft-search-real-query", "name": "search", "arguments": dict(arguments)},
+            timeout=timeout,
+            cap_timeout=False,
+        )
 
 
     def search(self, arguments: Mapping[str, Any]) -> JsonObject:
@@ -306,6 +331,43 @@ class NdjsonClient:
         if not isinstance(response.get("results"), list):
             raise AftProtocolError("aft_search_failed:results_not_array")
         return response
+
+
+def full_views_coverage(reply: Mapping[str, Any]) -> bool:
+    lanes = reply.get("lanes", {})
+    if not isinstance(lanes, Mapping) or not all(isinstance(lanes.get(lane), Mapping) for lane in ("trigram", "semantic")):
+        return False
+    return (
+        reply.get("success") is True
+        and reply.get("status") == "ready"
+        and reply.get("semantic_status") == "ready"
+        and reply.get("complete") is True
+        and isinstance(reply.get("results"), list)
+        and bool(reply["results"])
+        and not reply.get("fully_degraded", False)
+        and not reply.get("omitted_lanes")
+        and not reply.get("pending_paths")
+        and not reply.get("partial", False)
+        and lanes.get("trigram", {}).get("status") == "ready"
+        and lanes.get("semantic", {}).get("status") == "ready"
+        and not any(key in reply for key in ("semantic_gap", "index_read_gap", "exact_fallback_gap"))
+    )
+
+
+def building_views_lexical_ready(reply: Mapping[str, Any]) -> bool:
+    # The semantic-building fixture pauses corpus embedding responses. Its
+    # lexical index must answer before replay, but its semantic index must not
+    # be misreported as ready while those responses are paused.
+    lanes = reply.get("lanes", {})
+    if not isinstance(lanes, Mapping) or not isinstance(lanes.get("trigram"), Mapping):
+        return False
+    return (
+        reply.get("success") is True
+        and reply.get("status") == "building"
+        and reply.get("semantic_status") == "building"
+        and lanes["trigram"].get("status") == "ready"
+        and not reply.get("fully_degraded", False)
+    )
 
 
 def live_model_env() -> dict[str, str]:
@@ -453,6 +515,16 @@ def _request(arguments: Mapping[str, int], row: Mapping[str, Any], split: bool =
             request["query"] = row["query"] + " " + row["pattern"]
     if "offset" in arguments:
         request["offset"] = arguments["offset"]
+    return request
+
+
+def make_readiness_request(manifest: Mapping[str, Any]) -> JsonObject:
+    row = next(row for row in manifest["rows"] if "excluded_reason" not in row)
+    request = _request(profile_requests("single_page", False)[0], row)
+    # Readiness must cover the entire checkout, not only the non-test subset
+    # requested by some scored rows. A recorded query lets the fixture server
+    # return its saved model embedding, without introducing unknown query text.
+    request["includeTests"] = True
     return request
 
 
@@ -948,6 +1020,7 @@ def run(args: argparse.Namespace) -> int:
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
+    readiness_request = make_readiness_request(manifest) if args.views else None
     with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(
         provisioned_tree, views_enabled=args.views
     ) as project_root:
@@ -965,11 +1038,11 @@ def run(args: argparse.Namespace) -> int:
             client_env = None
             configured_model = FIXTURE_PROVIDER_MODEL
         with endpoint_context as endpoint:
-            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env)
+            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env, views_enabled=args.views)
             views_work: JsonObject = {}
             try:
                 client.configure(endpoint, configured_model, args.ready_timeout, views_enabled=args.views)
-                client.wait_ready(args.ready_timeout)
+                client.wait_ready(args.ready_timeout, readiness_request=readiness_request)
                 bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
                     lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
                     bench_rerank.burn_in_queries(),
@@ -986,7 +1059,7 @@ def run(args: argparse.Namespace) -> int:
                 not_applicable_building_rows: list[JsonObject] = []
                 if has_building_rows:
                     with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
-                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
+                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr", views_enabled=args.views)
                         building.allow_building = True
                         try:
                             building.configure(
@@ -998,17 +1071,19 @@ def run(args: argparse.Namespace) -> int:
                             deadline = time.monotonic() + args.ready_timeout
                             status: JsonObject = {}
                             while time.monotonic() < deadline:
-                                status = building.call(
-                                    "status",
-                                    timeout=deadline - time.monotonic() if args.views else 120.0,
-                                    cap_timeout=not args.views,
-                                )
-                                semantic_status = status.get("semantic_index", {}).get("status")
-                                lexical_status = status.get("search_index", {}).get("status")
+                                if args.views:
+                                    assert readiness_request is not None
+                                    status = building.readiness_reply(readiness_request, deadline - time.monotonic())
+                                    semantic_status = status.get("semantic_status")
+                                    lexical_status = status.get("lanes", {}).get("trigram", {}).get("status")
+                                else:
+                                    status = building.call("status", timeout=120.0, cap_timeout=True)
+                                    semantic_status = status.get("semantic_index", {}).get("status")
+                                    lexical_status = status.get("search_index", {}).get("status")
                                 if semantic_status in {"failed", "unavailable"}:
                                     raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
                                 if semantic_status == "ready":
-                                    if args.views and lexical_status == "ready":
+                                    if args.views and full_views_coverage(status):
                                         reason = (
                                             "views-enabled semantic index was ready before the held-embedding "
                                             "fixture reached the building state"
@@ -1024,10 +1099,13 @@ def run(args: argparse.Namespace) -> int:
                                         break
                                     if not args.views:
                                         raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
-                                if lexical_status == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
+                                if (args.views and building_views_lexical_ready(status)) or (
+                                    not args.views and lexical_status == "ready" and (
+                                        semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")
+                                    )
+                                ):
                                     break
-                                if not args.views:
-                                    time.sleep(0.1)
+                                time.sleep(1.0 if args.views else 0.1)
                             else:
                                 if args.views:
                                     reason = (
