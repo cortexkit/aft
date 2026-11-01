@@ -588,6 +588,30 @@ pub(crate) fn install_standalone(ctx: &AppContext, config: Config, decision: Fol
             stamps: stamps(&decision),
             decision,
         });
+    install_bound_cache(ctx, config, root, cache);
+}
+
+/// Install an already probed fixture decision without consulting persisted metadata.
+/// Index-lifecycle fixtures can replace a checkout at the same path; admission-cache
+/// reuse is exercised by the separate folder-admission lifecycle tests.
+#[cfg(test)]
+pub(crate) fn install_probe_for_test(
+    ctx: &AppContext,
+    root: &Path,
+    config: Config,
+    decision: FolderAdmission,
+) {
+    let cache = Cache {
+        relative_paths: false,
+        policy: policy(&config, root),
+        checked_ms: now_ms(),
+        stamps: stamps(&decision),
+        decision,
+    };
+    install_bound_cache(ctx, config, root.to_path_buf(), cache);
+}
+
+fn install_bound_cache(ctx: &AppContext, config: Config, root: PathBuf, cache: Cache) {
     let request: RawRequest = serde_json::from_value(json!({"id": "standing-folder", "command": "configure", "project_root": root, "harness": "runner"})).expect("standing request");
     let project = cache.decision.classification == FolderClassification::Project;
     let state = ctx.folder_admission();

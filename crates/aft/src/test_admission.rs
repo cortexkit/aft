@@ -25,5 +25,6 @@ pub(crate) fn prepare_project(ctx: &crate::context::AppContext, root: &std::path
     );
     // Seed only the classifier's decision. Index loaders and configure tail
     // stages must still start through the handler and gates under test.
-    crate::folder_admission_runtime::install_standalone(ctx, config, decision);
+    // A prior checkout's persisted observation is not part of this setup.
+    crate::folder_admission_runtime::install_probe_for_test(ctx, &root, config, decision);
 }

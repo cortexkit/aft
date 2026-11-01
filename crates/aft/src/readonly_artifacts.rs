@@ -1635,12 +1635,11 @@ mod tests {
         let root = fs::canonicalize(root).unwrap();
         let bind = || {
             let owner = borrowed_context(&root, storage.path());
-            // Replacing the checkout at this path requires fresh admission metadata.
+            crate::test_admission::prepare_project(&owner, &root);
             let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
                 "id": "replace-repository",
                 "command": "configure",
                 "project_root": root,
-                "refresh": true,
                 "harness": "opencode",
                 "storage_dir": storage.path(),
                 "config": [{
@@ -1658,10 +1657,13 @@ mod tests {
             ))
             .unwrap();
             assert_eq!(response["success"], true, "{response}");
-            crate::test_admission::settle(&owner);
-            owner
+            let key = owner
                 .cached_artifact_cache_key(&root)
-                .expect("settled repository identity")
+                .expect("settled repository identity");
+            // Only the cache key is needed; stop index work before replacing the checkout.
+            owner.mark_subc_unbound();
+            crate::commands::configure::cancel_deferred_configure_maintenance(&owner);
+            key
         };
         let original_key = bind();
         build_search_artifact(&root, storage.path());

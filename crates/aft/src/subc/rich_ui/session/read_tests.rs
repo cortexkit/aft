@@ -75,6 +75,7 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
                 "views":{"enabled":false}}).to_string()}]
     }))
     .unwrap();
+    crate::test_admission::prepare_project(&f.ctx, &f.policy.project_root);
     let response = crate::commands::configure::handle_configure(&request, &f.ctx);
     assert!(response.success, "configure: {response:?}");
     crate::test_admission::settle(&f.ctx);
