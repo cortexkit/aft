@@ -82,6 +82,7 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
             Some("go") => "go",
             Some("java") => "java",
             Some("cs") => "csharp",
+            Some("py") => "python",
             _ => "typescript",
         };
         let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
@@ -1124,6 +1125,52 @@ fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates(
             .filter(|row| selected.contains(std::str::from_utf8(&row.caller_path).unwrap()))
             .collect()
     );
+}
+
+#[test]
+fn callgraph_python_view_reexport_refresh_matches_cold() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let source = "def target():\n    pass\ndef replacement():\n    pass\n";
+    let package = "from .middle import forwarded as public\n";
+    let caller = "from pkg import public\ndef run():\n    public()\n";
+    let base = manifest(
+        &conn,
+        &[
+            ("pkg/source.py", source),
+            ("pkg/middle.py", "from .source import target as forwarded\n"),
+            ("pkg/__init__.py", package),
+            ("calls.py", caller),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("pkg/source.py", source),
+            (
+                "pkg/middle.py",
+                "from .source import replacement as forwarded\n",
+            ),
+            ("pkg/__init__.py", package),
+            ("calls.py", caller),
+        ],
+    );
+    let db = f.dir.path().join("python-reexport.sqlite");
+    let cold = f.dir.path().join("python-reexport-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_snapshot_parity(&snapshot(&cold), &snapshot(&db));
+    let conn = Connection::open(&db).unwrap();
+    let mut statement = conn
+        .prepare("SELECT target_symbol FROM edges WHERE kind='call' ORDER BY target_symbol")
+        .unwrap();
+    let targets = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(targets, ["replacement"]);
 }
 
 #[test]

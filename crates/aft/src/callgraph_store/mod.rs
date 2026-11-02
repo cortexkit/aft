@@ -32187,6 +32187,14 @@ mod rust_use_parser_tests {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_manifest_view_for_test(
+    root: &Path,
+    files: &[PathBuf],
+) -> ReadonlyCallGraphStore {
+    rust_resolution_tests::callgraph_fixture_view_store(root, files)
+}
+
+#[cfg(test)]
 mod rust_resolution_tests {
     use super::*;
     use crate::inspect::job::CallgraphSnapshot;
@@ -32594,9 +32602,18 @@ edition = "2021"
         (store, snapshot)
     }
 
-    fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
+    pub(super) fn callgraph_fixture_view_store(
+        root: &Path,
+        inputs: &[PathBuf],
+    ) -> ReadonlyCallGraphStore {
         use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
-        let blobs_path = root.join("view-blobs.sqlite");
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fixture_dir = root.join(format!(
+            "view-fixture-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&fixture_dir).unwrap();
+        let blobs_path = fixture_dir.join("view-blobs.sqlite");
         let blobs = Connection::open(&blobs_path).unwrap();
         blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
         let mut entries = Vec::new();
@@ -32641,7 +32658,7 @@ edition = "2021"
             ));
         }
         let manifest = Manifest::new(entries).unwrap();
-        let views = root.join("views");
+        let views = fixture_dir.join("views");
         fs::create_dir_all(&views).unwrap();
         let database = manifest_view_database_path(&views, "parity").unwrap();
         crate::views::materialization::materialize_manifest_view_database(
@@ -32650,14 +32667,18 @@ edition = "2021"
             &manifest,
         )
         .unwrap();
-        let view = ReadonlyCallGraphStore::open_manifest_view(
+        ReadonlyCallGraphStore::open_manifest_view(
             root.to_path_buf(),
             "parity".into(),
             views,
             "parity",
             None,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
+        let view = callgraph_fixture_view_store(root, inputs);
         project_dead_code_snapshot_from_view(&view).unwrap().1
     }
 
@@ -32670,8 +32691,9 @@ edition = "2021"
             write_file(&root, "pkg/__init__.py", "from .impl import factory as public\nfrom .impl import Widget\n"),
             write_file(&root, "calls.py", "from pkg import public, Widget\ndef outer():\n    def inner(public=public()):\n        public()\n    Widget()\n"),
         ];
-        let (_, legacy) = go_fixture_store(&root, &files);
-        let view = callgraph_fixture_view(&root, &files);
+        let (store, legacy) = go_fixture_store(&root, &files);
+        let view_store = callgraph_fixture_view_store(&root, &files);
+        let view = project_dead_code_snapshot_from_view(&view_store).unwrap().1;
         for snapshot in [&legacy, &view] {
             assert_projected_call(&root, snapshot, "pkg/impl.py", "factory");
             assert_projected_call(&root, snapshot, "pkg/impl.py", "__init__");
@@ -32680,13 +32702,48 @@ edition = "2021"
                 .iter()
                 .all(|call| matches!(call.caller_symbol.as_str(), "outer" | "inner")));
             assert_eq!(snapshot.outbound_calls.len(), 3);
-            assert!(snapshot
-                .outbound_calls
-                .iter()
-                .filter(|call| call.target != "public")
-                .all(|call| call.caller_symbol == "outer"));
+            assert!(
+                snapshot
+                    .outbound_calls
+                    .iter()
+                    .filter(|call| call.target.ends_with("::factory")
+                        || call.target.ends_with("::__init__"))
+                    .all(|call| call.caller_symbol == "outer"),
+                "{:#?}",
+                snapshot.outbound_calls
+            );
         }
-        assert_eq!(projection_rows(&legacy), projection_rows(&view));
+        let signatures = |sites: Vec<StoreCallSite>| {
+            sites
+                .into_iter()
+                .map(|site| {
+                    (
+                        site.caller.file,
+                        site.caller.symbol,
+                        site.line,
+                        site.byte_start,
+                        site.byte_end,
+                        site.target_file,
+                        site.target_symbol,
+                        site.provenance,
+                    )
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        for symbol in ["factory", "Widget::__init__"] {
+            assert_eq!(
+                signatures(
+                    store
+                        .direct_callers_of(Path::new("pkg/impl.py"), symbol)
+                        .unwrap()
+                ),
+                signatures(
+                    view_store
+                        .direct_callers_of(Path::new("pkg/impl.py"), symbol)
+                        .unwrap()
+                )
+            );
+        }
     }
 
     #[test]

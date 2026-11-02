@@ -28,6 +28,52 @@ fn impact(store: &CallGraphStore, file: &str, symbol: &str, tests: bool) -> Stri
     crate::subc_format::format_callgraph("impact", &serde_json::to_value(result).unwrap(), false)
 }
 
+fn assert_python_view_answers(
+    store: &CallGraphStore,
+    targets: &[(&str, &str)],
+    roots: &[(&str, &str)],
+) {
+    fn python_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("view-fixture-")
+                {
+                    python_files(&path, files);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "py") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    python_files(store.project_root(), &mut files);
+    files.sort();
+    let view = crate::callgraph_store::fixture_manifest_view_for_test(store.project_root(), &files);
+    for (file, symbol) in targets {
+        let legacy = callers_result(store, Path::new(file), symbol, 1, true).unwrap();
+        let viewed = callers_result(&view, Path::new(file), symbol, 1, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::to_value(viewed).unwrap(),
+            "callers {file}:{symbol}"
+        );
+    }
+    for (file, symbol) in roots {
+        let legacy = call_tree_result(store, Path::new(file), symbol, 2, true).unwrap();
+        let viewed = call_tree_result(&view, Path::new(file), symbol, 2, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(legacy).unwrap(),
+            serde_json::to_value(viewed).unwrap(),
+            "call_tree {file}:{symbol}"
+        );
+    }
+}
+
 #[test]
 fn callgraph_empty_receiver_note_exact_counts_and_test_filtering() {
     let (_temp, store) = fixture(&[("lib.rs", "fn target() {}\n")]);
@@ -199,6 +245,17 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
     names.sort();
     assert_eq!(names, ["named", "qualified"]);
     assert!(sites.iter().all(|site| !site.approximate()));
+    let targets = [
+        ("pkg/source.py", "target"),
+        ("pkg/source.py", "replacement"),
+    ];
+    let roots = [
+        ("calls.py", "named"),
+        ("calls.py", "qualified"),
+        ("calls.py", "shadow"),
+        ("negative.py", "rejected"),
+    ];
+    assert_python_view_answers(&store, &targets, &roots);
     let middle = store.project_root().join("pkg/middle.py");
     std::fs::write(&middle, "from .source import replacement as forwarded\n").unwrap();
     store.refresh_files(&[middle]).unwrap();
@@ -211,6 +268,7 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
         .unwrap();
     assert_eq!(sites.len(), 2);
     assert!(sites.iter().all(|site| !site.approximate()));
+    assert_python_view_answers(&store, &targets, &roots);
 }
 
 #[test]
@@ -238,6 +296,15 @@ fn callgraph_python_definition_headers_use_defining_scope() {
         ]
     );
     assert!(sites.iter().all(|site| !site.approximate()));
+    assert_python_view_answers(
+        &store,
+        &[("mod.py", "factory")],
+        &[
+            ("calls.py", "outer"),
+            ("calls.py", "inner"),
+            ("calls.py", "Container::method"),
+        ],
+    );
 }
 
 #[test]
@@ -274,6 +341,22 @@ fn callgraph_python_constructors_follow_class_bindings_not_names() {
         .direct_callers_of(Path::new("local_classes.py"), "Same::__init__")
         .unwrap()
         .is_empty());
+    assert_python_view_answers(
+        &store,
+        &[
+            ("pkg/source.py", "Widget::__init__"),
+            ("calls.py", "Local::__init__"),
+            ("unrelated.py", "Renamed::__init__"),
+            ("duplicate.py", "Duplicate::__init__"),
+            ("local_classes.py", "Same::__init__"),
+        ],
+        &[
+            ("calls.py", "construct"),
+            ("calls.py", "shadow"),
+            ("local_classes.py", "left"),
+            ("local_classes.py", "right"),
+        ],
+    );
 }
 
 #[test]
