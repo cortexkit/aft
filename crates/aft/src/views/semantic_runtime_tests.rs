@@ -2161,7 +2161,14 @@ fn large_semantic_fill_batches_pin_writes() {
     let (_storage, root, runtime) = large_pin_fixture();
     let (writes, syncs) = key_file_work();
     let bytes = key_file_bytes();
+    let opens = crate::blob_store::v3::work_profile::count("connection_open");
     fill_large(&runtime);
+    let opens = crate::blob_store::v3::work_profile::count("connection_open") - opens;
+    eprintln!("2048-file semantic refresh: v3 connection opens={opens}");
+    assert!(
+        opens <= 32,
+        "a fill must reuse database owners across model batches, got {opens} opens"
+    );
     let after = key_file_work();
     eprintln!(
         "fill pins: writes={} bytes={} key syncs={}",

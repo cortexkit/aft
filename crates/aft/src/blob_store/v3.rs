@@ -35,8 +35,11 @@ pub const SYMBOL_RETENTION_SWEEPS: i64 = 8;
 const TIMEOUT_MS: i64 = 5_000;
 pub(crate) const BUSY_PREFIX: &str = "v3 store busy: ";
 mod connections;
+pub(crate) use connections::FillConnections;
 mod copy;
 mod initialization;
+#[cfg(target_os = "macos")]
+mod inventory;
 #[cfg(test)]
 mod layout_gate;
 #[cfg(test)]
@@ -475,7 +478,16 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 /// each directory entry is read, and a walk that reaches it returns `None`:
 /// its partial sum is never a total. `path` is a family directory.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
-    walk_allocated(path, deadline, Level::Family)
+    #[cfg(test)]
+    let _profile = work_profile::span("namespace_walk");
+    #[cfg(target_os = "macos")]
+    {
+        inventory::measure(path, deadline)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        walk_stat_allocated(path, deadline, Level::Family)
+    }
 }
 
 /// Where a walk is inside a family directory.
@@ -513,7 +525,78 @@ impl Level {
     }
 }
 
-fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Result<Option<u64>> {
+#[cfg(target_os = "macos")]
+fn walk_allocated(
+    path: &Path,
+    root: &Path,
+    deadline: Option<Instant>,
+    level: Level,
+    entries: &mut inventory::Entries,
+) -> Result<bool> {
+    for entry in fs::read_dir(path)
+        .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
+    {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        WALK_DELAY.with(|delay| {
+            if !delay.get().is_zero() {
+                std::thread::sleep(delay.get());
+            }
+        });
+        let entry =
+            entry.map_err(|e| crate::views::io::at("reading v3 accounting entry", path, e))?;
+        let path = entry.path();
+        #[cfg(test)]
+        WALK_BEFORE_STAT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&path);
+            }
+        });
+        // Stat without following symlinks. Vanished entries
+        // occupy no bytes; other errors must leave accounting unknown.
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(
+                    crate::views::io::at("reading v3 accounting metadata", &path, error).into(),
+                )
+            }
+        };
+        let relative = path
+            .strip_prefix(root)
+            .expect("inventory entry under its root")
+            .to_path_buf();
+        if meta.is_dir() {
+            entries.insert(relative, inventory::Entry::new(&meta, false, false));
+            let child = level.child(&entry.file_name());
+            if !walk_allocated(&path, root, deadline, child, entries)? {
+                return Ok(false);
+            }
+        } else {
+            entries.insert(
+                relative,
+                inventory::Entry::new(
+                    &meta,
+                    level == Level::Member && meta.is_file(),
+                    matches!(level, Level::Member | Level::Base) && meta.is_file(),
+                ),
+            );
+        }
+    }
+    Ok(true)
+}
+
+// Without a private-size probe every charge comes directly from the metadata
+// already needed by the walk. Keep that path free of cache keys and inventories.
+#[cfg(not(target_os = "macos"))]
+fn walk_stat_allocated(
+    path: &Path,
+    deadline: Option<Instant>,
+    level: Level,
+) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
@@ -552,7 +635,7 @@ fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Resul
         };
         if meta.is_dir() {
             let child = level.child(&entry.file_name());
-            let Some(bytes) = walk_allocated(&entry.path(), deadline, child)? else {
+            let Some(bytes) = walk_stat_allocated(&path, deadline, child)? else {
                 return Ok(None);
             };
             total = total.saturating_add(bytes);
@@ -910,6 +993,8 @@ fn pragma(c: &Connection, path: &Path, kind: Kind, name: &'static str, value: i6
 thread_local! { static BAD_PRAGMA: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 
 fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<IdentityConnection> {
+    #[cfg(test)]
+    let _profile = work_profile::span("connection_open");
     let flags = if readonly {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } else if create {
