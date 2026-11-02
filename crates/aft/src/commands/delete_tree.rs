@@ -255,6 +255,7 @@ impl Walk<'_> {
             self.count_entry()?;
             // `DirEntry::metadata` does not follow a symlink either.
             let identity = recorded_identity(&entry.metadata()?);
+            crate::run_tool_call::progress::report();
             if file_type.is_dir() {
                 if self.boundary.should_descend(&path)? {
                     self.manifest.entries.push(TreeEntry {
@@ -1175,6 +1176,42 @@ mod tests {
             .iter()
             .filter(|entry| matches!(entry.kind, NodeKind::File { .. }))
             .count()
+    }
+
+    #[test]
+    fn call_keepalive_delete_preflight_reports_examined_entries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let clock = Arc::new(AtomicU64::new(0));
+        let sent = Arc::new(AtomicU64::new(0));
+        let origin = Instant::now();
+        let token = crate::executor::JobCancellation::new();
+        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+            {
+                let clock = clock.clone();
+                move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))
+            },
+            {
+                let sent = sent.clone();
+                move |_| {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+        ));
+        let _token = crate::executor::install_job_cancellation(token);
+        let manifest = walk(dir.path(), BackupPolicy::default(), 100, 100).unwrap();
+        assert_eq!(files(&manifest), 3);
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            3,
+            "enumeration is work before the first unlink"
+        );
     }
 
     #[test]

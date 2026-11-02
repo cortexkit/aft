@@ -290,6 +290,7 @@ struct HeldBashCall {
     /// loop cannot detach the command because it does not exist yet.
     detach: Option<BashDetachTarget>,
     _progress: Option<RequestProgress>,
+    keepalive_key: Option<usize>,
 }
 
 struct RequestProgress {
@@ -339,9 +340,41 @@ impl HeldBashCalls {
                 claim: Arc::clone(&claim),
                 detach: None,
                 _progress: None,
+                keepalive_key: None,
             },
         );
         claim
+    }
+
+    pub(super) fn record_keepalive(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+        progress: &crate::run_tool_call::progress::Progress,
+    ) {
+        if let Some(call) = self.lock().get_mut(&(route, corr)) {
+            call.keepalive_key = Some(progress.key());
+        }
+    }
+
+    pub(super) fn try_keepalive(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+        key: usize,
+        send: impl FnOnce() -> bool,
+    ) -> bool {
+        let Ok(calls) = self.calls.try_lock() else {
+            return false;
+        };
+        // Serialize with cancellation and the module loop reserving the call's
+        // only final reply. The key prevents an old wait renewing a reused id.
+        calls.get(&(route, corr)).is_some_and(|call| {
+            call.keepalive_key == Some(key)
+                && !call.claim.cancel_requested()
+                && call.claim.state.load(Ordering::SeqCst) == CLAIM_UNCLAIMED
+                && send()
+        })
     }
 
     /// The held call retains the opt-in to receive progress updates until answered or abandoned.
@@ -395,6 +428,7 @@ impl HeldBashCalls {
         match self.lock().get_mut(&(route, corr)) {
             Some(call) => {
                 call._progress.take();
+                call.keepalive_key.take();
                 call.claim.request_cancel();
                 true
             }
@@ -406,6 +440,7 @@ impl HeldBashCalls {
         for (&(held_route, _), call) in self.lock().iter_mut() {
             if held_route == route {
                 call._progress.take();
+                call.keepalive_key.take();
             }
         }
     }
@@ -413,6 +448,7 @@ impl HeldBashCalls {
     pub(super) fn clear_all_progress(&self) {
         for call in self.lock().values_mut() {
             call._progress.take();
+            call.keepalive_key.take();
         }
     }
 
@@ -726,6 +762,29 @@ pub(super) fn module_draining_response(request_id: &str, what: &str) -> Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_keepalive_bash_stops_at_cancel_reply_claim_and_id_reuse() {
+        use crate::run_tool_call::progress::Progress;
+        let calls = super::HeldBashCalls::default();
+        let route = super::RouteChannel {
+            channel: 7,
+            epoch: 3,
+        };
+        let old = Progress::new(|_| true);
+        let claim = calls.insert(route, 1);
+        calls.record_keepalive(route, 1, &old);
+        assert!(calls.try_keepalive(route, 1, old.key(), || true));
+        assert!(claim.try_claim_for_wait_task());
+        assert!(!calls.try_keepalive(route, 1, old.key(), || panic!("push after reply claim")));
+        let new = Progress::new(|_| true);
+        calls.insert(route, 1);
+        calls.record_keepalive(route, 1, &new);
+        assert!(!calls.try_keepalive(route, 1, old.key(), || panic!("stale channel")));
+        assert!(calls.try_keepalive(route, 1, new.key(), || true));
+        assert!(calls.request_cancel(route, 1));
+        assert!(!calls.try_keepalive(route, 1, new.key(), || panic!("push after cancel")));
+    }
+
     use super::*;
 
     #[test]

@@ -10767,6 +10767,12 @@ async fn hold_for_consent(
             return Some((response, text));
         }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        // A held RESPONSE ends the original REQUEST (tool-provider CONTRACT.md
+        // §4.4). If the call is approved later, its result is delivered as a
+        // separate late result, so this request must send no more keepalives.
+        if let Some(progress) = &plain_run.progress {
+            progress.close();
+        }
         if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
             .await
             .is_err()
@@ -11763,6 +11769,7 @@ async fn handle_tool_call_with_capabilities(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                keepalive: progress.clone(),
                 speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
@@ -11826,6 +11833,7 @@ async fn handle_tool_call_with_capabilities(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            keepalive: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
@@ -17447,6 +17455,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        keepalive: None,
                         speech_seed: None,
                         run_scope: None,
                         scope: None,

@@ -320,7 +320,12 @@ fn wait_with_deadline_with_limit(
                     truncated: stdout_truncated || stderr_truncated,
                 });
             }
-            Ok(Some(_)) | Ok(None) => {
+            Ok(status) => {
+                if status.is_none() {
+                    // tool-provider CONTRACT.md §4.4: observing a live child
+                    // is supervision work, even for a silent formatter/checker.
+                    crate::run_tool_call::progress::report();
+                }
                 let now = Instant::now();
                 if now >= deadline || cancelled() {
                     kill_process_tree(&mut child);
@@ -2860,6 +2865,59 @@ pub fn validate_full(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn call_keepalive_silent_formatter_supervision_preserves_result_and_timeout() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        for time_out in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "while [ ! -f release ]; do sleep 0.02; done; exit 7"])
+                .current_dir(dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            isolate_in_process_group(&mut command);
+            let child = command.spawn().unwrap();
+            let clock = Arc::new(AtomicU64::new(0));
+            let origin = Instant::now();
+            let (tx, pushes) = std::sync::mpsc::channel();
+            let token = crate::executor::JobCancellation::new();
+            token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+                {
+                    let clock = clock.clone();
+                    move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))
+                },
+                move |_| tx.send(()).is_ok(),
+            ));
+            let wait = thread::spawn(move || {
+                let _token = crate::executor::install_job_cancellation(token);
+                wait_with_deadline(
+                    child,
+                    "silent-formatter",
+                    Instant::now() + Duration::from_secs(if time_out { 2 } else { 15 }),
+                    || false,
+                )
+            });
+            for at in (30_000..=270_000).step_by(30_000) {
+                clock.store(at, Ordering::SeqCst);
+                pushes
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("live formatter supervision");
+            }
+            if !time_out {
+                fs::write(dir.path().join("release"), "").unwrap();
+            }
+            let outcome = wait.join().unwrap();
+            if time_out {
+                assert!(matches!(outcome, Err(FormatError::Timeout { .. })));
+            } else {
+                assert_eq!(outcome.unwrap().status.code(), Some(7));
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn ruff_policy_refusal_does_not_poison_another_sessions_version_cache() {

@@ -830,6 +830,7 @@ fn collect_candidates(
                     continue;
                 };
                 examined.disk_stacks += 1;
+                crate::run_tool_call::progress::report();
                 if key_matches(&key, path_filter) {
                     candidates.insert((session.clone(), key));
                 }
@@ -854,6 +855,7 @@ fn collect_candidates(
                 continue;
             }
             examined.db_stacks += 1;
+            crate::run_tool_call::progress::report();
             if key_matches(&key, path_filter) {
                 candidates.insert((stack.session_id, key));
             }
@@ -866,6 +868,7 @@ fn collect_candidates(
                 continue;
             }
             examined.memory_stacks += 1;
+            crate::run_tool_call::progress::report();
             if key_matches(&key, path_filter) {
                 candidates.insert((session, key));
             }
