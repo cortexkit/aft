@@ -1024,6 +1024,10 @@ impl SavedCheck {
         file.extension().is_some_and(|extension| extension == "rs")
             && self.fingerprint.files.contains_key(file)
     }
+    pub(crate) fn content_hash(&self, file: &Path) -> Option<[u8; 32]> {
+        let stamp = self.fingerprint.files.get(file)?;
+        Some(*blake3::Hash::from_hex(&stamp.hash).ok()?.as_bytes())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1484,8 +1488,8 @@ impl CompletedRustCheck {
         }
     }
 
-    pub(crate) fn complete(&mut self) {
-        let _ = self.complete_until(Instant::now() + BUDGET, false);
+    pub(crate) fn complete(&mut self) -> Option<SavedCheck> {
+        self.complete_until(Instant::now() + BUDGET, false)
     }
 
     fn complete_until(
@@ -2637,7 +2641,7 @@ mod tests {
         cache.runtime.binary = analyzer.clone();
         cache.begin(begin_after_fixture_inputs());
         cache.finished = true;
-        cache.complete();
+        let _ = cache.complete();
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
         crate::executable_cache::write_executable(
             &analyzer,
@@ -2698,7 +2702,7 @@ mod tests {
         );
         cache.begin(began);
         cache.finished = true;
-        cache.complete();
+        let _ = cache.complete();
         assert!(
             fs::read(&cache.path).unwrap() == before,
             "a check which began before the edit replaced the authoritative record"
@@ -2737,7 +2741,7 @@ mod tests {
             }],
         );
         cache.finished = true;
-        cache.complete();
+        let _ = cache.complete();
         assert!(
             fs::read(&cache.path).unwrap() == before,
             "an input changed during the check, but its result replaced the saved record"
@@ -2820,7 +2824,7 @@ mod tests {
         cache.begin(SystemTime::now());
         assert!(cache.running_reason().is_some());
         cache.finished = true;
-        cache.complete();
+        let _ = cache.complete();
         assert!(cache.running_reason().is_none());
         cache.begin(SystemTime::now());
         cache.abort();

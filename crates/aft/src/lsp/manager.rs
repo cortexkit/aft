@@ -4369,12 +4369,54 @@ impl LspManager {
                 accepted_snapshots.push(snapshot);
             }
         }
-        for client in self.clients.values_mut() {
+        let mut completed_checks = Vec::new();
+        for (key, client) in &mut self.clients {
             if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
                 && !client.diagnostics_are_provisional()
             {
-                if let Some(cache) = client.completed_rust_check.as_mut() {
-                    cache.complete();
+                if let Some(check) = client
+                    .completed_rust_check
+                    .as_mut()
+                    .and_then(|cache| cache.complete())
+                {
+                    completed_checks.push((key.clone(), check));
+                }
+            }
+        }
+        for (key, check) in completed_checks {
+            for (file, compiler) in &check.diagnostics {
+                let Some(hash) = check.content_hash(file) else {
+                    continue;
+                };
+                let document = self.documents.get(&key).and_then(|store| store.entry(file));
+                if document.is_some_and(|document| document.content_hash != Some(hash)) {
+                    continue;
+                }
+                // A bounded inspect can close and reopen a document before a
+                // delayed compiler push arrives. Its old or absent version is
+                // not document authority, but the completed check's verified
+                // inputs prove which bytes its compiler diagnostics describe.
+                self.latest_push_for_pull_servers
+                    .insert((key.clone(), file.clone()), compiler.clone());
+                let pulled = self.latest_pull_for_rust.get(&(key.clone(), file.clone()));
+                let merged =
+                    union_of_diagnostics(pulled.cloned().unwrap_or_default(), compiler.clone());
+                let version = document.map(|document| document.version);
+                self.diagnostics.publish_full_with_provisional(
+                    key.clone(),
+                    file.clone(),
+                    merged,
+                    None,
+                    version,
+                    false,
+                );
+                self.diagnostics.certify_content(&key, file, Some(hash));
+                if pulled.is_some() {
+                    self.diagnostics.mark_document_pull(&key, file);
+                }
+                diagnostics_changed = true;
+                if let Some(snapshot) = self.accepted_snapshot_for_file(&key, file) {
+                    accepted_snapshots.push(snapshot);
                 }
             }
         }

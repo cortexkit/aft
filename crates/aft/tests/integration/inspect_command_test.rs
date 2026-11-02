@@ -10118,7 +10118,7 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
         write_file(
             &root,
             "src/lib.rs",
-            "// fake_compile_error\npub fn f() {}\n",
+            "// fake_compile_error\n// BROKEN\npub fn f() {}\n",
         );
         crate::helpers::disable_in_process_file_watcher();
         let ctx = AppContext::new(
@@ -10152,12 +10152,12 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
         // Wait past the two-second filesystem timestamp safety margin so the
         // completed check can prove that its inputs predate the run. The stale
         // or missing document version cannot certify the compiler push, but
-        // that input fingerprint can keep its error beside the empty native pull.
+        // that input fingerprint can keep its errors beside the native pull.
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
         let response = scoped_diagnostics_inspect(&ctx, "certified-error", "src");
-        // The fake check pushes its default error and the compiler-only error;
-        // neither is returned by the content-based native pull.
+        // The fake check pushes two errors. The native pull independently
+        // reports the BROKEN marker, so the complete answer must contain three.
         let record = wait_for_completed_rust_check(&storage, 2, || {}).unwrap();
         println!(
             "{version_mode}: certified record {}: {response:#}",
@@ -10165,7 +10165,7 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
         );
         assert_eq!(response["complete"], true, "{version_mode}: {response:#}");
         assert_eq!(
-            response["summary"]["diagnostics"]["errors"], 2,
+            response["summary"]["diagnostics"]["errors"], 3,
             "{version_mode}: {response:#}"
         );
         assert!(
@@ -10173,6 +10173,26 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
                 .iter()
                 .any(|message| message == "fake compile error"),
             "{version_mode}: {response:#}"
+        );
+        let reopened = scoped_diagnostics_inspect(&ctx, "certified-error-reopened", "src");
+        assert_eq!(reopened["complete"], true, "{version_mode}: {reopened:#}");
+        assert_eq!(
+            reopened["summary"]["diagnostics"]["errors"], 3,
+            "{version_mode}: {reopened:#}"
+        );
+
+        write_file(&root, "src/lib.rs", "// BROKEN\npub fn f() {}\n");
+        let changed = scoped_diagnostics_inspect(&ctx, "certified-error-changed", "src");
+        assert_eq!(changed["complete"], true, "{version_mode}: {changed:#}");
+        assert_eq!(
+            changed["summary"]["diagnostics"]["errors"], 1,
+            "{version_mode}: {changed:#}"
+        );
+        assert!(
+            !diagnostic_messages_for(&changed, "src/lib.rs")
+                .iter()
+                .any(|message| message == "fake compile error"),
+            "{version_mode}: {changed:#}"
         );
     }
 }
@@ -10301,7 +10321,6 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let changed = scoped_diagnostics_inspect(&ctx, "saved-changed", "src");
-    println!("real restart: changed: {changed:#}");
     assert!(
         !changed["text"]
             .as_str()
@@ -10312,10 +10331,6 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     assert!(reported_check_still_running(&changed), "{changed:#}");
     let errors = loop {
         let response = scoped_diagnostics_inspect(&ctx, "saved-errors-warm", "src");
-        println!(
-            "real restart: warm errors {}: {}",
-            response["summary"]["diagnostics"], response["text"]
-        );
         if response["summary"]["diagnostics"]["errors"]
             .as_u64()
             .is_some_and(|n| n > 0)
@@ -10336,8 +10351,13 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     );
     drop(ctx);
     let ctx = new_context();
+    let started = std::time::Instant::now();
     let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
-    println!("real restart: restored errors: {restored_errors:#}");
+    let restored_elapsed = started.elapsed();
+    println!(
+        "real restart: restored errors in {} ms: {restored_errors:#}",
+        restored_elapsed.as_millis()
+    );
     assert!(
         restored_errors["text"]
             .as_str()
@@ -10350,6 +10370,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         errors["summary"]["diagnostics"]["errors"],
         "{restored_errors:#}"
     );
+    assert!(restored_elapsed < std::time::Duration::from_secs(5));
 }
 
 fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
