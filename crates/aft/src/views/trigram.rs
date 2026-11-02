@@ -511,6 +511,7 @@ impl LexicalView {
                         .collect()
                 }),
             ));
+            crate::run_tool_call::progress::report();
         }
         Ok(
             crate::search_index::SearchIndexSnapshot::from_verified_rows(

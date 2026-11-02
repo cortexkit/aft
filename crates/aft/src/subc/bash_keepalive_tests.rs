@@ -123,11 +123,10 @@ impl WaitHarness {
     }
 
     async fn quiet(&mut self) {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), self.frames.recv())
-                .await
-                .is_err()
-        );
+        assert!(!matches!(
+            tokio::time::timeout(Duration::from_millis(250), self.frames.recv()).await,
+            Ok(Some(_))
+        ));
     }
 
     async fn result(&mut self) -> Response {
