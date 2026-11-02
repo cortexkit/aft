@@ -12671,7 +12671,7 @@ mod tests {
                     let _scope = crate::executor::install_standalone_scope(Arc::clone(&ctx));
                     barrier.wait();
                     matches!(
-                        ctx.callgraph_store_for_ops(),
+                        ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
                         CallgraphStoreAccess::Ready(_)
                     )
                 })
@@ -12685,7 +12685,11 @@ mod tests {
             .filter(|event| *event == crate::views::donor::DonorEvent::Sealed)
             .count();
         assert_eq!(sealed, 1, "one base graph build for both queries");
-        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        let store = lazy_ready(
+            fixture
+                .borrower
+                .with_ready_callgraph_for_test(|| fixture.borrower.callgraph_store_for_ops()),
+        );
         assert_eq!(store.reader_kind(), "view");
         let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
         lazy_assert_same_graph(&store, &cold);
@@ -12699,7 +12703,9 @@ mod tests {
     ) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
         let access = {
             let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
-            fixture.borrower.callgraph_store_for_ops()
+            fixture
+                .borrower
+                .with_ready_callgraph_for_test(|| fixture.borrower.callgraph_store_for_ops())
         };
         let store = lazy_ready(access);
         assert_eq!(store.reader_kind(), "view");
@@ -13138,7 +13144,9 @@ mod tests {
 
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(ctx.views_route_root());
-        let graph_has = |file: &str, symbol: &str| match ctx.callgraph_store_for_ops() {
+        let graph_has = |file: &str, symbol: &str| match ctx
+            .with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops())
+        {
             CallgraphStoreAccess::Ready(store) => {
                 crate::callgraph_store::CallGraphRead::node_for(&store, Path::new(file), symbol)
                     .is_ok()
@@ -15183,7 +15191,7 @@ mod tests {
         };
         let before = ctx.callgraph_view_route_count();
         let expected = callgraph_views_answers(&oracle, &copy_root);
-        let actual = callgraph_views_answers(ctx, root);
+        let actual = ctx.with_ready_callgraph_for_test(|| callgraph_views_answers(ctx, root));
         for ((label, expected), (_, actual)) in expected.iter().zip(&actual) {
             assert!(expected.success, "legacy {label}: {:?}", expected.data);
             assert!(actual.success, "view {label}: {:?}", actual.data);
@@ -15446,7 +15454,9 @@ mod tests {
             "file": root.join("a.ts"), "symbol": "target", "depth": 1,
         }))
         .unwrap();
-        let initial = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        let initial = ctx.with_ready_callgraph_for_test(|| {
+            crate::commands::callers::handle_callers(&callers_request, &ctx)
+        });
         assert!(initial.success, "{:?}", initial.data);
         assert_eq!(initial.data["total_callers"], 64);
         assert!(initial.data.to_string().contains("before_"));
@@ -15551,7 +15561,9 @@ mod tests {
 
         published_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let started = Instant::now();
-        let next = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        let next = ctx.with_ready_callgraph_for_test(|| {
+            crate::commands::callers::handle_callers(&callers_request, &ctx)
+        });
         eprintln!("{command}: next_read_ms={}", started.elapsed().as_millis());
         assert!(next.success, "{:?}", next.data);
         assert_eq!(next.data["total_callers"], 64);
@@ -15630,7 +15642,12 @@ mod tests {
             "symbol": "target", "depth": 1,
         }))
         .unwrap();
-        assert!(crate::commands::callers::handle_callers(&request, &ctx).success);
+        assert!(
+            ctx.with_ready_callgraph_for_test(|| crate::commands::callers::handle_callers(
+                &request, &ctx
+            ))
+            .success
+        );
         if let Some(executor) = executor.as_ref().filter(|_| late_register) {
             executor.register_actor(root_id.clone(), ctx.clone());
         }
@@ -15885,7 +15902,7 @@ mod tests {
             handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
                 .success
         );
-        let ready = match ctx.callgraph_store_for_ops() {
+        let ready = match ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()) {
             CallgraphStoreAccess::Ready(store) => store,
             _ => panic!("fixture must have a ready checkout graph"),
         };

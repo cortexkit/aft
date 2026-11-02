@@ -13129,6 +13129,35 @@ impl AppContext {
         }
     }
 
+    /// Test-only fixture adapter: block until the view's acquisition completes,
+    /// then pin its reader for the read-only test request (up to 120 seconds).
+    /// Production callers must handle Building through the normal read APIs,
+    /// whose interactive acquisition wait remains three seconds.
+    #[doc(hidden)]
+    pub fn with_ready_callgraph_for_test<T>(&self, read: impl FnOnce() -> T) -> T {
+        if !self.callgraph_views_enabled() {
+            return read();
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let _pin = self.pin_config();
+        CALLGRAPH_QUERY_READERS.with(|readers| {
+            readers
+                .borrow_mut()
+                .retain(|(key, _)| *key != self.config_pin_key());
+        });
+        self.callgraph_view_reader_with(|view| {
+            Ok(view.ready_reader_before_for_test(Instant::now, deadline))
+        })
+        .expect("fixture must route through callgraph views")
+        .unwrap_or_else(|error| {
+            panic!(
+                "fixture callgraph root={} failed before acquisition: {error}",
+                self.canonical_cache_root().display()
+            )
+        });
+        read()
+    }
+
     /// The call-graph reader of this checkout's view, acquired once per
     /// pinned request. `None` means views do not route call-graph reads; a
     /// genuine acquisition error is final. Capacity borrows the same published
@@ -13148,6 +13177,19 @@ impl AppContext {
 
     fn callgraph_view_reader_inner(
         &self,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
+        self.callgraph_view_reader_with(|view| view.reader())
+    }
+
+    fn callgraph_view_reader_with(
+        &self,
+        acquire: impl FnOnce(
+            &crate::views::callgraph::CallgraphView,
+        ) -> Result<
+            Arc<ReadonlyCallGraphStore>,
+            crate::views::callgraph::CallgraphViewError,
+        >,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
     {
         if !self.callgraph_views_enabled() {
@@ -13250,7 +13292,7 @@ impl AppContext {
             slot.as_ref().unwrap().clone()
         };
         self.record_checkout_pending_watcher_gap();
-        let result = match view.reader() {
+        let result = match acquire(&view) {
             Err(error) if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) => self
                 .borrowed_callgraph_view_reader(&root, &storage, &family, policy, true)
                 .unwrap_or(Err(error)),
@@ -22001,7 +22043,9 @@ mod callgraph_store_for_ops_tests {
     #[test]
     fn views_changed_head_callers_answer_the_current_tree_not_the_stale_legacy_store() {
         let fixture = ViewsCallgraphFixture::new();
-        let before = fixture.callers();
+        let before = fixture
+            .ctx
+            .with_ready_callgraph_for_test(|| fixture.callers());
         assert!(before.success, "{:#}", before.data);
         assert_eq!(before.data["total_callers"], 1, "{:#}", before.data);
         fixture.commit_source(
@@ -22018,7 +22062,9 @@ mod callgraph_store_for_ops_tests {
         .expect("stale legacy callers");
         assert_eq!(stale.total_callers, 1, "legacy fixture must remain stale");
 
-        let response = fixture.callers();
+        let response = fixture
+            .ctx
+            .with_ready_callgraph_for_test(|| fixture.callers());
 
         assert!(response.success, "{:#}", response.data);
         assert_eq!(
@@ -22036,7 +22082,7 @@ mod callgraph_store_for_ops_tests {
         /// query must open the database, and waits for the deferred checkpoint
         /// so only the returned connection holds the file.
         fn hold_checkout_view_derived_busy(&self) -> rusqlite::Connection {
-            let bound = self.callers();
+            let bound = self.ctx.with_ready_callgraph_for_test(|| self.callers());
             assert!(bound.success, "{:#}", bound.data);
             self.ctx
                 .update_config(|config| config.views.enabled = false);
@@ -22125,7 +22171,9 @@ mod callgraph_store_for_ops_tests {
         );
         drop(busy);
         fixture.ctx.view_load_retry_due_for_test();
-        let response = fixture.callers();
+        let response = fixture
+            .ctx
+            .with_ready_callgraph_for_test(|| fixture.callers());
         assert!(response.success, "{:#}", response.data);
     }
 
@@ -22187,7 +22235,7 @@ mod callgraph_store_for_ops_tests {
 
         drop(busy);
         fixture.ctx.view_load_retry_due_for_test();
-        let response = inspect();
+        let response = fixture.ctx.with_ready_callgraph_for_test(inspect);
         assert!(response.success, "{:#}", response.data);
         assert!(
             response.data["summary"]["dead_code"]["count"]
@@ -22247,7 +22295,7 @@ mod callgraph_store_for_ops_tests {
         // Once the database is free again the same zoom reads the graph.
         drop(busy);
         fixture.ctx.view_load_retry_due_for_test();
-        let response = zoom();
+        let response = fixture.ctx.with_ready_callgraph_for_test(zoom);
         assert!(response.success, "{:#}", response.data);
         assert!(
             response.data.get("callgraph").is_none(),

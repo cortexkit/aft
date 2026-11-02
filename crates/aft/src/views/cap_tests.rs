@@ -88,7 +88,10 @@ impl HeldFamily {
             config.clone(),
         );
         main_ctx.set_canonical_cache_root(main.clone());
-        main_ctx.callgraph_view_reader().unwrap().unwrap();
+        main_ctx
+            .with_ready_callgraph_for_test(|| main_ctx.callgraph_view_reader())
+            .unwrap()
+            .unwrap();
         let family = main_ctx.memoized_artifact_cache_key(&main);
         with_base_barrier(&storage, &family, |tx| {
             let count: i64 =

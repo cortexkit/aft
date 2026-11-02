@@ -667,14 +667,16 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
     // With views on, the first query binds this worktree's own checkout view
     // from its own source, before configure maintenance has run: it never
     // answers from the owner's graph and never reports the owner's callers.
-    match ctx.callgraph_store_for_ops() {
-        aft::context::CallgraphStoreAccess::Ready(store) => {
-            assert_eq!(store.reader_kind(), "view");
-            assert_eq!(store.project_root(), checkout);
+    let response = ctx.with_ready_callgraph_for_test(|| {
+        match ctx.callgraph_store_for_ops() {
+            aft::context::CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert_eq!(store.project_root(), checkout);
+            }
+            _ => panic!("expected this checkout's view reader"),
         }
-        _ => panic!("expected this checkout's view reader"),
-    }
-    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
+        query(&ctx, &checkout, "callers", "checkoutCaller")
+    });
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(response.data.to_string().contains("checkoutCaller"));
