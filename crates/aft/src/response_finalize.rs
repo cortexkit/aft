@@ -10,28 +10,12 @@ use serde_json::Value;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
-/// Emergency ceiling, deliberately above every normal tool budget. A cut here
-/// is a bug in the tool's own cap, not normal pagination.
-pub const REPLY_CEILING_BYTES: usize = 2 * 1024 * 1024;
-
-pub fn enforce_reply_ceiling(tool: &str, text: &mut String) {
-    let total = text.len();
-    if total <= REPLY_CEILING_BYTES {
-        return;
-    }
-    log::warn!("AFT reply ceiling: tool={tool} rendered_bytes={total} ceiling_bytes={REPLY_CEILING_BYTES}; the tool's own cap failed");
-    let footer = format!("\nthis reply was cut at {REPLY_CEILING_BYTES} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report");
-    let mut end = REPLY_CEILING_BYTES - footer.len();
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push_str(&format!("\nthis reply was cut at {end} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report"));
-}
-
-fn enforce_response_ceiling(tool: &str, response: &mut Response) {
-    if let Some(Value::String(text)) = response.data.get_mut("text") {
-        enforce_reply_ceiling(tool, text);
+fn cap_response_text(response: &mut Response, ctx: &AppContext, session: &str, tool: &str) {
+    if response.data.get("text").is_some_and(Value::is_string) {
+        if let Value::String(mut text) = response.data["text"].take() {
+            crate::tool_output::cap(ctx, session, tool, response, &mut text);
+            response.data["text"] = Value::String(text);
+        }
     }
 }
 
@@ -137,7 +121,7 @@ pub fn finalize_response_with_bg_completions(
             }
         }
     }
-    enforce_response_ceiling(attach_command, response);
+    cap_response_text(response, ctx, session_id, attach_command);
 }
 
 /// Finalization for a tool result whose agent-visible text is held apart from the response
@@ -174,6 +158,51 @@ pub(crate) fn finalize_tool_response_with_visibility(
     allow_bg_completions: bool,
     agent_visible: bool,
 ) {
+    finalize_tool_response_text(
+        response,
+        text,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+        agent_visible,
+        true,
+    );
+}
+
+/// Shell delivery can render the body again after checking whether the runner
+/// received the command.
+/// Leave it whole until the writer applies the budget to that final rendering.
+pub(crate) fn finalize_redisplayed_bash_response(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    allow_bg_completions: bool,
+) {
+    finalize_tool_response_text(
+        response,
+        text,
+        ctx,
+        session_id,
+        "bash",
+        allow_bg_completions,
+        true,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_tool_response_text(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+    agent_visible: bool,
+    cap_text: bool,
+) {
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -187,7 +216,9 @@ pub(crate) fn finalize_tool_response_with_visibility(
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
-    enforce_reply_ceiling(attach_command, text);
+    if cap_text {
+        crate::tool_output::cap(ctx, session_id, attach_command, response, text);
+    }
 }
 
 /// Foreground and watch replies consume terminal results for their originating
@@ -290,7 +321,7 @@ pub fn finalize_response_for_dispatch_root(
         allow_bg_completions,
     );
     attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
-    enforce_response_ceiling(attach_command, response);
+    cap_response_text(response, ctx, session_id, attach_command);
 }
 
 fn attach_alert_block(

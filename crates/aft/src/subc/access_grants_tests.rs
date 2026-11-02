@@ -8,6 +8,7 @@ mod slow_restore;
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
     let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
+        output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
         harness: "runner".into(),
@@ -528,6 +529,7 @@ fn grants_head_policy_uses_latest_observed_restrictions() {
 
 fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
     RouteIdentityData {
+        output_scope: Default::default(),
         root: identity.root.clone(),
         project_root: identity.project_root.clone(),
         harness: identity.harness.clone(),

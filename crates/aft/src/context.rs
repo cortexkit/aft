@@ -5073,6 +5073,7 @@ pub struct AppContext {
     repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
+    output_files: Arc<crate::tool_output::OutputFiles>,
     #[cfg(unix)]
     escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
@@ -5894,6 +5895,7 @@ impl AppContext {
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
+            output_files: crate::tool_output::OutputFiles::shared(),
             #[cfg(unix)]
             escalation_grants: parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),
@@ -8529,7 +8531,9 @@ impl AppContext {
         session: String,
     ) -> std::thread::JoinHandle<()> {
         let ctx = Arc::clone(self);
-        std::thread::spawn(move || ctx.backup.lock().release_session_memory(&session))
+        std::thread::spawn(move || {
+            ctx.backup.lock().release_session_memory(&session);
+        })
     }
 
     /// Session-scoped hashline bindings installed by successful configure calls.
@@ -9648,6 +9652,14 @@ impl AppContext {
 
     pub fn storage_dir(&self) -> PathBuf {
         crate::bash_background::storage_dir(self.config().storage_dir.as_deref())
+    }
+
+    pub(crate) fn output_files(&self) -> &crate::tool_output::OutputFiles {
+        &self.output_files
+    }
+
+    pub(crate) fn output_files_arc(&self) -> Arc<crate::tool_output::OutputFiles> {
+        Arc::clone(&self.output_files)
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -16717,8 +16729,8 @@ impl AppContext {
         Ok((resolved, identity))
     }
 
-    /// Validate a read path. Registered bash output and a task's recorded
-    /// scratch directory may live outside the project root; their owning
+    /// Validate a read path. Saved tool results, registered bash output and a task's
+    /// recorded scratch directory may live outside the project root; their owning
     /// session may read them without an additional permission request. Mutating
     /// tools deliberately use
     /// [`AppContext::validate_path`] or [`AppContext::validate_write_location`]
@@ -16751,6 +16763,8 @@ impl AppContext {
         path: &Path,
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.output_files
+            .restore(self, session_id, &self.resolve_relative_path(path));
         let result = self.validate_path_with_artifact_session(
             req_id,
             path,
@@ -17007,8 +17021,10 @@ impl AppContext {
             return Ok(());
         };
         let owned_artifact = artifact_session.is_some_and(|session| {
-            self.bash_background
-                .is_session_owned_artifact_path(session, path)
+            self.output_files.owner(path).as_deref() == Some(session)
+                || self
+                    .bash_background
+                    .is_session_owned_artifact_path(session, path)
                 || self
                     .bash_background
                     .is_session_owned_scratch_path(session, path)
@@ -17525,7 +17541,12 @@ impl AppContext {
         } else {
             identify(resolved.to_path_buf())
         };
-        if crate::context::confinement::for_request(req_id) && self.request_force_restrict(req_id) {
+        let owned_tool_output = artifact_session
+            .is_some_and(|session| self.output_files.owner(&identity).as_deref() == Some(session));
+        if crate::context::confinement::for_request(req_id)
+            && self.request_force_restrict(req_id)
+            && !owned_tool_output
+        {
             // `identity` went through `policy_path`, which drops the Windows
             // verbatim prefix (`\\?\C:\`) that `canonicalize` puts on the
             // root. Compare both in that same form, or nothing is in the root.
@@ -17537,12 +17558,14 @@ impl AppContext {
             {
                 return Err(crate::context::confinement::refusal(req_id, original));
             }
-            // Containment is unconditional, but an in-root file still obeys
-            // the existing credential and user-configured denial floors.
+            // Only an exact, session-owned result file bypasses containment.
+            // Credential checks and user-configured denials still apply below.
         }
         let owned_artifact = artifact_session.is_some_and(|session| {
-            self.bash_background
-                .is_session_owned_artifact_path(session, &identity)
+            owned_tool_output
+                || self
+                    .bash_background
+                    .is_session_owned_artifact_path(session, &identity)
                 || self
                     .bash_background
                     .is_session_owned_scratch_path(session, &identity)
@@ -17550,6 +17573,15 @@ impl AppContext {
                     .bash_background
                     .is_readable_task_path(session, &identity)
         });
+        if self.output_files.is_result_path(self, &identity)
+            && (operation != AccessOperation::Read || !owned_tool_output)
+        {
+            return Err(crate::protocol::Response::error(
+                req_id,
+                "artifact_refused",
+                "tool result belongs to another session or is read-only",
+            ));
+        }
         self.check_unrestored_path(req_id, &identity, artifact_session, preserve_final)?;
         let mut policy = self.shared_access_policy(req_id)?;
         // A lost thread-local route must not turn a known plugin host into the

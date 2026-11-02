@@ -739,6 +739,7 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
     let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
+        output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
         harness: "runner".into(),

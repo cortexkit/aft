@@ -588,7 +588,7 @@ pub(super) fn reply(
         .iter()
         .filter(|hit| hit.kind == HitKind::Exact)
         .count();
-    let mut text = render_hits(&page, display_root);
+    let (mut text, rendered) = render_hits_counted(&page, display_root);
     text.push_str("\n\n");
     if total == 0 {
         text.push_str(&format!(
@@ -615,12 +615,16 @@ pub(super) fn reply(
         })
         .collect();
     let envelope = if outcome.fully_covered() {
-        more_available.then(|| {
+        (more_available || rendered < shown).then(|| {
             ListEnvelope::new(
-                shown,
+                rendered,
                 Total::Exact(total),
                 Unit::Results,
-                vec![Reason::Cap],
+                if rendered < shown {
+                    vec![Reason::Budget]
+                } else {
+                    vec![Reason::Cap]
+                },
                 crate::list_surfaces::search::SEARCH_NARROW,
             )
         })
@@ -629,8 +633,11 @@ pub(super) fn reply(
         if more_available {
             causes.push(Reason::Cap);
         }
+        if rendered < shown {
+            causes.push(Reason::Budget);
+        }
         Some(ListEnvelope::new(
-            shown,
+            rendered,
             Total::AtLeast(total.max(offset.saturating_add(shown))),
             Unit::Results,
             causes,
@@ -683,9 +690,9 @@ fn variant_list(terms: &IdentifierTerms) -> String {
 /// header with an `[exact]` or `[variant: ...]` marker, the matched line
 /// indented below it, and a `Found N result(s).` footer. The reply is held to
 /// the same byte budget as ranked results.
-fn render_hits(page: &[&SweepHit], display_root: &Path) -> String {
+fn render_hits_counted(page: &[&SweepHit], display_root: &Path) -> (String, usize) {
     if page.is_empty() {
-        return "Found 0 results.".to_string();
+        return ("Found 0 results.".to_string(), 0);
     }
     let mut out =
         super::snippet_bounds::BudgetedText::new(super::snippet_bounds::SEARCH_MAX_OUTPUT_BYTES);
@@ -705,11 +712,11 @@ fn render_hits(page: &[&SweepHit], display_root: &Path) -> String {
         if !out.push(&format!("{separator}{path}:{} {marker}", hit.grep.line)) {
             break;
         }
+        shown += 1;
         let line = super::snippet_bounds::cap_snippet_line(&hit.snippet);
         if !out.push(&format!("\n      {line}")) {
             break;
         }
-        shown += 1;
     }
     let cut = out.is_cut();
     let mut text = out.into_string();
@@ -721,7 +728,7 @@ fn render_hits(page: &[&SweepHit], display_root: &Path) -> String {
         ));
     }
     text.push_str(&format!("\n\nFound {} result(s).", page.len()));
-    text
+    (text, shown)
 }
 
 #[cfg(test)]

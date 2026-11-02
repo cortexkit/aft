@@ -552,6 +552,7 @@ pub(crate) fn with_secret_identity_for_test<R>(
 #[cfg(test)]
 fn test_identity_data(root: &std::path::Path, stamp: ScopeStamp) -> super::RouteIdentityData {
     super::RouteIdentityData {
+        output_scope: Default::default(),
         root: crate::path_identity::ProjectRootId::from_path(root).unwrap(),
         project_root: root.to_owned(),
         harness: "runner".into(),

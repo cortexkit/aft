@@ -264,7 +264,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
             },
         ],
     },
@@ -697,10 +697,22 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
     },
     ExclusionEntry {
-        file: "response_finalize.rs",
-        enclosing_item: "enforce_reply_ceiling",
-        location_or_primitive: "emergency rendered reply byte ceiling",
-        reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
+        file: "tool_output.rs",
+        enclosing_item: "cap_with_scope, cap_read, notice_suffix, render_cut, render_cut_with_data, read, cleanup_expired, SCAN_ENTRIES, save_failed_trailer",
+        location_or_primitive: "rendered reply and saved artifact byte bounds",
+        reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; read instead reclaims whole source lines for its native paging footer and notices without saving a copy; failure reasons have a bounded UTF-8 prefix, artifact reads have a separate 64 MiB allocation guard, and retention cleanup resumes each bounded directory scan",
+    },
+    ExclusionEntry {
+        file: "hashline/snapshot/mod.rs",
+        enclosing_item: "read_body_limit, render_tagged_snapshot_with_options, render_tagless_snapshot_with_options",
+        location_or_primitive: "hashline read byte budget with reserved finalization headroom",
+        reason: "a source-text byte ceiling, not a result list; elision is decided before publishing exactly the rendered seen-line set, and the existing footer names unaddressable lines; finalization preserves published rows and spends reserved headroom on notices",
+    },
+    ExclusionEntry {
+        file: "commands/bash_watch.rs",
+        enclosing_item: "output_tail",
+        location_or_primitive: "worker watch tail byte and line preview",
+        reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
     },
     ExclusionEntry {
         file: "cold_build_limiter/progress.rs",

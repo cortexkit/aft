@@ -263,12 +263,35 @@ impl WriterFrame {
     }
 
     pub(super) fn retained_tool_response(
-        frame: Frame,
+        mut frame: Frame,
         policy: ToolResponsePolicy,
         image_alt: Option<&str>,
     ) -> Self {
+        if let Some(scope) = &policy.output_scope {
+            if let Ok(mut result) = retained_tool_result(&frame.body) {
+                if result.text.len() > crate::tool_output::TEXT_LIMIT {
+                    crate::tool_output::cap_with_scope(
+                        scope,
+                        "retained tool",
+                        &result.response,
+                        &mut result.text,
+                    );
+                    if let Ok(rebuilt) = build_legacy_tool_response_frame(
+                        frame.header.ver,
+                        super::route_key(frame.header.channel, frame.header.epoch),
+                        frame.header.corr,
+                        frame.header.flags,
+                        &result,
+                        policy.trust,
+                        MAX_FRAME_BODY_LEN as usize,
+                    ) {
+                        frame = rebuilt;
+                    }
+                }
+            }
+        }
         let mut outgoing = Self::plain(frame);
-        outgoing.response_policy = Some(policy);
+        outgoing.response_policy = Some(policy.clone());
         if policy.tool_result_body {
             let source = if outgoing.header.ty == FrameType::Response {
                 if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
@@ -425,13 +448,56 @@ impl WriterFrame {
     /// transport writer projects the reply after the ledger has persisted those bytes.
     pub(super) fn project_tool_result(&mut self) -> Result<(), SubcError> {
         self.prepare_tool_result()?;
-        let Some(body) = self.prepared_projection.take() else {
-            return Ok(());
-        };
         if self.frame.header.ty != FrameType::Response {
             return Ok(());
         }
-        let body = Arc::try_unwrap(body).unwrap_or_else(|body| body.as_ref().clone());
+        let mut body = self
+            .prepared_projection
+            .take()
+            .map(|body| Arc::try_unwrap(body).unwrap_or_else(|body| body.as_ref().clone()))
+            .unwrap_or_else(|| self.frame.body.clone());
+        // Retained replies can carry a pre-rendered projection from before the
+        // text budget existed. Check the actual text at the last writer step.
+        if let Some(scope) = self
+            .response_policy
+            .as_ref()
+            .and_then(|policy| policy.output_scope.as_ref())
+        {
+            if body.len() > crate::tool_output::TEXT_LIMIT {
+                let mut envelope: Value = serde_json::from_slice(&body).map_err(SubcError::Json)?;
+                let mut text = envelope["content"]
+                    .as_array()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if text.len() > crate::tool_output::TEXT_LIMIT {
+                    let response = Response::success(
+                        "retained-tool-text",
+                        envelope["structuredContent"].clone(),
+                    );
+                    crate::tool_output::cap_with_scope(scope, "tool", &response, &mut text);
+                    if let Some(parts) = envelope["content"].as_array_mut() {
+                        let mut first = true;
+                        parts.retain_mut(|part| {
+                            if part["text"].is_string() {
+                                if !first {
+                                    return false;
+                                }
+                                part["text"] = Value::String(std::mem::take(&mut text));
+                                first = false;
+                            }
+                            true
+                        });
+                    }
+                    body = serde_json::to_vec(&envelope).map_err(SubcError::Json)?;
+                }
+            }
+        }
         let header = &self.frame.header;
         self.frame = Frame::build_with_version(
             header.ver,
@@ -449,7 +515,11 @@ impl WriterFrame {
     /// A failed ledger write may report the result, but must not bypass the
     /// recipient's projection by quoting the complete retained legacy body.
     pub(super) fn settlement_error_body(&self) -> Cow<'_, [u8]> {
-        if !self.response_policy.is_some_and(|policy| policy.model_only) {
+        if !self
+            .response_policy
+            .as_ref()
+            .is_some_and(|policy| policy.model_only)
+        {
             return Cow::Borrowed(&self.frame.body);
         }
         if let Some(body) = &self.prepared_projection {
@@ -499,7 +569,7 @@ impl WriterFrame {
             header.corr,
             header.flags,
             result,
-            policy,
+            policy.clone(),
             limit,
         )?;
         Ok(Some((projected.0, projected.1, policy, limit)))
@@ -1080,11 +1150,12 @@ fn response_too_large_frame(
 // harnesses: Thalamus shares `opencode` with AFT's own plugin, which needs diffs.
 const LLM_RUNNER_PRINCIPALS: &[&str] = &["reserved:broca", "reserved:thalamus-harness"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ToolResponsePolicy {
     pub(super) trust: BindTrust,
     pub(super) tool_result_body: bool,
     pub(super) model_only: bool,
+    pub(super) output_scope: Option<Arc<crate::tool_output::OutputScope>>,
 }
 
 impl ToolResponsePolicy {
@@ -1095,10 +1166,11 @@ impl ToolResponsePolicy {
             trust: BindTrust::FirstParty,
             tool_result_body: true,
             model_only: false,
+            output_scope: None,
         }
     }
 
-    fn include_structured(self) -> bool {
+    fn include_structured(&self) -> bool {
         !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
     }
 
@@ -1132,6 +1204,7 @@ impl From<BindTrust> for ToolResponsePolicy {
             trust,
             tool_result_body: false,
             model_only: false,
+            output_scope: None,
         }
     }
 }
@@ -1149,6 +1222,7 @@ impl From<&super::RouteIdentity> for ToolResponsePolicy {
             // Programs read arbitrary fields. Only positively identified
             // ordinary calls lose structured data; flow and unknown modes keep it.
             model_only: identity.call_mode == subc_protocol::call_mode::CallMode::Classic && runner,
+            output_scope: identity.output_scope.get().cloned(),
         }
     }
 }
@@ -1210,6 +1284,25 @@ pub(super) fn build_tool_response_frame_with_limit(
     max_body_len: usize,
 ) -> Result<WriterFrame, SubcError> {
     let policy = policy.into();
+    let mut capped;
+    let result = if result.text.len() > crate::tool_output::TEXT_LIMIT {
+        if let Some(scope) = &policy.output_scope {
+            capped = ToolCallResult {
+                text: result.text.clone(),
+                response: Response {
+                    id: result.response.id.clone(),
+                    success: result.response.success,
+                    data: result.response.data.clone(),
+                },
+            };
+            crate::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
+            &capped
+        } else {
+            result
+        }
+    } else {
+        result
+    };
     let trust = policy.trust;
     if !policy.tool_result_body {
         let frame =
@@ -1263,7 +1356,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         }
     }
     let mut outgoing = WriterFrame::plain(frame);
-    outgoing.response_policy = Some(policy);
+    outgoing.response_policy = Some(policy.clone());
     outgoing.result_projection = Some((policy, max_body_len, Some(source)));
     Ok(outgoing)
 }
@@ -2032,6 +2125,90 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn tool_output_cap_codemode_keeps_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().into()),
+                ..Default::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let original = "structured body\n".repeat(20_000);
+        let result = ToolCallResult {
+            text: original.clone(),
+            response: Response::success("id", json!({"output":original})),
+        };
+        for principal in [
+            "reserved:broca",
+            "reserved:thalamus-harness",
+            "reserved:basal",
+        ] {
+            let route = result_route(Some(principal), "opencode", CallMode::Codemode);
+            route
+                .output_scope
+                .set(Arc::new(crate::tool_output::OutputScope::new(
+                    &ctx,
+                    "result-session",
+                    Some("opencode"),
+                )))
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&projected_result_body(&result, &route)).unwrap();
+            assert!(body["content"][0]["text"].as_str().unwrap().len() <= 51_200);
+            assert_eq!(body["structuredContent"]["output"], original);
+            assert!(body["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[output cut at 50 KB of "));
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_last_writer_bounds_prepared_retained_text() {
+        use subc_protocol::call_mode::CallMode;
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().into()),
+                ..Default::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let original = "old retained output\n".repeat(10_000);
+        let body = serde_json::to_vec(&json!({"content":[{"type":"text","text":original}], "isError":false, "structuredContent":{"output":original}})).unwrap();
+        let route = result_route(Some("reserved:broca"), "opencode", CallMode::Codemode);
+        route
+            .output_scope
+            .set(Arc::new(crate::tool_output::OutputScope::new(
+                &ctx,
+                "result-session",
+                Some("opencode"),
+            )))
+            .unwrap();
+        let frame =
+            Frame::build(FrameType::Response, control_flags(), 1, 1, 1, body.clone()).unwrap();
+        let mut outgoing = WriterFrame::plain(frame);
+        outgoing.response_policy = Some(route.reply_policy());
+        outgoing.prepared_projection = Some(Arc::new(body));
+        outgoing.project_tool_result().unwrap();
+        let result: Value = serde_json::from_slice(&outgoing.frame.body).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.len() <= 51_200);
+        assert_eq!(result["structuredContent"]["output"], original);
+        let path = text
+            .rsplit_once("; full result saved to ")
+            .unwrap()
+            .1
+            .strip_suffix("; read it with read and a line range]")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
     fn plugin_results_keep_full_structured_content() {
         use subc_protocol::call_mode::CallMode;
         for harness in ["opencode", "pi"] {
@@ -2138,6 +2315,7 @@ pub(super) mod tests {
                 trust: BindTrust::FirstParty,
                 tool_result_body: true,
                 model_only: false,
+                output_scope: None,
             },
         ))
         .unwrap();
@@ -2153,7 +2331,8 @@ pub(super) mod tests {
                 ToolResponsePolicy {
                     trust: BindTrust::Untrusted,
                     tool_result_body: true,
-                    model_only: false
+                    model_only: false,
+                    output_scope: None,
                 }
             ),
         );

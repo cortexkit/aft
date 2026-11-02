@@ -834,6 +834,7 @@ mod preset_writer_tests {
 
     fn identity(root: &Path, principal: &str) -> RouteIdentity {
         RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: ProjectRootId::from_path(root).unwrap(),
             project_root: root.into(),
             harness: "Raw Harness".into(),
