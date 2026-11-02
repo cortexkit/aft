@@ -1238,6 +1238,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn folder_admission_regression_project_override_does_not_list() {
+        let root = tempfile::tempdir().unwrap();
+        let result = probe_with_read_dir(
+            root.path(),
+            &ProjectDetectionConfig {
+                mode: DetectionMode::Project,
+                overrides: vec![],
+            },
+            ProbeBudgets::default(),
+            |_| panic!("a project override must not run an evidence listing"),
+        );
+        assert_eq!(result.classification, FolderClassification::Project);
+        assert_eq!(result.reason, AdmissionReason::UserOverride);
+        assert_eq!(result.observed.entries, 0);
+    }
+
+    #[test]
+    fn folder_admission_regression_unexamined_probe_has_no_classification() {
+        let root = tempfile::tempdir().unwrap();
+        let result = probe(
+            root.path(),
+            &ProjectDetectionConfig::default(),
+            ProbeBudgets {
+                time: Duration::ZERO,
+                ..ProbeBudgets::default()
+            },
+        );
+        assert_eq!(result.reason, AdmissionReason::EvidenceBudgetExhausted);
+        assert!(!result.coverage.root_listing_complete);
+        assert_eq!(result.observed.entries, 0);
+        assert_eq!(
+            serde_json::to_value(result).unwrap()["classification"],
+            serde_json::Value::Null
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn canonical_override_matches_alias_but_symlinks_are_not_evidence() {

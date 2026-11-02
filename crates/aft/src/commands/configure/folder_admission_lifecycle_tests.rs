@@ -60,6 +60,54 @@ fn settle(ctx: &Arc<AppContext>) {
     panic!("folder configure maintenance did not settle");
 }
 
+#[test]
+fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    crate::test_project::mark_project(root.path()).unwrap();
+    isolated(root.path(), || {
+        let ctx = context(storage.path());
+        let (started, release) = admission::gate_probe_for_test(&ctx);
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !admission::poll_wait(&ctx) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "admission wait did not end"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let folder = admission::snapshot(&ctx).unwrap();
+        assert_eq!(folder["state"], "pending", "{folder}");
+        assert_eq!(folder["classification"], Value::Null, "{folder}");
+        assert_eq!(folder["reason"], "evidence_budget_exhausted", "{folder}");
+        assert_eq!(
+            folder["coverage"]["root_listing_complete"], false,
+            "{folder}"
+        );
+        assert_eq!(folder["observed"]["entries"], 0, "{folder}");
+        for _ in 0..2 {
+            let refused = admission::refusal(&ctx, "incomplete", "fixture").unwrap();
+            assert_eq!(refused.data["message"], admission::OFF_TEXT);
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+            let folder = admission::snapshot(&ctx).unwrap();
+            if folder["state"] == "decided" && folder["classification"] == "project" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "incomplete admission never rechecked: {folder}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+}
+
 fn isolated<R>(root: &Path, body: impl FnOnce() -> R) -> R {
     crate::git_probe::with_child_env_for_test(
         &[(
