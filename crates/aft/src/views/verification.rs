@@ -910,6 +910,8 @@ impl BindGuard {
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let current = Self::capture(root, None)?;
         if &current != self {
+            #[cfg(test)]
+            eprintln!("checkout guard changed at {root:?}: old={self:?}; new={current:?}");
             return Err(at(
                 "validating checkout",
                 root,
