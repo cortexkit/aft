@@ -889,7 +889,7 @@ describe("OpenCode doctor generation and load path", () => {
     });
 
     const output = lines.join("\n");
-    expect(code).toBe(1);
+    expect(code).toBe(0);
     expect(output).toContain(
       `This doctor is AFT ${getSelfVersion()}; OpenCode is configured for AFT plugin latest. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.`,
     );

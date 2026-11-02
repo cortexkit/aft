@@ -402,6 +402,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       // Same text as the "Issues found" entry, so the two never disagree.
       if (opencodeSkew) log.error(`  ${opencodeSkew.message} ${opencodeSkew.remediation}`);
+      else if (opencodeDoctor?.versionNotice) log.info(`  ${opencodeDoctor.versionNotice}`);
       for (const hostTool of OPENCODE_HOST_TOOL_NAMES) {
         const line = hostToolDoctorLine(opencodeAdapter, hostTool);
         if (line) log[line.level](`  ${line.text}`);

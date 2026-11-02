@@ -302,14 +302,29 @@ export class OpenCodeAdapter implements HarnessAdapter {
     const paths = this.detectConfigPaths();
     const path = tui ? paths.tuiConfig : paths.harnessConfig;
     const value = path ? readJsoncFile(path).value : null;
-    if (!value) return PLUGIN_ENTRY;
+    const policy = this.doctorVersionPolicy({ doctor: true });
+    if (!value) return policy.fallbackEntry ?? PLUGIN_ENTRY;
     return ensurePinnedPluginConfig(
       JSON.parse(JSON.stringify(value)),
       getSelfVersion(),
       pathPointsToOurPlugin,
       this.configGeneration(),
-      { doctor: true, installedVersion: doctorInstalledVersion(this.getPluginCacheInfo()) },
+      policy,
     ).entry;
+  }
+
+  private doctorVersionPolicy(policy: PluginVersionPolicy): PluginVersionPolicy {
+    if (!policy.doctor) return policy;
+    const cache = this.getPluginCacheInfo();
+    const installedVersion = doctorInstalledVersion(cache);
+    const fallbackEntry = preserveDoctorPluginEntry(
+      getSelfVersion(),
+      cache.configuredEntry,
+      installedVersion,
+    )
+      ? (cache.configuredEntry ?? (cache.cached ? pinnedPluginEntry(cache.cached) : undefined))
+      : undefined;
+    return { ...policy, installedVersion, fallbackEntry };
   }
 
   hasTuiPluginEntry(): boolean {
@@ -380,15 +395,17 @@ export class OpenCodeAdapter implements HarnessAdapter {
   ): PluginEntryResult {
     const generation = this.configGeneration();
     const key = openCodePluginKey(generation);
+    policy = this.doctorVersionPolicy(policy);
+    const initialEntry = policy.fallbackEntry ?? PLUGIN_ENTRY;
     if (format === "none") {
       const failed = this.tryWrite(configPath, () =>
-        writeJsoncFile(configPath, { [key]: [PLUGIN_ENTRY] }, "json"),
+        writeJsoncFile(configPath, { [key]: [initialEntry] }, "json"),
       );
       if (failed) return failed;
       return {
         ok: true,
         action: "added",
-        message: `Created ${configPath} and added ${PLUGIN_ENTRY} under \`${key}\` (${label})`,
+        message: `Created ${configPath} and added ${initialEntry} under \`${key}\` (${label})`,
         configPath,
       };
     }
@@ -408,7 +425,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       getSelfVersion(),
       pathPointsToOurPlugin,
       generation,
-      { ...policy, installedVersion: doctorInstalledVersion(this.getPluginCacheInfo()) },
+      policy,
     );
     const preserved =
       policy.doctor &&
@@ -566,7 +583,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       getSelfVersion(),
       pathPointsToOurPlugin,
       this.configGeneration(),
-      { ...policy, installedVersion: doctorInstalledVersion(this.getPluginCacheInfo()) },
+      this.doctorVersionPolicy(policy),
     );
   }
 

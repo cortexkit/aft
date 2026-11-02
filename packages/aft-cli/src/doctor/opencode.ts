@@ -50,6 +50,7 @@ export interface OpenCodeDoctorResult {
    * that reports the same fix another way can leave it out.
    */
   pinProblem: string | null;
+  versionNotice?: string;
 }
 
 interface PluginManifest {
@@ -220,13 +221,13 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     null;
   const problems: string[] = [...describePluginKeyProblems(config, generation)];
   let entryPinProblem: string | null = null;
+  let versionNotice: string | undefined;
   const cli = input.expectedPluginEntry ? exactPinnedVersion(input.expectedPluginEntry) : null;
   const installed =
     input.cachedPluginVersion ??
     (typeof manifest?.version === "string" ? manifest.version : undefined);
   if (cli && entry && isAftNpmEntry(entry) && preserveDoctorPluginEntry(cli, entry, installed)) {
-    entryPinProblem = doctorNoDowngradeMessage(cli, entry, installed);
-    problems.push(entryPinProblem);
+    versionNotice = doctorNoDowngradeMessage(cli, entry, installed);
   } else if (
     entry &&
     isAftNpmEntry(entry) &&
@@ -250,7 +251,14 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     );
   }
 
-  return { expectedLoadPath, takenLoadPath, pluginVersion, problems, pinProblem: entryPinProblem };
+  return {
+    expectedLoadPath,
+    takenLoadPath,
+    pluginVersion,
+    problems,
+    pinProblem: entryPinProblem,
+    versionNotice,
+  };
 }
 
 /**

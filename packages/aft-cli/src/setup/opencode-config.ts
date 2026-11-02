@@ -74,6 +74,7 @@ export function doctorNoDowngradeMessage(cli: string, entry?: string, installed?
 export interface PluginVersionPolicy {
   doctor?: boolean;
   installedVersion?: string;
+  fallbackEntry?: string;
 }
 
 /**
@@ -227,7 +228,7 @@ export function ensurePinnedPluginConfig(
   generation: OpenCodeConfigGeneration = "unknown",
   policy: PluginVersionPolicy = {},
 ): PluginConfigUpdate {
-  const entry = pinnedPluginEntry(version);
+  const entry = policy.fallbackEntry ?? pinnedPluginEntry(version);
   const key = openCodePluginKey(generation);
   const hadKey = Array.isArray(value[key]);
   const list = hadKey ? (value[key] as unknown[]) : [];
@@ -345,7 +346,7 @@ export function pluginConfigNeedsUpdate(
       return npmEntries.some((candidate) => !pluginEntryFitsKey(candidate, key));
     return (
       npmEntries.length !== 1 ||
-      pluginEntryPackage(npmEntries[0]) !== pinnedPluginEntry(version) ||
+      pluginEntryPackage(npmEntries[0]) !== (policy.fallbackEntry ?? pinnedPluginEntry(version)) ||
       !pluginEntryFitsKey(npmEntries[0], key)
     );
   }

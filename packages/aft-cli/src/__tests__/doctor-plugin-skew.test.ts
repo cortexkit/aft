@@ -14,7 +14,9 @@ import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-gua
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessConfigPaths } from "../adapters/types.js";
 import { buildDoctorFixPlan, runDoctor } from "../commands/doctor.js";
+import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import {
+  collectDiagnostics,
   type DiagnosticReport,
   type HarnessDiagnostic,
   renderDiagnosticsMarkdown,
@@ -86,6 +88,7 @@ beforeEach(async () => {
   releaseEnv = await acquireEnv({
     OPENCODE_CONFIG_DIR: root,
     XDG_CACHE_HOME: join(root, "xdg-cache"),
+    AFT_CACHE_DIR: join(root, "aft-cache"),
   });
 });
 
@@ -399,6 +402,8 @@ describe("doctor --fix: updating an OpenCode plugin older than the CLI", () => {
 });
 
 describe("doctor never downgrades OpenCode", () => {
+  const [major, minor, patch] = CLI_VERSION.split(".").map(Number);
+  const newer = `${major}.${minor}.${patch + 1}`;
   const V2: OpenCodeHostDetection = {
     ...V1,
     status: "v2",
@@ -406,20 +411,19 @@ describe("doctor never downgrades OpenCode", () => {
     evidence: V1.evidence.map((e) => ({ ...e, generation: "v2" })),
   };
   const cases = [
-    { host: V1, spec: "0.63.5", installed: undefined },
-    { host: V1, spec: "0.63.5", installed: "0.63.5" },
-    { host: V2, spec: "0.63.5", installed: undefined },
-    { host: V2, spec: "0.63.5", installed: "0.63.5" },
-    { host: V2, spec: "latest", installed: "0.63.5" },
+    { host: V1, spec: newer, installed: undefined },
+    { host: V1, spec: newer, installed: newer },
+    { host: V2, spec: newer, installed: undefined },
+    { host: V2, spec: newer, installed: newer },
+    { host: V2, spec: "latest", installed: newer },
     { host: V2, spec: "latest", installed: undefined },
     { host: V2, spec: "^0.63.0", installed: undefined },
-    { host: V2, spec: "0.63.5-beta.2", installed: "0.63.5-beta.2" },
+    { host: V2, spec: `${newer}-beta.2`, installed: `${newer}-beta.2` },
   ];
   for (const { host, spec, installed } of cases) {
     test(`${host.status} ${spec} installed=${installed ?? "missing"}: diagnosis, plan and --fix --yes preserve bytes`, async () => {
-      expect(CLI_VERSION).toBe("0.63.4");
       const entry = `${AFT_OPENCODE_PACKAGE}@${spec}`;
-      const { adapter, report } = fixture(entry, installed ?? "0.63.5");
+      const { adapter, report } = fixture(entry, installed ?? newer);
       rmSync(join(root, "xdg-cache"), { recursive: true, force: true });
       adapter.useHostDetection(host);
       const key = host.status === "v2" ? "plugins" : "plugin";
@@ -427,7 +431,7 @@ describe("doctor never downgrades OpenCode", () => {
         host.status === "v2"
           ? { package: entry, options: { enabled: true } }
           : [entry, { enabled: true }];
-      const bytes = `${JSON.stringify({ [key]: [packageEntry, "unrelated@1.0.0"], tools: { "-opencode.tool.shell": true, "-opencode.tool.patch": true } }, null, 2)}\n`;
+      const bytes = `${JSON.stringify({ [key]: [packageEntry, "unrelated@1.0.0", ...(host.status === "v2" ? ["-opencode.tool.shell", "-opencode.tool.patch"] : [])], tools: { "-opencode.tool.shell": true, "-opencode.tool.patch": true } }, null, 2)}\n`;
       writeFileSync(join(root, "opencode.json"), bytes);
       if (installed) {
         // Independently construct the host's layout, not the adapter's returned path.
@@ -441,10 +445,12 @@ describe("doctor never downgrades OpenCode", () => {
       harness.pluginCache = adapter.getPluginCacheInfo();
       const plan = buildDoctorFixPlan([adapter], report);
       expect(plan.filter((item) => item.kind === "plugin-update")).toEqual([]);
-      expect(plan.some((item) => item.message.includes(`update ${PINNED}`))).toBe(false);
+      expect(plan.some((item) => item.message.includes(PINNED))).toBe(false);
       const lines = captureOutput();
+      const approved = `This doctor is AFT ${CLI_VERSION}; OpenCode is configured for AFT plugin ${installed ?? spec}. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.`;
       let npmCalls = 0;
       for (const fix of [false, true]) {
+        const outputStart = lines.length;
         await runDoctor({
           clear: false,
           fix,
@@ -467,15 +473,19 @@ describe("doctor never downgrades OpenCode", () => {
           },
         });
         expect(readFileSync(join(root, "opencode.json"), "utf8")).toBe(bytes);
+        expect(stripAnsi(lines.slice(outputStart).join("\n"))).toContain(approved);
       }
       expect(npmCalls).toBe(0);
       const output = stripAnsi(lines.join("\n"));
-      const approved = `This doctor is AFT 0.63.4; OpenCode is configured for AFT plugin ${installed ?? spec}. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.`;
       expect(output).toContain(approved);
       expect(output).not.toContain("to pin it to");
       const markdown = renderDiagnosticsMarkdown(report);
       expect(markdown).toContain(approved);
-      const source = installed ? "installed" : spec.startsWith("0.") ? "configured" : "unknown";
+      const source = installed
+        ? "installed"
+        : spec === "latest" || spec.startsWith("^")
+          ? "unknown"
+          : "configured";
       expect(output).toContain(`(${source}`);
       expect(markdown).toContain(`(${source}`);
       expect(markdown).not.toContain("not installed");
@@ -490,4 +500,30 @@ describe("doctor never downgrades OpenCode", () => {
     expect(compareSemver("latest", "0.63.4")).toBeUndefined();
     expect(compareSemver("0.63.5-beta.02", "0.63.4")).toBeUndefined();
   });
+
+  test.skipIf(process.platform === "win32")(
+    "CLI binary evidence includes its lookup path and directory-cache meaning",
+    async () => {
+      const { adapter } = fixture(`${AFT_OPENCODE_PACKAGE}@${newer}`, newer);
+      const bin = join(root, "aft-cache", "bin");
+      mkdirSync(join(bin, `v${newer}`), { recursive: true });
+      expect(getBinaryCacheInfo(CLI_VERSION).activeVersion).toBeNull();
+      const cliDir = join(bin, `v${CLI_VERSION}`);
+      mkdirSync(cliDir);
+      // Cache inventory records the CLI's directory even before an executable exists.
+      expect(getBinaryCacheInfo(`v${CLI_VERSION}`).activeVersion).toBe(`v${CLI_VERSION}`);
+      const path = join(cliDir, "aft");
+      const binaryVersion = `${major}.${minor}.2`;
+      writeFileSync(path, `#!/bin/sh\necho 'aft ${binaryVersion}'\n`, { mode: 0o755 });
+      const report = await collectDiagnostics([adapter]);
+      expect(report.binaryVersion).toBe(binaryVersion);
+      expect(report.binaryPath).toBe(path);
+      const markdown = renderDiagnosticsMarkdown(report);
+      expect(markdown).toContain(
+        `CLI lookup of AFT binary: ${binaryVersion} at ${path} (not a probe of the running plugin worker)`,
+      );
+      expect(markdown).toContain('"CLI version cached":');
+      expect(markdown).not.toContain('"activeVersion":');
+    },
+  );
 });
