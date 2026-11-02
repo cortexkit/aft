@@ -1,0 +1,104 @@
+{
+  "legacy": {
+    "files.lang": {
+      "typescript": 1
+    },
+    "nodes.kind": {
+      "file_summary": 1,
+      "function": 2
+    },
+    "nodes.provenance": {
+      "treesitter+resolver": 3
+    },
+    "refs.kind": {
+      "call": 1
+    },
+    "refs.status": {
+      "resolved_local": 1
+    },
+    "refs.import_kind": {},
+    "refs.provenance": {
+      "treesitter+resolver": 1
+    },
+    "edges.kind": {
+      "call": 1
+    },
+    "edges.provenance": {
+      "treesitter+resolver": 1
+    },
+    "dispatch_hints.provenance": {},
+    "backend_file_state.backend": {
+      "treesitter": 1
+    },
+    "backend_file_state.status": {
+      "fresh": 1
+    },
+    "nodes.id_form": {
+      "pos:symbol:": 3
+    },
+    "refs.id_form": {
+      "digest": 1
+    },
+    "edges.id_form": {
+      "digest": 1
+    },
+    "refs.unresolved_form": {},
+    "edges.without_ref_row": 0
+  },
+  "views": {
+    "files.lang": {
+      "typescript": 1
+    },
+    "nodes.kind": {
+      "class": 1,
+      "method": 2
+    },
+    "nodes.provenance": {
+      "treesitter+resolver": 3
+    },
+    "refs.kind": {
+      "call": 4,
+      "construction": 2
+    },
+    "refs.status": {
+      "resolved": 6
+    },
+    "refs.import_kind": {},
+    "refs.provenance": {
+      "treesitter+resolver": 6
+    },
+    "edges.kind": {
+      "call": 4,
+      "value_ref": 2
+    },
+    "edges.provenance": {
+      "exact": 4,
+      "treesitter+resolver": 2
+    },
+    "dispatch_hints.provenance": {},
+    "backend_file_state.backend": {},
+    "backend_file_state.status": {},
+    "view_dispatch_sites.language": {
+      "typescript": 5
+    },
+    "nodes.id_form": {
+      "view:symbol:pos:symbol:": 3
+    },
+    "refs.id_form": {
+      "view:": 6
+    },
+    "edges.id_form": {
+      "dispatch:": 4,
+      "edge:view:": 2
+    },
+    "refs.unresolved_form": {},
+    "edges.without_ref_row": 1
+  },
+  "dispatch_shapes": {
+    "method:trait=false;body=true;private=false;shape=->": 2,
+    "site:receiver=true;member=true;caller=false;dynamic=false;blob_ref=true": 1,
+    "site:receiver=true;member=true;caller=true;dynamic=false;blob_ref=false": 1,
+    "site:receiver=true;member=true;caller=true;dynamic=false;blob_ref=true": 3,
+    "type:interface=false;closed=false": 1
+  }
+}
