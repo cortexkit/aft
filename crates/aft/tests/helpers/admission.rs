@@ -3,6 +3,9 @@
 use aft::context::AppContext;
 use std::time::{Duration, Instant};
 
+#[path = "project.rs"]
+mod project;
+
 /// Drive the folder decision and its configuration replay before a fixture
 /// observes configured index work.
 /// This does not admit a folder: a negative decision is returned unchanged.
@@ -26,12 +29,12 @@ pub fn settle(ctx: &AppContext) -> serde_json::Value {
 /// deferred index loading can then send an index-enabled configure request and
 /// inspect state before background maintenance releases the index loaders.
 pub fn prepare_project(ctx: &AppContext, root: &std::path::Path, storage: &std::path::Path) {
-    super::project::ensure_project(root).expect("mark test project");
+    project::ensure_project(root).expect("mark test project");
     let request = serde_json::from_value(serde_json::json!({
         "id": "fixture-admission", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage,
         "config": [{"tier": "user", "source": root.join("fixture-admission.jsonc"),
-            "doc": super::project::admitted_config(serde_json::json!({
+            "doc": project::admitted_config(serde_json::json!({
                 "indexes": {"trigram": false, "semantic": false, "callgraph": false},
                 "views": {"enabled": false}
             })).to_string()}]
