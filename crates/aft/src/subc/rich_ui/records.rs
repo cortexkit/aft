@@ -1,9 +1,13 @@
 //! Immutable display bodies. None of these values are part of a tool reply.
+#[cfg(test)]
 use std::collections::BTreeMap;
 
-use cortexkit_role_tool_display::{canonical_body, FieldKind, RecordSchema};
+use cortexkit_role_tool_display::canonical_body;
+#[cfg(test)]
+use cortexkit_role_tool_display::{FieldKind, RecordSchema};
 use serde_json::{json, Map, Value};
 
+#[cfg(test)]
 pub(crate) fn bash_schema() -> RecordSchema {
     RecordSchema::new(
         "aft/bash/1",
@@ -21,6 +25,7 @@ pub(crate) fn bash_schema() -> RecordSchema {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn files_schema() -> RecordSchema {
     let mut fields = BTreeMap::new();
     for name in [

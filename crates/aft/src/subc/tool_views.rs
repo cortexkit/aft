@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use subc_protocol::ErrorBody;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize)]
 pub(crate) struct Definition {
     pub name: String,
     pub input_schema: Value,
@@ -41,7 +41,18 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
 });
 
 pub(crate) fn view(pin: &str) -> Option<ViewManifest> {
-    SHIPPED.get(pin)?.history.last().cloned()
+    let shipped = SHIPPED.get(pin)?;
+    let digest =
+        cortexkit_role_tool_provider::catalog::schema_digest(&shipped.tool.input_schema).ok()?;
+    let catalog = cortexkit_role_tool_provider::catalog::CatalogTool::new(
+        shipped.tool.name.clone(),
+        digest,
+        shipped.tool.semantics,
+        shipped.tool.input_schema.clone(),
+    );
+    Some(shipped.history.last()?.clone().with_tool(
+        cortexkit_role_tool_provider::views::ViewTool::from(&catalog),
+    ))
 }
 
 pub(super) fn answer(body: Value) -> Result<Value, ErrorBody> {
@@ -88,6 +99,11 @@ mod tests {
             );
             let fetched: ViewManifest =
                 serde_json::from_value(answer["views"][&pin].clone()).unwrap();
+            assert_eq!(
+                answer["views"][&pin]["tool"],
+                serde_json::to_value(&kept.tool).unwrap(),
+                "first served definition changed for {pin}"
+            );
             for old in kept.history {
                 assert!(
                     matches!(
@@ -120,19 +136,72 @@ mod tests {
     }
 
     #[test]
-    fn placeholders_pass_occipital_check_and_have_revision_zero() {
+    fn placeholder_views_have_revision_zero_and_null_safe_pages() {
         for (pin, entry) in SHIPPED.iter() {
             let view = view(pin).unwrap();
             assert_eq!(view.template_revision, 0);
-            let reports = cortexkit_occipital_registry::view::check_view(
-                &view.template,
-                &view.record_schema,
-                &entry.tool.input_schema,
-            )
-            .unwrap();
-            assert_eq!(reports.len(), 2);
-            for report in reports {
-                assert!(report.passed(), "{pin}: {report:?}");
+            assert_eq!(
+                view.record_schema,
+                if entry.tool.name == "bash" {
+                    crate::subc::rich_ui::records::bash_schema()
+                } else {
+                    crate::subc::rich_ui::records::files_schema()
+                }
+            );
+            assert!(view.check_pin(pin).unwrap());
+            assert_eq!(
+                serde_json::to_value(view.tool.as_ref().unwrap()).unwrap(),
+                json!({"name":entry.tool.name,"input_schema":entry.tool.input_schema,"semantics":entry.tool.semantics})
+            );
+            for (slot, profile) in [("row", "tool_row"), ("page", "tool_page")] {
+                let template = &view.template[slot];
+                assert_eq!(template["schema"], "occipital.template/1");
+                assert_eq!(template["profile"], profile);
+                assert_eq!(template["reads"], json!([]));
+                assert!(
+                    cortexkit_role_tool_display::canonical_body(template.as_object().unwrap())
+                        .unwrap()
+                        .len()
+                        <= 131_072
+                );
+            }
+            assert!(view.template["page"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("view.output ??"));
+            assert!(!view.template["page"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("view.detail"));
+        }
+    }
+
+    #[test]
+    fn published_view_tool_vectors_match_mismatch_and_legacy() {
+        let vectors: Value =
+            serde_json::from_str(cortexkit_role_tool_provider::vectors::VIEW_TOOLS_JSON).unwrap();
+        let cases = vectors["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 3);
+        for case in cases {
+            let manifest: ViewManifest = serde_json::from_value(case["view"].clone()).unwrap();
+            let pin = case["pin"].as_str().unwrap();
+            match case["check"].as_str().unwrap() {
+                "present" => assert!(manifest.check_pin(pin).unwrap()),
+                "mismatch" => assert!(manifest.check_pin(pin).is_err()),
+                "absent" => {
+                    assert!(!manifest.check_pin(pin).unwrap());
+                    assert_eq!(
+                        serde_json::to_string(&manifest).unwrap(),
+                        case["encoded"].as_str().unwrap()
+                    );
+                }
+                _ => panic!("unexpected shared vector"),
+            }
+            if let Some(tool) = manifest.tool {
+                assert_eq!(
+                    tool.schema_pin().unwrap(),
+                    case["computed_pin"].as_str().unwrap()
+                );
             }
         }
     }

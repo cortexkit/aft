@@ -82,6 +82,12 @@ pub(crate) fn register(
     route: &crate::subc::RouteIdentity,
     call: &subc_protocol::tool_call::ToolCallRequest,
 ) {
+    // The outer key is used only by execution's existing replay ledger. An
+    // origin-only, keyless forward is display-free until it has durable
+    // display-attempt retention independent of execution replay.
+    if call.call_key.is_none() {
+        return;
+    }
     if !enabled()
         || !matches!(
             call.name.as_str(),
@@ -102,6 +108,11 @@ pub(crate) fn register(
     let Some(module_id) = principal.strip_prefix("reserved:") else {
         return;
     };
+    // Basal's inner program calls are not runner tool calls. Only an explicit
+    // origin can associate one with a runner's transcript call.
+    if (module_id == "basal" || route.run_owner.is_some()) && call.origin.is_none() {
+        return;
+    }
     let (runner, call_key, pin) = if let Some(origin) = &call.origin {
         (
             origin.carrier.clone(),
@@ -120,6 +131,11 @@ pub(crate) fn register(
     let (Some(call_key), Some(schema_pin)) = (call_key, pin) else {
         return;
     };
+    if subc_protocol::tool_call::validate_call_key(&call_key).is_err()
+        || subc_protocol::tool_call::validate_schema_pin(&schema_pin).is_err()
+    {
+        return;
+    }
     if crate::subc::tool_views::view(&schema_pin).is_none() {
         return;
     }
@@ -371,11 +387,10 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
 }
 
 fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
-    let schema = if capture.tool == "bash" {
-        records::bash_schema()
-    } else {
-        records::files_schema()
+    let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
+        return;
     };
+    let schema = view.record_schema;
     let Some(map) = body.as_object() else {
         return;
     };
@@ -781,7 +796,14 @@ pub(crate) fn bash_bodies(
     if !terminal {
         record["taskId"] = json!(metadata.task_id);
     }
-    if metadata.status == BgTaskStatus::FateUnknown {
+    if metadata.status == BgTaskStatus::FateUnknown
+        || (metadata.status == BgTaskStatus::Killed
+            && (!metadata.group_kill_sent
+                || metadata
+                    .live_descendants
+                    .as_ref()
+                    .is_some_and(|processes| !processes.is_empty())))
+    {
         record["reason"] = json!("fate_unknown");
     } else if terminal {
         let reason = match metadata.status {
@@ -858,6 +880,20 @@ pub(crate) fn bash_terminal(
     task_id: &str,
     duration_ms: Option<u64>,
 ) {
+    // Losing track of deferred work is not proof that it ended. The initial
+    // record stays, but neither a completion nor a terminal detail is written.
+    if bodies.0["reason"] == "fate_unknown" {
+        if let Some(capture) = CALLS
+            .lock()
+            .ok()
+            .and_then(|calls| calls.get(&display.capture_key).cloned())
+        {
+            if let Ok(mut capture) = capture.lock() {
+                capture.finished = true;
+            }
+        }
+        return;
+    }
     bodies.0["taskId"] = json!(task_id);
     bodies.1["taskId"] = json!(task_id);
     if let Some(duration) = duration_ms {

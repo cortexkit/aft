@@ -3259,8 +3259,8 @@ impl BgTaskRegistry {
             (metadata, state.buffer.clone())
         };
 
-        let cache = self.ensure_terminal_output_cache(task);
         self.capture_display_terminal(task, &metadata, &buffer);
+        let cache = self.ensure_terminal_output_cache(task);
         self.publish_uncaptured_drain_terminal(task, &metadata);
         self.enqueue_completion_from_parts(
             &metadata,
@@ -3292,9 +3292,12 @@ impl BgTaskRegistry {
                     .saturating_add(remote.unknown_len)
             })
             .unwrap_or_else(|| {
-                buffer
-                    .stream_len(StreamKind::Stdout)
-                    .saturating_add(buffer.stream_len(StreamKind::Stderr))
+                let stdout = buffer.stream_len(StreamKind::Stdout);
+                if metadata.mode == BgMode::Pty {
+                    stdout
+                } else {
+                    stdout.saturating_add(buffer.stream_len(StreamKind::Stderr))
+                }
             });
         let secrets = task.completion_secrets.lock().ok();
         let masker = secrets.as_deref().and_then(Option::as_ref);
@@ -29681,6 +29684,24 @@ mod a02_tests {
         std::fs::write(&task.paths.stdout, "identical output\n").unwrap();
         std::fs::write(&task.paths.stderr, "").unwrap();
         (dir, ctx, task)
+    }
+
+    #[test]
+    fn pty_display_counts_one_stream_and_uses_the_pty_detail_field() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let mut metadata = task.state.lock().unwrap().metadata.clone();
+        metadata.mode = BgMode::Pty;
+        metadata.completion_has_env_secrets = Some(false);
+        metadata.completion_has_non_ticket_env_secrets = Some(false);
+        std::fs::write(&task.paths.pty, "ok\n").unwrap();
+        let buffer = BgBuffer::registered(&task.paths, BgMode::Pty);
+        let (record, detail) = ctx
+            .bash_background()
+            .display_bodies(&task, &metadata, &buffer);
+        assert_eq!(record["outputBytes"], 3);
+        assert_eq!(detail["pty"], "ok\n");
+        assert!(detail.get("stdout").is_none());
+        assert!(detail.get("stderr").is_none());
     }
 
     #[cfg(unix)]

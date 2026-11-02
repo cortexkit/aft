@@ -56,8 +56,6 @@ dependencies = [
  "content_inspector",
  "cortexkit-agent-identity",
  "cortexkit-exec-remote-types",
- "cortexkit-occipital-lang",
- "cortexkit-occipital-registry",
  "cortexkit-paths",
  "cortexkit-project-identity",
  "cortexkit-role-agent-data",
@@ -801,30 +799,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortexkit-occipital-lang"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eb21eed4827fd638de6b1d544e5a950f0ce62300bb71e61112e70fa73cec813"
-dependencies = [
- "cortexkit-rich-ui-syntax",
- "hmac-sha256",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "cortexkit-occipital-registry"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc4bb3e54a8cc9ddacaf1894ce2c442df1a299deb4163e4a52748e3bdd0fdfb"
-dependencies = [
- "cortexkit-occipital-lang",
- "cortexkit-role-tool-display",
- "hmac-sha256",
- "serde_json",
-]
-
-[[package]]
 name = "cortexkit-paths"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -838,15 +812,6 @@ checksum = "d621991ba599532775822fc6a9f8d30c6a042b42027550801578d28c592b6c99"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cortexkit-rich-ui-syntax"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98509395f8f7afce4127b6c6e1f1eaf11ee20fba57a86c27a21da67e10a3bc45"
-dependencies = [
- "pulldown-cmark",
 ]
 
 [[package]]
@@ -870,9 +835,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-display"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16f62d6df6ee9edf8ef244b9c81595178513a0eafd5fcd5d5b73a0ef176e968e"
+checksum = "a1a8078663a8b485ccbd067c2b4dde6b17833a421dcc52db5ed3d1a47b665806"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -883,9 +848,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b95ff0bf302237d110aba060076a12817712c59f9d9ce9536e38af0646af6b0"
+checksum = "7d54ebd86c54e15c398e46507efaa83747c393a294bb3f58575c248cc2045bcf"
 dependencies = [
  "cortexkit-role-tool-display",
  "serde",
@@ -897,9 +862,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfdbb55deb87b991f5fecf6d363ca46419c0c3a9259e08c90c41620d782c55e"
+checksum = "e62a99716342add8a7144e0c0c9ea641217a8998546ceb4cf94c0f2bec6bf07c"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -1761,12 +1726,6 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest",
 ]
-
-[[package]]
-name = "hmac-sha256"
-version = "1.1.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ad320b3b96fb2a455a0726d16efe0a5afdbd34b71dea5bc53b05ea057714d4e"
 
 [[package]]
 name = "htmd"
@@ -3333,17 +3292,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pulldown-cmark"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
-dependencies = [
- "bitflags 2.11.0",
- "memchr",
- "unicase",
 ]
 
 [[package]]
@@ -5083,12 +5031,6 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
-
-[[package]]
-name = "unicase"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
 name = "unicode-id-start"

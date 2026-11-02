@@ -2,8 +2,6 @@
 //! fetched for an exact daemon-stamped session and scope, stored in aft.db.
 
 use rusqlite::{params, Connection};
-#[cfg(test)]
-use serde_json::json;
 
 pub use super::remote_exec::PolicyKey as PresetKey;
 
@@ -333,8 +331,6 @@ mod tests {
         }
         assert_eq!(conn.total_changes(), changes);
     }
-
-    use sha2::{Digest, Sha256};
 
     #[test]
     fn rich_ui_presets_retention_tick_removes_only_older_than_thirty_days() {

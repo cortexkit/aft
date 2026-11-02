@@ -70,9 +70,11 @@ fn terminal(f: &Fixture, display: &TaskDisplay, status: BgTaskStatus, exit: Opti
     let mut metadata = task();
     metadata.status = status;
     metadata.exit_code = exit;
+    metadata.group_kill_sent = metadata.status == BgTaskStatus::Killed;
     let bodies = bash_bodies(&metadata, Some(3), Some(("ok\n".into(), "".into())));
     bash_terminal(display, bodies, "bash-demo1", Some(2400));
-    assert!(f.capture.lock().unwrap().terminal);
+    let capture = f.capture.lock().unwrap();
+    assert!(capture.terminal || capture.finished);
 }
 
 #[test]
@@ -215,13 +217,20 @@ fn held_background_timeout_records_observed_code() {
     );
 }
 #[test]
-fn held_background_unknown_fate_never_invents_exit_proof() {
-    held_background_case(
-        "display-held-unknown",
-        BgTaskStatus::FateUnknown,
-        None,
-        Some("fate_unknown"),
-    );
+fn held_background_unknown_fate_writes_no_completion_or_terminal_detail() {
+    let f = fixture("bash", "display-held-unknown");
+    held(&f);
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut running = task();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    reply(&f.key, false, false, None);
+    terminal(&f, &display, BgTaskStatus::FateUnknown, None);
+    terminal(&f, &display, BgTaskStatus::FateUnknown, None);
+    let writes = publications();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].kind, DisplayKind::Record);
 }
 
 #[test]
@@ -560,4 +569,169 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
 fn publication_is_disabled_without_an_explicit_writer() {
     assert!(!enabled());
     assert!(current_task().is_none());
+}
+
+fn runner_route(f: &Fixture, module: &str) -> crate::subc::RouteIdentity {
+    let root = crate::path_identity::ProjectRootId::from_path(f._dir.path()).unwrap();
+    let mut route = crate::subc::test_support::route_identity(&root, "display-identity");
+    let data = Arc::get_mut(&mut route.0).unwrap();
+    data.role = crate::subc::tool_provider::RouteRole::ToolProviderV1;
+    if let crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut data.spawn_principal
+    {
+        *principal_id = Some(format!("reserved:{module}"));
+    }
+    route
+}
+
+#[test]
+fn direct_runner_calls_require_their_own_key_and_pin() {
+    let f = fixture("edit", "display-direct-identity");
+    let route = runner_route(&f, "broca");
+    let pin = f.capture.lock().unwrap().identity.schema_pin.clone();
+    for (name, call_key, schema_pin) in [
+        ("missing-key", None, Some(pin.clone())),
+        ("missing-pin", Some("missing-pin".to_owned()), None),
+    ] {
+        let mut call = subc_protocol::tool_call::ToolCallRequest::new("edit", json!({}));
+        call.call_key = call_key;
+        call.schema_pin = schema_pin;
+        let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, name);
+        register(&ledger, &route, &call);
+        assert!(!CALLS.lock().unwrap().contains_key(&key(&ledger)));
+    }
+    reply(&f.key, false, false, None);
+    let writes = publications();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].identity.call_key, "display-direct-identity");
+    assert_eq!(writes[0].identity.schema_pin, pin);
+}
+
+#[test]
+fn relays_write_only_the_origin_identity_not_the_forwarders_key_or_pin() {
+    let f = fixture("edit", "display-relay-base");
+    let route = runner_route(&f, "basal");
+    let pin = f.capture.lock().unwrap().identity.schema_pin.clone();
+    let mut call = subc_protocol::tool_call::ToolCallRequest::new("edit", json!({}));
+    call.call_key = Some("forwarder-key".into());
+    call.schema_pin = Some(
+        crate::subc::tool_views::SHIPPED
+            .keys()
+            .find(|pin| pin.starts_with("tp1:bash:"))
+            .unwrap()
+            .clone(),
+    );
+    call.origin = Some(
+        subc_protocol::tool_call::CallOrigin::new(
+            Principal::Reserved {
+                module_id: "thalamus-harness".into(),
+            },
+            "runner-original",
+        )
+        .with_schema_pin(pin.clone()),
+    );
+    let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, "forwarder-key");
+    register(&ledger, &route, &call);
+    reply(&ledger, false, false, None);
+    let writes = publications();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].identity.runner,
+        Principal::Reserved {
+            module_id: "thalamus-harness".into()
+        }
+    );
+    assert_eq!(writes[0].identity.call_key, "runner-original");
+    assert_eq!(writes[0].identity.schema_pin, pin);
+}
+
+#[test]
+fn incomplete_origins_and_basal_inner_calls_without_origin_write_nothing() {
+    let f = fixture("edit", "display-origin-rejections");
+    let route = runner_route(&f, "basal");
+    let pin = f.capture.lock().unwrap().identity.schema_pin.clone();
+    let mut call = subc_protocol::tool_call::ToolCallRequest::new("edit", json!({}));
+    call.call_key = Some("outer".into());
+    call.schema_pin = Some(pin.clone());
+    let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, "outer");
+    register(&ledger, &route, &call);
+    assert!(!CALLS.lock().unwrap().contains_key(&key(&ledger)));
+    call.origin = Some(subc_protocol::tool_call::CallOrigin::new(
+        Principal::Reserved {
+            module_id: "broca".into(),
+        },
+        "original",
+    ));
+    register(&ledger, &route, &call);
+    assert!(!CALLS.lock().unwrap().contains_key(&key(&ledger)));
+    call.origin = Some(
+        subc_protocol::tool_call::CallOrigin::new(
+            Principal::Reserved {
+                module_id: "broca".into(),
+            },
+            "",
+        )
+        .with_schema_pin(pin.clone()),
+    );
+    register(&ledger, &route, &call);
+    assert!(!CALLS.lock().unwrap().contains_key(&key(&ledger)));
+    let missing_key = json!({"name":"edit","arguments":{},"call_key":"outer","schema_pin":pin,"origin":{"carrier":{"kind":"reserved","module_id":"broca"},"schema_pin":pin}});
+    assert!(
+        serde_json::from_value::<subc_protocol::tool_call::ToolCallRequest>(missing_key).is_err()
+    );
+    call.origin = Some(
+        subc_protocol::tool_call::CallOrigin::new(
+            Principal::Reserved {
+                module_id: "broca".into(),
+            },
+            "original",
+        )
+        .with_schema_pin(pin),
+    );
+    call.call_key = None;
+    register(&ledger, &route, &call);
+    assert!(
+        !CALLS.lock().unwrap().contains_key(&key(&ledger)),
+        "origin-only calls remain display-free without an outer replay row"
+    );
+    assert!(publications().is_empty());
+}
+
+#[test]
+fn running_hold_without_a_person_wait_omits_held_ms() {
+    let f = fixture("bash", "display-running-held");
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut running = task();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    reply(&f.key, true, false, Some("running"));
+    terminal(&f, &display, BgTaskStatus::Completed, Some(0));
+    let writes = publications();
+    let completed = writes
+        .iter()
+        .find(|write| write.kind == DisplayKind::Completion)
+        .unwrap();
+    assert!(completed.body.get("heldMs").is_none());
+}
+
+#[test]
+fn killed_without_a_confirmed_provider_stop_has_no_completion() {
+    let f = fixture("bash", "display-kill-without-proof");
+    held(&f);
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut metadata = task();
+    metadata.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&metadata, Some(0), None), true);
+    reply(&f.key, false, false, None);
+    metadata.status = BgTaskStatus::Killed;
+    metadata.group_kill_sent = false;
+    bash_terminal(
+        &display,
+        bash_bodies(&metadata, Some(0), None),
+        "bash-demo1",
+        Some(10),
+    );
+    assert_eq!(publications().len(), 1);
 }
