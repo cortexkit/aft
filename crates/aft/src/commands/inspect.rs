@@ -131,6 +131,7 @@ static DEFERRED_INSPECT_ROOTS: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> =
 
 #[cfg(test)]
 struct DeferredInspectBodyGate {
+    request_id: Option<String>,
     started: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
 }
@@ -154,11 +155,26 @@ pub(crate) fn deferred_inspect_test_lock() -> std::sync::MutexGuard<'static, ()>
 #[cfg(test)]
 pub(crate) fn install_deferred_inspect_body_gate_for_test(
 ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    install_deferred_inspect_body_gate(None)
+}
+
+#[cfg(test)]
+pub(crate) fn install_deferred_inspect_body_gate_for_request_for_test(
+    request_id: &str,
+) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+    install_deferred_inspect_body_gate(Some(request_id.to_string()))
+}
+
+#[cfg(test)]
+fn install_deferred_inspect_body_gate(
+    request_id: Option<String>,
+) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     *DEFERRED_INSPECT_BODY_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DeferredInspectBodyGate {
+        request_id,
         started: started_tx,
         release: release_rx,
     });
@@ -182,11 +198,19 @@ pub(crate) fn deferred_inspect_root_count_for_test() -> usize {
 }
 
 #[cfg(test)]
-fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline) {
-    let gate = DEFERRED_INSPECT_BODY_GATE
+fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline, request_id: &str) {
+    let mut slot = DEFERRED_INSPECT_BODY_GATE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot
+        .as_ref()
+        .and_then(|gate| gate.request_id.as_deref())
+        .is_some_and(|expected| expected != request_id)
+    {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
     let Some(gate) = gate else {
         return;
     };
@@ -207,7 +231,11 @@ fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline)
 }
 
 #[cfg(not(test))]
-fn wait_at_deferred_inspect_body_gate_for_test(_deadline: InspectRequestDeadline) {}
+fn wait_at_deferred_inspect_body_gate_for_test(
+    _deadline: InspectRequestDeadline,
+    _request_id: &str,
+) {
+}
 
 #[cfg(test)]
 fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
@@ -1909,7 +1937,7 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    wait_at_deferred_inspect_body_gate_for_test(deadline);
+    wait_at_deferred_inspect_body_gate_for_test(deadline, &req.id);
     delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -8101,6 +8129,21 @@ mod deferred_terminal_tests {
         }
 
         #[test]
+        fn inspect_request_deadline_recognizes_completed_worker_timeout() {
+            let deadline =
+                InspectRequestDeadline::new(Duration::from_secs(10), INSPECT_TERMINAL_MARGIN);
+            let response = build_inspect_terminal(
+                "inspect-completed-timeout",
+                &InspectPhaseLog::for_request("inspect-completed-timeout"),
+                request_deadline_terminal(None, deadline),
+            );
+            assert_eq!(response.data["failure_reason"], "inspect_request_timeout");
+            // A completed worker's typed terminal must take the same PARTIAL
+            // fallback as an unfinished worker at the pending-response cutoff.
+            assert_eq!(inspect_failure_reason(&response), "inspect_request_timeout");
+        }
+
+        #[test]
         fn inspect_request_deadline_reserves_final_stat_verification() {
             let (_root, ctx, request) = fixture();
             let start = Instant::now();
@@ -8745,7 +8788,8 @@ mod deferred_terminal_tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), "hello\n").unwrap();
         let ctx = deferred_test_context(root.path());
-        let (started_rx, _release_tx) = install_deferred_inspect_body_gate_for_test();
+        let (started_rx, _release_tx) =
+            install_deferred_inspect_body_gate_for_request_for_test("inspect-client-deadline");
         let started = Instant::now();
         let request = serde_json::from_value(serde_json::json!({
             "id":"inspect-client-deadline", "command":"inspect", "sections":["todos"], "scope":"note.txt"

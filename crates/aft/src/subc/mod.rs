@@ -13534,7 +13534,9 @@ pub(crate) mod test_support {
         let ctx = inspect_context_with_timeout(dir.path(), Some(10_000));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-deadline",
+            );
         let started = Instant::now();
         let clock = Arc::new(StdMutex::new(started));
         let now = Arc::clone(&clock);
@@ -14549,7 +14551,9 @@ pub(crate) mod test_support {
             epoch: 1,
         };
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-abandoned",
+            );
         let (mut pending, cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-abandoned");
         active.lock().expect("active tool call map").insert(
