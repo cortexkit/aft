@@ -1179,7 +1179,12 @@ mod tests {
                     assert!(error.busy, "{error}");
                     let now = std::time::Instant::now();
                     assert!(now < deadline, "callgraph stayed pending: {error}");
-                    let retry_at = view.query.lock().unwrap().pending.as_ref().unwrap().0;
+                    let retry_at = view
+                        .query
+                        .lock()
+                        .pending
+                        .as_ref()
+                        .map_or(now, |(retry_at, _)| *retry_at);
                     std::thread::sleep(retry_at.min(deadline).saturating_duration_since(now));
                 }
             }
@@ -1253,8 +1258,28 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
         }
 
-        let graph = view(&root, &temp.path().join("storage"));
-        let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+        struct PolicyTimeoutOnce {
+            inner: Arc<dyn CallgraphReaderSource>,
+            timeout: std::sync::atomic::AtomicBool,
+        }
+        impl CallgraphReaderSource for PolicyTimeoutOnce {
+            fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+                // The fault is thread-local; install it where acquisition runs.
+                let _timeout = self
+                    .timeout
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    .then(crate::git_index_reader::timeout_next_config_for_test);
+                self.inner.acquire()
+            }
+            fn record_change(&self, path: &Path) {
+                self.inner.record_change(path);
+            }
+        }
+        let mut graph = view(&root, &temp.path().join("storage"));
+        graph.source = Arc::new(PolicyTimeoutOnce {
+            inner: graph.source.clone(),
+            timeout: std::sync::atomic::AtomicBool::new(true),
+        });
         let pending = graph.reader().unwrap_err();
         assert!(pending.busy, "{pending}");
         assert!(!pending.reason.contains("changed"), "{pending}");
@@ -1542,7 +1567,8 @@ mod tests {
         drop(hook);
 
         // No watcher reports the edit made after the earlier acquisition
-        // finished. Its queued reader cannot be considered verified now.
+        // finished. The acquisition result waiting for the next read was verified
+        // before this edit, so it cannot be considered verified now.
         std::fs::write(
             root.join("c.ts"),
             "import { caller } from './b';\nexport function latest() { return caller(); }\n",
