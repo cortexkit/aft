@@ -199,20 +199,21 @@ fn audit_daemon_rejects_v19_manifest_before_read_binding() {
 }
 
 #[test]
-fn audit_v19_status_matches_legacy_bytes_even_with_a_lookup_record() {
+fn audit_v19_full_audit_status_matches_legacy_bytes_even_with_a_lookup_record() {
     let fixture = Fixture::new(19);
     fs::write(
         fixture.paths.root.join("read-session-lookup.json"),
         br#"{"outcome":"unavailable","reason":"old daemon","at_unix_secs":7}"#,
     )
     .unwrap();
-    let rendered = render_self_report(&fixture.paths).unwrap();
+    // The historical capture predates the summary default; --audit retains its schema.
+    let rendered = render_self_report(&fixture.paths, true).unwrap();
     let captured = include_str!("../../tests/fixtures/gh_shim/v19-main-status.jsonc");
     let (_, expected) = captured.split_once("// END HEADER\n").unwrap();
     let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
     assert_eq!(
         normalized, expected,
-        "v19 status must match the frozen origin/main binary capture"
+        "v19 full-audit status must match the frozen origin/main binary capture"
     );
 }
 

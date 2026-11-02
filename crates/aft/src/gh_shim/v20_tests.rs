@@ -1438,7 +1438,8 @@ fn v20_status_records_the_last_lookup_outcome_and_reason() {
         let value = serde_json::to_value(last_lookup(&paths).unwrap()).unwrap();
         assert_eq!(value["outcome"], outcome);
         assert_eq!(value["reason"], reason);
-        let status: Value = serde_json::from_str(&render_self_report(&paths).unwrap()).unwrap();
+        let status: Value =
+            serde_json::from_str(&render_self_report(&paths, false).unwrap()).unwrap();
         assert_eq!(status["last_read_lookup"], value);
     }
 }
