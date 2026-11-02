@@ -48,8 +48,10 @@ pub(crate) struct Capture {
     terminal_bash: Option<(Value, Value)>,
     deferred: bool,
     terminal: bool,
-    // A bash exit can race its launch reply. Cached facts may be published
-    // only after the task's persisted completion marker has been claimed.
+    // A bash task can exit before its launch reply is sent. The cached exit
+    // facts are published only once this is true: the task's stored record
+    // shows a reply was produced for a deferred call and no completion was
+    // attempted yet, so the completion is written exactly once.
     completion_claimed: bool,
 }
 
