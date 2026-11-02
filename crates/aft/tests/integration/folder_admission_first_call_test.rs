@@ -239,7 +239,6 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
         "{status}"
     );
     assert_eq!(status["folder"]["coverage"]["complete"], false);
-    std::fs::write(&delay, "0").unwrap();
     aft.send_silent(&configure(&project, &storage, "fast-bind", false).to_string());
     aft.send_silent(&search("fast-tool").to_string());
     assert_eq!(response(&mut aft, "fast-bind")["success"], true);

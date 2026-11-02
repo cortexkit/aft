@@ -25233,18 +25233,39 @@ mod tests {
 
     #[test]
     fn handle_configure_refuses_a_home_folder_without_project_evidence() {
+        assert_home_folder_without_evidence(false);
+    }
+
+    #[test]
+    fn handle_configure_home_verdict_waits_for_actual_examination() {
+        assert_home_folder_without_evidence(true);
+    }
+
+    fn assert_home_folder_without_evidence(hold_probe: bool) {
         let _guard = home_env_mutex();
         let temp = tempfile::tempdir().unwrap();
         let canonical = std::fs::canonicalize(temp.path()).unwrap();
         let _home = EnvVarGuard::set("HOME", canonical.to_str().unwrap());
         let _profile = EnvVarGuard::set("USERPROFILE", canonical.to_str().unwrap());
         let ctx = test_context();
+        let gate = hold_probe.then(|| crate::folder_admission_runtime::gate_probe_for_test(&ctx));
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
             "config": [user_tier(json!({ "indexes": { "trigram": true, "semantic": true } }))],
         }));
         let response = handle_folder_configure_for_test(&req, &ctx);
+        if let Some((started, release)) = gate {
+            settle_configure_for_test(&ctx);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
+            assert_eq!(folder["classification"], Value::Null, "{folder}");
+            assert_eq!(folder["state"], "pending", "{folder}");
+            assert_eq!(folder["coverage"]["stop"], "time", "{folder}");
+            assert_eq!(folder["observed"]["entries"], 0, "{folder}");
+            eprintln!("HOME before examination: {folder}");
+            release.send(()).unwrap();
+        }
         settle_configure_for_test(&ctx);
         assert!(response.success);
         assert!(ctx.is_degraded());
