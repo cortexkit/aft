@@ -585,7 +585,7 @@ pub(crate) fn start(connection_file: PathBuf) {
         return;
     }
     if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft")
-        || !matches!(subc_client_rs::launch_nonce(), Ok(Some(_)))
+        || crate::launch_nonce::consumer_identity().is_none()
     {
         return;
     }
@@ -604,7 +604,7 @@ pub(crate) fn start(connection_file: PathBuf) {
 }
 
 async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Receiver<()>) {
-    use subc_client_rs::{ConsumerOptions, SubcConsumer};
+    use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
     use subc_protocol::BindIdentity;
     let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
@@ -641,7 +641,11 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                 if let Ok(route) = client
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
-                        BindIdentity::new(".", "aft", "tool-display"),
+                        BindIdentity::new("aft", "tool-display"),
+                        CallOptions {
+                            consumer_identity: crate::launch_nonce::consumer_identity(),
+                            ..CallOptions::default()
+                        },
                     )
                     .await
                 {
@@ -649,6 +653,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                         .request(
                             &route,
                             br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
+                            CallOptions::default(),
                         )
                         .await;
                     let limits = description
@@ -669,7 +674,10 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                         // An admitted body cannot be rebuilt for a smaller store.
                         // Lose that optional kind rather than change its first bytes.
                         if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0) {
-                            match client.request(&route, entry.frame.clone()).await {
+                            match client
+                                .request(&route, entry.frame.clone(), CallOptions::default())
+                                .await
+                            {
                                 Ok(bytes) => {
                                     retry = retry_reply(&bytes);
                                 }
@@ -682,7 +690,9 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
                             retry = false;
                         }
                     }
-                    let _ = client.close_handle(&route).await;
+                    let _ = client
+                        .close_handle(&route, CloseRouteOptions::default())
+                        .await;
                 }
             }
         }
