@@ -14662,7 +14662,7 @@ async fn submission_review_current_never_accepted_allows_local_fallback() {
         .submission
         .as_mut()
         .unwrap()
-        .attempts = SUBMISSION_RECOVERY_ATTEMPTS;
+        .attempts = PRE_ACCEPTANCE_RECOVERY_ATTEMPTS;
     write_task(&task.paths.json, &saved).unwrap();
     drop(task);
     drop(old);
