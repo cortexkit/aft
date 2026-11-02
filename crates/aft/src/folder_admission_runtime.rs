@@ -132,6 +132,7 @@ enum ProbeResult {
     Complete(Cache, bool),
     Wait(u64),
     Exhausted,
+    Failed,
 }
 
 pub fn wait_budget() -> Duration {
@@ -1402,9 +1403,7 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
                 .and_then(|task| match task.receiver.try_recv() {
                     Ok(result) => Some(result),
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some(ProbeResult::Exhausted)
-                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(ProbeResult::Failed),
                 })
         });
     let in_flight = result.is_none() && task.is_some();
@@ -1428,6 +1427,14 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
             return ResolveResult::Wait;
         }
         Some(ProbeResult::Exhausted) => timeout_cache(&root, &config, mode),
+        Some(ProbeResult::Failed) => {
+            let mut cache = timeout_cache(&root, &config, mode);
+            cache.decision.reason = crate::folder_admission::AdmissionReason::ProbeIoError;
+            cache.decision.observed.errors = 1;
+            cache.decision.coverage.stop = crate::folder_admission::ProbeStop::IoError;
+            cache.decision.coverage.elapsed_ms = 0;
+            cache
+        }
         None if Instant::now() < deadline => return ResolveResult::Wait,
         None => timeout_cache(&root, &config, mode),
     };
@@ -2143,5 +2150,10 @@ mod tests {
         assert!(matches!(resolve(&ctx), ResolveResult::Settled));
         assert!(ctx.folder_admission().probe.lock().is_none());
         assert_eq!(snapshot(&ctx).unwrap()["classification"], Value::Null);
+        assert_eq!(snapshot(&ctx).unwrap()["reason"], "probe_io_error");
+        assert_eq!(
+            snapshot(&ctx).unwrap()["message"],
+            "folder_not_admitted: probe_io_error"
+        );
     }
 }
