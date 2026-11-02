@@ -12939,8 +12939,8 @@ mod tests {
         let response = ctx.with_ready_callgraph_for_test(|| {
             crate::commands::callers::handle_callers(&request, &ctx)
         });
-        // Fixture acquisition verifies the working tree rather than serving
-        // the stale configure-publication snapshot.
+        // The fixture waits for a call-graph reader verified against the
+        // working tree, not the stale configure-publication snapshot.
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["total_callers"], 1);
     }
