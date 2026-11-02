@@ -4809,6 +4809,7 @@ pub struct AppContext {
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
+    callgraph_executor: parking_lot::Mutex<Option<crate::executor::RootMaintenanceExecutor>>,
     /// Set while this checkout is over `views.callgraph_copies` and reads
     /// another checkout's published call graph instead of building its own.
     callgraph_borrow: parking_lot::Mutex<Option<CallgraphBorrow>>,
@@ -5142,6 +5143,11 @@ impl Drop for ForceRestrictGuard<'_> {
 
 impl Drop for AppContext {
     fn drop(&mut self) {
+        self.subc_lifecycle
+            .mark_unbound(self.configure_generation.as_ref());
+        if let Some(view) = self.callgraph_view.get_mut().take() {
+            view.shutdown();
+        }
         self.artifact_owner_lease.get_mut().take();
         if let Some(runtime) = self.watcher_thread.get_mut().take() {
             let root = self
@@ -5157,6 +5163,45 @@ impl Drop for AppContext {
                 })
                 .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
             Self::spawn_watcher_shutdown(Arc::clone(&self.app), root, runtime);
+        }
+    }
+}
+
+struct CallgraphPublicationFence {
+    lifecycle: SubcLifecycleAdmission,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl crate::views::first_load::PublishFence for CallgraphPublicationFence {
+    fn publish(
+        &self,
+        commit: &mut dyn FnMut() -> Result<(), crate::views::contracts::PlaneError>,
+    ) -> Result<(), crate::views::contracts::PlaneError> {
+        let refused = || crate::views::contracts::PlaneError {
+            plane: Some(crate::blob_store::v2::FamilyPlane::Callgraph),
+            reason: crate::views::first_load::SUPERSEDED_PUBLISH.into(),
+        };
+        loop {
+            if crate::executor::current_job_cancelled() {
+                return Err(refused());
+            }
+            // A root's bound/unbound lock may be held while retiring its view.
+            // A cancelled worker must leave this wait so retirement can join it.
+            let Some(unbound) = self
+                .lifecycle
+                .unbound
+                .try_lock_for(Duration::from_millis(10))
+            else {
+                continue;
+            };
+            if *unbound
+                || self.generation.load(Ordering::Acquire) != self.expected
+                || crate::executor::current_job_cancelled()
+            {
+                return Err(refused());
+            }
+            return commit();
         }
     }
 }
@@ -5750,6 +5795,7 @@ impl AppContext {
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
+            callgraph_executor: parking_lot::Mutex::new(None),
             callgraph_borrow: parking_lot::Mutex::new(None),
             callgraph_construction_retry: parking_lot::Mutex::new(Default::default()),
             callgraph_view_read_diagnostics: parking_lot::Mutex::new(
@@ -7086,6 +7132,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        self.cancel_callgraph_acquisition();
         let _ = self
             .subc_lifecycle
             .run_if_unbound(|| self.callgraph_corpus_memo.lock().take());
@@ -10239,6 +10286,7 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        self.cancel_callgraph_acquisition();
         self.release_view_publication_cache();
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::cold_build_limiter::progress::cancel_root(&root);
@@ -13000,6 +13048,38 @@ impl AppContext {
         Arc::new(move || lifecycle.is_bound() && generation.load(Ordering::Acquire) == expected)
     }
 
+    pub(crate) fn install_callgraph_executor(
+        &self,
+        executor: crate::executor::RootMaintenanceExecutor,
+    ) {
+        *self.callgraph_executor.lock() = Some(executor);
+    }
+
+    fn cancel_callgraph_acquisition(&self) {
+        if let Some(view) = self.callgraph_view.lock().as_ref() {
+            view.cancel();
+        }
+    }
+
+    /// Fence and drain standalone call-graph acquisition before process teardown.
+    /// Daemon acquisitions are also cancelled, and their executor owns the drain.
+    pub fn shutdown_callgraph_acquisition(&self) {
+        self.mark_subc_unbound();
+        let view = self.callgraph_view.lock().take();
+        if let Some(view) = view {
+            view.shutdown();
+        }
+    }
+
+    fn callgraph_view_control(&self) -> crate::migration::v3_ledger::ImportControl {
+        let unbound = self.subc_lifecycle.unbound_hint.clone();
+        let generation = self.configure_generation_flag();
+        let expected = generation.load(Ordering::Acquire);
+        Arc::new(move || {
+            !unbound.load(Ordering::Acquire) && generation.load(Ordering::Acquire) == expected
+        })
+    }
+
     pub(crate) fn callgraph_view_is_ready(&self) -> bool {
         self.callgraph_view
             .lock()
@@ -13126,12 +13206,20 @@ impl AppContext {
                             storage.clone(),
                             family.clone(),
                             policy,
-                            self.views_import_control(),
+                            self.callgraph_view_control(),
                             self.cold_build_limiter(),
                         )
                     },
                 ) {
-                    Ok(view) => *slot = Some(Arc::new(view)),
+                    Ok(mut view) => {
+                        view.set_executor(self.callgraph_executor.lock().clone());
+                        view.set_publish_fence(Arc::new(CallgraphPublicationFence {
+                            lifecycle: self.subc_lifecycle_admission(),
+                            generation: self.configure_generation_flag(),
+                            expected: self.configure_generation(),
+                        }));
+                        *slot = Some(Arc::new(view));
+                    }
                     Err(error) => {
                         drop(slot);
                         if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) {

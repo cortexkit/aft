@@ -1138,6 +1138,36 @@ pub struct Executor {
     inner: Arc<ExecutorInner>,
 }
 
+/// A root may submit maintenance without keeping its owning executor alive.
+/// The weak link avoids a cycle through the executor's actor context.
+#[derive(Clone)]
+pub(crate) struct RootMaintenanceExecutor {
+    inner: std::sync::Weak<ExecutorInner>,
+    root_id: ProjectRootId,
+}
+
+impl RootMaintenanceExecutor {
+    pub(crate) fn submit_heavy(&self, cancellation: JobCancellation, job: ExecutorJob) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let executor = Executor { inner };
+        let (tx, _rx) = oneshot::channel();
+        executor.submit_with_completion_cancellable(
+            self.root_id.clone(),
+            JobClass::Maintenance,
+            Lane::HeavyInit,
+            "callgraph-view-acquire".into(),
+            job,
+            CompletionSender::Async(tx),
+            Some(cancellation),
+            None,
+            None,
+        );
+        true
+    }
+}
+
 impl Executor {
     pub fn new() -> Self {
         Self::with_config(ExecutorConfig::default())
@@ -1226,6 +1256,10 @@ impl Executor {
     /// new actor was inserted.
     pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
         ctx.bind_status_context();
+        let maintenance = RootMaintenanceExecutor {
+            inner: Arc::downgrade(&self.inner),
+            root_id: root_id.clone(),
+        };
         let memory_root = root_id.as_path().to_path_buf();
         let inserted = {
             let mut state = self.inner.state.lock();
@@ -1240,6 +1274,7 @@ impl Executor {
             }
         };
         if inserted {
+            ctx.install_callgraph_executor(maintenance);
             let app = ctx.app();
             crate::root_cache::register_live_scope(&ctx.storage_dir(), &memory_root);
             app.register_memory_context(memory_root, &ctx);
@@ -2286,6 +2321,21 @@ struct ExecutorInner {
 
 impl Drop for ExecutorInner {
     fn drop(&mut self) {
+        // Stop maintenance before joining workers. Queued closures must also
+        // release their captured builders instead of surviving a stopped loop.
+        {
+            let mut state = self.state.lock();
+            for job in state.running_jobs.values() {
+                if job.job_class == JobClass::Maintenance {
+                    if let Some(token) = &job.cancellation {
+                        token.request_cancel();
+                    }
+                }
+            }
+            for actor in state.actors.values_mut() {
+                actor.maintenance.cancel_queued_jobs();
+            }
+        }
         let _ = self.event_tx.send(SchedulerEvent::Shutdown);
 
         if let Some(handle) = self.scheduler_handle.lock().take() {
@@ -2720,6 +2770,7 @@ struct ActorState {
     /// `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
+    maintenance_heavy_inflight: bool,
     provider_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
@@ -2748,6 +2799,7 @@ impl ActorState {
             writer_inflight: false,
             shared_bind_inflight: false,
             maintenance_commit_inflight: false,
+            maintenance_heavy_inflight: false,
             provider_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
@@ -3565,7 +3617,11 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
             Lane::SerialLspStatus => {
                 actor.lsp_inflight = false;
             }
-            Lane::HeavyInit => {}
+            Lane::HeavyInit => {
+                if job_class == JobClass::Maintenance {
+                    actor.maintenance_heavy_inflight = false;
+                }
+            }
             Lane::Mutating => {
                 actor.writer_inflight = false;
                 actor.shared_bind_inflight = false;
@@ -4054,7 +4110,7 @@ fn try_admit_actor(
             .interactive
             .first_bind_job()
             .is_some_and(|job| job.rerun.is_some() && !job.force_exclusive);
-    // MaintenanceCommit uses the executor's global maintenance capacity and
+    // Maintenance uses the executor's global maintenance capacity and
     // must not consume the per-actor slots reserved for interactive work. This
     // matters when a two-worker executor has actor_cap=1: the global reserve
     // leaves one worker idle, and this accounting makes that worker reachable
@@ -4062,13 +4118,19 @@ fn try_admit_actor(
     let actor_interactive_inflight = actor
         .actor_total_inflight
         .saturating_sub(usize::from(actor.maintenance_commit_inflight))
+        .saturating_sub(usize::from(actor.maintenance_heavy_inflight))
         .saturating_sub(usize::from(actor.provider_inflight));
     let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
     let runnable = match lane {
         Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
         Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_interactive_capacity,
         Lane::HeavyInit => {
-            if !actor_has_interactive_capacity {
+            let capacity = if job_class == JobClass::Maintenance {
+                !actor.maintenance_heavy_inflight
+            } else {
+                actor_has_interactive_capacity
+            };
+            if !capacity {
                 false
             } else if let Some(permit) = heavy.try_acquire() {
                 heavy_permit = Some(permit);
@@ -4140,6 +4202,9 @@ fn try_admit_actor(
             actor.actor_total_inflight += 1;
         }
         Lane::HeavyInit => {
+            if job_class == JobClass::Maintenance {
+                actor.maintenance_heavy_inflight = true;
+            }
             actor.actor_total_inflight += 1;
         }
         Lane::Mutating => {

@@ -15370,7 +15370,7 @@ mod tests {
         );
     }
 
-    fn assert_callgraph_views_rematerialization_bounded(command: &str) {
+    fn assert_callgraph_views_rematerialization_bounded(command: &str, daemon: bool) {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -15411,7 +15411,21 @@ mod tests {
         };
         write_callers("before");
         let root = std::fs::canonicalize(&root).unwrap();
-        let ctx = Arc::new(test_context());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(temp.path().join("storage")),
+                ..Config::default()
+            },
+        ));
+        let _executor = daemon.then(|| {
+            let executor = crate::executor::Executor::new();
+            executor.register_actor(
+                crate::path_identity::ProjectRootId::from_path(&root).unwrap(),
+                ctx.clone(),
+            );
+            executor
+        });
         assert!(
             handle_configure_for_test(
                 &configure_callgraph_views(&root, &temp.path().join("storage"), true),
@@ -15518,15 +15532,25 @@ mod tests {
 
     #[test]
     fn callgraph_views_rematerialization_bounds_callers_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("callers");
+        assert_callgraph_views_rematerialization_bounded("callers", false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_zoom_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("zoom");
+        assert_callgraph_views_rematerialization_bounded("zoom", false);
     }
 
-    fn assert_callgraph_acquisition_lifecycle(daemon: bool) {
+    #[test]
+    fn callgraph_views_rematerialization_bounds_daemon_callers_then_serves_publication() {
+        assert_callgraph_views_rematerialization_bounded("callers", true);
+    }
+
+    #[test]
+    fn callgraph_views_rematerialization_bounds_daemon_zoom_then_serves_publication() {
+        assert_callgraph_views_rematerialization_bounded("zoom", true);
+    }
+
+    fn assert_callgraph_acquisition_lifecycle(daemon: bool, stop_executor: bool) {
         use crate::executor::{Executor, ExecutorConfig, Lane};
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
@@ -15548,7 +15572,7 @@ mod tests {
             },
         ));
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
-        let executor = daemon.then(|| {
+        let mut executor = daemon.then(|| {
             Executor::with_config(ExecutorConfig {
                 pool_size: 2,
                 actor_cap: 1,
@@ -15592,7 +15616,7 @@ mod tests {
         let _hook = crate::storage_retention::observe_test_hook(
             &root,
             Arc::new(move |step| {
-                if step == "callgraph-materialize" {
+                if step == "callgraph-reserved" {
                     entered_tx.send(()).unwrap();
                     let cancellation = crate::executor::current_job_cancellation();
                     let deadline = Instant::now() + Duration::from_secs(10);
@@ -15620,6 +15644,7 @@ mod tests {
         );
         let (answer_tx, answer_rx) = crossbeam_channel::bounded(1);
         let worker_ctx = ctx.clone();
+        let request_again = request.clone();
         let read = std::thread::spawn(move || {
             let _pin = worker_ctx.pin_config();
             answer_tx
@@ -15630,6 +15655,12 @@ mod tests {
                 .unwrap();
         });
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let reserved_during_build =
+            crate::blob_store::v3::LedgerReader::open_existing(&storage, &family)
+                .unwrap()
+                .accounting()
+                .unwrap()
+                .reserved_bytes;
 
         let interactive = executor.as_ref().map(|executor| {
             let file = root.join("a.ts");
@@ -15657,9 +15688,14 @@ mod tests {
                     .maintenance,
             )
         });
-        ctx.mark_subc_unbound();
-        if let Some(executor) = &executor {
+        let shutdown_started = Instant::now();
+        if stop_executor {
+            drop(executor.take());
+        } else if let Some(executor) = &executor {
+            ctx.mark_subc_unbound();
             executor.cancel_root_maintenance(&root_id);
+        } else {
+            ctx.shutdown_callgraph_acquisition();
         }
         let cancelled_answer = answer_rx.recv_timeout(Duration::from_secs(4));
         // If cancellation fails, release the blocked graph builder before
@@ -15669,6 +15705,15 @@ mod tests {
         let prompt = cancelled_answer.is_ok();
         let answer = cancelled_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
         finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if stop_executor {
+            ctx.view_load_retry_due_for_test();
+            let refused = crate::commands::callers::handle_callers(&request_again, &ctx);
+            assert_eq!(refused.data["code"], "callgraph_building");
+            assert!(
+                entered_rx.try_recv().is_err(),
+                "a stopped daemon executor fell back to a standalone worker"
+            );
+        }
         if let Some(executor) = &executor {
             let deadline = Instant::now() + Duration::from_secs(2);
             while !executor.actor_is_idle(&root_id) {
@@ -15689,6 +15734,14 @@ mod tests {
         assert!(
             prompt,
             "shutdown did not settle the acquisition before manual release"
+        );
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(2),
+            "acquisition shutdown did not drain promptly"
+        );
+        assert!(
+            reserved_during_build > 0,
+            "the fixture did not hold a real v3 reservation"
         );
         assert!(!answer.success, "{:?}", answer.data);
         assert_eq!(answer.data["code"], "callgraph_building");
@@ -15725,12 +15778,17 @@ mod tests {
 
     #[test]
     fn callgraph_views_acquisition_quiesce_fences_publication_and_preserves_reads() {
-        assert_callgraph_acquisition_lifecycle(true);
+        assert_callgraph_acquisition_lifecycle(true, false);
     }
 
     #[test]
     fn callgraph_views_acquisition_standalone_shutdown_releases_protection() {
-        assert_callgraph_acquisition_lifecycle(false);
+        assert_callgraph_acquisition_lifecycle(false, false);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_executor_shutdown_drains_protection() {
+        assert_callgraph_acquisition_lifecycle(true, true);
     }
 
     #[test]

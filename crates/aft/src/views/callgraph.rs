@@ -539,6 +539,7 @@ const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhe
 /// never substitute another store when acquisition fails.
 pub(crate) trait CallgraphReaderSource: Send + Sync {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError>;
+    fn set_publish_fence(&self, _: Arc<dyn super::first_load::PublishFence>) {}
     /// `acquire`, plus the source revision the reader's cut belongs to when
     /// the source tracks one. The view keeps the reader under it.
     fn acquire_with_revision(
@@ -584,6 +585,9 @@ pub(super) fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
 }
 
 impl CallgraphReaderSource for CheckoutCallgraphSource {
+    fn set_publish_fence(&self, fence: Arc<dyn super::first_load::PublishFence>) {
+        self.driver.set_publish_fence(fence);
+    }
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
         self.acquire_with_revision().map(|(store, _)| store)
     }
@@ -596,6 +600,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         &self,
     ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
         use super::first_load::FirstLoadDriver;
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
+        }
         let installed = self.driver.installed_snapshot();
         // After a restart, start from this checkout's own published worker
         // generation; verification still reconciles it against the disk.
@@ -624,6 +631,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
             .driver
             .verified_bind(&self.access, seed)
             .map_err(CallgraphViewError::from)?;
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
+        }
         if has_unpublished_changes(&snapshot) {
             // Publish the edits as a new worker generation (a donor clone
             // patched with the diff) before the single install, as a fresh
@@ -655,6 +665,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                 .snapshot()
                 .with_install_cut(cut.clone())
                 .with_reconciled_epoch(snapshot.reconciled_epoch().unwrap_or(cut.epoch));
+        }
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
         }
         self.driver
             .install(&self.access, &snapshot, revision)
@@ -731,6 +744,7 @@ pub(crate) struct CallgraphView {
     source: Arc<dyn CallgraphReaderSource>,
     query: parking_lot::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
     acquisition: std::sync::Mutex<Option<crossbeam_channel::Receiver<ReaderAcquisition>>>,
+    owner: super::callgraph_acquisition::AcquisitionOwner,
     /// The last reader with the source revision of the cut it reads. Taken
     /// only under `query`. A query whose source still reports that revision
     /// as steady reuses the reader instead of binding again.
@@ -743,9 +757,10 @@ pub(crate) struct CallgraphView {
     current: crate::migration::v3_ledger::ImportControl,
 }
 
-type ReaderAcquisition = Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError>;
+pub(super) type ReaderAcquisition =
+    Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError>;
 
-fn graph_building() -> CallgraphViewError {
+pub(super) fn graph_building() -> CallgraphViewError {
     CallgraphViewError {
         reason: "callgraph_building".into(),
         busy: true,
@@ -773,6 +788,7 @@ impl CallgraphView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && !self.owner.stopped()
             && (self.current)()
     }
 
@@ -865,6 +881,7 @@ impl CallgraphView {
         source: Arc<dyn CallgraphReaderSource>,
     ) -> Self {
         Self {
+            owner: super::callgraph_acquisition::AcquisitionOwner::new(root.clone()),
             root,
             storage,
             family,
@@ -885,6 +902,25 @@ impl CallgraphView {
         self.ready
             .store(false, std::sync::atomic::Ordering::Release);
         self.source.record_change(path);
+    }
+
+    pub(crate) fn set_executor(
+        &mut self,
+        executor: Option<crate::executor::RootMaintenanceExecutor>,
+    ) {
+        self.owner.set_executor(executor);
+    }
+
+    pub(crate) fn set_publish_fence(&self, fence: Arc<dyn super::first_load::PublishFence>) {
+        self.source.set_publish_fence(fence);
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.owner.cancel();
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.owner.shutdown();
     }
 
     pub(crate) fn record_overflow(&self) {
@@ -925,7 +961,7 @@ impl CallgraphView {
         now: impl Fn() -> std::time::Instant,
     ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
         let deadline = std::time::Instant::now() + super::contracts::CALLGRAPH_QUERY_WAIT;
-        if !(self.current)() {
+        if self.owner.stopped() || !(self.current)() {
             return Err(CallgraphViewError {
                 reason: "checkout is no longer bound to this generation".into(),
                 busy: true,
@@ -1008,34 +1044,20 @@ impl CallgraphView {
                     return Err(error);
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
-                Err(error) => {
+                Err(_) => {
                     *acquisition = None;
-                    return Err(error.to_string().into());
+                    return Err(graph_building());
                 }
             }
         }
         if acquisition.is_none() {
             let source = self.source.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
-            #[cfg(test)]
-            let root = self.root.clone();
-            // The worker owns its source and publication pins independently of
-            // the request. Dropping a timed-out read never cancels this work.
-            std::thread::Builder::new()
-                .name("callgraph-view-acquire".into())
-                .spawn(move || {
-                    let result = source.acquire_with_revision();
-                    #[cfg(test)]
-                    let finished = if result.is_ok() {
-                        "callgraph-reader-acquired"
-                    } else {
-                        "callgraph-acquisition-failed"
-                    };
-                    let _ = tx.send(result);
-                    #[cfg(test)]
-                    crate::storage_retention::test_hook(&root, finished);
-                })
-                .map_err(|error| CallgraphViewError::from(error.to_string()))?;
+            self.owner.spawn(
+                self.current.clone(),
+                move || source.acquire_with_revision(),
+                tx,
+            )?;
             #[cfg(test)]
             self.acquisitions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1051,9 +1073,9 @@ impl CallgraphView {
                 result
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(graph_building()),
-            Err(error) => {
+            Err(_) => {
                 *acquisition = None;
-                Err(error.to_string().into())
+                Err(graph_building())
             }
         }
     }

@@ -488,6 +488,14 @@ pub trait PublishFence: Send + Sync {
         -> Result<(), PlaneError>;
 }
 
+fn check_job_cancelled() -> Result<(), PlaneError> {
+    if crate::executor::current_job_cancelled() {
+        Err(SiblingLoader::error(SUPERSEDED_PUBLISH.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Derived graphs cannot be copied between checkouts until tests prove their
 /// rows contain no source-root-dependent data. Per-file blobs remain reusable.
 pub const DERIVED_CALLGRAPH_SEEDING: bool = false;
@@ -3091,6 +3099,7 @@ impl CheckoutDriver {
         snapshot: &Snapshot,
         header: super::manifest_v2::BaseHeader,
     ) -> Result<Arc<ComposedGeneration>, PlaneError> {
+        check_job_cancelled()?;
         let failed =
             |error: super::base_refs::BaseRefError| SiblingLoader::error(error.to_string());
         let route = self.owner.v3_route();
@@ -3220,6 +3229,7 @@ impl CheckoutDriver {
             .entries
             .clone();
         for plane in &self.planes {
+            check_job_cancelled()?;
             plane.materialize_v3(
                 &self.owner,
                 &route,
@@ -3229,6 +3239,7 @@ impl CheckoutDriver {
                 &mut delta,
                 &mut live,
             )?;
+            check_job_cancelled()?;
         }
         // `Wold`: the installed v3 generation of this checkout, or the
         // durable v3 pointer when the installed bundle is not one.
@@ -3281,6 +3292,8 @@ impl CheckoutDriver {
                 Ok(())
             },
             &mut || {
+                check_job_cancelled()
+                    .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))?;
                 if let Some(guard) = snapshot
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
@@ -3299,6 +3312,7 @@ impl CheckoutDriver {
                         .publication_transition
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    check_job_cancelled()?;
                     actual =
                         Some(commit().map_err(|error| SiblingLoader::error(error.to_string()))?);
                     Ok(())
@@ -5043,6 +5057,7 @@ impl CompositePlane for CallgraphBridge {
         let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
         #[cfg(test)]
         crate::storage_retention::test_hook(_owner.root(), "callgraph-materialize");
+        check_job_cancelled()?;
         let mut v3_readers = V3PlaneReaders::new(route);
         let mut attachments = Vec::new();
         for (path, entry) in observed {
@@ -5114,7 +5129,15 @@ impl CompositePlane for CallgraphBridge {
                 .saturating_add(1 << 20);
             let schema = FamilyPlane::Callgraph.payload_schema();
             crate::blob_store::v3::publish(&route.storage, &route.family, request, None, |p| {
+                #[cfg(test)]
+                crate::storage_retention::test_hook(_owner.root(), "callgraph-reserved");
+                if crate::executor::current_job_cancelled() {
+                    return Err(crate::blob_store::v3::Error::Refused(SUPERSEDED_PUBLISH));
+                }
                 for (_, key, bytes) in &payloads {
+                    if crate::executor::current_job_cancelled() {
+                        return Err(crate::blob_store::v3::Error::Refused(SUPERSEDED_PUBLISH));
+                    }
                     p.put(key, bytes, schema)?;
                 }
                 Ok(())
@@ -5137,6 +5160,7 @@ impl CompositePlane for CallgraphBridge {
         }
         drop((payloads, attachments));
         // Serialization and parsing buffers no longer belong to this phase.
+        check_job_cancelled()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         crate::memory::relieve_allocator_pressure();
         // The derived graph covers the composed generation. While the base's
