@@ -2588,6 +2588,51 @@ mod tests {
     }
 
     #[test]
+    fn home_directory_changes_preserve_complete_operands() {
+        let project = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        let cases = [
+            ("cd ~/sub/dir || exit 1; cp rel/a rel/b", "sub/dir"),
+            ("cd ~/x && cp rel/a rel/b", "x"),
+            ("cd ~ && cp rel/a rel/b", ""),
+            (r#"cd "$HOME/x"; cp rel/a rel/b"#, "x"),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (command, suffix) in cases {
+            let tree = parse_tree(command).unwrap();
+            let mut nodes = Vec::new();
+            collect_commands(tree.root_node(), &mut nodes);
+            let parts = command_parts(command, nodes[0]);
+            let mut cwd = Some(project.path().to_path_buf());
+            track_cwd_change("cd", &parts, Some(&home), &mut cwd, &mut Vec::new());
+            actual.push((command, cwd));
+            expected.push((command, Some(resolve_existing(&home.join(suffix)))));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn home_directory_change_guard_does_not_invent_external_targets() {
+        let project = tempfile::tempdir().unwrap();
+        for command in [
+            "cd ~/sub/dir || exit 1; cp rel/a rel/b",
+            r#"cd "$HOME/x"; cp rel/a rel/b"#,
+        ] {
+            let asks = scan_with_project_root(command, project.path(), project.path());
+            assert!(
+                asks.iter().any(|ask| ask.reason.as_deref()
+                    == Some(UNKNOWN_CWD_PERMISSION_REASON)),
+                "{command}: {asks:?}"
+            );
+            assert!(
+                asks.iter().all(|ask| ask.kind != PermissionKind::ExternalDirectory),
+                "{command}: {asks:?}"
+            );
+        }
+    }
+
+    #[test]
     fn external_path_outside_the_project_still_asks() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
