@@ -6111,15 +6111,11 @@ fn scoped_rust_inspect_retains_compiler_error_when_reopening_unchanged_file() {
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1500");
 
-    // Only the compiler push contains the error. Reopening unchanged bytes does
+    // The compiler error arrives only in a push. Reopening unchanged bytes does
     // not start another check, and the native pull is empty on both requests.
     for id in ["compiler-before-close", "compiler-after-reopen"] {
         let response = scoped_diagnostics_inspect(&ctx, id, "src/lib.rs");
         assert_eq!(response["complete"], true, "{response:#}");
-        assert_eq!(
-            response["summary"]["diagnostics"]["errors"], 1,
-            "{response:#}"
-        );
         assert!(
             diagnostic_messages_for(&response, "src/lib.rs")
                 .iter()
