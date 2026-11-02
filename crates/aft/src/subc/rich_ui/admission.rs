@@ -4,7 +4,7 @@
 use serde_json::Value;
 use subc_protocol::ErrorBody;
 
-use super::{chunks, schema};
+use super::{authorization, schema};
 
 #[derive(Debug)]
 pub(crate) struct Operation {
@@ -24,7 +24,7 @@ impl Operation {
         let mut arguments = self.arguments.clone();
         match self.entry["id"].as_str() {
             Some("bash_status" | "bash_output") => {
-                arguments = serde_json::json!({"taskId":task_id.ok_or_else(|| chunks::refusal("task_not_found"))?});
+                arguments = serde_json::json!({"taskId":task_id.ok_or_else(|| authorization::refusal("task_not_found"))?});
             }
             Some("bash_watch") => {
                 let args = arguments.as_object_mut().expect("operation args validated");
@@ -45,19 +45,19 @@ impl Operation {
                 args.insert(
                     "taskId".into(),
                     task_id
-                        .ok_or_else(|| chunks::refusal("task_not_found"))?
+                        .ok_or_else(|| authorization::refusal("task_not_found"))?
                         .into(),
                 );
             }
             _ if self.entry["kind"] == "page" => {
-                return Err(chunks::refusal("operation_version_unsupported"))
+                return Err(authorization::refusal("operation_version_unsupported"))
             }
             _ => {}
         }
         let call = serde_json::from_value(serde_json::json!({
             "name":self.entry["target"]["tool"], "arguments":arguments
         }))
-        .map_err(|_| chunks::refusal("args_invalid"))?;
+        .map_err(|_| authorization::refusal("args_invalid"))?;
         super::super::tool_provider::admit_arguments(
             &call,
             super::super::tool_provider::CallerRole::Head,
@@ -70,8 +70,7 @@ impl Operation {
 /// Parse and validate the operation and arguments before looking up the
 /// session's policy route or consulting its database.
 pub(crate) fn prepare(name: &str, arguments: &Value) -> Result<Operation, ErrorBody> {
-    let manifest = chunks::running_manifest()
-        .and_then(|(_, bytes)| serde_json::from_slice::<Value>(&bytes).ok());
+    let manifest = authorization::operation_policy();
     prepare_with_manifest(name, arguments, manifest.as_ref())
 }
 
@@ -83,13 +82,13 @@ fn prepare_with_manifest(
     let mut arguments = arguments
         .as_object()
         .cloned()
-        .ok_or_else(|| chunks::refusal("rich_ui_op_malformed"))?;
+        .ok_or_else(|| authorization::refusal("rich_ui_op_malformed"))?;
     let encoded = arguments.remove("rich_ui_op");
     let (id, version) = encoded
         .as_ref()
         .and_then(Value::as_str)
         .and_then(parse_operation)
-        .ok_or_else(|| chunks::refusal("rich_ui_op_malformed"))?;
+        .ok_or_else(|| authorization::refusal("rich_ui_op_malformed"))?;
     let entry = manifest
         .and_then(|manifest| manifest["operations"].as_array())
         .and_then(|entries| {
@@ -97,23 +96,23 @@ fn prepare_with_manifest(
                 .iter()
                 .find(|entry| entry["id"] == id && entry["version"] == version)
         })
-        .ok_or_else(|| chunks::refusal("operation_version_unsupported"))?;
+        .ok_or_else(|| authorization::refusal("operation_version_unsupported"))?;
     let name = crate::tool_gate::canonical_tool_name(name)
         .map(super::super::carrier_read_only::internal_name)
         .unwrap_or(name);
     if entry["target"]["module"] != "aft" || entry["target"]["tool"] != name {
-        return Err(chunks::refusal("operation_target_mismatch"));
+        return Err(authorization::refusal("operation_target_mismatch"));
     }
     if ["session", "session_id", "sessionId"]
         .iter()
         .any(|key| arguments.contains_key(*key))
     {
-        return Err(chunks::refusal("bound_field_supplied"));
+        return Err(authorization::refusal("bound_field_supplied"));
     }
     let task = match (entry["scope"].as_str(), arguments.remove("task")) {
         (Some("call"), Some(Value::String(task))) => Some(task),
         (Some("session"), None) => None,
-        _ => return Err(chunks::refusal("args_invalid")),
+        _ => return Err(authorization::refusal("args_invalid")),
     };
     let arguments = Value::Object(arguments);
     let limit = entry["limits"]["argsBytes"].as_u64().unwrap_or(8192) as usize;
@@ -121,7 +120,7 @@ fn prepare_with_manifest(
         || schema::validate(&entry["args"], &arguments).is_err()
         || remote_target(name, &arguments)
     {
-        return Err(chunks::refusal("args_invalid"));
+        return Err(authorization::refusal("args_invalid"));
     }
     Ok(Operation {
         entry: entry.clone(),

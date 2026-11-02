@@ -355,6 +355,24 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "subc/rich_ui/records.rs",
+        enclosing_item: "cut_detail",
+        location_or_primitive: "canonical byte limit, files.pop, UTF-8 stream prefix",
+        reason: "tool-display/v1 details use their own truncated/omittedItems/omittedBytes envelope, measured on RFC 8785 bytes, rather than the model-facing ListEnvelope.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/outbox.rs",
+        enclosing_item: "admit, retry, pop_due",
+        location_or_primitive: "MAX_CALLS, MAX_BYTES, EXPIRY, attempts",
+        reason: "Optional display delivery quotas bound pending snapshots and retries, never a tool's result list or execution.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/display.rs",
+        enclosing_item: "register",
+        location_or_primitive: "calls.len() >= 64",
+        reason: "Optional in-flight display capture admission is bounded independently of command execution; a rejected display capture never truncates the tool reply.",
+    },
+    ExclusionEntry {
         file: "semantic_index.rs",
         enclosing_item: "format_skipped_chunks_summary",
         location_or_primitive: ".take(5)",

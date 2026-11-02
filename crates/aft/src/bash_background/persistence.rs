@@ -1977,6 +1977,9 @@ pub struct PersistedTask {
     /// version: older JSON without this field still reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_pin: Option<String>,
+    /// Original display identity and once-only terminal publication fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) display: Option<crate::subc::rich_ui::display::TaskDisplay>,
     /// The daemon's scope owner, reference and epoch at spawn. A reconnect
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2083,6 +2086,7 @@ impl PersistedTask {
             output_incomplete: false,
             call_key,
             schema_pin: super::current_schema_pin(),
+            display: crate::subc::rich_ui::display::current_task(),
             scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
@@ -2248,6 +2252,7 @@ impl From<BashTaskRow> for PersistedTask {
             output_incomplete: false,
             call_key: None,
             schema_pin: None,
+            display: None,
             scope: None,
             remote: None,
             execution_note: None,

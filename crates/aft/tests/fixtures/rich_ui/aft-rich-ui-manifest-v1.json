@@ -1,7 +1,6 @@
 {
-  "format": "aft-rich-ui-manifest-v1",
-  "publication": "injected-test-manifest",
-  "manifestDigest": "sha256:3e11d5d9c9f14be5bf59f5eec229643e5c2e481ef7736e081d63fe1701b30f56",
+  "format": "aft-carrier-read-fixtures/1",
+  "publication": "injected-test-policy",
   "vectors": [
     {
       "name": "read",

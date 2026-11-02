@@ -1,12 +1,12 @@
 use super::*;
 use crate::subc::persistence::DatabaseWaits;
-use crate::subc::rich_ui::{carrier, chunks};
+use crate::subc::rich_ui::{authorization, carrier};
 
 const MANIFEST: &[u8] = include_bytes!("../../../../tests/fixtures/rich_ui/manifest.jcs.json");
 
 #[tokio::test]
 async fn session_read_targets_keep_frozen_gate_and_step_five_refusals() {
-    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest = authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (_dir, root) = test_support::test_root("session-read-targets");
     let cases: Vec<Value> = serde_json::from_slice(include_bytes!(
         "../../../../tests/fixtures/rich_ui/target-arguments.json"
@@ -59,7 +59,7 @@ async fn session_read_targets_keep_frozen_gate_and_step_five_refusals() {
 
 #[tokio::test]
 async fn operation_route_gate_and_admission_precedence() {
-    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest = authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (_dir, root) = test_support::test_root("operation-route");
     for (name, args, code, gate) in [
         ("bash", json!({}), "carrier_read_only", true),
@@ -152,7 +152,7 @@ async fn operation_route_gate_and_admission_precedence() {
 
 #[tokio::test]
 async fn operation_unpublished_carrier_status_and_read_fail_closed() {
-    let _manifest = chunks::set_test_manifest_for_test(None);
+    let _manifest = authorization::set_test_manifest_for_test(None);
     let (_dir, root) = test_support::test_root("operation-unpublished");
     for name in ["read", "bash_status"] {
         let reply = exchange_with_actor(
@@ -286,7 +286,7 @@ fn operation_ledger_namespace_preserves_unsigned_epoch() {
 
 #[tokio::test]
 async fn operation_structural_refusals_do_not_wait_for_database_or_confinement() {
-    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest = authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (_dir, root) = test_support::test_root("operation-precheck");
     let ctx = test_support::test_ctx();
     ctx.mark_database_runtime_initializing_for_test();
@@ -327,7 +327,7 @@ async fn operation_structural_refusals_do_not_wait_for_database_or_confinement()
 #[tokio::test]
 async fn operation_ledger_isolates_custodian_sessions_and_replays_exact_body() {
     use crate::db::call_ledger::{self as ledger, Admission, Key, RecordedFrame, State};
-    let _manifest = chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest = authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (dir, root) = test_support::test_root("operation-ledger");
     let ctx = test_support::test_ctx();
     let db = Arc::new(StdMutex::new(
