@@ -21,7 +21,10 @@ enum Binding {
         symbol: Option<String>,
         prefix: String,
     },
-    LocalDefinition(String),
+    LocalDefinition {
+        symbol: String,
+        position: usize,
+    },
     Shadowed,
 }
 
@@ -41,14 +44,14 @@ struct Extractor<'a> {
     calls: Vec<(Node<'a>, usize)>,
 }
 
-pub(super) struct Extraction {
+pub(crate) struct Extraction {
     pub imports: ImportBlock,
     pub bindings: Vec<CallBinding>,
     pub owners: HashMap<usize, String>,
     pub reexports: Vec<ImportStatement>,
 }
 
-pub(super) fn extract(source: &str, root: Node<'_>) -> Extraction {
+pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
     let mut extractor = Extractor {
         source,
         scopes: vec![Scope {
@@ -79,7 +82,7 @@ pub(super) fn extract(source: &str, root: Node<'_>) -> Extraction {
             }
             let binding = extractor.lookup(*scope, parts[0])?;
             let target = match binding {
-                Binding::LocalDefinition(symbol) if parts.len() == 1 => {
+                Binding::LocalDefinition { symbol, .. } if parts.len() == 1 => {
                     Some((String::new(), symbol.clone()))
                 }
                 Binding::Imported {
@@ -190,7 +193,10 @@ impl<'a> Extractor<'a> {
                 self.bind(
                     scope,
                     &self.source[name.byte_range()],
-                    Binding::LocalDefinition(path.join("::")),
+                    Binding::LocalDefinition {
+                        symbol: path.join("::"),
+                        position: node.start_byte(),
+                    },
                 );
             }
             let id = self.scopes.len();
@@ -250,6 +256,16 @@ impl<'a> Extractor<'a> {
                 self.shadow_pattern(left, scope);
             }
         }
+        if node.kind() == "as_pattern" {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                self.shadow_pattern(alias, scope);
+            }
+        }
+        if node.kind() == "delete_statement" {
+            for child in node.named_children(&mut node.walk()) {
+                self.shadow_pattern(child, scope);
+            }
+        }
         if node.kind() == "call" {
             self.calls.push((node, scope));
         }
@@ -263,7 +279,7 @@ impl<'a> Extractor<'a> {
             self.bind(scope, &self.source[node.byte_range()], Binding::Shadowed);
         } else if matches!(
             node.kind(),
-            "pattern_list" | "tuple_pattern" | "list_pattern"
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "as_pattern_target"
         ) {
             for child in node.named_children(&mut node.walk()) {
                 self.shadow_pattern(child, scope);

@@ -15760,8 +15760,15 @@ fn build_file_extract_in_corpus(
         &facts,
     );
     let line_index = LineIndex::new(&source);
-    let reexports =
-        collect_reexport_refs(project_root, &abs_path, &rel_path, &source, memo, &facts);
+    let reexports = collect_reexport_refs(
+        project_root,
+        &abs_path,
+        &rel_path,
+        &source,
+        lang,
+        memo,
+        &facts,
+    );
     let rust_reexports = if lang == LangId::Rust {
         collect_rust_pub_use_reexport_refs(
             project_root,
@@ -16592,6 +16599,7 @@ fn collect_reexport_refs(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    lang: LangId,
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> ReexportRefs {
@@ -16600,6 +16608,7 @@ fn collect_reexport_refs(
         abs_path,
         rel_path,
         source,
+        lang,
         memo,
         facts,
         &LineIndex::new(source),
@@ -16611,11 +16620,12 @@ fn collect_reexport_refs_with_line_index(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    lang: LangId,
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
     line_index: &LineIndex,
 ) -> ReexportRefs {
-    if abs_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+    if lang == LangId::Python {
         let Ok(tree) = parse_source_with_cached_parser(abs_path, source, LangId::Python) else {
             return ReexportRefs {
                 raw_refs: Vec::new(),
@@ -32649,6 +32659,29 @@ edition = "2021"
         )
         .unwrap();
         project_dead_code_snapshot_from_view(&view).unwrap().1
+    }
+
+    #[test]
+    fn callgraph_python_reexports_headers_and_constructors_match_manifest_view() {
+        let dir = tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let files = vec![
+            write_file(&root, "pkg/impl.py", "def factory():\n    pass\nclass Widget:\n    def __init__(self):\n        pass\n"),
+            write_file(&root, "pkg/__init__.py", "from .impl import factory as public\nfrom .impl import Widget\n"),
+            write_file(&root, "calls.py", "from pkg import public, Widget\ndef outer():\n    def inner(public=public()):\n        public()\n    Widget()\n"),
+        ];
+        let (_, legacy) = go_fixture_store(&root, &files);
+        let view = callgraph_fixture_view(&root, &files);
+        for snapshot in [&legacy, &view] {
+            assert_projected_call(&root, snapshot, "pkg/impl.py", "factory");
+            assert_projected_call(&root, snapshot, "pkg/impl.py", "Widget::__init__");
+            assert!(snapshot
+                .outbound_calls
+                .iter()
+                .all(|call| call.caller_symbol == "outer"));
+            assert_eq!(snapshot.outbound_calls.len(), 2);
+        }
+        assert_eq!(projection_rows(&legacy), projection_rows(&view));
     }
 
     #[test]

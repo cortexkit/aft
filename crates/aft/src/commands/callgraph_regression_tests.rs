@@ -184,7 +184,9 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
         ("ambiguous.py", "if condition:\n    from pkg.source import target as public\nelse:\n    from pkg.source import replacement as public\n"),
         ("cycle_a.py", "from cycle_b import public\n"),
         ("cycle_b.py", "from cycle_a import public\n"),
-        ("negative.py", "from hidden import public as hidden\nfrom shadowed import public as shadowed\nfrom ambiguous import public as ambiguous\nfrom cycle_a import public as cyclic\ndef rejected():\n    hidden()\n    shadowed()\n    ambiguous()\n    cyclic()\n"),
+        ("deleted.py", "from pkg.source import target as public\ndel public\n"),
+        ("with_alias.py", "from pkg.source import target as public\nwith unknown() as public:\n    pass\n"),
+        ("negative.py", "from hidden import public as hidden\nfrom shadowed import public as shadowed\nfrom ambiguous import public as ambiguous\nfrom cycle_a import public as cyclic\nfrom deleted import public as deleted\nfrom with_alias import public as with_alias\ndef rejected():\n    hidden()\n    shadowed()\n    ambiguous()\n    cyclic()\n    deleted()\n    with_alias()\n"),
     ]);
     let sites = store
         .direct_callers_of(Path::new("pkg/source.py"), "target")
@@ -244,6 +246,7 @@ fn callgraph_python_constructors_follow_class_bindings_not_names() {
         ("pkg/__init__.py", "from .source import Widget as Public\n"),
         ("calls.py", "from pkg import Public as Renamed\nimport pkg.source as module\nclass Local:\n    def __init__(self):\n        pass\ndef construct():\n    Local()\n    Renamed()\n    module.Widget()\ndef shadow(Renamed):\n    Renamed()\n"),
         ("unrelated.py", "class Renamed:\n    def __init__(self):\n        pass\n"),
+        ("duplicate.py", "class Duplicate:\n    def __init__(self):\n        pass\ndef Duplicate():\n    pass\ndef rejected():\n    Duplicate()\n"),
     ]);
     let sites = store
         .direct_callers_of(Path::new("pkg/source.py"), "Widget::__init__")
@@ -259,6 +262,10 @@ fn callgraph_python_constructors_follow_class_bindings_not_names() {
     assert_eq!(local[0].caller.symbol, "construct");
     assert!(store
         .direct_callers_of(Path::new("unrelated.py"), "Renamed::__init__")
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .direct_callers_of(Path::new("duplicate.py"), "Duplicate::__init__")
         .unwrap()
         .is_empty());
 }

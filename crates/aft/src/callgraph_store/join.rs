@@ -345,6 +345,7 @@ impl CallgraphBlob {
             file,
             "__callgraph_blob__",
             source,
+            lang,
             &crate::callgraph::ModuleResolutionMemo::default(),
             &paths,
             &line_index,
