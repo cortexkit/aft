@@ -284,13 +284,16 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
         ctx.memoized_artifact_cache_key(&checkout),
         owner.memoized_artifact_cache_key(&fixture.join("owner"))
     );
+    // The refusal may observe the lease before denying it, so the directory is
+    // read once, before the attempt.
+    let callgraph_dir = ctx.callgraph_store_dir().join("writer.lease");
     let result = aft::callgraph_store::CallGraphStore::open(ctx.callgraph_store_dir(), checkout);
     let error = result.err().expect("legacy writer must be refused");
     assert!(
         error.to_string().contains("writer capability denied"),
         "{error}"
     );
-    assert!(!ctx.callgraph_store_dir().join("writer.lease").exists());
+    assert!(!callgraph_dir.exists());
     assert!(!storage.join("blobs/v3").exists());
 }
 
