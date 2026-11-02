@@ -12,9 +12,16 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = if files.iter().any(|(path, _)| path.starts_with(".git/")) {
         crate::test_helpers::project::unborn_git_project_tempdir()
     } else {
-        crate::test_helpers::project::git_project_tempdir()
+        crate::test_helpers::project::project_tempdir()
     };
+    setup_project_in(temp_dir, files)
+}
 
+fn setup_git_project(files: &[(&str, &str)]) -> tempfile::TempDir {
+    setup_project_in(crate::test_helpers::project::git_project_tempdir(), files)
+}
+
+fn setup_project_in(temp_dir: tempfile::TempDir, files: &[(&str, &str)]) -> tempfile::TempDir {
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -300,7 +307,7 @@ fn grep_regex_over_em_dash_does_not_panic() {
 
 #[test]
 fn grep_reports_empty_scope_separately() {
-    let project = setup_project(&[]);
+    let project = setup_git_project(&[]);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path());
 
@@ -421,6 +428,8 @@ fn grep_and_glob_files(root: &Path, indexed: bool) -> (Vec<String>, Vec<String>)
 fn grep_and_glob_skip_gitignored_paths_in_non_git_root_like_git_root() {
     let plain = ignore_rules_project(false);
     let git = ignore_rules_project(true);
+    assert!(!plain.path().join(".git").exists());
+    assert!(git.path().join(".git/HEAD").is_file());
     let visible = vec![
         "src/main.rs".to_string(),
         "src/nested/keep.rs".to_string(),
@@ -840,7 +849,7 @@ fn em_dash_patterns_match_the_same_lines_on_indexed_and_fallback_grep() {
 #[cfg(debug_assertions)]
 #[test]
 fn grep_while_index_builds_says_the_walk_searched_every_file() {
-    let project = setup_project(&[
+    let project = setup_git_project(&[
         (
             ".fixture-id",
             "grep_while_index_builds_says_the_walk_searched_every_file\n",
