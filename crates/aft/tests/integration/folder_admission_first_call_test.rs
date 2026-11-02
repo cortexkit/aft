@@ -240,9 +240,13 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     );
     assert_eq!(status["folder"]["coverage"]["complete"], false);
     aft.send_silent(&configure(&project, &storage, "fast-bind", false).to_string());
-    aft.send_silent(&search("fast-tool").to_string());
     assert_eq!(response(&mut aft, "fast-bind")["success"], true);
-    let tool = response(&mut aft, "fast-tool");
+    // Reconnecting stages another check; its ACK is not a completed verdict.
+    std::fs::write(&delay, "0").unwrap();
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["state"], "decided", "{folder}");
+    assert_eq!(folder["classification"], "project", "{folder}");
+    let tool = aft.send(&search("fast-tool").to_string());
     assert_eq!(tool["success"], true, "{tool}");
     assert_ne!(tool["code"], "folder_not_admitted", "{tool}");
     let (status, stderr) = aft.stderr_output();

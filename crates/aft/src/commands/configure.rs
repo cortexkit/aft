@@ -10524,13 +10524,18 @@ mod tests {
 
     fn settle_configure_for_test(ctx: &AppContext) {
         // Configure returns before checking whether the folder can be indexed.
-        // Drain that check and the replayed configuration before reading an index view.
+        // An idle tail can still be waiting for admission's retry backoff. Wait
+        // for the admission decision and deferred configure maintenance to finish
+        // before reading an index view.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             super::drain_deferred_configure_maintenance(ctx);
+            let folder_decided = crate::folder_admission_runtime::snapshot(ctx)
+                .is_none_or(|folder| folder["state"] == "decided");
             if ctx.configure_tail_idle()
                 && !crate::folder_admission_runtime::pending(ctx)
                 && !crate::provisional_identity_retry::due(ctx)
+                && folder_decided
             {
                 return;
             }
@@ -25256,7 +25261,14 @@ mod tests {
         }));
         let response = handle_folder_configure_for_test(&req, &ctx);
         if let Some((started, release)) = gate {
-            settle_configure_for_test(&ctx);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::folder_admission_runtime::poll_wait(&ctx) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the held admission wait did not end"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
             assert_eq!(folder["classification"], Value::Null, "{folder}");
