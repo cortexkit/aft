@@ -241,11 +241,12 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                         node.end_position().column as u32,
                         name.as_str(),
                     )) {
+                        let symbol = symbol.scoped_name.clone();
                         result.object_methods.push(MethodHint {
                             owner: object_identity(object),
                             trait_name: None,
                             name,
-                            symbol: symbol.scoped_name.clone(),
+                            symbol,
                             has_body: field(*node, &["body"]).is_some(),
                             shape: String::new(),
                             private: false,
