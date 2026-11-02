@@ -1496,9 +1496,7 @@ pub(crate) fn handle_inspect_deferred_with_clock(
     let mut deadline = InspectRequestDeadline::for_request_at(req, &ctx.config(), now());
     if let Some(reply_deadline) = reply_deadline {
         deadline.terminal_at = deadline.terminal_at.min(reply_deadline);
-        deadline.budget = deadline
-            .terminal_at
-            .saturating_duration_since(Instant::now());
+        deadline.budget = deadline.terminal_at.saturating_duration_since(now());
         deadline.work_at = deadline
             .work_at
             .min(deadline.terminal_at - INSPECT_TERMINAL_MARGIN.min(deadline.budget / 2));
@@ -2350,7 +2348,10 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if message.contains("inspect_request_timeout") {
+    if response.data.get("failure_reason").and_then(Value::as_str)
+        == Some("inspect_request_timeout")
+        || message.contains("inspect_request_timeout")
+    {
         "inspect_request_timeout"
     } else if message.contains("writer_lease_timeout") {
         "writer_lease_timeout"
@@ -8790,27 +8791,41 @@ mod deferred_terminal_tests {
         let ctx = deferred_test_context(root.path());
         let (started_rx, _release_tx) =
             install_deferred_inspect_body_gate_for_request_for_test("inspect-client-deadline");
-        let started = Instant::now();
+        // Hold producer work independently of host speed; the injected clock,
+        // not a real 250ms worker deadline, drives the reply cutoff below.
+        let started = Instant::now() + Duration::from_secs(60);
+        let clock = Arc::new(Mutex::new(started));
+        let now = Arc::clone(&clock);
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _wake = wake.install();
         let request = serde_json::from_value(serde_json::json!({
             "id":"inspect-client-deadline", "command":"inspect", "sections":["todos"], "scope":"note.txt"
         })).unwrap();
-        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred_with_reply_deadline(
+        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred_with_clock(
             &request,
             ctx.clone(),
             false,
             Some(started + Duration::from_millis(500)),
+            move || *now.lock().unwrap(),
         ) else {
             panic!("inspect must defer");
         };
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let response = wait_for_pending_terminal(&mut pending, &ctx);
+        assert!((pending.poll)(&ctx).is_none());
+        *clock.lock().unwrap() = started + Duration::from_millis(250);
+        let response =
+            (pending.poll)(&ctx).expect("reply deadline must retain its terminal reserve");
         assert_eq!(response.data["inspect_terminal"], "partial", "{response:?}");
         assert_eq!(response.data["complete"], false);
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "inspect missed caller reply deadline: {:?}",
-            started.elapsed()
-        );
+        assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+        let cleanup_deadline = Instant::now() + Duration::from_millis(900);
+        while wake.generation() == 0 {
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "inspect ignored cancellation"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
