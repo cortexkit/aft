@@ -603,10 +603,12 @@ fn cap_read(response: &Response, text: &mut String) -> Option<()> {
     let mut appended = &text[after_paging..];
     let fixed_bytes = start + native_tail.len() + if has_paging { paging.len() } else { 0 };
     let remaining = TEXT_LIMIT.checked_sub(fixed_bytes)?;
-    if appended.len() > remaining {
+    let first_line_bytes = body.find('\n').map_or(0, |newline| newline + 1);
+    let notice_budget = remaining.saturating_sub(first_line_bytes);
+    if appended.len() > notice_budget {
         // If notices alone exceed the budget, retain their whole-line suffix
         // (including the status bar) after the read recovery text.
-        let excess = appended.len() - remaining;
+        let excess = appended.len() - notice_budget;
         let skip = appended.as_bytes()[excess..]
             .iter()
             .position(|byte| *byte == b'\n')
@@ -1361,18 +1363,20 @@ mod tests {
                 "total_lines":2000,"truncated":true
             }),
         );
-        let mut text = crate::subc_format::format_response("read", &response, false);
-        text.push_str(&"界".repeat(TEXT_LIMIT));
-        text.push_str("\nstatus bar");
-        cap(&ctx, "owner", "read", &response, &mut text);
-        assert!(text.len() <= TEXT_LIMIT);
-        assert!(text.starts_with(
-            "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
-        ));
-        assert!(text.contains("Use startLine/endLine or offset/limit to read other sections."));
-        assert!(text.ends_with("\nstatus bar"));
-        assert!(!text.contains("[output cut"));
-        assert!(ctx.output_files().files.lock().is_empty());
+        for notices in ["界".repeat(TEXT_LIMIT), "界\n".repeat(TEXT_LIMIT)] {
+            let mut text = crate::subc_format::format_response("read", &response, false);
+            text.push_str(&notices);
+            text.push_str("\nstatus bar");
+            cap(&ctx, "owner", "read", &response, &mut text);
+            assert!(text.len() <= TEXT_LIMIT);
+            assert!(text.starts_with(
+                "1: first\n... (output truncated at 50KB, use start_line/end_line to read sections)\n"
+            ));
+            assert!(text.contains("Use startLine/endLine or offset/limit to read other sections."));
+            assert!(text.ends_with("\nstatus bar"));
+            assert!(!text.contains("[output cut"));
+            assert!(ctx.output_files().files.lock().is_empty());
+        }
     }
 
     #[test]
