@@ -315,6 +315,125 @@ fn last_executor_owner_can_drop_on_worker() {
     assert!(recv_async(response, "last owner drop").success);
 }
 
+#[test]
+fn callgraph_submit_last_owner_returns_before_dependent_worker() {
+    let executor = test_executor(3, 2, 2, 1);
+    let (_a_dir, a_root) = test_root("callgraph-last-submit");
+    let (_b_dir, b_root) = test_root("callgraph-dependent-worker");
+    executor.register_actor(a_root.clone(), test_ctx());
+    executor.register_actor(b_root.clone(), test_ctx());
+    let submitter = RootMaintenanceExecutor {
+        inner: Arc::downgrade(&executor.inner),
+        root_id: a_root.clone(),
+    };
+    let (upgraded_tx, upgraded_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *executor.inner.maintenance_root_check_hook.lock() = Some(Box::new(move || {
+        upgraded_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }));
+    let (peer_started_tx, peer_started_rx) = crossbeam_channel::bounded(1);
+    let (after_submit_tx, after_submit_rx) = crossbeam_channel::bounded(1);
+    let (abort_tx, abort_rx) = crossbeam_channel::bounded(1);
+    let peer = executor.submit(
+        b_root,
+        Lane::PureRead,
+        "dependent-worker".into(),
+        Box::new(move |_| {
+            peer_started_tx.send(()).unwrap();
+            crossbeam_channel::select! {
+                recv(after_submit_rx) -> _ => {},
+                recv(abort_rx) -> _ => {},
+                default(Duration::from_secs(5)) => panic!("dependent worker was not released"),
+            }
+            ok("dependent-worker")
+        }),
+    );
+    peer_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let (returned_tx, returned_rx) = crossbeam_channel::bounded(1);
+    let caller = executor.submit(
+        a_root,
+        Lane::PureRead,
+        "last-owner-submit".into(),
+        Box::new(move |_| {
+            assert!(submitter.submit_heavy(JobCancellation::new(), Box::new(|_| ok("acquire"))));
+            returned_tx.send(()).unwrap();
+            let _ = after_submit_tx.send(());
+            ok("last-owner-submit")
+        }),
+    );
+    upgraded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The paused submitter now owns the only other strong reference. Its
+    // worker must return before the dependent worker can finish.
+    drop(executor);
+    release_tx.send(()).unwrap();
+    let returned_before_abort = returned_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let _ = abort_tx.send(());
+    assert!(peer.recv_timeout(Duration::from_secs(5)).unwrap().success);
+    assert!(caller.recv_timeout(Duration::from_secs(5)).unwrap().success);
+    assert!(
+        returned_before_abort,
+        "worker-side submission joined its dependent worker during last-owner drop"
+    );
+}
+
+#[test]
+fn callgraph_maintenance_preserves_other_heavy_overlap() {
+    let executor = test_executor(6, 3, 4, 3);
+    let (_dir, root) = test_root("callgraph-heavy-coexistence");
+    executor.register_actor(root.clone(), test_ctx());
+    let submitter = RootMaintenanceExecutor {
+        inner: Arc::downgrade(&executor.inner),
+        root_id: root.clone(),
+    };
+    let (graph_started_tx, graph_started_rx) = crossbeam_channel::bounded(1);
+    let (graph_release_tx, graph_release_rx) = crossbeam_channel::bounded(1);
+    assert!(submitter.submit_heavy(
+        JobCancellation::new(),
+        Box::new(move |_| {
+            graph_started_tx.send(()).unwrap();
+            graph_release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            ok("callgraph-acquisition")
+        })
+    ));
+    graph_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let (started_tx, started_rx) = crossbeam_channel::unbounded();
+    let (release_tx, release_rx) = crossbeam_channel::unbounded();
+    let mut replies = Vec::new();
+    for number in 0..2 {
+        let started_tx = started_tx.clone();
+        let release_rx = release_rx.clone();
+        replies.push(executor.submit_maintenance_async(
+            root.clone(),
+            Lane::HeavyInit,
+            format!("other-heavy-{number}"),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                ok("other-heavy")
+            }),
+        ));
+    }
+    let first = started_rx.recv_timeout(Duration::from_millis(500));
+    let second = started_rx.recv_timeout(Duration::from_millis(500));
+    graph_release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+    for reply in replies {
+        assert!(recv_async(reply, "other heavy maintenance").success);
+    }
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "unrelated heavy maintenance was serialized behind callgraph acquisition"
+    );
+}
+
 fn observe_max(max_seen: &AtomicUsize, value: usize) {
     let mut current = max_seen.load(Ordering::Acquire);
     while value > current {

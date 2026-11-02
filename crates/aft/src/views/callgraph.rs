@@ -1561,6 +1561,75 @@ mod tests {
     }
 
     #[test]
+    fn cancel_reaches_completed_and_running_acquisition_tokens() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = Arc::new(view(&root, &temp.path().join("storage")));
+        let tail_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tokens_tx, tokens_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                let hold_tail = step == "callgraph-reader-acquired"
+                    && !tail_seen.swap(true, std::sync::atomic::Ordering::AcqRel);
+                let hold_work = step == "callgraph-materialize"
+                    && tail_seen.load(std::sync::atomic::Ordering::Acquire);
+                if hold_tail || hold_work {
+                    let token = crate::executor::current_job_cancellation().unwrap();
+                    tokens_tx.send(token.clone()).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !token.cancel_already_requested() {
+                        if release_rx
+                            .recv_timeout(std::time::Duration::from_millis(10))
+                            .is_ok()
+                        {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "acquisition gate was not released"
+                        );
+                    }
+                }
+            }),
+        );
+        assert!(graph.reader().is_ok());
+        let old = tokens_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function latest() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        let next_graph = graph.clone();
+        let next = std::thread::spawn(move || next_graph.reader());
+        let current = tokens_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_ne!(old.progress_key(), current.progress_key());
+        graph.cancel();
+        let old_cancelled = old.wait_for_cancellation(std::time::Duration::from_millis(250));
+        let current_cancelled = current.cancel_already_requested();
+        let _ = release_tx.send(());
+        let answer = next.join().unwrap();
+        drop(graph);
+        assert!(answer.unwrap_err().building);
+        assert!(
+            current_cancelled,
+            "running acquisition token was not cancelled"
+        );
+        assert!(
+            old_cancelled,
+            "the earlier completion tail lost its cancellation token"
+        );
+    }
+
+    #[test]
     fn v3_checkpoint_contention_reaches_checkout_reader_as_busy() {
         use crate::blob_store::v3;
         use crate::db::file_identity::IdentityConnection;
