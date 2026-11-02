@@ -11,5 +11,10 @@
   // passing runon: "linux" to bash. Lines that need macOS stay local.
   "remote_exec": {
     "enabled": true
+  },
+  // Masons here run on the fast service tier (Ufuk, 2 Nov). Routing picks an
+  // account whose plan includes it and falls back to standard otherwise.
+  "workers": {
+    "service_tier": "fast"
   }
 }
