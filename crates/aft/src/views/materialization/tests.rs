@@ -66,6 +66,9 @@ struct Fixture {
     next: Manifest,
 }
 
+#[path = "reader_tests.rs"]
+pub(super) mod reader_tests;
+
 fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
     // Seed each manifest in one transaction; per-row durable commits make the
     // read-side fixtures unnecessarily expensive on Windows.

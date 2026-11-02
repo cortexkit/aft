@@ -30,6 +30,7 @@
 //!   database and print each table's and index's size in the main file.
 //! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
 //!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
+//! - `AFT_UPDATE_BENCH_READER=1`: patch through the v3 blob-reader adapter.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -249,6 +250,11 @@ fn bench_repository_incremental_update() {
     }
     drop(store);
 
+    let v3_reader = std::env::var_os("AFT_UPDATE_BENCH_READER").map(|_| {
+        let connection = Connection::open(&blobs).unwrap();
+        tests::reader_tests::v3_reader(&connection, &out.path().join("v3"))
+    });
+
     let keeper = |path: &Path| {
         let keeper = Connection::open(path).unwrap();
         keeper.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -260,7 +266,7 @@ fn bench_repository_incremental_update() {
         keeper
     };
     let cold = |label: &str, manifest: &Manifest| -> std::path::PathBuf {
-        let path = out.path().join(format!("cold-{label}.sqlite"));
+        let path = out.path().join(format!("derived-cold-{label}.sqlite"));
         let _keeper = keeper(&path);
         let (cpu_before, _) = usage();
         let started = Instant::now();
@@ -370,7 +376,9 @@ fn bench_repository_incremental_update() {
             new_db.as_ref().unwrap()
         };
         let size = manifest_diff_size(base, target);
-        let db = out.path().join(format!("incremental-{label}.sqlite"));
+        let db = out
+            .path()
+            .join(format!("derived-incremental-{label}.sqlite"));
         crate::views::generation::clone_derived(base_db, &db).unwrap();
         if synced {
             // Flush every pending write on the machine before timing, so the
@@ -394,7 +402,12 @@ fn bench_repository_incremental_update() {
         };
         let window_start = epoch();
         let started = Instant::now();
-        let (stats, timings) = materialize(&db, &blobs, target, Some(base)).unwrap();
+        let (stats, timings) = if let Some(reader) = &v3_reader {
+            materialize_reading(&db, target, Some(base), reader, None)
+        } else {
+            materialize(&db, &blobs, target, Some(base))
+        }
+        .unwrap();
         let wall = started.elapsed().as_secs_f64();
         // Wall-clock bounds, to line the run up with system-call traces.
         println!(
@@ -416,6 +429,10 @@ fn bench_repository_incremental_update() {
         );
         println!("update bench stats label={label} {stats:?}");
         println!("update bench timings label={label} {timings:?}");
+        println!(
+            "update bench patch_wal label={label} bytes={}",
+            super::profile::wal_len(&db)
+        );
         // Commit cost outside materialization: one small write committed on a
         // connection configured like the materializer's, then the WAL frames
         // a separate PASSIVE checkpoint finds and the time it takes.
@@ -461,6 +478,23 @@ fn bench_repository_incremental_update() {
         if parity {
             let expected = cold(&format!("target-{label}"), target);
             parity::assert_logical_parity(&db, &expected);
+            if v3_reader.is_some() {
+                tests::reader_tests::assert_query_parity(
+                    &db,
+                    &expected,
+                    &[
+                        (
+                            "crates/aft/src/views/materialization.rs",
+                            "apply_manifest_diff",
+                        ),
+                        (
+                            "crates/aft/src/callgraph_store/join.rs",
+                            "CallgraphBlob::extract",
+                        ),
+                        ("crates/aft/src/views/materialization.rs", "materialize_manifest_view_database"),
+                    ],
+                );
+            }
             println!("update bench parity label={label} equal=true");
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", expected.display()));

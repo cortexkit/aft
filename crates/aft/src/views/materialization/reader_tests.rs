@@ -1,0 +1,236 @@
+use super::*;
+use crate::blob_store::v2::{FamilyKey, FamilyPlane};
+use crate::blob_store::v3::{publish, PlaneReader};
+use crate::views::callgraph::V3BlobReader;
+
+// Copy rows through the fixture's owning SQLite connection. The destination
+// uses the v3 publication API so its PlaneReader shares the publication's owner.
+pub(crate) fn v3_reader(connection: &Connection, storage: &Path) -> V3BlobReader {
+    let rows = connection
+        .prepare("SELECT full_key, payload FROM blob_payloads")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let request = rows.iter().map(|(_, payload)| payload.len() as u64).sum();
+    publish(storage, "reader-test", request, None, |publication| {
+        for (key, payload) in &rows {
+            publication.put(
+                &FamilyKey::new(FamilyPlane::Callgraph, key.as_slice().try_into().unwrap()),
+                payload,
+                crate::blob_store::CALLGRAPH_PAYLOAD_SCHEMA,
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    V3BlobReader::new(
+        PlaneReader::open_existing(storage, "reader-test", FamilyPlane::Callgraph).unwrap(),
+    )
+}
+
+pub(crate) fn assert_query_parity(actual: &Path, expected: &Path, queries: &[(&str, &str)]) {
+    let open = |path: &Path| {
+        let generation = path
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("derived-")
+            .unwrap();
+        crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
+            path.parent().unwrap().to_path_buf(),
+            "reader-test".into(),
+            path.parent().unwrap().to_path_buf(),
+            generation,
+        )
+        .unwrap()
+    };
+    let (actual, expected) = (open(actual), open(expected));
+    for &(file, symbol) in queries {
+        let file = Path::new(file);
+        assert_eq!(
+            format!("{:?}", actual.callers_of(file, symbol, 3).unwrap()).as_bytes(),
+            format!("{:?}", expected.callers_of(file, symbol, 3).unwrap()).as_bytes(),
+            "callers {file:?} {symbol}"
+        );
+        assert_eq!(
+            format!("{:?}", actual.impact_of(file, symbol, 3).unwrap()).as_bytes(),
+            format!("{:?}", expected.impact_of(file, symbol, 3).unwrap()).as_bytes(),
+            "impact {file:?} {symbol}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&actual.call_tree(file, symbol, 3).unwrap()).unwrap(),
+            serde_json::to_vec(&expected.call_tree(file, symbol, 3).unwrap()).unwrap(),
+            "call_tree {file:?} {symbol}"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                actual
+                    .outgoing_calls_of(&actual.node_for(file, symbol).unwrap())
+                    .unwrap()
+            )
+            .as_bytes(),
+            format!(
+                "{:?}",
+                expected
+                    .outgoing_calls_of(&expected.node_for(file, symbol).unwrap())
+                    .unwrap()
+            )
+            .as_bytes(),
+            "callees {file:?} {symbol}"
+        );
+    }
+}
+
+#[test]
+fn blob_reader_patch_selects_one_file_and_reuses_dispatch() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let files = (0..12)
+        .map(|i| {
+            (
+                format!("file_{i}.ts"),
+                format!("export function f{i}(x) {{ x.run(); }}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let entries = |edited| {
+        files
+            .iter()
+            .map(|(path, source)| {
+                (
+                    path.clone(),
+                    if edited && path == "file_0.ts" {
+                        format!("{source}\nexport function added() {{}}")
+                    } else {
+                        source.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let versions = [false, true].map(|edited| {
+        let files = entries(edited);
+        manifest(
+            &connection,
+            &files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+    let patched = f.dir.path().join("derived-selected.sqlite");
+    let cold = f.dir.path().join("derived-cold.sqlite");
+    materialize_from_blob_reader(&patched, &versions[0], &reader).unwrap();
+    let stats = apply_manifest_diff_from_blob_reader(&patched, &versions[0], &versions[1], &reader)
+        .unwrap();
+    assert_eq!(stats.resolved_files, 1, "{stats:?}");
+    assert_eq!(stats.dispatch_resolved_files, 1, "{stats:?}");
+    assert!(!stats.full_resolution && !stats.dispatch_full, "{stats:?}");
+    materialize_from_blob_reader(&cold, &versions[1], &reader).unwrap();
+    parity::assert_logical_parity(&patched, &cold);
+    assert_query_parity(&patched, &cold, &[("file_0.ts", "f0")]);
+}
+
+#[test]
+fn blob_reader_patch_relinks_incoming_ordinals() {
+    let f = relinking_fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+    let patched = f.dir.path().join("derived-relinked.sqlite");
+    let cold = f.dir.path().join("derived-cold.sqlite");
+    materialize_from_blob_reader(&patched, &f.base, &reader).unwrap();
+    let before = snapshot(&patched);
+    let stats = apply_manifest_diff_from_blob_reader(&patched, &f.base, &f.next, &reader).unwrap();
+    assert!(!stats.full_resolution && !stats.dispatch_full, "{stats:?}");
+    assert!(stats.relinked_inserted > 0, "{stats:?}");
+    materialize_from_blob_reader(&cold, &f.next, &reader).unwrap();
+    assert_ne!(before["edges"], snapshot(&cold)["edges"]);
+    parity::assert_logical_parity(&patched, &cold);
+    assert_query_parity(
+        &patched,
+        &cold,
+        &[("target.ts", "target"), ("caller.ts", "caller")],
+    );
+}
+
+#[test]
+fn blob_reader_patch_language_corpus_matches_full_through_edits_and_renames() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let mut corpus = DifferentialCorpus::new(7).with_directory_packages();
+    let mut versions = Vec::new();
+    for choice in [
+        None,
+        Some(0),
+        Some(5),
+        Some(6),
+        Some(8),
+        Some(9),
+        Some(12),
+        Some(14),
+        Some(15),
+        Some(16),
+        Some(17),
+        Some(18),
+        Some(19),
+    ] {
+        if let Some(choice) = choice {
+            corpus.apply(choice);
+        }
+        versions.push(manifest(
+            &connection,
+            &corpus
+                .files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    let renamed = corpus.files.remove("mod_0.ts").unwrap();
+    corpus.files.insert("renamed.ts".into(), renamed);
+    versions.push(manifest(
+        &connection,
+        &corpus
+            .files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    ));
+    let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+    let patched = f.dir.path().join("derived-chain.sqlite");
+    materialize_from_blob_reader(&patched, &versions[0], &reader).unwrap();
+    let mut from = 0;
+    // Reverse transitions exercise removal of the added declarations and files.
+    for to in (1..versions.len()).chain((0..versions.len() - 1).rev()) {
+        let stats =
+            apply_manifest_diff_from_blob_reader(&patched, &versions[from], &versions[to], &reader)
+                .unwrap();
+        assert!(
+            !stats.full_resolution && !stats.dispatch_full,
+            "{from}->{to}: {stats:?}"
+        );
+        let cold = f
+            .dir
+            .path()
+            .join(format!("derived-cold-{from}-{to}.sqlite"));
+        materialize_from_blob_reader(&cold, &versions[to], &reader).unwrap();
+        parity::assert_logical_parity(&patched, &cold);
+        assert_query_parity(
+            &patched,
+            &cold,
+            &[
+                ("draw.ts", "draw"),
+                ("src/lib.rs", "entry"),
+                ("gosvc/talk.go", "Talk"),
+            ],
+        );
+        from = to;
+    }
+}
