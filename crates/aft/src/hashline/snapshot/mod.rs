@@ -959,6 +959,9 @@ pub fn render_tagged_snapshot(
 pub struct RenderOptions {
     pub max_output_bytes: usize,
     pub max_line_length: usize,
+    /// Headroom for finalization notices. When nonzero, the `[path#TAG]` header
+    /// and elision footer also fit inside the advertised limit, not after the body.
+    pub reserved_bytes: usize,
 }
 
 impl Default for RenderOptions {
@@ -966,6 +969,7 @@ impl Default for RenderOptions {
         Self {
             max_output_bytes: MAX_RENDER_BYTES,
             max_line_length: MAX_RENDER_LINE_LENGTH,
+            reserved_bytes: 0,
         }
     }
 }
@@ -977,6 +981,7 @@ pub fn render_tagged_snapshot_with_options(
 ) -> TaggedRendering {
     let requested_path = requested_path.into();
     let mut text = format!("[{requested_path}#{}]\n", snapshot.tag.to_ascii_uppercase());
+    let body_limit = read_body_limit(options, text.len(), snapshot.total_lines);
     let mut body_bytes = 0usize;
     let mut rendered_lines = BTreeSet::new();
     let mut display_truncated_lines = BTreeSet::new();
@@ -987,7 +992,7 @@ pub fn render_tagged_snapshot_with_options(
         let content = String::from_utf8_lossy(&record.content);
         let (display, was_truncated) = truncate_display_line(&content, options.max_line_length);
         let line = format!("{line_number}:{display}\n");
-        if body_bytes.saturating_add(line.len()) > options.max_output_bytes {
+        if body_bytes.saturating_add(line.len()) > body_limit {
             first_elided.get_or_insert(line_number);
             last_elided = Some(line_number);
             continue;
@@ -1002,10 +1007,7 @@ pub fn render_tagged_snapshot_with_options(
 
     let elided_range = first_elided.map(|start| {
         let end = last_elided.unwrap_or(start);
-        let notice = format!(
-            "... (output truncated at {}KB, use start_line/end_line to read sections; lines {start}-{end} are not addressable)\n",
-            options.max_output_bytes / 1024
-        );
+        let notice = elision_notice(options.max_output_bytes, start, end);
         text.push_str(&notice);
         LineRange::new(start, end)
     });
@@ -1027,8 +1029,17 @@ pub fn render_tagless_snapshot(
     snapshot: &Snapshot,
     requested_path: impl Into<String>,
 ) -> TaglessRendering {
+    render_tagless_snapshot_with_options(snapshot, requested_path, RenderOptions::default())
+}
+
+fn render_tagless_snapshot_with_options(
+    snapshot: &Snapshot,
+    requested_path: impl Into<String>,
+    options: RenderOptions,
+) -> TaglessRendering {
     let requested_path = requested_path.into();
     let mut text = String::new();
+    let body_limit = read_body_limit(options, 0, snapshot.total_lines);
     let mut body_bytes = 0usize;
     let mut rendered_lines = BTreeSet::new();
     let mut first_elided = None;
@@ -1038,7 +1049,7 @@ pub fn render_tagless_snapshot(
             "{line_number}: {}\n",
             String::from_utf8_lossy(&record.content)
         );
-        if body_bytes.saturating_add(line.len()) > MAX_RENDER_BYTES {
+        if body_bytes.saturating_add(line.len()) > body_limit {
             first_elided.get_or_insert(line_number);
             last_elided = Some(line_number);
             continue;
@@ -1049,10 +1060,7 @@ pub fn render_tagless_snapshot(
     }
     let elided_range = first_elided.map(|start| {
         let end = last_elided.unwrap_or(start);
-        text.push_str(&format!(
-            "... (output truncated at {}KB, use start_line/end_line to read sections; lines {start}-{end} are not addressable)\n",
-            MAX_RENDER_BYTES / 1024
-        ));
+        text.push_str(&elision_notice(options.max_output_bytes, start, end));
         LineRange::new(start, end)
     });
     TaglessRendering {
@@ -1061,6 +1069,26 @@ pub fn render_tagless_snapshot(
         rendered_lines,
         elided_range,
     }
+}
+
+fn elision_notice(limit: usize, start: usize, end: usize) -> String {
+    format!(
+        "... (output truncated at {}KB, use start_line/end_line to read sections; lines {start}-{end} are not addressable)\n",
+        limit / 1024
+    )
+}
+
+fn read_body_limit(options: RenderOptions, header_bytes: usize, total_lines: usize) -> usize {
+    if options.reserved_bytes == 0 {
+        return options.max_output_bytes;
+    }
+    // Decide elision before publishing seen-line evidence. Finalization may
+    // shorten notices, but must never remove already-published hashline rows.
+    options.max_output_bytes.saturating_sub(
+        options.reserved_bytes
+            + header_bytes
+            + elision_notice(options.max_output_bytes, total_lines, total_lines).len(),
+    )
 }
 
 fn truncate_display_line(content: &str, max_length: usize) -> (String, bool) {
@@ -1297,7 +1325,11 @@ pub(crate) fn capture_taggable_source_with_options(
     if !write_eligible {
         let tagless_snapshot = snapshot_for_lines(&source_snapshot, &selected);
         return Ok(ReadPublication::Tagless {
-            rendering: render_tagless_snapshot(&tagless_snapshot, requested_path),
+            rendering: render_tagless_snapshot_with_options(
+                &tagless_snapshot,
+                requested_path,
+                options,
+            ),
             reason: UntaggableReason::ReadOnly,
         });
     }
@@ -1306,7 +1338,11 @@ pub(crate) fn capture_taggable_source_with_options(
     {
         let tagless_snapshot = snapshot_for_lines(&source_snapshot, &selected);
         return Ok(ReadPublication::Tagless {
-            rendering: render_tagless_snapshot(&tagless_snapshot, requested_path.clone()),
+            rendering: render_tagless_snapshot_with_options(
+                &tagless_snapshot,
+                requested_path.clone(),
+                options,
+            ),
             reason: if bytes.is_empty() {
                 UntaggableReason::EmptyRange
             } else {
@@ -1327,7 +1363,11 @@ pub(crate) fn capture_taggable_source_with_options(
     } = outcome.status
     {
         return Ok(ReadPublication::Tagless {
-            rendering: render_tagless_snapshot(&selected_snapshot, requested_path),
+            rendering: render_tagless_snapshot_with_options(
+                &selected_snapshot,
+                requested_path,
+                options,
+            ),
             reason: UntaggableReason::Oversize {
                 bytes: retained_bytes as u64,
                 limit: limit as u64,
@@ -1359,10 +1399,44 @@ pub fn capture_bash_rewrite_read(
     funnel_accepted: bool,
     effective_hashline: bool,
 ) -> io::Result<ReadPublication> {
+    capture_bash_rewrite_read_with_options(
+        store,
+        canonical_path,
+        requested_path,
+        kind,
+        experimental_bash_rewrite,
+        funnel_accepted,
+        effective_hashline,
+        RenderOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_bash_rewrite_read_with_options(
+    store: &mut SnapshotStore,
+    canonical_path: impl AsRef<Path>,
+    requested_path: impl Into<String>,
+    kind: BashReadKind,
+    experimental_bash_rewrite: bool,
+    funnel_accepted: bool,
+    effective_hashline: bool,
+    options: RenderOptions,
+) -> io::Result<ReadPublication> {
     if !(experimental_bash_rewrite && funnel_accepted && effective_hashline) {
-        return capture_tagless_read(canonical_path, requested_path, kind.selection());
+        return capture_tagless_read_with_options(
+            canonical_path,
+            requested_path,
+            kind.selection(),
+            options,
+        );
     }
-    capture_taggable_read(store, canonical_path, requested_path, kind.selection())
+    capture_taggable_read_with_options(
+        store,
+        canonical_path,
+        requested_path,
+        kind.selection(),
+        options,
+    )
 }
 
 /// Capture a bash read without publication. This path intentionally does not
@@ -1371,6 +1445,20 @@ pub fn capture_tagless_read(
     canonical_path: impl AsRef<Path>,
     requested_path: impl Into<String>,
     selection: ReadSelection,
+) -> io::Result<ReadPublication> {
+    capture_tagless_read_with_options(
+        canonical_path,
+        requested_path,
+        selection,
+        RenderOptions::default(),
+    )
+}
+
+fn capture_tagless_read_with_options(
+    canonical_path: impl AsRef<Path>,
+    requested_path: impl Into<String>,
+    selection: ReadSelection,
+    options: RenderOptions,
 ) -> io::Result<ReadPublication> {
     let canonical_path = canonical_path.as_ref();
     let requested_path = requested_path.into();
@@ -1381,7 +1469,7 @@ pub fn capture_tagless_read(
     let selected = selection.selected_lines(snapshot.total_lines);
     let snapshot = snapshot_for_lines(&snapshot, &selected);
     Ok(ReadPublication::Tagless {
-        rendering: render_tagless_snapshot(&snapshot, requested_path),
+        rendering: render_tagless_snapshot_with_options(&snapshot, requested_path, options),
         reason: UntaggableReason::VirtualPath,
     })
 }
@@ -1745,6 +1833,7 @@ mod tests {
             RenderOptions {
                 max_output_bytes: 80,
                 max_line_length: MAX_RENDER_LINE_LENGTH,
+                reserved_bytes: 0,
             },
         )
         .unwrap();

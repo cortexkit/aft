@@ -1597,6 +1597,13 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             _ => None,
         });
     let selection = read_selection(req, &response);
+    // Hashline evidence is published before completion/repeated-call reminders
+    // and the status bar are appended. Reserve room before rendering; the final
+    // cap can shorten those notices, never published rows.
+    let render_options = crate::hashline::snapshot::RenderOptions {
+        reserved_bytes: 10 * 1024,
+        ..Default::default()
+    };
     let publication = guard.with_binding_mut(|binding| {
         if let Some(captured) = &captured_source {
             #[cfg(test)]
@@ -1609,13 +1616,13 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     &path,
                     requested_path.clone(),
                     selection,
-                    crate::hashline::snapshot::RenderOptions::default(),
+                    render_options,
                     &captured.source,
                 );
             }
         }
         if let Some(kind) = bash_kind {
-            crate::hashline::snapshot::capture_bash_rewrite_read(
+            crate::hashline::snapshot::capture_bash_rewrite_read_with_options(
                 binding.snapshots_mut(),
                 &path,
                 requested_path.clone(),
@@ -1623,13 +1630,15 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.config().experimental_bash_rewrite,
                 true,
                 true,
+                render_options,
             )
         } else {
-            crate::hashline::snapshot::capture_taggable_read(
+            crate::hashline::snapshot::capture_taggable_read_with_options(
                 binding.snapshots_mut(),
                 &path,
                 requested_path.clone(),
                 selection,
+                render_options,
             )
         }
     });
@@ -1656,6 +1665,11 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .unwrap_or(first_line);
                 data.insert("content".into(), Value::String(rendering.text));
                 data.remove("read_output_tail");
+                if rendering.elided_range.is_some() {
+                    data.insert("read_output_frozen".into(), Value::Bool(true));
+                    data.insert("complete".into(), Value::Bool(false));
+                    data.insert("truncated".into(), Value::Bool(true));
+                }
                 data.insert(
                     "requested_path".into(),
                     Value::String(rendering.requested_path),
@@ -1671,8 +1685,26 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             crate::hashline::snapshot::ReadPublication::Tagless { rendering, reason } => {
                 if !rendering.text.is_empty() {
+                    let first_line = rendering.rendered_lines.iter().next().copied().unwrap_or(1);
+                    let last_line = rendering
+                        .rendered_lines
+                        .iter()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(first_line);
+                    data.insert(
+                        "lines_read".into(),
+                        Value::from(rendering.rendered_lines.len()),
+                    );
+                    data.insert("start_line".into(), Value::from(first_line));
+                    data.insert("end_line".into(), Value::from(last_line));
                     data.insert("content".into(), Value::String(rendering.text));
                     data.remove("read_output_tail");
+                    if rendering.elided_range.is_some() {
+                        data.insert("read_output_frozen".into(), Value::Bool(true));
+                        data.insert("complete".into(), Value::Bool(false));
+                        data.insert("truncated".into(), Value::Bool(true));
+                    }
                 }
                 data.insert(
                     "requested_path".into(),

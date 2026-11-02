@@ -680,9 +680,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "tool_output.rs",
-        enclosing_item: "cap_with_scope, cap_read, render_cut, render_cut_with_data, read, cleanup_expired, SCAN_ENTRIES, save_failed_trailer",
+        enclosing_item: "cap_with_scope, cap_read, notice_suffix, render_cut, render_cut_with_data, read, cleanup_expired, SCAN_ENTRIES, save_failed_trailer",
         location_or_primitive: "rendered reply and saved artifact byte bounds",
         reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; read instead reclaims whole source lines for its native paging footer and notices without saving a copy; failure reasons have a bounded UTF-8 prefix, artifact reads have a separate 64 MiB allocation guard, and retention cleanup resumes each bounded directory scan",
+    },
+    ExclusionEntry {
+        file: "hashline/snapshot/mod.rs",
+        enclosing_item: "read_body_limit, render_tagged_snapshot_with_options, render_tagless_snapshot_with_options",
+        location_or_primitive: "hashline read byte budget with reserved finalization headroom",
+        reason: "a source-text byte ceiling, not a result list; elision is decided before publishing exactly the rendered seen-line set, and the existing footer names unaddressable lines; finalization preserves published rows and spends reserved headroom on notices",
     },
     ExclusionEntry {
         file: "commands/bash_watch.rs",

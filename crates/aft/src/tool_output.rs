@@ -590,16 +590,25 @@ fn cap_read(response: &Response, text: &mut String) -> Option<()> {
         .find(|data| {
             data.get("read_output_tail")
                 .is_some_and(serde_json::Value::is_u64)
+                || data["read_output_frozen"] == true
         })?;
     let content = data.get("content")?.as_str()?;
-    let body_end = usize::try_from(data["read_output_tail"].as_u64()?).ok()?;
-    let body = content.get(..body_end)?;
-    let native_tail = content.get(body_end..)?;
     let start = text.find(content)?;
     let after_content = start + content.len();
     let paging = crate::subc_format::format_read_footer(false, data);
     let has_paging = !paging.is_empty() && text[after_content..].starts_with(&paging);
     let after_paging = after_content + if has_paging { paging.len() } else { 0 };
+    if data["read_output_frozen"] == true {
+        // Hashline publishes exactly the rendered rows. Keep that rendering
+        // intact, spending its reserved headroom on the most recent notices.
+        let allowance = TEXT_LIMIT.checked_sub(after_paging)?;
+        let suffix = notice_suffix(&text[after_paging..], allowance).to_owned();
+        text.replace_range(after_paging.., &suffix);
+        return Some(());
+    }
+    let body_end = usize::try_from(data["read_output_tail"].as_u64()?).ok()?;
+    let body = content.get(..body_end)?;
+    let native_tail = content.get(body_end..)?;
     let mut appended = &text[after_paging..];
     let fixed_bytes = start + native_tail.len() + if has_paging { paging.len() } else { 0 };
     let remaining = TEXT_LIMIT.checked_sub(fixed_bytes)?;
@@ -608,12 +617,7 @@ fn cap_read(response: &Response, text: &mut String) -> Option<()> {
     if appended.len() > notice_budget {
         // If notices alone exceed the budget, retain their whole-line suffix
         // (including the status bar) after the read recovery text.
-        let excess = appended.len() - notice_budget;
-        let skip = appended.as_bytes()[excess..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(appended.len(), |newline| excess + newline + 1);
-        appended = &appended[skip..];
+        appended = notice_suffix(appended, notice_budget);
     }
     let allowance = remaining - appended.len();
     let end = body.as_bytes()[..allowance.min(body.len())]
@@ -645,6 +649,18 @@ fn cap_read(response: &Response, text: &mut String) -> Option<()> {
     tail.push_str(appended);
     text.replace_range(start + end.., &tail);
     Some(())
+}
+
+fn notice_suffix(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        return text;
+    }
+    let excess = text.len() - budget;
+    let skip = text.as_bytes()[excess..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(text.len(), |newline| excess + newline);
+    &text[skip..]
 }
 
 fn save_failed_trailer(total: usize, reason: &str) -> String {
@@ -1376,6 +1392,112 @@ mod tests {
             assert!(text.ends_with("\nstatus bar"));
             assert!(!text.contains("[output cut"));
             assert!(ctx.output_files().files.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_hashline_read_preserves_footer_and_exact_seen_lines_with_long_reminders() {
+        for ranged in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let ctx = context(&root, &root.join("store"));
+            assert!(
+                ctx.hashline_bindings()
+                    .register(
+                        &root,
+                        "owner".into(),
+                        crate::hashline::integration::RegistrationRequest {
+                            configured_enabled: true,
+                            edit_slot_survives: true,
+                            read_slot_survives: true,
+                        }
+                    )
+                    .effective
+            );
+            let source: String = (1..=2000)
+                .map(|line| {
+                    format!(
+                        "line-{line}-{}\n",
+                        if line % 5 == 0 {
+                            "y".into()
+                        } else {
+                            "界".repeat(27)
+                        }
+                    )
+                })
+                .collect();
+            let path = root.join("huge-hashline.txt");
+            std::fs::write(&path, &source).unwrap();
+            let mut params = json!({"file":path, "_hashline_requested_path":"huge-hashline.txt"});
+            if ranged {
+                params["start_line"] = 1.into();
+                params["end_line"] = 2000.into();
+            }
+            let response = crate::commands::read::handle_read(
+                &crate::protocol::RawRequest {
+                    id: "read-hashline-cap".into(),
+                    command: "read".into(),
+                    lsp_hints: None,
+                    session_id: Some("owner".into()),
+                    params,
+                },
+                &ctx,
+            );
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["read_output_frozen"], true);
+            let content = response.data["content"].as_str().unwrap();
+            let mut text = crate::subc_format::format_response("read", &response, ranged);
+            text.push_str(&format!(
+                "\n<system-reminder>\n{}</system-reminder>\nstatus bar",
+                "long reminder\n".repeat(1600)
+            ));
+            assert!(text.len() > TEXT_LIMIT);
+            cap(&ctx, "owner", "read", &response, &mut text);
+            assert!(text.len() <= TEXT_LIMIT);
+            assert!(
+                text.starts_with(content),
+                "published rendering must remain byte-identical"
+            );
+            assert!(text.ends_with("\nstatus bar"));
+            assert!(!text.contains("[output cut"));
+            assert!(ctx.output_files().files.lock().is_empty());
+
+            let shown: std::collections::BTreeSet<usize> = text
+                .lines()
+                .skip(1)
+                .take_while(|line| line.starts_with(|c: char| c.is_ascii_digit()))
+                .map(|line| {
+                    let (number, body) = line.split_once(':').unwrap();
+                    let number: usize = number.parse().unwrap();
+                    assert_eq!(body, source.lines().nth(number - 1).unwrap());
+                    number
+                })
+                .collect();
+            assert!(!shown.is_empty());
+            let omitted: Vec<_> = (1..=2000).filter(|line| !shown.contains(line)).collect();
+            assert!(!omitted.is_empty());
+            let footer = format!("... (output truncated at 50KB, use start_line/end_line to read sections; lines {}-{} are not addressable)\n", omitted.first().unwrap(), omitted.last().unwrap());
+            assert!(content.ends_with(&footer));
+            assert!(text.contains(&footer));
+            let guard = ctx
+                .hashline_bindings()
+                .capture(root.clone(), "owner".into())
+                .unwrap();
+            guard.with_binding(|binding| {
+                let (_, snapshot) = binding.snapshots().iter().next().unwrap();
+                assert_eq!(snapshot.coverage.seen_lines, shown);
+                assert_eq!(
+                    snapshot
+                        .records
+                        .keys()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    shown
+                );
+                for line in 1..=2000 {
+                    assert_eq!(snapshot.is_seen(line), shown.contains(&line), "line {line}");
+                }
+            });
         }
     }
 
