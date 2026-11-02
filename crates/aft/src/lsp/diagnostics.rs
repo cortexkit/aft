@@ -1,9 +1,58 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
+use crate::views::verification::NativeStat;
+
+struct VerifiedContent {
+    stat: NativeStat,
+    observed_ns: u128,
+    hash: [u8; 32],
+}
+
+#[derive(Default)]
+struct ContentVerifications {
+    entries: HashMap<PathBuf, VerifiedContent>,
+    memory_bytes: u64,
+}
+
+impl ContentVerifications {
+    fn remove(&mut self, file: &Path) {
+        if let Some((file, _)) = self.entries.remove_entry(file) {
+            self.memory_bytes = self.memory_bytes.saturating_sub(
+                DiagnosticsStore::file_memory_bytes(&file)
+                    .saturating_add(std::mem::size_of::<VerifiedContent>() as u64),
+            );
+        }
+    }
+
+    fn insert(&mut self, file: PathBuf, verified: VerifiedContent) {
+        self.remove(&file);
+        self.memory_bytes = self.memory_bytes.saturating_add(
+            DiagnosticsStore::file_memory_bytes(&file)
+                .saturating_add(std::mem::size_of::<VerifiedContent>() as u64),
+        );
+        self.entries.insert(file, verified);
+    }
+}
+
+fn reusable_content_stat(stat: &NativeStat, observed_ns: u128) -> bool {
+    #[cfg(unix)]
+    let regular = stat.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32;
+    #[cfg(windows)]
+    // NativeStat reads FILE_BASIC_INFO.ChangeTime, but it is a clock timestamp,
+    // not a write counter: rapid writes can keep both it and LastWriteTime.
+    // Windows must re-hash even when all native metadata compares equal.
+    let regular = false;
+    #[cfg(not(any(unix, windows)))]
+    let regular = false;
+    regular
+        && stat.reusable(stat, observed_ns)
+        && stat.changed_ns >= 0
+        && (stat.changed_ns as u128) < observed_ns
+}
 
 /// A single diagnostic from an LSP server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -107,6 +156,10 @@ pub struct DiagnosticsStore {
     /// Secondary lookup from a file to every server with a cached report.
     /// Every mutation of `entries` must update this index in the same operation.
     by_file: HashMap<PathBuf, HashSet<ServerKey>>,
+    // Keep disk-content proofs independently of report versions. Reopening a
+    // document invalidates its reports, but not a proof of unchanged disk bytes.
+    // Entries leave with the last report for the file, sharing the store's cap.
+    verified_content: parking_lot::Mutex<ContentVerifications>,
     /// Publish sequence maps to entries for oldest-first eviction.
     order: BTreeMap<u64, (ServerKey, PathBuf)>,
     order_clock: u64,
@@ -130,6 +183,47 @@ thread_local! {
 }
 
 impl DiagnosticsStore {
+    pub(crate) fn verified_content_hash(&self, file: &Path) -> Option<[u8; 32]> {
+        let observed_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let before = NativeStat::read(file).ok();
+        {
+            let mut memo = self.verified_content.lock();
+            if let (Some(cached), Some(current)) = (memo.entries.get(file), before.as_ref()) {
+                if reusable_content_stat(current, cached.observed_ns)
+                    && cached.stat.reusable(current, cached.observed_ns)
+                {
+                    return Some(cached.hash);
+                }
+            }
+            memo.remove(file);
+        }
+        let hash = super::document::file_content_hash(file)?;
+        if let Some(before) = before.filter(|stat| reusable_content_stat(stat, observed_ns)) {
+            let after = NativeStat::read(file).ok();
+            let mut memo = self.verified_content.lock();
+            // Never save a hash read across a write or replacement. Links and
+            // filesystems without precise native change evidence stay strict.
+            if self.by_file.contains_key(file) && after.as_ref() == Some(&before) {
+                memo.insert(
+                    file.to_path_buf(),
+                    VerifiedContent {
+                        stat: before,
+                        observed_ns,
+                        hash,
+                    },
+                );
+            }
+        }
+        Some(hash)
+    }
+
+    fn verification_memory_bytes(&self) -> u64 {
+        self.verified_content.lock().memory_bytes
+    }
+
     pub(crate) fn mark_receive_order(&mut self, server: &ServerKey, file: &Path) {
         if let Some(entry) = self.entries.get_mut(&(server.clone(), file.to_path_buf())) {
             entry.from_receive_order = true;
@@ -162,6 +256,7 @@ impl DiagnosticsStore {
             memory_bytes: 0,
             diagnostic_count: 0,
             by_file: HashMap::new(),
+            verified_content: parking_lot::Mutex::default(),
             order: BTreeMap::new(),
             order_clock: 0,
             order_positions: HashMap::new(),
@@ -198,9 +293,12 @@ impl DiagnosticsStore {
     }
 
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        crate::memory::MemoryEstimate::estimated(self.memory_bytes)
-            .count("diagnostic_entries", self.entries.len())
-            .count("diagnostics", self.diagnostic_count)
+        crate::memory::MemoryEstimate::estimated(
+            self.memory_bytes
+                .saturating_add(self.verification_memory_bytes()),
+        )
+        .count("diagnostic_entries", self.entries.len())
+        .count("diagnostics", self.diagnostic_count)
     }
 
     #[cfg(test)]
@@ -275,11 +373,22 @@ impl DiagnosticsStore {
                 .saturating_add(crate::memory::path_bytes(path))
                 .saturating_add(server_bytes)
         });
+        let verification_bytes =
+            self.verified_content
+                .lock()
+                .entries
+                .keys()
+                .fold(0u64, |bytes, file| {
+                    bytes
+                        .saturating_add(Self::file_memory_bytes(file))
+                        .saturating_add(std::mem::size_of::<VerifiedContent>() as u64)
+                });
         crate::memory::MemoryEstimate::estimated(
             entry_bytes
                 .saturating_add(order_bytes)
                 .saturating_add(publish_bytes)
-                .saturating_add(by_file_bytes),
+                .saturating_add(by_file_bytes)
+                .saturating_add(verification_bytes),
         )
         .count("diagnostic_entries", self.entries.len())
         .count("diagnostics", diagnostic_count)
@@ -1063,6 +1172,7 @@ impl DiagnosticsStore {
             servers.is_empty()
         });
         if remove_file {
+            self.verified_content.get_mut().remove(file);
             let (stored_file, _) = self.by_file.remove_entry(file).expect("empty file index");
             self.memory_bytes = self
                 .memory_bytes
@@ -1279,6 +1389,125 @@ mod tests {
         assert!(estimate.estimated_bytes.unwrap() > 0);
         assert_eq!(estimate.counts["diagnostic_entries"], 1);
         assert_eq!(estimate.counts["diagnostics"], 1);
+    }
+
+    #[test]
+    fn inspect_freshness_progress_invalidates_same_mtime_edits_and_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.ts");
+        std::fs::write(&file, "first").unwrap();
+        let key = server_key(ServerKind::TypeScript);
+        let mut store = DiagnosticsStore::new();
+        store.publish(key, file.clone(), Vec::new());
+        let hash = |text: &str| Some(*blake3::hash(text.as_bytes()).as_bytes());
+        assert_eq!(store.verified_content_hash(&file), hash("first"));
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "other").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(mtime)).unwrap();
+        assert_eq!(store.verified_content_hash(&file), hash("other"));
+        crate::file_identity::replace_keeping_times(&file, b"third");
+        assert_eq!(store.verified_content_hash(&file), hash("third"));
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(store.verified_content_hash(&file), None);
+        std::fs::write(&file, "again").unwrap();
+        assert_eq!(store.verified_content_hash(&file), hash("again"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn inspect_freshness_progress_shares_proofs_across_reports_and_evicts_with_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.ts");
+        std::fs::write(&file, "first").unwrap();
+        let key = server_key(ServerKind::TypeScript);
+        let mut store = DiagnosticsStore::with_capacity(1);
+        store.publish(key.clone(), file.clone(), Vec::new());
+        let before = super::super::document::CONTENT_HASH_READS.with(|reads| reads.get());
+        let hash = store.verified_content_hash(&file).unwrap();
+        store.publish(key.clone(), file.clone(), Vec::new());
+        assert_eq!(store.verified_content_hash(&file), Some(hash));
+        assert_eq!(
+            super::super::document::CONTENT_HASH_READS.with(|reads| reads.get()),
+            before + 1
+        );
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+        assert_eq!(store.verified_content.lock().entries.len(), 1);
+        store.publish(key, temp.path().join("b.ts"), Vec::new());
+        assert!(store.verified_content.lock().entries.is_empty());
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_freshness_progress_windows_rehashes_even_unchanged_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.ts");
+        std::fs::write(&file, "first").unwrap();
+        let key = server_key(ServerKind::TypeScript);
+        let mut store = DiagnosticsStore::new();
+        store.publish(key.clone(), file.clone(), Vec::new());
+        let before = super::super::document::CONTENT_HASH_READS.with(|reads| reads.get());
+        let hash = Some(*blake3::hash(b"first").as_bytes());
+        assert_eq!(store.verified_content_hash(&file), hash);
+        store.publish(key, file.clone(), Vec::new());
+        assert_eq!(store.verified_content_hash(&file), hash);
+        assert_eq!(
+            super::super::document::CONTENT_HASH_READS.with(|reads| reads.get()),
+            before + 2
+        );
+        assert!(store.verified_content.lock().entries.is_empty());
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_freshness_progress_never_reuses_a_symlink_stamp_for_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.ts");
+        let link = temp.path().join("link.ts");
+        std::fs::write(&target, "first").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut store = DiagnosticsStore::new();
+        store.publish(server_key(ServerKind::TypeScript), link.clone(), Vec::new());
+        assert_eq!(
+            store.verified_content_hash(&link),
+            Some(*blake3::hash(b"first").as_bytes())
+        );
+        std::fs::write(&target, "other").unwrap();
+        assert_eq!(
+            store.verified_content_hash(&link),
+            Some(*blake3::hash(b"other").as_bytes())
+        );
+        assert!(store.verified_content.lock().entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_freshness_progress_does_not_lock_memo_during_content_reads() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("held.ts");
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated string and mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut store = DiagnosticsStore::new();
+        store.publish(server_key(ServerKind::TypeScript), file.clone(), Vec::new());
+
+        let unlocked = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| store.verified_content_hash(&file));
+            // Opening the writer pairs with the reader's open. Keeping it open
+            // without data holds the content read without a timer or sleep.
+            let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            let unlocked = store.verified_content.try_lock().is_some();
+            drop(writer);
+            assert_eq!(reader.join().unwrap(), Some(*blake3::hash(b"").as_bytes()));
+            unlocked
+        });
+        assert!(
+            unlocked,
+            "a blocked content read must not hold the memo lock"
+        );
     }
 
     #[test]
