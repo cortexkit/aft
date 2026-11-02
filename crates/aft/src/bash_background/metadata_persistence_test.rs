@@ -1,0 +1,197 @@
+use super::*;
+
+fn metadata(task: &ResolvedTask) -> PersistedTask {
+    PersistedTask::starting(
+        task.paths.task_id.clone(),
+        "metadata-persistence".into(),
+        "synthetic task".into(),
+        task.paths.dir.clone(),
+        None,
+        None,
+        true,
+        false,
+    )
+}
+
+#[test]
+fn metadata_persistence_equal_bytes_skip_replacement_and_changed_bytes_write() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let mut metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    work_counts::reset();
+    write_task_at(&task, &metadata).unwrap();
+    update_task_at(&task, |_| {}).unwrap();
+    assert_eq!(work_counts::get().metadata_writes, 0);
+    assert_eq!(work_counts::get().renames, 0);
+    assert_eq!(work_counts::get().syncs, 0);
+
+    metadata.command.push_str(" changed");
+    write_task_at(&task, &metadata).unwrap();
+    assert_eq!(work_counts::get().metadata_writes, 1);
+    assert_eq!(work_counts::get().renames, 1);
+    assert_eq!(read_task_at(&task).unwrap().command, metadata.command);
+
+    // Compare on-disk bytes even when another writer replaced the record.
+    let mut foreign = metadata.clone();
+    foreign.command.push_str(" by another writer");
+    write_task_at(&task, &foreign).unwrap();
+    work_counts::reset();
+    write_task_at(&task, &metadata).unwrap();
+    assert_eq!(work_counts::get().renames, 1);
+    assert_eq!(read_task_at(&task).unwrap().command, metadata.command);
+}
+
+#[test]
+fn metadata_persistence_equal_checkpoint_keeps_durability_upgrade() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
+    work_counts::reset();
+    write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory).unwrap();
+    let counts = work_counts::get();
+    assert_eq!(counts.metadata_writes, 0);
+    assert_eq!(counts.renames, 0);
+    assert_eq!(
+        counts.syncs, 2,
+        "equal bytes must not elide a durability upgrade"
+    );
+}
+
+#[test]
+fn metadata_persistence_crash_child() {
+    let Some(path) = std::env::var_os("AFT_METADATA_CRASH_PATH") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let mut metadata = read_task(&path).unwrap();
+    metadata.command = "new complete record".into();
+    let after_rename = std::env::var("AFT_METADATA_CRASH_AFTER_RENAME").unwrap() == "true";
+    ATOMIC_REPLACE_CRASH.with(|phase| phase.set(Some(after_rename)));
+    write_task(&path, &metadata).unwrap();
+    panic!("crash hook did not run");
+}
+
+#[test]
+fn metadata_persistence_crash_leaves_old_or_new_complete_record() {
+    let storage = tempfile::tempdir().unwrap();
+    for after_rename in [false, true] {
+        let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+        let old = metadata(&task);
+        write_task_at(&task, &old).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bash_background::persistence::metadata_persistence_tests::metadata_persistence_crash_child",
+                "--nocapture",
+            ])
+            .env("AFT_METADATA_CRASH_PATH", &task.paths.json)
+            .env("AFT_METADATA_CRASH_AFTER_RENAME", after_rename.to_string())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86));
+        let mut expected = old;
+        if after_rename {
+            expected.command = "new complete record".into();
+        }
+        assert_eq!(
+            fs::read(&task.paths.json).unwrap(),
+            serde_json::to_vec_pretty(&expected).unwrap()
+        );
+        read_task_at(&task).unwrap();
+    }
+}
+
+/// Manual I/O measurement, excluded from ordinary filtered regression runs.
+/// Seed real directory-layout metadata, but never register or execute a command.
+#[test]
+#[ignore = "creates a throwaway 160,000-task store for filesystem measurements"]
+fn metadata_persistence_synthetic_store() {
+    let scratch = std::env::current_dir().unwrap().join("target/scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let storage = tempfile::Builder::new()
+        .prefix("metadata-store-")
+        .tempdir_in(&scratch)
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut samples = Vec::new();
+    for index in 0..160_000 {
+        let harness = ["runner", "opencode", "pi"][index % 3];
+        let session = format!("session-{}", index % 30);
+        let session_dir = session_tasks_dir(&storage.path().join(harness), &session);
+        let paths = TaskPaths::directory(session_dir, &format!("bash-{index:016x}"));
+        fs::create_dir_all(&paths.control_dir).unwrap();
+        fs::create_dir_all(&paths.io_dir).unwrap();
+        let mut record = PersistedTask::starting(
+            paths.task_id.clone(),
+            session,
+            "synthetic task".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        if index < 40 {
+            record.mark_running(123, 123);
+        } else {
+            record.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        }
+        fs::write(&paths.json, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        if index < 80 {
+            samples.push((
+                resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+                record,
+            ));
+        }
+        if index == 79 || index == 159_999 {
+            eprintln!("seeded {} folders in {:?}", index + 1, started.elapsed());
+            measure_replacements(index + 1, &mut samples);
+        }
+    }
+}
+
+fn measure_replacements(folders: usize, samples: &mut [(ResolvedTask, PersistedTask)]) {
+    for legacy in [true, false] {
+        work_counts::reset();
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            for (task, record) in samples.iter() {
+                if legacy {
+                    // The former writer serialized and replaced every request.
+                    let bytes = serde_json::to_vec_pretty(record).unwrap();
+                    work_counts::record_metadata_write();
+                    atomic_replace(
+                        &task.dirs.control,
+                        OsStr::new(METADATA_FILE),
+                        &bytes,
+                        ReplaceSync::for_task(record),
+                    )
+                    .unwrap();
+                } else {
+                    write_task_at(task, record).unwrap();
+                }
+            }
+        }
+        eprintln!(
+            "folders={folders} legacy={legacy} unchanged=800 elapsed={:?} counts={:?}",
+            started.elapsed(),
+            work_counts::get()
+        );
+        assert_eq!(work_counts::get().renames, if legacy { 800 } else { 0 });
+    }
+    work_counts::reset();
+    let started = std::time::Instant::now();
+    for (task, record) in samples.iter_mut() {
+        record.status_reason = Some(format!("changed at {folders} folders"));
+        write_task_at(task, record).unwrap();
+    }
+    eprintln!(
+        "folders={folders} changed=80 elapsed={:?} counts={:?}",
+        started.elapsed(),
+        work_counts::get()
+    );
+    assert_eq!(work_counts::get().metadata_writes, 80);
+    assert_eq!(work_counts::get().renames, 80);
+}

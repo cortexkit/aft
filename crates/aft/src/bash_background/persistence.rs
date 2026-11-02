@@ -1423,6 +1423,8 @@ impl PinnedDir {
         {
             let from = os_cstring(from)?;
             let to = os_cstring(to)?;
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             let result = unsafe {
                 libc::renameat(
                     self.file.as_raw_fd(),
@@ -1431,6 +1433,8 @@ impl PinnedDir {
                     to.as_ptr(),
                 )
             };
+            #[cfg(test)]
+            work_counts::record_rename_time(started.elapsed());
             if result != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -3030,8 +3034,6 @@ fn write_task_at_with(
     metadata: &PersistedTask,
     sync: ReplaceSync,
 ) -> io::Result<()> {
-    #[cfg(test)]
-    work_counts::record_metadata_write();
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3111,10 +3113,45 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
+    if sync_unchanged_metadata(dir, name, &content, sync)? {
+        return Ok(());
+    }
+    #[cfg(test)]
+    work_counts::record_metadata_write();
     super::gc_memo::metadata_written(&dir.path().join(name));
     let result = atomic_replace(dir, name, &content, sync);
     super::gc_memo::metadata_written(&dir.path().join(name));
     result
+}
+
+/// Compare the file, not an in-memory cache: another registry can acknowledge
+/// a completed task through the same pinned directory. Equal bytes need no
+/// replacement, but a durable state write must still sync an earlier checkpoint
+/// whose rename may not have reached disk yet.
+fn sync_unchanged_metadata(
+    dir: &PinnedDir,
+    name: &OsStr,
+    content: &[u8],
+    sync: ReplaceSync,
+) -> io::Result<bool> {
+    let Ok(mut file) = dir.open_file(name, sync != ReplaceSync::None) else {
+        // Missing, unreadable or non-regular metadata can still be replaced.
+        return Ok(false);
+    };
+    let mut previous = vec![0; content.len()];
+    if file.read_exact(&mut previous).is_err()
+        || previous != content
+        || file.read(&mut [0]).ok() != Some(0)
+    {
+        return Ok(false);
+    }
+    if sync != ReplaceSync::None {
+        sync_task_file(&file)?;
+    }
+    if sync == ReplaceSync::FileAndDirectory {
+        sync_task_file(&dir.file)?;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -4878,7 +4915,12 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
 pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
-    file.sync_all()
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let result = file.sync_all();
+    #[cfg(test)]
+    work_counts::record_sync_time(started.elapsed());
+    result
 }
 
 fn atomic_replace(
@@ -4902,7 +4944,11 @@ fn atomic_replace(
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
+            #[cfg(test)]
+            atomic_replace_crash_for_test(false);
             dir.rename(&temporary, name)?;
+            #[cfg(test)]
+            atomic_replace_crash_for_test(true);
             if sync == ReplaceSync::FileAndDirectory {
                 sync_task_file(&dir.file)?;
             }
@@ -4917,6 +4963,20 @@ fn atomic_replace(
         io::ErrorKind::AlreadyExists,
         "failed to allocate a randomized atomic-write name",
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_REPLACE_CRASH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn atomic_replace_crash_for_test(after_rename: bool) {
+    if ATOMIC_REPLACE_CRASH.with(|phase| phase.get()) == Some(after_rename) {
+        // Exit without unwinding so the subprocess leaves the interrupted
+        // replacement exactly as a killed daemon would, including its temp file.
+        std::process::exit(86);
+    }
 }
 
 pub fn create_control_file(dirs: &TaskDirs, name: &str, content: &[u8]) -> io::Result<File> {
@@ -4941,6 +5001,10 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
 }
 
 #[cfg(test)]
+#[path = "metadata_persistence_test.rs"]
+mod metadata_persistence_tests;
+
+#[cfg(test)]
 pub(crate) mod work_counts {
     use std::cell::Cell;
 
@@ -4962,6 +5026,9 @@ pub(crate) mod work_counts {
         pub artifact_opens: usize,
         pub syncs: usize,
         pub renames: usize,
+        pub rename_nanos: u128,
+        pub rename_max_nanos: u128,
+        pub sync_nanos: u128,
     }
 
     thread_local! {
@@ -4990,6 +5057,16 @@ pub(crate) mod work_counts {
     }
     pub(crate) fn record_rename() {
         record(|counts| counts.renames += 1);
+    }
+    #[cfg(unix)]
+    pub(crate) fn record_rename_time(elapsed: std::time::Duration) {
+        record(|counts| {
+            counts.rename_nanos += elapsed.as_nanos();
+            counts.rename_max_nanos = counts.rename_max_nanos.max(elapsed.as_nanos());
+        });
+    }
+    pub(crate) fn record_sync_time(elapsed: std::time::Duration) {
+        record(|counts| counts.sync_nanos += elapsed.as_nanos());
     }
     pub(crate) fn record_bytes(bytes: usize) {
         record(|counts| counts.artifact_bytes += bytes);
