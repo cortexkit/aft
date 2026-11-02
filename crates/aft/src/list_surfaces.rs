@@ -739,6 +739,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal reuse proof, not result lists; an expired proof cannot establish base reuse or authorize deletion",
     },
     ExclusionEntry {
+        file: "views/base_builder.rs",
+        enclosing_item: "claim_base_locked",
+        location_or_primitive: "LIVE_BASES_PER_FAMILY",
+        reason: "internal base admission count, not result lists; held capacity borrows a published graph or keeps text on its planned retry path",
+    },
+    ExclusionEntry {
         file: "storage_retention.rs",
         enclosing_item: "evict_least_recent_v3_member, reclaim_v3_admission_family",
         location_or_primitive: "SQL LIMIT and take(max_examined), 64-removal loop and five-second admission deadline",
