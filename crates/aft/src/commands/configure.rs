@@ -15738,7 +15738,8 @@ mod tests {
         });
         let shutdown_started = Instant::now();
         if stop_executor {
-            drop(executor.take());
+            // Assigning drops the executor, as taking it would.
+            executor = None;
         } else if let Some(executor) = &executor {
             ctx.mark_subc_unbound();
             executor.cancel_root_maintenance(&root_id);
