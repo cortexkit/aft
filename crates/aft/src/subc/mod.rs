@@ -10566,6 +10566,13 @@ impl PlainToolRun {
                     // A UI copy must leave completions and cancellation notices
                     // available to the session that actually owns the command.
                     if observation_only {
+                        crate::tool_output::cap(
+                            ctx,
+                            &identity_for_run.session,
+                            &bare_name,
+                            response,
+                            text,
+                        );
                         return;
                     }
                     crate::response_finalize::finalize_tool_response_with_visibility(
@@ -12097,6 +12104,13 @@ async fn handle_tool_call_with_capabilities(
                                 phase_trace.mark_execute_done();
                                 let finalizer = |response: &mut Response, text: &mut String| {
                                     if carrier_read_only::restricted(&identity_for_run) {
+                                        crate::tool_output::cap(
+                                            ctx,
+                                            &identity_for_run.session,
+                                            &bare_name_for_run,
+                                            response,
+                                            text,
+                                        );
                                         return;
                                     }
                                     crate::response_finalize::finalize_tool_response(
@@ -12834,6 +12848,9 @@ async fn deliver_resolved_subc_response(
         // A rich-UI result is a copy, not delivery to the worker: finalization
         // must not acknowledge completions or consume cancellation notices.
         if carrier_read_only::restricted(identity) {
+            if let Some(ctx) = &ctx {
+                crate::tool_output::cap(ctx, &entry.session_id, &entry.bare_name, response, text);
+            }
             return;
         }
         if let Some(ctx) = &ctx {

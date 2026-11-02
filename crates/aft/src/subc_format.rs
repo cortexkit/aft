@@ -275,9 +275,7 @@ pub fn format_response_with_context(
     response: &Response,
     ctx: &FormatContext,
 ) -> String {
-    let mut text = format_response_unbounded(bare_name, response, ctx);
-    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
-    text
+    format_response_unbounded(bare_name, response, ctx)
 }
 
 pub(crate) fn format_response_unbounded(

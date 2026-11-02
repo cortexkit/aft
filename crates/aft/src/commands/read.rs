@@ -1891,6 +1891,17 @@ fn handle_read_local(
         Err(resp) => return resp,
     };
 
+    if let Some(result) = ctx.output_files().read(req.session(), &path) {
+        return match result {
+            Ok(bytes) => handle_registered_artifact_read(req, bytes),
+            Err(error) => Response::error(
+                &req.id,
+                "artifact_refused",
+                format!("read: tool result refused: {error}"),
+            ),
+        };
+    }
+
     if let Some(result) = ctx
         .bash_background()
         .read_artifact_path(req.session(), path.as_path())

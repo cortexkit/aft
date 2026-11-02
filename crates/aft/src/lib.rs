@@ -210,6 +210,7 @@ pub(crate) mod task_temp_reads;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub mod tool_gate;
+pub(crate) mod tool_output;
 pub mod tool_path;
 pub mod url_fetch;
 pub mod views;

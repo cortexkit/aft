@@ -10,31 +10,6 @@ use serde_json::Value;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
-/// Emergency ceiling, deliberately above every normal tool budget. A cut here
-/// is a bug in the tool's own cap, not normal pagination.
-pub const REPLY_CEILING_BYTES: usize = 2 * 1024 * 1024;
-
-pub fn enforce_reply_ceiling(tool: &str, text: &mut String) {
-    let total = text.len();
-    if total <= REPLY_CEILING_BYTES {
-        return;
-    }
-    log::warn!("AFT reply ceiling: tool={tool} rendered_bytes={total} ceiling_bytes={REPLY_CEILING_BYTES}; the tool's own cap failed");
-    let footer = format!("\nthis reply was cut at {REPLY_CEILING_BYTES} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report");
-    let mut end = REPLY_CEILING_BYTES - footer.len();
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push_str(&format!("\nthis reply was cut at {end} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report"));
-}
-
-fn enforce_response_ceiling(tool: &str, response: &mut Response) {
-    if let Some(Value::String(text)) = response.data.get_mut("text") {
-        enforce_reply_ceiling(tool, text);
-    }
-}
-
 pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
@@ -137,7 +112,12 @@ pub fn finalize_response_with_bg_completions(
             }
         }
     }
-    enforce_response_ceiling(attach_command, response);
+    if response.data.get("text").is_some_and(Value::is_string) {
+        if let Value::String(mut text) = response.data["text"].take() {
+            crate::tool_output::cap(ctx, session_id, attach_command, response, &mut text);
+            response.data["text"] = Value::String(text);
+        }
+    }
 }
 
 /// Finalization for a tool result whose agent-visible text is held apart from the response
@@ -187,7 +167,7 @@ pub(crate) fn finalize_tool_response_with_visibility(
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
-    enforce_reply_ceiling(attach_command, text);
+    crate::tool_output::cap(ctx, session_id, attach_command, response, text);
 }
 
 /// Foreground and watch replies consume terminal results for their originating

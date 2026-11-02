@@ -673,10 +673,16 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
     },
     ExclusionEntry {
-        file: "response_finalize.rs",
-        enclosing_item: "enforce_reply_ceiling",
-        location_or_primitive: "emergency rendered reply byte ceiling",
-        reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
+        file: "tool_output.rs",
+        enclosing_item: "render_cut, read",
+        location_or_primitive: "rendered reply and saved artifact byte bounds",
+        reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; artifact reads have a separate 64 MiB allocation guard",
+    },
+    ExclusionEntry {
+        file: "commands/bash_watch.rs",
+        enclosing_item: "output_tail",
+        location_or_primitive: "worker watch tail byte and line preview",
+        reason: "a recent-output prose preview, not a result list; limits bytes as well as lines so a single huge log line cannot bypass the preview budget; full task output remains on disk",
     },
     ExclusionEntry {
         file: "cold_build_limiter/progress.rs",

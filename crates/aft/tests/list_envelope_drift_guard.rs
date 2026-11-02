@@ -77,6 +77,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(src_dir.join("url_fetch.rs"));
     files_to_scan.push(src_dir.join("response_finalize.rs"));
+    files_to_scan.push(src_dir.join("tool_output.rs"));
     files_to_scan.push(src_dir.join("runtime_drain.rs"));
     files_to_scan.push(src_dir.join("edit.rs"));
     files_to_scan.push(src_dir.join("bash_permissions/scan.rs"));

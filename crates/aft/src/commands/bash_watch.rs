@@ -48,6 +48,7 @@ const REGEX_SCAN_CONTEXT_BYTES: usize = 4;
 const REGEX_WINDOW_SCAN_INCOMPLETE: &str = "No match found, but the scan is incomplete: a regex match longer than 64 KiB may have been missed. Literal patterns are always scanned in full.";
 /// Most lines of a still-running command's output shown to a worker.
 const WORKER_OUTPUT_TAIL_LINES: usize = 20;
+const WORKER_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 /// Output preview a watch result carries for a finished task.
 const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
 
@@ -901,6 +902,13 @@ fn status_name(status: &BgTaskStatus) -> String {
 /// The last lines of `output`, so a worker can judge whether a command is stuck.
 fn output_tail(output: &str) -> String {
     let trimmed = output.trim_end();
+    // A single log line can be megabytes long. Limit bytes before counting
+    // lines, and keep the suffix on a UTF-8 boundary.
+    let mut from = trimmed.len().saturating_sub(WORKER_OUTPUT_TAIL_BYTES);
+    while !trimmed.is_char_boundary(from) {
+        from += 1;
+    }
+    let trimmed = &trimmed[from..];
     let lines: Vec<&str> = trimmed.split('\n').collect();
     let start = lines.len().saturating_sub(WORKER_OUTPUT_TAIL_LINES);
     lines[start..].join("\n")
@@ -1976,5 +1984,93 @@ mod tests {
         assert!(tail.starts_with("line 11\n"));
         assert!(tail.ends_with("line 30"));
         assert_eq!(output_tail("  \n"), "");
+    }
+
+    #[test]
+    fn tool_output_cap_watch_tail_bounds_a_two_megabyte_utf8_line() {
+        let output = format!("{}END\n", "界".repeat(700_000));
+        let tail = output_tail(&output);
+        assert!(tail.len() <= WORKER_OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("END"));
+        assert!(!tail.contains('\u{fffd}'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_output_cap_watch_task_printing_two_megabyte_line() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        let spawn: RawRequest = serde_json::from_value(json!({
+            "id":"start-large-watch", "command":"bash", "session_id":SESSION,
+            "worker_session":true,
+            "params":{"command":"printf '%2097152s\\n' '' | tr ' ' x", "background":true,"timeout":30_000},
+        })).unwrap();
+        let launched = with_authenticated_principal(principal(project.path()), || {
+            crate::commands::bash::handle(&spawn, &ctx)
+        });
+        assert!(launched.success, "{launched:?}");
+        let task = launched.data["task_id"].as_str().unwrap();
+        let mut response =
+            watch_with_wait_deadline(ctx.clone(), request(task, SESSION), Duration::from_secs(20))
+                .await;
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        let original = response.data["output"].as_str().unwrap().to_owned();
+        assert!(original.contains(&"x".repeat(2 * 1024 * 1024)));
+        let mut text = original.clone();
+        crate::response_finalize::finalize_tool_response(
+            &mut response,
+            &mut text,
+            &ctx,
+            SESSION,
+            "bash_watch",
+            false,
+        );
+        assert!(text.len() <= 51_200);
+        let path = text
+            .rsplit_once("; full result saved to ")
+            .unwrap()
+            .1
+            .strip_suffix("; read it with read and a line range]")
+            .unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.starts_with(&original));
+        assert_eq!(text.lines().last().unwrap(), format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", saved.len() as f64 / 1024.0));
+        assert_eq!(
+            response.data["output"], original,
+            "structured output must remain uncut"
+        );
+    }
+
+    #[test]
+    fn tool_output_cap_reuses_matching_task_capture() {
+        let original = "capture line\n".repeat(10_000);
+        let (dir, _) = terminal_watch_with_stdout(original.as_bytes());
+        let ctx = context(dir.path(), dir.path());
+        with_authenticated_principal(principal(dir.path()), || {
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            ctx.bash_background()
+                .recover_watch_task(&storage, SESSION, TASK, Some(dir.path()), Some("runner"))
+                .unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(TASK, SESSION, 0)
+                .unwrap();
+            let path = snapshot.output_path.unwrap();
+            let response = Response::success("id", json!({"output_path":path}));
+            for tool in ["bash", "bash_watch", "bash_status"] {
+                let mut text = original.clone();
+                crate::tool_output::cap(&ctx, SESSION, tool, &response, &mut text);
+                assert!(text.len() <= 51_200);
+                assert!(text.ends_with(&format!(
+                    "; full result saved to {path}; read it with read and a line range]"
+                )));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            }
+            assert!(
+                !ctx.harness_dir().join("tool-results").exists(),
+                "an identical task capture must not be copied"
+            );
+        });
     }
 }

@@ -2356,6 +2356,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
+    paths.push(source_dir.join("tool_output.rs"));
     paths.push(source_dir.join("subc/bind_log.rs"));
     paths.push(source_dir.join("subc/diagnostics_findings.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
