@@ -71,7 +71,7 @@ fn wait_for_capture_ready(ctx: &AppContext, timeout: Duration) {
 async fn capture() -> Value {
     // These calls inject a test manifest without publishing a production manifest.
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = sample_fixture();
     // Finish task-artifact writes before waiting for any indexed sample reply.
     bash_tests::seed(
@@ -131,9 +131,8 @@ async fn capture() -> Value {
     vectors.push(vector("read_missing", "read", args, body));
 
     let mut document = json!({
-        "format":"aft-rich-ui-manifest-v1",
-        "publication":"injected-test-manifest",
-        "manifestDigest":super::super::super::canonical::manifest_digest(MANIFEST),
+        "format":"aft-carrier-read-fixtures/1",
+        "publication":"injected-test-policy",
         "vectors":vectors,
     });
     normalize(&mut document, &f);

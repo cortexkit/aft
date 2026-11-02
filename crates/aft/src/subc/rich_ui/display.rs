@@ -16,7 +16,12 @@ use cortexkit_role_tool_display::{
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 
-static SENDER: OnceLock<tokio::sync::mpsc::Sender<Publication>> = OnceLock::new();
+struct Writer {
+    outbox: Mutex<Outbox>,
+    wake: tokio::sync::mpsc::Sender<()>,
+    limits: Mutex<cortexkit_role_tool_display::DisplayLimits>,
+}
+static SENDER: OnceLock<Writer> = OnceLock::new();
 static CALLS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Capture>>>>> =
     LazyLock::new(Default::default);
 thread_local! { static ACTIVE: RefCell<Option<Arc<Mutex<Capture>>>> = const { RefCell::new(None) }; }
@@ -31,11 +36,13 @@ pub(crate) struct Capture {
     tool: String,
     root: PathBuf,
     began: Option<Instant>,
+    processing_ms: u64,
     held_at: Option<Instant>,
     held_ms: Option<u64>,
     record_sent: bool,
     finished: bool,
     files: Vec<FileChange>,
+    masker: Option<crate::log_redact::SecretValues>,
     bash: Option<(Value, Value)>,
     deferred: bool,
     terminal: bool,
@@ -48,12 +55,25 @@ struct FileChange {
     before: Option<String>,
     after: Option<String>,
     change: &'static str,
+    existed_before: bool,
+    exists_after: bool,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
 struct Publication {
     identity: Identity,
     kind: DisplayKind,
     body: Value,
+}
+#[cfg(test)]
+thread_local! { static TEST_SINK: RefCell<Option<Vec<Publication>>> = const { RefCell::new(None) }; }
+fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_SINK.with(|sink| sink.borrow().is_some()) {
+        return true;
+    }
+    SENDER.get().is_some()
 }
 
 pub(crate) fn register(
@@ -61,7 +81,7 @@ pub(crate) fn register(
     route: &crate::subc::RouteIdentity,
     call: &subc_protocol::tool_call::ToolCallRequest,
 ) {
-    if SENDER.get().is_none()
+    if !enabled()
         || !matches!(
             call.name.as_str(),
             "bash" | "edit" | "write" | "apply_patch"
@@ -108,6 +128,7 @@ pub(crate) fn register(
         schema_pin,
     };
     if let Ok(mut calls) = CALLS.lock() {
+        calls.retain(|_, capture| capture.try_lock().map_or(true, |capture| !capture.finished));
         if calls.len() >= 64 {
             return;
         }
@@ -118,11 +139,13 @@ pub(crate) fn register(
                 tool: call.name.clone(),
                 root: route.project_root.clone(),
                 began: None,
+                processing_ms: 0,
                 held_at: None,
                 held_ms: None,
                 record_sent: false,
                 finished: false,
                 files: Vec::new(),
+                masker: None,
                 bash: None,
                 deferred: false,
                 terminal: false,
@@ -181,8 +204,14 @@ pub(crate) fn file(
                 capture.root.join(path)
             }
         });
-        if let Some(entry) = capture.files.iter_mut().find(|entry| entry.path == path) {
+        if let Some(entry) = capture
+            .files
+            .iter_mut()
+            .find(|entry| entry.path == path || old_path.as_ref() == Some(&entry.path))
+        {
             entry.after = after.map(str::to_owned);
+            entry.exists_after = change != "deleted";
+            entry.path = path;
             if change != "modified" {
                 entry.change = change;
                 entry.old_path = old_path;
@@ -194,6 +223,8 @@ pub(crate) fn file(
                 before: before.map(str::to_owned),
                 after: after.map(str::to_owned),
                 change,
+                existed_before: change != "created",
+                exists_after: change != "deleted",
             });
         }
     });
@@ -232,7 +263,19 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
     let (mut added, mut removed, mut known) = (0u64, 0u64, true);
     let mut changes = capture.files.clone();
     changes.sort_by(|a, b| a.path.cmp(&b.path));
-    for change in changes {
+    for mut change in changes {
+        if !change.existed_before && !change.exists_after {
+            continue;
+        }
+        change.change = if change.change == "moved" {
+            "moved"
+        } else if !change.existed_before {
+            "created"
+        } else if !change.exists_after {
+            "deleted"
+        } else {
+            "modified"
+        };
         if change.change == "modified" && change.before == change.after {
             continue;
         }
@@ -261,11 +304,47 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
             if let Some(old_path) = old_path {
                 entry["oldPath"] = json!(old_path);
             }
-            // The vault has no per-agent matcher for file content yet. Withhold
-            // content rather than persist a diff containing an unresolved secret.
-            entry["diffOmitted"] = json!(true);
+            if let (Some(masker), Some(before), Some(after)) = (
+                &capture.masker,
+                change.before.as_deref(),
+                change.after.as_deref(),
+            ) {
+                let path = entry["path"].as_str().unwrap();
+                let diff = if change.change == "moved" && before == after {
+                    format!(
+                        "rename from {}\nrename to {path}\n",
+                        entry["oldPath"].as_str().unwrap()
+                    )
+                } else {
+                    let old = if change.change == "created" {
+                        "/dev/null".into()
+                    } else {
+                        format!(
+                            "a/{}",
+                            entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
+                        )
+                    };
+                    let new = if change.change == "deleted" {
+                        "/dev/null".into()
+                    } else {
+                        format!("b/{path}")
+                    };
+                    similar::TextDiff::from_lines(before, after)
+                        .unified_diff()
+                        .header(&old, &new)
+                        .to_string()
+                };
+                entry["diff"] = json!(masker.redact(&diff));
+            } else {
+                // A missing per-agent matcher must not turn arbitrary file
+                // content into a persisted detail with only generic redaction.
+                entry["diffOmitted"] = json!(true);
+            }
         }
         files.push(entry);
+    }
+    if !success {
+        record["outcome"] = json!(if files.is_empty() { "error" } else { "partial" });
     }
     if known && !files.is_empty() {
         record["addedLines"] = json!(added);
@@ -301,12 +380,52 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
     if valid.is_err() {
         return;
     }
-    if let Some(sender) = SENDER.get() {
-        let _ = sender.try_send(Publication {
-            identity: capture.identity.clone(),
-            kind,
-            body,
-        });
+    #[cfg(test)]
+    if TEST_SINK.with(|sink| {
+        if let Some(sink) = sink.borrow_mut().as_mut() {
+            sink.push(Publication {
+                identity: capture.identity.clone(),
+                kind: kind.clone(),
+                body: body.clone(),
+            });
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    let Some(writer) = SENDER.get() else {
+        return;
+    };
+    if !enqueue_snapshot(writer, capture.identity.clone(), kind, body) {
+        DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn enqueue_snapshot(
+    writer: &Writer,
+    identity: Identity,
+    kind: DisplayKind,
+    mut body: Value,
+) -> bool {
+    let Ok(limits) = writer.limits.try_lock() else {
+        return false;
+    };
+    if kind == DisplayKind::Detail {
+        let Some(cut) = records::cut_detail(body, limits.max_detail_bytes as usize) else {
+            return false;
+        };
+        body = cut;
+    }
+    // No database, network, lock wait or queue wait is on the reply path.
+    if let Ok(mut outbox) = writer.outbox.try_lock() {
+        let admitted = outbox.admit(identity, kind, body, &limits, Instant::now());
+        let _ = writer.wake.try_send(());
+        admitted
+    } else {
+        false
     }
 }
 
@@ -330,23 +449,51 @@ pub(crate) fn reply(
     if capture.finished {
         return;
     }
-    let held_ms = capture.held_ms.unwrap_or(0);
     let duration = capture
         .began
         .map_or(0, |began| began.elapsed().as_millis() as u64)
-        .saturating_sub(held_ms);
+        .saturating_add(capture.processing_ms);
     if held {
+        let running = reason == Some("running");
+        if running {
+            capture.deferred = true;
+        }
         if !capture.record_sent {
-            let mut body = json!({"durationMs":duration,"outcome":"held","reason":"consent"});
+            let mut body = if running {
+                capture
+                    .bash
+                    .as_ref()
+                    .map(|(body, _)| body.clone())
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+            body["durationMs"] = json!(duration);
+            body["outcome"] = json!("held");
+            body["reason"] = json!(if running { "running" } else { "consent" });
             if capture.tool == "bash" {
-                body["phase"] = json!("held");
+                body["phase"] = json!(if running {
+                    "background_started"
+                } else {
+                    "held"
+                });
                 body["execution"] = json!("local");
             }
             emit(&capture, DisplayKind::Record, body);
             capture.record_sent = true;
-            capture.held_at = Some(Instant::now());
+            capture.processing_ms = duration;
+            capture.began = None;
+            if !running {
+                capture.held_at = Some(Instant::now());
+            }
+        }
+        if capture.deferred && capture.terminal {
+            emit_bash_completion(&mut capture);
         }
         return;
+    }
+    if let Some(held_at) = capture.held_at.take() {
+        capture.held_ms = Some(held_at.elapsed().as_millis() as u64);
     }
     let completion = capture.record_sent;
     let (mut body, detail) = if capture.tool == "bash" {
@@ -375,7 +522,12 @@ pub(crate) fn reply(
         if let Some(map) = body.as_object_mut() {
             map.remove("exitCode");
             map.remove("endReason");
+            map.remove("reason");
+            map.remove("runDurationMs");
         }
+    } else if capture.tool == "bash" {
+        body.as_object_mut().unwrap().remove("taskId");
+        body.as_object_mut().unwrap().remove("runDurationMs");
     }
     body["durationMs"] = json!(duration);
     if let Some(held_ms) = capture.held_ms {
@@ -384,7 +536,10 @@ pub(crate) fn reply(
     if error && body.get("reason").is_none() {
         body["reason"] = json!(if matches!(reason, Some("cancelled")) {
             "cancelled"
-        } else if matches!(reason, Some("consent")) {
+        } else if matches!(
+            reason,
+            Some("consent" | "bash_denied_untrusted" | "bash_denied")
+        ) {
             "consent"
         } else {
             "permission_denied"
@@ -404,7 +559,10 @@ pub(crate) fn reply(
         emit_bash_completion(&mut capture);
     }
     if !capture.deferred {
-        if let Some(detail) = detail {
+        if let Some(mut detail) = detail {
+            if capture.tool == "bash" {
+                detail.as_object_mut().unwrap().remove("taskId");
+            }
             emit(&capture, DisplayKind::Detail, detail);
         }
         capture.finished = true;
@@ -419,69 +577,102 @@ pub(crate) fn start(connection_file: PathBuf) {
     if std::env::var("AFT_TOOL_DISPLAY").as_deref() != Ok("1") {
         return;
     }
-    let (sender, receiver) = tokio::sync::mpsc::channel(192);
-    if SENDER.set(sender).is_err() {
+    if std::env::var("SUBC_MODULE_ID").as_deref() != Ok("aft")
+        || !matches!(subc_client_rs::launch_nonce(), Ok(Some(_)))
+    {
+        return;
+    }
+    let (wake, receiver) = tokio::sync::mpsc::channel(1);
+    if SENDER
+        .set(Writer {
+            outbox: Mutex::new(Outbox::new()),
+            wake,
+            limits: Mutex::new(outbox::ceilings()),
+        })
+        .is_err()
+    {
         return;
     }
     tokio::spawn(send_loop(connection_file, receiver));
 }
 
-async fn send_loop(
-    connection_file: PathBuf,
-    mut receiver: tokio::sync::mpsc::Receiver<Publication>,
-) {
-    use subc_client_rs::{BindIdentity, ConsumerOptions, SubcConsumer};
-    let mut outbox = Outbox::new();
+async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Receiver<()>) {
+    use subc_client_rs::{ConsumerOptions, SubcConsumer};
+    use subc_protocol::BindIdentity;
+    let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
     loop {
         tokio::select! {
-            publication = receiver.recv() => {
-                let Some(mut publication) = publication else { return; };
-                if publication.kind == DisplayKind::Detail {
-                    let Some(cut) = records::cut_detail(publication.body, 3_145_728) else { continue; };
-                    publication.body = cut;
-                }
-                outbox.admit(publication.identity, publication.kind, publication.body, &outbox::ceilings(), Instant::now());
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            _ = receiver.recv() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
         }
-        let Some(entry) = outbox.pop_due(Instant::now()) else {
+        let entry = writer
+            .outbox
+            .lock()
+            .ok()
+            .and_then(|mut outbox| outbox.pop_due(Instant::now()));
+        let Some(entry) = entry else {
             continue;
         };
         if consumer.is_none() {
-            consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
-                .await
-                .ok();
+            let options = ConsumerOptions {
+                call_timeout: std::time::Duration::from_secs(5),
+                ..Default::default()
+            };
+            consumer = SubcConsumer::connect(&connection_file, options).await.ok();
         }
         let mut retry = true;
         if let Some(client) = consumer.as_ref() {
-            // resolve_provider uses catalog capabilities, includes warming modules,
-            // and refuses ambiguity. Resolve again before every write and retry.
-            if let Ok(module_id) = client.resolve_provider("tool-display/v1").await {
-                let route = client
+            // Resolution includes warming modules and refuses ambiguity. Resolve
+            // again for every attempt, even when a prior route was usable.
+            if let Some(module_id) = client
+                .catalog_list()
+                .await
+                .ok()
+                .and_then(|catalog| declared_display(&catalog.modules))
+            {
+                if let Ok(route) = client
                     .open_route(
                         subc_protocol::RouteTarget::ToolProvider { module_id },
                         BindIdentity::new(".", "aft", "tool-display"),
                     )
-                    .await;
-                if let Ok(route) = route {
-                    if let Ok(bytes) = client.request(&route, entry.frame.clone()).await {
-                        if let Ok(reply) = serde_json::from_slice::<Value>(&bytes) {
-                            retry = !matches!(
-                                reply["result"].as_str(),
-                                Some("stored" | "already_stored")
-                            );
-                            if matches!(
-                                reply["code"].as_str(),
-                                Some(
-                                    "display_write_conflict"
-                                        | "invalid_params"
-                                        | "display_writer_unverified"
-                                        | "display_too_large"
-                                )
-                            ) {
-                                retry = false;
+                    .await
+                {
+                    let description = client
+                        .request(
+                            &route,
+                            br#"{"name":"role.describe","arguments":{}}"#.to_vec(),
+                        )
+                        .await;
+                    let limits = description
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|value| value.get("tool_display").cloned())
+                        .and_then(|value| {
+                            serde_json::from_value::<cortexkit_role_tool_display::DisplayLimits>(
+                                value,
+                            )
+                            .ok()
+                        })
+                        .filter(|limits| limits.validate().is_ok());
+                    if let Some(limits) = limits {
+                        if let Ok(mut cached) = writer.limits.lock() {
+                            *cached = limits.clone();
+                        }
+                        // An admitted body cannot be rebuilt for a smaller store.
+                        // Lose that optional kind rather than change its first bytes.
+                        if entry.body.len() as u64 <= limits.max_bytes(&entry.kind).unwrap_or(0) {
+                            match client.request(&route, entry.frame.clone()).await {
+                                Ok(bytes) => {
+                                    retry = retry_reply(&bytes);
+                                }
+                                Err(subc_client_rs::CallError::Module(error)) => {
+                                    retry = error.code == "module_warming";
+                                }
+                                Err(_) => {}
                             }
+                        } else {
+                            retry = false;
                         }
                     }
                     let _ = client.close_handle(&route).await;
@@ -489,9 +680,29 @@ async fn send_loop(
             }
         }
         if retry {
-            outbox.retry(entry, Instant::now());
+            if let Ok(mut outbox) = writer.outbox.lock() {
+                outbox.retry(entry, Instant::now());
+            }
         }
     }
+}
+
+fn retry_reply(bytes: &[u8]) -> bool {
+    let Ok(reply) = serde_json::from_slice::<Value>(bytes) else {
+        return true;
+    };
+    if matches!(reply["result"].as_str(), Some("stored" | "already_stored")) {
+        return false;
+    }
+    !matches!(
+        reply["code"].as_str(),
+        Some(
+            "display_write_conflict"
+                | "invalid_params"
+                | "display_writer_unverified"
+                | "display_too_large"
+        )
+    )
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -656,11 +867,13 @@ pub(crate) fn bash_terminal(
             tool: "bash".into(),
             root: PathBuf::new(),
             began: None,
+            processing_ms: 0,
             held_at: None,
             held_ms: display.held_ms,
             record_sent: true,
             finished: false,
             files: Vec::new(),
+            masker: None,
             bash: Some(bodies),
             deferred: true,
             terminal: true,
@@ -668,3 +881,25 @@ pub(crate) fn bash_terminal(
         emit_bash_completion(&mut capture);
     }
 }
+
+fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
+    let mut claimants: Vec<_> = modules
+        .iter()
+        .filter(|module| {
+            module.capabilities.as_ref().is_some_and(|capabilities| {
+                capabilities
+                    .provides
+                    .iter()
+                    .any(|capability| capability == "tool-display/v1")
+            })
+        })
+        .map(|module| module.module_id.clone())
+        .collect();
+    claimants.sort();
+    claimants.dedup();
+    (claimants.len() == 1).then(|| claimants.remove(0))
+}
+
+#[cfg(test)]
+#[path = "display/tests.rs"]
+mod tests;

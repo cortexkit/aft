@@ -866,6 +866,7 @@ mod tests {
             vec![
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
+                "tool-views/v1".to_string(),
                 "flow-scopes/v1".to_string(),
                 "worker-runs/v1".to_string(),
                 "scope-workdir/v1".to_string(),
@@ -879,6 +880,7 @@ mod tests {
             Some(&serde_json::json!([
                 "tool-provider/v1",
                 "call-modes/v1",
+                "tool-views/v1",
                 "flow-scopes/v1",
                 "worker-runs/v1",
                 "scope-workdir/v1",
@@ -1178,7 +1180,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1", "tool-views/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

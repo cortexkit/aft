@@ -258,9 +258,6 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         result["no_op"] = serde_json::json!(true);
     }
 
-    if let Some(original) = original {
-        edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
-    }
     if !rolled_back {
         crate::subc::rich_ui::display::file(
             &path.to_string_lossy(),
@@ -269,6 +266,9 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             Some(final_content),
             if existed { "modified" } else { "created" },
         );
+    }
+    if let Some(original) = original {
+        edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
     }
     Response::success(&req.id, result)
 }

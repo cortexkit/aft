@@ -1,0 +1,488 @@
+[
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 240,
+      "outcome": "success",
+      "phase": "foreground_finished",
+      "exitCode": 0,
+      "outputBytes": 3,
+      "endReason": "exited",
+      "execution": "local"
+    },
+    "jcs": "{\"durationMs\":240,\"endReason\":\"exited\",\"execution\":\"local\",\"exitCode\":0,\"outcome\":\"success\",\"outputBytes\":3,\"phase\":\"foreground_finished\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 8,
+      "outcome": "success",
+      "taskId": "bash-demo1",
+      "phase": "background_started",
+      "outputBytes": 0,
+      "execution": "local"
+    },
+    "jcs": "{\"durationMs\":8,\"execution\":\"local\",\"outcome\":\"success\",\"outputBytes\":0,\"phase\":\"background_started\",\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 1000,
+      "outcome": "error",
+      "reason": "timed_out",
+      "phase": "foreground_finished",
+      "exitCode": 124,
+      "outputBytes": 32,
+      "endReason": "timed_out",
+      "execution": "local"
+    },
+    "jcs": "{\"durationMs\":1000,\"endReason\":\"timed_out\",\"execution\":\"local\",\"exitCode\":124,\"outcome\":\"error\",\"outputBytes\":32,\"phase\":\"foreground_finished\",\"reason\":\"timed_out\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 420,
+      "outcome": "error",
+      "reason": "killed",
+      "phase": "foreground_finished",
+      "outputBytes": 32,
+      "endReason": "killed",
+      "execution": "local"
+    },
+    "jcs": "{\"durationMs\":420,\"endReason\":\"killed\",\"execution\":\"local\",\"outcome\":\"error\",\"outputBytes\":32,\"phase\":\"foreground_finished\",\"reason\":\"killed\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 630,
+      "outcome": "success",
+      "phase": "foreground_finished",
+      "exitCode": 0,
+      "outputBytes": 3,
+      "endReason": "exited",
+      "execution": "remote",
+      "target": "linux"
+    },
+    "jcs": "{\"durationMs\":630,\"endReason\":\"exited\",\"execution\":\"remote\",\"exitCode\":0,\"outcome\":\"success\",\"outputBytes\":3,\"phase\":\"foreground_finished\",\"target\":\"linux\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "bash",
+    "body": {
+      "outcome": "success",
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "exitCode": 0,
+      "runDurationMs": 2400,
+      "outputBytes": 3,
+      "endReason": "exited",
+      "execution": "local"
+    },
+    "jcs": "{\"endReason\":\"exited\",\"execution\":\"local\",\"exitCode\":0,\"outcome\":\"success\",\"outputBytes\":3,\"phase\":\"background_finished\",\"runDurationMs\":2400,\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "bash",
+    "body": {
+      "outcome": "error",
+      "reason": "killed",
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "runDurationMs": 900,
+      "outputBytes": 32,
+      "endReason": "killed",
+      "execution": "local"
+    },
+    "jcs": "{\"endReason\":\"killed\",\"execution\":\"local\",\"outcome\":\"error\",\"outputBytes\":32,\"phase\":\"background_finished\",\"reason\":\"killed\",\"runDurationMs\":900,\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "bash",
+    "body": {
+      "outcome": "error",
+      "reason": "timed_out",
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "exitCode": 124,
+      "runDurationMs": 1000,
+      "outputBytes": 32,
+      "endReason": "timed_out",
+      "execution": "local"
+    },
+    "jcs": "{\"endReason\":\"timed_out\",\"execution\":\"local\",\"exitCode\":124,\"outcome\":\"error\",\"outputBytes\":32,\"phase\":\"background_finished\",\"reason\":\"timed_out\",\"runDurationMs\":1000,\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "bash",
+    "body": {
+      "outcome": "success",
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "exitCode": 0,
+      "runDurationMs": 2400,
+      "outputBytes": 3,
+      "endReason": "exited",
+      "execution": "remote",
+      "target": "linux"
+    },
+    "jcs": "{\"endReason\":\"exited\",\"execution\":\"remote\",\"exitCode\":0,\"outcome\":\"success\",\"outputBytes\":3,\"phase\":\"background_finished\",\"runDurationMs\":2400,\"target\":\"linux\",\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 8,
+      "outcome": "success",
+      "taskId": "bash-demo1",
+      "phase": "background_started",
+      "outputBytes": 0,
+      "execution": "remote",
+      "target": "linux"
+    },
+    "jcs": "{\"durationMs\":8,\"execution\":\"remote\",\"outcome\":\"success\",\"outputBytes\":0,\"phase\":\"background_started\",\"target\":\"linux\",\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "detail",
+    "schema": "bash",
+    "body": {
+      "schema": "aft/bash-detail/1",
+      "revision": 1,
+      "phase": "foreground_finished",
+      "stdout": "ok\n",
+      "stderr": ""
+    },
+    "jcs": "{\"phase\":\"foreground_finished\",\"revision\":1,\"schema\":\"aft/bash-detail/1\",\"stderr\":\"\",\"stdout\":\"ok\\n\"}"
+  },
+  {
+    "kind": "detail",
+    "schema": "bash",
+    "body": {
+      "schema": "aft/bash-detail/1",
+      "revision": 1,
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "stdout": "ok\n",
+      "stderr": ""
+    },
+    "jcs": "{\"phase\":\"background_finished\",\"revision\":1,\"schema\":\"aft/bash-detail/1\",\"stderr\":\"\",\"stdout\":\"ok\\n\",\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "detail",
+    "schema": "bash",
+    "body": {
+      "schema": "aft/bash-detail/1",
+      "revision": 1,
+      "phase": "foreground_finished",
+      "execution": "remote",
+      "target": "linux",
+      "stdout": "ok\n",
+      "stderr": ""
+    },
+    "jcs": "{\"execution\":\"remote\",\"phase\":\"foreground_finished\",\"revision\":1,\"schema\":\"aft/bash-detail/1\",\"stderr\":\"\",\"stdout\":\"ok\\n\",\"target\":\"linux\"}"
+  },
+  {
+    "kind": "detail",
+    "schema": "bash",
+    "body": {
+      "schema": "aft/bash-detail/1",
+      "revision": 1,
+      "taskId": "bash-demo1",
+      "phase": "background_finished",
+      "stdout": "0123456789abcdef0123456789abcdef",
+      "stderr": ""
+    },
+    "jcs": "{\"phase\":\"background_finished\",\"revision\":1,\"schema\":\"aft/bash-detail/1\",\"stderr\":\"\",\"stdout\":\"0123456789abcdef0123456789abcdef\",\"taskId\":\"bash-demo1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 12,
+      "outcome": "success",
+      "fileCount": 1,
+      "modifiedCount": 1,
+      "createdCount": 0,
+      "deletedCount": 0,
+      "movedCount": 0,
+      "addedLines": 1,
+      "removedLines": 1,
+      "path": "src/a.rs"
+    },
+    "jcs": "{\"addedLines\":1,\"createdCount\":0,\"deletedCount\":0,\"durationMs\":12,\"fileCount\":1,\"modifiedCount\":1,\"movedCount\":0,\"outcome\":\"success\",\"path\":\"src/a.rs\",\"removedLines\":1}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "modified",
+          "path": "src/a.rs",
+          "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"modified\",\"diff\":\"--- a/src/a.rs\\n+++ b/src/a.rs\\n@@ -1 +1 @@\\n-old\\n+new\\n\",\"path\":\"src/a.rs\"}],\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 8,
+      "outcome": "success",
+      "fileCount": 1,
+      "modifiedCount": 0,
+      "createdCount": 1,
+      "deletedCount": 0,
+      "movedCount": 0,
+      "addedLines": 1,
+      "removedLines": 0,
+      "path": "src/new.rs"
+    },
+    "jcs": "{\"addedLines\":1,\"createdCount\":1,\"deletedCount\":0,\"durationMs\":8,\"fileCount\":1,\"modifiedCount\":0,\"movedCount\":0,\"outcome\":\"success\",\"path\":\"src/new.rs\",\"removedLines\":0}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "created",
+          "path": "src/new.rs",
+          "diff": "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+new\n"
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"created\",\"diff\":\"--- /dev/null\\n+++ b/src/new.rs\\n@@ -0,0 +1 @@\\n+new\\n\",\"path\":\"src/new.rs\"}],\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 8,
+      "outcome": "success",
+      "fileCount": 1,
+      "modifiedCount": 0,
+      "createdCount": 0,
+      "deletedCount": 1,
+      "movedCount": 0,
+      "addedLines": 0,
+      "removedLines": 1,
+      "path": "src/old.rs"
+    },
+    "jcs": "{\"addedLines\":0,\"createdCount\":0,\"deletedCount\":1,\"durationMs\":8,\"fileCount\":1,\"modifiedCount\":0,\"movedCount\":0,\"outcome\":\"success\",\"path\":\"src/old.rs\",\"removedLines\":1}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "deleted",
+          "path": "src/old.rs",
+          "diff": "--- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"deleted\",\"diff\":\"--- a/src/old.rs\\n+++ /dev/null\\n@@ -1 +0,0 @@\\n-old\\n\",\"path\":\"src/old.rs\"}],\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 8,
+      "outcome": "success",
+      "fileCount": 1,
+      "modifiedCount": 0,
+      "createdCount": 0,
+      "deletedCount": 0,
+      "movedCount": 1,
+      "addedLines": 0,
+      "removedLines": 0,
+      "path": "src/b.rs"
+    },
+    "jcs": "{\"addedLines\":0,\"createdCount\":0,\"deletedCount\":0,\"durationMs\":8,\"fileCount\":1,\"modifiedCount\":0,\"movedCount\":1,\"outcome\":\"success\",\"path\":\"src/b.rs\",\"removedLines\":0}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "moved",
+          "oldPath": "src/a.rs",
+          "path": "src/b.rs",
+          "diff": "rename from src/a.rs\nrename to src/b.rs\n"
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"moved\",\"diff\":\"rename from src/a.rs\\nrename to src/b.rs\\n\",\"oldPath\":\"src/a.rs\",\"path\":\"src/b.rs\"}],\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 18,
+      "outcome": "success",
+      "fileCount": 2,
+      "modifiedCount": 0,
+      "createdCount": 1,
+      "deletedCount": 1,
+      "movedCount": 0,
+      "addedLines": 1,
+      "removedLines": 1
+    },
+    "jcs": "{\"addedLines\":1,\"createdCount\":1,\"deletedCount\":1,\"durationMs\":18,\"fileCount\":2,\"modifiedCount\":0,\"movedCount\":0,\"outcome\":\"success\",\"removedLines\":1}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "created",
+          "path": "src/new.rs",
+          "diff": "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+new\n"
+        },
+        {
+          "change": "deleted",
+          "path": "src/old.rs",
+          "diff": "--- a/src/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"created\",\"diff\":\"--- /dev/null\\n+++ b/src/new.rs\\n@@ -0,0 +1 @@\\n+new\\n\",\"path\":\"src/new.rs\"},{\"change\":\"deleted\",\"diff\":\"--- a/src/old.rs\\n+++ /dev/null\\n@@ -1 +0,0 @@\\n-old\\n\",\"path\":\"src/old.rs\"}],\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "files": [
+        {
+          "change": "modified",
+          "path": "src/huge.rs",
+          "diffOmitted": true
+        }
+      ],
+      "truncated": true,
+      "omittedItems": 0,
+      "omittedBytes": 4000000
+    },
+    "jcs": "{\"files\":[{\"change\":\"modified\",\"diffOmitted\":true,\"path\":\"src/huge.rs\"}],\"omittedBytes\":4000000,\"omittedItems\":0,\"revision\":1,\"schema\":\"aft/files-detail/1\",\"truncated\":true}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 12,
+      "outcome": "success",
+      "location": "outside_project",
+      "fileCount": 1,
+      "modifiedCount": 1,
+      "createdCount": 0,
+      "deletedCount": 0,
+      "movedCount": 0,
+      "addedLines": 1,
+      "removedLines": 1
+    },
+    "jcs": "{\"addedLines\":1,\"createdCount\":0,\"deletedCount\":0,\"durationMs\":12,\"fileCount\":1,\"location\":\"outside_project\",\"modifiedCount\":1,\"movedCount\":0,\"outcome\":\"success\",\"removedLines\":1}"
+  },
+  {
+    "kind": "detail",
+    "schema": "files",
+    "body": {
+      "schema": "aft/files-detail/1",
+      "revision": 1,
+      "location": "outside_project",
+      "files": [
+        {
+          "change": "modified",
+          "location": "outside_project",
+          "diffOmitted": true
+        }
+      ]
+    },
+    "jcs": "{\"files\":[{\"change\":\"modified\",\"diffOmitted\":true,\"location\":\"outside_project\"}],\"location\":\"outside_project\",\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "bash",
+    "body": {
+      "durationMs": 1,
+      "outcome": "held",
+      "reason": "consent",
+      "phase": "held",
+      "execution": "local"
+    },
+    "jcs": "{\"durationMs\":1,\"execution\":\"local\",\"outcome\":\"held\",\"phase\":\"held\",\"reason\":\"consent\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "files",
+    "body": {
+      "durationMs": 12,
+      "heldMs": 2000,
+      "outcome": "success",
+      "fileCount": 1,
+      "modifiedCount": 1,
+      "createdCount": 0,
+      "deletedCount": 0,
+      "movedCount": 0,
+      "addedLines": 1,
+      "removedLines": 1,
+      "path": "src/a.rs"
+    },
+    "jcs": "{\"addedLines\":1,\"createdCount\":0,\"deletedCount\":0,\"durationMs\":12,\"fileCount\":1,\"heldMs\":2000,\"modifiedCount\":1,\"movedCount\":0,\"outcome\":\"success\",\"path\":\"src/a.rs\",\"removedLines\":1}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 2,
+      "outcome": "error",
+      "reason": "permission_denied",
+      "fileCount": 0,
+      "modifiedCount": 0,
+      "createdCount": 0,
+      "deletedCount": 0,
+      "movedCount": 0
+    },
+    "jcs": "{\"createdCount\":0,\"deletedCount\":0,\"durationMs\":2,\"fileCount\":0,\"modifiedCount\":0,\"movedCount\":0,\"outcome\":\"error\",\"reason\":\"permission_denied\"}"
+  },
+  {
+    "kind": "record",
+    "schema": "files",
+    "body": {
+      "durationMs": 1,
+      "outcome": "held",
+      "reason": "consent"
+    },
+    "jcs": "{\"durationMs\":1,\"outcome\":\"held\",\"reason\":\"consent\"}"
+  },
+  {
+    "kind": "completion",
+    "schema": "files",
+    "body": {
+      "outcome": "error",
+      "reason": "cancelled"
+    },
+    "jcs": "{\"outcome\":\"error\",\"reason\":\"cancelled\"}"
+  }
+]

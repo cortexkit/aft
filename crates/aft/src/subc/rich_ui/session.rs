@@ -47,7 +47,7 @@ pub(super) fn resolve(
     routes: &[RouteIdentity],
     capabilities: ProofCapabilities,
 ) -> Result<Session, ErrorBody> {
-    let refusal = super::chunks::refusal;
+    let refusal = super::authorization::refusal;
     let scope = carrier
         .scope
         .as_ref()
@@ -157,9 +157,9 @@ fn effective_identity(
         ..
     } = &carrier.spawn_principal
     else {
-        return Err(super::chunks::refusal("session_not_bound"));
+        return Err(super::authorization::refusal("session_not_bound"));
     };
-    let id = principal(policy).ok_or_else(|| super::chunks::refusal("session_not_bound"))?;
+    let id = principal(policy).ok_or_else(|| super::authorization::refusal("session_not_bound"))?;
     Ok(RouteIdentity(Arc::new(RouteIdentityData {
         root: policy.root.clone(),
         project_root: policy.project_root.clone(),
@@ -191,7 +191,7 @@ fn effective_identity(
 
 impl Session {
     fn viewed_task(&self, ctx: &AppContext, key: &str) -> Result<String, ErrorBody> {
-        let refusal = super::chunks::refusal;
+        let refusal = super::authorization::refusal;
         let requester = principal(&self.identity).ok_or_else(|| refusal("task_not_found"))?;
         let harness = self
             .identity

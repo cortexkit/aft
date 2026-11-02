@@ -255,11 +255,7 @@ pub(crate) fn handle_with_observation_only(
                     .append_db_hint(&task_id, &mut snapshot.output_preview);
             }
             let response = if let Some(refusal) = &snapshot.remote_refusal {
-                let mut extra = json!(snapshot);
-                if !observation_only {
-                    ctx.bash_background()
-                        .attach_terminal_view(&mut extra, task_session);
-                }
+                let extra = json!(snapshot);
                 Response::error_with_data(&req.id, refusal.code, &refusal.message, extra)
             } else if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
@@ -367,10 +363,6 @@ pub(crate) fn handle_with_observation_only(
                             }
                         }
                     }
-                }
-                if !observation_only {
-                    ctx.bash_background()
-                        .attach_terminal_view(&mut data, task_session);
                 }
                 Response::success(&req.id, data)
             };
@@ -1020,155 +1012,5 @@ mod tests {
         assert!(message.contains("background task row was erased: bash-erased"));
         assert!(message.contains("stop polling this ID"));
         assert!(!message.contains(super::UNKNOWN_TASK_GUIDANCE));
-    }
-
-    const VIEW_SESSION: &str = "view-session";
-    const VIEW_TASK: &str = "bash-0000000000000031";
-
-    struct ViewFixture {
-        ctx: AppContext,
-        pin: String,
-        stored: serde_json::Value,
-        _writing: crate::db::rich_ui::TestViewWritingGuard,
-        _root: tempfile::TempDir,
-    }
-
-    impl ViewFixture {
-        /// A terminal pinned task on disk with its row and view record in
-        /// aft.db, as a restart recovery plus terminal upsert would leave it.
-        fn terminal() -> Self {
-            Self::with_status(true)
-        }
-
-        fn with_status(terminal: bool) -> Self {
-            let manifest = crate::db::rich_ui::test_view_manifest_for_test();
-            let pin = manifest.pins[0].clone();
-            let writing = crate::db::rich_ui::enable_test_view_writing_for_test(manifest.clone());
-            let root = tempfile::tempdir().unwrap();
-            let project = root.path().join("project");
-            fs::create_dir(&project).unwrap();
-            let storage = root.path().join("storage");
-            let ctx = AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                Config {
-                    storage_dir: Some(storage.clone()),
-                    project_root: Some(project.clone()),
-                    harness: Some(Harness::Opencode),
-                    ..Config::default()
-                },
-            );
-            let db = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::db::open(&root.path().join("aft.db")).unwrap(),
-            ));
-            ctx.set_db(std::sync::Arc::clone(&db));
-            ctx.bash_background()
-                .set_db_pool(std::sync::Arc::clone(&db));
-            ctx.bash_background().set_harness(Harness::Opencode);
-            let task_storage = storage.join(Harness::Opencode.storage_segment());
-            let layout = create_task_layout(&task_storage, VIEW_SESSION, VIEW_TASK).unwrap();
-            let mut metadata = crate::db::rich_ui::terminal_task_metadata_for_test(Some(&pin));
-            metadata.session_id = VIEW_SESSION.into();
-            metadata.task_id = VIEW_TASK.into();
-            metadata.harness = Some(Harness::Opencode.storage_segment());
-            metadata.workdir = project.clone();
-            metadata.project_root = Some(project.clone());
-            if !terminal {
-                metadata.status = BgTaskStatus::Running;
-                metadata.finished_at = None;
-                metadata.duration_ms = None;
-                metadata.exit_code = None;
-                metadata.completion_preview = None;
-                // Read-only restore probes: no timeout or process group can
-                // stand in for a live child, so point at this process.
-                metadata.child_pid = Some(std::process::id());
-            }
-            write_task_at(&layout, &metadata).unwrap();
-            fs::write(&layout.paths.stdout, "done\n").unwrap();
-            fs::write(&layout.paths.stderr, "").unwrap();
-            let row = crate::db::rich_ui::task_row_for_test(
-                &metadata,
-                &Harness::Opencode.storage_segment(),
-                if terminal { "completed" } else { "running" },
-                terminal.then_some(7),
-                true,
-            );
-            // The terminal upsert writes the record through the shared
-            // wrapper, the same path production uses; a running upsert
-            // writes no record.
-            let stored = {
-                let conn = db.lock().unwrap();
-                crate::db::rich_ui::upsert_task_row_with_view(&conn, &row, &metadata).unwrap();
-                crate::db::rich_ui::view_record_json(
-                    &conn,
-                    &Harness::Opencode.storage_segment(),
-                    VIEW_SESSION,
-                    VIEW_TASK,
-                )
-                .unwrap()
-                .unwrap_or(serde_json::Value::Null)
-            };
-            Self {
-                ctx,
-                pin,
-                stored,
-                _writing: writing,
-                _root: root,
-            }
-        }
-
-        fn status(&self, task_id: &str) -> Response {
-            let request: RawRequest = serde_json::from_value(serde_json::json!({
-                "id": "view-status", "command": "bash_status", "session_id": VIEW_SESSION,
-                "params": { "task_id": task_id },
-            }))
-            .unwrap();
-            super::handle(&request, &self.ctx)
-        }
-    }
-
-    /// A terminal pinned `bash_status` on a tool-result/v1 route carries the
-    /// stored record in `structuredContent.view`, with the same model-visible
-    /// content bytes as the legacy reply. A legacy route never receives it.
-    #[test]
-    fn terminal_bash_status_carries_the_stored_record_on_tool_result_routes() {
-        let fixture = ViewFixture::terminal();
-        assert!(fixture.stored.is_object(), "record must be stored");
-        // A legacy-envelope route never receives the record.
-        let legacy = fixture.status(VIEW_TASK);
-        assert!(legacy.success, "{legacy:?}");
-        assert_eq!(legacy.data["status"], "completed");
-        assert!(legacy.data.get("view").is_none());
-        // A tool-result/v1 route receives the stored record verbatim.
-        let _v1 = crate::subc::result_body::enter(true);
-        let response = fixture.status(VIEW_TASK);
-        assert!(response.success, "{response:?}");
-        assert_eq!(response.data["view"], fixture.stored);
-        assert_eq!(response.data["view"]["task_id"], VIEW_TASK);
-        assert_eq!(response.data["view"]["schema_pin"], fixture.pin);
-        // The extra member leaves the model-visible content bytes unchanged.
-        let context = crate::subc_format::FormatContext::default();
-        let with_view =
-            crate::subc_format::format_response_with_context("bash_status", &response, &context);
-        let plain = Response::success(&response.id, {
-            let mut data = response.data.clone();
-            data.as_object_mut().unwrap().remove("view");
-            data
-        });
-        let without_view =
-            crate::subc_format::format_response_with_context("bash_status", &plain, &context);
-        assert_eq!(with_view, without_view);
-    }
-
-    /// A still-running `bash_status` carries no record, even on a
-    /// tool-result/v1 route with writing enabled.
-    #[test]
-    fn running_bash_status_carries_no_view_record() {
-        let fixture = ViewFixture::with_status(false);
-        assert!(fixture.stored.is_null());
-        let _v1 = crate::subc::result_body::enter(true);
-        let response = fixture.status(VIEW_TASK);
-        assert!(response.success, "{response:?}");
-        assert_eq!(response.data["status"], "running");
-        assert!(response.data.get("view").is_none());
     }
 }

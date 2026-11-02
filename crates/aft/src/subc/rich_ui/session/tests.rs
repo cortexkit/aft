@@ -698,7 +698,8 @@ async fn exchange_keyed(
 
 #[tokio::test]
 async fn session_read_dispatch_uses_policy_disables_and_closed_envelope() {
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for kind in ["head", "worker"] {
         let mut f = Fixture::new(kind);
         std::fs::write(f.dir.path().join("in-root.txt"), "inside\n").unwrap();
@@ -724,7 +725,8 @@ async fn session_read_dispatch_uses_policy_disables_and_closed_envelope() {
 
 #[tokio::test]
 async fn carrier_presets_never_promote_flow_head_and_task_seam_fails_closed() {
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let mut f = Fixture::new("head");
     Arc::get_mut(&mut f.carrier.0)
         .unwrap()
@@ -768,7 +770,8 @@ async fn carrier_presets_never_promote_flow_head_and_task_seam_fails_closed() {
 #[tokio::test]
 async fn worker_opening_database_waits_for_every_carrier_operation() {
     use std::future::Future;
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for op in ["read", "bash_status", "bash_output", "bash_watch"] {
         let name = if op == "bash_output" {
             "bash_status"
@@ -953,7 +956,8 @@ fn carrier_symlink_inside_root_cannot_use_agent_outside_grant() {
 
 #[tokio::test]
 async fn flow_read_carrier_keeps_earlier_principal_refusal() {
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let mut f = Fixture::new("ephemeral");
     Arc::get_mut(&mut f.carrier.0)
         .unwrap()
@@ -974,7 +978,8 @@ async fn flow_read_carrier_keeps_earlier_principal_refusal() {
 
 #[tokio::test]
 async fn unscoped_occipital_tool_call_is_not_session_bound() {
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let mut f = Fixture::new("head");
     Arc::get_mut(&mut f.carrier.0).unwrap().scope = None;
     let reply = exchange(
@@ -993,7 +998,8 @@ async fn unscoped_occipital_tool_call_is_not_session_bound() {
 
 #[tokio::test]
 async fn unresolved_policy_is_typed_and_database_and_preset_errors_precede_mode() {
-    let _manifest = super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+    let _manifest =
+        super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let mut f = Fixture::new("head");
     Arc::get_mut(&mut f.policy.0).unwrap().session.push('x');
     let reply = exchange(

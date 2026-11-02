@@ -101,6 +101,7 @@
           "ops": [
             "role.describe",
             "tool.catalog",
+            "tool.views",
             "tool.call",
             "tool.withdraw",
             "late_results",
@@ -110,7 +111,7 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": ["tool-catalog-confine/v1"]
+      "capabilities": ["tool-catalog-confine/v1", "tool-views/v1"]
     },
     "presets": {
       "head": {

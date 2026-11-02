@@ -2981,7 +2981,14 @@ impl LedgerEdge {
                         .unwrap()
                         .get(&(route, outgoing.header.corr))
                     {
-                        super::rich_ui::display::reply(&call.key, true, false, None);
+                        let body =
+                            serde_json::from_slice::<Value>(&outgoing.body).unwrap_or(Value::Null);
+                        super::rich_ui::display::reply(
+                            &call.key,
+                            true,
+                            false,
+                            body["held"]["reason"].as_str(),
+                        );
                     }
                     let running = serde_json::from_slice::<Value>(&outgoing.body)
                         .is_ok_and(|body| body["held"]["reason"] == "running");
@@ -3012,16 +3019,6 @@ impl LedgerEdge {
                     }
                     continue;
                 };
-                let display_result =
-                    serde_json::from_slice::<Value>(&outgoing.body).unwrap_or(Value::Null);
-                super::rich_ui::display::reply(
-                    &call.key,
-                    false,
-                    outgoing.header.ty == FrameType::Error || display_result["isError"] == true,
-                    display_result["code"]
-                        .as_str()
-                        .or_else(|| display_result["errorCode"].as_str()),
-                );
                 if outgoing.header.ty == FrameType::Error
                     && serde_json::from_slice::<Value>(&outgoing.body)
                         .is_ok_and(|body| body["code"] == "detached")
@@ -3043,6 +3040,16 @@ impl LedgerEdge {
                     }
                     continue;
                 }
+                let display_result =
+                    serde_json::from_slice::<Value>(&outgoing.body).unwrap_or(Value::Null);
+                super::rich_ui::display::reply(
+                    &call.key,
+                    false,
+                    outgoing.header.ty == FrameType::Error || display_result["isError"] == true,
+                    display_result["code"]
+                        .as_str()
+                        .or_else(|| display_result["errorCode"].as_str()),
+                );
                 let actual = actual.clone();
                 let detached = call.detached;
                 // Save the complete tool-result data before projecting the
@@ -3179,6 +3186,9 @@ fn detach_shell_row(ctx: &crate::context::AppContext, key: &crate::db::call_ledg
         crate::db::call_ledger::get(&conn, key).ok().flatten()?.task_id
     });
     if let Some(task) = task {
+        ctx.bash_background()
+            .capture_display_reply(&json!({"task_id":task,"status":"running"}));
+        super::rich_ui::display::reply(key, true, false, Some("running"));
         ctx.bash_background().settle_detached_call(&task);
     }
 }
@@ -3680,6 +3690,29 @@ mod tests {
 
     fn call(name: &str, arguments: Value) -> cortexkit_role_tool_provider::call::ToolCallRequest {
         serde_json::from_value(json!({"name": name, "arguments": arguments})).unwrap()
+    }
+
+    #[test]
+    fn tool_views_table_covers_all_current_schema_variants() {
+        for preset in [CatalogPreset::Head, CatalogPreset::Worker] {
+            for (base, remote, revision) in build_tools(preset) {
+                for tool in std::iter::once(base).chain(remote).chain(revision) {
+                    if !matches!(
+                        tool.name.as_str(),
+                        "bash" | "edit" | "write" | "apply_patch"
+                    ) {
+                        continue;
+                    }
+                    let pin = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+                        .encode()
+                        .unwrap();
+                    assert!(
+                        super::super::tool_views::view(&pin).is_some(),
+                        "missing current view {pin}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5295,6 +5328,39 @@ pub(in crate::subc) mod route_tests {
     static LAST_DISPATCH: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
     static EXCHANGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[tokio::test]
+    async fn tool_views_every_shipped_pin_remains_servable_on_the_real_handler() {
+        let baseline: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tool_views/shipped-v1.json"
+        ))
+        .unwrap();
+        let pins: Vec<_> = baseline.as_object().unwrap().keys().cloned().collect();
+        let frame = exchange(
+            json!({"op":"tool.views","pins":pins}),
+            RouteRole::ToolProviderV1,
+            "view-history",
+            vec![],
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let answer: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(answer["views"].as_object().unwrap().len(), pins.len());
+        for pin in pins {
+            assert!(
+                answer["views"][&pin].is_object(),
+                "never retire served pin {pin}"
+            );
+            assert_eq!(
+                answer["views"][&pin]["record_schema"],
+                baseline[&pin]["history"][0]["record_schema"]
+            );
+            assert_eq!(
+                answer["views"][&pin]["reads"],
+                baseline[&pin]["history"][0]["reads"]
+            );
+        }
+    }
+
     async fn exchange(
         body: Value,
         role: RouteRole,
@@ -5717,7 +5783,7 @@ pub(in crate::subc) mod route_tests {
 
     #[tokio::test]
     async fn occipital_unpublished_read_uses_closed_carrier_body() {
-        let _manifest = super::super::rich_ui::chunks::set_test_manifest_for_test(None);
+        let _manifest = super::super::rich_ui::authorization::set_test_manifest_for_test(None);
         let (_dir, root) = test_support::test_root("occipital-tool-result");
         let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
         Arc::get_mut(&mut identity.0).unwrap().tool_result_body = true;
