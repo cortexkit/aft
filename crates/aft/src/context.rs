@@ -11266,20 +11266,33 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_capped(None)
+    }
+
+    /// Keep inspect's graph wait inside its request budget. Retain the checkout
+    /// wait outcome so inspect can name files whose edits are not in the graph.
+    pub(crate) fn callgraph_store_for_ops_until(&self, deadline: Instant) -> CallgraphStoreAccess {
+        if Instant::now() >= deadline {
+            return CallgraphStoreAccess::Building;
+        }
+        self.callgraph_store_for_ops_capped(Some(deadline))
+    }
+
+    fn callgraph_store_for_ops_capped(&self, deadline: Option<Instant>) -> CallgraphStoreAccess {
         let active = self
             .checkout_query_runtime
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        self.callgraph_store_for_ops_with_wait(
-            if active {
-                crate::views::contracts::CALLGRAPH_QUERY_WAIT
-            } else {
-                self.callgraph_build_wait_window()
-            },
-            true,
-            None,
-        )
+        let wait = if active {
+            crate::views::contracts::CALLGRAPH_QUERY_WAIT
+        } else {
+            self.callgraph_build_wait_window()
+        };
+        let wait = deadline.map_or(wait, |deadline| {
+            wait.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        self.callgraph_store_for_ops_with_wait(wait, true, None)
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
@@ -11654,7 +11667,17 @@ impl AppContext {
         // rather than answer from the store as it was before.
         if self.callgraph_catch_up.outstanding() {
             let deadline = Instant::now() + wait;
+            let mut progress = crate::run_tool_call::progress::BuildProgress::new(
+                self.config()
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(Path::new(".")),
+            );
             while self.callgraph_catch_up.outstanding() && Instant::now() < deadline {
+                if crate::executor::current_job_cancelled() {
+                    return CallgraphStoreAccess::Building;
+                }
+                progress.observe();
                 std::thread::sleep(Duration::from_millis(5).min(wait));
             }
             if self.callgraph_catch_up.outstanding() {
@@ -11836,8 +11859,24 @@ impl AppContext {
                 let Some(rx) = rx_ref.as_ref() else {
                     return CallgraphStoreAccess::Building;
                 };
+                let deadline = Instant::now() + wait;
+                let mut progress =
+                    crate::run_tool_call::progress::BuildProgress::new(&project_root);
+                let received = loop {
+                    if crate::executor::current_job_cancelled() {
+                        return CallgraphStoreAccess::Building;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let received = rx.recv_timeout(remaining.min(Duration::from_millis(50)));
+                    progress.observe();
+                    if !matches!(received, Err(crossbeam_channel::RecvTimeoutError::Timeout))
+                        || Instant::now() >= deadline
+                    {
+                        break received;
+                    }
+                };
                 (
-                    rx.recv_timeout(wait),
+                    received,
                     self.callgraph_store_rx_generation(),
                     self.callgraph_store_rx_epoch(),
                 )
@@ -12622,6 +12661,14 @@ impl AppContext {
         &self,
     ) -> Arc<dyn crate::views::trigram::LexicalSnapshotSource> {
         self.lexical_view.lock().as_ref().unwrap().source_for_test()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn lexical_view_acquisitions_for_test(&self) -> usize {
+        self.lexical_view
+            .lock()
+            .as_ref()
+            .map_or(0, |view| view.acquisitions_for_test())
     }
 
     #[cfg(test)]

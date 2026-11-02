@@ -93,11 +93,17 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
     let project_root = normalize_path(&ctx.project_root);
     let public_api_entries = crate::inspect::entry_points::resolve_entry_points(&project_root);
     let package_warnings = public_api_entries.warnings().to_vec();
+    let progress = crate::run_tool_call::progress::FileProgress::current();
 
     let per_file = job
         .scope_files
         .par_iter()
         .filter_map(|path| scan_file(path, &project_root))
+        .inspect(|_| {
+            if let Some(progress) = &progress {
+                progress.finished();
+            }
+        })
         .map(|scan| suppress_public_api_exports(scan, &project_root, &public_api_entries))
         .collect::<Vec<_>>();
 
