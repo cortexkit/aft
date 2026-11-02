@@ -258,13 +258,7 @@ fn materialize(
         "views::materialization::blob_reader",
     )?;
     let reader = ManifestViewBlobReader::new(&blob_connection);
-    materialize_reading(
-        database_path,
-        manifest,
-        base,
-        &reader,
-        Some(&blob_connection),
-    )
+    materialize_reading(database_path, manifest, base, &reader)
 }
 
 /// Cold construction from an immutable blob reader, including v2 family stores.
@@ -274,29 +268,23 @@ pub fn materialize_from_blob_reader(
     manifest: &crate::views::Manifest,
     reader: &impl join::ManifestBlobReader,
 ) -> Result<()> {
-    materialize_reading(database_path, manifest, None, reader, None).map(|_| ())
+    materialize_reading(database_path, manifest, None, reader).map(|_| ())
 }
 
 /// [`apply_manifest_diff`] over an immutable blob reader, for a private clone
-/// of a sealed donor built from `base_manifest`. Without the legacy blob
-/// table there are no per-fact resolution inputs, so callers that may read a
-/// changed fact are re-resolved; rows are still rewritten only where they
-/// change. A clone whose recorded fingerprint is not `base_manifest`'s is
-/// refused unchanged (see [`is_base_fingerprint_mismatch`]).
+/// of a sealed donor built from `base_manifest`. The reader must retain access
+/// to both manifests' blobs: only changed resolver-consumed config fields
+/// (such as package exports) invalidate callers that consulted those fields
+/// in the donor. A clone whose recorded fingerprint is not
+/// `base_manifest`'s is refused unchanged (see [`is_base_fingerprint_mismatch`]).
 pub(crate) fn apply_manifest_diff_from_blob_reader(
     database_path: &Path,
     base_manifest: &crate::views::Manifest,
     new_manifest: &crate::views::Manifest,
     reader: &impl join::ManifestBlobReader,
 ) -> Result<MaterializeStats> {
-    materialize_reading(
-        database_path,
-        new_manifest,
-        Some(base_manifest),
-        reader,
-        None,
-    )
-    .map(|(stats, _)| stats)
+    materialize_reading(database_path, new_manifest, Some(base_manifest), reader)
+        .map(|(stats, _)| stats)
 }
 
 fn materialize_reading(
@@ -304,7 +292,6 @@ fn materialize_reading(
     manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
     reader: &impl join::ManifestBlobReader,
-    blob_connection: Option<&Connection>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
     let shared_reader = join::SharedBlobReader {
         inner: reader,
@@ -470,15 +457,8 @@ fn materialize_reading(
     let mut fact_invalidated = BTreeSet::new();
     let mut fallback_count = 0;
     let selected = match (&changed, base) {
-        (Some(changed), Some(base))
-            if blob_connection.is_some() && !requires_full_resolution(base, manifest, changed) =>
-        {
-            let diff = resolution_facts::diff_inputs(
-                base,
-                manifest,
-                changed,
-                blob_connection.expect("legacy incremental blob connection"),
-            )?;
+        (Some(changed), Some(base)) if !requires_full_resolution(base, manifest, changed) => {
+            let diff = resolution_facts::diff_inputs(base, manifest, changed, reader)?;
             if diff.unknown == 0 && (!diff.changed.is_empty() || diff.inputs_changed) {
                 let cached = load_bindings(&transaction)?;
                 for (caller, binding) in &cached {
@@ -1918,6 +1898,10 @@ fn requires_full_resolution(
     next: &crate::views::Manifest,
     changed: &BTreeSet<Vec<u8>>,
 ) -> bool {
+    #[cfg(test)]
+    if tests::FORCE_FULL_RESOLUTION.get() {
+        return true;
+    }
     changed.iter().any(|path| {
         base.entries()
             .chain(next.entries())

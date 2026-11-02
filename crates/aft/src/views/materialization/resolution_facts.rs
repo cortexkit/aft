@@ -81,11 +81,10 @@ pub(super) fn diff_inputs(
     base: &crate::views::Manifest,
     next: &crate::views::Manifest,
     changed: &std::collections::BTreeSet<Vec<u8>>,
-    connection: &rusqlite::Connection,
+    reader: &impl crate::callgraph_store::join::ManifestBlobReader,
 ) -> crate::callgraph_store::Result<InputDiff> {
-    use crate::callgraph_store::join::{CallgraphBlob, ManifestBlobReader};
+    use crate::callgraph_store::join::CallgraphBlob;
     use crate::views::{ManifestEntry, RelPath};
-    let reader = super::ManifestViewBlobReader::new(connection);
     let mut result = InputDiff::default();
     for path in changed {
         let rel = RelPath::new(path.clone()).expect("manifest path");
@@ -114,8 +113,8 @@ pub(super) fn diff_inputs(
             let bytes = if manifest.get(&rel).is_none() {
                 Some(Vec::new())
             } else if let Some(key) = key(manifest) {
-                let payload = reader
-                    .read_callgraph_blob(&key)
+                let blob = reader
+                    .read_callgraph_blob_decoded(&key)
                     .map_err(|e| {
                         crate::callgraph_store::CallGraphStoreError::Unavailable(e.to_string())
                     })?
@@ -124,10 +123,8 @@ pub(super) fn diff_inputs(
                             "missing resolution input blob {key}"
                         ))
                     })?;
-                match CallgraphBlob::from_bytes(&payload).map_err(|e| {
-                    crate::callgraph_store::CallGraphStoreError::Unavailable(e.to_string())
-                })? {
-                    CallgraphBlob::Config(config) => Some(config.source),
+                match blob.as_ref() {
+                    CallgraphBlob::Config(config) => Some(config.source.clone()),
                     _ => None,
                 }
             } else {

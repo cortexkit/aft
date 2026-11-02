@@ -46,6 +46,9 @@ thread_local! {
     // same fixture without adding a production configuration switch.
     pub(super) static COLD_BUILD_MODE: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
     pub(super) static COLD_WRITE_LIMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Paired measurements retain the previous blob-reader behavior: resolve
+    // every caller and dispatch site even when dependency caches are available.
+    pub(super) static FORCE_FULL_RESOLUTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn with_cold_mode<T>(mode: (bool, bool), run: impl FnOnce() -> T) -> T {
@@ -427,10 +430,8 @@ fn cold_reference_batches_match_unbatched_rows_and_dispatch() {
     let bounded = f.dir.path().join("batched.sqlite");
     let unbatched = f.dir.path().join("unbatched.sqlite");
     drop(Connection::open(&unbatched).unwrap());
-    let (batched, _) =
-        materialize_reading(&bounded, &manifest, None, &reader, Some(&connection)).unwrap();
-    let (whole, _) =
-        materialize_reading(&unbatched, &manifest, None, &reader, Some(&connection)).unwrap();
+    let (batched, _) = materialize_reading(&bounded, &manifest, None, &reader).unwrap();
+    let (whole, _) = materialize_reading(&unbatched, &manifest, None, &reader).unwrap();
     assert!(batched.resolved_refs > 4096);
     assert!(batched.dispatch_resolved_sites > 0);
     assert_eq!(batched.inserted, whole.inserted);

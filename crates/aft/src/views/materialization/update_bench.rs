@@ -30,7 +30,8 @@
 //!   database and print each table's and index's size in the main file.
 //! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
 //!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
-//! - `AFT_UPDATE_BENCH_READER=1`: patch through the v3 blob-reader adapter.
+//! - `AFT_UPDATE_BENCH_READER=1`: compare full and selective v3 blob-store reader patches,
+//!   including single-file Rust/config edits and a Rust file rename.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -248,6 +249,72 @@ fn bench_repository_incremental_update() {
         println!("edit-{size} paths: {}", edited_paths.join(" "));
         targets.push((format!("edit-{size}"), &new, edited));
     }
+    if std::env::var_os("AFT_UPDATE_BENCH_READER").is_some() {
+        for (label, path, language, source) in [
+            (
+                "edit-shared-rust",
+                "crates/aft/src/callgraph_store/join.rs",
+                "rust",
+                format!(
+                    "pub fn aft_view_patch_probe() {{}}\n{}",
+                    std::fs::read_to_string(
+                        checkout.join("crates/aft/src/callgraph_store/join.rs")
+                    )
+                    .unwrap()
+                ),
+            ),
+            (
+                "edit-cargo",
+                "Cargo.toml",
+                "config",
+                format!(
+                    "{}\n# offline callgraph parity edit\n",
+                    std::fs::read_to_string(checkout.join("Cargo.toml")).unwrap()
+                ),
+            ),
+            ("edit-package", "package.json", "config", {
+                let mut package: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(checkout.join("package.json")).unwrap())
+                        .unwrap();
+                package["version"] = serde_json::json!("0.0.0-parity");
+                serde_json::to_string(&package).unwrap()
+            }),
+        ] {
+            let key = crate::blob_store::CallgraphKey::for_current(source.as_bytes(), language)
+                .full_key();
+            let blob = if language == "config" {
+                join::CallgraphBlob::config(source.as_bytes(), crate::views::callgraph::PRODUCER)
+            } else {
+                join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
+                    .unwrap()
+            };
+            store.put(&key, &blob.to_bytes().unwrap()).unwrap();
+            let edited = Manifest::new(new.entries().map(|(entry_path, entry)| {
+                let mut entry = entry.clone();
+                if entry_path.as_bytes() == path.as_bytes() {
+                    let ManifestEntry::Regular { planes, .. } = &mut entry else {
+                        panic!("regular source input")
+                    };
+                    planes.callgraph = Some(key.to_hex());
+                }
+                (entry_path.clone(), entry)
+            }))
+            .unwrap();
+            targets.push((label.into(), &new, edited));
+        }
+        let renamed = Manifest::new(new.entries().map(|(path, entry)| {
+            (
+                if path.as_bytes() == b"crates/aft/src/views/materialization.rs" {
+                    RelPath::new(b"crates/aft/src/views/materialization_renamed.rs").unwrap()
+                } else {
+                    path.clone()
+                },
+                entry.clone(),
+            )
+        }))
+        .unwrap();
+        targets.push(("rename-rust".into(), &new, renamed));
+    }
     drop(store);
 
     let v3_reader = std::env::var_os("AFT_UPDATE_BENCH_READER").map(|_| {
@@ -361,15 +428,34 @@ fn bench_repository_incremental_update() {
     } else {
         vec![false]
     };
-    for (case, base, target, synced) in targets.iter().flat_map(|(label, base, target)| {
-        variants
-            .iter()
-            .map(move |synced| (label, base, target, *synced))
-    }) {
+    let resolution_modes: &[bool] = if v3_reader.is_some() {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for (case, base, target, synced, full_resolution) in
+        targets.iter().flat_map(|(label, base, target)| {
+            variants.iter().flat_map(move |synced| {
+                resolution_modes
+                    .iter()
+                    .map(move |full| (label, base, target, *synced, *full))
+            })
+        })
+    {
         if only.as_ref().is_some_and(|only| !only.contains(case)) {
             continue;
         }
-        let label = &format!("{case}{}", if synced { "-synced" } else { "" });
+        let label = &format!(
+            "{case}{}{}",
+            if synced { "-synced" } else { "" },
+            if v3_reader.is_none() {
+                ""
+            } else if full_resolution {
+                "-full-reader"
+            } else {
+                "-selected-reader"
+            }
+        );
         let base_db = if std::ptr::eq(*base, &old) {
             old_db.as_ref().unwrap()
         } else {
@@ -402,12 +488,14 @@ fn bench_repository_incremental_update() {
         };
         let window_start = epoch();
         let started = Instant::now();
-        let (stats, timings) = if let Some(reader) = &v3_reader {
-            materialize_reading(&db, target, Some(base), reader, None)
+        let previous = tests::FORCE_FULL_RESOLUTION.replace(full_resolution);
+        let result = if let Some(reader) = &v3_reader {
+            materialize_reading(&db, target, Some(base), reader)
         } else {
             materialize(&db, &blobs, target, Some(base))
-        }
-        .unwrap();
+        };
+        tests::FORCE_FULL_RESOLUTION.set(previous);
+        let (stats, timings) = result.unwrap();
         let wall = started.elapsed().as_secs_f64();
         // Wall-clock bounds, to line the run up with system-call traces.
         println!(
@@ -479,19 +567,22 @@ fn bench_repository_incremental_update() {
             let expected = cold(&format!("target-{label}"), target);
             parity::assert_logical_parity(&db, &expected);
             if v3_reader.is_some() {
+                let materialization_path = if case == "rename-rust" {
+                    "crates/aft/src/views/materialization_renamed.rs"
+                } else {
+                    "crates/aft/src/views/materialization.rs"
+                };
                 tests::reader_tests::assert_query_parity(
                     &db,
                     &expected,
+                    &checkout,
                     &[
-                        (
-                            "crates/aft/src/views/materialization.rs",
-                            "apply_manifest_diff",
-                        ),
+                        (materialization_path, "apply_manifest_diff"),
                         (
                             "crates/aft/src/callgraph_store/join.rs",
                             "CallgraphBlob::extract",
                         ),
-                        ("crates/aft/src/views/materialization.rs", "materialize_manifest_view_database"),
+                        (materialization_path, "materialize_manifest_view_database"),
                     ],
                 );
             }

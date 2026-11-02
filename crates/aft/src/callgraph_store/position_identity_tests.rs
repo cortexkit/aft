@@ -462,9 +462,8 @@ fn s4_upgrade_old_legacy_single_file_and_superseded_generation_are_not_migrated(
     assert_eq!(fs::read(&single).unwrap(), old_bytes);
 }
 
-#[test]
-fn s4_one_node_per_scoped_name_for_every_supported_language() {
-    for (path, language, source) in [
+pub(crate) fn language_fixtures() -> [(&'static str, &'static str, &'static str); 33] {
+    [
         (
             "a.ts",
             "typescript",
@@ -530,7 +529,12 @@ fn s4_one_node_per_scoped_name_for_every_supported_language() {
             "@interface C\n- (void)f;\n@end\n@implementation C\n- (void)f {}\n@end",
         ),
         ("a.toml", "toml", "[f]\ng = 1\n"),
-    ] {
+    ]
+}
+
+#[test]
+fn s4_one_node_per_scoped_name_for_every_supported_language() {
+    for (path, language, source) in language_fixtures() {
         let data = callgraph::build_file_data_from_source(Path::new(path), source).unwrap();
         let nodes = build_node_records(path, source, &data).unwrap();
         assert!(!nodes.is_empty(), "{language} fixture must define a symbol");

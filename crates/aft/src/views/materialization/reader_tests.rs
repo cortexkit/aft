@@ -32,7 +32,12 @@ pub(crate) fn v3_reader(connection: &Connection, storage: &Path) -> V3BlobReader
     )
 }
 
-pub(crate) fn assert_query_parity(actual: &Path, expected: &Path, queries: &[(&str, &str)]) {
+pub(crate) fn assert_query_parity(
+    actual: &Path,
+    expected: &Path,
+    root: &Path,
+    queries: &[(&str, &str)],
+) {
     let open = |path: &Path| {
         let generation = path
             .file_stem()
@@ -42,7 +47,7 @@ pub(crate) fn assert_query_parity(actual: &Path, expected: &Path, queries: &[(&s
             .strip_prefix("derived-")
             .unwrap();
         crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
-            path.parent().unwrap().to_path_buf(),
+            root.to_path_buf(),
             "reader-test".into(),
             path.parent().unwrap().to_path_buf(),
             generation,
@@ -135,7 +140,7 @@ fn blob_reader_patch_selects_one_file_and_reuses_dispatch() {
     assert!(!stats.full_resolution && !stats.dispatch_full, "{stats:?}");
     materialize_from_blob_reader(&cold, &versions[1], &reader).unwrap();
     parity::assert_logical_parity(&patched, &cold);
-    assert_query_parity(&patched, &cold, &[("file_0.ts", "f0")]);
+    assert_query_parity(&patched, &cold, f.dir.path(), &[("file_0.ts", "f0")]);
 }
 
 #[test]
@@ -156,6 +161,7 @@ fn blob_reader_patch_relinks_incoming_ordinals() {
     assert_query_parity(
         &patched,
         &cold,
+        f.dir.path(),
         &[("target.ts", "target"), ("caller.ts", "caller")],
     );
 }
@@ -225,6 +231,7 @@ fn blob_reader_patch_language_corpus_matches_full_through_edits_and_renames() {
         assert_query_parity(
             &patched,
             &cold,
+            f.dir.path(),
             &[
                 ("draw.ts", "draw"),
                 ("src/lib.rs", "entry"),
@@ -232,5 +239,64 @@ fn blob_reader_patch_language_corpus_matches_full_through_edits_and_renames() {
             ],
         );
         from = to;
+    }
+}
+
+#[test]
+fn blob_reader_patch_all_supported_language_fixtures_match_full() {
+    use crate::callgraph_store::position_identity_tests::language_fixtures;
+    for (path, language, source) in language_fixtures() {
+        let f = fixture();
+        let connection = Connection::open(&f.blobs).unwrap();
+        let versions = [source.to_string(), format!("\n{source}")].map(|source| {
+            let blob = join::CallgraphBlob::extract(&source, language, "fixture").unwrap();
+            let payload = blob.to_bytes().unwrap();
+            let key = blake3::hash(&payload);
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                    params![
+                        key.as_bytes().as_slice(),
+                        payload,
+                        blake3::hash(&payload).as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            Manifest::new([(
+                RelPath::new(path.as_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key.to_hex().to_string()),
+                        semantic: None,
+                    },
+                    resolution_input: false,
+                },
+            )])
+            .unwrap()
+        });
+        let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+        let patched = f.dir.path().join("derived-language.sqlite");
+        let cold = f.dir.path().join("derived-cold.sqlite");
+        materialize_from_blob_reader(&patched, &versions[0], &reader).unwrap();
+        let stats =
+            apply_manifest_diff_from_blob_reader(&patched, &versions[0], &versions[1], &reader)
+                .unwrap();
+        assert!(
+            !stats.full_resolution && !stats.dispatch_full,
+            "{language}: {stats:?}"
+        );
+        materialize_from_blob_reader(&cold, &versions[1], &reader).unwrap();
+        parity::assert_logical_parity(&patched, &cold);
+        let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
+        let queries = blob
+            .parse()
+            .unwrap()
+            .symbols
+            .iter()
+            .map(|symbol| (path, symbol.scoped_name.as_str()))
+            .collect::<Vec<_>>();
+        assert!(!queries.is_empty(), "{language} must exercise queries");
+        assert_query_parity(&patched, &cold, f.dir.path(), &queries);
     }
 }
