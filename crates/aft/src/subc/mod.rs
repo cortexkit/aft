@@ -10767,6 +10767,11 @@ async fn hold_for_consent(
             return Some((response, text));
         }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        // A held RESPONSE ends the original REQUEST (tool-provider CONTRACT.md
+        // §4.4). Approved work continues through late_results, not keepalives.
+        if let Some(progress) = &plain_run.progress {
+            progress.close();
+        }
         if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
             .await
             .is_err()
