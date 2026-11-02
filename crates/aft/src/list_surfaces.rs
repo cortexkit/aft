@@ -733,6 +733,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal database admission maintenance, not result lists; exhausted eviction work makes the checkout borrow the main graph",
     },
     ExclusionEntry {
+        file: "views/tree_base.rs",
+        enclosing_item: "identity_for_admission, prove_until",
+        location_or_primitive: "optional admission deadline in member proof and membership identity loops",
+        reason: "internal reuse proof, not result lists; an expired proof cannot establish base reuse or authorize deletion",
+    },
+    ExclusionEntry {
         file: "storage_retention.rs",
         enclosing_item: "evict_least_recent_v3_member, reclaim_v3_admission_family",
         location_or_primitive: "SQL LIMIT and take(max_examined), 64-removal loop and five-second admission deadline",

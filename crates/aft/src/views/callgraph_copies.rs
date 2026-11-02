@@ -100,17 +100,19 @@ pub(crate) fn admit(
         root: target_root.clone(),
         scope: target.scope.clone(),
     };
-    if copies == 0
-        || matches_target(
-            storage,
-            family,
-            policy,
-            &target.scope,
-            &target_root,
-            root,
-            identities,
-        )
-    {
+    if copies == 0 {
+        return Ok(borrow);
+    }
+    let known = identities();
+    if matches_target(
+        storage,
+        family,
+        policy,
+        &target.scope,
+        &target_root,
+        root,
+        || known.clone(),
+    ) {
         return Ok(borrow);
     }
     // At the limit: make room by evicting copies nobody is using. When none
@@ -123,6 +125,7 @@ pub(crate) fn admit(
         copies as usize,
         root,
         policy,
+        known.as_ref(),
     ) {
         Ok(true) => Ok(Admission::Own),
         Ok(false) => Ok(borrow),
@@ -145,6 +148,7 @@ fn evict_for(
     copies: usize,
     root: &Path,
     policy: crate::blob_store::v2::TrigramPolicy,
+    known: Option<&HashMap<String, (u64, blake3::Hash)>>,
 ) -> Result<bool, String> {
     let storage = paths.artifacts.as_path();
     // View-directory removal refuses a cache whose durable owner is unknown;
@@ -157,8 +161,19 @@ fn evict_for(
         crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, &lock)
             .map_err(|error| error.to_string())?;
     for _ in 0..EVICTION_CANDIDATES {
-        let (owned, exempt_base, reusable) =
-            database_count(storage, family, &mut registry, target, root, policy)?;
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let (owned, exempt_base, reusable) = database_count(
+            storage,
+            family,
+            &mut registry,
+            target,
+            root,
+            policy,
+            known,
+            deadline,
+        )?;
         // A different base and the checkout's mutable copy are two databases,
         // even on filesystems where their initial pages are cloned.
         let needed = if reusable.is_some() { 1 } else { 2 };
@@ -204,6 +219,8 @@ fn database_count(
     target: &str,
     root: &Path,
     policy: crate::blob_store::v2::TrigramPolicy,
+    known: Option<&HashMap<String, (u64, blake3::Hash)>>,
+    deadline: Instant,
 ) -> Result<(usize, Option<String>, Option<String>), String> {
     let target_dir = crate::blob_store::v3::view_dir(storage, family, target)
         .map_err(|error| error.to_string())?;
@@ -220,6 +237,9 @@ fn database_count(
     let mut count = 0;
     let mut reusable = None;
     for (scope, kind, stored) in members {
+        if Instant::now() >= deadline {
+            return Err("call-graph database census exceeded the admission budget".into());
+        }
         if scope == target {
             continue;
         }
@@ -265,15 +285,18 @@ fn database_count(
                     scope: scope.clone(),
                 };
                 let paths: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
-                let candidate =
-                    super::tree_base::identity_for_admission(super::tree_base::TreeBaseInput {
+                let candidate = super::tree_base::identity_for_admission(
+                    super::tree_base::TreeBaseInput {
                         route: &route,
                         root,
                         paths: &paths,
                         policy,
                         producers: &producers,
                         ignore_fingerprint: manifest.header().ignore_fingerprint.clone(),
-                    });
+                    },
+                    deadline,
+                    known,
+                );
                 if candidate.is_some_and(|identity| identity.scope == scope) {
                     reusable = Some(scope);
                 }
@@ -660,6 +683,60 @@ mod tests {
         );
         assert!(matches!(admission(&f, 1), Admission::Borrow { .. }));
         assert_eq!(admission(&f, 2), Admission::Own);
+    }
+
+    #[test]
+    fn callgraph_copies_reuses_a_shared_membership_base_for_identical_tracked_edits() {
+        let _serial = v3::serial_for_test();
+        let f = fixture();
+        let edited = "export function edited() {}\n";
+        std::fs::write(f.worker.join("a.ts"), edited).unwrap();
+        let held = super::super::callgraph::CallgraphView::new(
+            f.worker.clone(),
+            f.paths.clone(),
+            FAMILY.into(),
+            policy(),
+        )
+        .unwrap();
+        held.reader().unwrap();
+        let peer = f._temp.path().join("peer");
+        git(
+            &f.main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                peer.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let peer = std::fs::canonicalize(peer).unwrap();
+        std::fs::write(peer.join("a.ts"), edited).unwrap();
+        std::fs::copy(f.worker.join("extra.ts"), peer.join("extra.ts")).unwrap();
+        let admit_peer = |copies| {
+            admit(&f.paths, FAMILY, policy(), &peer, copies, || {
+                Some(
+                    ["a.ts", "extra.ts"]
+                        .into_iter()
+                        .map(|name| {
+                            let bytes = std::fs::read(peer.join(name)).unwrap();
+                            (
+                                name.to_owned(),
+                                (bytes.len() as u64, super::super::io::source_hash(&bytes)),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap()
+        };
+        assert!(matches!(admit_peer(2), Admission::Borrow { .. }));
+        assert_eq!(
+            admit_peer(3),
+            Admission::Own,
+            "the existing membership base must not cost another slot"
+        );
     }
 
     #[test]

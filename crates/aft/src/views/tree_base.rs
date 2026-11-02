@@ -39,15 +39,46 @@ pub(crate) struct TreeBaseInput<'a> {
     pub ignore_fingerprint: Option<String>,
 }
 
-/// Read-only counterpart of bootstrap for copy admission. It proves the
-/// checkout would use an existing tree base without claiming or building it.
-pub(crate) fn identity_for_admission(input: TreeBaseInput<'_>) -> Option<BaseIdentity> {
+/// Read-only helper for copy admission. It computes the
+/// checkout's tree or membership identity without claiming or building a base.
+pub(crate) fn identity_for_admission(
+    input: TreeBaseInput<'_>,
+    deadline: std::time::Instant,
+    known: Option<&std::collections::HashMap<String, (u64, blake3::Hash)>>,
+) -> Option<BaseIdentity> {
     let guard = BindGuard::capture(input.root, None).ok()?;
     if input.ignore_fingerprint.as_deref() != Some(guard.policy.base_digest.as_str()) {
         return None;
     }
-    let proven = prove(&input, &guard).ok()?;
-    BaseIdentity::of(&input.route.family, &proven.manifest).ok()
+    if let Ok(proven) = prove_until(&input, &guard, Some(deadline)) {
+        return BaseIdentity::of(&input.route.family, &proven.manifest).ok();
+    }
+    // Tracked edits cannot use the Git tree base. Match the same membership
+    // identity the checkout driver builds from known paths, sizes and hashes instead.
+    let mut manifest = ManifestV2::new_v3(
+        ManifestHeader {
+            producers: input.producers.clone(),
+            head_tree: None,
+            ignore_fingerprint: input.ignore_fingerprint.clone(),
+            segment: None,
+        },
+        None,
+        Default::default(),
+    );
+    for (path, (size, hash)) in known? {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let path = RelPath::new(path.as_bytes().to_vec()).ok()?;
+        let content = crate::blob_store::v2::ContentHash::from_bytes(*hash.as_bytes());
+        manifest
+            .insert(
+                path.clone(),
+                super::base_builder::base_entry(&path, content, *size, Default::default()),
+            )
+            .ok()?;
+    }
+    BaseIdentity::of(&input.route.family, &manifest).ok()
 }
 
 /// A base manifest whose every member was read and matched to the index,
@@ -64,6 +95,14 @@ pub(crate) type NoTreeProof = &'static str;
 
 /// Reads and proves the members, or names the first check that failed.
 fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Result<ProvenMembers, NoTreeProof> {
+    prove_until(input, guard, None)
+}
+
+fn prove_until(
+    input: &TreeBaseInput<'_>,
+    guard: &BindGuard,
+    deadline: Option<std::time::Instant>,
+) -> Result<ProvenMembers, NoTreeProof> {
     if !guard.policy.reusable {
         return Err("conversion_policy_not_reusable");
     }
@@ -100,6 +139,9 @@ fn prove(input: &TreeBaseInput<'_>, guard: &BindGuard) -> Result<ProvenMembers, 
     let mut bytes = BTreeMap::new();
     let mut receipts = BTreeMap::new();
     for path in input.paths {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err("admission_deadline");
+        }
         // Untracked files and tracked symlinks or gitlinks stay out of the
         // base; the worker's own delta carries whatever the walker admits.
         let Some(entry) = index.get(path.as_bytes()) else {
