@@ -1,1 +1,1 @@
-{"id":"wire-trace-symbol","success":true,"path":[{"symbol":"main","file":"main.ts","line":3},{"symbol":"processData","file":"utils.ts","line":3},{"symbol":"validate","file":"helpers.ts","line":1}],"complete":true}
+{"id":"wire-trace-symbol","success":true,"path":[{"symbol":"main","file":"main.ts","line":3},{"symbol":"processData","file":"utils.ts","line":3},{"symbol":"validate","file":"helpers.ts","line":1}],"complete":true,"text":"3 hops\n  ↳ main [main.ts:3]\n    ↳ processData [utils.ts:3]\n      ↳ validate [helpers.ts:1]"}

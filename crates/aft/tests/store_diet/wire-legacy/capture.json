@@ -1,7 +1,7 @@
 {
   "baseline": "998c896b05753dd3a83158e30f97779b89ef28e2",
-  "binary_sha256": "723bcc502b6243124b094eb42bb2f8036b409fb8965e0e8c0a91e335f52afb67",
-  "manifest_sha256": "b5105f9353aa41f4f58c444adbecc806850c24d6820231a79e0e7c3adfe3f665",
+  "binary_sha256": "fb33584339a40bf2c400b44a634bd2632a75d2779e0ae2e3980fda751bbfc149",
+  "manifest_sha256": "da37f2c73b97176730e9218b855141293230986f3594f62775cbaa3b20fa3cd6",
   "normalised_fields": [],
   "requests": 6,
   "views": false,
@@ -12,5 +12,8 @@
     "trace_to": 1,
     "trace_to_symbol": 1,
     "trace_data": 1
-  }
+  },
+  "config_sha256": "6a472273be79587efe321d9f1bc5de6eb2b0a184e0d353de855e92cc2cfb5d2c",
+  "prepared_cache": false,
+  "required_borrowed": false
 }
