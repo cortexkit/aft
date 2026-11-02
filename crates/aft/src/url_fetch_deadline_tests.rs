@@ -387,7 +387,11 @@ fn a_server_that_hit_the_headers_limit_fails_from_memory_without_a_new_fetch() {
 
     let (second, elapsed) = fetch_within(roomy, &target, storage.path(), local());
     let error = second.expect_err("the remembered failure is repeated");
-    assert!(elapsed < Duration::from_millis(200), "{elapsed:?}");
+    // A new fetch would wait out the 15 s headers limit again, so anything well
+    // under that proves the answer came from memory. The connection count
+    // below is the exact check; this bound only has to survive a loaded runner
+    // (a Windows CI run took 212 ms).
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     assert_eq!(error.code(), "url_fetch_timeout", "{error}");
     assert_eq!(error.phase(), Some(FetchPhase::Headers), "{error}");
     assert!(error.to_string().contains("cached failure"), "{error}");
