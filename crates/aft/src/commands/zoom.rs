@@ -484,6 +484,7 @@ fn handle_zoom_targets(
                                 include_callgraph,
                                 &mut memo,
                             );
+                            crate::run_tool_call::progress::report();
                             // An access ask must reach the host unchanged so it
                             // can ask and retry; inside one batch entry nobody
                             // would see it.
@@ -1402,6 +1403,7 @@ fn zoom_batch_symbols(
             include_callgraph,
             &mut enrichments,
         );
+        crate::run_tool_call::progress::report();
         let json = match serde_json::to_value(&resp) {
             Ok(v) => v,
             Err(err) => {

@@ -89,6 +89,7 @@ fn run_metrics_scan_with_memo(
 ) -> crate::inspect::InspectResult {
     let started = Instant::now();
     memo.reserve_for_scan(job.scope_files.len());
+    let progress = crate::run_tool_call::progress::FileProgress::current();
     let per_file = job
         .scope_files
         .par_iter()
@@ -99,6 +100,11 @@ fn run_metrics_scan_with_memo(
                 language: cached.language,
                 symbol_count: cached_symbol_count(path, job),
                 loc: cached.loc,
+            }
+        })
+        .inspect(|_| {
+            if let Some(progress) = &progress {
+                progress.finished();
             }
         })
         .collect::<Vec<_>>();
@@ -322,6 +328,41 @@ mod tests {
             callgraph_writer: true,
             callgraph_snapshot: None,
         }
+    }
+
+    #[test]
+    fn call_keepalive_inspect_counts_parallel_file_completions() {
+        let project = tempfile::tempdir().unwrap();
+        let files = (0..3)
+            .map(|index| {
+                let path = project.path().join(format!("source-{index}.rs"));
+                fs::write(&path, "fn work() { if true { return; } }\n").unwrap();
+                path
+            })
+            .collect();
+        let mut job = metrics_job(project.path(), files);
+        let progress = crate::run_tool_call::progress::FileProgress::default();
+        let guard = progress.enter();
+        assert_eq!(progress.completed(), 0);
+        assert!(run_metrics_scan(&job).outcome.is_ok());
+        assert_eq!(progress.completed(), 3);
+        job.category = InspectCategory::Duplicates;
+        assert!(super::super::duplicates::run_duplicates_scan(&job)
+            .outcome
+            .is_ok());
+        assert_eq!(progress.completed(), 6);
+        job.category = InspectCategory::Complexity;
+        assert!(super::super::complexity::run_complexity_scan(&job)
+            .outcome
+            .is_ok());
+        assert_eq!(progress.completed(), 9);
+        drop(guard);
+        assert!(crate::run_tool_call::progress::FileProgress::current().is_none());
+        assert_eq!(
+            progress.completed(),
+            9,
+            "waiting does not finish more files"
+        );
     }
 
     #[test]

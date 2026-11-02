@@ -715,7 +715,19 @@ fn bash_background_completion_redaction_preserves_pipeline_failure_warning() {
         assert!(warning.contains("(segment 1 of 2) exited 1"), "{warning}");
         let expected = warning.replace(&token, SECRET_PLACEHOLDER);
         let snapshot = registry.completion_snapshot_for_task(&task).unwrap();
-        let queued = registry.pending_completions_for_session("pipeline-redaction");
+        // Terminal state is visible before completion rendering and queueing.
+        let completion_deadline = Instant::now() + Duration::from_secs(10);
+        let queued = loop {
+            let queued = registry.pending_completions_for_session("pipeline-redaction");
+            if !queued.is_empty() {
+                break queued;
+            }
+            assert!(
+                Instant::now() < completion_deadline,
+                "terminal task {id} never queued its completion"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(queued.len(), 1);
         for completion in [&snapshot, &queued[0]] {
             assert_eq!(completion.exit_code, Some(0));

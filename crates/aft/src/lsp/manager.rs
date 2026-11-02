@@ -3849,7 +3849,7 @@ impl LspManager {
         let language_id = language_id_for_path(&canonical_path, Some(&content)).to_string();
         let mut opened = Vec::with_capacity(targets.len());
         for key in targets {
-            self.invalidate_diagnostic_content(&key, &canonical_path);
+            self.invalidate_diagnostic_content_for_open(&key, &canonical_path, &content);
             let version = self
                 .documents
                 .get(&key)
@@ -6335,6 +6335,40 @@ impl LspManager {
             .remove(&(key.clone(), file.to_path_buf()));
     }
 
+    fn invalidate_diagnostic_content_for_open(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        content: &str,
+    ) {
+        // Native Rust pulls do not repeat compiler diagnostics. Reopening the
+        // same bytes must retain a content-proven push from the current check,
+        // but the native report still needs a pull for the new document version.
+        let keep_push = key.kind == ServerKind::Rust
+            && self.rust_check_state(key) == RustCheckState::Current
+            && self
+                .diagnostics
+                .entries_for_file(file)
+                .iter()
+                .any(|(producer, entry)| {
+                    *producer == key
+                        && !entry.stale
+                        && !entry.from_receive_order
+                        && entry.content_hash == Some(*blake3::hash(content.as_bytes()).as_bytes())
+                });
+        let pushed = keep_push
+            .then(|| {
+                self.latest_push_for_pull_servers
+                    .remove(&(key.clone(), file.to_path_buf()))
+            })
+            .flatten();
+        self.invalidate_diagnostic_content(key, file);
+        if let Some(pushed) = pushed {
+            self.latest_push_for_pull_servers
+                .insert((key.clone(), file.to_path_buf()), pushed);
+        }
+    }
+
     fn confirmed_document_hash(
         &self,
         key: &ServerKey,
@@ -7081,27 +7115,16 @@ impl LspManager {
             cache.reports.insert(file.clone(), stored.clone());
         }
         let mut stored = stored;
-        if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
-            // Recorded before the close check below: rust-analyzer's reply to
-            // a close still carries the file's `cargo check` results.
-            // An empty push is kept as no entry: a missing entry already
-            // reads as "no pushed diagnostics", and storing empty lists kept
-            // one entry for every file rust-analyzer ever published.
-            // Compiler-check results are stored separately. An unversioned push
-            // does not identify the document state it analyzed, so it cannot
-            // borrow a later document pull's content proof.
-            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
-                self.latest_push_for_pull_servers
-                    .remove(&(key.clone(), file.clone()));
-            } else {
-                self.latest_push_for_pull_servers
-                    .insert((key.clone(), file.clone()), stored.clone());
-            }
-        }
         if version.is_some() {
             self.versioned_publish_servers.insert(key.clone());
         }
         if self.is_late_close_reply(&key, &file, version.is_some(), stored.is_empty()) {
+            if key.kind == ServerKind::Rust
+                && self.rust_check_state(&key) != RustCheckState::Current
+            {
+                self.latest_push_for_pull_servers
+                    .remove(&(key.clone(), file.clone()));
+            }
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-late-reply-to-inspect-close file={}",
                 key.kind.id_str(),
@@ -7111,6 +7134,12 @@ impl LspManager {
             return None;
         }
         if self.is_inspect_close_clearing(&key, &file, stored.is_empty()) {
+            if key.kind == ServerKind::Rust
+                && self.rust_check_state(&key) != RustCheckState::Current
+            {
+                self.latest_push_for_pull_servers
+                    .remove(&(key.clone(), file.clone()));
+            }
             slog_info!(
                 "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-inspect-closed-document file={} diagnostics={}",
                 key.kind.id_str(),
@@ -7119,6 +7148,18 @@ impl LspManager {
                 diagnostic_count
             );
             return None;
+        }
+        if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
+            // Ignore close clears for the merge cache too, unless a new check
+            // is pending: its empty compiler report must still clear old rows.
+            // Unversioned pushes cannot borrow a later pull's content proof.
+            if stored.is_empty() || self.confirmed_document_hash(&key, &file, version).is_none() {
+                self.latest_push_for_pull_servers
+                    .remove(&(key.clone(), file.clone()));
+            } else {
+                self.latest_push_for_pull_servers
+                    .insert((key.clone(), file.clone()), stored.clone());
+            }
         }
         if let Some(pulled) = self.latest_pull_for_rust.get(&(key.clone(), file.clone())) {
             // A rust-analyzer push in pull mode carries only `cargo check`

@@ -1,0 +1,1 @@
+- A long tool call that is still making progress (a cold inspect, a call-graph build wait, a large patch) is no longer cut off by its runner; a call that stops making progress still is.

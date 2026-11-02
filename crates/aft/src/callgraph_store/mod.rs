@@ -1985,6 +1985,8 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
     }
     let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
     if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
+        crate::cold_build_limiter::progress::phase(stage, Some(total));
+        crate::cold_build_limiter::progress::completed(completed);
         if let Some(scope) = crate::logging::current_index_build() {
             crate::logging::log_index_event(
                 crate::logging::IndexEvent::from_scope(
@@ -2017,6 +2019,29 @@ fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize
         );
     }
     Err(CallGraphStoreError::Superseded)
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    #[test]
+    fn call_keepalive_build_slice_checkpoints_publish_completed_work() {
+        use crate::cold_build_limiter::progress;
+        let root = tempfile::tempdir().unwrap();
+        let _build = progress::start(
+            root.path(),
+            "callgraph build",
+            Some(10),
+            progress::StartLog::Quiet,
+        );
+        super::ensure_cold_build_current("resolution", 4, 10).unwrap();
+        let first = progress::work_for_root(root.path());
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].1, first[0].2), ("resolution", 4));
+        super::ensure_cold_build_current("resolution", 4, 10).unwrap();
+        assert_eq!(progress::work_for_root(root.path()), first);
+        super::ensure_cold_build_current("resolution", 8, 10).unwrap();
+        assert_eq!(progress::work_for_root(root.path())[0].2, 8);
+    }
 }
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {

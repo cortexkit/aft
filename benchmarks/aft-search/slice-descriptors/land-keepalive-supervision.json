@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "keepalive-supervision"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs. It only reports completed projection and glob rows to the call's keepalive progress channel, so a long call isn't cut by the runner's silence window. Ranking, routing, candidate ordering and returned data are unchanged, so ranked rows must remain byte-identical to the committed reference."
+}

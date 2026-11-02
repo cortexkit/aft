@@ -659,6 +659,171 @@ fn floor_refusal_before_creation_leaves_no_store_and_no_family_byte_budget_appli
     assert_eq!(ledger.accounting().unwrap().reserved_bytes, 0);
 }
 
+fn floor_attempt_at(storage: &Path, family: &str, now: Instant) -> Result<()> {
+    with_floor_reclaim_using_clock(
+        storage,
+        family,
+        None,
+        || now,
+        || preflight_floor(storage, 1),
+    )
+}
+
+fn assert_floor_refusal(result: Result<()>) {
+    assert!(
+        matches!(result, Err(Error::Refused("device_free_space_floor"))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn floor_reclaim_no_progress_cools_down_per_family_and_retries_after_sixty_seconds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    seed(root.path(), A);
+    seed(root.path(), B);
+    let _floor = set_free_space_for_test(root.path(), 0, 1 << 30);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let _hook = crate::storage_retention::observe_test_hook(
+        root.path(),
+        Arc::new({
+            let attempts = attempts.clone();
+            move |step| {
+                if step == "v3-pressure-reclaim-started" {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }),
+    );
+    let now = Instant::now();
+    assert_floor_refusal(floor_attempt_at(root.path(), A, now));
+    for offset in [1, 20_000, 59_999] {
+        assert_floor_refusal(floor_attempt_at(
+            root.path(),
+            A,
+            now + Duration::from_millis(offset),
+        ));
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "cooldown must skip the walk"
+    );
+    assert_floor_refusal(floor_attempt_at(root.path(), B, now));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one family's cooldown must not block another family"
+    );
+    assert_floor_refusal(floor_attempt_at(
+        root.path(),
+        A,
+        now + Duration::from_secs(60),
+    ));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "reclaim is eligible at the window boundary"
+    );
+}
+
+#[test]
+fn floor_reclaim_failure_cools_down_walks_and_warnings() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    fs::create_dir_all(family_dir(root.path(), A).unwrap().join("members.sqlite")).unwrap();
+    let _floor = set_free_space_for_test(root.path(), 0, 1 << 30);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let _hook = crate::storage_retention::observe_test_hook(
+        root.path(),
+        Arc::new({
+            let attempts = attempts.clone();
+            move |step| {
+                if step == "v3-pressure-reclaim-started" {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }),
+    );
+    let now = Instant::now();
+    let (_, logs) = crate::logging::capture_log_lines(|| {
+        for offset in [0, 1, 59_999] {
+            assert_floor_refusal(floor_attempt_at(
+                root.path(),
+                A,
+                now + Duration::from_millis(offset),
+            ));
+        }
+    });
+    let warning = format!("views admission reclaim failed family={A}:");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        logs.iter().filter(|line| line.contains(&warning)).count(),
+        1,
+        "{logs:?}"
+    );
+    let (_, logs) = crate::logging::capture_log_lines(|| {
+        assert_floor_refusal(floor_attempt_at(
+            root.path(),
+            A,
+            now + Duration::from_secs(60),
+        ));
+        assert_floor_refusal(floor_attempt_at(
+            root.path(),
+            A,
+            now + Duration::from_secs(61),
+        ));
+    });
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        logs.iter().filter(|line| line.contains(&warning)).count(),
+        1,
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn floor_reclaim_progress_clears_the_cooldown_even_if_space_is_still_low() {
+    use crate::views::base_refs::tests::{publish_test_base, FAMILY};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let _serial = serial();
+    let root = tempdir().unwrap();
+    crate::root_cache::register_durable_owner(&crate::root_cache::StoragePaths::same(root.path()))
+        .unwrap();
+    let (base, _) = publish_test_base(root.path(), &[("src/a.rs", b"unused")]);
+    let pin = crate::pins::LivePin::create_v3(root.path(), FAMILY, &base.scope).unwrap();
+    let _floor = set_free_space_for_test(root.path(), 0, 1 << 30);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let _hook = crate::storage_retention::observe_test_hook(
+        root.path(),
+        Arc::new({
+            let attempts = attempts.clone();
+            move |step| {
+                if step == "v3-pressure-reclaim-started" {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }),
+    );
+    let now = Instant::now();
+    assert_floor_refusal(floor_attempt_at(root.path(), FAMILY, now));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    drop(pin);
+    let later = now + Duration::from_secs(60);
+    assert_floor_refusal(floor_attempt_at(root.path(), FAMILY, later));
+    assert!(!view_dir(root.path(), FAMILY, &base.scope).unwrap().exists());
+    // Free space is deliberately still below the floor after the deletion.
+    // Progress must let the next request try again without waiting another minute.
+    assert_floor_refusal(floor_attempt_at(
+        root.path(),
+        FAMILY,
+        later + Duration::from_millis(1),
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
 struct Recheck<'a> {
     storage: &'a Path,
     space: Mutex<Option<FreeSpaceTestGuard>>,

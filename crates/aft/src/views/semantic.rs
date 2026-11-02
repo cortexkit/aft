@@ -550,10 +550,23 @@ impl SemanticStore {
         match self {
             Self::V2(store) => store.touch(keys),
             Self::V3(route, opened) => {
-                if Self::v3_reader(route, opened)?.is_none() {
+                let Some(reader) = Self::v3_reader(route, opened)? else {
                     return Ok(crate::blob_store::v2::TouchReport {
                         missing: keys.to_vec(),
                         ..Default::default()
+                    });
+                };
+                // Chunk batches commonly just inserted or reused these rows at
+                // the current GC epoch. Avoid locking the storage root,
+                // reserving disk capacity and flushing the accounting ledger
+                // when there is no liveness write to make.
+                // A stale row still takes the publication path, which rechecks
+                // presence and the current epoch under the writer lease.
+                if let Some(missing) = reader.touch_if_current(keys).map_err(v3_store_error)? {
+                    return Ok(crate::blob_store::v2::TouchReport {
+                        touched: keys.len() - missing.len(),
+                        missing,
+                        ref_epoch: 0,
                     });
                 }
                 let request = (keys.len() as u64).saturating_mul(64 * 1024).max(1 << 20);
@@ -840,7 +853,9 @@ struct ViewState {
     /// it keeps its keys until the view state holding it is dropped.
     live_v3: Option<Arc<Mutex<crate::pins::LivePin>>>,
     active_fills: usize,
-    cache: Option<(CacheKey, Arc<SemanticIndex>)>,
+    // An installed overlay is immutable; retain its private byte total so a
+    // health tick does not revisit its file metadata and tombstones.
+    cache: Option<(CacheKey, Arc<SemanticIndex>, u64)>,
 }
 
 struct ActiveFill(Arc<Mutex<ViewState>>);
@@ -2853,7 +2868,7 @@ impl SemanticPlane {
             unvouched,
         );
         let index = match state.cache.as_ref() {
-            Some((key, index)) if *key == cache_key => Arc::clone(index),
+            Some((key, index, _)) if *key == cache_key => Arc::clone(index),
             _ => {
                 self.overlay_builds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2864,8 +2879,9 @@ impl SemanticPlane {
                     &replacements,
                 );
                 index.set_summary_budget_limited(budget_limited);
+                let private_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                 let index = Arc::new(index);
-                state.cache = Some((cache_key, Arc::clone(&index)));
+                state.cache = Some((cache_key, Arc::clone(&index), private_bytes));
                 index
             }
         };
@@ -2892,7 +2908,7 @@ impl SemanticPlane {
             .get(&(access.family().to_owned(), access.scope().to_owned()))
             .cloned()?;
         let state = lock(&view);
-        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+        state.cache.as_ref().map(|(_, index, _)| Arc::clone(index))
     }
 
     /// The last overlay cached in this snapshot's reader binding. Borrowers
@@ -2905,7 +2921,7 @@ impl SemanticPlane {
     ) -> Option<Arc<SemanticIndex>> {
         let view = self.query_view(access, snapshot);
         let state = lock(&view);
-        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+        state.cache.as_ref().map(|(_, index, _)| Arc::clone(index))
     }
 
     /// How many scored indexes `overlay` has built.
@@ -2920,9 +2936,7 @@ impl SemanticPlane {
     pub fn private_memory(&self, access: &ViewAccess) -> u64 {
         let view = self.view(access);
         let state = lock(&view);
-        state.cache.as_ref().map_or(0, |(_, index)| {
-            index.estimated_memory().estimated_bytes.unwrap_or(0)
-        })
+        state.cache.as_ref().map_or(0, |(_, _, bytes)| *bytes)
     }
 
     /// [`Self::private_memory`] without waiting: `None` while the view's
@@ -2937,9 +2951,7 @@ impl SemanticPlane {
             }
         };
         let state = try_lock(&view)?;
-        Some(state.cache.as_ref().map_or(0, |(_, index)| {
-            index.estimated_memory().estimated_bytes.unwrap_or(0)
-        }))
+        Some(state.cache.as_ref().map_or(0, |(_, _, bytes)| *bytes))
     }
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
@@ -5727,6 +5739,13 @@ mod tests {
                 )
                 .unwrap();
             checkout.query(&snapshot, "model-a", "edited");
+            let recounted = plane
+                .cached_index(&checkout.access)
+                .unwrap()
+                .estimated_memory()
+                .estimated_bytes
+                .unwrap();
+            assert_eq!(plane.try_private_memory(&checkout.access), Some(recounted));
             plane.private_memory(&checkout.access)
         };
         let one = edit(&[("src/gamma.rs", "fn gamma_edited() {}\n")]);
@@ -5918,6 +5937,116 @@ mod tests {
 #[cfg(test)]
 mod v3_store_tests {
     use super::*;
+
+    #[test]
+    fn v3_semantic_touch_skips_current_rows_and_publishes_after_epoch_advance() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let family = "00112233445566ff";
+        let store = SemanticStore::V3(
+            super::super::snapshot::V3Route {
+                storage: storage.path().to_path_buf(),
+                family: family.into(),
+                scope: "worker".into(),
+            },
+            std::sync::OnceLock::new(),
+        );
+        let key = FamilyKey::new(FamilyPlane::Semantic, [1; 32]);
+        let absent = FamilyKey::new(FamilyPlane::Semantic, [2; 32]);
+        store.put_or_touch(&key, b"run").unwrap();
+        crate::blob_store::v3::work_profile::take();
+        let report = store.touch(&[key, absent, key, absent]).unwrap();
+        assert_eq!(report.touched, 2);
+        assert_eq!(report.missing, vec![absent, absent]);
+        assert_eq!(crate::blob_store::v3::work_profile::count("publication"), 0);
+
+        let path = crate::blob_store::v3::plane_path(storage.path(), family, FamilyPlane::Semantic)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute("UPDATE store_meta SET gc_epoch=gc_epoch+1", [])
+            .unwrap();
+        assert_eq!(store.touch(&[key, absent]).unwrap().missing, vec![absent]);
+        assert_eq!(crate::blob_store::v3::work_profile::count("publication"), 1);
+        assert!(store.touch(&[key]).unwrap().missing.is_empty());
+        assert_eq!(crate::blob_store::v3::work_profile::count("publication"), 1);
+        assert_eq!(store.get(&key).unwrap().unwrap(), b"run");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in frozen-checkout storage measurement"]
+    fn measurement_v3_semantic_touch_frozen_checkout() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let root = PathBuf::from(std::env::var_os("AFT_HOT_SPOT_CORPUS").expect("frozen corpus"));
+        let producer = SemanticProducer::current("measurement", EmbedTextCaps::default());
+        let mut payloads = BTreeMap::new();
+        let files = [
+            "crates/aft/src/views/semantic.rs",
+            "crates/aft/src/fs_lock.rs",
+            "crates/aft/src/commands/semantic_search/mod.rs",
+            "crates/aft/src/parser.rs",
+            "crates/aft/src/search_index.rs",
+        ];
+        for file in files {
+            let bytes = std::fs::read(root.join(file)).unwrap();
+            for chunk in crate::semantic_index::chunk_view_file(
+                &root,
+                Path::new(file),
+                &bytes,
+                EmbedTextCaps::default(),
+            )
+            .unwrap()
+            .unwrap()
+            {
+                let text = chunk.embed_text;
+                payloads.insert(
+                    producer.chunk_key(&text),
+                    encode_chunk_vector(&producer.chunk_identity(), &text, &[0.25; 16]).unwrap(),
+                );
+            }
+        }
+        assert!(
+            payloads.len() > 1000,
+            "nonempty real chunk workload required"
+        );
+        let payloads: Vec<_> = payloads.into_iter().collect();
+        let keys: Vec<_> = payloads.iter().map(|(key, _)| *key).collect();
+        for batch_size in [1, 64, keys.len()] {
+            let storage = tempfile::tempdir().unwrap();
+            let store = SemanticStore::V3(
+                super::super::snapshot::V3Route {
+                    storage: storage.path().to_path_buf(),
+                    family: "00112233445566ff".into(),
+                    scope: "measurement".into(),
+                },
+                std::sync::OnceLock::new(),
+            );
+            store.put_batch(&payloads).unwrap();
+            crate::blob_store::v3::work_profile::take();
+            let cpu = thread_cpu_seconds();
+            let started = Instant::now();
+            for batch in keys.chunks(batch_size) {
+                assert!(store.touch(batch).unwrap().missing.is_empty());
+            }
+            eprintln!("TOUCH_MEASUREMENT files={} keys={} batch_size={} wall_ms={:.3} thread_cpu_ms={:.3} profile={:?}",
+                files.len(), keys.len(), batch_size, started.elapsed().as_secs_f64() * 1000.0,
+                (thread_cpu_seconds() - cpu) * 1000.0, crate::blob_store::v3::work_profile::take());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_seconds() -> f64 {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+    }
 
     #[test]
     fn a_v3_semantic_store_puts_touches_and_admits_runs_without_the_v2_store() {

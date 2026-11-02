@@ -246,6 +246,7 @@ pub(crate) use secret_consent::{
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
+mod keepalive;
 mod manifest;
 mod page_collect;
 mod persistence;
@@ -1629,6 +1630,7 @@ struct RouteIdentityData {
     consumer_elicitation_capable: bool,
     held_reply: bool,
     held_update: bool,
+    call_keepalive: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -8801,6 +8803,10 @@ async fn handle_control_request(
             let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
                 consumer_capabilities.as_deref(),
             );
+            let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
+            });
             let held_reply = consumer_capabilities
                 .as_ref()
                 .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
@@ -8896,6 +8902,7 @@ async fn handle_control_request(
                 tool_result_body,
                 held_reply,
                 held_update,
+                call_keepalive,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -10467,6 +10474,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    progress: Option<crate::run_tool_call::progress::Progress>,
     speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
@@ -10500,6 +10508,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                progress,
                 speech_seed,
                 bare_name,
                 mut arguments,
@@ -10514,6 +10523,11 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if let (Some(progress), Some(token)) =
+                (progress, crate::executor::current_job_cancellation())
+            {
+                token.set_progress(progress);
+            }
             if identity_for_run.run_owner.is_some() {
                 if let Err(response) = tool_provider::check_program_scope(
                     ctx,
@@ -10767,6 +10781,12 @@ async fn hold_for_consent(
             return Some((response, text));
         }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        // A held RESPONSE ends the original REQUEST (tool-provider CONTRACT.md
+        // §4.4). If the call is approved later, its result is delivered as a
+        // separate late result, so this request must send no more keepalives.
+        if let Some(progress) = &plain_run.progress {
+            progress.close();
+        }
         if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
             .await
             .is_err()
@@ -11046,6 +11066,13 @@ async fn handle_tool_call_with_capabilities(
         flags: frame.header.flags,
         deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
     };
+    let progress = keepalive::channel(
+        tx,
+        metrics,
+        active_tool_calls,
+        frame,
+        identity.call_keepalive,
+    );
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
@@ -11756,6 +11783,7 @@ async fn handle_tool_call_with_capabilities(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                keepalive: progress.clone(),
                 speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
@@ -11819,6 +11847,7 @@ async fn handle_tool_call_with_capabilities(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            keepalive: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
@@ -11879,7 +11908,8 @@ async fn handle_tool_call_with_capabilities(
 
     // Catalog role controls tool behavior, but a stamped worker must never
     // enable Cargo indirectly by selecting a head catalog on its route.
-    if access_grants::alfonso_worker(&identity) {
+    // Inspect applies the policy inside its deadline-bounded deferred body.
+    if access_grants::alfonso_worker(&identity) && bare_name != "inspect" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             ctx.disable_rust_cargo_for_worker();
         }
@@ -11940,6 +11970,7 @@ async fn handle_tool_call_with_capabilities(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            progress: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
@@ -12027,7 +12058,13 @@ async fn handle_tool_call_with_capabilities(
                         });
                         response
                     }
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
+                        if bare_name_for_run == "inspect"
+                            && access_grants::alfonso_worker(&identity_for_run)
+                        {
+                            prepared.request.params[crate::protocol::WORKER_SESSION_FIELD] =
+                                Value::Bool(true);
+                        }
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
                                 &prepared.request,
@@ -12156,6 +12193,7 @@ async fn handle_tool_call_with_capabilities(
         });
         let deferred_setup_guard =
             PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
+        let job = keepalive::job(progress, job);
         let rx = submit_active_tool_call(
             executor.as_ref(),
             active_tool_calls,
@@ -12344,6 +12382,7 @@ async fn handle_tool_call_with_capabilities(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        progress,
         speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
@@ -13283,6 +13322,16 @@ pub(crate) mod test_support {
         ctx: &Arc<AppContext>,
         request_id: &str,
     ) -> (PendingResponse, JobCancellation) {
+        submit_deferred_inspect_setup_with_clock(executor, root, ctx, request_id, Instant::now)
+    }
+
+    fn submit_deferred_inspect_setup_with_clock(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        ctx: &Arc<AppContext>,
+        request_id: &str,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> (PendingResponse, JobCancellation) {
         let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
         let request = inspect_request(request_id);
         let inspect_ctx = Arc::clone(ctx);
@@ -13292,10 +13341,12 @@ pub(crate) mod test_support {
             request_id.to_string(),
             Box::new(move |_| {
                 let DispatchOutcome::Deferred(pending) =
-                    crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                    crate::commands::inspect::handle_inspect_deferred_with_clock(
                         &request,
                         inspect_ctx,
                         true,
+                        None,
+                        now,
                     )
                 else {
                     panic!("inspect setup must defer")
@@ -13327,6 +13378,24 @@ pub(crate) mod test_support {
             assert!(Instant::now() < deadline, "inspect terminal timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_deferred_inspect_cleanup(ctx: &AppContext, request_id: &str) {
+        // A pending callback can acknowledge cancellation before the worker
+        // observes it. The worker drops its root permit before its restriction
+        // guard, so guard removal is the teardown barrier, not the terminal reply.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ctx.request_force_restrict(request_id) {
+            assert!(
+                Instant::now() < deadline,
+                "detached force-restrict guard leaked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::commands::inspect::deferred_inspect_root_count_for_test(ctx),
+            0
+        );
     }
 
     fn cold_navigation_context(root: &Path) -> (Arc<AppContext>, PathBuf) {
@@ -13440,7 +13509,7 @@ pub(crate) mod test_support {
             );
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "writer admissions must not finish the detached inspect"
         );
@@ -13527,23 +13596,42 @@ pub(crate) mod test_support {
         let ctx = inspect_context_with_timeout(dir.path(), Some(10_000));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-deadline",
+            );
         let started = Instant::now();
-        let (mut pending, _cancellation) =
-            submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-deadline");
+        let clock = Arc::new(StdMutex::new(started));
+        let now = Arc::clone(&clock);
+        let (mut pending, cancellation) = submit_deferred_inspect_setup_with_clock(
+            &executor,
+            &root,
+            &ctx,
+            "subc-inspect-deadline",
+            move || *now.lock().expect("inspect test clock"),
+        );
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("deferred inspect body starts");
 
-        let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
-        assert_eq!(terminal.data["inspect_terminal"], "phase_failed");
-        assert_eq!(terminal.data["failure_reason"], "inspect_request_timeout");
-        assert_eq!(terminal.data["failed_phase"], "tier2_rescan");
-        assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "deferred inspect missed its terminal reserve: {:?}",
-            started.elapsed()
-        );
+        assert_eq!(pending.poll_interval(), Some(Duration::from_millis(50)));
+        assert!((pending.poll)(&ctx).is_none());
+        assert!(ctx.request_force_restrict("subc-inspect-deadline"));
+        // The 10s request budget reserves 5s for replying. Exhausting work
+        // returns incomplete analysis, not a failed phase or clean zero counts.
+        *clock.lock().expect("inspect test clock") = started + Duration::from_secs(5);
+        let terminal = (pending.poll)(&ctx).expect("held inspect must answer at its work deadline");
+        assert!(terminal.success, "{terminal:?}");
+        assert_eq!(terminal.data["inspect_terminal"], "partial");
+        assert_eq!(terminal.data["complete"], false);
+        assert_eq!(terminal.data["summary"]["dead_code"]["complete"], false);
+        assert!(terminal.data["summary"]["dead_code"].get("count").is_none());
+        assert!(terminal.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("analysis did not finish within its wait budget"));
+        assert!(cancellation.cancel_requested_before_commit());
+        assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+        wait_for_deferred_inspect_cleanup(&ctx, "subc-inspect-deadline");
     }
 
     #[test]
@@ -13915,6 +14003,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14387,7 +14476,7 @@ pub(crate) mod test_support {
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-second");
 
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "only one detached body may run for a root"
         );
@@ -14396,7 +14485,7 @@ pub(crate) mod test_support {
         let second_terminal = wait_for_inspect_terminal(&mut second, &ctx);
         assert_eq!(second_terminal.data["inspect_terminal"], "interrupted");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "cancelling the queued request must not release the active flight"
         );
@@ -14405,7 +14494,7 @@ pub(crate) mod test_support {
         let first_terminal = wait_for_inspect_terminal(&mut first, &ctx);
         assert_eq!(first_terminal.data["inspect_terminal"], "fresh");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             0
         );
     }
@@ -14525,7 +14614,9 @@ pub(crate) mod test_support {
             epoch: 1,
         };
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-abandoned",
+            );
         let (mut pending, cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-abandoned");
         active.lock().expect("active tool call map").insert(
@@ -14555,20 +14646,10 @@ pub(crate) mod test_support {
         .is_some());
         let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
         assert_eq!(terminal.data["inspect_terminal"], "interrupted");
-        assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
-            0
-        );
         assert!(executor.actor_is_idle(&root));
         assert!(active.lock().expect("active tool call map").is_empty());
-        let restriction_deadline = Instant::now() + Duration::from_secs(1);
-        while ctx.request_force_restrict("subc-inspect-abandoned") {
-            assert!(
-                Instant::now() < restriction_deadline,
-                "detached force-restrict guard leaked"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+        wait_for_deferred_inspect_cleanup(&ctx, "subc-inspect-abandoned");
     }
 
     #[test]
@@ -14846,7 +14927,7 @@ pub(crate) mod test_support {
         );
         finish_active_tool_call(&active, route, 42);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0 {
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx) != 0 {
             assert!(Instant::now() < deadline, "shutdown cancellation was inert");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -14995,7 +15076,7 @@ pub(crate) mod test_support {
         assert_eq!(by_corr[&52].data["retryable"], true);
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&inspect_ctx) != 0
             || crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0
         {
             assert!(
@@ -15196,6 +15277,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -17403,6 +17485,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        keepalive: None,
                         speech_seed: None,
                         run_scope: None,
                         scope: None,
@@ -20329,6 +20412,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20463,6 +20547,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -22036,7 +22121,21 @@ mod tests {
                 );
                 let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
-                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                // The standing pass may still be writing aft.db. A busy probe
+                // reschedules the retry, so drive its zero-delay attempts until
+                // the retry disarms, as the module loop does on later ticks.
+                let retry_deadline = Instant::now() + Duration::from_secs(10);
+                while ctx.provisional_identity_retry().is_armed() {
+                    crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "identity retry did not finish: {:?}",
+                        ctx.degraded_reasons()
+                    );
+                    if ctx.provisional_identity_retry().is_armed() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 assert!(
                     ctx.artifact_identity_provisional_reason().is_none(),
                     "{:?}",

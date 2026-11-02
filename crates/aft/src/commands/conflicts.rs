@@ -110,11 +110,11 @@ fn discover_conflicted_files(
     }
 
     let mut sweep_error = None;
-    match crate::git_probe::command()
-        .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
-        .current_dir(&toplevel)
-        .output()
-    {
+    match crate::git_probe::supervised_output(
+        crate::git_probe::command()
+            .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
+            .current_dir(&toplevel),
+    ) {
         Ok(grep_output) => {
             let status = grep_output.status.code();
             if status == Some(0) {
@@ -349,6 +349,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
 
         // Find conflict regions
         let regions = find_conflict_regions(&content);
+        crate::run_tool_call::progress::report();
         if regions.is_empty() {
             // File is in unmerged state but has no conflict markers
             // (could be a deleted-vs-modified conflict)

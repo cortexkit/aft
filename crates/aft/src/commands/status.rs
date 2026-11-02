@@ -808,6 +808,7 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
         } else if ft.is_dir() {
             total += dir_size_recursive(&entry.path());
         }
+        crate::run_tool_call::progress::report();
     }
     total
 }

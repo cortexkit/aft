@@ -136,6 +136,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
         remaining: bounded.then_some(256 * 1024),
         cut: false,
     };
+    let progress = crate::executor::current_job_cancellation();
     let search = |file_path: &std::path::PathBuf, budget: &mut MatchBudget| {
         let source = match crate::bounded_io::read_to_string(file_path) {
             Ok(s) => s,
@@ -159,6 +160,9 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
             context_lines,
             budget,
         );
+        if let Some(progress) = &progress {
+            progress.report_progress();
+        }
         (1usize, total, matches, None)
     };
     // A single producer owns the opted-in byte budget, retaining a deterministic
