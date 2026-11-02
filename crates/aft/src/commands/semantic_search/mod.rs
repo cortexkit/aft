@@ -4866,48 +4866,71 @@ impl MatchingSource {
         if tokens.is_empty() {
             return None;
         }
-        source
-            .lines()
-            .zip(&self.lines)
-            .enumerate()
-            .filter_map(|(index, (line, prepared))| {
-                let score = tokens
-                    .iter()
-                    .map(|token| {
-                        if prepared.compact.contains(token) {
-                            token.len().saturating_mul(4)
-                        } else {
-                            let trigrams = prepared.trigrams.get_or_init(|| {
-                                let mut trigrams = prepared
-                                    .compact
-                                    .as_bytes()
-                                    .windows(3)
-                                    .map(|trigram| {
-                                        #[cfg(test)]
-                                        MATCHING_LINE_TRIGRAM_VISITS
-                                            .with(|count| count.set(count.get() + 1));
-                                        [trigram[0], trigram[1], trigram[2]]
-                                    })
-                                    .collect::<Vec<_>>();
-                                trigrams.sort_unstable();
-                                trigrams.dedup();
-                                trigrams.into_boxed_slice()
-                            });
-                            token
-                                .as_bytes()
-                                .windows(3)
-                                .filter(|trigram| {
-                                    trigrams
-                                        .binary_search(&[trigram[0], trigram[1], trigram[2]])
-                                        .is_ok()
-                                })
-                                .count()
-                        }
-                    })
-                    .sum::<usize>();
-                (score > 0).then_some((score, index, line))
-            })
-            .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+        let perfect_score = tokens
+            .iter()
+            .map(|token| token.len().saturating_mul(4))
+            .sum::<usize>();
+        let mut best = None;
+        let mut best_score = 0_usize;
+        let mut missing = Vec::with_capacity(tokens.len());
+        for (index, (line, prepared)) in source.lines().zip(&self.lines).enumerate() {
+            missing.clear();
+            let mut score = 0_usize;
+            let mut remaining = 0_usize;
+            for token in tokens {
+                if prepared.compact.contains(token) {
+                    score += token.len().saturating_mul(4);
+                } else {
+                    missing.push(token);
+                    remaining += token.len().saturating_sub(2);
+                }
+            }
+            // A missing token contributes at most one point per byte trigram,
+            // including repeats. Equal scores keep the earlier source line.
+            if score.saturating_add(remaining) <= best_score {
+                continue;
+            }
+            if !missing.is_empty() {
+                let trigrams = prepared.trigrams.get_or_init(|| {
+                    let mut trigrams = prepared
+                        .compact
+                        .as_bytes()
+                        .windows(3)
+                        .map(|trigram| {
+                            #[cfg(test)]
+                            MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(count.get() + 1));
+                            [trigram[0], trigram[1], trigram[2]]
+                        })
+                        .collect::<Vec<_>>();
+                    trigrams.sort_unstable();
+                    trigrams.dedup();
+                    trigrams.into_boxed_slice()
+                });
+                for token in &missing {
+                    remaining -= token.len().saturating_sub(2);
+                    score += token
+                        .as_bytes()
+                        .windows(3)
+                        .filter(|trigram| {
+                            trigrams
+                                .binary_search(&[trigram[0], trigram[1], trigram[2]])
+                                .is_ok()
+                        })
+                        .count();
+                    if score.saturating_add(remaining) <= best_score {
+                        break;
+                    }
+                }
+            }
+            if score > best_score {
+                best_score = score;
+                best = Some((score, index, line));
+                if score == perfect_score {
+                    break;
+                }
+            }
+        }
+        best
     }
 }
 
@@ -14243,6 +14266,29 @@ mod tests {
     }
 
     #[test]
+    fn matching_line_prunes_only_lines_that_cannot_win() {
+        let source = "target_name matching\nother unrelated lines\nmore unrelated lines";
+        let tokens = vec!["targetname".into(), "matching".into()];
+        let prepared = MatchingSource::new(source);
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        assert_eq!(
+            prepared.best_line(source, &tokens),
+            Some((72, 0, "target_name matching"))
+        );
+        assert_eq!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()), 0);
+
+        let source = "abc\nabcdefghijklmnopqrstuvwx\nunrelated";
+        let tokens = vec!["abc".into(), "defghijklmnopqrstuvwxzzz".into()];
+        let prepared = MatchingSource::new(source);
+        MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.set(0));
+        assert_eq!(
+            prepared.best_line(source, &tokens),
+            Some((31, 1, "abcdefghijklmnopqrstuvwx"))
+        );
+        assert_eq!(MATCHING_LINE_TRIGRAM_VISITS.with(|count| count.get()), 23);
+    }
+
+    #[test]
     fn matching_line_preparation_reuses_different_queries_and_observes_edits() {
         let cache = MatchingSourceCache::new(1024 * 1024);
         let source = "fn alpha_beta() {}\r\n// café 中中中 abcabc\r\nfn second_alpha() {}\n";
@@ -14671,6 +14717,46 @@ mod tests {
                 expected,
                 "{source}"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in frozen-checkout ranking parse measurement"]
+    fn measurement_prose_identifier_frozen_checkout() {
+        let root = PathBuf::from(std::env::var_os("AFT_HOT_SPOT_CORPUS").expect("frozen corpus"));
+        let cpu = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            time.tv_sec as f64 + time.tv_nsec as f64 / 1e9
+        };
+        for repeat in 0..3 {
+            let mut parser = crate::parser::FileParser::new();
+            let before = crate::parser::work_counters::tree_parses();
+            let cpu_started = cpu();
+            let started = std::time::Instant::now();
+            for (file, identifier) in [
+                ("crates/aft/src/views/semantic.rs", "SemanticPlane"),
+                ("crates/aft/src/fs_lock.rs", "LockGuard"),
+                ("crates/aft/src/context.rs", "AppContext"),
+                ("crates/aft/src/parser.rs", "FileParser"),
+                ("crates/aft/src/search_index.rs", "SearchIndex"),
+            ] {
+                assert!(identifier_has_code_reference(
+                    &root.join(file),
+                    identifier,
+                    &mut parser
+                ));
+            }
+            eprintln!("RANKING_PARSE_MEASUREMENT repeat={} files=5 tree_parses={} wall_ms={:.3} thread_cpu_ms={:.3}",
+                repeat, crate::parser::work_counters::tree_parses() - before,
+                started.elapsed().as_secs_f64() * 1000.0, (cpu() - cpu_started) * 1000.0);
         }
     }
 

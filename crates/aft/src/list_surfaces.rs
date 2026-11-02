@@ -763,6 +763,30 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
     },
     ExclusionEntry {
+        file: "views/callgraph_copies.rs",
+        enclosing_item: "evict_for",
+        location_or_primitive: "EVICTION_CANDIDATES and five-second deadline",
+        reason: "internal database admission maintenance, not result lists; exhausted eviction work makes the checkout borrow the main graph",
+    },
+    ExclusionEntry {
+        file: "views/tree_base.rs",
+        enclosing_item: "identity_for_admission, prove_until",
+        location_or_primitive: "optional admission deadline in member proof and membership identity loops",
+        reason: "internal reuse proof, not result lists; an expired proof cannot establish base reuse or authorize deletion",
+    },
+    ExclusionEntry {
+        file: "views/base_builder.rs",
+        enclosing_item: "claim_base_locked",
+        location_or_primitive: "LIVE_BASES_PER_FAMILY",
+        reason: "internal base admission count, not result lists; held capacity borrows a published graph or keeps text on its planned retry path",
+    },
+    ExclusionEntry {
+        file: "storage_retention.rs",
+        enclosing_item: "evict_least_recent_v3_member, reclaim_v3_admission_family",
+        location_or_primitive: "SQL LIMIT and take(max_examined), 64-removal loop and five-second admission deadline",
+        reason: "internal LRU database reclamation, not result lists; every deletion rechecks references and live holds and insufficient reclaim preserves the device-space refusal",
+    },
+    ExclusionEntry {
         file: "cache_location.rs",
         enclosing_item: "candidates_and_durable, candidates_and_durable_with_budget, deletion_protections, deletion_protections_with_budget, retention_protections_with_budget, ensure_cache_idle",
         location_or_primitive: "RepairBudget",
@@ -770,9 +794,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, validate_tree_observed, TreeObservation::unchanged, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness, collect_v3_idle, report_v3_idle_unknown",
-        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take, v3 idle SQL LIMIT 1 and member/deadline window",
-        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, retained-tree metadata probes honor the repair budget, TRASH_SCAN_HANDLES counts active iterators rather than completed refusal memos, incomplete protection snapshots refuse deletion, and health reports remaining views, trash estimates, kept reasons and incomplete censuses",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, sweep_view_generations, generation_registries, report_generation_registry_error, validate_tree, validate_tree_with_admission, validate_tree_observed, TreeObservation::unchanged, report_candidate_error, reap_trash, reap_trash_with_snapshot_budget, reap_trash_with_cursor, trash_scans, reap_retired_with_budget, due_first, orphan_first, run_pass_with_budget, prune_bindings, retirement_members, retirement_members_with_budget, write_retirement_witness, verify_retirement_witness, collect_v3_idle, report_v3_idle_unknown, root_history, drain_due_views",
+        location_or_primitive: "DUE_FIRST_ENTRIES, PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, TRASH_SCAN_HANDLES, reaper deadline and 10ms mount-snapshot admission budget, 64-view generation batch, 16 diagnostic errors, take, v3 idle SQL LIMIT 1 and member/deadline window, HISTORY_ENTRIES root-history census chunks and four immediate census followups",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, retained-tree metadata probes honor the repair budget, TRASH_SCAN_HANDLES counts active iterators rather than completed refusal memos, incomplete protection snapshots refuse deletion, root-history iterators resume until a directory-stable census completes, and health reports census examined/accumulated/restarted/complete alongside remaining views, trash estimates and kept reasons",
     },
     ExclusionEntry {
         file: "views/registry.rs",

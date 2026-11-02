@@ -1335,7 +1335,7 @@ fn watcher_config_user_dropped_rescans_without_creating_streams() {
             .set_flag(Flag::Rescan)
             .set_info("rescan: user dropped")
             .add_path(root.clone());
-        handle_config_watch_event(&dir, &event, &mut attachment, &rescan);
+        handle_config_watch_event(&dir.join("aft.jsonc"), &event, &mut attachment, &rescan);
         attach(&mut attachment);
     }
     assert_eq!(
@@ -1380,6 +1380,221 @@ fn publishing_inside_update_config_panics_instead_of_deadlocking() {
     );
     ctx.update_config(|config| config.format_on_edit = true);
     assert!(ctx.config().format_on_edit);
+}
+
+#[test]
+fn idle_regular_config_checks_symlinks_only_once_per_two_seconds() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::canonicalize(dir.path()).unwrap().join("aft.jsonc");
+    std::fs::write(&file, "{}").unwrap();
+    let start = Instant::now();
+    let mut next_check = start;
+    let mut checks = 0;
+    for tick in 0..=30 {
+        let now = start + CONFIG_WATCH_POLL * tick;
+        recheck_config_target(&mut next_check, now, false, |poll_content| {
+            checks += 1;
+            assert!(!config_path_is_symlink(&file));
+            assert!(poll_content);
+            false
+        });
+        assert_eq!(checks, 1 + tick / 10, "symlink checks at idle tick {tick}");
+    }
+    assert_eq!(checks, 4, "startup plus three two-second revalidations");
+}
+
+#[test]
+fn config_target_events_refresh_immediately_without_extra_fingerprint_polls() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.jsonc");
+    std::fs::write(&file, "{}").unwrap();
+    let mut attachment = DirAttachment::new(dir.path().to_path_buf());
+    assert!(attachment.attach(&mut |_| Ok(())));
+    let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Any,
+    )))
+    .add_path(file.clone());
+    let start = Instant::now();
+    let mut next_check = start;
+    let mut refreshes = 0;
+    let mut polls = 0;
+    for tick in 0..=10 {
+        let now = start + CONFIG_WATCH_POLL * tick;
+        let relevant = handle_config_watch_event(&file, &event, &mut attachment, &|| {});
+        assert!(
+            relevant,
+            "the target's actual filename must trigger discovery"
+        );
+        recheck_config_target(&mut next_check, now, relevant, |poll_content| {
+            refreshes += 1;
+            polls += u32::from(poll_content);
+            false
+        });
+    }
+    assert_eq!(refreshes, 11, "events bypass the idle discovery deadline");
+    assert_eq!(
+        polls, 2,
+        "fingerprints are polled only at startup and two seconds"
+    );
+    let unrelated = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+        notify::event::DataChange::Any,
+    )))
+    .add_path(dir.path().join("unrelated"));
+    assert!(!handle_config_watch_event(
+        &file,
+        &unrelated,
+        &mut attachment,
+        &|| {}
+    ));
+}
+
+#[test]
+fn config_target_fallback_hashes_bounded_content_and_stops_when_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("settings.jsonc");
+    std::fs::write(&file, "before").unwrap();
+    let modified =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&file).unwrap());
+    let mut target = ConfigTargetWatch {
+        file: file.clone(),
+        watcher: None,
+        attachment: DirAttachment::new(dir.path().to_path_buf()),
+        fingerprint: None,
+    };
+    assert!(target.poll_if_unattached(&file));
+    assert!(!target.poll_if_unattached(&file));
+    std::fs::write(&file, "after!").unwrap();
+    filetime::set_file_mtime(&file, modified).unwrap();
+    assert!(
+        target.poll_if_unattached(&file),
+        "same size and mtime still need a hash"
+    );
+    std::fs::remove_file(&file).unwrap();
+    assert!(target.poll_if_unattached(&file));
+    std::fs::write(&file, "return").unwrap();
+    assert!(target.poll_if_unattached(&file));
+
+    let bytes = vec![b'a'; CONFIG_READ_LIMIT + 32];
+    std::fs::write(&file, &bytes).unwrap();
+    let before = config_file_fingerprint(&file).unwrap();
+    let mut bytes = bytes;
+    bytes[CONFIG_READ_LIMIT] = b'b';
+    std::fs::write(&file, bytes).unwrap();
+    filetime::set_file_mtime(
+        &file,
+        filetime::FileTime::from_system_time(before.modified.unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        config_file_fingerprint(&file).unwrap().hash,
+        before.hash,
+        "fallback reads no more than the config size limit"
+    );
+
+    assert!(target.attachment.attach(&mut |_| Ok(())));
+    assert!(!target.poll_if_unattached(&file));
+    assert!(
+        target.fingerprint.is_none(),
+        "an attached target does not retain a polling snapshot"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn config_target_shares_canonical_directory_watch_and_keeps_actual_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    let alias = dir.path().join("config-alias");
+    std::fs::create_dir(&config_dir).unwrap();
+    let original = config_dir.join("aft.jsonc");
+    std::fs::write(&original, "{}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&config_dir, &alias).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&config_dir, &alias).unwrap();
+    let file = alias.join("aft.jsonc");
+    let mut attachment = DirAttachment::new(alias.clone());
+    assert!(attachment.attach(&mut |_| Ok(())));
+    let (tx, _rx) = mpsc::channel();
+    let counters = Arc::new(crate::context::WatcherCounters::default());
+    let mut target = None;
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &attachment,
+        &tx,
+        &counters,
+        true,
+    ));
+    {
+        let target = target.as_ref().unwrap();
+        assert!(
+            target.watcher.is_none(),
+            "an ancestor alias shares the link's watch"
+        );
+        assert!(target.attachment.watched().is_none());
+        assert!(
+            target.fingerprint.is_none(),
+            "the shared watch needs no content poll"
+        );
+    }
+
+    let actual = config_dir.join("settings.jsonc");
+    std::fs::write(&actual, r#"{"bash":{"enabled":false}}"#).unwrap();
+    std::fs::remove_file(&original).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&actual, &original).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&actual, &original).unwrap();
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &attachment,
+        &tx,
+        &counters,
+        true,
+    ));
+    {
+        let target = target.as_mut().unwrap();
+        assert!(
+            target.watcher.is_none(),
+            "a same-folder file link also shares the watch"
+        );
+        assert_eq!(target.file, std::fs::canonicalize(&actual).unwrap());
+        let changes = std::cell::Cell::new(0);
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(target.file.clone());
+        assert!(handle_config_watch_event(
+            &target.file,
+            &event,
+            &mut target.attachment,
+            &|| changes.set(changes.get() + 1),
+        ));
+        assert_eq!(
+            changes.get(),
+            1,
+            "the shared watch recognizes the target's actual name"
+        );
+    }
+
+    let unattached = DirAttachment::new(alias);
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &unattached,
+        &tx,
+        &counters,
+        true,
+    ));
+    assert!(target.as_ref().unwrap().watcher.is_none());
+    assert!(
+        target.as_ref().unwrap().fingerprint.is_some(),
+        "a failed shared attachment still polls"
+    );
+    refresh_config_target_watch(&file, &mut target, &attachment, &tx, &counters, true);
+    assert!(target.as_ref().unwrap().fingerprint.is_none());
 }
 
 #[test]

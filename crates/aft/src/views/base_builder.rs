@@ -268,6 +268,9 @@ pub enum ClaimOutcome {
     Claimed(BuildClaim),
     /// A live owner (running, stopped, or of uncertain liveness) holds it.
     Busy { owner_pid: u32, attempt: i64 },
+    /// This claim hit the live-base count limit while another reclaim holds
+    /// the family's gate; retry at the live-claim polling cadence.
+    Reclaiming,
     /// The family already has the ruled number of live bases; the cap hit is
     /// counted in `sweep_state.live_base_cap_hits`.
     CapReached { live_bases: i64 },
@@ -291,9 +294,45 @@ pub fn claim_base(
     scope: &str,
     observer: Option<&dyn DurabilityObserver>,
 ) -> Result<ClaimOutcome> {
+    let lock = v3::ReservationLock::acquire(storage)?;
+    let (outcome, dead_attempt) = claim_base_locked(storage, family, scope, &lock, true)?;
+    let (outcome, dead_attempt) = if matches!(outcome, ClaimOutcome::CapReached { .. }) {
+        // Only capped claims take this gate. An ordinary claim must not be
+        // deferred because another worktree is claiming a different base.
+        let cooldown = v3::floor_reclaim_cooldown(storage, family);
+        let mut retry_at = match cooldown.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(ClaimOutcome::Reclaiming),
+        };
+        v3::reclaim_admission_family(storage, family, &lock, &mut retry_at, |lock| {
+            claim_base_locked(storage, family, scope, lock, false)
+        })
+        .unwrap_or(Ok((outcome, dead_attempt)))?
+    } else {
+        (outcome, dead_attempt)
+    };
+    drop(lock);
+    if let ClaimOutcome::Claimed(claim) = &outcome {
+        if let Some((attempt, token)) = dead_attempt {
+            claim.remove_dead_staging(attempt, &token)?;
+        }
+        boundary(observer, DurabilityStep::BaseClaimed)?;
+    }
+    Ok(outcome)
+}
+
+fn claim_base_locked(
+    storage: &Path,
+    family: &str,
+    scope: &str,
+    lock: &v3::ReservationLock,
+    record_cap_hit: bool,
+) -> Result<(ClaimOutcome, Option<(i64, String)>)> {
     let me = super::registry::current_owner();
     let token = super::base_refs::fresh_nonce();
-    let (outcome, dead_attempt) = with_base_barrier(storage, family, |tx| {
+    let mut registry = v3::open_base_refs_registry(storage, family, lock, None)?;
+    super::base_refs::barrier(&mut registry, |tx| {
         let existing: Option<(u32, i64, String, i64)> = tx
             .query_row(
                 "SELECT owner_pid,owner_start,owner_token,attempt FROM base_builds WHERE base_scope=?1",
@@ -311,10 +350,12 @@ pub fn claim_base(
                 )?;
                 let live = live_base_count(tx)?;
                 if !registered && live >= LIVE_BASES_PER_FAMILY {
-                    tx.execute(
-                        "UPDATE sweep_state SET live_base_cap_hits=live_base_cap_hits+1 WHERE singleton=1",
-                        [],
-                    )?;
+                    if record_cap_hit {
+                        tx.execute(
+                            "UPDATE sweep_state SET live_base_cap_hits=live_base_cap_hits+1 WHERE singleton=1",
+                            [],
+                        )?;
+                    }
                     return Ok((ClaimOutcome::CapReached { live_bases: live }, None));
                 }
                 tx.execute(
@@ -359,14 +400,7 @@ pub fn claim_base(
                 ))
             }
         }
-    })?;
-    if let ClaimOutcome::Claimed(claim) = &outcome {
-        if let Some((attempt, token)) = dead_attempt {
-            claim.remove_dead_staging(attempt, &token)?;
-        }
-        boundary(observer, DurabilityStep::BaseClaimed)?;
-    }
-    Ok(outcome)
+    })
 }
 
 impl BuildClaim {
@@ -666,8 +700,9 @@ impl BuildClaim {
 pub enum BinderPlan {
     /// Build the base under this claim.
     Build(BuildClaim),
-    /// Another owner is building it: ACK the bind at once, serve the bounded
-    /// direct scan with honest coverage, and wait for the first publication.
+    /// Another owner is building it, or capacity is temporarily held: ACK the
+    /// bind at once and retry until publication is possible, reporting only
+    /// the files covered by the bounded direct scan in the meantime.
     Wait { remaining: std::time::Duration },
     /// Take the strict path to an own generation, for this reason.
     Strict(&'static str),
@@ -676,7 +711,7 @@ pub enum BinderPlan {
 /// The binder decision of the views design: only the claim owner builds;
 /// everyone else waits for the first lexical-ready publication, and goes
 /// strict only on a failed claim, a refused admission (decided by the caller
-/// after `Build`), the live-base cap, or an exhausted wait.
+/// after `Build`), or an exhausted live-owner wait. Capacity remains retryable.
 pub fn plan_binder(
     storage: &Path,
     family: &str,
@@ -691,7 +726,12 @@ pub fn plan_binder(
         Ok(ClaimOutcome::Busy { .. }) => BinderPlan::Wait {
             remaining: LIVE_CLAIM_WAIT - waited,
         },
-        Ok(ClaimOutcome::CapReached { .. }) => BinderPlan::Strict("live_base_cap"),
+        Ok(ClaimOutcome::Reclaiming) => BinderPlan::Wait {
+            remaining: CLAIM_HEARTBEAT,
+        },
+        Ok(ClaimOutcome::CapReached { .. }) => BinderPlan::Wait {
+            remaining: std::time::Duration::from_secs(60),
+        },
         Err(_) => BinderPlan::Strict("claim_failed"),
     }
 }
@@ -790,6 +830,8 @@ pub enum BaseBuild {
     },
     /// Another live owner is building it.
     Busy,
+    /// Capacity is held after reclaim; consumers use their planned retry path.
+    AtCapacity,
     /// The bind takes the strict path for this reason.
     Strict(String),
 }
@@ -872,8 +914,8 @@ pub fn build_base(
     let identity = BaseIdentity::of(family, &manifest)?;
     let claim = match claim_base(storage, family, &identity.scope, observer)? {
         ClaimOutcome::Claimed(claim) => BuildAttempt(Some(claim)),
-        ClaimOutcome::Busy { .. } => return Ok(BaseBuild::Busy),
-        ClaimOutcome::CapReached { .. } => return Ok(BaseBuild::Strict("live_base_cap".into())),
+        ClaimOutcome::Busy { .. } | ClaimOutcome::Reclaiming => return Ok(BaseBuild::Busy),
+        ClaimOutcome::CapReached { .. } => return Ok(BaseBuild::AtCapacity),
     };
     // Admission first: the reservation charges the build before any byte.
     let request = initial_reservation(paths.len() as u64, source_bytes, history);

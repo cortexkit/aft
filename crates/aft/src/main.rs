@@ -1965,7 +1965,11 @@ fn dispatch_outcome_on_route(req: RawRequest, ctx: &Arc<AppContext>) -> Dispatch
     if let Some(response) = aft::folder_admission_runtime::route_refusal(&req, ctx) {
         return DispatchOutcome::Immediate(response);
     }
-    if req.worker_session() {
+    // Inspect applies worker policy inside its independently timed deferred body.
+    if req.worker_session()
+        && req.command != "inspect"
+        && deferred_tool_call_name(&req) != Some("inspect")
+    {
         ctx.disable_rust_cargo_for_worker();
     }
     // The request is admitted here: pin the published config so every handler

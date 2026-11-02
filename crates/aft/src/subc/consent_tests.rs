@@ -872,6 +872,7 @@ fn identity(root: &Path, scope: Option<subc_protocol::scope::ScopeStamp>) -> Rou
         consumer_elicitation_capable: false,
         held_reply: false,
         held_update: false,
+        call_keepalive: false,
         tool_result_body: false,
         disabled_tools: Arc::new(vec![]),
         scope,

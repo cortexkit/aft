@@ -7,6 +7,7 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 mod cpu_time;
+pub(crate) mod progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
@@ -495,7 +496,8 @@ pub(crate) fn prepare_tool_call(
             phase_trace,
         ));
     }
-    if ctx.worker_session {
+    // Inspect must not wait for the manager before its deferred deadline is armed.
+    if ctx.worker_session && bare_name != "inspect" {
         app_ctx.disable_rust_cargo_for_worker();
     }
     let sanitized_args = strip_agent_preview_arg_owned(args);
