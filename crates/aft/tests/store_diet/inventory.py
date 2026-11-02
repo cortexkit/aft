@@ -135,7 +135,7 @@ def order_inventory(rows):
 
 
 def variants(row, tables):
-    sql = row['baseline']
+    sql = row['candidate']
     expanded = [('literal', sql)]
     if '{requested_values}' in sql:
         expanded = [(f'batch-{n}', sql.replace('{requested_values}', ', '.join(['(?, ?)'] * n))) for n in [1, 499]]
@@ -300,9 +300,24 @@ def compare_plans(baseline, candidate):
                         assert 'PRIMARY KEY' in tail or 'INTEGER PRIMARY KEY' in tail, f'{key}: new join {table} is not a primary-key search'
 
 
+def mapped_census(expected, actual):
+    by_text = {row['baseline']: row for row in actual}
+    assert set(by_text) == {row['candidate'] for row in expected}, 'SQL census changed; review baseline-to-candidate mappings'
+    assert len({row['id'] for row in expected}) == len(expected), 'duplicate statement ids'
+    mapped = []
+    for row in expected:
+        baseline = row['baseline']
+        text = row['candidate']
+        prefix = 'sql-' if baseline is not None else 'new-sql-'
+        digest = hashlib.sha256((baseline if baseline is not None else text).encode()).hexdigest()[:20]
+        assert row['id'] == prefix + digest, 'statement baseline identity changed'
+        mapped.append(dict(row, baseline=text, sites=by_text[text]['sites']))
+    return mapped
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['capture', 'check', 'coverage', 'compare-plans'])
+    parser.add_argument('command', choices=['capture', 'derive', 'check', 'coverage', 'compare-plans'])
     parser.add_argument('paths', nargs='*', type=pathlib.Path)
     parser.add_argument('--report', type=pathlib.Path)
     args = parser.parse_args()
@@ -318,14 +333,27 @@ def main():
         dump(HERE / 'table_encoding.json', tables)
         dump(HERE / 'sweep_references.json', sweep_references(tables, rows))
         print(f'captured {len(rows)} SQL statements')
+    elif args.command == 'derive':
+        rows = json.loads(path.read_text())
+        mapped = mapped_census(rows, census())
+        tables = schemas(mapped)
+        for row, current in zip(rows, mapped):
+            row['sites'] = current['sites']
+            row['variants'] = variants(row, tables)
+        dump(path, rows)
+        dump(HERE / 'order_sql.json', order_inventory(mapped))
+        dump(HERE / 'source_inventory.json', source_inventory())
+        dump(HERE / 'table_encoding.json', tables)
+        dump(HERE / 'sweep_references.json', sweep_references(tables, mapped))
+        print(f'derived inventories for {len(rows)} stable statement ids')
     elif args.command == 'check':
         actual = census()
         expected = json.loads(path.read_text())
-        assert [(r['id'], r['baseline']) for r in actual] == [(r['id'], r['candidate']) for r in expected], 'SQL census changed; review and update statements.json'
-        assert json.loads((HERE / 'table_encoding.json').read_text()) == schemas(actual), 'table encoding census is stale'
-        assert json.loads((HERE / 'order_sql.json').read_text()) == order_inventory(actual), 'SQL ordering census is stale'
+        mapped = mapped_census(expected, actual)
+        assert json.loads((HERE / 'table_encoding.json').read_text()) == schemas(mapped), 'table encoding census is stale'
+        assert json.loads((HERE / 'order_sql.json').read_text()) == order_inventory(mapped), 'SQL ordering census is stale'
         assert json.loads((HERE / 'source_inventory.json').read_text()) == source_inventory(), 'Rust source census is stale'
-        assert json.loads((HERE / 'sweep_references.json').read_text()) == sweep_references(schemas(actual), actual), 'sweep reference census is stale'
+        assert json.loads((HERE / 'sweep_references.json').read_text()) == sweep_references(schemas(mapped), mapped), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
         coverage(json.loads(path.read_text()), args.paths, args.report)

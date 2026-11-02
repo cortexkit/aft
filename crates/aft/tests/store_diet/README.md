@@ -147,6 +147,13 @@ python3 crates/aft/tests/store_diet/inventory_test.py
 python3 crates/aft/tests/store_diet/inventory.py compare-plans BASELINE_PLANS.json CANDIDATE_PLANS.json
 ```
 
+`capture` records a baseline, not an encoding change's replacement oracle. For
+subsequent changes, retain each row's `id` and `baseline`, edit its `candidate`
+text explicitly, then use `derive` to update the dependent inventories. A new
+statement has `baseline: null` and an id of `new-sql-` plus the first 20 hex
+characters of SHA-256(candidate text). `check` matches current source text to
+candidate text without changing the baseline identity.
+
 The Python tools use only the standard library. Plan-guard tests deliberately
 exercise red cases (SEARCH to SCAN, fewer equality columns, new unindexed join,
 unavailable plan), and byte-comparison tests change row order to prove it is

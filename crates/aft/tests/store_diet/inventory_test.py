@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import hashlib
 import pathlib
 import tempfile
 import unittest
@@ -24,6 +25,18 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         for text in ['WITH x AS (SELECT 1) SELECT * FROM x', 'UPDATE refs SET line=1',
                      'CREATE UNIQUE INDEX x ON refs(line)', 'SELECT count(*) FROM refs']:
             self.assertIsNotNone(inventory.SQL.match(text))
+
+    def test_candidate_sql_keeps_its_baseline_statement_identity(self):
+        baseline = 'SELECT id FROM nodes'
+        candidate = baseline + ' ORDER BY id'
+        key = 'sql-' + hashlib.sha256(baseline.encode()).hexdigest()[:20]
+        expected = [{'id': key, 'baseline': baseline, 'candidate': candidate, 'sites': []}]
+        actual = [{'id': 'different-candidate-hash', 'baseline': candidate, 'sites': [{'path': 'reader.rs', 'line': 1}]}]
+        mapped = inventory.mapped_census(expected, actual)
+        self.assertEqual(mapped[0]['id'], key)
+        self.assertEqual(mapped[0]['baseline'], candidate)
+        with self.assertRaisesRegex(AssertionError, 'baseline identity changed'):
+            inventory.mapped_census([dict(expected[0], baseline='SELECT name FROM nodes')], actual)
 
     def test_plan_guard_rejects_search_to_scan_and_lost_equalities(self):
         baseline = {'q': ['SEARCH refs USING INDEX r (caller_file=? AND kind=?)']}
@@ -80,6 +93,19 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'building'}}}))
         self.assertFalse(parity.pending_reply(request, {'success': True, 'complete': False, 'unresolved_call_sites': 1}))
         self.assertFalse(parity.pending_reply(request, {'success': False, 'code': 'symbol_not_found'}))
+
+    def test_capture_trusts_only_its_checkout_and_discards_injected_git_config(self):
+        scratch = inventory.ROOT / 'target/scratch'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            root = pathlib.Path(temporary)
+            (root / '.git').mkdir()
+            nested = root / 'fixtures'
+            nested.mkdir()
+            env = {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': 'outside'}
+            parity.trust_selected_checkout(env, nested)
+            trusted = root.resolve().as_posix().replace("'", "'\\''")
+            self.assertEqual(env, {'GIT_CONFIG_PARAMETERS': f"'safe.directory'='{trusted}'"})
 
     def test_parity_rejects_changed_reply_bytes_and_empty_capture(self):
         # Keep scratch beneath the checkout.

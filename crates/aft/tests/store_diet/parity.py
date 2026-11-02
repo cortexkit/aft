@@ -59,6 +59,20 @@ def pending_reply(request, reply):
     return graph.get('reason') == 'identity_provisional' or graph.get('status') in {'building', 'refreshing'}
 
 
+def trust_selected_checkout(env, root):
+    # A copied checkout may belong to a different user. Trust that checkout
+    # alone, not arbitrary repositories or the operator's global Git settings.
+    for key in list(env):
+        if key.startswith('GIT_CONFIG_'):
+            del env[key]
+    root = root.resolve()
+    for candidate in [root, *root.parents]:
+        if (candidate / '.git').exists():
+            path = str(candidate).replace('\\', '/').replace("'", "'\\''")
+            env['GIT_CONFIG_PARAMETERS'] = f"'safe.directory'='{path}'"
+            break
+
+
 def capture(binary, root, cache, requests, output, timeout, views=False):
     assert not cache.exists(), f'cold capture requires a fresh cache: {cache}'
     cache.mkdir(parents=True)
@@ -68,6 +82,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
                XDG_STATE_HOME=str(cache.resolve() / 'state'), XDG_CACHE_HOME=str(cache.resolve() / 'cache'),
                HOME=str(cache.resolve() / 'home'), USERPROFILE=str(cache.resolve() / 'home'),
                AFT_CALLGRAPH_BUILD_WAIT_MS=str(timeout * 1000), AFT_TEST_DISABLE_FILE_WATCHER='1')
+    trust_selected_checkout(env, root)
     frames = queue.Queue()
     successes = {request['command']: 0 for request in requests}
     with (output / 'stderr.txt').open('wb') as stderr:
