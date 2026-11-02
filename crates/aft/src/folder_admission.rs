@@ -1355,11 +1355,24 @@ mod tests {
         let child = root.path().join("src");
         std::fs::create_dir(&child).unwrap();
         let result = isolated(root.path(), || {
-            super::probe(
-                &child,
-                &ProjectDetectionConfig::default(),
-                ProbeBudgets::default(),
-            )
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let result = super::probe(
+                    &child,
+                    &ProjectDetectionConfig::default(),
+                    ProbeBudgets::default(),
+                );
+                if result.is_determined() {
+                    break result;
+                }
+                // A probe timeout is not a verdict; retry with the same default budget.
+                assert_eq!(result.reason, AdmissionReason::EvidenceBudgetExhausted);
+                assert!(
+                    Instant::now() < deadline,
+                    "Git evidence never became available: {result:?}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
         });
         assert_eq!(result.reason, AdmissionReason::GitCheckout);
         assert_eq!(

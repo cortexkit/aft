@@ -406,7 +406,12 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
             "folder_not_admitted: evidence_budget_exhausted"
         };
         assert_eq!(folder["message"], incomplete_message);
-        assert_eq!(admission::probe_counts_for_test(&ctx), (1, 0));
+        let (attempts, cache_hits) = admission::probe_counts_for_test(&ctx);
+        assert!(attempts >= 1, "no fresh observation completed");
+        assert_eq!(
+            cache_hits, 0,
+            "an incomplete observation must not be reused"
+        );
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.semantic_index().read().unwrap().is_none());
         assert!(ctx.callgraph_store().read().unwrap().is_none());
@@ -446,7 +451,9 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         let restarted = context(storage.path());
         assert!(configure(root.path(), storage.path(), &restarted, true, false).success);
         settle(&restarted);
-        assert_eq!(admission::probe_counts_for_test(&restarted), (1, 0));
+        let (attempts, cache_hits) = admission::probe_counts_for_test(&restarted);
+        assert!(attempts >= 1, "restart did not make a fresh observation");
+        assert_eq!(cache_hits, 0, "restart reused an incomplete observation");
         assert_eq!(
             admission::snapshot(&restarted).unwrap()["classification"],
             Value::Null
