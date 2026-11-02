@@ -4377,12 +4377,13 @@ fn handle_configure_inner(
     });
     let root_too_broad = canonicalization_failed
         || admission.as_ref().is_none_or(|a| {
-            a.classification == crate::folder_admission::FolderClassification::NotProject
+            !a.is_determined()
+                || a.classification == crate::folder_admission::FolderClassification::NotProject
         });
     let combined_root_off = root_too_broad || workspace;
     if root_too_broad {
         degraded_reasons.push(
-            if admission.is_none() {
+            if admission.as_ref().is_none_or(|a| !a.is_determined()) {
                 "folder_admission_pending"
             } else {
                 "folder_not_admitted"
@@ -4930,7 +4931,10 @@ fn handle_configure_inner(
     let retention_started = Instant::now();
     // A pending folder check has not resolved the artifact identity yet. Its
     // replay records retention only after the identity can be judged final.
-    let retention_result = if cache_available && admission.is_some() && !identity_provisional {
+    let retention_result = if cache_available
+        && admission.as_ref().is_some_and(|a| a.is_determined())
+        && !identity_provisional
+    {
         crate::storage_retention::record_bind(
             &crate::root_cache::StoragePaths::new(durable_root.clone(), storage_root.clone()),
             &canonical_cache_root,
