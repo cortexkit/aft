@@ -358,14 +358,15 @@ fn callgraph_submit_last_owner_returns_before_dependent_worker() {
         Lane::PureRead,
         "last-owner-submit".into(),
         Box::new(move |_| {
-            assert!(submitter.submit_heavy(JobCancellation::new(), Box::new(|_| ok("acquire"))));
+            assert!(submitter
+                .submit_callgraph_acquisition(JobCancellation::new(), Box::new(|_| ok("acquire"))));
             returned_tx.send(()).unwrap();
             let _ = after_submit_tx.send(());
             ok("last-owner-submit")
         }),
     );
     upgraded_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    // The paused submitter now owns the only other strong reference. Its
+    // The paused submitter owns the only other strong executor reference. Its
     // worker must return before the dependent worker can finish.
     drop(executor);
     release_tx.send(()).unwrap();
@@ -390,7 +391,7 @@ fn callgraph_maintenance_preserves_other_heavy_overlap() {
     };
     let (graph_started_tx, graph_started_rx) = crossbeam_channel::bounded(1);
     let (graph_release_tx, graph_release_rx) = crossbeam_channel::bounded(1);
-    assert!(submitter.submit_heavy(
+    assert!(submitter.submit_callgraph_acquisition(
         JobCancellation::new(),
         Box::new(move |_| {
             graph_started_tx.send(()).unwrap();

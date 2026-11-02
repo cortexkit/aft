@@ -11,8 +11,21 @@ pub(super) struct AcquisitionOwner {
     root: PathBuf,
     executor: Option<RootMaintenanceExecutor>,
     stopped: Arc<AtomicBool>,
-    active: Mutex<Option<JobCancellation>>,
+    active: Mutex<Vec<ActiveAcquisition>>,
     standalone: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct ActiveAcquisition {
+    cancellation: JobCancellation,
+    finished: Arc<AtomicBool>,
+}
+
+struct AcquisitionCompletion(Arc<AtomicBool>);
+
+impl Drop for AcquisitionCompletion {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl AcquisitionOwner {
@@ -21,7 +34,7 @@ impl AcquisitionOwner {
             root,
             executor: None,
             stopped: Arc::new(AtomicBool::new(false)),
-            active: Mutex::new(None),
+            active: Mutex::new(Vec::new()),
             standalone: Mutex::new(Vec::new()),
         }
     }
@@ -36,8 +49,8 @@ impl AcquisitionOwner {
 
     pub(super) fn cancel(&self) {
         self.stopped.store(true, Ordering::Release);
-        if let Some(token) = self.active.lock().unwrap().as_ref() {
-            token.request_cancel();
+        for active in self.active.lock().unwrap().iter() {
+            active.cancellation.request_cancel();
         }
     }
 
@@ -61,12 +74,30 @@ impl AcquisitionOwner {
             return Err(graph_building());
         }
         let cancellation = JobCancellation::new().with_root(&self.root);
-        *self.active.lock().unwrap() = Some(cancellation.clone());
+        let finished = Arc::new(AtomicBool::new(false));
+        // Capturing the guard also completes the record if queued work is
+        // dropped without running, or if source acquisition unwinds.
+        let completion = AcquisitionCompletion(finished.clone());
+        {
+            let mut active = self.active.lock().unwrap();
+            if self.stopped() {
+                return Err(graph_building());
+            }
+            // The view's result receiver prevents overlapping source calls.
+            // An older worker can still be returning after sending its result,
+            // so keep its token until its closure finishes.
+            active.retain(|job| !job.finished.load(Ordering::Acquire));
+            active.push(ActiveAcquisition {
+                cancellation: cancellation.clone(),
+                finished,
+            });
+        }
         let token = cancellation.clone();
         let stopped = self.stopped.clone();
         #[cfg(test)]
         let root = self.root.clone();
         let run = move || {
+            let _completion = completion;
             let _cancel = crate::executor::current_job_cancellation()
                 .is_none()
                 .then(|| crate::executor::install_job_cancellation(token));
@@ -98,7 +129,7 @@ impl AcquisitionOwner {
         if let Some(executor) = &self.executor {
             // A configured daemon submitter that has shut down must refuse;
             // falling back to a new thread would reactivate a retired root.
-            if !executor.submit_heavy(
+            if !executor.submit_callgraph_acquisition(
                 cancellation,
                 Box::new(move |_| {
                     run();
@@ -112,6 +143,9 @@ impl AcquisitionOwner {
             }
         } else {
             let mut handles = self.standalone.lock().unwrap();
+            if self.stopped() {
+                return Err(graph_building());
+            }
             handles.retain(|handle| !handle.is_finished());
             handles.push(
                 std::thread::Builder::new()

@@ -50,6 +50,7 @@ const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
 /// between batches.
 const SCHEDULER_EVENT_BATCH_CAP: usize = 64;
 pub(crate) const MAINTENANCE_QUEUE_CAP: usize = 512;
+const CALLGRAPH_ACQUISITION_REQUEST_ID: &str = "callgraph-view-acquire";
 
 /// Scheduler lane for command-handler execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1146,24 +1147,46 @@ pub(crate) struct RootMaintenanceExecutor {
     root_id: ProjectRootId,
 }
 
+struct SubmissionExecutor(Option<Executor>);
+
+impl Drop for SubmissionExecutor {
+    fn drop(&mut self) {
+        let executor = self.0.take();
+        if current_thread_is_executor_worker() {
+            // Shutdown may leave this temporary as the last executor owner.
+            // Other workers can depend on this worker returning, so release
+            // the temporary off-worker rather than joining them here.
+            std::thread::spawn(move || drop(executor));
+        }
+    }
+}
+
 impl RootMaintenanceExecutor {
-    pub(crate) fn submit_heavy(&self, cancellation: JobCancellation, job: ExecutorJob) -> bool {
+    pub(crate) fn submit_callgraph_acquisition(
+        &self,
+        cancellation: JobCancellation,
+        job: ExecutorJob,
+    ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
-        let executor = Executor { inner };
+        let executor = SubmissionExecutor(Some(Executor { inner }));
         let (tx, _rx) = oneshot::channel();
-        executor.submit_with_completion_cancellable(
-            self.root_id.clone(),
-            JobClass::Maintenance,
-            Lane::HeavyInit,
-            "callgraph-view-acquire".into(),
-            job,
-            CompletionSender::Async(tx),
-            Some(cancellation),
-            None,
-            None,
-        );
+        executor
+            .0
+            .as_ref()
+            .unwrap()
+            .submit_with_completion_cancellable(
+                self.root_id.clone(),
+                JobClass::Maintenance,
+                Lane::HeavyInit,
+                CALLGRAPH_ACQUISITION_REQUEST_ID.into(),
+                job,
+                CompletionSender::Async(tx),
+                Some(cancellation),
+                None,
+                None,
+            );
         true
     }
 }
@@ -2718,6 +2741,12 @@ fn is_bind_job(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
     job_class == JobClass::Interactive && lane == Lane::Mutating && is_configure_request(request_id)
 }
 
+fn is_callgraph_acquisition(job_class: JobClass, lane: Lane, request_id: &str) -> bool {
+    job_class == JobClass::Maintenance
+        && lane == Lane::HeavyInit
+        && request_id == CALLGRAPH_ACQUISITION_REQUEST_ID
+}
+
 fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
     format!(
         "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
@@ -2792,7 +2821,8 @@ struct ActorState {
     /// `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
-    maintenance_heavy_inflight: bool,
+    /// Only the internal callgraph acquisition bypasses interactive capacity.
+    callgraph_acquisition_inflight: bool,
     provider_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
@@ -2821,7 +2851,7 @@ impl ActorState {
             writer_inflight: false,
             shared_bind_inflight: false,
             maintenance_commit_inflight: false,
-            maintenance_heavy_inflight: false,
+            callgraph_acquisition_inflight: false,
             provider_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
@@ -3640,8 +3670,8 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
                 actor.lsp_inflight = false;
             }
             Lane::HeavyInit => {
-                if job_class == JobClass::Maintenance {
-                    actor.maintenance_heavy_inflight = false;
+                if is_callgraph_acquisition(job_class, lane, &request_id) {
+                    actor.callgraph_acquisition_inflight = false;
                 }
             }
             Lane::Mutating => {
@@ -4092,6 +4122,11 @@ fn try_admit_actor(
         AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
     };
     let mut heavy_permit = None;
+    let callgraph_acquisition = actor
+        .class_queues(job_class)
+        .queue(lane)
+        .front()
+        .is_some_and(|job| is_callgraph_acquisition(job_class, lane, &job.request_id));
 
     // A bind that runs with a shared hold (see `current_bind_gate_is_shared`)
     // blocks other writers and maintenance like any running writer, but
@@ -4132,7 +4167,7 @@ fn try_admit_actor(
             .interactive
             .first_bind_job()
             .is_some_and(|job| job.rerun.is_some() && !job.force_exclusive);
-    // Maintenance uses the executor's global maintenance capacity and
+    // MaintenanceCommit and callgraph acquisition use global maintenance capacity and
     // must not consume the per-actor slots reserved for interactive work. This
     // matters when a two-worker executor has actor_cap=1: the global reserve
     // leaves one worker idle, and this accounting makes that worker reachable
@@ -4140,15 +4175,15 @@ fn try_admit_actor(
     let actor_interactive_inflight = actor
         .actor_total_inflight
         .saturating_sub(usize::from(actor.maintenance_commit_inflight))
-        .saturating_sub(usize::from(actor.maintenance_heavy_inflight))
+        .saturating_sub(usize::from(actor.callgraph_acquisition_inflight))
         .saturating_sub(usize::from(actor.provider_inflight));
     let actor_has_interactive_capacity = actor_interactive_inflight < config.actor_cap;
     let runnable = match lane {
         Lane::PureRead => actor.read_inflight < config.read_cap && actor_has_interactive_capacity,
         Lane::SerialLspStatus => !actor.lsp_inflight && actor_has_interactive_capacity,
         Lane::HeavyInit => {
-            let capacity = if job_class == JobClass::Maintenance {
-                !actor.maintenance_heavy_inflight
+            let capacity = if callgraph_acquisition {
+                !actor.callgraph_acquisition_inflight
             } else {
                 actor_has_interactive_capacity
             };
@@ -4224,8 +4259,8 @@ fn try_admit_actor(
             actor.actor_total_inflight += 1;
         }
         Lane::HeavyInit => {
-            if job_class == JobClass::Maintenance {
-                actor.maintenance_heavy_inflight = true;
+            if callgraph_acquisition {
+                actor.callgraph_acquisition_inflight = true;
             }
             actor.actor_total_inflight += 1;
         }
