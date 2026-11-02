@@ -5,7 +5,7 @@
 // process groups, so Windows coverage is the cross-target `cargo check` gate.
 
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
