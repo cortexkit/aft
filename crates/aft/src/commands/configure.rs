@@ -25254,8 +25254,8 @@ mod tests {
             .contains(&"folder_not_admitted".into()));
         assert!(!ctx.degraded_reasons().contains(&"home_root".into()));
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], "not_project");
-        assert_eq!(folder["reason"], "no_project_evidence");
+        assert_eq!(folder["classification"], "not_project", "{folder}");
+        assert_eq!(folder["reason"], "no_project_evidence", "{folder}");
         assert!(!ctx.config().indexes.trigram);
         assert!(!ctx.config().indexes.semantic);
     }
