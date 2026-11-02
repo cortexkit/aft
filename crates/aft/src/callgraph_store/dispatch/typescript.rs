@@ -264,7 +264,10 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                         ) && field(**n, &["name", "pattern", "parameter"]).is_some_and(|key| {
                             text(key, self.source) == name
                                 || descendants(key).iter().any(|n| {
-                                    n.kind() == "identifier" && text(*n, self.source) == name
+                                    matches!(
+                                        n.kind(),
+                                        "identifier" | "shorthand_property_identifier_pattern"
+                                    ) && text(*n, self.source) == name
                                 })
                         }) && binding_scope(**n) == Some(ancestor)
                     })
