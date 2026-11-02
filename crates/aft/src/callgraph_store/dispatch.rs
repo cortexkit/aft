@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use super::super::rust_bindings::{Initializer, RustBindings};
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
@@ -217,6 +218,7 @@ pub fn complete_members(
         .iter()
         .map(|s| s.scoped_name.clone())
         .collect::<HashSet<_>>();
+    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new(source, root));
     let mut callers = symbol_callers(parse);
     for &node in &all {
         if !FUNCTIONS.contains(&node.kind()) {
@@ -237,6 +239,17 @@ pub fn complete_members(
             node.end_position().column as u32,
             name.clone(),
         );
+        if let Some(symbol) = rust_bindings
+            .as_ref()
+            .and_then(|index| index.symbol_at(node.start_byte()))
+        {
+            if scoped_names.contains(symbol) {
+                callers
+                    .entry(position)
+                    .or_insert_with(|| symbol.to_string());
+                continue;
+            }
+        }
         if let Some(symbol) = identities.get(&identity) {
             callers.entry(position).or_insert_with(|| symbol.clone());
             continue;
@@ -361,6 +374,12 @@ pub fn extract(
     #[cfg(test)]
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
     let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
+    #[cfg(test)]
+    let unindexed_bindings =
+        (language == "rust" && receiver_index.is_none()).then(|| RustBindings::new(source, root));
+    let rust_bindings = receiver_index.as_ref().map(|index| &index.bindings);
+    #[cfg(test)]
+    let rust_bindings = rust_bindings.or(unindexed_bindings.as_ref());
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
@@ -370,7 +389,9 @@ pub fn extract(
             .or_insert(symbol);
     }
     let mut functions = HashMap::<(u32, u32), Node<'_>>::new();
+    let mut functions_by_end = HashMap::new();
     for &node in all.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
+        functions_by_end.insert(node.end_byte(), node);
         let key = (
             node.end_position().row as u32,
             node.end_position().column as u32,
@@ -405,7 +426,11 @@ pub fn extract(
             }
         }
         for symbol in &parse.symbols {
-            if let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) {
+            if let Some(&node) = rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration(&symbol.scoped_name))
+                .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
+            {
                 if let Some(ty) = field(node, &["return_type"]) {
                     let mut ty = type_name(text(ty, source));
                     if ty == "Self" {
@@ -489,7 +514,15 @@ pub fn extract(
         });
     }
     for symbol in &parse.symbols {
-        let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) else {
+        let node = if language == "rust" {
+            rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration(&symbol.scoped_name))
+                .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
+        } else {
+            functions.get(&(symbol.end_line, symbol.end_col))
+        };
+        let Some(&node) = node else {
             continue;
         };
         if !["method", "function"].contains(&symbol.kind.as_str()) {
@@ -812,6 +845,7 @@ struct RustReceiverIndex<'nodes, 'tree> {
     nodes: &'nodes [Node<'tree>],
     functions: HashMap<usize, (usize, usize)>,
     constructors: HashSet<String>,
+    bindings: RustBindings,
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
@@ -825,6 +859,10 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
             nodes,
             functions: HashMap::new(),
             constructors: HashSet::new(),
+            bindings: nodes
+                .first()
+                .map(|root| RustBindings::new(source, *root))
+                .unwrap_or_default(),
         };
         let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
         for (position, &node) in nodes.iter().enumerate() {
@@ -986,6 +1024,55 @@ fn receiver_type<'tree>(
     }
     if !["identifier", "simple_identifier", "self"].contains(&receiver.kind()) {
         return None;
+    }
+    if language == "rust" {
+        #[cfg(test)]
+        let unindexed = rust_index.is_none().then(|| {
+            let mut root = call;
+            while let Some(parent) = root.parent() {
+                root = parent;
+            }
+            super::extraction_work::note(|work| {
+                work.receiver_function_nodes += descendants(function).len()
+            });
+            RustBindings::new(source, root)
+        });
+        let bindings = rust_index.map(|index| &index.bindings);
+        #[cfg(test)]
+        let bindings = bindings.or(unindexed.as_ref());
+        let bindings = bindings?;
+        let binding = bindings.binding(value, call.start_byte())?;
+        if let Some(annotation) = &binding.annotation {
+            let annotation_name = type_name(annotation);
+            if let Some(bound) = bindings.bound(&annotation_name, call.start_byte()) {
+                return Some(type_name(bound.split('+').next().unwrap_or_default()));
+            }
+            if bindings.type_parameter(&annotation_name, call.start_byte())
+                || annotation.contains('<') && bindings.generic_callable(call.start_byte())
+                || annotation_name.contains("::")
+                    && !annotation_name
+                        .split("::")
+                        .next()
+                        .is_some_and(|name| name.chars().next().is_some_and(char::is_lowercase))
+            {
+                return None;
+            }
+            return Some(annotation_name);
+        }
+        return match binding.initializer.as_ref()? {
+            Initializer::Nominal(name) => Some(type_name(name)),
+            Initializer::Call { callee, .. } => {
+                let expression = if let Some(member) = callee
+                    .strip_prefix("self.")
+                    .or_else(|| callee.strip_prefix("Self::"))
+                {
+                    format!("{}::{member}", current_owner?)
+                } else {
+                    callee.clone()
+                };
+                Some(format!("@return:{expression}"))
+            }
+        };
     }
     // Only declarations in the enclosing function are evidence. Assignments
     // invalidate constructor inference; arbitrary return-value inference is absent.
@@ -1369,7 +1456,18 @@ impl<'a> Resolver<'a> {
             return self.project_type_at_depth(&base_file, &field.ty, depth + 1);
         }
         if let Some(expression) = name.strip_prefix("@return:") {
-            let (target_file, symbol) = self.type_target(file, expression)?;
+            let local;
+            let (target_file, symbol) = if let Some(target) = self.type_target(file, expression) {
+                (&target.0, &target.1)
+            } else {
+                self.file(file)?
+                    .dispatch
+                    .returns
+                    .iter()
+                    .find(|r| r.symbol == expression)?;
+                local = (file.to_string(), expression.to_string());
+                (&local.0, &local.1)
+            };
             let returned = self
                 .file(target_file)?
                 .dispatch
@@ -1687,8 +1785,32 @@ impl<'a> Resolver<'a> {
                         provenance: "exact",
                     })
                     .collect();
-            } else if methods.len() > 1 || exact.len() > 1 {
-                return self.unknown(&parse.language, member);
+            } else if !ty.interface {
+                exact.retain(|target| {
+                    let Some(method) = self
+                        .known_file(&target.file)
+                        .dispatch
+                        .methods
+                        .iter()
+                        .find(|m| m.symbol == target.symbol)
+                    else {
+                        return false;
+                    };
+                    let trait_name = method.trait_name.as_deref().unwrap_or(&method.owner);
+                    let Some((trait_file, declaration)) =
+                        self.project_type(&target.file, trait_name)
+                    else {
+                        return false;
+                    };
+                    self.project_type(file, trait_name).is_some_and(
+                        |(caller_file, caller_trait)| {
+                            caller_file == trait_file && caller_trait.name == declaration.name
+                        },
+                    )
+                });
+                if exact.len() > 1 {
+                    return self.unknown(&parse.language, member);
+                }
             }
         }
         if parse.language == "go" && exact.len() > 1 {

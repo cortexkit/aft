@@ -1768,6 +1768,7 @@ pub(crate) mod perf_tests;
 #[cfg(test)]
 pub(crate) mod position_identity_tests;
 mod refresh_wal;
+mod rust_bindings;
 mod rust_manifest;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
@@ -20842,6 +20843,7 @@ fn load_name_match_candidates(
 struct ParsedDispatchSource {
     source: String,
     tree: tree_sitter::Tree,
+    rust: Option<rust_bindings::RustBindings>,
 }
 
 type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
@@ -20849,15 +20851,23 @@ type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource
 fn rust_dispatch_data<'a>(
     project_root: &Path,
     file: &str,
+    sources: &mut DispatchSourceCache,
     cache: &'a mut HashMap<String, Option<Rc<FileCallData>>>,
 ) -> Option<Rc<FileCallData>> {
     cache
         .entry(file.to_string())
         .or_insert_with(|| {
-            let source = std::fs::read_to_string(project_root.join(file)).ok()?;
-            let mut data =
-                callgraph::build_file_data_from_source(&project_root.join(file), &source).ok()?;
-            extend_rust_imports_with_nested_uses(&source, &mut data);
+            let parsed =
+                parsed_dispatch_source_for_file(project_root, file, "rust", LangId::Rust, sources)?;
+            let mut data = callgraph::build_file_data_from_tree(
+                &project_root.join(file),
+                &parsed.source,
+                LangId::Rust,
+                &parsed.tree,
+                &LineIndex::new(&parsed.source),
+            )
+            .ok()?;
+            extend_rust_imports_from_tree(&parsed.source, parsed.tree.root_node(), &mut data);
             Some(Rc::new(data))
         })
         .as_ref()
@@ -20892,7 +20902,8 @@ fn rust_exact_dispatch_candidate(
     symbol: &str,
 ) -> Option<NameMatchCandidate> {
     tx.query_row(
-        "SELECT id, kind, start_line FROM nodes WHERE file_path=?1 AND scoped_name=?2 AND kind='method'",
+        "SELECT id, kind, start_line FROM nodes WHERE file_path=?1 AND scoped_name=?2 AND kind='method'
+         AND (SELECT COUNT(*) FROM nodes WHERE file_path=?1 AND scoped_name=?2)=1",
         params![file, symbol], |row| Ok(NameMatchCandidate {
             node_id: row.get(0)?, file_path: file.to_string(), scoped_name: symbol.to_string(),
             kind: row.get(1)?, start_line: row.get::<_, u32>(2)? + 1,
@@ -20916,7 +20927,12 @@ fn rust_bound_dispatch_candidate(
         )
         .ok()?;
     let raw = rust_dispatch_raw(reference, start, end);
-    let data = rust_dispatch_data(project_root, &reference.caller_file, data_cache)?.clone();
+    let data = rust_dispatch_data(
+        project_root,
+        &reference.caller_file,
+        source_cache,
+        data_cache,
+    )?;
     let binding = if reference.colon_dispatch {
         rust_type_binding(
             index,
@@ -20934,17 +20950,19 @@ fn rust_bound_dispatch_candidate(
             return None;
         }
         let parsed = parsed_dispatch_source(project_root, reference, LangId::Rust, source_cache)?;
-        let initializer = rust_visible_initializer(
-            parsed.tree.root_node(),
-            &parsed.source,
-            &reference.receiver,
-            start,
-        )?;
-        let callee = initializer.child_by_field_name("function")?;
+        let initializer = parsed
+            .rust
+            .as_ref()?
+            .binding(&reference.receiver, start)?
+            .initializer
+            .as_ref()?;
+        let rust_bindings::Initializer::Call { callee, bytes } = initializer else {
+            return None;
+        };
         let (file, symbol): (String, String) = tx.query_row(
             "SELECT r.target_file, r.target_symbol FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
-            params![reference.caller_file, initializer.start_byte(), initializer.end_byte(), node_text(callee, &parsed.source)],
+            params![reference.caller_file, bytes.start, bytes.end, callee],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional().ok().flatten()?;
         let parsed = parsed_dispatch_source_for_file(
@@ -20954,22 +20972,18 @@ fn rust_bound_dispatch_candidate(
             LangId::Rust,
             source_cache,
         )?;
-        let declaration = rust_scoped_function(parsed.tree.root_node(), &parsed.source, &symbol)?;
-        let declaration_byte = declaration.start_byte();
-        let declaration_line = declaration.start_position().row;
-        let return_type = node_text(
-            declaration.child_by_field_name("return_type")?,
-            &parsed.source,
-        )
-        .to_string();
+        let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+        let declaration_byte = declaration.bytes.start;
+        let declaration_line = declaration.line;
+        let declaration_owner = declaration.owner.clone();
+        let return_type = declaration.return_type.as_deref()?.to_string();
         if return_type == "Self" {
-            let (owner, _) = symbol.rsplit_once("::")?;
-            let owner = owner.split_once(" for ").map_or(owner, |(_, ty)| ty);
+            let owner = declaration_owner?;
             let target = format!("{owner}::{}", reference.method_name);
             if let Some(candidate) = rust_exact_dispatch_candidate(tx, &file, &target) {
                 return Some(candidate);
             }
-            (file, owner.to_string())
+            (file, owner)
         } else {
             // A declared trait-object return binds the contract, not an arbitrary
             // implementation whose method happens to have the same name.
@@ -20977,11 +20991,11 @@ fn rust_bound_dispatch_candidate(
             if !receiver_is_bare_identifier(trait_name) {
                 return None;
             }
-            let return_data = rust_dispatch_data(project_root, &file, data_cache)?.clone();
+            let return_data = rust_dispatch_data(project_root, &file, source_cache, data_cache)?;
             let mut declaration_raw = raw.clone();
             declaration_raw.caller_file = file.clone();
             declaration_raw.caller_symbol = Some(symbol.clone());
-            declaration_raw.line = declaration_line as u32 + 1;
+            declaration_raw.line = declaration_line;
             declaration_raw.byte_start = declaration_byte;
             declaration_raw.byte_end = declaration_raw.byte_start;
             let binding =
@@ -20994,15 +21008,19 @@ fn rust_bound_dispatch_candidate(
         }
     };
     let suffix = format!(" for {}::{}", binding.1, reference.method_name);
-    let mut statement = tx.prepare_cached("SELECT scoped_name, start_line FROM nodes WHERE file_path=?1 AND name=?2 AND kind='method'").ok()?;
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT scoped_name FROM nodes WHERE file_path=?1 AND name=?2 AND kind='method'",
+        )
+        .ok()?;
     let methods = statement
         .query_map(params![binding.0, reference.method_name], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?))
+            r.get::<_, String>(0)
         })
         .ok()?;
     let mut selected = None;
     for method in methods {
-        let (symbol, line) = method.ok()?;
+        let symbol = method.ok()?;
         let Some(trait_name) = symbol.strip_suffix(&suffix) else {
             continue;
         };
@@ -21011,7 +21029,7 @@ fn rust_bound_dispatch_candidate(
         else {
             continue;
         };
-        let impl_data = rust_dispatch_data(project_root, &binding.0, data_cache)?;
+        let impl_data = rust_dispatch_data(project_root, &binding.0, source_cache, data_cache)?;
         let parsed = parsed_dispatch_source_for_file(
             project_root,
             &binding.0,
@@ -21022,13 +21040,9 @@ fn rust_bound_dispatch_candidate(
         let mut impl_raw = raw.clone();
         impl_raw.caller_file = binding.0.clone();
         impl_raw.caller_symbol = Some(symbol.clone());
-        impl_raw.line = line + 1;
-        impl_raw.byte_start = parsed
-            .source
-            .split_inclusive('\n')
-            .take(line as usize)
-            .map(str::len)
-            .sum();
+        let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+        impl_raw.line = declaration.line;
+        impl_raw.byte_start = declaration.bytes.start;
         impl_raw.byte_end = impl_raw.byte_start;
         if rust_type_binding(index, &binding.0, trait_name, &impl_data, &impl_raw)
             != Some(caller_trait)
@@ -21042,121 +21056,6 @@ fn rust_bound_dispatch_candidate(
         selected = Some(candidate);
     }
     selected
-}
-
-// Legacy node ranges may cover only a declaration's name. Recover its return
-// syntax from the declared owner, rejecting duplicate declaration identities.
-fn rust_scoped_function<'a>(root: Node<'a>, source: &str, symbol: &str) -> Option<Node<'a>> {
-    let (owner, name) = symbol.rsplit_once("::").unwrap_or(("", symbol));
-    let mut stack = vec![root];
-    let mut selected = None;
-    while let Some(node) = stack.pop() {
-        if node.kind() == "function_item"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|n| node_text(n, source) == name)
-        {
-            let mut scope = Vec::new();
-            let mut parent = node.parent();
-            let mut implementation = false;
-            while let Some(ancestor) = parent {
-                if ancestor.kind() == "impl_item" {
-                    let ty = node_text(ancestor.child_by_field_name("type")?, source);
-                    scope.push(
-                        if let Some(trait_node) = ancestor.child_by_field_name("trait") {
-                            format!("{} for {ty}", node_text(trait_node, source))
-                        } else {
-                            ty.to_string()
-                        },
-                    );
-                    implementation = true;
-                    break;
-                }
-                if matches!(ancestor.kind(), "mod_item" | "trait_item") {
-                    scope
-                        .push(node_text(ancestor.child_by_field_name("name")?, source).to_string());
-                }
-                parent = ancestor.parent();
-            }
-            if !implementation {
-                scope.reverse();
-            }
-            if scope.join("::") == owner {
-                if selected.is_some() {
-                    return None;
-                }
-                selected = Some(node);
-            }
-        }
-        push_named_children(node, &mut stack);
-    }
-    selected
-}
-
-fn rust_visible_initializer<'a>(
-    root: Node<'a>,
-    source: &str,
-    receiver: &str,
-    call_byte: usize,
-) -> Option<Node<'a>> {
-    let mut scope = root.descendant_for_byte_range(call_byte, call_byte)?;
-    while !matches!(scope.kind(), "function_item" | "closure_expression") {
-        scope = scope.parent()?;
-    }
-    let mut stack = vec![scope];
-    let mut selected = None;
-    let mut shadow = 0;
-    while let Some(node) = stack.pop() {
-        if node.start_byte() >= call_byte {
-            continue;
-        }
-        if node.kind() == "let_declaration" {
-            let pattern = node.child_by_field_name("pattern")?;
-            if rust_pattern_binds(pattern, source, receiver) {
-                let mut scope = node.parent()?;
-                while !matches!(scope.kind(), "block" | "source_file") {
-                    scope = scope.parent()?;
-                }
-                if scope.start_byte() <= call_byte
-                    && call_byte < scope.end_byte()
-                    && selected.is_none_or(|old: Node<'_>| old.start_byte() < node.start_byte())
-                {
-                    // Retain a shadowing declaration even when its initializer
-                    // cannot be resolved, rather than falling back to an outer one.
-                    selected = Some(node);
-                }
-            }
-        } else if node.start_byte() < call_byte && call_byte < node.end_byte() {
-            if let Some(pattern) = node
-                .child_by_field_name("pattern")
-                .or_else(|| node.child_by_field_name("parameters"))
-            {
-                if rust_pattern_binds(pattern, source, receiver) {
-                    shadow = shadow.max(pattern.start_byte());
-                }
-            }
-        }
-        push_named_children(node, &mut stack);
-    }
-    let selected = selected?;
-    let pattern = selected.child_by_field_name("pattern")?;
-    if shadow > selected.start_byte() || !matches!(pattern.kind(), "identifier" | "mut_pattern") {
-        return None;
-    }
-    selected
-        .child_by_field_name("value")
-        .filter(|node| node.kind() == "call_expression")
-}
-
-fn rust_pattern_binds(pattern: Node<'_>, source: &str, receiver: &str) -> bool {
-    let mut stack = vec![pattern];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" && node_text(node, source) == receiver {
-            return true;
-        }
-        push_named_children(node, &mut stack);
-    }
-    false
 }
 
 fn rust_trait_dispatch_candidate(tx: &Transaction<'_>, candidate: &NameMatchCandidate) -> bool {
@@ -21227,7 +21126,9 @@ fn parse_dispatch_source(
     let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
     let tree =
         parse_source_with_cached_parser(&project_root.join(caller_file), &source, lang).ok()?;
-    Some(ParsedDispatchSource { source, tree })
+    let rust =
+        (lang == LangId::Rust).then(|| rust_bindings::RustBindings::new(&source, tree.root_node()));
+    Some(ParsedDispatchSource { source, tree, rust })
 }
 
 fn parsed_dispatch_source<'a>(
@@ -34182,6 +34083,7 @@ pub fn run() -> bool { create() }
             wrong, 0,
             "associated trait functions are not free functions"
         );
+        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]
@@ -34224,6 +34126,7 @@ pub fn run() -> bool { create() }
             wrong, 0,
             "a type import must not bind a module's free function"
         );
+        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]
@@ -34250,6 +34153,16 @@ pub fn run() -> bool { create() }
             "src/lib.rs",
             "run",
         );
+        assert_rust_exact_view_parity(root, &store);
+        let negative = tempdir().expect("negative tempdir");
+        let root = negative.path();
+        write_rust_manifest(root, "trait-constructor-negative");
+        write_file(
+            root,
+            "src/database/mod.rs",
+            "mod backend;\npub use backend::Backend;\npub trait Database { fn new() -> Self; }\n",
+        );
+        write_file(root, "src/database/backend.rs", "use super::Database;\npub struct Backend;\nimpl Database for Backend { fn new() -> Self { Self } }\n");
         write_file(root, "src/lib.rs", "mod database;\nuse database::Backend;\ntrait Database { fn new() -> Self; }\npub fn run() { Backend::new(); }\n");
         let (store, _) = cold_build_twice(root);
         let conn = Connection::open(store.sqlite_path()).expect("reader");
@@ -34258,6 +34171,7 @@ pub fn run() -> bool { create() }
             wrong, 0,
             "same-named traits from different modules are not interchangeable"
         );
+        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]
@@ -34335,6 +34249,39 @@ impl Other { pub fn qualified(self) -> Self { self } }
             )
             .unwrap();
         assert_eq!(wrong, 0);
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    fn assert_rust_exact_view_parity(root: &Path, legacy: &CallGraphStore) {
+        let mut inputs = rust_files(root);
+        inputs.push(root.join("Cargo.toml"));
+        let _ = callgraph_fixture_view(root, &inputs);
+        let view = manifest_view_database_path(&root.join("views"), "parity").unwrap();
+        let rows = |database: &Path| {
+            let conn = Connection::open(database).unwrap();
+            let mut query = conn.prepare("SELECT e.target_file, e.target_symbol, n.file_path, n.scoped_name, e.line
+                FROM edges e JOIN nodes n ON n.id=e.source_node JOIN refs r ON r.ref_id=e.ref_id
+                WHERE e.kind='call' AND r.kind='call' AND e.provenance NOT IN ('name_match', 'dispatch')
+                ORDER BY 1,2,3,4,5").unwrap();
+            query
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, u32>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<BTreeSet<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows(legacy.sqlite_path()),
+            rows(&view),
+            "exact declaration edges differ between graph producers"
+        );
     }
 
     #[test]
