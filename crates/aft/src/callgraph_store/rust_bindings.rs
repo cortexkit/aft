@@ -17,7 +17,7 @@ pub(super) struct Declaration {
 #[derive(Clone, Debug)]
 pub(super) enum Initializer {
     Call { callee: String, bytes: Range<usize> },
-    Nominal(String),
+    Nominal(String, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +37,7 @@ pub(super) struct RustBindings {
     bounds: HashMap<(usize, String), String>,
     parameters: HashSet<(usize, String)>,
     generic_functions: HashSet<usize>,
+    unit_structs: HashMap<String, bool>,
 }
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -96,6 +97,26 @@ impl RustBindings {
         let mut result = Self::default();
         let mut stack = vec![(root, None, root.byte_range())];
         while let Some((node, mut callable, mut scope)) = stack.pop() {
+            if node.kind() == "struct_item" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut parts = vec![text(name, source).to_string()];
+                    let mut parent = node.parent();
+                    while let Some(ancestor) = parent {
+                        if ancestor.kind() == "mod_item" {
+                            if let Some(name) = ancestor.child_by_field_name("name") {
+                                parts.push(text(name, source).to_string());
+                            }
+                        }
+                        parent = ancestor.parent();
+                    }
+                    parts.reverse();
+                    result
+                        .unit_structs
+                        .entry(parts.join("::"))
+                        .and_modify(|unit| *unit = false)
+                        .or_insert(node.child_by_field_name("body").is_none());
+                }
+            }
             if matches!(node.kind(), "function_item" | "closure_expression") {
                 callable = Some(node.start_byte());
                 scope = node.byte_range();
@@ -172,6 +193,7 @@ impl RustBindings {
                                 }),
                                 "struct_expression" => Some(Initializer::Nominal(
                                     text(value.child_by_field_name("name")?, source).to_string(),
+                                    false,
                                 )),
                                 "identifier"
                                     if text(value, source)
@@ -179,7 +201,10 @@ impl RustBindings {
                                         .next()
                                         .is_some_and(char::is_uppercase) =>
                                 {
-                                    Some(Initializer::Nominal(text(value, source).to_string()))
+                                    Some(Initializer::Nominal(
+                                        text(value, source).to_string(),
+                                        true,
+                                    ))
                                 }
                                 _ => None,
                             });
@@ -275,6 +300,10 @@ impl RustBindings {
             .get(&call_byte)
             .is_some_and(|callable| self.generic_functions.contains(callable))
     }
+
+    pub fn unit_struct(&self, symbol: &str) -> bool {
+        self.unit_structs.get(symbol).copied() == Some(true)
+    }
 }
 
 #[cfg(test)]
@@ -344,5 +373,16 @@ mod tests {
         assert!(index.declaration("I::m").is_some());
         assert!(index.declaration("I for A::m").is_some());
         assert!(index.declaration("I for B::m").is_some());
+    }
+
+    #[test]
+    fn bare_values_require_a_unique_unit_struct_declaration() {
+        let index = index(
+            "struct Unit; struct Named { field: u8 } struct Tuple(u8); mod inner { struct Unit; }",
+        );
+        assert!(index.unit_struct("Unit"));
+        assert!(index.unit_struct("inner::Unit"));
+        assert!(!index.unit_struct("Named"));
+        assert!(!index.unit_struct("Tuple"));
     }
 }

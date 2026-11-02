@@ -1095,7 +1095,7 @@ fn receiver_type<'tree>(
             return Some(annotation_name);
         }
         return match binding.initializer.as_ref()? {
-            Initializer::Nominal(name) => Some(type_name(name)),
+            Initializer::Nominal(name, _) => Some(type_name(name)),
             Initializer::Call { callee, .. } => {
                 if let Some((ty, "new")) = callee.split_once("::") {
                     if bindings.declaration(callee).is_some_and(|declaration| {

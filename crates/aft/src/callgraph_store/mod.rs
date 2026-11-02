@@ -20959,8 +20959,44 @@ fn rust_bound_dispatch_candidate(
             .binding(&reference.receiver, start)?
             .initializer
             .as_ref()?;
-        if let rust_bindings::Initializer::Nominal(name) = initializer {
-            rust_type_binding(index, &reference.caller_file, name, &data, &raw)?
+        if let rust_bindings::Initializer::Nominal(name, unit_value) = initializer {
+            let name = name.clone();
+            let unit_value = *unit_value;
+            // A bare value can be a constant or a local rather than a constructor.
+            // Its unit-struct declaration must supply the receiver type.
+            if unit_value && parsed.rust.as_ref()?.binding(&name, start).is_some() {
+                return None;
+            }
+            let binding = rust_type_binding(index, &reference.caller_file, &name, &data, &raw)?;
+            for import in data
+                .import_block
+                .imports
+                .iter()
+                .filter(|import| rust_import_is_visible_to_call(import, &raw))
+            {
+                if let Some(other) =
+                    rust_target_for_use(index, &reference.caller_file, import, &name, &data, &raw)
+                {
+                    if other != binding && index.node_for_symbol(&other.0, &other.1).is_some() {
+                        return None;
+                    }
+                }
+            }
+            if unit_value
+                && !parsed_dispatch_source_for_file(
+                    project_root,
+                    &binding.0,
+                    "rust",
+                    LangId::Rust,
+                    source_cache,
+                )?
+                .rust
+                .as_ref()?
+                .unit_struct(&binding.1)
+            {
+                return None;
+            }
+            binding
         } else {
             let rust_bindings::Initializer::Call { callee, bytes } = initializer else {
                 return None;
@@ -34354,6 +34390,39 @@ mod tests {
         write_file(root, "src/database.rs", "pub fn new() {}\n");
         let (store, _) = cold_build_twice(root);
         assert_direct_caller(&store, "src/database.rs", "new", "src/lib.rs", "run");
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_trait_associated_function_is_not_a_free_import() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "associated-function-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod api;\nuse api::*;\npub fn unbound() { create(); }\n",
+        );
+        write_file(
+            root,
+            "src/api.rs",
+            "pub trait Factory { fn create() -> Self; }\n",
+        );
+        let data = callgraph::build_file_data(&root.join("src/api.rs")).unwrap();
+        assert_eq!(
+            data.symbol_metadata["Factory::create"].kind,
+            SymbolKind::Method
+        );
+        let (store, _) = cold_build_twice(root);
+        let conn = Connection::open(store.sqlite_path()).unwrap();
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE target_file='src/api.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "trait members are not module-level imports");
         assert_rust_exact_view_parity(root, &store);
     }
 

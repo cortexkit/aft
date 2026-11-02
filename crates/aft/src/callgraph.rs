@@ -1987,9 +1987,6 @@ fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
                 }
                 scope.reverse();
                 scope.push(name.clone());
-                let exported = node
-                    .named_children(&mut node.walk())
-                    .any(|n| n.kind() == "visibility_modifier");
                 for method in body.named_children(&mut body.walk()) {
                     if !matches!(method.kind(), "function_item" | "function_signature_item") {
                         continue;
@@ -2016,7 +2013,8 @@ fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
                                 .to_string(),
                         ),
                         scope_chain: scope.clone(),
-                        exported,
+                        // Members are reached through the trait, not imported from the module.
+                        exported: false,
                         parent: Some(name.clone()),
                     });
                 }
