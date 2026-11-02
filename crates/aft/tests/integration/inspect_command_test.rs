@@ -10097,6 +10097,85 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
 }
 
 #[test]
+fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_document_version() {
+    for version_mode in [
+        "AFT_FAKE_LSP_STALE_VERSION",
+        "AFT_FAKE_LSP_UNVERSIONED_PUSH",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        let storage = temp.path().join("storage");
+        write_file(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"certified-compiler-error\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_file(
+            &root,
+            "Cargo.lock",
+            "version = 4\n[[package]]\nname = \"certified-compiler-error\"\nversion = \"0.1.0\"\n",
+        );
+        write_file(
+            &root,
+            "src/lib.rs",
+            "// fake_compile_error\npub fn f() {}\n",
+        );
+        crate::helpers::disable_in_process_file_watcher();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(json!({
+                "id": "certified-configure", "command": "configure", "project_root": root, "storage_dir": storage,
+                "harness": "opencode", "config": crate::helpers::user_config(json!({
+                    "indexes": { "trigram": false, "semantic": false }
+                }))
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        configure_fake_rust_lsp(&ctx);
+        for flag in [
+            "AFT_FAKE_LSP_PULL",
+            "AFT_FAKE_LSP_DISABLE_PUSH",
+            "AFT_FAKE_LSP_PULL_FROM_CONTENT",
+            version_mode,
+        ] {
+            ctx.lsp().set_extra_env(flag, "1");
+        }
+        // Wait past the two-second filesystem timestamp safety margin so the
+        // completed check can prove that its inputs predate the run. The stale
+        // or missing document version cannot certify the compiler push, but
+        // that input fingerprint can keep its error beside the empty native pull.
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
+        let response = scoped_diagnostics_inspect(&ctx, "certified-error", "src");
+        let record = wait_for_completed_rust_check(&storage, 1, || {}).unwrap();
+        println!(
+            "{version_mode}: certified record {}: {response:#}",
+            fs::read_to_string(record).unwrap()
+        );
+        assert_eq!(response["complete"], true, "{version_mode}: {response:#}");
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], 1,
+            "{version_mode}: {response:#}"
+        );
+        assert!(
+            diagnostic_messages_for(&response, "src/lib.rs")
+                .iter()
+                .any(|message| message == "fake compile error"),
+            "{version_mode}: {response:#}"
+        );
+    }
+}
+
+#[test]
 fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer() {
     if !crate::helpers::real_rust_analyzer_available(
         "rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer",

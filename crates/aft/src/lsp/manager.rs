@@ -6324,16 +6324,6 @@ impl LspManager {
                         && !entry.from_receive_order
                         && entry.content_hash == Some(*blake3::hash(content.as_bytes()).as_bytes())
                 });
-        if key.kind == ServerKind::Rust {
-            eprintln!(
-                "RESTART reopen {} state={:?} keep_push={keep_push} push={:?}",
-                file.display(),
-                self.rust_check_state(key),
-                self.latest_push_for_pull_servers
-                    .get(&(key.clone(), file.to_path_buf()))
-                    .map(Vec::len)
-            );
-        }
         let pushed = keep_push
             .then(|| {
                 self.latest_push_for_pull_servers
@@ -7083,9 +7073,6 @@ impl LspManager {
         let from_receive_order = version.is_none();
         let proven_version =
             version.or_else(|| self.version_for_unversioned_push(&key, &file, receive_order));
-        if key.kind == ServerKind::Rust {
-            eprintln!("RESTART publish {} version={version:?} current={:?} diagnostics={diagnostic_count} state={:?} closed={} late={}", file.display(), self.documents.get(&key).and_then(|store| store.version(&file)), self.rust_check_state(&key), self.inspect_closed_documents.contains_key(&(key.clone(), file.clone())), self.late_close_replies.contains_key(&(key.clone(), file.clone())));
-        }
         // Preserve the full compiler result independently of the working-set
         // LRU and document-close exceptions, which must not turn errors clean.
         if let Some(cache) = self
