@@ -13203,11 +13203,20 @@ mod tests {
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
         let complete = |ctx: &AppContext| {
-            ctx.checkout_semantic_runtime().is_some_and(|runtime| {
-                runtime
-                    .search(&[1.0, 0.0, 0.0], 1_000, &|_| true)
-                    .is_ok_and(|answer| answer.complete())
-            })
+            let answer = ctx
+                .checkout_semantic_runtime()
+                .map(|runtime| runtime.search(&[1.0, 0.0, 0.0], 1_000, &|_| true));
+            let complete = answer
+                .as_ref()
+                .is_some_and(|answer| answer.as_ref().is_ok_and(|answer| answer.complete()));
+            if !complete {
+                eprintln!(
+                    "semantic view incomplete: {}; non_probe_inputs={}; answer={answer:?}",
+                    ctx.checkout_semantic().describe(),
+                    server.non_probe_input_count(),
+                );
+            }
+            complete
         };
         fills.wait_until_settled(Duration::from_secs(60)).unwrap();
         assert!(complete(&ctx), "the semantic view never filled");
