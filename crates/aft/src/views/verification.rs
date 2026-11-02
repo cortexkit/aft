@@ -1679,6 +1679,41 @@ mod tests {
     }
 
     #[test]
+    fn completed_attribute_refusal_from_real_git_is_stable_policy_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let queries = crate::git_index_reader::GitQueries::new(
+            root.path().to_owned(),
+            Duration::from_secs(2),
+        );
+        let capture = || {
+            let sources = ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"].map(|variable| {
+                let mut command = std::process::Command::new("git");
+                command
+                    .current_dir(root.path())
+                    .args(["var", variable])
+                    .env("GIT_ATTR_NOSYSTEM", "1")
+                    .env("LC_ALL", "C");
+                crate::test_env::apply_hermetic_git_env(&mut command);
+                let output = command.output().unwrap();
+                if variable == "GIT_ATTR_SYSTEM" {
+                    assert!(output.status.code().is_some(), "{output:?}");
+                    assert!(
+                        !output.status.success(),
+                        "the test must exercise a completed refusal: {output:?}"
+                    );
+                }
+                Ok(output)
+            });
+            Policy::capture_sources(root.path(), &[], queries.config(), sources)
+                .expect("a completed attribute refusal is not an unfinished query")
+        };
+        let before = capture();
+        let after = capture();
+        assert!(!before.reusable);
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn final_policy_digest_covers_git_stat_settings_and_include_targets() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q"]);
