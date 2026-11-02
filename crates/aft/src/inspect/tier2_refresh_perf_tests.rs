@@ -156,6 +156,20 @@ pub(super) fn notify_callgraph_read_retry_for_test() {
     }
 }
 
+pub(super) fn observe_callgraph_read_error_for_test(
+    error: &CallGraphStoreError,
+    attempt_elapsed: Duration,
+    retry_remaining: Duration,
+) {
+    CALLGRAPH_READ_RETRY_OBSERVER.with(|slot| {
+        if slot.borrow().is_some() {
+            eprintln!(
+                "locked callgraph read: attempt={attempt_elapsed:?}, retry_remaining={retry_remaining:?}, error={error:?}"
+            );
+        }
+    });
+}
+
 struct CallgraphReadRetryObserverReset;
 
 impl Drop for CallgraphReadRetryObserverReset {
@@ -198,6 +212,7 @@ fn assert_completed_scoped_dead_code_retries_transient_lock(wait_for_completion:
         .unwrap()
         .unwrap();
     let blocker = store.lock_readiness_for_test();
+    let locked_at = Instant::now();
     drop(store);
     assert!(callgraph_store_ready_for_dead_code(graph_dir, root.clone())
         .unwrap_err()
@@ -209,12 +224,19 @@ fn assert_completed_scoped_dead_code_retries_transient_lock(wait_for_completion:
     let observed = Arc::clone(&released);
     CALLGRAPH_READ_RETRY_OBSERVER.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(move || {
+            let release_started = Instant::now();
             blocker.execute_batch("ROLLBACK").unwrap();
+            eprintln!(
+                "callgraph lock released: held={:?}, rollback={:?}",
+                locked_at.elapsed(),
+                release_started.elapsed()
+            );
             observed.store(true, Ordering::SeqCst);
         }));
     });
     let _reset = CallgraphReadRetryObserverReset;
     crate::callgraph_store::take_projection_work();
+    let retry_started = Instant::now();
     let payload = if wait_for_completion {
         completed_scoped_waiter(
             &manager,
@@ -238,7 +260,10 @@ fn assert_completed_scoped_dead_code_retries_transient_lock(wait_for_completion:
     };
     assert_eq!(
         payload, expected,
-        "a short lock must not downgrade a ready graph"
+        "a short lock must not downgrade a ready graph: held={:?}, retry={:?}, released={}",
+        locked_at.elapsed(),
+        retry_started.elapsed(),
+        released.load(Ordering::SeqCst)
     );
     assert!(
         released.load(Ordering::SeqCst),

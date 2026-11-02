@@ -870,7 +870,18 @@ fn retry_dead_code_store_read<T>(
     // give contention the same short grace period as serving-reader queries.
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
-        match read() {
+        #[cfg(test)]
+        let attempt_started = Instant::now();
+        let result = read();
+        #[cfg(test)]
+        if let Err(error) = &result {
+            guard_tests::observe_callgraph_read_error_for_test(
+                error,
+                attempt_started.elapsed(),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        match result {
             Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {
                 #[cfg(test)]
                 guard_tests::notify_callgraph_read_retry_for_test();
