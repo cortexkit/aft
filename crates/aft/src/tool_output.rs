@@ -1,19 +1,23 @@
 //! The final text budget is shared by every transport, not imposed by the host.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::ReadDir;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
 use crate::context::AppContext;
+use crate::file_identity::FileIdentity;
 use crate::protocol::Response;
 
 pub const TEXT_LIMIT: usize = 50 * 1024;
 pub const SAVED_FILE_LIMIT: usize = 64 * 1024 * 1024;
 pub const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
+// Approved by Ufuk as agent-visible wording; keep this trailer byte-identical.
+pub const SAVE_FAILED_TRAILER: &str =
+    "[output cut at 50 KB of <total> KB; the full result could not be saved: <reason>]";
 
 fn harness_root(ctx: &AppContext) -> PathBuf {
     let routed = crate::bash_background::task_storage_dir(ctx);
@@ -26,14 +30,18 @@ fn harness_root(ctx: &AppContext) -> PathBuf {
     }
 }
 
+#[derive(Clone)]
 struct Artifact {
     session: String,
-    file: Mutex<File>,
+    identity: FileIdentity,
 }
 
 #[derive(Default)]
 pub(crate) struct OutputFiles {
     files: Mutex<HashMap<PathBuf, Artifact>>,
+    roots: Mutex<HashMap<PathBuf, PathBuf>>,
+    #[cfg(test)]
+    canonicalizations: std::sync::atomic::AtomicUsize,
 }
 
 /// A deferred subc tool reply can be sent after its AppContext is evicted.
@@ -115,7 +123,7 @@ impl OutputFiles {
         let dir = &scope.directory;
         crate::production_storage::refuse_write(&dir)?;
         crate::private_storage::open_dir(&root, &dir)?;
-        let dir = dir.canonicalize()?;
+        let dir = self.canonicalize(dir)?;
         let mut files = self.files.lock();
         loop {
             let path = dir.join(format!(
@@ -142,14 +150,26 @@ impl OutputFiles {
                 let _ = std::fs::remove_file(&path);
                 return Err(error);
             }
-            let path = crate::access_policy::policy_path(&path);
+            let identity = FileIdentity::of_file(&file);
+            drop(file);
+            if identity == FileIdentity::Unavailable {
+                let _ = std::fs::remove_file(&path);
+                return Err(io::Error::other("tool result file identity unavailable"));
+            }
+            let path = crate::inspect::job::normalize_path(&path);
             files.insert(
                 path.clone(),
                 Artifact {
                     session: scope.session.clone(),
-                    file: Mutex::new(file),
+                    identity,
                 },
             );
+            if let (Some(raw), Some(canonical)) = (scope.directory.parent(), dir.parent()) {
+                self.roots.lock().insert(
+                    raw.to_path_buf(),
+                    crate::inspect::job::normalize_path(canonical),
+                );
+            }
             if let Some(harness) = scope.directory.parent().and_then(Path::parent) {
                 scope.bash.retain_tool_output_store(harness);
             }
@@ -158,7 +178,10 @@ impl OutputFiles {
     }
 
     pub(crate) fn owner(&self, path: &Path) -> Option<String> {
-        let path = crate::access_policy::policy_path(path);
+        if !generated_name(path) {
+            return None;
+        }
+        let path = crate::inspect::job::normalize_path(path);
         self.files
             .lock()
             .get(&path)
@@ -169,78 +192,79 @@ impl OutputFiles {
     /// actor has been evicted. A directory-prefix grant would expose other
     /// private stores or another session's results.
     pub(crate) fn restore(&self, ctx: &AppContext, session: &str, path: &Path) {
-        let Ok(path) = path.canonicalize() else {
+        if !generated_name(path) {
+            return;
+        }
+        if self.owner(path).is_some() {
+            return;
+        }
+        let Ok(path) = self.canonicalize(path) else {
             return;
         };
-        let path = crate::access_policy::policy_path(&path);
+        let path = crate::inspect::job::normalize_path(&path);
         if self.owner(&path).is_some() || !generated_name(&path) {
             return;
         }
         let dir = Self::session_dir(ctx, session);
-        let Some(namespace) = dir.parent() else {
+        let Some(namespace) = self.canonical_root(ctx) else {
             return;
         };
-        let Ok(namespace) = namespace.canonicalize() else {
-            return;
-        };
-        let expected = crate::access_policy::policy_path(&namespace)
-            .join(crate::backup::hash_session(session));
+        let expected = namespace.join(crate::backup::hash_session(session));
         if !std::fs::symlink_metadata(&dir)
             .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
             || path.parent() != Some(expected.as_path())
         {
             return;
         }
-        let reopen = || -> io::Result<File> {
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if !metadata.is_file() || metadata.len() > SAVED_FILE_LIMIT as u64 {
-                return Err(io::Error::other("not a bounded tool result file"));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(io::Error::other("tool result has multiple hard links"));
-                }
-            }
-            let mut options = crate::private_storage::options();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let file = options.open(&path)?;
-            let opened = crate::commands::file_read_exact::opened_location(&file)?;
-            if crate::access_policy::policy_path(&opened) != path || !file.metadata()?.is_file() {
-                return Err(io::Error::other("tool result file was replaced"));
-            }
-            Ok(file)
+        let reopen = || -> io::Result<FileIdentity> {
+            let (metadata, identity) = crate::file_identity::symlink_metadata(&path)?;
+            check_metadata(&metadata)?;
+            let file = open_verified(&path, identity)?;
+            drop(file);
+            Ok(identity)
         };
-        if let Ok(file) = reopen() {
+        if let Ok(identity) = reopen() {
             self.files.lock().entry(path).or_insert_with(|| Artifact {
                 session: session.to_owned(),
-                file: Mutex::new(file),
+                identity,
             });
         }
     }
 
     pub(crate) fn is_result_path(&self, ctx: &AppContext, path: &Path) -> bool {
-        let Some(root) = Self::session_dir(ctx, "").parent().map(Path::to_path_buf) else {
+        if !generated_name(path) {
+            return false;
+        }
+        let Some(root) = self.canonical_root(ctx) else {
             return false;
         };
-        let Ok(root) = root.canonicalize() else {
-            return false;
-        };
-        let path = crate::access_policy::policy_path(path);
-        path.strip_prefix(crate::access_policy::policy_path(&root))
-            .is_ok_and(|relative| relative.components().count() == 2 && generated_name(&path))
+        path.strip_prefix(root)
+            .is_ok_and(|relative| relative.components().count() == 2)
+    }
+
+    fn canonical_root(&self, ctx: &AppContext) -> Option<PathBuf> {
+        let root = harness_root(ctx).join("tool-results");
+        let mut roots = self.roots.lock();
+        if let Some(canonical) = roots.get(&root) {
+            return Some(canonical.clone());
+        }
+        let canonical = crate::inspect::job::normalize_path(&self.canonicalize(&root).ok()?);
+        roots.insert(root, canonical.clone());
+        Some(canonical)
+    }
+
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        #[cfg(test)]
+        self.canonicalizations.fetch_add(1, Ordering::Relaxed);
+        path.canonicalize()
     }
 
     pub(crate) fn read(&self, session: &str, path: &Path) -> Option<io::Result<Vec<u8>>> {
-        let path = crate::access_policy::policy_path(path);
-        let files = self.files.lock();
-        let artifact = files.get(&path)?;
+        if !generated_name(path) {
+            return None;
+        }
+        let path = crate::inspect::job::normalize_path(path);
+        let artifact = self.files.lock().get(&path)?.clone();
         Some((|| {
             if artifact.session != session {
                 return Err(io::Error::new(
@@ -248,15 +272,7 @@ impl OutputFiles {
                     "tool result belongs to another session",
                 ));
             }
-            let mut file = artifact.file.lock();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if file.metadata()?.nlink() != 1 {
-                    return Err(io::Error::other("tool result has multiple hard links"));
-                }
-            }
-            file.seek(SeekFrom::Start(0))?;
+            let mut file = open_verified(&path, artifact.identity)?;
             let mut bytes = Vec::new();
             (&mut *file)
                 .take(SAVED_FILE_LIMIT as u64 + 1)
@@ -267,37 +283,45 @@ impl OutputFiles {
             Ok(bytes)
         })())
     }
+}
 
-    pub(crate) fn cleanup_session(&self, ctx: &AppContext, session: &str) {
-        let mut files = self.files.lock();
-        let paths: Vec<_> = files
-            .iter()
-            .filter(|(_, artifact)| artifact.session == session)
-            .map(|(path, _)| path.clone())
-            .collect();
-        for path in paths {
-            // Windows requires the reader handle to close before unlinking.
-            drop(files.remove(&path));
-            let _ = std::fs::remove_file(&path);
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::remove_dir(dir);
-            }
-        }
-        let dir = Self::session_dir(ctx, session);
-        if std::fs::symlink_metadata(&dir)
-            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
-        {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if generated_name(&path) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-            }
-            let _ = std::fs::remove_dir(dir);
+fn check_metadata(metadata: &std::fs::Metadata) -> io::Result<()> {
+    if !metadata.is_file() || metadata.len() > SAVED_FILE_LIMIT as u64 {
+        return Err(io::Error::other("not a bounded tool result file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::other("tool result has multiple hard links"));
         }
     }
+    Ok(())
+}
+
+fn open_verified(
+    path: &Path,
+    identity: FileIdentity,
+) -> io::Result<crate::commands::file_read_exact::OpenedFile> {
+    if identity == FileIdentity::Unavailable {
+        return Err(io::Error::other("tool result file identity unavailable"));
+    }
+    let root = path
+        .parent()
+        .ok_or_else(|| io::Error::other("tool result has no parent"))?;
+    // Walk with O_NOFOLLOW on Unix; on Windows open reparse points without
+    // following them. Verify the actual handle before reading any bytes.
+    let file = crate::commands::file_read_exact::open_no_follow(root, path)
+        .map_err(|error| io::Error::other(format!("tool result open refused: {error:?}")))?;
+    check_metadata(&file.metadata()?)?;
+    if FileIdentity::of_file(&file) != identity
+        || crate::inspect::job::normalize_path(&crate::commands::file_read_exact::opened_location(
+            &file,
+        )?) != path
+    {
+        return Err(io::Error::other("tool result file was replaced"));
+    }
+    Ok(file)
 }
 
 fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
@@ -306,11 +330,56 @@ fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
     STORES.get_or_init(Default::default)
 }
 
-/// The task-artifact watchdog calls this with the same retention window as
-/// finished shell output. Disk scanning also removes files left by a restart.
-pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) {
+/// Counts the directory entries and filesystem work examined in one GC pass.
+#[derive(Debug, Default)]
+pub(crate) struct CleanupReport {
+    pub session_entries: usize,
+    pub file_entries: usize,
+    pub removed: usize,
+    pub errors: usize,
+    pub steps: usize,
+    pub complete: bool,
+}
+
+struct CleanupCursor {
+    sessions: ReadDir,
+    files: Option<(PathBuf, ReadDir)>,
+}
+
+/// The task-artifact watchdog uses the same retention window as finished shell
+/// output. The cursor resumes on the next bounded pass, including after eviction.
+pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) -> CleanupReport {
     const SCAN_ENTRIES: usize = 256;
     let root = crate::access_policy::policy_path(&harness.join("tool-results"));
+    static CURSORS: std::sync::OnceLock<Mutex<HashMap<PathBuf, CleanupCursor>>> =
+        std::sync::OnceLock::new();
+    let mut cursors = CURSORS.get_or_init(Default::default).lock();
+    if !cursors.contains_key(&root) {
+        match std::fs::read_dir(&root) {
+            Ok(sessions) => {
+                cursors.insert(
+                    root.clone(),
+                    CleanupCursor {
+                        sessions,
+                        files: None,
+                    },
+                );
+            }
+            Err(error) => {
+                let report = CleanupReport {
+                    errors: usize::from(error.kind() != io::ErrorKind::NotFound),
+                    complete: true,
+                    ..Default::default()
+                };
+                log::debug!(
+                    "tool result cleanup root={} examined={report:?}",
+                    root.display()
+                );
+                return report;
+            }
+        }
+    }
+    let cursor = cursors.get_mut(&root).expect("output cleanup cursor");
     let expired = |path: &Path| {
         std::fs::symlink_metadata(path)
             .ok()
@@ -319,45 +388,81 @@ pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) {
             .and_then(|time| time.elapsed().ok())
             .is_some_and(|age| age >= retention)
     };
-    let live = {
-        let mut stores = stores().lock();
-        let live: Vec<_> = stores.iter().filter_map(std::sync::Weak::upgrade).collect();
-        stores.retain(|store| store.strong_count() > 0);
-        live
-    };
-    let mut remove = Vec::new();
-    for store in live {
-        let mut files = store.files.lock();
-        let paths: Vec<_> = files
-            .keys()
-            .filter(|path| path.starts_with(&root) && expired(path))
-            .cloned()
-            .collect();
-        for path in paths {
-            drop(files.remove(&path));
-            remove.push(path);
-        }
-    }
-    // Close every context's reader handle before unlinking on Windows.
-    for path in remove {
-        let _ = std::fs::remove_file(path);
-    }
-    let Ok(sessions) = std::fs::read_dir(&root) else {
-        return;
-    };
-    for session in sessions.flatten().take(SCAN_ENTRIES) {
-        if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        if let Ok(files) = std::fs::read_dir(session.path()) {
-            for file in files.flatten().take(SCAN_ENTRIES) {
-                if generated_name(&file.path()) && expired(&file.path()) {
-                    let _ = std::fs::remove_file(file.path());
+    let mut report = CleanupReport::default();
+    let mut removed = Vec::new();
+    // Retain the two directory iterators across passes. A fresh iterator would
+    // revisit unexpired entries forever and starve later sessions or files.
+    for _ in 0..SCAN_ENTRIES {
+        report.steps += 1;
+        if let Some((_, files)) = &mut cursor.files {
+            match files.next() {
+                Some(Ok(file)) => {
+                    report.file_entries += 1;
+                    let path = file.path();
+                    if generated_name(&path) && expired(&path) {
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {
+                                report.removed += 1;
+                                removed.push(path);
+                            }
+                            Err(_) => report.errors += 1,
+                        }
+                    }
+                }
+                Some(Err(_)) => {
+                    report.file_entries += 1;
+                    report.errors += 1;
+                }
+                None => {
+                    let (session, entries) = cursor.files.take().unwrap();
+                    drop(entries);
+                    let _ = std::fs::remove_dir(session);
+                }
+            }
+        } else {
+            match cursor.sessions.next() {
+                Some(Ok(session)) => {
+                    report.session_entries += 1;
+                    if session.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        match std::fs::read_dir(session.path()) {
+                            Ok(files) => cursor.files = Some((session.path(), files)),
+                            Err(_) => report.errors += 1,
+                        }
+                    }
+                }
+                Some(Err(_)) => {
+                    report.session_entries += 1;
+                    report.errors += 1;
+                }
+                None => {
+                    report.complete = true;
+                    break;
                 }
             }
         }
-        let _ = std::fs::remove_dir(session.path());
     }
+    if report.complete {
+        cursors.remove(&root);
+    }
+    drop(cursors);
+    if !removed.is_empty() {
+        let mut stores = stores().lock();
+        stores.retain(|store| {
+            let Some(store) = store.upgrade() else {
+                return false;
+            };
+            let mut files = store.files.lock();
+            for path in &removed {
+                files.remove(path);
+            }
+            true
+        });
+    }
+    log::debug!(
+        "tool result cleanup root={} examined={report:?}",
+        root.display()
+    );
+    report
 }
 
 fn generated_name(path: &Path) -> bool {
@@ -365,11 +470,16 @@ fn generated_name(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_suffix(".txt"))
         .is_some_and(|name| {
-            let pieces: Vec<_> = name.split('-').collect();
-            pieces.len() == 3
-                && pieces.iter().all(|piece| {
-                    !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
-                })
+            let mut pieces = name.split('-');
+            for _ in 0..3 {
+                let Some(piece) = pieces.next() else {
+                    return false;
+                };
+                if piece.is_empty() || !piece.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return false;
+                }
+            }
+            pieces.next().is_none()
         })
 }
 
@@ -416,10 +526,7 @@ pub(crate) fn cap_with_scope(
                 "could not save {tool} result for {}: {error}",
                 scope.session
             );
-            *text = format!(
-                "Tool result unavailable: could not save the full {total}-byte result: {error}"
-            );
-            return;
+            save_failed_trailer(total, &error.to_string())
         }
     };
     // A list's pagination contract remains visible even if its rows exceed
@@ -443,6 +550,16 @@ pub(crate) fn cap_with_scope(
     }
 }
 
+fn save_failed_trailer(total: usize, reason: &str) -> String {
+    // An error may contain an oversized path. Reserve almost all of the budget
+    // for useful tool text, and keep the recovery notice on one line.
+    let reason = reason.replace(['\r', '\n'], " ");
+    let end = reason.floor_char_boundary(reason.len().min(1024));
+    SAVE_FAILED_TRAILER
+        .replace("<total>", &format!("{:.1}", total as f64 / 1024.0))
+        .replace("<reason>", &reason[..end])
+}
+
 fn render_cut(text: &mut String, trailer: &str, envelope: &str) {
     let envelope_bytes = if envelope.is_empty() {
         0
@@ -454,7 +571,9 @@ fn render_cut(text: &mut String, trailer: &str, envelope: &str) {
         end -= 1;
     }
     if let Some(newline) = text[..end].rfind('\n') {
-        end = newline;
+        if newline >= end * 3 / 4 {
+            end = newline;
+        }
     }
     text.truncate(end);
     if !envelope.is_empty() {
@@ -678,10 +797,8 @@ mod tests {
                 .validate_read_path("read-cap", "foreign", &path)
                 .is_err());
         });
-        ctx.output_files().cleanup_session(&ctx, "foreign");
-        assert!(path.exists());
         drop(restored);
-        ctx.output_files().cleanup_session(&ctx, "owner");
+        cleanup_expired(&ctx.harness_dir(), std::time::Duration::ZERO);
         assert!(!path.exists());
     }
 
@@ -698,7 +815,15 @@ mod tests {
             &mut text,
         );
         assert!(text.len() <= TEXT_LIMIT);
-        assert!(text.contains("64 MiB saved-file limit"));
+        assert_eq!(
+            SAVE_FAILED_TRAILER,
+            "[output cut at 50 KB of <total> KB; the full result could not be saved: <reason>]"
+        );
+        assert!(
+            text.starts_with(&"x".repeat(38_000)),
+            "save failure must retain useful output"
+        );
+        assert!(text.ends_with("[output cut at 50 KB of 65536.0 KB; the full result could not be saved: full tool result exceeds the 64 MiB saved-file limit]"));
         assert!(!text.contains("full result saved"));
         assert!(ctx.output_files().files.lock().is_empty());
     }
@@ -716,11 +841,161 @@ mod tests {
             &mut text,
         );
         let path = saved_path(&text);
-        let normalized = text.replace(&path.display().to_string(), "<path>");
+        let (prefix, trailer) = text.rsplit_once("\n[output cut").unwrap();
+        let long_line = prefix.strip_prefix("header\n").unwrap();
+        assert!(long_line.len() >= 38_000);
+        assert!(long_line.bytes().all(|byte| byte == b'x'));
+        let normalized = format!("header\n<long-line prefix>\n[output cut{trailer}")
+            .replace(&path.display().to_string(), "<path>");
         assert_eq!(
             normalized,
             include_str!("../tests/fixtures/tool-result-cap.txt").trim_end()
         );
+    }
+
+    #[test]
+    fn tool_output_cap_header_and_two_megabyte_line_keep_useful_utf8_prefix() {
+        let original = format!("header\n{}", "界".repeat(700_000));
+        let mut text = original.clone();
+        render_cut(&mut text, "[trailer]", "");
+        let prefix = text.strip_suffix("\n[trailer]").unwrap();
+        assert!(prefix.len() >= 38_400 && prefix.len() <= 51_200);
+        assert!(original.starts_with(prefix));
+        assert!(!prefix.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn tool_output_cap_read_access_fast_paths_do_not_canonicalize_ordinary_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let files = ctx.output_files();
+        let ordinary = temp.path().join("ordinary.txt");
+        files.restore(&ctx, "owner", &ordinary);
+        assert!(!files.is_result_path(&ctx, &ordinary));
+        assert!(files.owner(&ordinary).is_none());
+        assert!(files.read("owner", &ordinary).is_none());
+        assert_eq!(files.canonicalizations.load(Ordering::Relaxed), 0);
+        let mut text = "row\n".repeat(20_000);
+        cap(
+            &ctx,
+            "owner",
+            "zoom",
+            &Response::success("id", json!({})),
+            &mut text,
+        );
+        let path = saved_path(&text);
+        let before = files.canonicalizations.load(Ordering::Relaxed);
+        for _ in 0..50 {
+            files.restore(&ctx, "owner", &path);
+            assert!(files.is_result_path(&ctx, &path));
+            assert_eq!(files.owner(&path).as_deref(), Some("owner"));
+        }
+        assert_eq!(files.canonicalizations.load(Ordering::Relaxed), before);
+        let restored = context(temp.path(), &temp.path().join("store"));
+        assert!(restored.output_files().is_result_path(&restored, &path));
+        let before = restored
+            .output_files()
+            .canonicalizations
+            .load(Ordering::Relaxed);
+        assert!(before > 0, "a new context must resolve its root once");
+        for _ in 0..50 {
+            assert!(restored.output_files().is_result_path(&restored, &path));
+        }
+        assert_eq!(
+            restored
+                .output_files()
+                .canonicalizations
+                .load(Ordering::Relaxed),
+            before
+        );
+    }
+
+    #[test]
+    fn tool_output_cap_read_rejects_replacement_with_identical_size_and_times() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let original = "x".repeat(60_000);
+        let mut text = original.clone();
+        cap(
+            &ctx,
+            "owner",
+            "zoom",
+            &Response::success("id", json!({})),
+            &mut text,
+        );
+        let path = saved_path(&text);
+        assert_eq!(
+            ctx.output_files().read("owner", &path).unwrap().unwrap(),
+            original.as_bytes()
+        );
+        crate::file_identity::replace_keeping_times(&path, &vec![b'y'; original.len()]);
+        ctx.output_files().restore(&ctx, "owner", &path);
+        assert!(ctx.output_files().read("owner", &path).unwrap().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tool_output_cap_read_refuses_symlink_and_hardlink_replacements() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let mut text = "x".repeat(60_000);
+        cap(
+            &ctx,
+            "owner",
+            "zoom",
+            &Response::success("id", json!({})),
+            &mut text,
+        );
+        let path = saved_path(&text);
+        let renamed = path.with_extension("original");
+        std::fs::rename(&path, &renamed).unwrap();
+        std::os::unix::fs::symlink(&renamed, &path).unwrap();
+        assert!(ctx.output_files().read("owner", &path).unwrap().is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&renamed, &path).unwrap();
+        assert!(ctx.output_files().read("owner", &path).unwrap().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tool_output_cap_saved_results_do_not_hold_file_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let mut paths = Vec::new();
+        for _ in 0..20 {
+            let mut text = "row\n".repeat(20_000);
+            cap(
+                &ctx,
+                "owner",
+                "zoom",
+                &Response::success("id", json!({})),
+                &mut text,
+            );
+            paths.push(saved_path(&text));
+        }
+        let descriptors: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|target| paths.contains(target))
+            .collect();
+        assert!(
+            descriptors.is_empty(),
+            "saved files still open: {descriptors:?}"
+        );
+        for path in paths {
+            assert!(ctx.output_files().read("owner", &path).unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_save_failure_bounds_oversized_reason_without_losing_body() {
+        let trailer = save_failed_trailer(70_000, &format!("{}\nreason", "界".repeat(30_000)));
+        let mut text = "body\n".repeat(20_000);
+        render_cut(&mut text, &trailer, "");
+        assert!(text.len() <= 51_200);
+        assert!(text.starts_with(&"body\n".repeat(7500)));
+        assert_eq!(text.lines().last().unwrap(), trailer);
     }
 
     #[test]
@@ -753,6 +1028,82 @@ mod tests {
         cleanup_expired(&ctx.harness_dir(), std::time::Duration::ZERO);
         assert!(!path.exists() && !persisted.exists());
         assert!(ctx.output_files().owner(&path).is_none());
+    }
+
+    fn make_expired(path: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+    }
+
+    fn finish_cleanup(harness: &Path) -> (usize, usize, usize) {
+        let mut sessions = 0;
+        let mut files = 0;
+        let mut removed = 0;
+        for _ in 0..20 {
+            let report = cleanup_expired(harness, std::time::Duration::from_secs(3600));
+            assert!(report.steps <= 256, "{report:?}");
+            assert!(
+                report.session_entries + report.file_entries <= report.steps,
+                "{report:?}"
+            );
+            assert_eq!(report.errors, 0, "{report:?}");
+            sessions += report.session_entries;
+            files += report.file_entries;
+            removed += report.removed;
+            if report.complete {
+                return (sessions, files, removed);
+            }
+        }
+        panic!("bounded cleanup cursor never completed");
+    }
+
+    #[test]
+    fn tool_output_cap_retention_progresses_past_256_unexpired_session_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut old = Vec::new();
+        let mut fresh = Vec::new();
+        for i in 0..300 {
+            let dir = temp
+                .path()
+                .join("tool-results")
+                .join(format!("session-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let expired = dir.join("1-1-1.txt");
+            let current = dir.join("1-1-2.txt");
+            std::fs::write(&expired, "old").unwrap();
+            std::fs::write(&current, "fresh").unwrap();
+            make_expired(&expired);
+            old.push(expired);
+            fresh.push(current);
+        }
+        assert_eq!(finish_cleanup(temp.path()), (300, 600, 300));
+        assert!(old.iter().all(|path| !path.exists()));
+        assert!(fresh.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn tool_output_cap_retention_progresses_past_256_unexpired_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("tool-results").join("session");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut old = Vec::new();
+        let mut fresh = Vec::new();
+        for i in 0..350 {
+            let expired = dir.join(format!("1-1-{}.txt", i * 2));
+            let current = dir.join(format!("1-1-{}.txt", i * 2 + 1));
+            std::fs::write(&expired, "old").unwrap();
+            std::fs::write(&current, "fresh").unwrap();
+            make_expired(&expired);
+            old.push(expired);
+            fresh.push(current);
+        }
+        assert_eq!(finish_cleanup(temp.path()), (1, 700, 350));
+        assert!(old.iter().all(|path| !path.exists()));
+        assert!(fresh.iter().all(|path| path.exists()));
     }
 
     #[test]

@@ -8511,7 +8511,6 @@ impl AppContext {
         let ctx = Arc::clone(self);
         std::thread::spawn(move || {
             ctx.backup.lock().release_session_memory(&session);
-            ctx.output_files.cleanup_session(&ctx, &session);
         })
     }
 
