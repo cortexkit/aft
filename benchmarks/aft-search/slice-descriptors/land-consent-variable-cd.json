@@ -3,7 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/src/bash_permissions/scan.rs"
+    "harness-goldens"
   ],
   "slices": [
     "land-consent-variable-cd"
