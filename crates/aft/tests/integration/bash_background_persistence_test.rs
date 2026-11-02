@@ -32,8 +32,13 @@ fn spawn_storage_dir(name: &str) -> tempfile::TempDir {
     dir
 }
 
-fn configure_background(aft: &mut AftProcess, project: &Path, storage: &Path, session: &str) {
-    configure_background_for_harness(aft, project, storage, session, "opencode");
+fn configure_background(
+    aft: &mut AftProcess,
+    project: &Path,
+    storage: &Path,
+    session: &str,
+) -> Value {
+    configure_background_for_harness(aft, project, storage, session, "opencode")
 }
 
 fn configure_background_for_harness(
@@ -42,7 +47,7 @@ fn configure_background_for_harness(
     storage: &Path,
     session: &str,
     harness: &str,
-) {
+) -> Value {
     let response = aft.send(
         &json!({
             "id": format!("cfg-{session}"),
@@ -59,6 +64,7 @@ fn configure_background_for_harness(
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
+    response
 }
 
 fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, session: &str) {
@@ -317,7 +323,10 @@ fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
     let project = crate::test_helpers::project::project_tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
-    configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    let configured = configure_background(&mut aft, project.path(), storage.path(), SESSION);
+    if configured["warnings_pending"] == true {
+        aft.merge_configure_warnings(configured);
+    }
     let forensics = TaskForensics {
         storage: storage.path(),
         spawned_at: Instant::now(),
