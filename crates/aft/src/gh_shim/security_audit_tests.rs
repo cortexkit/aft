@@ -207,7 +207,6 @@ fn audit_v19_full_audit_status_matches_legacy_bytes_even_with_a_lookup_record() 
     )
     .unwrap();
     // The historical capture predates the summary default; --audit retains its schema.
-    fs::write(&fixture.paths.bypass_audit, "").unwrap();
     let rendered = render_self_report(&fixture.paths, true).unwrap();
     let captured = include_str!("../../tests/fixtures/gh_shim/v19-main-status.jsonc");
     let (_, expected) = captured.split_once("// END HEADER\n").unwrap();

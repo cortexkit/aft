@@ -16,9 +16,11 @@ The summary streams the JSONL file and retains only those 10 entries in memory.
 
 Use `gh --status --audit` to print the full list in the original `bypass_audit`
 field instead of the count and recent entries. Both forms preserve each audit
-entry's fields. If the audit file is missing, unreadable or corrupt,
-`bypass_audit_error` describes the failure and the corresponding audit fields
-are `null`, not a zero count or an empty list. A readable empty file has count 0.
+entry's fields. A missing audit file means no bypasses have been recorded yet,
+just like a readable empty file: the default reports count 0 and recent `[]`,
+and `--audit` reports `bypass_audit: []`, with no error. If the audit file is
+unreadable or corrupt, `bypass_audit_error` describes the failure and the
+corresponding audit fields are `null`, not a zero count or an empty list.
 
 ## Authority classes
 

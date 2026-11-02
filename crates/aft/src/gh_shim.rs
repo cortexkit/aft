@@ -8136,7 +8136,12 @@ fn summarize_bypass_audit(paths: &StatePaths) -> Result<(usize, VecDeque<Value>)
 
 fn visit_bypass_audit(paths: &StatePaths, mut visit: impl FnMut(Value)) -> Result<(), String> {
     let unavailable = |error| format!("bypass audit is unavailable: {error}");
-    let file = fs::File::open(&paths.bypass_audit).map_err(unavailable)?;
+    let file = match fs::File::open(&paths.bypass_audit) {
+        Ok(file) => file,
+        // The audit file is created on the first bypass, so absence means no entries yet.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unavailable(error)),
+    };
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(unavailable)?;
         let record = serde_json::from_str(&line).map_err(|error| {
@@ -9037,10 +9042,24 @@ mod tests {
     }
 
     #[test]
-    fn status_missing_bypass_audit_reports_an_error_instead_of_zero() {
+    fn status_missing_bypass_audit_is_empty_in_both_modes() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        assert_status_audit_error(&paths, "bypass audit is unavailable: ");
+        assert!(!paths.bypass_audit.exists());
+        for full_audit in [false, true] {
+            let report: Value =
+                serde_json::from_str(&render_self_report(&paths, full_audit).unwrap()).unwrap();
+            assert!(report["bypass_audit_error"].is_null());
+            if full_audit {
+                assert_eq!(report["bypass_audit"], json!([]));
+                assert!(report.get("bypass_audit_count").is_none());
+                assert!(report.get("bypass_audit_recent").is_none());
+            } else {
+                assert_eq!(report["bypass_audit_count"], 0);
+                assert_eq!(report["bypass_audit_recent"], json!([]));
+                assert!(report.get("bypass_audit").is_none());
+            }
+        }
     }
 
     #[test]
