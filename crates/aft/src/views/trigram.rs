@@ -1817,6 +1817,10 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
 }
 
 #[cfg(test)]
+#[path = "trigram/rebind_tests.rs"]
+mod rebind_tests;
+
+#[cfg(test)]
 mod tests {
     struct FixedSource(Snapshot);
     impl LexicalSnapshotSource for FixedSource {
