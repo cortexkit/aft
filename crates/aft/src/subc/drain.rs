@@ -762,6 +762,29 @@ pub(super) fn module_draining_response(request_id: &str, what: &str) -> Response
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_keepalive_bash_stops_at_cancel_reply_claim_and_id_reuse() {
+        use crate::run_tool_call::progress::Progress;
+        let calls = super::HeldBashCalls::default();
+        let route = super::RouteChannel {
+            channel: 7,
+            epoch: 3,
+        };
+        let old = Progress::new(|_| true);
+        let claim = calls.insert(route, 1);
+        calls.record_keepalive(route, 1, &old);
+        assert!(calls.try_keepalive(route, 1, old.key(), || true));
+        assert!(claim.try_claim_for_wait_task());
+        assert!(!calls.try_keepalive(route, 1, old.key(), || panic!("push after reply claim")));
+        let new = Progress::new(|_| true);
+        calls.insert(route, 1);
+        calls.record_keepalive(route, 1, &new);
+        assert!(!calls.try_keepalive(route, 1, old.key(), || panic!("stale channel")));
+        assert!(calls.try_keepalive(route, 1, new.key(), || true));
+        assert!(calls.request_cancel(route, 1));
+        assert!(!calls.try_keepalive(route, 1, new.key(), || panic!("push after cancel")));
+    }
+
     use super::*;
 
     #[test]

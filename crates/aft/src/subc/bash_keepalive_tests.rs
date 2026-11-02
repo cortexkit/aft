@@ -180,16 +180,19 @@ async fn bash_keepalive_stalled_state_observation_goes_silent() {
 
 #[tokio::test]
 async fn bash_keepalive_does_not_extend_command_timeout() {
+    let started = Instant::now();
     let mut h = WaitHarness::start(1_500, Duration::from_secs(15)).await;
     for at in [30_000, 60_000, 90_000] {
         h.tick(at).await;
     }
     let response = h.result().await;
     assert_eq!(response.data["status"], "timed_out", "{response:?}");
+    assert!(started.elapsed() < Duration::from_secs(4));
 }
 
 #[tokio::test]
 async fn bash_keepalive_does_not_extend_reply_deadline() {
+    let started = Instant::now();
     let mut h = WaitHarness::start(30_000, Duration::from_secs(3)).await;
     for at in [30_000, 60_000, 90_000] {
         h.tick(at).await;
@@ -197,6 +200,7 @@ async fn bash_keepalive_does_not_extend_reply_deadline() {
     let response = h.result().await;
     assert_eq!(response.data["task_id"], h.task_id, "{response:?}");
     assert_eq!(response.data["status"], "running", "{response:?}");
+    assert!(started.elapsed() < Duration::from_secs(4));
     h.clock.now.store(120_000, Ordering::SeqCst);
     h.quiet().await;
 }

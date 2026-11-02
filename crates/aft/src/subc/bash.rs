@@ -1541,6 +1541,8 @@ async fn await_runon_launch_reply(
                     return Some(with_capture_warning(response));
                 }
                 Ok(Ok(None)) if Instant::now() < deadline => {
+                    // tool-provider CONTRACT.md §4.4: a completed pending-state
+                    // read proves the local supervisor of the remote job is live.
                     if let Some(progress) = &cancel.keepalive {
                         progress.report();
                     }
@@ -3507,6 +3509,14 @@ async fn run_deferred_bash_wait(
                 .await
             } => {
                 let DeferredWaitObservation { target_finished, detach_pending, remote_handback_due } = observation;
+                if !target_finished {
+                    // tool-provider CONTRACT.md §4.4: supervising a child is
+                    // work even when it is silent. Report only after the state
+                    // read returns, never from a timer beside a stalled wait.
+                    if let Some(progress) = &cancel.keepalive {
+                        progress.report();
+                    }
+                }
                 let promotion_due = !block_to_completion && Instant::now() >= deadline;
                 // While the module drains, every foreground wait (wait:true,
                 // block_to_completion, or a plain wait window) is detached into
@@ -6875,6 +6885,54 @@ mod grant_path_tests {
         assert!(done.result.is_none(), "module loop owns the only reply");
         assert!(writer_rx.try_recv().is_err(), "one terminal reply per call");
         daemon.acceptance_gate.notify_one();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_keepalive_runon_local_capture_wait_observes_quiet_remote_job() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, _ctx) =
+            capture_fixture(Script::GatedAcceptanceThenExit).await;
+        let clock = Arc::new(AtomicU64::new(0));
+        let origin = Instant::now();
+        let (pushes, mut received) = mpsc::unbounded_channel();
+        let progress = crate::run_tool_call::progress::Progress::with_clock(
+            {
+                let clock = clock.clone();
+                move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))
+            },
+            move |_| pushes.send(()).is_ok(),
+        );
+        let cancel = BashWaitCancel {
+            keepalive: Some(progress),
+            ..capture_cancel()
+        };
+        let mut done = deadline_test_call_controlled(
+            &executor,
+            &root,
+            remote_runon_stub,
+            json!({"command":"uname -s", "runon":"linux", "wait":true, "timeout":30_000}),
+            Instant::now(),
+            false,
+            false,
+            Arc::new(DispatchPathMetrics::new()),
+            cancel,
+        );
+        daemon.wait_for_requests("exec.run", 1).await;
+        for at in [30_000, 60_000, 90_000, 120_000] {
+            clock.store(at, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(5), received.recv())
+                .await
+                .expect("remote pending-state observation keeps the local call alive")
+                .unwrap();
+        }
+        assert!(done.try_recv().is_err());
+        daemon.acceptance_gate.notify_one();
+        let completed = tokio::time::timeout(Duration::from_secs(10), done.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.response_for_test().data["exit_code"], 0);
     }
 
     #[cfg(unix)]

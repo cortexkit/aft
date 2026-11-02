@@ -130,6 +130,7 @@ fn bash_watch_keepalive_stalled_state_read_goes_silent() {
 
 #[test]
 fn bash_watch_keepalive_does_not_extend_reply_deadline() {
+    let started = Instant::now();
     let mut h = QuietWatch::start(Duration::from_secs(2));
     for at in [30_000, 60_000, 90_000] {
         h.tick(at);
@@ -137,6 +138,7 @@ fn bash_watch_keepalive_does_not_extend_reply_deadline() {
     let response = h.result();
     assert_eq!(response.data["status"], "running", "{response:?}");
     assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[test]

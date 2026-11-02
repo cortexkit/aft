@@ -248,6 +248,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Phase 1 — parallel compute. Each worker reads, parses, computes edits,
     // and produces the new content. No mutation of shared state, no ctx access.
+    let progress = crate::executor::current_job_cancellation();
     let outcomes: Vec<Result<Option<FileChange>, (PathBuf, String)>> = scope
         .files
         .par_iter()
@@ -286,6 +287,13 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 replacement_count,
                 observation,
             }))
+        })
+        .inspect(|outcome| {
+            if outcome.is_ok() {
+                if let Some(progress) = &progress {
+                    progress.report_progress();
+                }
+            }
         })
         .collect();
 
@@ -406,6 +414,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
             changes_to_apply.push((change, validated_path, backup_id));
         }
+        crate::run_tool_call::progress::report();
     }
 
     if !invalid_rewrites.is_empty() {
@@ -494,6 +503,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                         Some(validated_path.as_path()),
                     );
                     file_results.push(entry);
+                    crate::run_tool_call::progress::report();
                 }
                 Err(e) => {
                     let rollback_error = rollback_written_changes(
