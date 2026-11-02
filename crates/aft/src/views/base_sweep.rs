@@ -405,7 +405,7 @@ fn sweep_inner(
         .iter()
         .filter(|member| member.kind == KIND_BASE && member.state == STATE_EVICTING)
     {
-        finish_base_reclaim(registry, member)?;
+        finish_base_reclaim(registry, &member.scope, &member.view_dir)?;
         report.reclaimed_bases.push(member.scope.clone());
     }
 
@@ -771,7 +771,7 @@ fn count_or_reclaim(
         Step::Reclaim => {
             remove_pointer(&member.view_dir)?;
             boundary(observer, DurabilityStep::BaseReclaimBegun)?;
-            finish_base_reclaim(registry, member)?;
+            finish_base_reclaim(registry, &member.scope, &member.view_dir)?;
             report.reclaimed_bases.push(member.scope.clone());
         }
     }
@@ -793,11 +793,15 @@ fn remove_pointer(view_dir: &Path) -> Result<()> {
 
 /// Removes an `evicting` base: pointer, directory, then its rows and member
 /// row in one transaction. Safe to repeat after a crash.
-fn finish_base_reclaim(registry: &mut RegistryWriter<'_>, member: &Member) -> Result<()> {
-    remove_pointer(&member.view_dir)?;
-    super::registry::remove_view_dir(&member.view_dir)?;
+pub(crate) fn finish_base_reclaim(
+    registry: &mut RegistryWriter<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> Result<()> {
+    remove_pointer(view_dir)?;
+    super::registry::remove_view_dir(view_dir)?;
     barrier(registry, |tx| {
-        delete_base_rows(tx, &member.scope)?;
+        delete_base_rows(tx, scope)?;
         Ok(())
     })
 }
