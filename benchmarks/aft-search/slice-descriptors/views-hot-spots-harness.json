@@ -1,0 +1,10 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "benchmarks/aft-search/test_run_real_query.py",
+    "benchmarks/aft-search/test_harness_integrity.py"
+  ],
+  "note": "Views readiness requires a genuine complete public search reply with all lanes ready and no coverage gaps. Views-on clients get isolated HOME/XDG roots whose default AFT store equals configure.storage_dir, without AFT_STORAGE_DIR. Views-off setup, scored requests, replies, scoring and row parity are unchanged; views-off scored output must remain byte-identical to the prior harness."
+}

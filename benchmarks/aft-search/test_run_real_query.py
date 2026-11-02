@@ -23,6 +23,7 @@ from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
 import bench_rerank
 from run_real_query import ROOT, NdjsonClient, assemble_score, attach_pinned_git_metadata, load_capability, load_inputs, parser as real_query_parser, score_manifest_rows, probe_pattern_capability
+from run_real_query import building_views_lexical_ready, full_views_coverage, make_readiness_request
 from search_quality_lib import (
     D_0,
     EVIDENCE_SHA,
@@ -457,28 +458,95 @@ class ViewsOptionTests(unittest.TestCase):
             },
         )
 
-    def test_wait_ready_waits_for_pinned_quiescent_views_without_sleeping(self) -> None:
+    @staticmethod
+    def full_reply() -> dict[str, Any]:
+        return {
+            "success": True, "status": "ready", "semantic_status": "ready", "complete": True,
+            "results": [{"file": "known.rs"}], "omitted_lanes": [],
+            "lanes": {"trigram": {"status": "ready"}, "semantic": {"status": "ready"}},
+        }
+
+    def test_wait_ready_requires_a_complete_public_reply_not_resident_status(self) -> None:
         client = object.__new__(NdjsonClient)
         client.views_enabled = True
-        statuses = [
-            {
-                "search_index": {"status": "ready"},
-                "semantic_index": {"status": "ready"},
-                "views": {"pinned": True, "pending_paths": 4, "failed_paths": 0},
-            },
-            {
-                "search_index": {"status": "ready"},
-                "semantic_index": {"status": "ready"},
-                "views": {"pinned": True, "pending_paths": 0, "failed_paths": 0},
-            },
-        ]
+        resident = {"search_index": {"status": "ready"}, "semantic_index": {"status": "ready"}, "views": None}
+        pending = {**self.full_reply(), "complete": False, "semantic_gap": {"pending": ["known.rs"]}}
+        request = {"query": "known", "topK": 50, "includeTests": True}
         with (
-            mock.patch.object(client, "call", side_effect=statuses) as call,
-            mock.patch("run_real_query.time.sleep", side_effect=AssertionError("views readiness must not sleep")),
-            mock.patch("run_real_query.bench_rerank.settle", side_effect=AssertionError("views readiness uses status")),
+            mock.patch.object(client, "call", side_effect=[resident, pending, resident, self.full_reply()]) as call,
+            mock.patch("run_real_query.time.sleep") as sleep,
+            mock.patch("run_real_query.bench_rerank.settle", side_effect=AssertionError("views readiness requires public coverage")),
         ):
-            client.wait_ready(5.0)
-        self.assertEqual(call.call_count, 2)
+            client.wait_ready(5.0, readiness_request=request)
+        self.assertEqual(call.call_count, 4)
+        self.assertEqual(call.call_args_list[1].args[0], "tool_call")
+        self.assertEqual(call.call_args_list[1].args[1]["arguments"], request)
+        sleep.assert_called_once_with(1.0)
+
+    def test_views_readiness_rejects_every_partial_or_omitted_lane(self) -> None:
+        self.assertTrue(full_views_coverage(self.full_reply()))
+        for fields in [
+            {"complete": False}, {"status": "partial"}, {"semantic_status": "building"},
+            {"success": False}, {"results": []}, {"fully_degraded": True},
+            {"omitted_lanes": ["semantic"]}, {"pending_paths": 1}, {"partial": True},
+            {"semantic_gap": {}}, {"index_read_gap": []}, {"exact_fallback_gap": []},
+            {"lanes": None}, {"lanes": {"trigram": None, "semantic": {"status": "ready"}}},
+            {"lanes": {"trigram": {"status": "building"}, "semantic": {"status": "ready"}}},
+            {"lanes": {"trigram": {"status": "ready"}, "semantic": {"status": "building"}}},
+        ]:
+            with self.subTest(fields=fields):
+                self.assertFalse(full_views_coverage({**self.full_reply(), **fields}))
+
+    def test_building_fixture_only_requires_its_actual_indexed_lexical_reply(self) -> None:
+        reply = {**self.full_reply(), "status": "building", "semantic_status": "building", "complete": False}
+        self.assertTrue(building_views_lexical_ready(reply))
+        self.assertFalse(full_views_coverage(reply))
+        self.assertFalse(building_views_lexical_ready(self.full_reply()))
+        self.assertFalse(building_views_lexical_ready({**reply, "fully_degraded": True}))
+
+    def test_readiness_query_uses_recorded_text_and_covers_tests_too(self) -> None:
+        request = make_readiness_request(manifest(False))
+        self.assertEqual(request["query"], manifest(False)["rows"][0]["query"])
+        self.assertTrue(request["includeTests"])
+        self.assertNotIn("path", request)
+        self.assertNotIn("offset", request)
+
+    def test_views_client_isolates_default_storage_without_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = mock.Mock()
+            proc.poll.return_value = 0
+            with (
+                mock.patch.dict("os.environ", {"AFT_STORAGE_DIR": "/must-not-use", "AFT_CACHE_DIR": "/must-not-use", bench_rerank.CACHE_ENV: ""}),
+                mock.patch("run_real_query.subprocess.Popen", return_value=proc) as popen,
+                mock.patch("run_real_query.NdjsonStream"),
+            ):
+                client = NdjsonClient(root / "aft", root, root / "storage", root / "stderr", views_enabled=True)
+                try:
+                    env = popen.call_args.kwargs["env"]
+                    self.assertNotIn("AFT_STORAGE_DIR", env)
+                    self.assertNotIn("AFT_CACHE_DIR", env)
+                    self.assertEqual(Path(env["XDG_DATA_HOME"]) / "cortexkit" / "aft", client.storage_dir)
+                    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+                        self.assertTrue(Path(env[key]).is_relative_to(root / "storage"), key)
+                finally:
+                    client.close()
+
+    def test_views_off_client_preserves_its_explicit_storage_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = mock.Mock()
+            proc.poll.return_value = 0
+            with (
+                mock.patch("run_real_query.subprocess.Popen", return_value=proc) as popen,
+                mock.patch("run_real_query.NdjsonStream"),
+            ):
+                client = NdjsonClient(root / "aft", root, root / "storage", root / "stderr")
+                try:
+                    self.assertEqual(client.storage_dir, root / "storage")
+                    self.assertEqual(popen.call_args.kwargs["env"]["AFT_STORAGE_DIR"], str(root / "storage"))
+                finally:
+                    client.close()
 
 
 class RealQueryRunnerTests(unittest.TestCase):
