@@ -353,6 +353,33 @@ fn go_concrete_missing_package_fact_is_unknown_in_views() {
     );
 }
 
+#[test]
+fn go_concrete_repeated_callback_parameters_are_scoped() {
+    let fixture = Fixture::from_files(&[
+        ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype Other struct{}\nfunc (x *Other) run() {}\nvar x *Other\n"),
+        ("caller.go", "package p\nfunc caller() {\n callbacks := []func(x *T){\n  func(x *T) { x.run() },\n  func(x *T) { x.run() },\n }\n _ = callbacks\n x.run()\n other := func() { var x *Other; x.run() }; _ = other\n}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![("caller.go".into(), "types.go".into(), "T::run".into()); 2]
+    );
+    let answers = go_method_answers(&fixture.store.conn.lock().unwrap());
+    assert_eq!(answers.iter().map(|e| e.4).collect::<Vec<_>>(), vec![4, 5]);
+    assert_go_concrete_view_parity(&fixture, false);
+    for source in [
+        "package p\nfunc caller() { callbacks := []any{func(x *T) { x.run() }, func(x *Other) { x.run() }}; _=callbacks }\n",
+        "package p\nfunc unknown() interface { run() } { return nil }\nfunc caller() { callbacks := []any{func(x *T) { { x := unknown(); x.run() } }, func(x *T) { x.run() }}; _=callbacks }\n",
+        "package p\nimport . \"net/http\"\nfunc caller() { _=StatusOK; callbacks := []any{func(x *T) { x.run() }, func(x *T) { x.run() }}; _=callbacks }\n",
+    ] {
+        let refused = Fixture::from_files(&[
+            ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype Other struct{}\nfunc (x *Other) run() {}\n"),
+            ("caller.go", source),
+        ]);
+        assert!(go_typed_edges(&refused.store).is_empty());
+        assert_go_concrete_view_parity(&refused, false);
+    }
+}
+
 /// A cold-built fixture store that edit shapes are applied to.
 struct Fixture {
     temp: tempfile::TempDir,

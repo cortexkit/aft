@@ -16,9 +16,15 @@ pub(super) struct SourceIndex {
 
 struct Binding {
     scope: Option<(usize, usize)>,
+    repeated_scopes: Option<Vec<(usize, usize)>>,
     end: usize,
     local: bool,
     ty: Option<String>,
+}
+
+enum Declarations<'tree> {
+    One(Node<'tree>),
+    Repeated(Vec<Node<'tree>>),
 }
 
 #[cfg(test)]
@@ -66,8 +72,34 @@ fn scope(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn binding_names(node: Node<'_>, source: &str) -> Vec<String> {
+    if matches!(
+        node.kind(),
+        "parameter_declaration" | "variadic_parameter_declaration"
+    ) {
+        // Function-type signatures name their arguments, not values in the
+        // enclosing function's scope.
+        let mut parent = node.parent();
+        while let Some(node) = parent {
+            if node.kind() == "function_type" {
+                return Vec::new();
+            }
+            if matches!(
+                node.kind(),
+                "function_declaration" | "method_declaration" | "func_literal"
+            ) {
+                break;
+            }
+            parent = node.parent();
+        }
+    }
     match node.kind() {
-        "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" | "const_spec" => {
+        "parameter_declaration"
+        | "variadic_parameter_declaration"
+        | "var_spec"
+        | "const_spec"
+        | "type_spec"
+        | "type_alias"
+        | "type_parameter_declaration" => {
             let mut cursor = node.walk();
             node.children_by_field_name("name", &mut cursor)
                 .map(|n| text(n, source).to_string())
@@ -87,6 +119,61 @@ fn binding_names(node: Node<'_>, source: &str) -> Vec<String> {
             .unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+fn repeated_parameter_binding(
+    declarations: &[Node<'_>],
+    source: &str,
+    type_shadows: &HashSet<String>,
+) -> Option<Binding> {
+    let mut ty = None;
+    let mut scopes = Vec::new();
+    let mut other_scopes = Vec::new();
+    for &declaration in declarations {
+        let declaration_scope = scope(declaration)?;
+        if declaration.kind() == "variadic_parameter_declaration"
+            && declaration_scope.kind() == "func_literal"
+        {
+            return None;
+        }
+        if declaration.kind() != "parameter_declaration"
+            || declaration_scope.kind() != "func_literal"
+        {
+            other_scopes.push((declaration_scope.start_byte(), declaration_scope.end_byte()));
+            continue;
+        }
+        let scope = declaration_scope.child_by_field_name("body")?;
+        let declared = nominal_type(declaration.child_by_field_name("type")?, source)?;
+        if type_shadows.contains(&declared) || ty.as_ref().is_some_and(|ty| ty != &declared) {
+            return None;
+        }
+        ty = Some(declared);
+        scopes.push((scope.start_byte(), scope.end_byte()));
+    }
+    if scopes.len() < 2 {
+        return None;
+    }
+    scopes.sort_unstable();
+    // Only disjoint closures qualify. A call must be covered by its own
+    // parameter's scope, never by a same-named parameter in another callback.
+    if scopes.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return None;
+    }
+    // An unrelated local may use the name elsewhere, but must neither shadow
+    // a callback parameter nor borrow its type outside that callback's body.
+    for (start, end) in other_scopes {
+        let position = scopes.partition_point(|(_, scope_end)| *scope_end <= start);
+        if position < scopes.len() && scopes[position].0 < end {
+            return None;
+        }
+    }
+    Some(Binding {
+        scope: None,
+        repeated_scopes: Some(scopes),
+        end: 0,
+        local: false,
+        ty,
+    })
 }
 
 fn initializer_type(
@@ -132,6 +219,7 @@ impl SourceIndex {
             ..Self::default()
         };
         let mut factories = HashMap::new();
+        let mut has_dot_import = false;
         let mut functions = HashMap::<usize, Vec<Node<'_>>>::new();
         let mut stack = vec![(root, None)];
         // Walk each source once. Function literals stay in their enclosing
@@ -149,6 +237,13 @@ impl SourceIndex {
             };
             if let Some(function) = function {
                 functions.entry(function).or_default().push(node);
+            }
+            if node.kind() == "import_spec"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| text(name, source) == ".")
+            {
+                has_dot_import = true;
             }
             if node.kind() == "function_declaration" {
                 if let Some(name) = node.child_by_field_name("name") {
@@ -184,14 +279,22 @@ impl SourceIndex {
                 let (n, f, b) = work.get();
                 work.set((n, f + 1, b));
             });
-            let mut declarations = HashMap::<String, Option<Node<'_>>>::new();
+            let mut declarations = HashMap::<String, Declarations<'_>>::new();
             let mut type_shadows = HashSet::new();
             for &node in all {
                 for name in binding_names(node, source) {
+                    if name == "_" {
+                        continue;
+                    }
                     declarations
                         .entry(name)
-                        .and_modify(|old| *old = None)
-                        .or_insert(Some(node));
+                        .and_modify(|old| match old {
+                            Declarations::One(first) => {
+                                *old = Declarations::Repeated(vec![*first, node])
+                            }
+                            Declarations::Repeated(all) => all.push(node),
+                        })
+                        .or_insert(Declarations::One(node));
                 }
                 if matches!(
                     node.kind(),
@@ -211,10 +314,28 @@ impl SourceIndex {
                     let (n, f, b) = work.get();
                     work.set((n, f, b + 1));
                 });
-                let Some(declaration) = declaration else {
-                    continue;
+                let declaration = match declaration {
+                    Declarations::One(node) => node,
+                    Declarations::Repeated(all) => {
+                        // A dot import may shadow an unqualified type name;
+                        // its export set is not resolved by this source index.
+                        if !has_dot_import {
+                            if let Some(binding) =
+                                repeated_parameter_binding(&all, source, &type_shadows)
+                            {
+                                bindings.insert(name, binding);
+                            }
+                        }
+                        continue;
+                    }
                 };
-                if declaration.kind() == "variadic_parameter_declaration" {
+                if matches!(
+                    declaration.kind(),
+                    "variadic_parameter_declaration"
+                        | "type_spec"
+                        | "type_alias"
+                        | "type_parameter_declaration"
+                ) {
                     continue;
                 }
                 let ty = declaration
@@ -244,6 +365,7 @@ impl SourceIndex {
                     name,
                     Binding {
                         scope: scope(declaration).map(|n| (n.start_byte(), n.end_byte())),
+                        repeated_scopes: None,
                         end: declaration.end_byte(),
                         local: !matches!(
                             declaration.kind(),
@@ -271,6 +393,13 @@ impl SourceIndex {
                 }
                 let receiver = text(receiver, source).to_string();
                 let ty = bindings.get(&receiver).and_then(|b| {
+                    if let Some(scopes) = &b.repeated_scopes {
+                        let position =
+                            scopes.partition_point(|(start, _)| *start <= call.start_byte());
+                        return (position > 0 && call.end_byte() <= scopes[position - 1].1)
+                            .then(|| b.ty.clone())
+                            .flatten();
+                    }
                     let (start, end) = b.scope?;
                     (start <= call.start_byte()
                         && call.end_byte() <= end
@@ -424,6 +553,36 @@ mod tests {
         assert!(
             visits[1] < visits[0] * 5,
             "four times as many calls must have linear indexing work: {visits:?}"
+        );
+    }
+
+    #[test]
+    fn go_concrete_repeated_parameter_scope_index_has_bounded_lookup_work() {
+        let mut visits = Vec::new();
+        for count in [40, 160] {
+            let source = format!("package p\ntype T struct{{}}\nfunc (r *T) run() {{}}\nfunc caller() {{ var callbacks=[]func(x *T){{\n{}\n}}; _=callbacks }}", "func(x *T) { x.run() },\n".repeat(count));
+            let tree =
+                parse_source_with_cached_parser(Path::new("callbacks.go"), &source, LangId::Go)
+                    .unwrap();
+            WORK.with(|work| work.set((0, 0, 0)));
+            let index = SourceIndex::new(tree.root_node(), &source, false);
+            let work = WORK.with(|work| work.get());
+            assert_eq!(work.1, 2);
+            assert_eq!(
+                work.2, 3,
+                "function-type parameter names are not value bindings"
+            );
+            assert_eq!(index.calls.len(), count);
+            assert!(index.calls.values().all(|ty| ty.as_deref() == Some("T")));
+            for &(start, end) in index.calls.keys() {
+                assert_eq!(index.receiver(start, end), Some("T"));
+            }
+            assert_eq!(WORK.with(|work| work.get()), work);
+            visits.push(work.0);
+        }
+        assert!(
+            visits[1] < visits[0] * 5,
+            "scope indexing must not rescan a function per callback: {visits:?}"
         );
     }
 }
