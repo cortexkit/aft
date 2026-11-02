@@ -19,8 +19,10 @@ enum Shape {
     Interpreter,
 }
 
-// All command-shape classification lives here. Unknown commands and dynamic
-// operands are left to the build server's filesystem protection.
+// All command-shape classification lives here. Commands not listed, and
+// operands whose path can't be known before the job runs (for example `$VAR`),
+// are allowed; the build server is expected to make tracked files read-only
+// during a job, which catches what this check can't see.
 const SHAPES: &[(&str, Shape)] = &[
     ("tee", Shape::Tee),
     ("sed", Shape::InPlace),
