@@ -43,8 +43,8 @@ impl AcquisitionOwner {
 
     pub(super) fn shutdown(&self) {
         self.cancel();
-        // Standalone has no executor to drain its workers. Keep ownership of
-        // their handles until cancellation releases pins and byte reservations.
+        // Standalone has no executor to drain its workers. Keep their handles
+        // so shutdown can cancel and join every acquisition before returning.
         let handles = std::mem::take(&mut *self.standalone.lock().unwrap());
         for handle in handles {
             let _ = handle.join();
