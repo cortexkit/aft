@@ -264,7 +264,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
             },
         ],
     },
