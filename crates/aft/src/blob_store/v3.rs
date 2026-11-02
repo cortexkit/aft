@@ -1113,6 +1113,93 @@ fn preflight_floor(storage: &Path, request: u64) -> Result<()> {
     })?;
     check_space(storage, request, live)
 }
+
+const FLOOR_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn floor_reclaim_cooldown(storage: &Path, family: &str) -> Arc<Mutex<Option<Instant>>> {
+    type Cooldown = Arc<Mutex<Option<Instant>>>;
+    type Key = (PathBuf, String);
+    static COOLDOWNS: std::sync::OnceLock<Mutex<std::collections::HashMap<Key, Cooldown>>> =
+        std::sync::OnceLock::new();
+    let storage = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
+    COOLDOWNS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((storage, family.to_owned()))
+        .or_default()
+        .clone()
+}
+
+fn with_floor_reclaim<T>(
+    storage: &Path,
+    family: &str,
+    lock: Option<&ReservationLock>,
+    admission: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    with_floor_reclaim_using_clock(storage, family, lock, Instant::now, admission)
+}
+
+fn with_floor_reclaim_using_clock<T>(
+    storage: &Path,
+    family: &str,
+    lock: Option<&ReservationLock>,
+    now: impl Fn() -> Instant,
+    mut admission: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match admission() {
+        Err(Error::Refused("device_free_space_floor")) => {}
+        result => return result,
+    }
+    // An unopened family has nothing to reclaim. Keep the read-only
+    // preflight's guarantee that a refused first write creates no store.
+    if !family_dir(storage, family)?
+        .join("members.sqlite")
+        .try_exists()
+        .unwrap_or(false)
+    {
+        return Err(Error::Refused("device_free_space_floor"));
+    }
+    let cooldown = floor_reclaim_cooldown(storage, family);
+    // Do not queue agent-facing requests behind another reclaim's I/O, or
+    // repeat an unproductive walk more than once per minute for this family.
+    let mut retry_at = match cooldown.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(Error::Refused("device_free_space_floor"));
+        }
+    };
+    if retry_at.is_some_and(|retry_at| now() < retry_at) {
+        return Err(Error::Refused("device_free_space_floor"));
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let owned_lock;
+    let lock = match lock {
+        Some(lock) => lock,
+        None => {
+            owned_lock = match ReservationLock::acquire_until(storage, deadline) {
+                Ok(lock) => lock,
+                Err(_) => {
+                    *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN);
+                    return Err(Error::Refused("device_free_space_floor"));
+                }
+            };
+            &owned_lock
+        }
+    };
+    match crate::storage_retention::reclaim_v3_admission_family(storage, family, lock, deadline) {
+        Ok(true) => *retry_at = None,
+        Ok(false) => *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN),
+        Err(error) => {
+            // The same cooldown suppresses both another walk and another
+            // warning until the family is eligible for a new reclaim attempt.
+            *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN);
+            crate::slog_warn!("views admission reclaim failed family={family}: {error}");
+        }
+    }
+    admission()
+}
 fn recover_ledgers(storage: &Path, lock: &ReservationLock) -> Result<()> {
     lock.verify(storage)?;
     for_each_registry(storage, |family, path| {
@@ -1534,7 +1621,10 @@ impl<'a> RegistryWriter<'a> {
         let before = allocated_bytes(&self.dir)?;
         let registry = self.registry_identity()?;
         let path = self.dir.join("members.sqlite");
-        let id = self.with_barrier(|tx| {
+        let family = self.family()?.to_owned();
+        let lock = self.lock;
+        let id = with_floor_reclaim(&storage, &family, Some(lock), || {
+            self.with_barrier(|tx| {
             // The current barrier already borrows this owner's connection.
             // Use that borrow rather than re-entering its connection mutex.
             check_floor(&storage,request,Some((&path,tx)))?;
@@ -1542,6 +1632,7 @@ impl<'a> RegistryWriter<'a> {
             if request == 100 { tests::admission_hook(); }
             tx.execute("INSERT INTO reservations(owner_pid,owner_start,state,reserved_bytes,charge_bytes) VALUES(?1,?2,'reserved',?3,0)",params![std::process::id(),owner_start,request])?;
             Ok(tx.last_insert_rowid())
+        })
         })?;
         Ok(Reservation {
             id,
@@ -1559,7 +1650,10 @@ impl<'a> RegistryWriter<'a> {
         let storage = self.lock.storage.clone();
         let path = self.dir.join("members.sqlite");
         let id = reservation.id;
-        self.with_barrier(|tx| {
+        let family = self.family()?.to_owned();
+        let lock = self.lock;
+        with_floor_reclaim(&storage, &family, Some(lock), || {
+            self.with_barrier(|tx| {
             check_floor(&storage, additional, Some((&path, tx)))?;
             let updated = tx.execute(
                 "UPDATE reservations SET reserved_bytes=reserved_bytes+?1 WHERE id=?2 AND state='reserved'",
@@ -1569,6 +1663,7 @@ impl<'a> RegistryWriter<'a> {
                 return Err(Error::Refused("reservation_not_live"));
             }
             Ok(())
+        })
         })
     }
     /// Bytes still reserved by a live reservation (0 once committed or
@@ -1699,7 +1794,7 @@ pub fn publish<T>(
     #[cfg(test)]
     let _profile = work_profile::span("publication");
     family_dir(storage, family)?;
-    preflight_floor(storage, request)?;
+    with_floor_reclaim(storage, family, None, || preflight_floor(storage, request))?;
     crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
         observe(observer, DurabilityStep::V3FloorRaised);
         let lock = ReservationLock::acquire(storage)?;
@@ -1718,7 +1813,9 @@ pub fn publish_locked<T>(
     body: impl FnOnce(&mut Publication<'_, '_>) -> Result<T>,
 ) -> Result<T> {
     lock.verify(storage)?;
-    preflight_floor(storage, request)?;
+    with_floor_reclaim(storage, family, Some(lock), || {
+        preflight_floor(storage, request)
+    })?;
     crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
         observe(observer, DurabilityStep::V3FloorRaised);
         publish_under_lock(storage, family, request, lock, observer, body)
@@ -2329,6 +2426,38 @@ impl PlaneReader {
             |r| r.get(0),
         )?)
     }
+
+    /// Inspect liveness without opening a publication when every stored key is
+    /// already current. Missing keys retain their input order and duplicates.
+    /// Callers must hold a pin or live pin containing the keys so collection
+    /// cannot remove them between this check and their use.
+    pub(crate) fn touch_if_current(&self, keys: &[FamilyKey]) -> Result<Option<Vec<FamilyKey>>> {
+        let mut connection = self.database.connection()?;
+        let tx = connection.transaction()?;
+        let epoch: i64 = tx.query_row("SELECT gc_epoch FROM store_meta", [], |row| row.get(0))?;
+        let sql = if plane_layout(&tx)? == 1 {
+            "SELECT ref_epoch FROM blob_payloads WHERE full_key=?1"
+        } else {
+            "SELECT ref_epoch FROM blob_liveness WHERE blob_id=(SELECT id FROM blob_payloads WHERE full_key=?1)"
+        };
+        let mut missing = Vec::new();
+        let mut outdated = false;
+        {
+            let mut lookup = tx.prepare(sql)?;
+            for key in keys {
+                let stored: Option<i64> = lookup
+                    .query_row([key.as_bytes().as_slice()], |row| row.get(0))
+                    .optional()?;
+                match stored {
+                    Some(stored) => outdated |= stored < epoch,
+                    None => missing.push(*key),
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((!outdated).then_some(missing))
+    }
+
     pub fn get(&self, key: &FamilyKey) -> Result<Option<Vec<u8>>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .database
