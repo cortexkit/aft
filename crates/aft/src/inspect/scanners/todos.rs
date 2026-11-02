@@ -26,6 +26,55 @@ thread_local! {
     static TODOS_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Isolated cold-scan timing: inventory and fixture preparation stay outside
+/// the measured interval, and each invocation uses a fresh test process.
+#[cfg(all(test, target_os = "linux"))]
+mod throughput_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "repository throughput probe; requires AFT_SCAN_BENCH_ROOT on Linux"]
+    fn todos_and_metrics_throughput_probe() {
+        use crate::inspect::{InspectCategory, JobKey, JobScope};
+        use std::sync::{Arc, RwLock};
+        let root = PathBuf::from(std::env::var_os("AFT_SCAN_BENCH_ROOT").expect("corpus root"));
+        let mut files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        files.sort();
+        let input_bytes = files
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum::<u64>();
+        eprintln!("SCAN_CORPUS files={} bytes={input_bytes}", files.len());
+        let scope = JobScope::for_project(&root);
+        let mut job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
+            category: InspectCategory::Todos,
+            scope_files: files,
+            project_root: root.clone(),
+            inspect_dir: root.join("inspect"),
+            config: Arc::new(crate::config::Config::default()),
+            symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let started = Instant::now();
+        let todos = run_todos_scan(&job).outcome.expect("TODO scan");
+        let todo_ms = started.elapsed().as_secs_f64() * 1000.0;
+        job.category = InspectCategory::Metrics;
+        job.key = JobKey::for_category_scope(job.category, &scope);
+        let started = Instant::now();
+        let metrics = super::super::metrics::run_metrics_scan(&job)
+            .outcome
+            .expect("metrics scan");
+        let metrics_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("SCAN_TIMING files={} todo_ms={todo_ms:.3} metrics_ms={metrics_ms:.3} total_ms={:.3} todo_count={} todo_scanned={} metrics_scanned={}", job.scope_files.len(), todo_ms + metrics_ms, todos.aggregate["count"], todos.scanned_files.len(), metrics.scanned_files.len());
+        assert!(!todos.scanned_files.is_empty());
+        assert!(!metrics.scanned_files.is_empty());
+    }
+}
+
 #[cfg(debug_assertions)]
 static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
 
@@ -194,8 +243,10 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
             },
         );
     }
-    let _permit = super::source_text::source_scan_permit();
-    let (freshness, source, skipped_reason) = read_text_file(path);
+    let metadata = std::fs::metadata(path).ok();
+    let _permit =
+        super::source_text::source_scan_permit(metadata.as_ref().map_or(0, std::fs::Metadata::len));
+    let (freshness, source, skipped_reason) = read_text_file(path, metadata);
     let Some(source) = source else {
         return (
             freshness,
@@ -548,9 +599,11 @@ fn next_char_len(line: &str, cursor: usize) -> usize {
         .unwrap_or_default()
 }
 
-fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>, Option<&'static str>) {
+fn read_text_file(
+    path: &Path,
+    metadata: Option<std::fs::Metadata>,
+) -> (Option<FileFreshness>, Option<String>, Option<&'static str>) {
     use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
-    let metadata = std::fs::metadata(path).ok();
     let bytes = match read_source_bytes(path) {
         Ok(SourceBytes::Bytes(bytes)) => {
             #[cfg(debug_assertions)]
@@ -797,10 +850,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.rs");
         fs::write(&path, "// TODO: marker\n").unwrap();
-        let _ = read_text_file(&path);
+        let _ = read_text_file(&path, fs::metadata(&path).ok());
         assert_eq!(file_read_count_for_debug(dir.path()), 0);
         reset_file_read_count_for_debug(dir.path());
-        let _ = read_text_file(&path);
+        let _ = read_text_file(&path, fs::metadata(&path).ok());
         assert_eq!(file_read_count_for_debug(dir.path()), 1);
     }
     use crate::config::Config;
@@ -906,11 +959,14 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn several_large_todo_files_hold_at_most_two_read_parse_permits() {
+    fn several_large_todo_files_hold_source_bytes_through_parse_without_a_two_file_cap() {
         let project = tempfile::tempdir().unwrap();
         let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
         let (release_tx, release_rx) = crossbeam_channel::unbounded();
-        let paths = (0..6)
+        let fitting_files = (super::super::source_text::SOURCE_SCAN_BUDGET_BYTES
+            / super::super::source_text::MAX_SOURCE_BYTES) as usize;
+        let total_files = fitting_files + 1;
+        let paths = (0..total_files)
             .map(|index| {
                 let path = project.path().join(format!("large-{index}.rs"));
                 let mut source = String::from("// TODO: bounded parallel parsing\n");
@@ -931,7 +987,7 @@ mod tests {
         let job = todos_job(project.path(), paths);
         let worker = std::thread::spawn(move || {
             rayon::ThreadPoolBuilder::new()
-                .num_threads(8)
+                .num_threads(total_files)
                 .build()
                 .unwrap()
                 .install(|| {
@@ -941,24 +997,25 @@ mod tests {
                 })
         });
         let deadline = std::time::Duration::from_secs(5);
-        entered_rx.recv_timeout(deadline).unwrap();
-        entered_rx.recv_timeout(deadline).unwrap();
-        let third = entered_rx.recv_timeout(std::time::Duration::from_millis(100));
+        for _ in 0..fitting_files {
+            entered_rx.recv_timeout(deadline).unwrap();
+        }
+        let over_budget = entered_rx.recv_timeout(std::time::Duration::from_millis(100));
         let reads_while_blocked = file_read_count_for_debug(project.path());
-        for _ in 0..6 {
+        for _ in 0..total_files {
             release_tx.send(()).unwrap();
         }
         let result = worker.join().unwrap();
         assert!(
-            third.is_err(),
-            "a third parser ran while two parses held their permits"
+            over_budget.is_err(),
+            "another parser ran while the source-byte budget was fully reserved"
         );
         assert_eq!(
-            reads_while_blocked, 2,
+            reads_while_blocked, fitting_files,
             "permits must cover reads, not only parsing"
         );
-        assert_eq!(result.scanned_files.len(), 6);
-        assert_eq!(result.aggregate["count"], 6);
+        assert_eq!(result.scanned_files.len(), total_files);
+        assert_eq!(result.aggregate["count"], total_files);
     }
 
     /// Run in its own process under `/usr/bin/time -v`; fixtures are prepared

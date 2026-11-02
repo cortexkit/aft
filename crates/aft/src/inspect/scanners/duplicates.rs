@@ -230,9 +230,8 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
 /// and this scan and is treated as deleted. A file that is not valid UTF-8 is
 /// a per-file skip; other read failures keep failing the scan as before.
 fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> {
-    let _permit = super::source_text::source_scan_permit();
     let display_path = display_path(&job.project_root, path);
-    let freshness = match super::source_text::source_freshness(path) {
+    let (freshness, _permit) = match super::source_text::source_freshness(path) {
         Ok(freshness) => freshness,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),

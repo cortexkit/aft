@@ -139,8 +139,9 @@ fn metrics_memo() -> &'static Tier1FileMemo<CachedFileMetric> {
 }
 
 fn scan_file(path: &Path) -> (Option<FileFreshness>, CachedFileMetric) {
-    let _permit = super::source_text::source_scan_permit();
     let metadata = fs::metadata(path).ok();
+    let _permit =
+        super::source_text::source_scan_permit(metadata.as_ref().map_or(0, fs::Metadata::len));
     let (bytes, skipped_reason) = read_file_bytes(path);
     let freshness = metadata
         .as_ref()
