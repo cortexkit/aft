@@ -837,7 +837,7 @@ fn move_set(set: &LegacySet, area: &Path) -> io::Result<Moved> {
     }
 }
 
-pub(crate) fn human_bytes(bytes: u64) -> String {
+fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

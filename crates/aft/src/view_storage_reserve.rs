@@ -24,16 +24,32 @@ impl DiskReserveCondition {
         // treatment rather than inventing a free-space measurement.
         let (free_bytes, capacity) = crate::blob_store::v3::floor_refusal_measurement(storage)?;
         let floor_bytes = crate::blob_store::v3::free_disk_floor(capacity);
-        let human_bytes = crate::migration::prune_legacy::human_bytes;
         let message = APPROVED_MESSAGE
-            .replace("{free}", &human_bytes(free_bytes))
-            .replace("{floor}", &human_bytes(floor_bytes));
+            .replace("{free}", &size(free_bytes))
+            .replace("{floor}", &size(floor_bytes));
         Some(Self {
             code: CODE,
             free_bytes,
             floor_bytes,
             message,
         })
+    }
+}
+
+/// A size for the agent-facing sentence, such as `21.0 GiB`. The exact byte
+/// counts are in `free_bytes` and `floor_bytes` for anything that needs them.
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -58,6 +74,8 @@ mod tests {
         crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
             .unwrap_err();
         let condition = DiskReserveCondition::observed(storage.path(), CODE).unwrap();
-        assert_eq!(condition.message, "View storage is paused: 21.0 GiB (22548578304 bytes) is free on this disk and AFT keeps 32.0 GiB (34359738368 bytes) free. Unused view data is being cleaned up; retry later.");
+        assert_eq!(condition.message, "View storage is paused: 21.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused view data is being cleaned up; retry later.");
+        assert_eq!(condition.free_bytes, 22_548_578_304);
+        assert_eq!(condition.floor_bytes, 34_359_738_368);
     }
 }
