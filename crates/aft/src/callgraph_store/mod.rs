@@ -34342,6 +34342,22 @@ mod tests {
     }
 
     #[test]
+    fn rust_study_module_alias_new_keeps_its_ordinary_binding() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "module-new-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod database;\nuse crate::database as Factory;\npub fn run() { Factory::new(); }\n",
+        );
+        write_file(root, "src/database.rs", "pub fn new() {}\n");
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/database.rs", "new", "src/lib.rs", "run");
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
     fn rust_same_file_test_module_receiver_method_dispatch_resolves() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();

@@ -239,10 +239,10 @@ pub fn complete_members(
             node.end_position().column as u32,
             name.clone(),
         );
-        if let Some(symbol) = rust_bindings
+        let rust_symbol = rust_bindings
             .as_ref()
-            .and_then(|index| index.symbol_at(node.start_byte()))
-        {
+            .and_then(|index| index.symbol_at(node.start_byte()));
+        if let Some(symbol) = rust_symbol {
             if scoped_names.contains(symbol) {
                 callers
                     .entry(position)
@@ -254,7 +254,9 @@ pub fn complete_members(
             callers.entry(position).or_insert_with(|| symbol.clone());
             continue;
         }
-        let mut scoped_name = format!("{owner}::{name}");
+        let mut scoped_name = rust_symbol
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{owner}::{name}"));
         let ordinal = spans
             .get(&(node.start_byte(), node.end_byte()))
             .copied()
@@ -645,6 +647,11 @@ pub fn extract(
         .iter()
         .filter_map(|i| i.namespace_import.as_deref())
         .collect::<HashSet<_>>();
+    let local_rust_types = facts
+        .types
+        .iter()
+        .map(|ty| ty.name.as_str())
+        .collect::<HashSet<_>>();
     for (reference, target) in references.into_iter().zip(targets) {
         let Some(call) = target.map(|i| calls[i]) else {
             continue;
@@ -658,6 +665,29 @@ pub fn extract(
         }) else {
             continue;
         };
+        let callee = if language == "rust" && callee.kind() == "generic_function" {
+            field(callee, &["function"]).unwrap_or(callee)
+        } else {
+            callee
+        };
+        let associated = language == "rust"
+            && callee.kind() == "scoped_identifier"
+            && field(callee, &["name"]).is_some_and(|name| text(name, source) == "new");
+        if associated {
+            let Some(path) = field(callee, &["path"]) else {
+                continue;
+            };
+            let owner = type_name(text(path, source));
+            if owner == "Self"
+                || local_rust_types.contains(owner.as_str())
+                || !owner
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|name| name.chars().next().is_some_and(char::is_uppercase))
+            {
+                continue;
+            }
+        }
         let dynamic = syntactic_dynamic(callee, source, language);
         let receiver_node = field(
             callee,
@@ -672,6 +702,8 @@ pub fn extract(
         });
         // Java method invocations carry their receiver on the invocation itself.
         let receiver_node = receiver_node.or_else(|| field(call, &["object"]));
+        let receiver_node =
+            receiver_node.or_else(|| associated.then(|| field(callee, &["path"])).flatten());
         if !dynamic && receiver_node.is_none() {
             // Token-tree calls already extracted by calls.rs have no receiver
             // expression in the outer syntax tree. Retain the written member
@@ -700,6 +732,9 @@ pub fn extract(
             continue;
         }
         let receiver = receiver_node.and_then(|receiver| {
+            if associated {
+                return Some(text(receiver, source).to_string());
+            }
             receiver_type(
                 receiver,
                 call,

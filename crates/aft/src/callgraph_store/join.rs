@@ -1661,42 +1661,94 @@ fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names
 }
 
-/// Bind one Rust file's receiver type names with the same workspace, module and
-/// re-export rules as ordinary Rust paths. A name maps to its target file and
-/// symbol only when the target names a node of the index.
+/// Bind receiver names using the same lexical call context as ordinary Rust
+/// references. Different bindings of one written name remain ambiguous.
 fn resolve_dispatch_type_names<I: super::ResolverIndex>(
     index: &I,
     file: &str,
     parse: &ParseBlob,
     data: &FileCallData,
 ) -> BTreeMap<String, (String, String)> {
-    let mut targets = BTreeMap::new();
-    for name in dispatch_type_names(parse) {
-        let short = name.rsplit("::").next().unwrap_or(&name);
-        let raw = super::RawRef {
-            ref_id: String::new(),
-            caller_node: None,
-            caller_symbol: None,
-            caller_file: file.to_string(),
-            kind: "call".into(),
-            short_name: Some(short.into()),
-            full_ref: Some(name.clone()),
-            module_path: None,
-            import_kind: None,
-            local_name: None,
-            requested_name: None,
-            namespace_alias: None,
-            wildcard: false,
-            line: 0,
-            byte_start: 0,
-            byte_end: 0,
-            dependencies: BTreeSet::new(),
+    let mut names = dispatch_type_names(parse);
+    for import in &data.import_block.imports {
+        names.extend(callgraph::rust_import_local_names(import));
+    }
+    let references = parse
+        .refs
+        .iter()
+        .filter(|raw| matches!(raw.kind, BlobRefKind::Call | BlobRefKind::Construction))
+        .map(|raw| (raw.ordinal, raw))
+        .collect::<HashMap<_, _>>();
+    let mut contexts = HashMap::<String, BTreeMap<u32, &BlobRef>>::new();
+    for raw in references.values() {
+        if let Some(name) = &raw.full_ref {
+            contexts
+                .entry(name.clone())
+                .or_default()
+                .insert(raw.ordinal, raw);
+        }
+    }
+    for site in &parse.dispatch.sites {
+        let (Some(receiver), Some(reference)) = (&site.receiver, references.get(&site.ordinal))
+        else {
+            continue;
         };
-        let resolved = super::resolve_rust_target(index, file, &name, short, data, &raw);
-        if let Some((_, target_file, symbol)) = resolved {
-            if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
-                targets.insert(name, (target_file, symbol));
+        let mut name = receiver.as_str();
+        while let Some(expression) = name.strip_prefix("@field:") {
+            name = expression
+                .rsplit_once('|')
+                .map(|(base, _)| base)
+                .unwrap_or(expression);
+        }
+        name = name.strip_prefix("@return:").unwrap_or(name);
+        contexts
+            .entry(name.to_string())
+            .or_default()
+            .insert(reference.ordinal, reference);
+    }
+    let mut targets = BTreeMap::new();
+    for name in names {
+        let short = name.rsplit("::").next().unwrap_or(&name);
+        let sites = contexts
+            .get(&name)
+            .map(|refs| refs.values().copied().map(Some).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![None]);
+        let mut bindings = BTreeSet::new();
+        let mut incomplete = false;
+        for site in sites {
+            let raw = super::RawRef {
+                ref_id: String::new(),
+                caller_node: None,
+                caller_symbol: site.and_then(|raw| raw.caller_symbol.clone()),
+                caller_file: file.to_string(),
+                kind: "call".into(),
+                short_name: Some(short.into()),
+                full_ref: Some(name.clone()),
+                module_path: None,
+                import_kind: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                line: site.map_or(0, |raw| raw.line),
+                byte_start: site.map_or(0, |raw| raw.byte_start),
+                byte_end: site.map_or(0, |raw| raw.byte_end),
+                dependencies: BTreeSet::new(),
+            };
+            if let Some((_, target_file, symbol)) =
+                super::resolve_rust_target(index, file, &name, short, data, &raw)
+            {
+                if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                    bindings.insert((target_file, symbol));
+                } else {
+                    incomplete = true;
+                }
+            } else {
+                incomplete = true;
             }
+        }
+        if !incomplete && bindings.len() == 1 {
+            targets.insert(name, bindings.into_iter().next().unwrap());
         }
     }
     targets
