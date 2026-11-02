@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "slices": [
+    "views-disk-reserve"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/lib.rs, which only registers the new view_storage_reserve module. The change caps the views free-disk reserve and replaces the reply text for a measured reserve refusal. No search lane, scoring, ordering or truncation changes, so ranked rows must remain byte-identical to the committed reference."
+}

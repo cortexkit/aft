@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "land-views-policy-undetermined"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. A Git policy query that never finished (timeout, failed start, killed child) is undetermined: the view retries as building and never reports a checkout change. A query that finished and refused (older Git, GIT_ATTR_NOSYSTEM) keeps main's handling as stable non-reusable evidence. No search, ranking or routing code changes."
+}

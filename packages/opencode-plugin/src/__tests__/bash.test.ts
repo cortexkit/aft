@@ -7,6 +7,7 @@ import {
   BASH_HOST_FALLBACK_BANNER,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  BashPermissionLoopError,
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportTimeoutError,
@@ -37,7 +38,7 @@ import {
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { createBashWriteTool } from "../tools/bash_write.js";
 import type { PluginContext } from "../types.js";
-import { mockAsk, noopAsk } from "./test-helpers";
+import { mockAsk, mockAskDeny, noopAsk } from "./test-helpers";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
@@ -543,6 +544,29 @@ describe("OpenCode bash adapter", () => {
     });
     expect(calls).toHaveLength(2);
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
+  });
+
+  test("permission loop reports host refusal of all shell command parts without retrying", async () => {
+    const ask = mockAskDeny("Permission denied: shell");
+    const { calls, tool: bash } = createHarness(() => ({
+      success: false,
+      code: "permission_required",
+      asks: [
+        { kind: "bash", patterns: ["mkdir -p x"] },
+        { kind: "bash", patterns: ["rm -rf x"] },
+      ],
+    }));
+    const error = await bash
+      .execute({ command: "mkdir -p x && rm -rf x" }, createMockSdkContext({ ask }))
+      .catch((error) => error);
+    expect(error).toBeInstanceOf(BashPermissionLoopError);
+    expect(error.message).toBe(
+      "Permission denied for this shell command: mkdir -p x, rm -rf x (Permission denied: shell). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.",
+    );
+    expect(error.cause).toBeInstanceOf(Error);
+    expect(error.cause.message).toBe("Permission denied: shell");
+    expect(calls).toHaveLength(1);
+    expect(ask).toHaveBeenCalledTimes(1);
   });
 
   test("permission loop stops early and names an already granted ask", async () => {

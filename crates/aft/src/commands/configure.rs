@@ -10246,6 +10246,8 @@ mod views_import_tests;
 
 #[cfg(test)]
 mod tests {
+    #[path = "disk_reserve_tests.rs"]
+    mod disk_reserve_tests;
     #[test]
     fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
         use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};
@@ -13401,15 +13403,35 @@ mod tests {
         let request = configure_semantic_views(&root, storage.path(), &server.base_url);
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
-        let complete = |ctx: &AppContext| {
-            ctx.checkout_semantic_runtime().is_some_and(|runtime| {
-                runtime
-                    .search(&[1.0, 0.0, 0.0], 1_000, &|_| true)
-                    .is_ok_and(|answer| answer.complete())
-            })
+        let query = |ctx: &AppContext| {
+            ctx.checkout_semantic_runtime()
+                .map(|runtime| runtime.search(&[1.0, 0.0, 0.0], 1_000, &|_| true))
         };
-        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
-        assert!(complete(&ctx), "the semantic view never filled");
+        let complete = |ctx: &AppContext| {
+            let answer = query(ctx);
+            let complete = answer
+                .as_ref()
+                .is_some_and(|answer| answer.as_ref().is_ok_and(|answer| answer.complete()));
+            if !complete {
+                eprintln!(
+                    "semantic view incomplete: {}; non_probe_inputs={}; answer={answer:?}",
+                    ctx.checkout_semantic().describe(),
+                    server.non_probe_input_count(),
+                );
+            }
+            complete
+        };
+        let settled = fills.wait_until_settled(Duration::from_secs(60)).unwrap();
+        let initial = query(&ctx);
+        assert!(
+            initial
+                .as_ref()
+                .is_some_and(|answer| answer.as_ref().is_ok_and(|answer| answer.complete())),
+            "the semantic view never filled; at settlement={settled:?}; at query: lane={}; retry_pending={}; non_probe_inputs={}; answer={initial:?}",
+            ctx.checkout_semantic().describe(),
+            ctx.checkout_semantic().retry_pending_for_test(),
+            server.non_probe_input_count(),
+        );
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
 

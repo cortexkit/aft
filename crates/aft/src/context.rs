@@ -1129,10 +1129,13 @@ pub struct ViewHealthSnapshot {
 pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 
 /// Add reporting guidance only when a view-load failure becomes an agent reply.
-/// Health and logs retain the loader's raw error.
+/// Busy loads and measured disk-reserve refusals are expected conditions,
+/// not internal errors that need a bug report.
 pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String {
     let error = error.to_string();
-    if crate::views::trigram::bind_is_busy(&error) {
+    if crate::views::trigram::bind_is_busy(&error)
+        || crate::view_storage_reserve::is_message(&error)
+    {
         return error;
     }
     format!("{error}\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.")
@@ -1200,9 +1203,11 @@ const CALLGRAPH_BORROW_RECHECK_AFTER: Duration = Duration::from_secs(1);
 /// Per-project checkout view load health. Counts every load attempt the
 /// queries actually made (grep, glob, aft_search binds for the lexical view;
 /// navigation, zoom and inspect for the callgraph view), so a persistent
-/// outage keeps counting while it keeps failing queries.
+/// outage keeps counting while it keeps failing queries. Measured reserve
+/// refusals are active storage conditions, separate from failure history.
 #[derive(Debug, Default)]
 struct ViewLoadHealth {
+    disk_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     by_cause: BTreeMap<(String, String), u64>,
     total: u64,
     last: Option<ViewLoadFailure>,
@@ -1327,6 +1332,9 @@ pub struct RootHealthSnapshot {
     /// The most recent view load failure, if any load has failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub view_load_failure_last: Option<ViewLoadFailure>,
+    /// Active measured disk-reserve refusals, separate from view-load bugs.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1346,6 +1354,7 @@ pub(crate) struct RootHealthSummary {
     views: Option<ViewHealthSnapshot>,
     view_load_failures: BTreeMap<String, u64>,
     view_load_failure_last: Option<ViewLoadFailure>,
+    view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     tier2_status: Option<&'static str>,
     tier2_completion_generation: Option<u64>,
     tier2_stale_since_ms: Option<u64>,
@@ -1368,6 +1377,7 @@ impl RootHealthSummary {
             views: None,
             view_load_failures: BTreeMap::new(),
             view_load_failure_last: None,
+            view_storage_reserve: BTreeMap::new(),
             tier2_status: None,
             tier2_completion_generation: None,
             tier2_stale_since_ms: None,
@@ -1386,6 +1396,7 @@ impl RootHealthSummary {
     pub(crate) fn is_fully_ready(&self) -> bool {
         let component_is_satisfied = |status: &str| matches!(status, "ready" | "disabled");
         matches!(self.state, RootHealthState::Ready)
+            && self.view_storage_reserve.is_empty()
             && self.search_index_status.is_some_and(component_is_satisfied)
             && self
                 .semantic_index
@@ -1444,6 +1455,7 @@ impl RootHealthSummary {
             views: self.views,
             view_load_failures: self.view_load_failures,
             view_load_failure_last: self.view_load_failure_last,
+            view_storage_reserve: self.view_storage_reserve,
             tier2: self.tier2_status.map(|status| Tier2HealthSnapshot {
                 status,
                 completion_generation: self.tier2_completion_generation.unwrap_or_default(),
@@ -1475,6 +1487,7 @@ impl RootHealthSnapshot {
             views: None,
             view_load_failures: BTreeMap::new(),
             view_load_failure_last: None,
+            view_storage_reserve: BTreeMap::new(),
             tier2: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -1488,6 +1501,7 @@ impl RootHealthSnapshot {
             |tier2: &Tier2HealthSnapshot| matches!(tier2.status, "ready" | "disabled");
 
         matches!(self.state, RootHealthState::Ready)
+            && self.view_storage_reserve.is_empty()
             && self
                 .search_index
                 .as_ref()
@@ -5205,6 +5219,9 @@ pub(crate) fn checkout_view_callgraph_access(
         {
             CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
         }
+        Some(Err(error)) if crate::view_storage_reserve::is_message(&error.reason) => {
+            CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+        }
         Some(Err(error)) => CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(format!(
             "callgraph view unavailable: {}",
             view_load_failure_message(error)
@@ -6173,25 +6190,30 @@ impl AppContext {
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
-        let (mut view_load_failures, mut view_load_failure_last): (BTreeMap<String, u64>, _) =
-            match self.view_load_health.try_lock() {
-                Some(health) => (
-                    health
-                        .by_cause
-                        .iter()
-                        .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
-                        .collect(),
-                    health.last.clone(),
-                ),
-                None => return RootHealthSummary::busy(),
-            };
+        let (mut view_load_failures, mut view_load_failure_last, mut view_storage_reserve): (
+            BTreeMap<String, u64>,
+            _,
+            _,
+        ) = match self.view_load_health.try_lock() {
+            Some(health) => (
+                health
+                    .by_cause
+                    .iter()
+                    .map(|((plane, cause), count)| (format!("{plane}:{cause}"), *count))
+                    .collect(),
+                health.last.clone(),
+                health.disk_reserve.clone(),
+            ),
+            None => return RootHealthSummary::busy(),
+        };
         // A parent folder's worker reads its children's views itself; their
         // failures are recorded under the parent root and reported here too.
         if config.views.enabled {
             if let Some(root) = config.project_root.as_deref() {
                 match crate::views::parent::try_child_load_failures(root) {
-                    Some(Some((counts, last))) => {
+                    Some(Some((counts, last, reserves))) => {
                         view_load_failures.extend(counts);
+                        view_storage_reserve.extend(reserves);
                         if last.as_ref().is_some_and(|last| {
                             view_load_failure_last
                                 .as_ref()
@@ -6458,6 +6480,7 @@ impl AppContext {
             views,
             view_load_failures,
             view_load_failure_last,
+            view_storage_reserve,
             tier2_status: Some(tier2_status),
             tier2_completion_generation: Some(successful_tier2_completions),
             tier2_stale_since_ms,
@@ -10122,7 +10145,19 @@ impl AppContext {
     /// counts the failure (by plane and cause), keeps the last error and
     /// time, marks the project degraded until the next successful load, and
     /// logs at error level at most once a minute per plane.
+    /// A measured disk-reserve refusal is recorded separately, without adding
+    /// to the bug count or replacing the most recent genuine failure.
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
+        if let Some(condition) = crate::view_storage_reserve::DiskReserveCondition::observed(
+            &self.storage_paths().artifacts,
+            error,
+        ) {
+            self.view_load_health
+                .lock()
+                .disk_reserve
+                .insert(plane.to_string(), condition);
+            return;
+        }
         if crate::views::trigram::bind_is_busy(error) {
             return;
         }
@@ -10182,8 +10217,17 @@ impl AppContext {
 
     /// A checkout view load succeeded: the project is no longer degraded for
     /// view loads. History counts and the last error are kept.
-    pub(crate) fn note_view_load_success(&self) {
+    pub(crate) fn note_view_load_success(&self, plane: &str) {
+        self.view_load_health.lock().disk_reserve.remove(plane);
         self.remove_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
+    }
+
+    fn view_storage_refusal_message(&self, error: String) -> String {
+        crate::view_storage_reserve::DiskReserveCondition::observed(
+            &self.storage_paths().artifacts,
+            &error,
+        )
+        .map_or(error, |condition| condition.message)
     }
 
     #[cfg(test)]
@@ -12893,6 +12937,7 @@ impl AppContext {
                 },
             )
         });
+        let result = result.map_err(|error| self.view_storage_refusal_message(error));
         if pinned_config_for(self.config_pin_key()).is_some() {
             LEXICAL_QUERY_SNAPSHOTS.with(|snapshots| {
                 snapshots
@@ -12910,7 +12955,7 @@ impl AppContext {
         }
         match &result {
             Ok(crate::views::trigram::LexicalViewSnapshot::Ready(_)) => {
-                self.note_view_load_success()
+                self.note_view_load_success("trigram")
             }
             Ok(crate::views::trigram::LexicalViewSnapshot::ImportBuilding) => {}
             Err(error) => self.note_view_load_failure("trigram", error),
@@ -13137,6 +13182,18 @@ impl AppContext {
         &self,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
     {
+        self.callgraph_view_reader_inner().map(|result| {
+            result.map_err(|mut error| {
+                error.reason = self.view_storage_refusal_message(error.reason);
+                error
+            })
+        })
+    }
+
+    fn callgraph_view_reader_inner(
+        &self,
+    ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
+    {
         if !self.callgraph_views_enabled() {
             return None;
         }
@@ -13173,7 +13230,7 @@ impl AppContext {
                     });
                 }
                 match &borrowed {
-                    Ok(_) => self.note_view_load_success(),
+                    Ok(_) => self.note_view_load_success("callgraph"),
                     Err(error) if !error.busy => {
                         self.note_view_load_failure("callgraph", &error.reason)
                     }
@@ -13210,7 +13267,7 @@ impl AppContext {
                                 &root, &storage, &family, policy, true,
                             ) {
                                 match &borrowed {
-                                    Ok(_) => self.note_view_load_success(),
+                                    Ok(_) => self.note_view_load_success("callgraph"),
                                     Err(error) if !error.busy => {
                                         self.note_view_load_failure("callgraph", &error.reason)
                                     }
@@ -13244,7 +13301,7 @@ impl AppContext {
         }
         if result.is_ok() {
             self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
-            self.note_view_load_success();
+            self.note_view_load_success("callgraph");
         } else if let Err(error) = &result {
             self.note_view_load_failure("callgraph", &error.reason);
         }
@@ -16726,7 +16783,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None, None)
+        self.validate_path_with_artifact_session(req_id, path, None, None, true)
     }
 
     /// Validate a write location without following its final path component.
@@ -16774,7 +16831,7 @@ impl AppContext {
             // is what gets checked, and the handler must touch the same one
             // rather than resolve the spelling against the daemon's cwd.
             let rooted = self.resolve_relative_path(path);
-            let identity = self.check_path_access(req_id, path, &rooted, None, None, true)?;
+            let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
             return Ok((rooted, identity));
         };
         let normalized = normalize_path(&path_for_resolution);
@@ -16804,7 +16861,7 @@ impl AppContext {
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        let identity = self.check_path_access(req_id, path, &resolved, None, None, true)?;
+        let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
         Ok((resolved, identity))
     }
 
@@ -16820,7 +16877,35 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id), None);
+        self.validate_read_path_with_approval(req_id, session_id, path, true)
+    }
+
+    /// Apply the normal session read policy without entering an approval route.
+    /// Keep the caller's policy context intact, including plugin read exemptions,
+    /// but refuse a path that would require an outside-access ask.
+    pub(crate) fn validate_read_path_without_approval(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_read_path_with_approval(req_id, session_id, path, false)
+    }
+
+    fn validate_read_path_with_approval(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+        allow_approval: bool,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        let result = self.validate_path_with_artifact_session(
+            req_id,
+            path,
+            Some(session_id),
+            None,
+            allow_approval,
+        );
         if crate::context::confinement::for_request(req_id) {
             // Canonical targets and symlink destinations are private outside the
             // fence. Always report the caller's spelling, including on failure.
@@ -16837,7 +16922,13 @@ impl AppContext {
         path: &Path,
         search_tool: WorkerSearchTool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_path_with_artifact_session(req_id, path, Some(session_id), Some(search_tool))
+        self.validate_path_with_artifact_session(
+            req_id,
+            path,
+            Some(session_id),
+            Some(search_tool),
+            true,
+        )
     }
 
     /// Refuse `location` unless it lies under the resolved project root,
@@ -16879,6 +16970,7 @@ impl AppContext {
         path: &Path,
         artifact_session_id: Option<&str>,
         search_tool: Option<WorkerSearchTool>,
+        allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
@@ -16917,6 +17009,7 @@ impl AppContext {
                         artifact_session_id,
                         search_tool,
                         false,
+                        allow_approval,
                     )?;
                     return Ok(resolved);
                 }
@@ -16928,6 +17021,7 @@ impl AppContext {
                 artifact_session_id,
                 search_tool,
                 false,
+                allow_approval,
             )?;
             return Ok(rooted);
         };
@@ -16974,6 +17068,7 @@ impl AppContext {
             artifact_session_id,
             search_tool,
             false,
+            allow_approval,
         )?;
         Ok(resolved)
     }
@@ -17527,6 +17622,7 @@ impl AppContext {
         artifact_session: Option<&str>,
         search_tool: Option<WorkerSearchTool>,
         preserve_final: bool,
+        allow_approval: bool,
     ) -> Result<PathBuf, crate::protocol::Response> {
         use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
@@ -17708,6 +17804,10 @@ impl AppContext {
                 crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
             }
             AccessDecision::Ask => {
+                if !allow_approval {
+                    let root = self.config().project_root.clone().unwrap_or_default();
+                    return Err(path_error_response(req_id, original, &root));
+                }
                 let operation = if preserve_final {
                     AccessOperation::Write
                 } else {
@@ -23667,7 +23767,7 @@ mod view_load_health_tests {
         assert!(degraded(&ctx));
 
         // A later successful load clears the flag but keeps the history.
-        ctx.note_view_load_success();
+        ctx.note_view_load_success("trigram");
         assert!(!degraded(&ctx));
         let snapshot = ctx.try_health_snapshot(root);
         assert_eq!(snapshot.view_load_failures.get("trigram:other"), Some(&2));

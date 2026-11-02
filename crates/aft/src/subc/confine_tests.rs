@@ -489,7 +489,7 @@ fn confined_epoch_refetch_cannot_remove_fence() {
     let f = Fixture::new();
     for (epoch, params) in [
         (8, json!({"remote_exec":{"enabled":true}})),
-        (9, json!({"siblings":[f.live]})),
+        (9, json!({"siblings":[f.pin]})),
     ] {
         let route = identity(&f.pin, "designer", epoch, true);
         let answer = catalog(json!({"preset":"worker","params":params}), &route, &f.ctx).unwrap();
@@ -629,7 +629,7 @@ fn confined_security_golden_vectors() {
     let f = Fixture::new();
     let route = identity(&f.pin, "designer", 8, true);
     catalog(
-        json!({"preset":"worker","params":{"siblings":[f.live]}}),
+        json!({"preset":"worker","params":{"siblings":[f.pin]}}),
         &route,
         &f.ctx,
     )

@@ -7,6 +7,7 @@ struct LeaseFence {
     live: Mutex<bool>,
     calls: AtomicUsize,
     policy_change: Mutex<Option<PathBuf>>,
+    policy_query_timeout: std::sync::atomic::AtomicBool,
 }
 impl LeaseFence {
     fn live() -> Arc<Self> {
@@ -14,6 +15,7 @@ impl LeaseFence {
             live: Mutex::new(true),
             calls: AtomicUsize::new(0),
             policy_change: Mutex::new(None),
+            policy_query_timeout: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn revoke(&self) {
@@ -33,6 +35,10 @@ impl PublishFence for LeaseFence {
         if let Some(path) = self.policy_change.lock().unwrap().take() {
             std::fs::write(path, b"*.rs text\n").unwrap();
         }
+        let _timeout = self
+            .policy_query_timeout
+            .swap(false, Ordering::SeqCst)
+            .then(crate::git_index_reader::timeout_next_config_for_test);
         commit()
     }
 }
@@ -159,6 +165,39 @@ fn v3_final_metadata_validation_runs_inside_the_ownership_fence() {
         .is_err());
     assert_eq!(fence.calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.pointer(), previous);
+}
+
+#[test]
+fn v3_unknown_policy_at_publication_is_pending_not_changed() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let fixture = Fixture::new();
+    fixture.bootstrap();
+    let previous = fixture.pointer();
+    let fence = LeaseFence::live();
+    fixture.driver.set_publish_fence(fence.clone());
+    let snapshot = fixture.validated_change();
+    fence.policy_query_timeout.store(true, Ordering::SeqCst);
+    let error = fixture
+        .driver
+        .build_own_generation(&fixture.access, &snapshot, false)
+        .err()
+        .expect("unknown policy must block publication");
+    assert!(
+        error
+            .reason
+            .contains(super::super::verification::POLICY_QUERY_UNDETERMINED),
+        "{error}"
+    );
+    assert!(
+        !error.reason.contains(CHECKOUT_CHANGED_BEFORE_INSTALL),
+        "{error}"
+    );
+    assert!(
+        super::super::trigram::bind_is_busy(&error.reason),
+        "{error}"
+    );
+    assert_eq!(fixture.pointer(), previous);
+    assert_eq!(fence.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

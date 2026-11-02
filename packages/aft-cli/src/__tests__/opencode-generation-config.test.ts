@@ -25,6 +25,7 @@ import {
 import {
   AFT_OPENCODE_PACKAGE,
   ensurePinnedPluginConfig,
+  exactPinnedVersion,
   MODERN_V1_VERSION,
   OPENCODE_HOST_PATCH_DISABLE_ENTRY,
   OPENCODE_HOST_SHELL_DISABLE_ENTRY,
@@ -650,7 +651,13 @@ function doctorFixture(
       message: "already present",
       configPath: configPaths.harnessConfig,
     }),
-    getPluginCacheInfo: () => ({ path: join(root, "cache"), exists: false }),
+    getPluginCacheInfo: () => ({
+      path: join(root, "cache"),
+      exists: false,
+      configuredEntry: pluginEntry,
+      version: exactPinnedVersion(pluginEntry) ?? undefined,
+      versionSource: "configured",
+    }),
     getStorageDir: () => join(root, "storage"),
     getLogFile: () => join(root, "aft-plugin.log"),
     getInstallHint: () => "fixture",
@@ -664,7 +671,7 @@ function doctorFixture(
     pluginRegistered: true,
     configPaths,
     aftConfig: { exists: false, enabled: true, flags: {} },
-    pluginCache: { path: join(root, "cache"), exists: false },
+    pluginCache: adapter.getPluginCacheInfo(),
     storageDir: { path: join(root, "storage"), exists: false, accessible: false, sizesByKey: {} },
     onnxRuntime: {
       required: false,
@@ -863,7 +870,7 @@ describe("OpenCode doctor generation and load path", () => {
     expect(result.problems).toEqual([]);
   });
 
-  test("still requires the exact plugin pin on V2", async () => {
+  test("V2 does not replace an unresolved dist-tag with the older doctor's pin", async () => {
     const root = tempRoot("aft-cli-doctor-v2-latest-");
     const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`);
     writeFileSync(fixture.harness.logFile.path, "load path: export-server-effect-node\n");
@@ -882,11 +889,9 @@ describe("OpenCode doctor generation and load path", () => {
     });
 
     const output = lines.join("\n");
-    expect(code).toBe(1);
+    expect(code).toBe(0);
     expect(output).toContain(
-      // Reworded for users: the line names why the entry is a problem and the
-      // exact entry doctor --fix writes, instead of "is not the required exact pin".
-      `the plugin entry ${AFT_OPENCODE_PACKAGE}@latest follows the newest release, which can differ from this CLI and its binary; run \`npx @cortexkit/aft doctor --fix\` to pin it to ${pinnedPluginEntry(getSelfVersion())}`,
+      `This doctor is AFT ${getSelfVersion()}; OpenCode is configured for AFT plugin latest. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.`,
     );
   });
 
@@ -1155,9 +1160,8 @@ describe("OpenCode plugin registration follows the host's key", () => {
 
   test("doctor --fix leaves both generations' keys intact in one config", async () => {
     const entry = pinnedPluginEntry(getSelfVersion());
-    // The V2 entry is stale on purpose. A config that already holds the exact
-    // pin is never rewritten, so only a config that forces a write can show
-    // what that write does to the other generation's key.
+    // Host-tool repairs still write the V2 list, but an unresolved tag is not
+    // proof that replacing its package spec with this CLI's pin is safe.
     const result = await runFixOverConfig("aft-cli-fix-both-keys-", "v2", {
       plugin: ["v1-only-plugin", entry],
       plugins: ["v2-only-plugin", `${AFT_OPENCODE_PACKAGE}@latest`],
@@ -1170,7 +1174,7 @@ describe("OpenCode plugin registration follows the host's key", () => {
       plugin: ["v1-only-plugin", entry],
       plugins: [
         "v2-only-plugin",
-        entry,
+        `${AFT_OPENCODE_PACKAGE}@latest`,
         OPENCODE_HOST_SHELL_DISABLE_ENTRY,
         OPENCODE_HOST_PATCH_DISABLE_ENTRY,
       ],
@@ -1185,7 +1189,7 @@ describe("OpenCode plugin registration follows the host's key", () => {
     });
 
     expect(result.server).toEqual({
-      plugin: ["v1-only-plugin", entry],
+      plugin: ["v1-only-plugin", `${AFT_OPENCODE_PACKAGE}@latest`],
       plugins: ["v2-only-plugin", entry],
     });
   });

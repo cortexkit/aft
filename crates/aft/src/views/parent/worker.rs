@@ -212,6 +212,7 @@ fn refresh_publications(session: &ParentSession) {
 /// Installs a new trigram snapshot for `child` and hands it to the child's
 /// search engine.
 fn install_trigram(session: &ParentSession, child: &Child, trigram: TrigramChild) {
+    session.note_child_success(child, "parent_trigram");
     let trigram = Arc::new(trigram);
     *write(&child.trigram) = Plane::Ready(Arc::clone(&trigram));
     super::engine::sync(session, child);
@@ -239,7 +240,7 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
     let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
-            session.note_child_failure(child, "parent_trigram", &error);
+            let error = session.note_child_failure(child, "parent_trigram", &error);
             *write(&child.trigram) = Plane::Gap(error);
             return;
         }
@@ -254,7 +255,7 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
         }
         Err(error) => {
             let error = format!("lexical view unavailable: {error}");
-            session.note_child_failure(child, "parent_trigram", &error);
+            let error = session.note_child_failure(child, "parent_trigram", &error);
             *write(&child.trigram) = Plane::Gap(error);
             return;
         }
@@ -295,7 +296,7 @@ fn refresh_trigram(session: &ParentSession, child: &Child) {
                 "the trigram index could not be read ({})",
                 degradation.reason
             );
-            session.note_child_failure(child, "parent_trigram", &error);
+            let error = session.note_child_failure(child, "parent_trigram", &error);
             *write(&child.trigram) = Plane::Gap(error);
             return;
         }
@@ -382,7 +383,7 @@ fn install_view_trigram(
         }
         Err(error) => {
             let error = format!("lexical view unreadable: {error}");
-            session.note_child_failure(child, "parent_trigram", &error);
+            let error = session.note_child_failure(child, "parent_trigram", &error);
             *write(&child.trigram) = Plane::Gap(error);
         }
     }
@@ -593,7 +594,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
-            session.note_child_failure(child, "parent_callgraph", &error);
+            let error = session.note_child_failure(child, "parent_callgraph", &error);
             *write(&child.callgraph) = Plane::Gap(error);
             return;
         }
@@ -618,7 +619,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
         }
         Err(error) => {
             let error = format!("call graph view unavailable: {error}");
-            session.note_child_failure(child, "parent_callgraph", &error);
+            let error = session.note_child_failure(child, "parent_callgraph", &error);
             *write(&child.callgraph) = Plane::Gap(error);
             return;
         }
@@ -644,6 +645,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
             child.loads.fetch_add(1, Ordering::SeqCst);
             // The store keeps the generation, and with it the generation's
             // read marker, for as long as the parent serves it.
+            session.note_child_success(child, "parent_callgraph");
             *write(&child.callgraph) = Plane::Ready(Arc::new(CallgraphChild {
                 store: Arc::new(store.retain_generation(generation)),
                 published,
@@ -656,7 +658,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
                 crate::callgraph_store::CallGraphStoreError::Unavailable(reason) => reason,
                 other => {
                     let error = format!("call graph view unreadable: {other}");
-                    session.note_child_failure(child, "parent_callgraph", &error);
+                    let error = session.note_child_failure(child, "parent_callgraph", &error);
                     error
                 }
             });
@@ -742,7 +744,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     let family = match child.family(session) {
         Ok(family) => family,
         Err(error) => {
-            session.note_child_failure(child, "parent_semantic", &error);
+            let error = session.note_child_failure(child, "parent_semantic", &error);
             *write(&child.semantic) = Plane::Gap(error);
             return;
         }
@@ -766,7 +768,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         }
         Err(error) => {
             let error = format!("semantic view unavailable: {error}");
-            session.note_child_failure(child, "parent_semantic", &error);
+            let error = session.note_child_failure(child, "parent_semantic", &error);
             *write(&child.semantic) = Plane::Gap(error);
             return;
         }
@@ -787,7 +789,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         Ok(reader) => Arc::new(reader),
         Err(error) => {
             let error = format!("semantic view unreadable: {error}");
-            session.note_child_failure(child, "parent_semantic", &error);
+            let error = session.note_child_failure(child, "parent_semantic", &error);
             *write(&child.semantic) = Plane::Gap(error);
             return;
         }
@@ -802,11 +804,12 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     // a small one.
     if let Err(error) = semantic.plane.open_generation(&access, &generation) {
         let error = format!("semantic view unavailable: {error}");
-        session.note_child_failure(child, "parent_semantic", &error);
+        let error = session.note_child_failure(child, "parent_semantic", &error);
         *write(&child.semantic) = Plane::Gap(error);
         return;
     }
     let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();
+    session.note_child_success(child, "parent_semantic");
     let previous = std::mem::replace(
         &mut *write(&child.semantic),
         Plane::Ready(Arc::new(SemanticChild {

@@ -59,10 +59,12 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // counted as a failed load or reported as an AFT bug. The graph also waits
     // until the legacy import finishes, or AFT verifies pending writes and
     // includes them in its installed snapshot. A repository at its live-base
-    // limit after cleanup (`BASE_CAP_BUSY`) is retried the same way.
+    // limit after cleanup (`BASE_CAP_BUSY`) is retried the same way. An unread
+    // policy is also pending: it proves neither a change nor a current view.
     checkout_changed_during_load(reason)
         || reason.contains("legacy text and symbol import building")
         || reason.contains(BASE_CAP_BUSY)
+        || reason.contains(super::verification::POLICY_QUERY_UNDETERMINED)
         || reason.contains("callgraph view has unverified writes (")
         || reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")

@@ -507,6 +507,11 @@ pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObserv
         {
             (IndexObservation::building(), true)
         }
+        crate::context::CallgraphStoreAccess::Error(
+            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
+        ) if crate::view_storage_reserve::is_message(message) => {
+            (IndexObservation::unavailable(message.clone()), false)
+        }
         crate::context::CallgraphStoreAccess::Error(error) => {
             (IndexObservation::unavailable(error.to_string()), false)
         }

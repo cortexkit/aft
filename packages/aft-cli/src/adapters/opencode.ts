@@ -12,8 +12,14 @@ import {
 import { formatFsError } from "../lib/fs-errors.js";
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
+import {
+  discoverLocalOpenCodePlugin,
+  discoverOpenCodePluginCache,
+  doctorInstalledVersion,
+} from "../lib/opencode-plugin-cache.js";
 import { getCortexKitStorageRoot } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { compareSemver } from "../lib/semver.js";
 import {
   detectOpenCodeHostGeneration,
   findExecutableOnPath,
@@ -22,7 +28,9 @@ import {
 import {
   AFT_OPENCODE_PACKAGE,
   aftHostReplacementEnabled,
+  doctorNoDowngradeMessage,
   ensurePinnedPluginConfig,
+  exactPinnedVersion,
   hostToolPluginDisabled,
   isAftNpmEntry,
   OPENCODE_HOST_TOOLS,
@@ -30,9 +38,11 @@ import {
   type OpenCodeHostTool,
   openCodePluginKey,
   openCodePluginReadKeys,
+  type PluginVersionPolicy,
   pinnedPluginEntry,
   pluginConfigNeedsUpdate,
   pluginEntryPackage,
+  preserveDoctorPluginEntry,
   setHostToolPluginDisabled,
 } from "../setup/opencode-config.js";
 import type {
@@ -275,14 +285,53 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return configRegistersAft(value, this.configGeneration());
   }
 
-  async ensurePluginEntry(): Promise<PluginEntryResult> {
+  async ensurePluginEntry(options: PluginVersionPolicy = {}): Promise<PluginEntryResult> {
     const paths = this.detectConfigPaths();
-    return this.ensureConfigEntry(paths.harnessConfig, paths.harnessConfigFormat, "server config");
+    return this.ensureConfigEntry(
+      paths.harnessConfig,
+      paths.harnessConfigFormat,
+      "server config",
+      options,
+    );
   }
 
-  needsPluginEntryUpdate(): boolean {
+  needsPluginEntryUpdate(options: PluginVersionPolicy = {}): boolean {
     const paths = this.detectConfigPaths();
-    return this.configEntryNeedsUpdate(paths.harnessConfig, paths.harnessConfigFormat);
+    return this.configEntryNeedsUpdate(paths.harnessConfig, paths.harnessConfigFormat, options);
+  }
+
+  doctorPluginEntry(tui = false): string {
+    const paths = this.detectConfigPaths();
+    const path = tui ? paths.tuiConfig : paths.harnessConfig;
+    const value = path ? readJsoncFile(path).value : null;
+    const policy = this.doctorVersionPolicy({ doctor: true });
+    if (!value) return policy.fallbackEntry ?? PLUGIN_ENTRY;
+    return ensurePinnedPluginConfig(
+      JSON.parse(JSON.stringify(value)),
+      getSelfVersion(),
+      pathPointsToOurPlugin,
+      this.configGeneration(),
+      policy,
+    ).entry;
+  }
+
+  private doctorVersionPolicy(policy: PluginVersionPolicy): PluginVersionPolicy {
+    if (!policy.doctor) return policy;
+    const cache = this.getPluginCacheInfo();
+    const installedVersion = doctorInstalledVersion(cache);
+    const configuredVersion = cache.configuredEntry
+      ? exactPinnedVersion(cache.configuredEntry)
+      : null;
+    const newer =
+      (configuredVersion && (compareSemver(configuredVersion, getSelfVersion()) ?? 0) > 0) ||
+      (cache.cached && (compareSemver(cache.cached, getSelfVersion()) ?? 0) > 0);
+    // A missing TUI entry is a new registration, not a replacement of the
+    // server's unresolved tag. Only known newer versions require carrying
+    // that server spec over instead of registering this CLI's exact version.
+    const fallbackEntry = newer
+      ? (cache.configuredEntry ?? (cache.cached ? pinnedPluginEntry(cache.cached) : undefined))
+      : undefined;
+    return { ...policy, installedVersion, fallbackEntry };
   }
 
   hasTuiPluginEntry(): boolean {
@@ -303,7 +352,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
    * the file there left a config the host never reads, which reads to a user
    * like a setup step that did something.
    */
-  async ensureTuiPluginEntry(): Promise<PluginEntryResult> {
+  async ensureTuiPluginEntry(options: PluginVersionPolicy = {}): Promise<PluginEntryResult> {
     const paths = this.detectConfigPaths();
     if (this.configGeneration() === "v2") {
       return {
@@ -322,21 +371,26 @@ export class OpenCodeAdapter implements HarnessAdapter {
         configPath: paths.configDir,
       };
     }
-    return this.ensureConfigEntry(paths.tuiConfig, paths.tuiConfigFormat ?? "none", "TUI config");
+    return this.ensureConfigEntry(
+      paths.tuiConfig,
+      paths.tuiConfigFormat ?? "none",
+      "TUI config",
+      options,
+    );
   }
 
   tuiPluginEntryApplies(): boolean {
     return this.configGeneration() !== "v2";
   }
 
-  needsTuiPluginEntryUpdate(): boolean {
+  needsTuiPluginEntryUpdate(options: PluginVersionPolicy = {}): boolean {
     // V2 has no TUI config to update: the host loads the plugin from its own
     // entrypoint, so reporting work here would make doctor offer a repair that
     // writes a file OpenCode 2 never reads.
     if (this.configGeneration() === "v2") return false;
     const paths = this.detectConfigPaths();
     return paths.tuiConfig
-      ? this.configEntryNeedsUpdate(paths.tuiConfig, paths.tuiConfigFormat ?? "none")
+      ? this.configEntryNeedsUpdate(paths.tuiConfig, paths.tuiConfigFormat ?? "none", options)
       : true;
   }
 
@@ -344,18 +398,21 @@ export class OpenCodeAdapter implements HarnessAdapter {
     configPath: string,
     format: HarnessConfigPaths["harnessConfigFormat"],
     label: string,
+    policy: PluginVersionPolicy = {},
   ): PluginEntryResult {
     const generation = this.configGeneration();
     const key = openCodePluginKey(generation);
+    policy = this.doctorVersionPolicy(policy);
+    const initialEntry = policy.fallbackEntry ?? PLUGIN_ENTRY;
     if (format === "none") {
       const failed = this.tryWrite(configPath, () =>
-        writeJsoncFile(configPath, { [key]: [PLUGIN_ENTRY] }, "json"),
+        writeJsoncFile(configPath, { [key]: [initialEntry] }, "json"),
       );
       if (failed) return failed;
       return {
         ok: true,
         action: "added",
-        message: `Created ${configPath} and added ${PLUGIN_ENTRY} under \`${key}\` (${label})`,
+        message: `Created ${configPath} and added ${initialEntry} under \`${key}\` (${label})`,
         configPath,
       };
     }
@@ -375,12 +432,29 @@ export class OpenCodeAdapter implements HarnessAdapter {
       getSelfVersion(),
       pathPointsToOurPlugin,
       generation,
+      policy,
     );
+    const preserved =
+      policy.doctor &&
+      preserveDoctorPluginEntry(
+        getSelfVersion(),
+        update.entry,
+        doctorInstalledVersion(this.getPluginCacheInfo()),
+      );
+    const notice = preserved
+      ? doctorNoDowngradeMessage(
+          getSelfVersion(),
+          update.entry,
+          doctorInstalledVersion(this.getPluginCacheInfo()),
+        )
+      : "";
     if (!update.changed) {
       return {
         ok: true,
         action: "already_present",
-        message: `${PLUGIN_ENTRY} is already registered under \`${update.key}\` in ${configPath}`,
+        message:
+          notice ||
+          `${update.entry} is already registered under \`${update.key}\` in ${configPath}`,
         configPath,
       };
     }
@@ -390,7 +464,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return {
       ok: true,
       action: update.action,
-      message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} under \`${update.key}\` in ${configPath} (${label})`,
+      message: `${update.action === "added" ? "Added" : "Updated"} ${update.entry} under \`${update.key}\` in ${configPath} (${label})${notice ? `. ${notice}` : ""}`,
       configPath,
     };
   }
@@ -506,6 +580,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
   private configEntryNeedsUpdate(
     configPath: string,
     format: HarnessConfigPaths["harnessConfigFormat"],
+    policy: PluginVersionPolicy = {},
   ): boolean {
     if (format === "none") return true;
     const { value, error } = readJsoncFile(configPath);
@@ -515,42 +590,32 @@ export class OpenCodeAdapter implements HarnessAdapter {
       getSelfVersion(),
       pathPointsToOurPlugin,
       this.configGeneration(),
+      this.doctorVersionPolicy(policy),
     );
   }
 
   getPluginCacheInfo(): PluginCacheInfo {
     const configPath = this.detectConfigPaths().harnessConfig;
     const { value } = readJsoncFile(configPath);
-    const configuredEntry = openCodePluginReadKeys(this.configGeneration())
+    const entries = openCodePluginReadKeys(this.configGeneration())
       .flatMap((key) => (Array.isArray(value?.[key]) ? (value[key] as unknown[]) : []))
-      .map(pluginEntryPackage)
-      .find(isAftNpmEntry);
-    const path = join(getOpenCodeCacheDir(), "packages", configuredEntry ?? PLUGIN_ENTRY);
-    let cached: string | undefined;
-    let readError: string | undefined;
-    try {
-      const installedPkgPath = join(
-        path,
-        "node_modules",
-        "@cortexkit",
-        "aft-opencode",
-        "package.json",
-      );
-      const pkg = JSON.parse(readFileSync(installedPkgPath, "utf-8")) as { version?: unknown };
-      cached = typeof pkg.version === "string" ? pkg.version : undefined;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        readError = error instanceof Error ? error.message : String(error);
-      }
+      .map(pluginEntryPackage);
+    const configuredEntry = entries.find(isAftNpmEntry);
+    if (!configuredEntry) {
+      const localEntry = entries.find((entry) => entry !== null && pathPointsToOurPlugin(entry));
+      const localPath = localEntry ? pathFromEntry(localEntry) : null;
+      const local = localPath
+        ? discoverLocalOpenCodePlugin(localPath, getSelfVersion())
+        : undefined;
+      if (local) return local;
     }
-    return {
-      path,
-      cached,
-      readError,
-      latest: getSelfVersion(),
-      exists: existsSync(path),
+    return discoverOpenCodePluginCache(
+      getOpenCodeCacheDir(),
+      configuredEntry ?? PLUGIN_ENTRY,
+      this.configGeneration(),
+      getSelfVersion(),
       configuredEntry,
-    };
+    );
   }
 
   getStorageDir(): string {
@@ -580,6 +645,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
     legacy_path_cleared?: string;
   }> {
     const info = this.getPluginCacheInfo();
+    if (info.local) return { action: "not_applicable", path: info.path };
     const clearLegacy = force ? clearLegacyOpenCodePluginCache(info.path) : { clearedPath: null };
     if (clearLegacy.error) {
       return {
@@ -598,12 +664,12 @@ export class OpenCodeAdapter implements HarnessAdapter {
           }
         : { action: "not_found", path: info.path };
     }
-    if (!force && info.cached && info.cached === info.latest) {
+    if (!force && info.cached && info.cached === info.cliVersion) {
       return {
         action: "up_to_date",
         path: info.path,
         cached: info.cached,
-        latest: info.latest,
+        latest: info.cliVersion,
       };
     }
     try {
@@ -612,7 +678,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
         action: "cleared",
         path: info.path,
         cached: info.cached,
-        latest: info.latest,
+        latest: info.cliVersion,
         ...(clearLegacy.clearedPath ? { legacy_path_cleared: clearLegacy.clearedPath } : {}),
       };
     } catch (error) {
@@ -620,7 +686,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
         action: "error",
         path: info.path,
         cached: info.cached,
-        latest: info.latest,
+        latest: info.cliVersion,
         error: error instanceof Error ? error.message : String(error),
       };
     }

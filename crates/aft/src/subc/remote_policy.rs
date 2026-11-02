@@ -221,7 +221,7 @@ fn catalog_inner(
             confined(ctx, identity)?,
         );
     }
-    let routing_policy = if preset == "worker"
+    let mut routing_policy = if preset == "worker"
         && (original.contains_key("remote_exec")
             || original.contains_key("siblings")
             || original.contains_key("confine"))
@@ -255,6 +255,26 @@ fn catalog_inner(
         }
     }
     access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    if let Some(policy) = routing_policy.as_mut().filter(|p| !p.siblings.is_empty()) {
+        let _scope =
+            crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(identity)));
+        let _grants =
+            crate::access_policy::scope_grants_guard(access_grants::scope_grants_denial(identity));
+        // Catalog discovery has no permission UI. Use the same scope and saved
+        // grants as file calls, but never turn an outside-access ask into approval.
+        let _ask =
+            crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+                once: vec![],
+                launch: access_grants::launch_key(identity, &preset),
+            }));
+        with_call_policy(ctx, identity, "tool.catalog", "read", json!({}), |_| {
+            policy.validate_siblings(ctx, "tool.catalog", &identity.session)
+        })
+        .unwrap_or(Err(crate::exec_remote::SIBLINGS_REFUSAL))
+        .map_err(|message| {
+            cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
+        })?;
+    }
     // A head preflighting a worker plan validates its override without changing
     // its own session. The actual worker fetch persists the override on its scope.
     if let Some(mode) = original

@@ -18,8 +18,57 @@ use std::path::Path;
 /// What a file under a member view is charged: the bytes it holds alone where
 /// the filesystem can report them, otherwise `allocated`, its `stat` charge.
 /// Never more than `allocated`.
+#[cfg(any(test, not(target_os = "macos")))]
 pub(super) fn charge(path: &Path, allocated: u64) -> u64 {
-    private_bytes(path).map_or(allocated, |bytes| bytes.min(allocated))
+    #[cfg(target_os = "macos")]
+    {
+        measure(path, allocated).0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        #[cfg(test)]
+        let _profile = super::work_profile::span("private_size_measurement");
+        allocated
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn measure(path: &Path, allocated: u64) -> (u64, bool) {
+    #[cfg(test)]
+    let _profile = super::work_profile::span("private_size_measurement");
+    #[cfg(test)]
+    let overridden = PRIVATE_BYTES.with(|probe| probe.borrow().as_ref().map(|probe| probe(path)));
+    #[cfg(test)]
+    let measured = overridden.unwrap_or_else(|| private_bytes(path));
+    #[cfg(not(test))]
+    let measured = private_bytes(path);
+    match measured {
+        Some(bytes) => (bytes.min(allocated), true),
+        // A failed native probe must be retried even if metadata is unchanged.
+        None => (allocated, false),
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static PRIVATE_BYTES: std::cell::RefCell<Option<Box<dyn Fn(&Path) -> Option<u64>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn with_private_bytes_for_test<T>(
+    probe: impl Fn(&Path) -> Option<u64> + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PRIVATE_BYTES.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    PRIVATE_BYTES.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    let _reset = Reset;
+    body()
 }
 
 /// `ATTR_CMNEXT_PRIVATESIZE`: the size of the file's data not shared with a
@@ -28,6 +77,8 @@ pub(super) fn charge(path: &Path, allocated: u64) -> u64 {
 /// volumes) or the call fails.
 #[cfg(target_os = "macos")]
 fn private_bytes(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    let _profile = super::work_profile::span("getattrlist_call");
     use std::os::unix::ffi::OsStrExt;
 
     // Attributes come back packed at 4-byte alignment after the length word:
@@ -69,11 +120,6 @@ fn private_bytes(path: &Path) -> Option<u64> {
     }
     let private_size = reply.private_size;
     u64::try_from(private_size).ok()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn private_bytes(_path: &Path) -> Option<u64> {
-    None
 }
 
 #[cfg(test)]

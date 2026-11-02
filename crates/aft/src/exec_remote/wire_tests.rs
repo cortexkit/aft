@@ -261,6 +261,8 @@ pub(crate) enum Script {
 
 pub(crate) struct Daemon {
     pub(crate) connection: std::path::PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) connections: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) acceptance_gate: Arc<tokio::sync::Notify>,
@@ -324,6 +326,8 @@ pub(crate) async fn daemon_with_capabilities(
     let key = vec![0x42; subc_transport::KEY_LEN];
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let log = Arc::new(Mutex::new(Vec::new()));
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_connections = connections.clone();
     let server_log = Arc::clone(&log);
     let acceptance_gate = Arc::new(tokio::sync::Notify::new());
     let server_acceptance_gate = acceptance_gate.clone();
@@ -341,6 +345,7 @@ pub(crate) async fn daemon_with_capabilities(
         let mut submission: Option<Value> = None;
         for _ in 0..clients {
             let (mut socket, _) = listener.accept().await.unwrap();
+            server_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             subc_transport::authenticate_server(
                 &mut socket,
                 &server_key,
@@ -1035,6 +1040,7 @@ pub(crate) async fn daemon_with_capabilities(
     .unwrap();
     Daemon {
         connection,
+        connections,
         log,
         acceptance_gate,
         output_gate,

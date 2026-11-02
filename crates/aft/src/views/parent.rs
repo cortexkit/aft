@@ -574,6 +574,8 @@ static CHILD_LOAD_FAILURES: std::sync::LazyLock<Mutex<HashMap<PathBuf, ChildLoad
 
 #[derive(Default)]
 struct ChildLoadFailures {
+    disk_reserve:
+        std::collections::BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     /// Keyed `parent_<plane>:<cause>`, like a context's own view load counts.
     by_cause: std::collections::BTreeMap<String, u64>,
     total: u64,
@@ -592,6 +594,7 @@ pub(crate) fn try_child_load_failures(
     Option<(
         std::collections::BTreeMap<String, u64>,
         Option<crate::context::ViewLoadFailure>,
+        std::collections::BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,
     )>,
 > {
     let failures = match CHILD_LOAD_FAILURES.try_lock() {
@@ -599,11 +602,13 @@ pub(crate) fn try_child_load_failures(
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return None,
     };
-    Some(
-        failures
-            .get(root)
-            .map(|failures| (failures.by_cause.clone(), failures.last.clone())),
-    )
+    Some(failures.get(root).map(|failures| {
+        (
+            failures.by_cause.clone(),
+            failures.last.clone(),
+            failures.disk_reserve.clone(),
+        )
+    }))
 }
 
 /// Counts a failed child view load under the parent `root` by plane and
@@ -611,7 +616,21 @@ pub(crate) fn try_child_load_failures(
 /// parent root's health, and logs it at error level at most once a minute per
 /// plane. A busy or locked store, or a child that changed mid-read, clears by
 /// itself and the worker retries it, so it is not counted.
-fn record_child_failure(root: &Path, child: &str, plane: &'static str, error: &str) {
+fn record_child_failure(
+    root: &Path,
+    child: &str,
+    plane: &'static str,
+    error: &str,
+    reserve: Option<crate::view_storage_reserve::DiskReserveCondition>,
+) {
+    if let Some(reserve) = reserve {
+        lock(&CHILD_LOAD_FAILURES)
+            .entry(root.to_path_buf())
+            .or_default()
+            .disk_reserve
+            .insert(child_reserve_key(child, plane), reserve);
+        return;
+    }
     if super::semantic_runtime::is_transient_reason(error) {
         return;
     }
@@ -674,7 +693,11 @@ pub(crate) fn record_child_failure_for_test(
     plane: &'static str,
     error: &str,
 ) {
-    record_child_failure(root, child, plane, error);
+    record_child_failure(root, child, plane, error, None);
+}
+
+fn child_reserve_key(child: &str, plane: &str) -> String {
+    format!("{plane}/{}", blake3::hash(child.as_bytes()).to_hex())
 }
 
 /// The parent session serving `ctx`'s root, when views are on.
@@ -1087,8 +1110,27 @@ impl ParentSession {
     /// Records a child view the worker failed to open or read: an I/O,
     /// verification or store error, not normal coverage such as a view the
     /// child has not published yet. See [`record_child_failure`].
-    pub(crate) fn note_child_failure(&self, child: &Child, plane: &'static str, error: &str) {
-        record_child_failure(&self.root, &child.display(), plane, error);
+    pub(crate) fn note_child_failure(
+        &self,
+        child: &Child,
+        plane: &'static str,
+        error: &str,
+    ) -> String {
+        let reserve =
+            crate::view_storage_reserve::DiskReserveCondition::observed(&self.storage, error);
+        let message = reserve
+            .as_ref()
+            .map_or_else(|| error.to_string(), |reserve| reserve.message.clone());
+        record_child_failure(&self.root, &child.display(), plane, error, reserve);
+        message
+    }
+
+    fn note_child_success(&self, child: &Child, plane: &str) {
+        if let Some(failures) = lock(&CHILD_LOAD_FAILURES).get_mut(&self.root) {
+            failures
+                .disk_reserve
+                .remove(&child_reserve_key(&child.display(), plane));
+        }
     }
 
     /// The children found so far; empty until discovery finishes.
