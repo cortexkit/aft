@@ -161,6 +161,7 @@ fn effective_identity(
     };
     let id = principal(policy).ok_or_else(|| super::chunks::refusal("session_not_bound"))?;
     Ok(RouteIdentity(Arc::new(RouteIdentityData {
+        output_scope: Default::default(),
         root: policy.root.clone(),
         project_root: policy.project_root.clone(),
         harness: policy.harness.clone(),

@@ -1959,6 +1959,7 @@ mod tests {
         routes.insert(
             route_key(1, 1),
             RouteIdentity(Arc::new(RouteIdentityData {
+                output_scope: Default::default(),
                 root: root.clone(),
                 project_root: root.as_path().to_path_buf(),
                 harness: "opencode".to_string(),

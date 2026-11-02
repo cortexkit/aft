@@ -105,6 +105,7 @@ fn data(
     scope: Option<ScopeStamp>,
 ) -> RouteIdentityData {
     RouteIdentityData {
+        output_scope: Default::default(),
         root: root(),
         project_root: root().as_path().to_path_buf(),
         harness: "runner".into(),

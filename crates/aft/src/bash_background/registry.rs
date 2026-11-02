@@ -3550,6 +3550,11 @@ impl BgTaskRegistry {
                 .project_root
                 .as_deref()
                 .unwrap_or(&metadata.workdir),
+            crate::tool_output::OutputScope::for_task(
+                &paths.session_dir,
+                &metadata.session_id,
+                self.clone(),
+            ),
         ) {
             crate::slog_info!(
                 "recovered bash reply phase=settle task={} reply_bytes={} outcome={outcome}",
@@ -21726,7 +21731,7 @@ mod tests {
                 call_key: "terminal".into(),
             };
             let (frame, _, retained_body) =
-                crate::subc::recovered_bash_frame(snapshot, &key, dir.path())
+                crate::subc::recovered_bash_frame(snapshot, &key, dir.path(), None)
                     .expect("terminal recovered frame");
             let retained = retained_body
                 .as_deref()

@@ -25,22 +25,77 @@ pub(crate) struct OutputFiles {
     files: Mutex<HashMap<PathBuf, Artifact>>,
 }
 
+/// A deferred subc tool reply can be sent after its AppContext is evicted.
+/// Capture only the private output store and task registry needed to save it,
+/// without retaining the project's indexes or other runtime state.
+pub(crate) struct OutputScope {
+    storage: PathBuf,
+    directory: PathBuf,
+    session: String,
+    files: std::sync::Arc<OutputFiles>,
+    bash: crate::bash_background::BgTaskRegistry,
+}
+
+impl std::fmt::Debug for OutputScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputScope")
+            .field("directory", &self.directory)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OutputScope {
+    pub(crate) fn new(ctx: &AppContext, session: &str, harness: Option<&str>) -> Self {
+        let storage = ctx.storage_dir();
+        let harness_root = harness
+            .and_then(|h| h.parse::<crate::harness::Harness>().ok())
+            .map(|h| storage.join(h.storage_segment()))
+            .unwrap_or_else(|| crate::bash_background::task_storage_dir(ctx));
+        Self {
+            directory: harness_root
+                .join("tool-results")
+                .join(crate::backup::hash_session(session)),
+            storage,
+            session: session.into(),
+            files: ctx.output_files_arc(),
+            bash: ctx.bash_background().clone(),
+        }
+    }
+
+    pub(crate) fn for_task(
+        session_dir: &Path,
+        session: &str,
+        bash: crate::bash_background::BgTaskRegistry,
+    ) -> Option<Self> {
+        let harness = session_dir.parent()?.parent()?;
+        Some(Self {
+            storage: harness.to_path_buf(),
+            directory: harness
+                .join("tool-results")
+                .join(crate::backup::hash_session(session)),
+            session: session.into(),
+            files: Default::default(),
+            bash,
+        })
+    }
+}
+
 impl OutputFiles {
-    fn save(&self, ctx: &AppContext, session: &str, text: &str) -> io::Result<PathBuf> {
+    fn session_dir(ctx: &AppContext, session: &str) -> PathBuf {
+        crate::bash_background::task_storage_dir(ctx)
+            .join("tool-results")
+            .join(crate::backup::hash_session(session))
+    }
+
+    fn save(&self, scope: &OutputScope, text: &str) -> io::Result<PathBuf> {
         if text.len() > SAVED_FILE_LIMIT {
             return Err(io::Error::other(
                 "full tool result exceeds the 64 MiB saved-file limit",
             ));
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = ctx.storage_dir();
-        let dir = root
-            .join(
-                ctx.harness_opt()
-                    .map_or("standalone", |h| h.storage_segment()),
-            )
-            .join("tool-results")
-            .join(crate::backup::hash_session(session));
+        let root = &scope.storage;
+        let dir = &scope.directory;
         crate::production_storage::refuse_write(&dir)?;
         crate::private_storage::open_dir(&root, &dir)?;
         let dir = dir.canonicalize()?;
@@ -74,7 +129,7 @@ impl OutputFiles {
             files.insert(
                 path.clone(),
                 Artifact {
-                    session: session.to_owned(),
+                    session: scope.session.clone(),
                     file: Mutex::new(file),
                 },
             );
@@ -88,6 +143,78 @@ impl OutputFiles {
             .lock()
             .get(&path)
             .map(|artifact| artifact.session.clone())
+    }
+
+    /// Reopen only generated names in the exact session namespace after an
+    /// actor has been evicted. A directory-prefix grant would expose other
+    /// private stores or another session's results.
+    pub(crate) fn restore(&self, ctx: &AppContext, session: &str, path: &Path) {
+        let Ok(path) = path.canonicalize() else {
+            return;
+        };
+        let path = crate::access_policy::policy_path(&path);
+        if self.owner(&path).is_some() || !generated_name(&path) {
+            return;
+        }
+        let dir = Self::session_dir(ctx, session);
+        let Some(namespace) = dir.parent() else {
+            return;
+        };
+        let Ok(namespace) = namespace.canonicalize() else {
+            return;
+        };
+        let expected = crate::access_policy::policy_path(&namespace)
+            .join(crate::backup::hash_session(session));
+        if !std::fs::symlink_metadata(&dir)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            || path.parent() != Some(expected.as_path())
+        {
+            return;
+        }
+        let reopen = || -> io::Result<File> {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.len() > SAVED_FILE_LIMIT as u64 {
+                return Err(io::Error::other("not a bounded tool result file"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(io::Error::other("tool result has multiple hard links"));
+                }
+            }
+            let mut options = crate::private_storage::options();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let file = options.open(&path)?;
+            let opened = crate::commands::file_read_exact::opened_location(&file)?;
+            if crate::access_policy::policy_path(&opened) != path || !file.metadata()?.is_file() {
+                return Err(io::Error::other("tool result file was replaced"));
+            }
+            Ok(file)
+        };
+        if let Ok(file) = reopen() {
+            self.files.lock().entry(path).or_insert_with(|| Artifact {
+                session: session.to_owned(),
+                file: Mutex::new(file),
+            });
+        }
+    }
+
+    pub(crate) fn is_result_path(&self, ctx: &AppContext, path: &Path) -> bool {
+        let Some(root) = Self::session_dir(ctx, "").parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        let Ok(root) = root.canonicalize() else {
+            return false;
+        };
+        let path = crate::access_policy::policy_path(path);
+        path.strip_prefix(crate::access_policy::policy_path(&root))
+            .is_ok_and(|relative| relative.components().count() == 2 && generated_name(&path))
     }
 
     pub(crate) fn read(&self, session: &str, path: &Path) -> Option<io::Result<Vec<u8>>> {
@@ -121,7 +248,7 @@ impl OutputFiles {
         })())
     }
 
-    pub(crate) fn cleanup_session(&self, session: &str) {
+    pub(crate) fn cleanup_session(&self, ctx: &AppContext, session: &str) {
         let mut files = self.files.lock();
         let paths: Vec<_> = files
             .iter()
@@ -136,7 +263,34 @@ impl OutputFiles {
                 let _ = std::fs::remove_dir(dir);
             }
         }
+        let dir = Self::session_dir(ctx, session);
+        if std::fs::symlink_metadata(&dir)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if generated_name(&path) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(dir);
+        }
     }
+}
+
+fn generated_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".txt"))
+        .is_some_and(|name| {
+            let pieces: Vec<_> = name.split('-').collect();
+            pieces.len() == 3
+                && pieces.iter().all(|piece| {
+                    !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
 }
 
 /// Called after reminders and the status bar, so the host never cuts off recovery text.
@@ -147,31 +301,41 @@ pub(crate) fn cap(
     response: &Response,
     text: &mut String,
 ) {
+    cap_with_scope(&OutputScope::new(ctx, session, None), tool, response, text);
+}
+
+pub(crate) fn cap_with_scope(
+    scope: &OutputScope,
+    tool: &str,
+    response: &Response,
+    text: &mut String,
+) {
     if text.len() <= TEXT_LIMIT {
         return;
     }
     let total = text.len();
-    let existing = matches!(tool, "bash" | "bash_watch" | "bash_status")
-        .then(|| response.data.get("output_path").and_then(serde_json::Value::as_str))
-        .flatten()
+    let existing = response.data.get("output_path").and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
-        .filter(|path| ctx.bash_background().is_session_owned_artifact_path(session, path))
+        .filter(|path| scope.bash.is_session_owned_artifact_path(&scope.session, path))
         // A task capture is reusable only if it contains the entire rendered reply,
         // not just stdout without stderr, formatting or appended reminders.
         .filter(|path| {
             std::fs::metadata(path).is_ok_and(|meta| meta.len() == total as u64)
-                && ctx.bash_background().read_artifact_path(session, path)
+                && scope.bash.read_artifact_path(&scope.session, path)
                     .is_some_and(|result| result.is_ok_and(|bytes| bytes == text.as_bytes()))
         });
     let path = existing
         .map(Ok)
-        .unwrap_or_else(|| ctx.output_files().save(ctx, session, text));
+        .unwrap_or_else(|| scope.files.save(scope, text));
     let trailer = match path {
         Ok(path) => CUT_TRAILER
             .replace("<total>", &format!("{:.1}", total as f64 / 1024.0))
             .replace("<path>", &path.display().to_string()),
         Err(error) => {
-            log::error!("could not save {tool} result for {session}: {error}");
+            log::error!(
+                "could not save {tool} result for {}: {error}",
+                scope.session
+            );
             *text = format!(
                 "Tool result unavailable: could not save the full {total}-byte result: {error}"
             );
@@ -423,15 +587,21 @@ mod tests {
         assert_eq!(response.data["content"], "2: second\n");
         let foreign = crate::commands::read::handle(&request("foreign"), &ctx);
         assert!(!foreign.success, "{foreign:?}");
-        // No root restriction must not turn another session's result into a public file.
+        // A second context for the same session can recover a persisted result.
+        let restored = context(&root, &temp.path().join("store"));
+        let restored_read = crate::commands::read::handle(&request("owner"), &restored);
+        assert!(restored_read.success, "{restored_read:?}");
+        assert_eq!(restored_read.data["content"], "2: second\n");
+        assert!(!crate::commands::read::handle(&request("foreign"), &restored).success);
         ctx.with_force_restrict("read-cap", || {
             assert!(ctx
                 .validate_read_path("read-cap", "foreign", &path)
                 .is_err());
         });
-        ctx.output_files().cleanup_session("foreign");
+        ctx.output_files().cleanup_session(&ctx, "foreign");
         assert!(path.exists());
-        ctx.output_files().cleanup_session("owner");
+        drop(restored);
+        ctx.output_files().cleanup_session(&ctx, "owner");
         assert!(!path.exists());
     }
 

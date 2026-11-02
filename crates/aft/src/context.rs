@@ -5060,7 +5060,7 @@ pub struct AppContext {
     repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
-    output_files: crate::tool_output::OutputFiles,
+    output_files: Arc<crate::tool_output::OutputFiles>,
     #[cfg(unix)]
     escalation_grants: parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
@@ -5879,7 +5879,7 @@ impl AppContext {
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
-            output_files: crate::tool_output::OutputFiles::default(),
+            output_files: Arc::default(),
             #[cfg(unix)]
             escalation_grants: parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),
@@ -8511,7 +8511,7 @@ impl AppContext {
         let ctx = Arc::clone(self);
         std::thread::spawn(move || {
             ctx.backup.lock().release_session_memory(&session);
-            ctx.output_files.cleanup_session(&session);
+            ctx.output_files.cleanup_session(&ctx, &session);
         })
     }
 
@@ -9635,6 +9635,10 @@ impl AppContext {
 
     pub(crate) fn output_files(&self) -> &crate::tool_output::OutputFiles {
         &self.output_files
+    }
+
+    pub(crate) fn output_files_arc(&self) -> Arc<crate::tool_output::OutputFiles> {
+        Arc::clone(&self.output_files)
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -16670,8 +16674,8 @@ impl AppContext {
         Ok((resolved, identity))
     }
 
-    /// Validate a read path. Registered bash output and a task's recorded
-    /// scratch directory may live outside the project root; their owning
+    /// Validate a read path. Saved tool results, registered bash output and a task's
+    /// recorded scratch directory may live outside the project root; their owning
     /// session may read them without an additional permission request. Mutating
     /// tools deliberately use
     /// [`AppContext::validate_path`] or [`AppContext::validate_write_location`]
@@ -16682,6 +16686,8 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.output_files
+            .restore(self, session_id, &self.resolve_relative_path(path));
         let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id), None);
         if crate::context::confinement::for_request(req_id) {
             // Canonical targets and symlink destinations are private outside the
@@ -17473,9 +17479,9 @@ impl AppContext {
                     .bash_background
                     .is_readable_task_path(session, &identity)
         });
-        if self.output_files.owner(&identity).is_some_and(|owner| {
-            operation != AccessOperation::Read || artifact_session != Some(owner.as_str())
-        }) {
+        if self.output_files.is_result_path(self, &identity)
+            && (operation != AccessOperation::Read || !owned_tool_output)
+        {
             return Err(crate::protocol::Response::error(
                 req_id,
                 "artifact_refused",

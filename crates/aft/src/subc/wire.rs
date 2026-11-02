@@ -263,12 +263,35 @@ impl WriterFrame {
     }
 
     pub(super) fn retained_tool_response(
-        frame: Frame,
+        mut frame: Frame,
         policy: ToolResponsePolicy,
         image_alt: Option<&str>,
     ) -> Self {
+        if let Some(scope) = &policy.output_scope {
+            if let Ok(mut result) = retained_tool_result(&frame.body) {
+                if result.text.len() > crate::tool_output::TEXT_LIMIT {
+                    crate::tool_output::cap_with_scope(
+                        scope,
+                        "retained tool",
+                        &result.response,
+                        &mut result.text,
+                    );
+                    if let Ok(rebuilt) = build_legacy_tool_response_frame(
+                        frame.header.ver,
+                        route_key(frame.header.channel, frame.header.epoch),
+                        frame.header.corr,
+                        frame.header.flags,
+                        &result,
+                        policy.trust,
+                        MAX_FRAME_BODY_LEN as usize,
+                    ) {
+                        frame = rebuilt;
+                    }
+                }
+            }
+        }
         let mut outgoing = Self::plain(frame);
-        outgoing.response_policy = Some(policy);
+        outgoing.response_policy = Some(policy.clone());
         if policy.tool_result_body {
             let source = if outgoing.header.ty == FrameType::Response {
                 if outgoing.frame.body.len() >= super::result_body::MAX_RESULT_BYTES {
@@ -449,7 +472,11 @@ impl WriterFrame {
     /// A failed ledger write may report the result, but must not bypass the
     /// recipient's projection by quoting the complete retained legacy body.
     pub(super) fn settlement_error_body(&self) -> Cow<'_, [u8]> {
-        if !self.response_policy.is_some_and(|policy| policy.model_only) {
+        if !self
+            .response_policy
+            .as_ref()
+            .is_some_and(|policy| policy.model_only)
+        {
             return Cow::Borrowed(&self.frame.body);
         }
         if let Some(body) = &self.prepared_projection {
@@ -1080,11 +1107,12 @@ fn response_too_large_frame(
 // harnesses: Thalamus shares `opencode` with AFT's own plugin, which needs diffs.
 const LLM_RUNNER_PRINCIPALS: &[&str] = &["reserved:broca", "reserved:thalamus-harness"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ToolResponsePolicy {
     pub(super) trust: BindTrust,
     pub(super) tool_result_body: bool,
     pub(super) model_only: bool,
+    pub(super) output_scope: Option<Arc<crate::tool_output::OutputScope>>,
 }
 
 impl ToolResponsePolicy {
@@ -1095,6 +1123,7 @@ impl ToolResponsePolicy {
             trust: BindTrust::FirstParty,
             tool_result_body: true,
             model_only: false,
+            output_scope: None,
         }
     }
 
@@ -1132,6 +1161,7 @@ impl From<BindTrust> for ToolResponsePolicy {
             trust,
             tool_result_body: false,
             model_only: false,
+            output_scope: None,
         }
     }
 }
@@ -1149,6 +1179,7 @@ impl From<&super::RouteIdentity> for ToolResponsePolicy {
             // Programs read arbitrary fields. Only positively identified
             // ordinary calls lose structured data; flow and unknown modes keep it.
             model_only: identity.call_mode == subc_protocol::call_mode::CallMode::Classic && runner,
+            output_scope: identity.output_scope.get().cloned(),
         }
     }
 }
@@ -1210,6 +1241,25 @@ pub(super) fn build_tool_response_frame_with_limit(
     max_body_len: usize,
 ) -> Result<WriterFrame, SubcError> {
     let policy = policy.into();
+    let mut capped;
+    let result = if result.text.len() > crate::tool_output::TEXT_LIMIT {
+        if let Some(scope) = &policy.output_scope {
+            capped = ToolCallResult {
+                text: result.text.clone(),
+                response: Response {
+                    id: result.response.id.clone(),
+                    success: result.response.success,
+                    data: result.response.data.clone(),
+                },
+            };
+            crate::tool_output::cap_with_scope(scope, "tool", &capped.response, &mut capped.text);
+            &capped
+        } else {
+            result
+        }
+    } else {
+        result
+    };
     let trust = policy.trust;
     if !policy.tool_result_body {
         let frame =
@@ -1263,7 +1313,7 @@ pub(super) fn build_tool_response_frame_with_limit(
         }
     }
     let mut outgoing = WriterFrame::plain(frame);
-    outgoing.response_policy = Some(policy);
+    outgoing.response_policy = Some(policy.clone());
     outgoing.result_projection = Some((policy, max_body_len, Some(source)));
     Ok(outgoing)
 }
@@ -2032,6 +2082,48 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn tool_output_cap_codemode_keeps_full_structured_content() {
+        use subc_protocol::call_mode::CallMode;
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.path().into()),
+                ..Default::default()
+            },
+        )
+        .with_test_checkpoint_store();
+        let original = "structured body\n".repeat(20_000);
+        let result = ToolCallResult {
+            text: original.clone(),
+            response: Response::success("id", json!({"output":original})),
+        };
+        for principal in [
+            "reserved:broca",
+            "reserved:thalamus-harness",
+            "reserved:basal",
+        ] {
+            let route = result_route(Some(principal), "opencode", CallMode::Codemode);
+            route
+                .output_scope
+                .set(Arc::new(crate::tool_output::OutputScope::new(
+                    &ctx,
+                    "result-session",
+                    Some("opencode"),
+                )))
+                .unwrap();
+            let body: Value =
+                serde_json::from_slice(&projected_result_body(&result, &route)).unwrap();
+            assert!(body["content"][0]["text"].as_str().unwrap().len() <= 51_200);
+            assert_eq!(body["structuredContent"]["output"], original);
+            assert!(body["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("[output cut at 50 KB of "));
+        }
+    }
+
+    #[test]
     fn plugin_results_keep_full_structured_content() {
         use subc_protocol::call_mode::CallMode;
         for harness in ["opencode", "pi"] {
@@ -2138,6 +2230,7 @@ pub(super) mod tests {
                 trust: BindTrust::FirstParty,
                 tool_result_body: true,
                 model_only: false,
+                output_scope: None,
             },
         ))
         .unwrap();
@@ -2153,7 +2246,8 @@ pub(super) mod tests {
                 ToolResponsePolicy {
                     trust: BindTrust::Untrusted,
                     tool_result_body: true,
-                    model_only: false
+                    model_only: false,
+                    output_scope: None,
                 }
             ),
         );

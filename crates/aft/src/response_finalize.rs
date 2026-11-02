@@ -10,6 +10,15 @@ use serde_json::Value;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
+fn cap_response_text(response: &mut Response, ctx: &AppContext, session: &str, tool: &str) {
+    if response.data.get("text").is_some_and(Value::is_string) {
+        if let Value::String(mut text) = response.data["text"].take() {
+            crate::tool_output::cap(ctx, session, tool, response, &mut text);
+            response.data["text"] = Value::String(text);
+        }
+    }
+}
+
 pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
@@ -112,12 +121,7 @@ pub fn finalize_response_with_bg_completions(
             }
         }
     }
-    if response.data.get("text").is_some_and(Value::is_string) {
-        if let Value::String(mut text) = response.data["text"].take() {
-            crate::tool_output::cap(ctx, session_id, attach_command, response, &mut text);
-            response.data["text"] = Value::String(text);
-        }
-    }
+    cap_response_text(response, ctx, session_id, attach_command);
 }
 
 /// Finalization for a tool result whose agent-visible text is held apart from the response
@@ -270,7 +274,7 @@ pub fn finalize_response_for_dispatch_root(
         allow_bg_completions,
     );
     attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
-    enforce_response_ceiling(attach_command, response);
+    cap_response_text(response, ctx, session_id, attach_command);
 }
 
 fn attach_alert_block(

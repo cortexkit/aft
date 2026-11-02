@@ -5323,6 +5323,7 @@ pub(in crate::subc) mod route_tests {
         let ctx = test_support::test_ctx();
         ctx.mark_database_runtime_initializing_for_test();
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
             harness: "runner".into(),
@@ -6616,6 +6617,7 @@ pub(in crate::subc) mod route_tests {
         let ctx = runner_restore_context(&root);
         let project_id = ProjectRootId::from_path(&project).unwrap();
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: project_id,
             project_root: project.clone(),
             harness: "runner".into(),
@@ -7305,6 +7307,7 @@ pub(in crate::subc) mod route_tests {
             crate::db::open(&storage.path().join("aft.db")).unwrap(),
         )));
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: ProjectRootId::from_path(&root).unwrap(),
             project_root: root.clone(),
             harness: "runner".into(),
