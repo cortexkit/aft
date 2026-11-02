@@ -520,16 +520,30 @@ describe("the pin message and doctor --fix agree", () => {
     }
   });
 
-  test("on V2 any other version is reported and --fix rewrites it to the same entry", () => {
-    const entry = `${AFT_OPENCODE_PACKAGE}@latest`;
+  test("on V2 an older exact pin is reported and --fix rewrites it to the same entry", () => {
+    const entry = `${AFT_OPENCODE_PACKAGE}@0.0.1`;
     const problems = problemsFor(entry, v2());
     expect(problems[0]).toContain(`pin it to ${pinned}`);
-    expect(pluginConfigNeedsUpdate({ plugins: [entry] }, getSelfVersion(), () => false, "v2")).toBe(
-      true,
-    );
+    expect(
+      pluginConfigNeedsUpdate({ plugins: [entry] }, getSelfVersion(), () => false, "v2", {
+        doctor: true,
+      }),
+    ).toBe(true);
     const config: Record<string, unknown> = { plugins: [entry] };
-    ensurePinnedPluginConfig(config, getSelfVersion(), () => false, "v2");
+    ensurePinnedPluginConfig(config, getSelfVersion(), () => false, "v2", { doctor: true });
     expect(config.plugins).toEqual([pinned]);
+  });
+
+  test("on V2 newer pins and unresolved tags do not authorize a downgrade", () => {
+    for (const entry of [`${AFT_OPENCODE_PACKAGE}@99.0.0`, `${AFT_OPENCODE_PACKAGE}@latest`]) {
+      expect(problemsFor(entry, v2())).toEqual([]);
+      const config: Record<string, unknown> = { plugins: [entry] };
+      expect(
+        pluginConfigNeedsUpdate(config, getSelfVersion(), () => false, "v2", { doctor: true }),
+      ).toBe(false);
+      ensurePinnedPluginConfig(config, getSelfVersion(), () => false, "v2", { doctor: true });
+      expect(config.plugins).toEqual([entry]);
+    }
   });
 });
 

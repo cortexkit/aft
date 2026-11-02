@@ -30,6 +30,8 @@ export interface ResolvedNpm {
    * `#!/usr/bin/env node` shebang can find its sibling node. Null when the
    * command was found via the OS PATH resolver and no augmentation is needed. */
   binDir: string | null;
+  /** npm's own CLI when invoking it directly with Node instead of a command shim. */
+  cliPath?: string;
 }
 
 /** Executable and arguments suitable for Node's child-process APIs. */
@@ -206,6 +208,25 @@ export function resolveNpm(deps: ResolveNpmDeps = defaultDeps()): ResolvedNpm | 
   return null;
 }
 
+/** All discovery candidates, so protected installs can skip incompatible PATH wrappers. */
+export function npmCandidates(deps: ResolveNpmDeps = defaultDeps()): ResolvedNpm[] {
+  const name = npmBinaryName(deps.platform);
+  const dirs = [
+    ...(deps.env.PATH ?? "").split(deps.platform === "win32" ? ";" : ":").filter(isAbsolute),
+    dirname(deps.execPath),
+    ...wellKnownNpmDirs(deps),
+  ];
+  return [...new Set(dirs)].flatMap((binDir) => {
+    return [
+      join(binDir, name),
+      join(binDir, "node_modules", "npm", "bin", "npm-cli.js"),
+      join(binDir, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    ]
+      .filter(isFile)
+      .map((command) => ({ command, binDir }));
+  });
+}
+
 function quoteCmdArgument(value: string): string {
   // cmd.exe expands percent variables even inside quotes, while quotes and line
   // breaks can terminate the argument and append another command. npm's current
@@ -232,6 +253,7 @@ export function npmInvocation(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
 ): NpmInvocation {
+  if (resolved.cliPath) return { command: resolved.command, args: [resolved.cliPath, ...npmArgs] };
   if (platform !== "win32" || !/\.(?:cmd|bat)$/i.test(resolved.command)) {
     return { command: resolved.command, args: [...npmArgs] };
   }

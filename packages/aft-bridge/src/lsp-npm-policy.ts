@@ -92,10 +92,11 @@ function probeNpmCutoffSupport(npm: ResolvedNpm, clock: BridgeClock): Promise<Np
 }
 
 async function npmSupportsCutoff(npm: ResolvedNpm, clock: BridgeClock): Promise<NpmProbeOutcome> {
-  const identity = await stat(npm.command)
+  const key = npm.cliPath ? `${npm.command}\0${npm.cliPath}` : npm.command;
+  const identity = await stat(npm.cliPath ?? npm.command)
     .then(({ size, mtimeMs }) => ({ size, mtimeMs }))
     .catch(() => undefined);
-  const existing = npmCutoffSupport.get(npm.command);
+  const existing = npmCutoffSupport.get(key);
   const sameIdentity =
     existing &&
     existing.identity?.size === identity?.size &&
@@ -120,7 +121,7 @@ async function npmSupportsCutoff(npm: ResolvedNpm, clock: BridgeClock): Promise<
       return outcome;
     });
   const entry: NpmCutoffEntry = { identity, pending };
-  npmCutoffSupport.set(npm.command, entry);
+  npmCutoffSupport.set(key, entry);
   return pending;
 }
 
