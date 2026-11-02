@@ -10052,6 +10052,11 @@ impl AppContext {
         self.remove_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
     }
 
+    #[cfg(test)]
+    pub(crate) fn view_load_failure_total_for_test(&self) -> u64 {
+        self.view_load_health.lock().total
+    }
+
     /// Suppressed error-log repeats for `plane` since its last emission.
     /// Tests use it to prove the per-minute throttle without wall-clock waits.
     #[cfg(test)]

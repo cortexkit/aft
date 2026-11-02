@@ -116,7 +116,7 @@ impl HeldFamily {
             .collect();
         std::fs::write(
             root.join("lib.rs"),
-            "pub fn caller() { target(); target(); }\npub fn target() {}\n",
+            "pub fn caller() { target(); }\npub fn worktree_only() { target(); }\npub fn target() {}\n",
         )
         .unwrap();
         let worker = AppContext::new(
@@ -154,6 +154,7 @@ impl HeldFamily {
 
     fn assert_no_failure(&self) {
         let health = self.worker.try_health_snapshot(&self.root);
+        assert_eq!(self.worker.view_load_failure_total_for_test(), 0);
         assert!(health.view_load_failures.is_empty(), "{health:?}");
         assert!(health.view_load_failure_last.is_none(), "{health:?}");
         assert!(!self

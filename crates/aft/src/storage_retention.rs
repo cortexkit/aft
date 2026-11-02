@@ -6145,9 +6145,10 @@ pub(crate) fn evict_least_recent_v3_member(
     Ok(None)
 }
 
-/// Give a write refused for insufficient free device space a bounded chance
-/// to free its family's unused databases. The reservation lock stays held through the
-/// caller's subsequent space check; no registry barrier is held on entry.
+/// Give admission blocked by the free-device-space floor or the family's
+/// live-base count limit a bounded chance to free unused databases. The reservation
+/// lock stays held through the caller's subsequent admission check; no registry
+/// barrier is held on entry.
 /// Returns whether any database was removed, so an unsuccessful walk can be throttled.
 pub(crate) fn reclaim_v3_admission_family(
     storage: &Path,
