@@ -1587,6 +1587,7 @@ impl SemanticPlane {
         if owner.registry().storage() != self.storage {
             return Err(plane_error("view belongs to another storage root"));
         }
+        let _connections = crate::blob_store::v3::FillConnections::new();
         let resident = self
             .pinned_resident(access.family(), access.scope(), snapshot)
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
@@ -5963,6 +5964,7 @@ mod v3_store_tests {
         }
         drop(store);
         for pass in 0..2 {
+            let _connections = crate::blob_store::v3::FillConnections::new();
             let store = SemanticStore::V3(route.clone(), std::sync::OnceLock::new());
             crate::blob_store::v3::work_profile::take();
             let started = Instant::now();
@@ -5973,7 +5975,19 @@ mod v3_store_tests {
                 assert_eq!(store.get(&key).unwrap(), Some(b"run".to_vec()));
                 assert!(store.touch(&[key]).unwrap().missing.is_empty());
             }
-            eprintln!("FILL_MEASUREMENT pass={pass} views=8 files=2048 batches=4 wall_ms={:.3} profile={:?}", started.elapsed().as_secs_f64() * 1000.0, crate::blob_store::v3::work_profile::take());
+            let profile = crate::blob_store::v3::work_profile::take();
+            eprintln!("FILL_MEASUREMENT pass={pass} views=8 files=2048 batches=4 wall_ms={:.3} profile={profile:?}", started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(profile.get("namespace_walk").unwrap().0, 20);
+            assert!(
+                profile.get("connection_open").unwrap().0 <= 3,
+                "{profile:?}"
+            );
+            if pass == 1 {
+                assert!(
+                    !profile.contains_key("private_size_measurement"),
+                    "{profile:?}"
+                );
+            }
         }
     }
 

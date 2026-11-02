@@ -7,6 +7,41 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, MutexGuard, OnceLock, Weak};
 
+thread_local! {
+    static FILLS: std::cell::RefCell<Vec<Vec<Arc<Database>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Keeps each database owner alive across a fill's short-lived readers and
+/// publications. It retains no mutex guard, SQLite transaction or storage-root
+/// reservation lock.
+pub(crate) struct FillConnections(std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl FillConnections {
+    pub(crate) fn new() -> Self {
+        FILLS.with(|fills| fills.borrow_mut().push(Vec::new()));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for FillConnections {
+    fn drop(&mut self) {
+        // Drop connections outside the RefCell borrow: closing a database can
+        // invoke SQLite hooks that inspect other shared database owners.
+        let owners = FILLS.with(|fills| fills.borrow_mut().pop());
+        drop(owners);
+    }
+}
+
+fn retain_for_fill(database: &Arc<Database>) {
+    FILLS.with(|fills| {
+        if let Some(owners) = fills.borrow_mut().last_mut() {
+            if !owners.iter().any(|owner| Arc::ptr_eq(owner, database)) {
+                owners.push(database.clone());
+            }
+        }
+    });
+}
+
 enum Slot {
     Open {
         connection: IdentityConnection,
@@ -145,6 +180,7 @@ pub(super) fn shared(
         // cache: admission can hold one connection while looking up another ledger.
         drop(cache);
         database.prepare(path, create, readonly)?;
+        retain_for_fill(&database);
         return Ok(database);
     }
     // The cache lock spans creation so two first opens cannot acquire separate
@@ -159,5 +195,6 @@ pub(super) fn shared(
         }),
     });
     cache.insert(canonical, Arc::downgrade(&database));
+    retain_for_fill(&database);
     Ok(database)
 }

@@ -35,8 +35,10 @@ pub const SYMBOL_RETENTION_SWEEPS: i64 = 8;
 const TIMEOUT_MS: i64 = 5_000;
 pub(crate) const BUSY_PREFIX: &str = "v3 store busy: ";
 mod connections;
+pub(crate) use connections::FillConnections;
 mod copy;
 mod initialization;
+mod inventory;
 #[cfg(test)]
 mod layout_gate;
 #[cfg(test)]
@@ -477,7 +479,7 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
     #[cfg(test)]
     let _profile = work_profile::span("namespace_walk");
-    walk_allocated(path, deadline, Level::Family)
+    inventory::measure(path, deadline)
 }
 
 /// Where a walk is inside a family directory.
@@ -515,13 +517,17 @@ impl Level {
     }
 }
 
-fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Result<Option<u64>> {
-    let mut total = 0u64;
+fn walk_allocated(
+    path: &Path,
+    deadline: Option<Instant>,
+    level: Level,
+    entries: &mut std::collections::BTreeMap<PathBuf, inventory::Entry>,
+) -> Result<bool> {
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
     {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Ok(None);
+            return Ok(false);
         }
         #[cfg(test)]
         WALK_DELAY.with(|delay| {
@@ -553,18 +559,23 @@ fn walk_allocated(path: &Path, deadline: Option<Instant>, level: Level) -> Resul
             }
         };
         if meta.is_dir() {
+            entries.insert(path.clone(), inventory::Entry::new(&meta, false, false));
             let child = level.child(&entry.file_name());
-            let Some(bytes) = walk_allocated(&entry.path(), deadline, child)? else {
-                return Ok(None);
-            };
-            total = total.saturating_add(bytes);
-        } else if level == Level::Member && meta.is_file() {
-            total = total.saturating_add(unshared::charge(&path, file_allocated(&meta)));
+            if !walk_allocated(&path, deadline, child, entries)? {
+                return Ok(false);
+            }
         } else {
-            total = total.saturating_add(file_allocated(&meta));
+            entries.insert(
+                path,
+                inventory::Entry::new(
+                    &meta,
+                    level == Level::Member && meta.is_file(),
+                    matches!(level, Level::Member | Level::Base) && meta.is_file(),
+                ),
+            );
         }
     }
-    Ok(Some(total))
+    Ok(true)
 }
 
 /// The bytes one non-directory entry is charged in the namespace inventory.
