@@ -32674,12 +32674,17 @@ edition = "2021"
         let view = callgraph_fixture_view(&root, &files);
         for snapshot in [&legacy, &view] {
             assert_projected_call(&root, snapshot, "pkg/impl.py", "factory");
-            assert_projected_call(&root, snapshot, "pkg/impl.py", "Widget::__init__");
+            assert_projected_call(&root, snapshot, "pkg/impl.py", "__init__");
             assert!(snapshot
                 .outbound_calls
                 .iter()
+                .all(|call| matches!(call.caller_symbol.as_str(), "outer" | "inner")));
+            assert_eq!(snapshot.outbound_calls.len(), 3);
+            assert!(snapshot
+                .outbound_calls
+                .iter()
+                .filter(|call| call.target != "public")
                 .all(|call| call.caller_symbol == "outer"));
-            assert_eq!(snapshot.outbound_calls.len(), 2);
         }
         assert_eq!(projection_rows(&legacy), projection_rows(&view));
     }

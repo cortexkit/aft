@@ -233,7 +233,7 @@ fn callgraph_python_definition_headers_use_defining_scope() {
             (4, "outer"),
             (4, "outer"),
             (4, "outer"),
-            (11, "Container")
+            (10, "Container")
         ]
     );
     assert!(sites.iter().all(|site| !site.approximate()));
