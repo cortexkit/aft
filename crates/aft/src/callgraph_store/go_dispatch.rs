@@ -19,7 +19,9 @@ fn nodes(node: Node<'_>) -> Vec<Node<'_>> {
 fn nominal_type(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "type_identifier" => Some(text(node, source).to_string()),
-        "pointer_type" => nominal_type(node.named_child(0)?, source),
+        "pointer_type" if node.named_child(0)?.kind() == "type_identifier" => {
+            nominal_type(node.named_child(0)?, source)
+        }
         _ => None,
     }
 }
@@ -60,14 +62,18 @@ fn scope(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn binding_names(node: Node<'_>, source: &str) -> Vec<String> {
     match node.kind() {
-        "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" => {
+        "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" | "const_spec" => {
             let mut cursor = node.walk();
             node.children_by_field_name("name", &mut cursor)
                 .map(|n| text(n, source).to_string())
                 .collect()
         }
-        "short_var_declaration" | "range_clause" | "receive_statement" => node
+        "short_var_declaration"
+        | "range_clause"
+        | "receive_statement"
+        | "type_switch_statement" => node
             .child_by_field_name("left")
+            .or_else(|| node.child_by_field_name("alias"))
             .map(|n| {
                 n.named_children(&mut n.walk())
                     .map(|n| text(n, source).to_string())
@@ -145,7 +151,10 @@ fn receiver_type(call: Node<'_>, parsed: &ParsedDispatchSource, receiver: &str) 
             .any(|name| name == receiver)
     });
     let declaration = bindings.next()?;
-    if bindings.next().is_some() || !contains(scope(declaration)?, call) {
+    if bindings.next().is_some()
+        || declaration.kind() == "variadic_parameter_declaration"
+        || !contains(scope(declaration)?, call)
+    {
         return None;
     }
     let ty = if let Some(ty) = declaration.child_by_field_name("type") {

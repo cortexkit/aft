@@ -222,7 +222,7 @@ fn go_concrete_factory_return_and_local_declarations_bind_exactly() {
 fn go_concrete_binding_refuses_shadows_interfaces_and_nonlocal_packages() {
     let fixture = Fixture::from_files(&[
         ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype I interface { run() }\nfunc factory() *T { return &T{} }\n"),
-        ("caller_test.go", "package p\nfunc shadowed(x *T) { { x := unknown(); x.run() }; x.run() }\nfunc localType() { type T struct{}; var x T; x.run() }\nfunc shadowFactory(factory func() I) { x := factory(); x.run() }\nfunc contract(x I) { x.run() }\nfunc sibling() { { var x T }; x.run() }\nfunc closure(x *T) { f := func(x I) { x.run() }; _ = f }\nfunc unknown() I { return nil }\n"),
+        ("caller_test.go", "package p\nfunc shadowed(x *T) { { x := unknown(); x.run() }; x.run() }\nfunc localType() { type T struct{}; var x T; x.run() }\nfunc shadowFactory(factory func() I) { x := factory(); x.run() }\nfunc contract(x I) { x.run() }\nfunc sibling() { { var x T }; x.run() }\nfunc closure(x *T) { f := func(x I) { x.run() }; _ = f }\nfunc switched(x *T, value any) { switch x := value.(type) { case I: x.run() } }\nfunc variadic(x ...T) { x.run() }\nfunc pointer(x **T) { x.run() }\nfunc unknown() I { return nil }\n"),
         ("external_test.go", "package p_test\nfunc outsider(x *T) { x.run() }\n"),
     ]);
     assert!(go_typed_edges(&fixture.store).is_empty());

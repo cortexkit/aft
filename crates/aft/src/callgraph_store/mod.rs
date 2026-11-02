@@ -17540,20 +17540,16 @@ fn resolve_go_target<I: ResolverIndex>(
         }
         // An object selector is not a package-level symbol lookup. Leave
         // it for receiver-aware dispatch rather than binding its bare name.
-        let import = caller_data
-            .import_block
-            .imports
-            .iter()
-            .find(|import| {
-                let raw_alias = import.raw_text.split('"').next().unwrap_or("").trim();
-                import.default_import.as_deref().unwrap_or_else(|| {
-                    if !raw_alias.is_empty() {
-                        raw_alias
-                    } else {
-                        import.module_path.rsplit('/').next().unwrap_or("")
-                    }
-                }) == alias
-            })?;
+        let import = caller_data.import_block.imports.iter().find(|import| {
+            let raw_alias = import.raw_text.split('"').next().unwrap_or("").trim();
+            import.default_import.as_deref().unwrap_or_else(|| {
+                if !raw_alias.is_empty() {
+                    raw_alias
+                } else {
+                    import.module_path.rsplit('/').next().unwrap_or("")
+                }
+            }) == alias
+        })?;
         Some(import.module_path.as_str())
     } else {
         None
