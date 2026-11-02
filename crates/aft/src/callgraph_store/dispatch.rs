@@ -1750,6 +1750,9 @@ impl<'a> Resolver<'a> {
                 if candidate.language != parse.language {
                     continue;
                 }
+                if parse.language == "go" && candidate.dispatch.go_package.is_none() {
+                    continue;
+                }
                 {
                     let implements = method.trait_name.as_deref().is_some_and(|name| {
                         self.project_type(candidate_file, name)

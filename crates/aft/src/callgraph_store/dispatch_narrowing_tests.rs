@@ -160,6 +160,7 @@ fn go_method_answers(conn: &Connection) -> Vec<(String, String, String, String, 
 fn go_view_answers(
     fixture: &Fixture,
     package_known: bool,
+    unknown_file: Option<&str>,
 ) -> Vec<(String, String, String, String, u32)> {
     use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
     let temp = tempfile::tempdir_in(fixture.temp.path()).unwrap();
@@ -172,7 +173,7 @@ fn go_view_answers(
         let blob =
             join::CallgraphBlob::extract(&source, "go", crate::views::callgraph::PRODUCER).unwrap();
         let mut value = serde_json::to_value(&blob).unwrap();
-        if !package_known {
+        if !package_known || unknown_file == Some(relative_path(&fixture.root, &path).as_str()) {
             value["dispatch"]
                 .as_object_mut()
                 .unwrap()
@@ -216,7 +217,7 @@ fn go_view_answers(
 
 fn assert_go_concrete_view_parity(fixture: &Fixture, has_interface: bool) {
     let legacy = go_method_answers(&fixture.store.conn.lock().unwrap());
-    let mut viewed = go_view_answers(fixture, true);
+    let mut viewed = go_view_answers(fixture, true, None);
     // A known interface receiver deliberately retains declaration/implementation
     // fan-out in views; the retiring store only resolves concrete receivers.
     let interface = viewed
@@ -335,7 +336,21 @@ fn go_concrete_missing_package_fact_is_unknown_in_views() {
     ]);
     assert_go_concrete_view_parity(&fixture, false);
     assert_eq!(go_typed_edges(&fixture.store).len(), 1);
-    assert!(go_view_answers(&fixture, false).is_empty());
+    assert!(go_view_answers(&fixture, false, None).is_empty());
+    let mixed = Fixture::from_files(&[
+        ("interface.go", "package p\ntype I interface { run() }\n"),
+        (
+            "types.go",
+            "package p\ntype T struct{}\nfunc (x *T) run() {}\n",
+        ),
+        ("caller.go", "package p\nfunc contract(x I) { x.run() }\n"),
+    ]);
+    let viewed = go_view_answers(&mixed, true, Some("types.go"));
+    assert_eq!(viewed.len(), 1);
+    assert_eq!(
+        viewed[0].3, "I::run",
+        "an old implementation fact cannot acquire a binding without package identity"
+    );
 }
 
 /// A cold-built fixture store that edit shapes are applied to.
