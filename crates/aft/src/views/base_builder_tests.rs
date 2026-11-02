@@ -68,19 +68,14 @@ fn live_base_cap_reclaims_unreferenced_bases_then_admits() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     let scopes = capped_bases(storage.path());
-    let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let walks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _hook = crate::storage_retention::observe_test_hook(
         storage.path(),
         std::sync::Arc::new({
-            let storage = storage.path().to_path_buf();
-            let concurrent = concurrent.clone();
+            let walks = walks.clone();
             move |step| {
                 if step == "v3-pressure-reclaim-started" {
-                    assert!(matches!(
-                        claim_base(&storage, FAMILY, &scope(201), None).unwrap(),
-                        ClaimOutcome::Reclaiming
-                    ));
-                    concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    walks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }),
@@ -95,7 +90,7 @@ fn live_base_cap_reclaims_unreferenced_bases_then_admits() {
         .any(|scope| !v3::view_dir(storage.path(), FAMILY, scope)
             .unwrap()
             .exists()));
-    assert_eq!(concurrent.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -214,6 +209,25 @@ fn concurrent_different_bases_below_cap_never_wait_for_the_reclaim_gate() {
 }
 
 #[test]
+fn capped_claim_retries_a_busy_reclaim_gate_at_the_live_claim_cadence() {
+    let _serial = v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    capped_bases(storage.path());
+    let cooldown = v3::floor_reclaim_cooldown(storage.path(), FAMILY);
+    let _gate = cooldown.lock().unwrap();
+    assert!(matches!(
+        claim_base(storage.path(), FAMILY, &scope(200), None).unwrap(),
+        ClaimOutcome::Reclaiming
+    ));
+    for waited in [std::time::Duration::ZERO, LIVE_CLAIM_WAIT] {
+        assert!(matches!(
+            plan_binder(storage.path(), FAMILY, &scope(200), waited),
+            BinderPlan::Wait { remaining } if remaining == CLAIM_HEARTBEAT
+        ));
+    }
+}
+
+#[test]
 fn two_claimants_of_one_base_produce_exactly_one_build() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
@@ -226,7 +240,7 @@ fn two_claimants_of_one_base_produce_exactly_one_build() {
                     ClaimOutcome::Claimed(_claim) => {
                         builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    ClaimOutcome::Busy { .. } | ClaimOutcome::Reclaiming => {}
+                    ClaimOutcome::Busy { .. } => {}
                     other => panic!("{other:?}"),
                 },
             );
@@ -343,7 +357,7 @@ fn the_live_base_cap_counts_claims_and_registered_bases_and_records_hits() {
     assert_eq!(hits, 1);
     assert!(matches!(
         plan_binder(storage.path(), FAMILY, &scope(6), std::time::Duration::ZERO),
-        BinderPlan::Wait { .. }
+        BinderPlan::Wait { remaining } if remaining == std::time::Duration::from_secs(60)
     ));
 }
 

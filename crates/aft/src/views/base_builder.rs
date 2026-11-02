@@ -268,8 +268,8 @@ pub enum ClaimOutcome {
     Claimed(BuildClaim),
     /// A live owner (running, stopped, or of uncertain liveness) holds it.
     Busy { owner_pid: u32, attempt: i64 },
-    /// Another call is claiming or reclaiming in this family; retry without
-    /// waiting behind its reservation lock or reclaim I/O.
+    /// This claim hit the live-base count limit while another reclaim holds
+    /// the family's gate; retry at the live-claim polling cadence.
     Reclaiming,
     /// The family already has the ruled number of live bases; the cap hit is
     /// counted in `sweep_state.live_base_cap_hits`.
@@ -294,17 +294,17 @@ pub fn claim_base(
     scope: &str,
     observer: Option<&dyn DurabilityObserver>,
 ) -> Result<ClaimOutcome> {
-    // Take the nonblocking family gate before the reservation lock. Otherwise
-    // a second claimant could queue behind the very reclaim it should skip.
-    let cooldown = v3::floor_reclaim_cooldown(storage, family);
-    let mut retry_at = match cooldown.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return Ok(ClaimOutcome::Reclaiming),
-    };
     let lock = v3::ReservationLock::acquire(storage)?;
     let (outcome, dead_attempt) = claim_base_locked(storage, family, scope, &lock, true)?;
     let (outcome, dead_attempt) = if matches!(outcome, ClaimOutcome::CapReached { .. }) {
+        // Only capped claims take this gate. An ordinary claim must not be
+        // deferred because another worktree is claiming a different base.
+        let cooldown = v3::floor_reclaim_cooldown(storage, family);
+        let mut retry_at = match cooldown.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(ClaimOutcome::Reclaiming),
+        };
         v3::reclaim_admission_family(storage, family, &lock, &mut retry_at, |lock| {
             claim_base_locked(storage, family, scope, lock, false)
         })
@@ -313,7 +313,6 @@ pub fn claim_base(
         (outcome, dead_attempt)
     };
     drop(lock);
-    drop(retry_at);
     if let ClaimOutcome::Claimed(claim) = &outcome {
         if let Some((attempt, token)) = dead_attempt {
             claim.remove_dead_staging(attempt, &token)?;
@@ -727,7 +726,10 @@ pub fn plan_binder(
         Ok(ClaimOutcome::Busy { .. }) => BinderPlan::Wait {
             remaining: LIVE_CLAIM_WAIT - waited,
         },
-        Ok(ClaimOutcome::CapReached { .. } | ClaimOutcome::Reclaiming) => BinderPlan::Wait {
+        Ok(ClaimOutcome::Reclaiming) => BinderPlan::Wait {
+            remaining: CLAIM_HEARTBEAT,
+        },
+        Ok(ClaimOutcome::CapReached { .. }) => BinderPlan::Wait {
             remaining: std::time::Duration::from_secs(60),
         },
         Err(_) => BinderPlan::Strict("claim_failed"),
