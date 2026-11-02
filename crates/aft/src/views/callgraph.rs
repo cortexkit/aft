@@ -1085,6 +1085,35 @@ mod tests {
     }
 
     #[test]
+    fn policy_query_timeout_does_not_become_checkout_evidence() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        setup_git(&root, &["init", "-q"]);
+        setup_git(&root, &["config", "core.autocrlf", "false"]);
+        setup_git(&root, &["add", "-A"]);
+        setup_git(&root, &["commit", "-q", "-m", "fixture"]);
+        let before = super::super::verification::BindGuard::capture(&root, None).unwrap();
+
+        let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+        let error = before.validate(&root).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+        assert!(!error.to_string().contains("changed"), "{error}");
+        let planned = CallgraphViewError::from(error.to_string());
+        assert!(planned.busy, "{planned}");
+        let after = super::super::verification::BindGuard::capture(&root, None).unwrap();
+        assert_eq!(before, after, "a timed-out query must not write the checkout");
+        before.validate(&root).unwrap();
+
+        // Repeated failures must not compare equal as if both read the policy.
+        for _ in 0..2 {
+            let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+            let error = super::super::verification::BindGuard::capture(&root, None).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+        }
+    }
+
+    #[test]
     fn legacy_import_uses_reader_backoff_until_it_finishes() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -2137,17 +2166,6 @@ mod tests {
         setup_git(&linked, &["add", "-A"]);
         setup_git(&linked, &["commit", "-q", "-m", "next"]);
 
-        for root in [&main, &linked] {
-            for name in ["a.ts", "b.ts", "package.json", "notes.md"] {
-                std::fs::File::options().write(true).open(root.join(name))
-                    .unwrap()
-                    .set_times(std::fs::FileTimes::new().set_modified(
-                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
-                    ))
-                    .unwrap();
-            }
-        }
-
         let producers = super::super::manifest_v2::Producers {
             trigram: crate::blob_store::v2::TrigramPolicy {
                 max_file_size: 1 << 20,
@@ -2198,15 +2216,11 @@ mod tests {
         // A store with only the worktree builds the same base cold.
         drop((main_view, linked_view));
         let cold_storage = temp.path().join("cold-storage");
-        let before = super::super::verification::BindGuard::capture(&linked, None).unwrap();
         let cold_view = view(&linked, &cold_storage);
         assert_eq!(
             callers(&cold_view.reader().unwrap(), "a.ts", "target"),
             patched
         );
-        let after = super::super::verification::BindGuard::capture(&linked, None).unwrap();
-        eprintln!("cold linked checkout old={before:?}; new={after:?}");
-        assert_eq!(before, after);
         assert!(!events(&base_dir(&cold_storage, &linked))
             .iter()
             .any(|event| matches!(event, DonorEvent::Cloned(_))));

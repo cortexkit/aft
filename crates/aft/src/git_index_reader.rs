@@ -624,6 +624,27 @@ pub struct GitQueries {
     spawned: AtomicU64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONFIG_TIMEOUT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ConfigTimeoutGuard(bool);
+
+#[cfg(test)]
+impl Drop for ConfigTimeoutGuard {
+    fn drop(&mut self) {
+        CONFIG_TIMEOUT_ONCE.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Expire one real config child at its native pipe deadline without a sleep.
+#[cfg(test)]
+pub(crate) fn timeout_next_config_for_test() -> ConfigTimeoutGuard {
+    ConfigTimeoutGuard(CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(true)))
+}
+
 impl GitQueries {
     pub fn new(root: PathBuf, timeout: Duration) -> Self {
         Self {
@@ -706,14 +727,6 @@ impl GitQueries {
     }
 
     fn run(&self, args: &[&str], input: Vec<u8>) -> io::Result<Output> {
-        #[cfg(test)]
-        let index_before = crate::views::verification::gitdir(&self.root)
-            .ok()
-            .map(|dir| dir.join("index"))
-            .map(|path| {
-                let stat = crate::views::verification::NativeStat::strict_read(&path);
-                (path, stat.ok())
-            });
         let mut command = Command::new("git");
         command
             .current_dir(&self.root)
@@ -722,15 +735,16 @@ impl GitQueries {
             .env("LC_ALL", "C");
         #[cfg(test)]
         crate::test_env::apply_hermetic_git_env(&mut command);
-        let result = pump(&mut command, input, self.timeout, &self.spawned);
+        let timeout = self.timeout;
         #[cfg(test)]
-        if let Some((path, before)) = index_before {
-            let after = crate::views::verification::NativeStat::strict_read(&path).ok();
-            if before != after || !result.as_ref().is_ok_and(|output| output.status.success()) {
-                eprintln!("Git query {args:?} at {:?}: {result:?}; index {path:?}: old={before:?}; new={after:?}", self.root);
-            }
-        }
-        result.map_err(|error| {
+        let timeout = if args.first() == Some(&"config")
+            && CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(false))
+        {
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        pump(&mut command, input, timeout, &self.spawned).map_err(|error| {
             crate::views::io::at(
                 &format!("running git {} in", args.join(" ")),
                 &self.root,
@@ -760,8 +774,6 @@ fn pump(
         .stderr(Stdio::piped())
         .spawn()?;
     spawned.fetch_add(1, Ordering::Relaxed);
-    #[cfg(test)]
-    eprintln!("metadata child pid={} cwd={:?} args={:?}", child.id(), command.get_current_dir(), command.get_args().collect::<Vec<_>>());
     crate::views::io::WORK
         .git_subprocesses
         .fetch_add(1, Ordering::Relaxed);
@@ -830,6 +842,8 @@ fn pump(
         }
     })();
     if result.is_err() {
+        #[cfg(test)]
+        eprintln!("metadata child pid={} cwd={:?} args={:?} failed: {result:?}", child.id(), command.get_current_dir(), command.get_args().collect::<Vec<_>>());
         crate::format::kill_process_tree(&mut child);
         let _ = child.wait();
     }

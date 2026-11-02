@@ -911,7 +911,7 @@ impl BindGuard {
         let current = Self::capture(root, None)?;
         if &current != self {
             #[cfg(test)]
-            eprintln!("checkout guard changed at {root:?}: old={self:?}; new={current:?}");
+            eprintln!("verification mismatch: index {:?}/index old={:?} new={:?}; policy old={:?} new={:?}", self.gitdir, self.index, current.index, self.policy, current.policy);
             return Err(at(
                 "validating checkout",
                 root,
