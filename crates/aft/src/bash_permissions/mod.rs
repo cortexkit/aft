@@ -82,7 +82,7 @@ fn path_is_under(root: &Path, path: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
+pub(crate) fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return normalize_path(&canonical);
     }

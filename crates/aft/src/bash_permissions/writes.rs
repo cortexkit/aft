@@ -1,10 +1,8 @@
 //! Best-effort literal write targets for the runon preflight, not a shell sandbox.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-
-use regex::Regex;
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser};
 
 use super::scan::{command_parts, walk_shell_commands};
 
@@ -218,20 +216,132 @@ fn patch_input(
         .unwrap_or_default()
 }
 
-fn inline_paths(code: &str) -> Vec<String> {
-    static WRITES: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-        r#"(?x)(?:\bopen\(\s*['"]([^'"\n]+)['"]\s*,\s*['"][wa](?:[bt+]{0,2})['"]|\b(?:Path|pathlib\.Path)\(\s*['"]([^'"\n]+)['"]\s*\)\.write_text\s*\(|\b(?:fs\.)?writeFileSync\(\s*['"]([^'"\n]+)['"]\s*,)"#
-    ).expect("literal write regex")
-    });
-    WRITES
-        .captures_iter(code)
-        .filter_map(|capture| {
-            let path = (1..=3).find_map(|i| capture.get(i))?.as_str();
-            // Do not interpret interpolation or escape sequences as literal paths.
-            literal(path)
-        })
-        .collect()
+fn inline_paths(code: &str, javascript: bool) -> Vec<String> {
+    fn text<'a>(node: Node<'_>, code: &'a str) -> &'a str {
+        node.utf8_text(code.as_bytes()).unwrap_or("")
+    }
+    fn string(node: Node<'_>, code: &str) -> Option<String> {
+        let raw = text(node, code);
+        (node.kind() == "string" && (raw.starts_with('\'') || raw.starts_with('"')))
+            .then(|| literal(raw))
+            .flatten()
+    }
+    fn path(node: Node<'_>, code: &str, bindings: &HashMap<String, String>) -> Option<String> {
+        if node.kind() == "identifier" {
+            return bindings.get(text(node, code)).cloned();
+        }
+        if let Some(value) = string(node, code) {
+            return Some(value);
+        }
+        if node.kind() == "call" {
+            let name = text(node.child_by_field_name("function")?, code);
+            if matches!(name, "Path" | "pathlib.Path") {
+                return string(node.child_by_field_name("arguments")?.named_child(0)?, code);
+            }
+        }
+        None
+    }
+    fn visit(
+        node: Node<'_>,
+        code: &str,
+        bindings: &mut HashMap<String, String>,
+        out: &mut Vec<String>,
+    ) {
+        if matches!(
+            node.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "arrow_function"
+                | "lambda"
+                | "class_definition"
+        ) {
+            return;
+        }
+        if matches!(
+            node.kind(),
+            "assignment" | "variable_declarator" | "assignment_expression"
+        ) {
+            let left = node
+                .child_by_field_name("left")
+                .or_else(|| node.child_by_field_name("name"));
+            let right = node
+                .child_by_field_name("right")
+                .or_else(|| node.child_by_field_name("value"));
+            if let Some(left) = left.filter(|left| left.kind() == "identifier") {
+                let name = text(left, code).to_string();
+                // Only straight-line, top-level assignments establish literals.
+                let mut parent = node.parent();
+                let mut straight_line = true;
+                while let Some(ancestor) = parent {
+                    if !matches!(
+                        ancestor.kind(),
+                        "module"
+                            | "program"
+                            | "expression_statement"
+                            | "lexical_declaration"
+                            | "variable_declaration"
+                    ) {
+                        straight_line = false;
+                    }
+                    parent = ancestor.parent();
+                }
+                let value = right
+                    .filter(|_| straight_line)
+                    .and_then(|right| path(right, code, bindings));
+                bindings.remove(&name);
+                if let Some(value) = value {
+                    bindings.insert(name, value);
+                }
+            }
+        }
+        if matches!(node.kind(), "call" | "call_expression") {
+            if let (Some(function), Some(arguments)) = (
+                node.child_by_field_name("function"),
+                node.child_by_field_name("arguments"),
+            ) {
+                let name = text(function, code);
+                let first = arguments.named_child(0);
+                let target = if name == "open"
+                    && arguments
+                        .named_child(1)
+                        .and_then(|n| string(n, code))
+                        .is_some_and(|mode| mode.starts_with(['w', 'a']))
+                {
+                    first.and_then(|node| path(node, code, bindings))
+                } else if name == "writeFileSync" || name.ends_with(".writeFileSync") {
+                    first.and_then(|node| path(node, code, bindings))
+                } else if name.ends_with(".write_text") {
+                    function
+                        .child_by_field_name("object")
+                        .and_then(|object| path(object, code, bindings))
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    out.push(target);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            visit(child, code, bindings, out);
+        }
+    }
+    let mut parser = Parser::new();
+    let language = if javascript {
+        tree_sitter_javascript::LANGUAGE.into()
+    } else {
+        tree_sitter_python::LANGUAGE.into()
+    };
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(code, None) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    visit(tree.root_node(), code, &mut HashMap::new(), &mut paths);
+    paths
 }
 
 fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathBuf> {
@@ -413,7 +523,8 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
                     }
                 })
                 .or_else(|| heredoc(source, wrapper));
-            code.map(|code| inline_paths(&code)).unwrap_or_default()
+            code.map(|code| inline_paths(&code, head == "node"))
+                .unwrap_or_default()
         }
         _ => Vec::new(),
     };

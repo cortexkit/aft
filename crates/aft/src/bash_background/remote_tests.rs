@@ -12315,8 +12315,7 @@ async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = remote_test_context(dir.path());
-    let command =
-        "python3 - <<'PY' && cargo nextest run\nopen('source.rs', 'w').write('source')\nPY";
+    let command = "python3 - <<'PY' && cargo nextest run\np = 'source.rs'\nt = 'source'\nopen(p, 'w').write(t)\nPY";
     let response = handle_with_policy(
         &ctx,
         Some(launch(daemon.connection.clone())),
