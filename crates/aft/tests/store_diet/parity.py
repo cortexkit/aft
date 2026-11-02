@@ -50,22 +50,32 @@ def manifest(symbols):
     for symbol in sample(symbols, 500):
         path, name = symbol.split('\0', 1)
         for op in ['callers', 'call_tree', 'impact']:
-            requests.append({'command': op, 'file': path, 'symbol': name, 'include_tests': True})
-        requests.append({'command': 'zoom', 'file': path, 'symbol': name, 'callgraph': True})
-        requests.append({'command': 'semantic_search', 'query': name, 'include_tests': True})
+            requests.append(tool_request('callgraph', {'op': op, 'path': path, 'symbol': name, 'includeTests': True}))
+        requests.append(tool_request('zoom', {'batch': [{'target': path, 'symbols': name}], 'callgraph': True}))
+        requests.append(tool_request('search', {'query': name, 'includeTests': True}))
     for symbol, other_symbol in sample_pairs(symbols):
         path, name = symbol.split('\0', 1)
         other_path, other = other_symbol.split('\0', 1)
-        requests.append({'command': 'trace_to', 'file': path, 'symbol': name})
-        requests.append({'command': 'trace_to_symbol', 'file': path, 'symbol': name, 'toSymbol': other, 'toFile': other_path})
-        requests.append({'command': 'trace_data', 'file': path, 'symbol': name, 'expression': 'value'})
+        requests.append(tool_request('callgraph', {'op': 'trace_to', 'path': path, 'symbol': name}))
+        requests.append(tool_request('callgraph', {'op': 'trace_to_symbol', 'path': path, 'symbol': name, 'toSymbol': other, 'toPath': other_path}))
+        requests.append(tool_request('callgraph', {'op': 'trace_data', 'path': path, 'symbol': name, 'expression': 'value'}))
     for section in ['dead_code', 'unused_exports', 'cycles']:
-        requests.append({'command': 'inspect', 'sections': [section]})
+        requests.append(tool_request('inspect', {'sections': [section]}))
     return [dict(request, id=f'parity-{i:05}') for i, request in enumerate(requests)]
 
 
+def tool_request(name, arguments):
+    return {'command': 'tool_call', 'name': name, 'arguments': arguments}
+
+
+def operation(request):
+    if request['command'] == 'tool_call':
+        return request['arguments'].get('op', request['name'])
+    return request['command']
+
+
 def pending_reply(request, reply):
-    if request['command'] == 'inspect' and reply.get('code') == 'inspect_not_fresh':
+    if operation(request) == 'inspect' and reply.get('code') == 'inspect_not_fresh':
         return True
     graph = (reply.get('index') or {}).get('callgraph') or {}
     return graph.get('reason') == 'identity_provisional' or graph.get('status') in {'building', 'refreshing'}
@@ -103,7 +113,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
                AFT_CALLGRAPH_BUILD_WAIT_MS=str(timeout * 1000), AFT_TEST_DISABLE_FILE_WATCHER='1')
     trust_selected_checkout(env, root)
     frames = queue.Queue()
-    successes = {request['command']: 0 for request in requests}
+    successes = {operation(request): 0 for request in requests}
     borrowed = 0
     with (output / 'stderr.txt').open('wb') as stderr:
         process = subprocess.Popen([str(binary.resolve())], cwd=root,
@@ -146,7 +156,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
                                     process.stdin.flush()
                                     continue
                                 (output / (request['id'] + '.reply')).write_bytes(line)
-                                successes[request['command']] += int(value.get('success') is True)
+                                successes[operation(request)] += int(value.get('success') is True)
                                 borrowed += int(bool(value.get('borrowed_callgraph')))
                             break
                         assert value.get('id') is None, f'unexpected reply: {line!r}'

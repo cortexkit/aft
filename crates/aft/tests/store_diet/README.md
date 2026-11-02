@@ -18,7 +18,9 @@ There are two complementary runners:
    through the production materializer, then uses the same CallGraphStore reader
    with manifest_view set. It does not simulate borrowing/publication.
 2. `parity.py` drives an actual standalone AFT binary over newline-delimited JSON
-   (NDJSON). It sends one
+   (NDJSON), using canonical `tool_call` arguments rather than backend-only
+   argument spellings. The replies include the real agent-facing formatted text
+   as well as structured results. It sends one
    request at a time, keeps push frames separate, waits for its matching reply,
    uses isolated empty caches, and compares complete reply lines as bytes. Its
    seeded manifest includes callers/call_tree/impact (up to 500 symbols), three

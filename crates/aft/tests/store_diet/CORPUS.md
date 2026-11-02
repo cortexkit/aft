@@ -28,8 +28,12 @@ from unrelated fixture projects cannot change resolution.
 
 New inputs are not an invented replacement language suite. The C# overload
 program pins same-named overload/arity behavior. The Rust default-trait/dynamic
-receiver program exercises a single dispatch identity offered with different
-provenances. Each has a `new_for` obligation in the manifest. A one-byte invalid
+receiver program exercises default-method dispatch. The actual writer probe
+separately supplies one dispatch identity with two provenances and checks its
+last-write winner. The top-level TS and final Java inputs cover the otherwise
+missing file-summary/top-caller values and `closed=true`, the flag indicating
+a final class cannot have overriding subclasses. Each authored input has
+a `new_for` obligation in the manifest. A one-byte invalid
 UTF-8 source in the lifecycle probe exists solely to exercise the legitimate
 `undecodable` backend status. Its valid Rust companion reuses the established
 f/g call shape; stale marking uses the production `mark_files_stale` API.
@@ -80,3 +84,11 @@ must decode rows back to these logical values and compare to the frozen oracle,
 not regenerate a new expected result. The general standalone runner remains
 available for the separately pinned AFT/reth trees and prepared borrowed graphs;
 this fixture corpus is not a substitute for those full-tree acceptance runs.
+
+Data-flow input selection is separate from graph-node selection: synthetic
+package-initializer scopes and overload storage suffixes are not valid source
+selectors. The data manifest samples source-addressable origins with a committed
+identifier-expression set, up to 100 distinct origin/expression pairs. It never
+rewrites an absolute path out of an error reply. Non-addressable graph scopes
+remain covered by callers/tree/impact/trace graph queries and stored-value
+observations; source-selector failures are not manufactured as data-flow inputs.

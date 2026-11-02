@@ -3334,8 +3334,8 @@
  #[cfg(test)]
 --- a/crates/aft/tests/store_diet/harness.rs
 +++ b/crates/aft/tests/store_diet/harness.rs
-@@ -158,7 +158,7 @@
- ) -> TestViewBuild {
+@@ -167,7 +167,7 @@
+ ) -> std::result::Result<TestViewBuild, String> {
      use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
      let blobs = temp.join("blobs.sqlite");
 -    let connection = Connection::open(&blobs).unwrap();
@@ -3343,7 +3343,7 @@
      connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
      let mut entries = Vec::new();
      let mut shapes = BTreeMap::<String, usize>::new();
-@@ -322,7 +322,7 @@
+@@ -331,7 +331,7 @@
      // Other databases and transaction-local tables do not live in a finished
      // graph fixture. Keep their schemas on a separate in-memory connection.
      // Actual graph plans always use the real fixture's schema first.
@@ -3352,14 +3352,35 @@
      let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
      for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
          let _ = auxiliary.execute_batch(&sql.unwrap());
-@@ -840,7 +840,7 @@
-     drop(reader);
-     let base = Manifest::new(built.entries.clone()).unwrap();
-     let mut entries = built.entries;
--    let connection = Connection::open(&built.blobs).unwrap();
-+    let connection = crate::db::store_diet_trace::open(&built.blobs).unwrap();
+@@ -945,9 +945,9 @@
+     for reverse in [false, true] {
+         let copy = directory.join(format!("copy-{reverse}.sqlite"));
+         let source_connection =
+-            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
++            crate::db::store_diet_trace::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                 .unwrap();
+-        let mut destination = Connection::open(&copy).unwrap();
++        let mut destination = crate::db::store_diet_trace::open(&copy).unwrap();
+         rusqlite::backup::Backup::new(&source_connection, &mut destination)
+             .unwrap()
+             .run_to_completion(64, std::time::Duration::from_millis(0), None)
+@@ -970,7 +970,7 @@
+             "{error}"
+         );
+         let connection =
+-            Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
++            crate::db::store_diet_trace::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+         assert_eq!(
+             dispatch_rows(&connection),
+             after["rows"],
+@@ -992,7 +992,7 @@
+     Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
+ ) {
+     use crate::views::{Manifest, ManifestEntry};
+-    let connection = Connection::open(blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(blobs).unwrap();
      for (path, entry) in &mut entries {
-         if path.as_bytes() != b"a.ts" {
+         if path.as_bytes() != file {
              continue;
 --- /dev/null
 +++ b/crates/aft/src/db/store_diet_trace.rs

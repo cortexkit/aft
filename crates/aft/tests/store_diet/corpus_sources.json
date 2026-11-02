@@ -3,6 +3,11 @@
   "smoke_table": {"source":"crates/aft/src/callgraph_store/position_identity_tests.rs","owner":"s4_one_node_per_scoped_name_for_every_supported_language"},
   "receiver_table": {"source":"crates/aft/src/callgraph_store/dispatch/tests.rs","owner":"receiver_form_extraction_table"},
   "cases": [
+    {"name":"typescript-top-level","language":"typescript","shapes":["file summary","top-level dispatch caller","constructed receiver without a function scope"],"files":[{"target":"top.ts","new_for":"Missing stored values: nodes.kind=file_summary, top id forms and dispatch caller=false","text":"class C { m() {} }\nnew C().m();\n"}]},
+    {"name":"java-final","language":"java","shapes":["closed dispatch type"],"files":[{"target":"Closed.java","new_for":"Missing stored dispatch shape: closed=true","text":"final class C { void m() {} }\n"}]},
+    {"name":"typescript-dynamic","language":"typescript","shapes":["unknown receiver","computed member","unresolved protected targets"],"files":[{"target":"dynamic.ts","source":"crates/aft/src/callgraph_store/dispatch/tests.rs","owner":"unknown_and_dynamic_public_fixture_python_js_ts","contains":"function caller(x, name) { x.m(); x[name](); }"}]},
+    {"name":"javascript-dynamic","language":"javascript","shapes":["unknown receiver","computed member","unresolved protected targets"],"files":[{"target":"dynamic.js","source":"crates/aft/src/callgraph_store/dispatch/tests.rs","owner":"unknown_and_dynamic_public_fixture_python_js_ts","contains":"function caller(x, name) { x.m(); x[name](); }"}]},
+    {"name":"python-dynamic","language":"python","shapes":["unknown receiver","getattr dynamic call","unresolved protected targets"],"files":[{"target":"dynamic.py","source":"crates/aft/src/callgraph_store/dispatch/tests.rs","owner":"unknown_and_dynamic_public_fixture_python_js_ts","contains":"getattr(x, name)()"}]},
     {"name":"typescript-export-alias","language":"typescript","shapes":["source-less export alias","cross-file caller"],"files":[
       {"target":"module.ts","source":"crates/aft/tests/integration/callgraph_test.rs","owner":"callgraph_source_less_export_alias_resolves_local_symbol","contains":"export { foo as bar };"},
       {"target":"app.ts","source":"crates/aft/tests/integration/callgraph_test.rs","owner":"callgraph_source_less_export_alias_resolves_local_symbol","contains":"import { bar }"}]},

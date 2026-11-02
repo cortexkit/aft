@@ -33532,6 +33532,25 @@
     ]
   },
   {
+    "id": "sql-dc1047533d4132ad46ac",
+    "baseline": "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1)",
+    "candidate": "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1)",
+    "sites": [
+      {
+        "path": "crates/aft/src/views/materialization/dispatch.rs",
+        "line": 1386,
+        "owner": "store_diet_replacement_order",
+        "test_only": true
+      }
+    ],
+    "variants": [
+      {
+        "variant": "literal/0",
+        "sql": "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1)"
+      }
+    ]
+  },
+  {
     "id": "sql-dc411512c8e02fe6b9de",
     "baseline": "INSERT OR REPLACE INTO nodes(\n                id, file_path, name, scoped_name, kind, start_line, start_col,\n                end_line, end_col, range_ordinal, signature, exported,\n                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test\n            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     "candidate": "INSERT OR REPLACE INTO nodes(\n                id, file_path, name, scoped_name, kind, start_line, start_col,\n                end_line, end_col, range_ordinal, signature, exported,\n                is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test\n            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
@@ -33908,6 +33927,25 @@
       {
         "variant": "literal/0",
         "sql": "UPDATE reservations SET reserved_bytes=reserved_bytes+?1 WHERE id=?2 AND state='reserved'"
+      }
+    ]
+  },
+  {
+    "id": "sql-de16060e23234ee5a5c2",
+    "baseline": "SELECT provenance FROM edges WHERE edge_id=?1",
+    "candidate": "SELECT provenance FROM edges WHERE edge_id=?1",
+    "sites": [
+      {
+        "path": "crates/aft/src/views/materialization/dispatch.rs",
+        "line": 1381,
+        "owner": "store_diet_replacement_order",
+        "test_only": true
+      }
+    ],
+    "variants": [
+      {
+        "variant": "literal/0",
+        "sql": "SELECT provenance FROM edges WHERE edge_id=?1"
       }
     ]
   },

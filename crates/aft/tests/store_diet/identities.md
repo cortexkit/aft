@@ -19,6 +19,7 @@ little-endian eight-byte salt followed by the complete salt-zero digest.
 | `nodes.id`, top level | relative path alone; `top:` form tag | same |
 | views `nodes.id` | base node inputs above; former text `view:symbol:<base-id>` | same; `views/materialization.rs:707` |
 | callable `refs.ref_id` | caller file, original hash-kind argument, caller scoped symbol, line, byte start, byte end, full callee text, per-file callable ordinal | `callgraph_store/mod.rs:16008-16060` |
+| macro-template / macro-mention `refs.ref_id` | the same callable constructor, with original hash-kind `macro_body_call` or `macro_mention`; macro-template `local_name` is subsequently replaced by the macro caller's `name!`, not the callee name | `mod.rs:15798`, `15976-15994`; `callgraph.rs` macro extraction |
 | import `refs.ref_id` | caller file, `import`, byte start, byte end, module path, import index | `mod.rs:16062-16105` |
 | Rust module `refs.ref_id` | caller file, `module`, module name, node start byte | `mod.rs:16107-16192` |
 | JS re-export `refs.ref_id` | caller file, `reexport`, statement start/end bytes, module path, re-export ordinal | `mod.rs:16601-16736` |
@@ -42,6 +43,12 @@ columns** even though the finished baseline does not retain all of them.
 Views id constructors must hash their former complete text independently of
 whether a refs row exists. Ordinary keys and dispatch ordinals cannot be
 translated through each other when they happen to have the same spelling.
+
+Macro readers are also information consumers: template-call lookup uses the
+macro `local_name` when a caller node is absent, and unparseable macro mentions
+are retained as distinct unresolved evidence rather than ordinary invocation
+edges (`commands/callgraph_store_adapter.rs:790-864`). Keep both macro ref kinds,
+their original hash-kind inputs and their full-ref/caller information.
 
 ## Text-sensitive readers
 

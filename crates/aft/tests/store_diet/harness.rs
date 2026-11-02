@@ -156,6 +156,15 @@ fn view_store_custom(
     files: &[PathBuf],
     mutate: impl Fn(&str, &mut join::CallgraphBlob),
 ) -> TestViewBuild {
+    try_view_store_custom(temp, root, files, mutate).unwrap()
+}
+
+fn try_view_store_custom(
+    temp: &Path,
+    root: &Path,
+    files: &[PathBuf],
+    mutate: impl Fn(&str, &mut join::CallgraphBlob),
+) -> std::result::Result<TestViewBuild, String> {
     use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
     let blobs = temp.join("blobs.sqlite");
     let connection = Connection::open(&blobs).unwrap();
@@ -264,7 +273,7 @@ fn view_store_custom(
     let manifest = Manifest::new(entries.clone()).unwrap();
     let database = temp.join("derived.sqlite");
     crate::views::materialization::materialize_manifest_view_database(&database, &blobs, &manifest)
-        .unwrap();
+        .map_err(|error| error.to_string())?;
     let conn = open_readonly_connection(&database).unwrap();
     let mut store = CallGraphStore::from_connection(
         root.to_path_buf(),
@@ -279,12 +288,12 @@ fn view_store_custom(
     );
     store.manifest_view = true;
     store.database_ready.store(true, AtomicOrdering::Release);
-    TestViewBuild {
+    Ok(TestViewBuild {
         store,
         shapes: json!(shapes),
         entries,
         blobs,
-    }
+    })
 }
 
 fn readonly_view(inner: CallGraphStore) -> ReadonlyCallGraphStore {
@@ -459,13 +468,43 @@ fn seeded_replies(store: &CallGraphStore, reader: &impl CallGraphRead, root: &Pa
         let (file, symbol) = &symbols[(index / count) as usize];
         let (to_file, to_symbol) = &symbols[(index % count) as usize];
         let path = root.join(file);
-        let cache = Arc::new(RwLock::new(SymbolCache::new()));
         results.push(json!({
             "file": file, "symbol": symbol, "to_file": to_file, "to_symbol": to_symbol,
             "trace_to": answer(adapter::trace_to_result(reader, &path, symbol, 4, true)),
             "trace_to_symbol": answer(adapter::trace_to_symbol_result(reader, &path, symbol, to_symbol, Some(&root.join(to_file)), 4, true)),
-            "trace_data": answer(adapter::trace_data_result(reader, &path, symbol, "value", 4, cache)),
         }));
+    }
+    // Data-flow scopes come from source-addressable selectors, not synthetic
+    // graph scopes or overload storage suffixes. This selects inputs; no reply
+    // field or error message is normalized.
+    let cache = Arc::new(RwLock::new(SymbolCache::new()));
+    let origins = symbols
+        .iter()
+        .filter(|(file, symbol)| {
+            adapter::store_diet_trace_data_origin(&root.join(file), symbol, &cache)
+        })
+        .collect::<Vec<_>>();
+    let expressions = [
+        "value", "input", "rawInput", "x", "y", "data", "result", "items", "callback", "self",
+        "this",
+    ];
+    let mut data_pairs = origins[..origins.len().min(100)]
+        .iter()
+        .flat_map(|(file, symbol)| {
+            expressions
+                .iter()
+                .map(move |expression| (file, symbol, *expression))
+        })
+        .collect::<Vec<_>>();
+    data_pairs.sort_by_cached_key(|(file, symbol, expression)| {
+        *blake3::hash(
+            format!("callgraph-store-diet-v1\0data\0{file}\0{symbol}\0{expression}").as_bytes(),
+        )
+        .as_bytes()
+    });
+    for (file, symbol, expression) in &data_pairs[..data_pairs.len().min(100)] {
+        results.push(json!({"file": file, "symbol": symbol, "expression": expression,
+            "trace_data": answer(adapter::trace_data_result(reader, &root.join(file), symbol, expression, 4, cache.clone()))}));
     }
     json!(results)
 }
@@ -772,6 +811,10 @@ fn store_diet_sqlite_implicit_order() {
 
 fn ordered_dispatch_rows(store: &CallGraphStore) -> Value {
     let connection = store.conn.lock().unwrap();
+    dispatch_rows(&connection)
+}
+
+fn dispatch_rows(connection: &Connection) -> Value {
     let mut result = serde_json::Map::new();
     for (table, columns, count) in [
         (
@@ -800,7 +843,7 @@ fn ordered_dispatch_rows(store: &CallGraphStore) -> Value {
 
 #[test]
 fn store_diet_duplicate_site_order_and_prefix_paths() {
-    use crate::views::{Manifest, ManifestEntry};
+    use crate::views::Manifest;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("source");
     fs::create_dir_all(&root).unwrap();
@@ -810,39 +853,148 @@ fn store_diet_duplicate_site_order_and_prefix_paths() {
     for file in ["a.ts", "a.ts.more.ts"] {
         fs::write(root.join(file), &source).unwrap();
     }
+    let files = fixture_files(&root);
+    let mut cold_failures = Vec::new();
+    // Duplicate site keys reach the original row-by-row writer, including its
+    // UNIQUE refusal. Do not turn a baseline error into a successful build.
+    for reverse in [false, true] {
+        let directory = temp.path().join(format!("duplicate-{reverse}"));
+        fs::create_dir_all(&directory).unwrap();
+        let result = try_view_store_custom(&directory, &root, &files, |file, blob| {
+            if file != "a.ts.more.ts" {
+                return;
+            }
+            let join::CallgraphBlob::Parse(parsed) = blob else {
+                return;
+            };
+            let sites = parsed
+                .dispatch
+                .sites
+                .iter()
+                .enumerate()
+                .filter(|(_, site)| site.member.as_deref() == Some("m"))
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            parsed.dispatch.sites[sites[1]].ordinal = parsed.dispatch.sites[sites[0]].ordinal;
+            parsed.dispatch.sites[sites[0]].member = Some("f".into());
+            if reverse {
+                parsed.dispatch.sites.swap(sites[0], sites[1]);
+            }
+        });
+        let error = match result {
+            Ok(_) => panic!("duplicate site keys unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("UNIQUE constraint failed: view_dispatch_sites"),
+            "{error}"
+        );
+        assert!(!directory.join("derived.sqlite").exists());
+        cold_failures.push(json!({"reverse": reverse, "error": error, "published": false}));
+    }
     let directory = temp.path().join("view");
     fs::create_dir_all(&directory).unwrap();
-    let files = fixture_files(&root);
-    // Duplicate ordinals are legal stored facts. The consumer must retain
-    // site-vector order, including when one file forces the whole-view fallback.
-    let built = view_store_custom(&directory, &root, &files, |file, blob| {
-        if file != "a.ts" {
-            return;
-        }
-        let join::CallgraphBlob::Parse(parsed) = blob else {
-            return;
-        };
-        let sites = parsed
-            .dispatch
-            .sites
-            .iter()
-            .enumerate()
-            .filter(|(_, site)| site.member.as_deref() == Some("m"))
-            .map(|(i, _)| i)
-            .collect::<Vec<_>>();
-        assert!(sites.len() >= 2);
-        parsed.dispatch.sites[sites[1]].ordinal = parsed.dispatch.sites[sites[0]].ordinal;
-        parsed.dispatch.sites[sites[1]].member = Some("f".into());
-    });
+    let built = view_store_custom(&directory, &root, &files, |_, _| {});
     let database = built.store.sqlite_path().to_path_buf();
+    let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "store_diet_order_probe",
+    )
+    .unwrap();
+    let replacement = crate::views::materialization::dispatch::store_diet_replacement_order(
+        &connection,
+        "a.ts",
+        "C::f",
+        "C::m",
+    )
+    .unwrap();
+    assert_eq!(replacement["winning_provenance"], "exact");
+    assert_eq!(replacement["ref_row_exists"], false);
+    drop(connection);
     let reader = readonly_view(built.store);
     let before = json!({"rows": ordered_dispatch_rows(&reader.inner), "tree": answer(adapter::call_tree_result(&reader, &root.join("a.ts"), "C::f", 4, true))});
     drop(reader);
     let base = Manifest::new(built.entries.clone()).unwrap();
-    let mut entries = built.entries;
-    let connection = Connection::open(&built.blobs).unwrap();
+    let (next, entries) =
+        reordered_site_manifest(&built.blobs, built.entries, b"a.ts", false, true);
+    crate::views::materialization::apply_manifest_diff(&database, &base, &next, &built.blobs)
+        .unwrap();
+    let connection = open_readonly_connection(&database).unwrap();
+    let mut inner = CallGraphStore::from_connection(
+        root.clone(),
+        "order-probe".into(),
+        database.clone(),
+        directory.clone(),
+        false,
+        None,
+        None,
+        None,
+        connection,
+    );
+    inner.manifest_view = true;
+    inner.database_ready.store(true, AtomicOrdering::Release);
+    let reader = readonly_view(inner);
+    let after = json!({"rows": ordered_dispatch_rows(&reader.inner), "tree": answer(adapter::call_tree_result(&reader, &root.join("a.ts"), "C::f", 4, true))});
+    assert_ne!(
+        before, after,
+        "the changed target must be visible in the prefix-path diff"
+    );
+    drop(reader);
+    let mut incremental_failures = Vec::new();
+    for reverse in [false, true] {
+        let copy = directory.join(format!("copy-{reverse}.sqlite"));
+        let source_connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut destination = Connection::open(&copy).unwrap();
+        rusqlite::backup::Backup::new(&source_connection, &mut destination)
+            .unwrap()
+            .run_to_completion(64, std::time::Duration::from_millis(0), None)
+            .unwrap();
+        drop(destination);
+        drop(source_connection);
+        let (bad, _) = reordered_site_manifest(
+            &built.blobs,
+            entries.clone(),
+            b"a.ts.more.ts",
+            true,
+            reverse,
+        );
+        let error =
+            crate::views::materialization::apply_manifest_diff(&copy, &next, &bad, &built.blobs)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("UNIQUE constraint failed: view_dispatch_sites"),
+            "{error}"
+        );
+        let connection =
+            Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            dispatch_rows(&connection),
+            after["rows"],
+            "failed whole-manifest fallback must roll back earlier writes"
+        );
+        incremental_failures.push(json!({"reverse": reverse, "error": error, "rolled_back": true}));
+    }
+    golden("dispatch-order.json", &serde_json::to_vec_pretty(&json!({"target_replacement": replacement, "cold_duplicate": cold_failures, "before": before, "after": after, "incremental_duplicate": incremental_failures})).unwrap());
+}
+
+fn reordered_site_manifest(
+    blobs: &Path,
+    mut entries: Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
+    file: &[u8],
+    duplicate: bool,
+    reverse: bool,
+) -> (
+    crate::views::Manifest,
+    Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
+) {
+    use crate::views::{Manifest, ManifestEntry};
+    let connection = Connection::open(blobs).unwrap();
     for (path, entry) in &mut entries {
-        if path.as_bytes() != b"a.ts" {
+        if path.as_bytes() != file {
             continue;
         }
         let ManifestEntry::Regular { planes, .. } = entry else {
@@ -860,30 +1012,22 @@ fn store_diet_duplicate_site_order_and_prefix_paths() {
         let join::CallgraphBlob::Parse(parsed) = &mut blob else {
             panic!("parse fixture")
         };
-        let duplicate = parsed
-            .dispatch
-            .sites
-            .iter()
-            .map(|site| site.ordinal)
-            .find(|ordinal| {
-                parsed
-                    .dispatch
-                    .sites
-                    .iter()
-                    .filter(|site| site.ordinal == *ordinal)
-                    .count()
-                    > 1
-            })
-            .unwrap();
         let sites = parsed
             .dispatch
             .sites
             .iter()
             .enumerate()
-            .filter(|(_, site)| site.ordinal == duplicate)
+            .filter(|(_, site)| site.member.as_deref() == Some("m"))
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
-        parsed.dispatch.sites.swap(sites[0], sites[1]);
+        assert!(sites.len() >= 2);
+        if duplicate {
+            parsed.dispatch.sites[sites[1]].ordinal = parsed.dispatch.sites[sites[0]].ordinal;
+        }
+        parsed.dispatch.sites[sites[0]].member = Some("f".into());
+        if reverse {
+            parsed.dispatch.sites.swap(sites[0], sites[1]);
+        }
         let payload = blob.to_bytes().unwrap();
         let key = blake3::hash(&payload);
         connection
@@ -898,32 +1042,5 @@ fn store_diet_duplicate_site_order_and_prefix_paths() {
             .unwrap();
         planes.callgraph = Some(key.to_hex().to_string());
     }
-    drop(connection);
-    let next = Manifest::new(entries).unwrap();
-    crate::views::materialization::apply_manifest_diff(&database, &base, &next, &built.blobs)
-        .unwrap();
-    let connection = open_readonly_connection(&database).unwrap();
-    let mut inner = CallGraphStore::from_connection(
-        root.clone(),
-        "order-probe".into(),
-        database,
-        directory,
-        false,
-        None,
-        None,
-        None,
-        connection,
-    );
-    inner.manifest_view = true;
-    inner.database_ready.store(true, AtomicOrdering::Release);
-    let reader = readonly_view(inner);
-    let after = json!({"rows": ordered_dispatch_rows(&reader.inner), "tree": answer(adapter::call_tree_result(&reader, &root.join("a.ts"), "C::f", 4, true))});
-    assert_ne!(
-        before, after,
-        "shuffling duplicate sites must change the baseline last writer"
-    );
-    golden(
-        "dispatch-order.json",
-        &serde_json::to_vec_pretty(&json!({"before": before, "after": after})).unwrap(),
-    );
+    (Manifest::new(entries.clone()).unwrap(), entries)
 }

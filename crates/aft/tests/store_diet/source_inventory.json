@@ -17691,6 +17691,11 @@
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
+      "path": "crates/aft/src/views/materialization/dispatch.rs",
+      "line": 1351,
+      "text": "targets: BTreeSet::from(["
+    },
+    {
       "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
       "line": 247,
       "text": "let protected = snapshot.entry_point_symbols.values().flatten().collect::<std::collections::BTreeSet<_>>();"

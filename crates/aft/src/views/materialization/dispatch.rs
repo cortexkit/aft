@@ -1332,3 +1332,64 @@ pub(crate) fn store_diet_node_kind(
     transaction.commit()?;
     Ok(kind)
 }
+
+#[cfg(test)]
+pub(crate) fn store_diet_replacement_order(
+    connection: &rusqlite::Connection,
+    file: &str,
+    caller: &str,
+    symbol: &str,
+) -> Result<serde_json::Value> {
+    let hint = SiteHint {
+        ordinal: 1_000_000,
+        caller: Some(caller.into()),
+        line: 1,
+        member: Some("m".into()),
+        receiver: Some("C".into()),
+        dynamic: false,
+    };
+    let resolution = Resolution {
+        targets: BTreeSet::from([
+            Target {
+                file: file.into(),
+                symbol: symbol.into(),
+                provenance: "exact",
+            },
+            Target {
+                file: file.into(),
+                symbol: symbol.into(),
+                provenance: "dispatch",
+            },
+        ]),
+        ..Resolution::default()
+    };
+    let order = resolution
+        .targets
+        .iter()
+        .map(|target| target.provenance)
+        .collect::<Vec<_>>();
+    let site = ResolvedSite {
+        file,
+        language: "typescript",
+        ref_id: format!("view:{file}:{}", hint.ordinal),
+        site: &hint,
+        resolution: Rc::new(resolution),
+    };
+    let transaction = connection.unchecked_transaction()?;
+    write_row_by_row(&transaction, std::slice::from_ref(&site), false)?;
+    let edge_id = site.edge_id(site.resolution.targets.iter().next().unwrap());
+    let provenance: String = transaction.query_row(
+        "SELECT provenance FROM edges WHERE edge_id=?1",
+        [&edge_id],
+        |row| row.get(0),
+    )?;
+    let ref_row: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1)",
+        [&site.ref_id],
+        |row| row.get(0),
+    )?;
+    transaction.rollback()?;
+    Ok(
+        serde_json::json!({"target_order": order, "winning_provenance": provenance, "ref_row_exists": ref_row}),
+    )
+}

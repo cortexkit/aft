@@ -98,8 +98,8 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         symbols = [f'file{i}.rs\0f{i}' for i in range(600)]
         self.assertEqual(parity.manifest(symbols), parity.manifest(list(reversed(symbols))))
         requests = parity.manifest(symbols)
-        self.assertEqual(sum(r['command'] == 'callers' for r in requests), 500)
-        self.assertEqual(sum(r['command'] == 'trace_to_symbol' for r in requests), 100)
+        self.assertEqual(sum(parity.operation(r) == 'callers' for r in requests), 500)
+        self.assertEqual(sum(parity.operation(r) == 'trace_to_symbol' for r in requests), 100)
         self.assertEqual(len({r['id'] for r in requests}), len(requests))
 
     def test_small_corpus_samples_pairs_not_only_neighbouring_symbols(self):

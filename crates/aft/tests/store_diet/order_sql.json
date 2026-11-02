@@ -2543,6 +2543,14 @@
     "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
   },
   {
+    "statement": "sql-dc1047533d4132ad46ac",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
     "statement": "sql-dc4c4b3fd3d9919bdf9a",
     "keys": [],
     "implicit_order": true,
@@ -2572,6 +2580,14 @@
   },
   {
     "statement": "sql-ddf8d5d50e827e5e7b58",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-de16060e23234ee5a5c2",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",

@@ -186,6 +186,21 @@
     ]
   },
   {
+    "name": "java-final",
+    "language": "java",
+    "shapes": [
+      "closed dispatch type"
+    ],
+    "files": [
+      {
+        "target": "Closed.java",
+        "new_for": "Missing stored dispatch shape: closed=true",
+        "text": "final class C { void m() {} }\n",
+        "sha256": "67c511d4197070174410d3a6ec34648a97207943518e53195fc5534ed7d10e49"
+      }
+    ]
+  },
+  {
     "name": "javascript-callback",
     "language": "javascript",
     "shapes": [
@@ -199,6 +214,23 @@
         "source": "crates/aft/src/callgraph.rs",
         "owner": "call_site_kind_classification_matches_range_lookup",
         "sha256": "ab200a67e453a812c1bc894a0a8c653163c7e6144ad6d25053ca55ae21d0cddb"
+      }
+    ]
+  },
+  {
+    "name": "javascript-dynamic",
+    "language": "javascript",
+    "shapes": [
+      "unknown receiver",
+      "computed member",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.js",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "ea56d2b6d0ebe8b0fcf0cbc9835d27eac1be97f03dc2664e4b996a79092d07de"
       }
     ]
   },
@@ -336,6 +368,23 @@
         "source": "crates/aft/tests/integration/outline_languages_test.rs",
         "owner": "outline_php_symbols_include_namespaces_types_functions_methods_and_properties",
         "sha256": "ab0857d24036023f4b68033d1ec620ebbdb4856707f3cbb8c3d386e4fec0e047"
+      }
+    ]
+  },
+  {
+    "name": "python-dynamic",
+    "language": "python",
+    "shapes": [
+      "unknown receiver",
+      "getattr dynamic call",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.py",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "9cdc1f3714f4a6614a50bb3776d5643fedef67eff696f90d8cd3ba659a6b4a35"
       }
     ]
   },
@@ -1287,6 +1336,23 @@
     ]
   },
   {
+    "name": "typescript-dynamic",
+    "language": "typescript",
+    "shapes": [
+      "unknown receiver",
+      "computed member",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "ea56d2b6d0ebe8b0fcf0cbc9835d27eac1be97f03dc2664e4b996a79092d07de"
+      }
+    ]
+  },
+  {
     "name": "typescript-export-alias",
     "language": "typescript",
     "shapes": [
@@ -1416,6 +1482,23 @@
         "source": "crates/aft/tests/integration/callgraph_test.rs",
         "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
         "sha256": "f08571147b5bcac8003533c4e434ac73aea947b39d7c1ed6a5c0e6cebe26e947"
+      }
+    ]
+  },
+  {
+    "name": "typescript-top-level",
+    "language": "typescript",
+    "shapes": [
+      "file summary",
+      "top-level dispatch caller",
+      "constructed receiver without a function scope"
+    ],
+    "files": [
+      {
+        "target": "top.ts",
+        "new_for": "Missing stored values: nodes.kind=file_summary, top id forms and dispatch caller=false",
+        "text": "class C { m() {} }\nnew C().m();\n",
+        "sha256": "d9ef79adcc9964ff4d53d8ff2e8362e2a9cd37029bd9c0d4e1bd353a04ea3ea3"
       }
     ]
   },

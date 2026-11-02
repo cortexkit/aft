@@ -32,6 +32,11 @@ def inventory():
                         locations.setdefault(column, {}).setdefault(value, []).append({'case': 'lifecycle', 'mode': 'legacy', 'phase': phase, 'count': count})
     assert lifecycle['staged_ref_write'], 'no actual staged-ref write observed'
     locations.setdefault('refs.status', {}).setdefault('staged', []).append({'case': 'lifecycle', 'mode': 'legacy', 'observation': 'successful cold-build INSERT', 'count': 1})
+    ordering = json.loads((HERE / 'dispatch-order.json').read_text(encoding='utf-8'))['target_replacement']
+    assert ordering['target_order'] == ['dispatch', 'exact'] and ordering['winning_provenance'] == 'exact'
+    assert ordering['ref_row_exists'] is False
+    locations.setdefault('edges.ref_row_presence', {}).setdefault('absent', []).append({'case': 'sqlite-writer', 'mode': 'views', 'observation': 'actual row-by-row writer, transaction rolled back after observation', 'count': 1})
+    shapes['target:duplicate_provenance=true'] = [{'case': 'sqlite-writer', 'mode': 'views', 'count': 1}]
     required = json.loads((HERE / 'required_values.json').read_text(encoding='utf-8'))
     missing, domains = [], {}
     for name, domain in required['domains'].items():

@@ -1897,19 +1897,31 @@
   },
   {
     "path": "crates/aft/tests/store_diet/harness.rs",
-    "raw_open_calls": 3,
+    "raw_open_calls": 6,
     "helpers": [
       {
-        "line": 161,
-        "helper": "view_store_custom"
+        "line": 170,
+        "helper": "try_view_store_custom"
       },
       {
-        "line": 325,
+        "line": 334,
         "helper": "plans"
       },
       {
-        "line": 843,
+        "line": 948,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 950,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 973,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 995,
+        "helper": "reordered_site_manifest"
       }
     ]
   }

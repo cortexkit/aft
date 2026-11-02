@@ -1,8 +1,8 @@
 [
-  {"id":"wire-callers","command":"callers","file":"helpers.ts","symbol":"validate","depth":4,"include_tests":true},
-  {"id":"wire-tree","command":"call_tree","file":"main.ts","symbol":"main","depth":4,"include_tests":true},
-  {"id":"wire-impact","command":"impact","file":"helpers.ts","symbol":"validate","depth":4,"include_tests":true},
-  {"id":"wire-trace-to","command":"trace_to","file":"helpers.ts","symbol":"validate","depth":4,"include_tests":true},
-  {"id":"wire-trace-symbol","command":"trace_to_symbol","file":"main.ts","symbol":"main","toSymbol":"validate","toFile":"helpers.ts","depth":4,"include_tests":true},
-  {"id":"wire-data","command":"trace_data","file":"data_flow.ts","symbol":"transformData","expression":"rawInput","depth":4}
+  {"id":"wire-callers","command":"tool_call","name":"callgraph","arguments":{"op":"callers","path":"helpers.ts","symbol":"validate","depth":4,"includeTests":true}},
+  {"id":"wire-tree","command":"tool_call","name":"callgraph","arguments":{"op":"call_tree","path":"main.ts","symbol":"main","depth":4,"includeTests":true}},
+  {"id":"wire-impact","command":"tool_call","name":"callgraph","arguments":{"op":"impact","path":"helpers.ts","symbol":"validate","depth":4,"includeTests":true}},
+  {"id":"wire-trace-to","command":"tool_call","name":"callgraph","arguments":{"op":"trace_to","path":"helpers.ts","symbol":"validate","depth":4,"includeTests":true}},
+  {"id":"wire-trace-symbol","command":"tool_call","name":"callgraph","arguments":{"op":"trace_to_symbol","path":"main.ts","symbol":"main","toSymbol":"validate","toPath":"helpers.ts","depth":4,"includeTests":true}},
+  {"id":"wire-data","command":"tool_call","name":"callgraph","arguments":{"op":"trace_data","path":"data_flow.ts","symbol":"transformData","expression":"rawInput","depth":4}}
 ]
