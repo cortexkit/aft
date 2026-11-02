@@ -1994,6 +1994,9 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
         && root["standing"] != true
         && !root["standing_refusal"].is_string()
         && root["cache_unavailable_reason"].is_null()
+        && root["view_storage_reserve"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
         && root["state"] == "ready"
         && ["search_index", "semantic_index", "callgraph_store", "tier2"]
             .iter()
@@ -2085,6 +2088,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
                 | "standing_entry"
                 | "standing_refusal"
                 | "cache_unavailable_reason"
+                | "view_storage_reserve"
                 | "search_index"
                 | "semantic_index"
                 | "callgraph_store"
@@ -4926,6 +4930,38 @@ mod tests {
             root[field] = value;
             assert!(!ordinary_ready_health_root(&root), "{field}");
         }
+    }
+
+    #[test]
+    fn disk_reserve_health_survives_ready_root_filtering_and_abbreviation() {
+        let storage = tempfile::tempdir().unwrap();
+        let _low = crate::blob_store::v3::set_free_space_for_test(
+            storage.path(),
+            21 * 1024 * 1024 * 1024,
+            3_900_000_000_000,
+        );
+        let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
+            storage.path(),
+            "device_free_space_floor",
+        )
+        .unwrap();
+        let mut root = json!({
+            "project_root": "project", "state": "ready",
+            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
+        });
+        assert!(ordinary_ready_health_root(&root));
+        root["view_storage_reserve"] = json!({"trigram": reserve});
+        assert!(!ordinary_ready_health_root(&root));
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(
+            root["view_storage_reserve"]["trigram"]["code"],
+            "device_free_space_floor"
+        );
+        assert_eq!(
+            root["view_storage_reserve"]["trigram"]["message"],
+            reserve.message
+        );
     }
 
     #[test]
@@ -10126,6 +10162,7 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         views: None,
         view_load_failures: Default::default(),
         view_load_failure_last: None,
+        view_storage_reserve: Default::default(),
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),

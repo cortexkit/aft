@@ -306,6 +306,18 @@ pub(super) fn from_health(
                 break;
             }
             let key = root_key(root);
+            if let Some(reserves) = root["view_storage_reserve"].as_object() {
+                for (plane, reserve) in reserves {
+                    if let Some(message) = reserve["message"].as_str() {
+                        findings.push(condition(
+                            "storage_reserve", &format!("{key}/{plane}"), Severity::Warn,
+                            1, observed, now, message,
+                            vec![json!({"code": reserve["code"], "free_bytes": reserve["free_bytes"], "floor_bytes": reserve["floor_bytes"]})],
+                            "",
+                        ));
+                    }
+                }
+            }
             let evidence = &root["diagnostics_evidence"];
             if root["state"] == "busy" || !evidence.is_object() {
                 findings.push(unknown(
@@ -562,6 +574,40 @@ mod tests {
         collect_cold_waits(Ok((0, 1_000_000)), 1_000_000, &mut findings);
         collect_floor_refusals(Some(Default::default()), 1_000_000, &mut findings);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn disk_reserve_findings_are_not_reader_floor_or_view_load_bugs() {
+        let storage = tempfile::tempdir().unwrap();
+        let _space = crate::blob_store::v3::set_free_space_for_test(
+            storage.path(),
+            21 * 1024 * 1024 * 1024,
+            3_900_000_000_000,
+        );
+        let condition = crate::view_storage_reserve::DiskReserveCondition::observed(
+            storage.path(),
+            "device_free_space_floor",
+        )
+        .unwrap();
+        let mut metrics = healthy_metrics();
+        metrics["roots"][0]["view_storage_reserve"] = json!({"trigram": condition});
+        let findings = snapshot(&metrics);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.check, "storage_reserve");
+        assert_eq!(finding.count, 1);
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.summary, condition.message);
+        assert_eq!(finding.samples[0]["code"], "device_free_space_floor");
+        assert_eq!(
+            finding.samples[0]["floor_bytes"],
+            32 * 1024 * 1024 * 1024_u64
+        );
+        assert!(!serde_json::to_string(&findings)
+            .unwrap()
+            .contains("/private/user/project"));
+        metrics["roots"][0]["view_storage_reserve"] = json!({});
+        assert!(snapshot(&metrics).is_empty());
     }
 
     #[test]

@@ -23,11 +23,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
-/// Free bytes a v3 reservation must leave on the device, or 5% of its
-/// capacity when that is larger. v3 sets no byte budget per family: how many
-/// copies a repository keeps is a matter of count and age, and this floor is
-/// what keeps the device from filling.
+/// Minimum free bytes a v3 reservation must leave on the device. The reserve
+/// is 5% of capacity, bounded by this minimum and [`MAX_FREE_BYTES`].
 pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_FREE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+pub(crate) fn free_disk_floor(capacity: u64) -> u64 {
+    (capacity / 20).clamp(MIN_FREE_BYTES, MAX_FREE_BYTES)
+}
 /// Sweep epochs a symbol-plane row survives without being touched. Symbol
 /// rows are a reusable cache that no manifest names, so the plane-row sweep
 /// ages them out by epoch instead of by marking.
@@ -284,7 +287,7 @@ struct FreeSpaceOverrides {
 }
 struct FreeSpaceOverride {
     canonical: Option<PathBuf>,
-    value: (u64, u64),
+    value: Option<(u64, u64)>,
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
     storage: std::collections::BTreeMap::new(),
@@ -316,10 +319,19 @@ impl Drop for FreeSpaceTestGuard {
 /// Production never calls this setter.
 #[doc(hidden)]
 pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    set_free_space_probe_for_test(storage, Some((free, capacity)))
+}
+
+#[cfg(test)]
+pub(crate) fn set_free_space_probe_failure_for_test(storage: &Path) -> FreeSpaceTestGuard {
+    set_free_space_probe_for_test(storage, None)
+}
+
+fn set_free_space_probe_for_test(storage: &Path, value: Option<(u64, u64)>) -> FreeSpaceTestGuard {
     let storage = storage.to_path_buf();
     let entry = FreeSpaceOverride {
         canonical: canonical_free_space_path(&storage),
-        value: (free, capacity),
+        value,
     };
     let previous = FREE_SPACE
         .lock()
@@ -372,7 +384,7 @@ fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
 pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
     probe_free_space(path)
 }
-fn free_space(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn free_space(path: &Path) -> Option<(u64, u64)> {
     let value = {
         let overrides = FREE_SPACE
             .lock()
@@ -399,10 +411,10 @@ fn free_space(path: &Path) -> Option<(u64, u64)> {
             })
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, value)| value)
-            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+            .or_else(|| (overrides.unlimited > 0).then_some(Some((u64::MAX, u64::MAX / 2))))
     };
     if let Some(value) = value {
-        return Some(value);
+        return value;
     }
     probe_free_space(path)
 }
@@ -1170,7 +1182,7 @@ fn for_each_registry(
 }
 fn check_space(storage: &Path, request: u64, reserved: u64) -> Result<()> {
     let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
-    let floor = MIN_FREE_BYTES.max(capacity / 20);
+    let floor = free_disk_floor(capacity);
     if free
         .checked_sub(request)
         .and_then(|bytes| bytes.checked_sub(reserved))
@@ -1390,7 +1402,7 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                 .ok_or(Error::Refused("device_free_space_floor"))?;
         }
     }
-    let floor = MIN_FREE_BYTES.max(capacity / 20);
+    let floor = free_disk_floor(capacity);
     if free
         .checked_sub(request)
         .and_then(|v| v.checked_sub(reserved))
