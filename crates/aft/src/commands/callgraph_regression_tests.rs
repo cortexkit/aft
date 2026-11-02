@@ -247,6 +247,7 @@ fn callgraph_python_constructors_follow_class_bindings_not_names() {
         ("calls.py", "from pkg import Public as Renamed\nimport pkg.source as module\nclass Local:\n    def __init__(self):\n        pass\ndef construct():\n    Local()\n    Renamed()\n    module.Widget()\ndef shadow(Renamed):\n    Renamed()\n"),
         ("unrelated.py", "class Renamed:\n    def __init__(self):\n        pass\n"),
         ("duplicate.py", "class Duplicate:\n    def __init__(self):\n        pass\ndef Duplicate():\n    pass\ndef rejected():\n    Duplicate()\n"),
+        ("local_classes.py", "def left():\n    class Same:\n        def __init__(self):\n            pass\n    Same()\ndef right():\n    class Same:\n        def __init__(self):\n            pass\n    Same()\n"),
     ]);
     let sites = store
         .direct_callers_of(Path::new("pkg/source.py"), "Widget::__init__")
@@ -266,6 +267,10 @@ fn callgraph_python_constructors_follow_class_bindings_not_names() {
         .is_empty());
     assert!(store
         .direct_callers_of(Path::new("duplicate.py"), "Duplicate::__init__")
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .direct_callers_of(Path::new("local_classes.py"), "Same::__init__")
         .unwrap()
         .is_empty());
 }

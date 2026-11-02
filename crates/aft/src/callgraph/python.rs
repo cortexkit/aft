@@ -25,6 +25,7 @@ enum Binding {
     LocalDefinition {
         symbol: String,
         position: usize,
+        class: bool,
     },
     Shadowed,
 }
@@ -42,6 +43,7 @@ struct Extractor<'a> {
     scopes: Vec<Scope>,
     imports: Vec<ImportStatement>,
     module_imports: HashSet<(usize, usize)>,
+    declarations: HashMap<String, usize>,
     calls: Vec<(Node<'a>, usize)>,
 }
 
@@ -64,6 +66,7 @@ pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
         }],
         imports: Vec::new(),
         module_imports: HashSet::new(),
+        declarations: HashMap::new(),
         calls: Vec::new(),
     };
     extractor.visit(root, 0);
@@ -83,7 +86,10 @@ pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
             }
             let binding = extractor.lookup(*scope, parts[0])?;
             let target = match binding {
-                Binding::LocalDefinition { symbol, .. } if parts.len() == 1 => {
+                Binding::LocalDefinition { symbol, class, .. }
+                    if parts.len() == 1
+                        && (!*class || extractor.declarations.get(symbol) == Some(&1)) =>
+                {
                     Some((String::new(), symbol.clone()))
                 }
                 Binding::Imported {
@@ -191,12 +197,17 @@ impl<'a> Extractor<'a> {
             if let Some(name) = node.child_by_field_name("name") {
                 let mut path = self.scopes[scope].classes.clone();
                 path.push(self.source[name.byte_range()].to_string());
+                // Python symbol identities omit enclosing function names. Distinct
+                // function-local classes can therefore share a stored name;
+                // constructor calls must stay unresolved when that name is ambiguous.
+                *self.declarations.entry(path.join("::")).or_default() += 1;
                 self.bind(
                     scope,
                     &self.source[name.byte_range()],
                     Binding::LocalDefinition {
                         symbol: path.join("::"),
                         position: node.start_byte(),
+                        class: node.kind() == "class_definition",
                     },
                 );
             }
