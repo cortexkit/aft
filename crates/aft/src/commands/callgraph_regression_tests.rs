@@ -224,6 +224,7 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
         ("pkg/source.py", "def target():\n    pass\n\ndef replacement():\n    pass\n"),
         ("pkg/middle.py", "from .source import target as forwarded\n"),
         ("pkg/__init__.py", "from .middle import forwarded as public\n"),
+        ("pkg.py", "def public():\n    pass\n"),
         ("calls.py", "from pkg import public as renamed\nimport pkg as namespace\ndef named():\n    renamed()\ndef qualified():\n    namespace.public()\ndef shadow(renamed):\n    renamed()\n"),
         ("hidden.py", "def setup():\n    from pkg.source import target as public\n"),
         ("shadowed.py", "from pkg.source import target as public\npublic = unknown\n"),
@@ -248,7 +249,12 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
     let targets = [
         ("pkg/source.py", "target"),
         ("pkg/source.py", "replacement"),
+        ("pkg.py", "public"),
     ];
+    assert!(store
+        .direct_callers_of(Path::new("pkg.py"), "public")
+        .unwrap()
+        .is_empty());
     let roots = [
         ("calls.py", "named"),
         ("calls.py", "qualified"),

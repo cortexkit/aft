@@ -19233,10 +19233,12 @@ impl DbFileIndex {
             let target_file =
                 if extract.lang == LangId::Python && module_targets.contains_key(module_path) {
                     module_targets.get(module_path).cloned().flatten()
-                } else if extract.lang == LangId::Rust && raw_ref.kind == "reexport" {
-                    // Dependency sets include parent-module candidates. Their lexical
-                    // order is not Rust resolution order: retain the most-specific
-                    // module target for each flattened re-export leaf.
+                } else if extract.lang == LangId::Python
+                    || (extract.lang == LangId::Rust && raw_ref.kind == "reexport")
+                {
+                    // Dependency sets include fallback candidates. Their lexical
+                    // order is not language resolution order; Python packages,
+                    // for example, take precedence over same-named module files.
                     module_ref_target(
                         project_root,
                         &extract.rel_path,
