@@ -99,13 +99,15 @@ export async function withBashPermissionLoop(options: {
       await options.approve(pendingAsks);
     } catch (error) {
       const parts = pendingAsks.map(permissionAskPath).join(", ");
+      // The host's reason sits in parentheses, so drop its own final period.
+      // Without a reason, drop the parenthetical rather than inventing one.
       const reason =
-        error instanceof Error && error.message ? error.message : "no host reason provided";
+        error instanceof Error && error.message ? error.message.trim().replace(/\.$/, "") : "";
+      const message = reason
+        ? BASH_PERMISSION_DENIED.replace("{host reason}", () => reason)
+        : BASH_PERMISSION_DENIED.replace(" ({host reason})", "");
       throw new BashPermissionLoopError(
-        BASH_PERMISSION_DENIED.replace("{parts}", () => parts).replace(
-          "{host reason}",
-          () => reason,
-        ),
+        message.replace("{parts}", () => parts),
         { cause: error },
       );
     }

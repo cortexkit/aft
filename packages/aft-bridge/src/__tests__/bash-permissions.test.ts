@@ -170,7 +170,7 @@ test.each([
   new Error(),
   undefined,
   null,
-])("permission loop supplies a fallback when the host throws without a message (%p)", async (cause) => {
+])("permission loop omits the host reason when the host throws without a message (%p)", async (cause) => {
   const error = await withBashPermissionLoop({
     request: async () => required,
     approve: async () => {
@@ -179,7 +179,7 @@ test.each([
   }).catch((error) => error);
   expect(error).toBeInstanceOf(BashPermissionLoopError);
   expect(error.message).toBe(
-    "Permission denied for this shell command: /outside/worker/* (no host reason provided). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.",
+    "Permission denied for this shell command: /outside/worker/*. The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.",
   );
   expect(error.cause).toBe(cause);
 });

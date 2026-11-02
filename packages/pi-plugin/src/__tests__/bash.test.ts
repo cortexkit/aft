@@ -1920,7 +1920,7 @@ describe("bash tool adapter", () => {
       .catch((error) => error);
     expect(error).toBeInstanceOf(BridgeError);
     expect(error.message).toBe(
-      `Permission denied for this shell command: mkdir -p x && rm -rf x @ ${projectRoot} (Permission denied: unsandboxed host execution was denied.). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+      `Permission denied for this shell command: mkdir -p x && rm -rf x @ ${projectRoot} (Permission denied: unsandboxed host execution was denied). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
     );
     expect(error.code).toBe("permission_denied");
     expect(calls).toHaveLength(1);
