@@ -9075,8 +9075,14 @@ fn run_configure_maintenance_unit_inner(
                     crate::provisional_identity_retry::finish_folder_check(ctx);
                 }
             }
-            if job.root_too_broad {
-                ctx.lsp().shutdown_all();
+            // The job may have captured a pending folder check that has since
+            // admitted the root. Only a settled, still-disabled root should
+            // lose its servers; refusal cleanup may already have taken them.
+            if ctx.root_too_broad() && !crate::folder_admission_runtime::waiting(ctx) {
+                let mut lsp = ctx.lsp();
+                if lsp.server_count() > 0 {
+                    lsp.shutdown_all();
+                }
             }
             crate::folder_admission_runtime::ensure_metadata_watch(ctx);
             // Start artifact workers only after sending the configure acknowledgement,

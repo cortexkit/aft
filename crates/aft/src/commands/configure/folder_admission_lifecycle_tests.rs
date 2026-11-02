@@ -583,6 +583,82 @@ fn folder_admission_grep_has_an_aggregate_content_byte_bound() {
     });
 }
 
+#[cfg(unix)]
+#[test]
+fn folder_admission_refresh_preserves_lsp_until_a_settled_refusal() {
+    use crate::lsp::child_registry::LspChildRegistry;
+    use crate::lsp::client::LspClient;
+    use crate::lsp::registry::ServerKind;
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    isolated(root.path(), || {
+        std::fs::write(root.path().join("one.rs"), "pub fn one() {}\n").unwrap();
+        std::fs::write(root.path().join("two.rs"), "pub fn two() {}\n").unwrap();
+        let ctx = context(storage.path());
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        settle(&ctx);
+        assert!(ctx.heavy_root_work_allowed());
+
+        // A refresh must not kill a root's existing server while its new
+        // folder decision is pending or waiting to be applied by replay.
+        let registry = LspChildRegistry::new();
+        ctx.lsp().set_child_registry(registry.clone());
+        let client = LspClient::spawn_with_reclaim_root(
+            ServerKind::TypeScript,
+            root.path().canonicalize().unwrap(),
+            Path::new("sh"),
+            &["-c".into(), "exec sleep 60".into()],
+            &std::collections::HashMap::new(),
+            ctx.lsp().event_sender_for_test(),
+            registry,
+            None,
+            false,
+        )
+        .unwrap();
+        let pid = client.child_pid();
+        ctx.lsp().insert_client_for_test(client);
+        assert!(configure(root.path(), storage.path(), &ctx, false, true).success);
+        assert!(admission::waiting(&ctx));
+        let mut jobs = ctx.drain_configure_maintenance();
+        assert_eq!(jobs.len(), 1);
+        let mut continuation = super::ConfigureMaintenanceContinuation::new(jobs.pop().unwrap());
+        // Run the captured job before a successful probe can replay configure
+        // and make that job stale, rather than depending on scheduler order.
+        super::run_configure_maintenance_unit_inner(&ctx, &mut continuation);
+        assert_eq!(
+            ctx.lsp().server_count(),
+            1,
+            "pending refresh lost its server"
+        );
+        ctx.enqueue_configure_maintenance(continuation.job).unwrap();
+        settle(&ctx);
+        assert!(ctx.heavy_root_work_allowed());
+        assert_eq!(
+            ctx.lsp().server_count(),
+            1,
+            "admitted refresh lost its server"
+        );
+        assert!(crate::bash_background::process::is_process_alive(pid));
+
+        ctx.update_config(|config| {
+            config.project_detection.mode = crate::folder_admission::DetectionMode::Off
+        });
+        admission::policy_changed(&ctx, &ctx.config());
+        settle(&ctx);
+        assert_eq!(
+            admission::snapshot(&ctx).unwrap()["classification"],
+            "not_project"
+        );
+        assert_eq!(
+            ctx.lsp().server_count(),
+            0,
+            "refused root retained its server"
+        );
+        assert!(!crate::bash_background::process::is_process_alive(pid));
+    });
+}
+
 #[test]
 fn folder_admission_refresh_and_live_policy_changes_recheck_the_root() {
     let root = tempfile::tempdir().unwrap();
