@@ -6826,11 +6826,11 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String> {
         self.file_index(file).and_then(|index| {
-            index
-                .node_by_scoped
-                .get(symbol)
-                .cloned()
-                .or_else(|| index.node_by_bare.get(symbol).cloned())
+            index.node_by_scoped.get(symbol).cloned().or_else(|| {
+                (index.lang != Some(LangId::Python))
+                    .then(|| index.node_by_bare.get(symbol).cloned())
+                    .flatten()
+            })
         })
     }
 
@@ -17660,17 +17660,16 @@ fn resolve_python_symbol<I: ResolverIndex>(
             return None;
         }
         if let Some(node) = index.node_for_symbol(&file, &symbol) {
-            // A bare import must not accidentally select a class method with the same name.
-            if node == node_id(&file, "function", &symbol) && index.node_is_callable(&file, &node) {
+            // Python index lookups require an exact scoped name, so a bare
+            // import cannot select a class method with the same name.
+            if index.node_is_callable(&file, &node) {
                 return Some((file, symbol));
             }
-            if node == node_id(&file, "class", &symbol) {
-                let initializer = format!("{symbol}::__init__");
-                let init_node = index.node_for_symbol(&file, &initializer)?;
-                return (init_node == node_id(&file, "method", &initializer)
-                    && index.node_is_callable(&file, &init_node))
+            let initializer = format!("{symbol}::__init__");
+            let init_node = index.node_for_symbol(&file, &initializer)?;
+            return index
+                .node_is_callable(&file, &init_node)
                 .then_some((file, initializer));
-            }
         }
         let mut targets = BTreeSet::new();
         for export in index.reexports_for(&file) {
@@ -18849,10 +18848,11 @@ impl<'a> ProjectIndex<'a> {
 
     fn node_for_symbol(&self, rel_path: &str, symbol: &str) -> Option<String> {
         self.file_index(rel_path).and_then(|file| {
-            file.node_by_scoped
-                .get(symbol)
-                .cloned()
-                .or_else(|| file.node_by_bare.get(symbol).cloned())
+            file.node_by_scoped.get(symbol).cloned().or_else(|| {
+                (file.lang != Some(LangId::Python))
+                    .then(|| file.node_by_bare.get(symbol).cloned())
+                    .flatten()
+            })
         })
     }
 
