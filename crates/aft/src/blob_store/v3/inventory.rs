@@ -2,7 +2,7 @@
 //! still inventories names and metadata without opening any database file.
 
 use super::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -65,7 +65,37 @@ impl Entry {
 
 #[derive(Default)]
 struct Inventory {
-    entries: BTreeMap<PathBuf, Entry>,
+    entries: Entries,
+    members: usize,
+}
+
+pub(super) type Entries = HashMap<PathBuf, Entry>;
+
+fn sqlite_sidecar(path: &Path) -> bool {
+    // Only the named family databases' root-level sidecars are never cloned
+    // or used as clone sources. A same-named file anywhere in views/ still
+    // participates in clone invalidation.
+    path.parent() == Some(Path::new(""))
+        && matches!(
+            path.to_str(),
+            Some(
+                "members.sqlite-wal"
+                    | "members.sqlite-shm"
+                    | "members.sqlite-journal"
+                    | "trigram.sqlite-wal"
+                    | "trigram.sqlite-shm"
+                    | "trigram.sqlite-journal"
+                    | "semantic.sqlite-wal"
+                    | "semantic.sqlite-shm"
+                    | "semantic.sqlite-journal"
+                    | "callgraph.sqlite-wal"
+                    | "callgraph.sqlite-shm"
+                    | "callgraph.sqlite-journal"
+                    | "symbol.sqlite-wal"
+                    | "symbol.sqlite-shm"
+                    | "symbol.sqlite-journal"
+            )
+        )
 }
 
 fn inventory(path: &Path) -> Result<Arc<Mutex<Inventory>>> {
@@ -100,8 +130,8 @@ pub(super) fn measure(path: &Path, deadline: Option<Instant>) -> Result<Option<u
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    let mut entries = BTreeMap::new();
-    if !walk_allocated(path, deadline, Level::Family, &mut entries)? {
+    let mut entries = Entries::with_capacity(inventory.entries.len());
+    if !walk_allocated(path, path, deadline, Level::Family, &mut entries)? {
         return Ok(None);
     }
     // Deleting or replacing a clone changes a sibling's private size without
@@ -109,17 +139,20 @@ pub(super) fn measure(path: &Path, deadline: Option<Instant>) -> Result<Option<u
     // member can do the same. The family registry and blob databases outside
     // views/ (including SQLite recreating their sidecars at the same names)
     // do not share view data blocks.
-    let invalidate_private = entries.len() != inventory.entries.len()
-        || entries.iter().any(|(path, entry)| {
-            inventory.entries.get(path).is_none_or(|old| {
-                old.directory != entry.directory
-                    || ((entry.directory || entry.shares_data || old.shares_data)
-                        && old.version.identity != entry.version.identity)
-                    || ((entry.shares_data || old.shares_data) && old.version != entry.version)
-            })
-        });
+    let members = entries.keys().filter(|path| !sqlite_sidecar(path)).count();
+    let invalidate_private = members != inventory.members
+        || entries
+            .iter()
+            .filter(|(path, _)| !sqlite_sidecar(path))
+            .any(|(path, entry)| {
+                inventory.entries.get(path).is_none_or(|old| {
+                    old.directory != entry.directory
+                        || old.version.identity != entry.version.identity
+                        || ((entry.shares_data || old.shares_data) && old.version != entry.version)
+                })
+            });
     let mut total = 0u64;
-    for (path, entry) in &mut entries {
+    for (relative, entry) in &mut entries {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(None);
         }
@@ -130,14 +163,14 @@ pub(super) fn measure(path: &Path, deadline: Option<Instant>) -> Result<Option<u
         let charge = if entry.private {
             let cached = inventory
                 .entries
-                .get(path)
+                .get(relative)
                 .filter(|old| !invalidate_private && old.private && old.version == entry.version)
                 .and_then(|old| old.charge);
             if let Some(charge) = cached {
                 entry.charge = Some(charge);
                 charge
             } else {
-                let (charge, reusable) = unshared::measure(path, allocated);
+                let (charge, reusable) = unshared::measure(&path.join(relative), allocated);
                 entry.charge = reusable.then_some(charge);
                 charge
             }
@@ -147,6 +180,7 @@ pub(super) fn measure(path: &Path, deadline: Option<Instant>) -> Result<Option<u
         total = total.saturating_add(charge);
     }
     inventory.entries = entries;
+    inventory.members = members;
     Ok(Some(total))
 }
 
@@ -181,6 +215,41 @@ mod tests {
                 assert_eq!(work_profile::count("private_size_measurement"), before + 3);
                 fs::remove_file(&path).unwrap();
                 assert_eq!(allocated_bytes(root.path()).unwrap(), 4096);
+            },
+        );
+    }
+
+    #[test]
+    fn incremental_measurement_ignores_only_named_root_sidecar_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = member(root.path(), "worker");
+        fs::write(dir.join("payload"), [7; 4096]).unwrap();
+        unshared::with_private_bytes_for_test(
+            |path| Some(fs::metadata(path).unwrap().len()),
+            || {
+                assert_eq!(allocated_bytes(root.path()).unwrap(), 4096);
+                let probes = work_profile::count("private_size_measurement");
+                let mut sidecar_bytes = 0;
+                for database in ["members", "trigram", "semantic", "callgraph", "symbol"] {
+                    for suffix in ["wal", "shm", "journal"] {
+                        let path = root.path().join(format!("{database}.sqlite-{suffix}"));
+                        fs::write(&path, [8; 4096]).unwrap();
+                        sidecar_bytes += file_allocated(&fs::metadata(&path).unwrap());
+                    }
+                }
+                assert_eq!(allocated_bytes(root.path()).unwrap(), 4096 + sidecar_bytes);
+                assert_eq!(work_profile::count("private_size_measurement"), probes);
+                let removed = root.path().join("members.sqlite-wal");
+                sidecar_bytes -= file_allocated(&fs::metadata(&removed).unwrap());
+                fs::remove_file(removed).unwrap();
+                // This same-named member file is not a family sidecar. Its
+                // addition must invalidate the payload's private size too.
+                fs::write(dir.join("semantic.sqlite-wal"), [9; 4096]).unwrap();
+                assert_eq!(allocated_bytes(root.path()).unwrap(), 8192 + sidecar_bytes);
+                assert_eq!(work_profile::count("private_size_measurement"), probes + 2);
+                fs::write(root.path().join("unknown.sqlite-wal"), [8; 4096]).unwrap();
+                allocated_bytes(root.path()).unwrap();
+                assert_eq!(work_profile::count("private_size_measurement"), probes + 4);
             },
         );
     }

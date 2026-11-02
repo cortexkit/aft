@@ -519,9 +519,10 @@ impl Level {
 
 fn walk_allocated(
     path: &Path,
+    root: &Path,
     deadline: Option<Instant>,
     level: Level,
-    entries: &mut std::collections::BTreeMap<PathBuf, inventory::Entry>,
+    entries: &mut inventory::Entries,
 ) -> Result<bool> {
     for entry in fs::read_dir(path)
         .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
@@ -558,15 +559,19 @@ fn walk_allocated(
                 )
             }
         };
+        let relative = path
+            .strip_prefix(root)
+            .expect("inventory entry under its root")
+            .to_path_buf();
         if meta.is_dir() {
-            entries.insert(path.clone(), inventory::Entry::new(&meta, false, false));
+            entries.insert(relative, inventory::Entry::new(&meta, false, false));
             let child = level.child(&entry.file_name());
-            if !walk_allocated(&path, deadline, child, entries)? {
+            if !walk_allocated(&path, root, deadline, child, entries)? {
                 return Ok(false);
             }
         } else {
             entries.insert(
-                path,
+                relative,
                 inventory::Entry::new(
                     &meta,
                     level == Level::Member && meta.is_file(),
