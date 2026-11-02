@@ -35,7 +35,7 @@ unset AFT_NEXTEST_ARCHIVE_FILE
 prepush_step watcher-conformance env AFT_GATE_PHASES=watcher,conformance bash scripts/rust-test-gate.sh || true
 prepush_step deny-warnings env RUSTFLAGS='-D warnings' cargo check --workspace --all-targets || true
 prepush_step provider-deny-warnings env RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --features test-timing-hooks --test rest || true
-prepush_step dependencies bun install --frozen-lockfile
+prepush_step dependencies bun install --frozen-lockfile --offline
 prepush_step bridge bun run --cwd packages/aft-bridge build
 prepush_step pi bun run --cwd packages/pi-plugin build
 prepush_step opencode bun run --cwd packages/opencode-plugin build
