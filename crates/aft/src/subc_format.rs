@@ -2057,8 +2057,10 @@ pub(crate) fn format_ast_search_match(m: &Value) -> String {
     if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
         let capture_text = m.get("meta_variable_text").and_then(Value::as_object);
         for (key, value) in meta_vars {
-            // A $$$ capture keeps the engine's source text instead of joining
-            // its node list, which would lose original separators.
+            // In ast-grep patterns, `$$$NAME` captures a sequence of nodes (for
+            // example all call arguments) rather than one node. For such a
+            // capture, print the engine's original source text: joining the
+            // node list would drop the separators between the nodes.
             let value = capture_text
                 .and_then(|texts| texts.get(key))
                 .filter(|text| text.is_string())
