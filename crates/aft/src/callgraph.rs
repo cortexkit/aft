@@ -1743,7 +1743,10 @@ pub(crate) fn build_file_data_from_tree(
     };
 
     // Get symbols (for call site extraction and export detection)
-    let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let mut symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    if lang == LangId::Rust {
+        symbols.extend(rust_trait_members(source, tree.root_node()));
+    }
 
     let root = tree.root_node();
     let mut macro_body_calls_by_macro = HashMap::new();
@@ -1960,6 +1963,68 @@ pub(crate) fn build_file_data_from_tree(
         python_bindings,
         lang,
     })
+}
+
+fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "trait_item" {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("body"),
+            ) {
+                let name = node_text(name, source);
+                let mut scope = Vec::new();
+                let mut parent = node.parent();
+                while let Some(ancestor) = parent {
+                    if ancestor.kind() == "mod_item" {
+                        if let Some(module) = ancestor.child_by_field_name("name") {
+                            scope.push(node_text(module, source));
+                        }
+                    }
+                    parent = ancestor.parent();
+                }
+                scope.reverse();
+                scope.push(name.clone());
+                let exported = node
+                    .named_children(&mut node.walk())
+                    .any(|n| n.kind() == "visibility_modifier");
+                for method in body.named_children(&mut body.walk()) {
+                    if !matches!(method.kind(), "function_item" | "function_signature_item") {
+                        continue;
+                    }
+                    let Some(method_name) = method.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let end = method
+                        .child_by_field_name("body")
+                        .map_or(method.end_byte(), |body| body.start_byte());
+                    symbols.push(Symbol {
+                        name: node_text(method_name, source),
+                        kind: SymbolKind::Method,
+                        range: crate::symbols::Range {
+                            start_line: method.start_position().row as u32,
+                            start_col: method.start_position().column as u32,
+                            end_line: method.end_position().row as u32,
+                            end_col: method.end_position().column as u32,
+                        },
+                        signature: Some(
+                            source[method.start_byte()..end]
+                                .trim()
+                                .trim_end_matches(';')
+                                .to_string(),
+                        ),
+                        scope_chain: scope.clone(),
+                        exported,
+                        parent: Some(name.clone()),
+                    });
+                }
+            }
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    symbols
 }
 
 #[derive(Debug, Clone)]
