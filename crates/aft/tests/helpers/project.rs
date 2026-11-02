@@ -26,6 +26,14 @@ pub fn project_tempdir() -> tempfile::TempDir {
 /// Use Git evidence when a fixture asserts the exact visible file inventory.
 /// Git metadata is excluded by project walkers, unlike an added root manifest.
 pub fn git_project_tempdir() -> tempfile::TempDir {
+    git_tempdir(true)
+}
+
+pub fn unborn_git_project_tempdir() -> tempfile::TempDir {
+    git_tempdir(false)
+}
+
+fn git_tempdir(commit: bool) -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("create test Git project");
     let root = directory.path();
     let ignored_config = root.join(".git/aft-no-user-config");
@@ -47,27 +55,29 @@ pub fn git_project_tempdir() -> tempfile::TempDir {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = git()
-        .args([
-            "-c",
-            "user.name=AFT Tests",
-            "-c",
-            "user.email=aft-tests@example.test",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "--allow-empty",
-            "-m",
-        ])
-        .arg(format!("fixture at {}", root.display()))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if commit {
+        let output = git()
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.test",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+            ])
+            .arg(format!("fixture at {}", root.display()))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     directory
 }
 
@@ -89,4 +99,11 @@ pub fn ensure_project(root: &Path) -> io::Result<()> {
         mark_project(root)?;
     }
     Ok(())
+}
+
+/// Declare a known project when a fixture tests tool replies, not detection.
+/// The classifier's wall-clock cutoff must not change those replies under load.
+pub fn admitted_config(mut config: serde_json::Value) -> serde_json::Value {
+    config["project_detection"] = serde_json::json!({ "mode": "project" });
+    config
 }

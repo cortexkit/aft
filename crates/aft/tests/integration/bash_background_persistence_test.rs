@@ -314,7 +314,7 @@ fn wait_for_frame_with_forensics(
 
 #[test]
 fn missing_background_frame_panic_includes_bounded_non_destructive_forensics() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::project::project_tempdir();
     let storage = spawn_storage_dir("storage");
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path(), storage.path(), SESSION);

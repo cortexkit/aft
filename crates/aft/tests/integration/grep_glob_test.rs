@@ -9,7 +9,11 @@ use serde_json::{json, Value};
 use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = crate::test_helpers::project::git_project_tempdir();
+    let temp_dir = if files.iter().any(|(path, _)| path.starts_with(".git/")) {
+        crate::test_helpers::project::unborn_git_project_tempdir()
+    } else {
+        crate::test_helpers::project::git_project_tempdir()
+    };
 
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);

@@ -5412,10 +5412,10 @@ async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
         10,
         &root1,
         "repeat-breaker-bash-session",
-        json!({
+        crate::test_helpers::project::admitted_config(json!({
             "bash": { "rewrite": true },
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-        }),
+        })),
     )
     .await;
     expect_route_bind_ack(&mut stream, 10).await;

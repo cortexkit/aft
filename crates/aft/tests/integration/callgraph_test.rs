@@ -14,10 +14,15 @@ use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
     crate::test_helpers::project::ensure_project(root).unwrap();
-    let resp = aft.send(&format!(
-        r#"{{"id":"configure","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root.display())
-    ));
+    let resp = aft.send(
+        &serde_json::json!({
+            "id": "configure", "command": "configure", "harness": "opencode", "project_root": root,
+            "config": crate::helpers::user_config(crate::test_helpers::project::admitted_config(
+                serde_json::json!({})
+            ))
+        })
+        .to_string(),
+    );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
     aft.wait_for_folder_admission();
 }
