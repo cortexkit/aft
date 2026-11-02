@@ -246,6 +246,7 @@ pub(crate) use secret_consent::{
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
+mod keepalive;
 mod manifest;
 mod page_collect;
 mod persistence;
@@ -1629,6 +1630,7 @@ struct RouteIdentityData {
     consumer_elicitation_capable: bool,
     held_reply: bool,
     held_update: bool,
+    call_keepalive: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -8787,6 +8789,10 @@ async fn handle_control_request(
             let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
                 consumer_capabilities.as_deref(),
             );
+            let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
+            });
             let held_reply = consumer_capabilities
                 .as_ref()
                 .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
@@ -8882,6 +8888,7 @@ async fn handle_control_request(
                 tool_result_body,
                 held_reply,
                 held_update,
+                call_keepalive,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -10453,6 +10460,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    progress: Option<crate::run_tool_call::progress::Progress>,
     speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
@@ -10486,6 +10494,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                progress,
                 speech_seed,
                 bare_name,
                 mut arguments,
@@ -10500,6 +10509,11 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if let (Some(progress), Some(token)) =
+                (progress, crate::executor::current_job_cancellation())
+            {
+                token.set_progress(progress);
+            }
             if identity_for_run.run_owner.is_some() {
                 if let Err(response) = tool_provider::check_program_scope(
                     ctx,
@@ -11032,6 +11046,13 @@ async fn handle_tool_call_with_capabilities(
         flags: frame.header.flags,
         deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
     };
+    let progress = keepalive::channel(
+        tx,
+        metrics,
+        active_tool_calls,
+        frame,
+        identity.call_keepalive,
+    );
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
@@ -11926,6 +11947,7 @@ async fn handle_tool_call_with_capabilities(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            progress: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
@@ -12142,6 +12164,7 @@ async fn handle_tool_call_with_capabilities(
         });
         let deferred_setup_guard =
             PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
+        let job = keepalive::job(progress, job);
         let rx = submit_active_tool_call(
             executor.as_ref(),
             active_tool_calls,
@@ -12330,6 +12353,7 @@ async fn handle_tool_call_with_capabilities(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        progress,
         speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
@@ -13885,6 +13909,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -15166,6 +15191,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20297,6 +20323,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20431,6 +20458,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),

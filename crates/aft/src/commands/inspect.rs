@@ -349,6 +349,7 @@ fn capture_inspect_root_stats_while(
                 ));
             }
         }
+        crate::run_tool_call::progress::report();
     }
     // An exhausted iterator may mean timeout, including roots with no source
     // files at all. Never mistake a partial census for a fresh empty snapshot.
@@ -370,6 +371,7 @@ fn capture_inspect_root_stats_while(
             )
         })?;
         manifests.push((manifest.clone(), blake3::hash(&contents)));
+        crate::run_tool_call::progress::report();
     }
     if !has_work_budget() {
         return Err(timeout_detail());
@@ -2221,8 +2223,14 @@ fn start_applicable_servers_concurrently(
     startup_deadline: Instant,
 ) -> Vec<ApplicableServerStartOutcomes> {
     let config = ctx.config();
+    let cancellation = crate::executor::current_job_cancellation();
     let start = |server: &crate::lsp::roots::ServerKey| {
-        ctx.lsp_start_applicable_server_until(applicability, server, &config, startup_deadline)
+        let outcome =
+            ctx.lsp_start_applicable_server_until(applicability, server, &config, startup_deadline);
+        if let Some(token) = &cancellation {
+            token.report_progress();
+        }
+        outcome
     };
     std::thread::scope(|scope| {
         let handles = applicability
@@ -3090,7 +3098,13 @@ fn receive_tier2_completion_until(
     deadline: std::time::Instant,
     request_deadline: Option<InspectRequestDeadline>,
 ) -> Option<JobOutcome> {
+    let mut progress = manager.work_progress(category);
     loop {
+        let next = manager.work_progress(category);
+        if next.is_some() && next != progress {
+            progress = next;
+            crate::run_tool_call::progress::report();
+        }
         // Another category may have used this wait's budget after the worker
         // finished. Keep an already published result even at the deadline.
         if let Ok(outcome) = rx.try_recv() {

@@ -7,6 +7,7 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 mod cpu_time;
+pub(crate) mod progress;
 pub(crate) use cpu_time::ThreadCpuSample;
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;

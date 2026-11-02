@@ -605,6 +605,7 @@ type IoJob = Box<dyn FnOnce() + Send + 'static>;
 /// A published walk snapshot never holds its lock while accessing the filesystem.
 /// The caller can take the last examined prefix even if the helper is stuck in `next`.
 pub(crate) struct WalkProgress<T> {
+    cancellation: Option<crate::executor::JobCancellation>,
     snapshot: Arc<Mutex<T>>,
     stopped: Arc<AtomicBool>,
     deadline: Instant,
@@ -617,6 +618,10 @@ pub(crate) struct WalkCompletion {
 impl<T> WalkProgress<T> {
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
             || Instant::now() >= self.deadline
             || prior_failure().is_some()
     }
@@ -628,6 +633,9 @@ impl<T> WalkProgress<T> {
         update(&mut snapshot);
         drop(snapshot);
         self.published.store(true, Ordering::Release);
+        if let Some(token) = &self.cancellation {
+            token.report_progress();
+        }
         ACTIVE_PROBE.with(|probe| {
             if let Some(probe) = probe.borrow().as_ref() {
                 probe
@@ -660,6 +668,7 @@ pub(crate) fn run_walk<T: Clone + Send + 'static>(
     let stopped = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicBool::new(false));
     let progress = WalkProgress {
+        cancellation: crate::executor::current_job_cancellation(),
         snapshot: snapshot.clone(),
         stopped: stopped.clone(),
         deadline,
