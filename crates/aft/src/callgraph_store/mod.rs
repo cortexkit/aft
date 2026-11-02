@@ -20200,12 +20200,18 @@ fn insert_method_dispatch_edges_cached(
             continue;
         }
 
-        let eligible = candidates
-            .iter()
-            .filter(|c| !c.scoped_name.starts_with("@object:"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let Some(candidate) = select_name_match_candidate(&reference, eligible.as_slice()) else {
+        let eligible;
+        let candidates = if matches!(reference.lang.as_str(), "typescript" | "tsx") {
+            eligible = candidates
+                .iter()
+                .filter(|c| !c.scoped_name.starts_with("@object:"))
+                .cloned()
+                .collect::<Vec<_>>();
+            eligible.as_slice()
+        } else {
+            candidates.as_slice()
+        };
+        let Some(candidate) = select_name_match_candidate(&reference, candidates) else {
             continue;
         };
         edge_ids.insert(insert_method_dispatch_edge(

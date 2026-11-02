@@ -1110,7 +1110,7 @@ impl ParseBlob {
         keys
     }
 
-    fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
+    pub(super) fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
         let lang = language_id(&self.language)
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(self.language.clone()))?;
         let mut calls_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();

@@ -176,6 +176,16 @@ fn typescript_object_factory_returns_are_lexically_bound() {
 }
 
 #[test]
+fn typescript_object_same_named_local_bindings_do_not_share_a_method() {
+    let parse = parse("function first() { const value = { run() {} }; value.run(); }\nfunction second() { const value = { run() {} }; value.run(); }", "typescript");
+    let first = ts_object_target(&parse, 1);
+    let second = ts_object_target(&parse, 2);
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert!(first.is_disjoint(&second));
+}
+
+#[test]
 fn typescript_object_factory_import_uses_the_export_binding() {
     let producer = parse(
         "export function make() { return { run: () => {} }; }",

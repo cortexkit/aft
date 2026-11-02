@@ -3085,9 +3085,17 @@ pub(crate) fn ts_object_scope(source: &str, object: Node<'_>) -> String {
         .parent()
         .filter(|n| n.kind() == "variable_declarator")
     {
+        let top_level = declaration
+            .parent()
+            .and_then(|n| n.parent())
+            .is_some_and(|n| {
+                n.kind() == "program"
+                    || n.kind() == "export_statement"
+                        && n.parent().is_some_and(|p| p.kind() == "program")
+            });
         if let Some(name) = declaration
             .child_by_field_name("name")
-            .filter(|n| n.kind() == "identifier")
+            .filter(|n| top_level && n.kind() == "identifier")
         {
             return node_text(source, &name).to_string();
         }
