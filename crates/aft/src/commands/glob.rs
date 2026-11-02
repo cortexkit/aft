@@ -34,7 +34,7 @@ const GLOB_TRUNCATED_MESSAGE: &str =
 const MAX_FLAT_FILES: usize = 20;
 const MAX_FILES_PER_DIRECTORY: usize = 7;
 const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
-const MAX_DIRECTORY_SECTIONS: usize = 8;
+const MAX_DIRECTORY_SECTIONS: usize = MAX_DISPLAY_DIRECTORIES;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {

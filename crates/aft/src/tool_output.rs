@@ -657,7 +657,7 @@ fn native_envelope_line(data: &serde_json::Value, text: &str) -> Option<(usize, 
             }
             let envelope =
                 serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()?;
-            let line = crate::list_envelope::render_trailer(&envelope)?;
+            let line = crate::subc_format::render_envelope_trailer(&envelope)?;
             let start = text
                 .match_indices(line.as_str())
                 .filter(|(start, _)| {
