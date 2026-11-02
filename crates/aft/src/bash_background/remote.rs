@@ -933,6 +933,11 @@ pub(crate) struct KeyedSubmission {
 
 #[cfg(unix)]
 impl KeyedSubmission {
+    fn recovered(&mut self) {
+        self.recovery_started_at_ms = None;
+        self.attempts = 0;
+    }
+
     fn expires_at(&self, metadata: &PersistedTask) -> u64 {
         let retention_end = self.created_at_ms.saturating_add(SUBMISSION_RETENTION_MS);
         if metadata.remote.as_ref().is_some_and(|r| !r.accepted) {
@@ -1761,6 +1766,9 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             if let Some(submission) = r.submission.as_mut() {
                 submission.reattached |= accepted.attached;
+                if !r.accepted {
+                    submission.recovered();
+                }
             }
             r.return_first_seq = None;
             r.return_staging = Default::default();
@@ -1994,6 +2002,20 @@ impl TaskSink {
                 submission
                     .recovery_started_at_ms
                     .get_or_insert_with(unix_millis);
+            }
+        })
+    }
+
+    fn finish_submission_recovery(&mut self) -> io::Result<()> {
+        self.commit(|r| {
+            // A re-established stream ends this pre-acceptance interruption.
+            // A later outage needs a new window, even if placement is still
+            // pending. Keep retries bounded when an accepted job's terminal
+            // result is unknown.
+            if !r.accepted {
+                if let Some(submission) = &mut r.submission {
+                    submission.recovered();
+                }
             }
         })
     }
@@ -2850,7 +2872,11 @@ impl BgTaskRegistry {
                 result
             };
             match tokio::time::timeout(Duration::from_millis(remaining), submit).await {
-                Ok(Ok(stream)) => return Ok(Some(stream)),
+                Ok(Ok(stream)) => {
+                    sink.finish_submission_recovery()
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Some(stream));
+                }
                 result => crate::slog_warn!(
                     "runon: keyed recovery failed task_id={} attempt={} reason={}",
                     sink.task.task_id,

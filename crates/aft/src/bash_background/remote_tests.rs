@@ -14158,6 +14158,11 @@ async fn runon_preaccepted_recovery_window_is_persisted_and_retention_bounded() 
     submission.created_at_ms = 1;
     submission.recovery_started_at_ms = Some(86_400_000);
     assert_eq!(submission.expires_at(&metadata), 86_400_001);
+    sink.accepted(&Accepted::new(id(), 1)).unwrap();
+    let accepted = read_task(&paths.json).unwrap().remote.unwrap();
+    let submission = accepted.submission.unwrap();
+    assert_eq!(submission.recovery_started_at_ms, None);
+    assert_eq!(submission.attempts, 0);
 }
 
 #[tokio::test]
