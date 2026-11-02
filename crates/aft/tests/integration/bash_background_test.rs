@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use super::helpers::{AftProcess, ReleaseOnDrop};
 // The project-tier test is Unix-only, so this import is too.
 #[cfg(unix)]
 use super::helpers::user_config_tier;
@@ -39,7 +39,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     configure_background_at_root(
         aft,
         &dir,
-        user_config(serde_json::json!({
+        crate::test_helpers::project_detection_user_config(serde_json::json!({
             "experimental": { "bash": { "background": true } }
         })),
     );
@@ -52,7 +52,9 @@ fn configure_background_with_env(aft: &mut AftProcess, env: Value) -> tempfile::
     configure_background_at_root(
         aft,
         &dir,
-        user_config(serde_json::json!({ "bash": { "background": true, "env": env } })),
+        crate::test_helpers::project_detection_user_config(
+            serde_json::json!({ "bash": { "background": true, "env": env } }),
+        ),
     );
     dir
 }
@@ -84,7 +86,7 @@ fn configure_restricted_background(aft: &mut AftProcess) -> (tempfile::TempDir, 
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "restrict_to_project_root": true,
                 "experimental": { "bash": { "background": true } }
             })),
@@ -757,7 +759,7 @@ fn assert_background_artifact_search_access(command: &str) {
                 "harness": "opencode",
                 "project_root": project.path(),
                 "storage_dir": storage.path(),
-                "config": user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "restrict_to_project_root": restricted,
                     "experimental": { "bash": { "background": true } }
                 }))
@@ -1974,7 +1976,7 @@ fn replay_does_not_return_acknowledged_completion_after_restart() {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": dir.path().join("aft-storage"),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = crate::test_helpers::tempdir();
@@ -31,7 +31,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }),
     );
     assert_eq!(

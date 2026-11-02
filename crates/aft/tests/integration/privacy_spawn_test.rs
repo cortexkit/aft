@@ -1,7 +1,7 @@
 //! Prompt-free real macOS launch coverage. Only process attribution and ordinary
 //! temporary files/terminal IO are observed; no TCC-protected API is exercised.
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
@@ -24,7 +24,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, sandbox: bool
     let response = aft.send(&json!({
         "id": "cfg-privacy", "session_id": SESSION, "command": "configure",
         "harness": "opencode", "project_root": project, "storage_dir": storage,
-        "config": user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "enabled": sandbox } })),
+        "config": crate::test_helpers::project_detection_user_config(json!({ "bash": { "disclaim_privacy": true }, "sandbox": { "enabled": sandbox } })),
     }).to_string());
     assert_eq!(response["success"], true, "{response}");
 }

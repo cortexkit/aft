@@ -334,7 +334,7 @@ fn configure_context_with_views(
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": true, "semantic": true, "callgraph": true },
             "views": { "enabled": views_enabled },
             "worktree": { "ram_overlay": ram_overlay },

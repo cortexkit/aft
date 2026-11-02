@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -51,7 +51,7 @@ fn configure_native_policy(
             "project_root": project,
             "storage_dir": storage,
             "bash_permissions": true,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "background": true, "rewrite": true },
                 "sandbox": {
                     "enabled": enabled,
@@ -140,7 +140,7 @@ impl CortexkitFloorFixture {
                 "id": "configure-cortexkit-floor", "command": "configure",
                 "harness": "opencode", "project_root": project, "storage_dir": storage,
                 "bash_permissions": true,
-                "config": user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
                     "sandbox": { "enabled": true },
                     "subc": { "connection_file": "~/daemon/connection.json" },

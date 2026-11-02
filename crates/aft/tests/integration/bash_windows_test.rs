@@ -17,7 +17,7 @@
 
 #![allow(unused_imports)]
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -190,7 +190,7 @@ fn windows_cmd_background_wrapper_allows_bang_in_path() {
             "harness":"opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

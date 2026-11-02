@@ -64,7 +64,7 @@ fn configured_context_with_storage(
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": callgraph_store }
         })),
     }));
@@ -402,7 +402,7 @@ fn automatic_refresh_reincludes_dead_code_after_callgraph_store_reconfigure() {
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
             "storage_dir": storage_dir.to_string_lossy(),
-            "config": crate::helpers::user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true }
             })),
         })),

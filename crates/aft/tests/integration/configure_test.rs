@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use super::helpers::link_cached_executable;
 #[cfg(unix)]
 use super::helpers::warm_executable;
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -24,7 +24,7 @@ fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, st
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": true, "semantic": false }
             })),
         })
@@ -104,7 +104,7 @@ fn configure_accepts_tier_validate_on_edit() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({ "validate_on_edit": "syntax" })),
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "validate_on_edit": "syntax" })),
         })
         .to_string(),
     );
@@ -208,7 +208,7 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "validate_on_edit": "syntax"
             }))
@@ -270,7 +270,7 @@ fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({ "format_on_edit": true }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "format_on_edit": true }))
         })
         .to_string(),
     );
@@ -310,7 +310,7 @@ fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({ "format_on_edit": false }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "format_on_edit": false }))
         })
         .to_string(),
     );
@@ -347,7 +347,7 @@ fn configure_warns_for_missing_explicit_tsgo_checker() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "checker": {
                     "typescript": "tsgo"
                 }
@@ -420,7 +420,7 @@ fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
             "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": ["bash-language-server"],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "tinymist": {
@@ -545,7 +545,7 @@ fn configure_deduplicates_nested_python_builtin_override() {
             "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": [binary_name],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "python": {
@@ -678,7 +678,7 @@ fn configure_warns_for_custom_lsp_regardless_of_auto_install_set() {
             "harness": "opencode",
             "project_root": dir.path(),
             "lsp_auto_install_binaries": [],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "custom-thing": {
@@ -853,7 +853,7 @@ fn configure_accepts_custom_lsp_servers() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "lsp_ty": true },
                 "lsp": {
                     "disabled": ["Pyright"],
@@ -901,7 +901,7 @@ fn configure_accepts_partial_builtin_lsp_override() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "rust": {
@@ -1076,7 +1076,7 @@ fn configure_answers_before_the_language_server_applicability_walk() {
         "command": "configure",
         "harness": "opencode",
         "project_root": project,
-        "config": user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         })),
     })

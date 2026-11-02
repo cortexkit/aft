@@ -4,7 +4,7 @@
 //! to test the full move pipeline: symbol extraction, destination insertion,
 //! consumer import rewiring, checkpoint creation/restore, and error paths.
 
-use crate::helpers::{fixture_path, link_cached_executable, user_config, AftProcess};
+use crate::helpers::{fixture_path, link_cached_executable, AftProcess};
 use serde_json::json;
 
 /// Copy the `tests/fixtures/move_symbol/` directory into a temp dir,
@@ -150,7 +150,7 @@ exit "$status"
     }
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
-            "config":user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
+            "config":crate::test_helpers::project_detection_user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
     assert_eq!(cfg["success"], true, "{cfg}");
     let request = if command == "move_symbol" {
         json!({"id":"count", "command":command, "file":root.join("source.ts"), "symbol":"moved", "destination":root.join(if fail { "dest.js" } else { "dest.ts" })})
@@ -718,7 +718,7 @@ fn move_symbol_configured_without_store_still_rewrites_ts_consumers() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "indexes": { "callgraph": false } }))
+            "config": crate::test_helpers::project_detection_user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );
@@ -788,7 +788,7 @@ fn move_symbol_large_project_has_no_legacy_file_cap() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({ "indexes": { "callgraph": false } }))
+            "config": crate::test_helpers::project_detection_user_config(json!({ "indexes": { "callgraph": false } }))
         })
         .to_string(),
     );

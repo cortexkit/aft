@@ -69,7 +69,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": crate::helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         }),

@@ -24,7 +24,7 @@ mod aft {
 use aft::search_index::artifact_cache_key;
 use serde_json::{json, Value};
 
-use crate::helpers::{user_config, AftProcess};
+use crate::helpers::AftProcess;
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = crate::test_helpers::project::project_tempdir();
@@ -62,7 +62,7 @@ fn configure_semantic(
             // tests assert the bounded-walk ("literal") fallback, and a trigram
             // index that finishes building before the query would instead
             // answer through the ranked lexical engine.
-            "config": user_config(if enabled {
+            "config": crate::test_helpers::project_detection_user_config(if enabled {
                 serde_json::json!({ "indexes": { "semantic": true } })
             } else {
                 serde_json::json!({ "indexes": { "semantic": false, "trigram": false } })
@@ -251,7 +251,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
                 "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "ollama",
@@ -290,7 +290,7 @@ fn configure_accepts_user_private_base_url() {
                 "harness": "opencode",
                 "project_root": project.path().display().to_string(),
                 "storage_dir": storage.path().display().to_string(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "indexes": { "semantic": true },
                     "semantic": {
                         "backend": "openai_compatible",

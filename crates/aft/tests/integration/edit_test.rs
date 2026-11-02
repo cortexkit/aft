@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-use super::helpers::{fixture_path, user_config, AftProcess};
+use super::helpers::{fixture_path, AftProcess};
 #[cfg(unix)]
 use super::helpers::{link_cached_executable, warm_executable};
 
@@ -1122,7 +1122,7 @@ fn edit_match_handles_brackets_in_relative_literal_path() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true }))
         })
         .to_string(),
     );
@@ -2255,7 +2255,7 @@ exit 0
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome" }
             }))
@@ -2315,7 +2315,7 @@ fn edit_match_glob_reports_formatter_excluded_path_per_file_and_summary() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome" }
             }))
@@ -2368,7 +2368,7 @@ fn edit_match_glob_reports_format_on_edit_false_for_each_file() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({ "format_on_edit": false }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "format_on_edit": false }))
         })
         .to_string(),
     );
@@ -2435,7 +2435,7 @@ exit 0
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome", "python": "biome" }
             }))

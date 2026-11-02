@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{canonicalize_like_product, user_config, AftProcess};
+use super::helpers::{canonicalize_like_product, AftProcess};
 
 const TOKENS: [&str; 3] = ["TOKEN_TOP", "TOKEN_ONE", "TOKEN_TWO"];
 
@@ -112,7 +112,7 @@ fn run_session(fixture: &Fixture, root: &Path) -> SessionOutcome {
             "harness": "opencode",
             "project_root": root.display().to_string(),
             "storage_dir": fixture.storage.display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "worktree": { "ram_overlay": true }
             })),

@@ -997,6 +997,7 @@ pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
     std::fs::write(
         config_dir.join("aft.jsonc"),
         serde_json::to_string(&json!({
+            "project_detection": { "mode": "project" },
             "storage_dir": storage,
             "bash": { "background": true },
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },

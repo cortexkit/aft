@@ -2,9 +2,7 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
-use super::helpers::{
-    canonicalize_like_product, link_cached_path, user_config, warm_executable, AftProcess,
-};
+use super::helpers::{canonicalize_like_product, link_cached_path, warm_executable, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -124,7 +122,7 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
             "harness": "opencode",
             "project_root": root,
             "lsp_paths_extra": [fake_bin_dir],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "fake": {
@@ -418,7 +416,7 @@ fn lsp_inspect_real_oxlint_reports_no_debugger() {
         &json!({
             "id": "cfg-oxlint", "command": "configure", "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(json!({"lsp": {"disabled": ["typescript"]}}))
+            "config": crate::test_helpers::project_detection_user_config(json!({"lsp": {"disabled": ["typescript"]}}))
         })
         .to_string(),
     );

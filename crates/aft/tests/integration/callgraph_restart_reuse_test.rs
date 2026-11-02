@@ -104,7 +104,7 @@ fn configure(aft: &mut AftProcess, root: &Path, storage: &Path) {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::test_helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": true },
             "views": { "enabled": false }
         }))

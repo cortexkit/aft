@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use super::helpers::{AftProcess, ReleaseOnDrop};
 
 const SHORT_WAIT_MS: &str = "600";
 const HANG_CATCH: Duration = Duration::from_secs(12);
@@ -29,7 +29,7 @@ fn configure_bash_background(
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": dir.path().join("storage"),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": {
                     "background": true,
                     "foreground_wait_window_ms": configured_wait_ms,

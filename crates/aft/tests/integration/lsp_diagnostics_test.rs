@@ -479,7 +479,7 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         })),
     }))
@@ -588,7 +588,7 @@ fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
             "harness": "opencode",
             "project_root": root,
             "lsp_paths_extra": [bin_dir],
-            "config": crate::helpers::user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "servers": {
                         "pull-only-markdown": {
@@ -3029,7 +3029,7 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "lsp": lsp
         })),

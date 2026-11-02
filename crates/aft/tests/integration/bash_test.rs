@@ -1,6 +1,6 @@
+use super::helpers::AftProcess;
 #[cfg(unix)]
 use super::helpers::{link_cached_executable, warm_executable};
-use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
 fn shell_quote_path(path: &std::path::Path) -> String {
@@ -190,7 +190,7 @@ fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "bash": { "background": true },
                 "sandbox": { "enabled": false }
             })),
@@ -274,7 +274,7 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "github": { "shim": true },
                 "gh_shim": { "binary_path": binary },
                 "git": { "co_author": "off" }
@@ -316,7 +316,7 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "github": { "shim": false },
                 "git": { "co_author": "off" }
             })),
@@ -378,7 +378,7 @@ fn sandboxed_head_shell_without_a_ticket_keeps_gh_passthrough() {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "github": { "shim": true },
                 "gh_shim": { "binary_path": binary },
                 "git": { "co_author": "off" },
@@ -596,7 +596,7 @@ fn bash_rejects_invalid_pty_dimensions() {
             "harness": "opencode",
             "project_root": dir.path(),
             "storage_dir": dir.path().join("storage"),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })
@@ -742,7 +742,7 @@ fn non_pty_foreground_and_deferred_bash_children_get_isolated_sessions() {
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })
@@ -1034,7 +1034,7 @@ fn assert_changed_files_completion_with_git_budget(
     let configured = aft.send(&serde_json::json!({
         "id": "changed-files-config", "command": "configure", "harness": "opencode",
         "project_root": project.path(), "storage_dir": storage.path(),
-        "config": user_config(serde_json::json!({"bash": bash_config, "sandbox": {"profile": {"head": "off"}}}))
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({"bash": bash_config, "sandbox": {"profile": {"head": "off"}}}))
     }).to_string());
     assert_eq!(configured["success"], true, "{configured}");
     let folder = aft.wait_for_folder_admission();
@@ -1219,7 +1219,7 @@ fn bash_changed_files_flush_timeout_reports_incomplete() {
             std::ffi::OsStr::new("1"),
         ),
     ]);
-    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":{"head":"off"}}}))}).to_string());
+    let configured = aft.send(&serde_json::json!({"id":"flush-timeout-config", "command":"configure", "harness":"opencode", "project_root":project.path(), "storage_dir":storage.path(), "config":crate::test_helpers::project_detection_user_config(serde_json::json!({"bash":{"changed_files":"list","rewrite":false},"sandbox":{"profile":{"head":"off"}}}))}).to_string());
     assert_eq!(configured["success"], true, "{configured}");
     let result = aft.send(&serde_json::json!({"id":"flush-timeout-command", "method":"bash", "params":{"command":"printf last > late.txt", "notify_on_completion":false}}).to_string());
     assert_eq!(result["success"], true, "{result}");

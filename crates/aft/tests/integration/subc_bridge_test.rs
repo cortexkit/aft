@@ -3384,7 +3384,7 @@ fn subc_bridge_new_manifest_tools_route_in_production() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_new_manifest_tools_route_in_production",
         Duration::from_secs(90),
-        r#"{ "disabled_tools": [] }"#,
+        r#"{ "disabled_tools": [], "project_detection": { "mode": "project" } }"#,
         drive_manifest_reachability_daemon,
         |_, _, _| {},
         bridge_dispatch,
@@ -3407,7 +3407,7 @@ fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_disabled_tools_are_refused_at_dispatch",
         Duration::from_secs(30),
-        r#"{ "disabled_tools": ["aft_delete", "bash"] }"#,
+        r#"{ "disabled_tools": ["aft_delete", "bash"], "project_detection": { "mode": "project" } }"#,
         drive_disabled_tools_daemon,
         |_, _, _| {},
         tool_disabled_bridge_dispatch,
@@ -3424,7 +3424,7 @@ fn subc_bridge_host_tool_names_follow_each_route_not_the_root() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_host_tool_names_follow_each_route_not_the_root",
         Duration::from_secs(60),
-        r#"{ "backup": { "enabled": false } }"#,
+        r#"{ "backup": { "enabled": false }, "project_detection": { "mode": "project" } }"#,
         drive_host_tool_names_per_route_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
@@ -3450,7 +3450,7 @@ fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
     run_subc_bridge_production_test_with_user_config(
         "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
         Duration::from_secs(30),
-        r#"{ "disabled_tools": [] }"#,
+        r#"{ "disabled_tools": [], "project_detection": { "mode": "project" } }"#,
         drive_module_hello_health_manifest_daemon,
         |_, _, _| {},
         bridge_dispatch,

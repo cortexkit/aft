@@ -17,7 +17,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(
         &serde_json::json!({
             "id": "configure", "command": "configure", "harness": "opencode", "project_root": root,
-            "config": crate::helpers::user_config(crate::test_helpers::project::admitted_config(
+            "config": crate::test_helpers::project_detection_user_config(crate::test_helpers::project::admitted_config(
                 serde_json::json!({})
             ))
         })

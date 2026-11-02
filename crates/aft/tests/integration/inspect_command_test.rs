@@ -157,7 +157,7 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": {
                 "trigram": false,
                 "semantic": false,
@@ -194,7 +194,7 @@ fn configured_restricted_context(root: &Path) -> AppContext {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false },
             "restrict_to_project_root": true
         })),
@@ -225,7 +225,7 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
@@ -1872,7 +1872,7 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         &request(json!({
             "id": "configure-view", "command": "configure", "harness": "opencode",
             "project_root": linked, "storage_dir": storage,
-            "config": crate::helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": {"enabled": true}
             }))
@@ -8605,7 +8605,7 @@ fn configured_context_with_held_applicability(
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             "inspect": { "diagnostics_timeout_ms": timeout_ms }
         })),
@@ -8910,7 +8910,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
         "harness": "opencode",
         "project_root": root.to_string_lossy(),
         "storage_dir": storage_dir.to_string_lossy(),
-        "config": crate::helpers::user_config(serde_json::json!({
+        "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
             "indexes": { "trigram": false, "semantic": false }
         })),
     }));
@@ -9934,7 +9934,7 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             &request(json!({
                 "id": "gated-configure", "command": "configure", "project_root": root,
                 "storage_dir": storage, "harness": "opencode",
-                "config": crate::helpers::user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": false, "semantic": false },
                     "inspect": { "diagnostics_timeout_ms": 40_000 }
                 }))
@@ -10058,7 +10058,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         let response = handle_configure(
             &request(json!({
                 "id": "saved-configure", "command": "configure", "project_root": root, "storage_dir": storage,
-                "harness": "opencode", "config": crate::helpers::user_config(json!({
+                "harness": "opencode", "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": false, "semantic": false },
                     "inspect": {"diagnostics_timeout_ms": 40_000}
                 }))
@@ -10212,7 +10212,7 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         let response = handle_configure(
             &request(
                 json!({"id":"unsuccessful-configure", "command":"configure", "harness":"opencode", "project_root":root,"storage_dir":storage,
-            "config":crate::helpers::user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
+            "config":crate::test_helpers::project_detection_user_config(json!({"indexes":{"trigram":false,"semantic":false},"inspect":{"diagnostics_timeout_ms":40_000}}))}),
             ),
             &ctx,
         );

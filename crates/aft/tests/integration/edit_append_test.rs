@@ -3,9 +3,9 @@ use std::path::Path;
 
 use serde_json::json;
 
+use super::helpers::AftProcess;
 #[cfg(unix)]
 use super::helpers::{link_cached_executable, warm_executable};
-use super::helpers::{user_config, AftProcess};
 
 fn configure(aft: &mut AftProcess, root: &Path) {
     let resp = aft.configure(root);
@@ -19,7 +19,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }))
         .unwrap(),
     );
@@ -313,7 +313,7 @@ rm "$file"
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "format_on_edit": true,
                 "formatter": { "typescript": "biome" }
             })),

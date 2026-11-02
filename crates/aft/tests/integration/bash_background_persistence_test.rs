@@ -19,7 +19,7 @@ use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
+use super::helpers::{wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 use super::test_helpers::{init_test_logger, take_logs};
 
 const SESSION: &str = "persist-session";
@@ -56,7 +56,7 @@ fn configure_background_for_harness(
             "harness": harness,
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -75,7 +75,7 @@ fn configure_background_without_storage(aft: &mut AftProcess, project: &Path, se
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -3311,7 +3311,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
                 "harness": "opencode",
                 "project_root": project.path(),
                 "storage_dir": storage.path(),
-                "config": user_config(serde_json::json!({
+                "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                     "experimental": { "bash": { "background": true } }
                 })),
                 "max_background_bash_tasks": 32,

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 const SESSION: &str = "bash-token-count-test";
 
@@ -16,7 +16,7 @@ fn configure_background(aft: &mut AftProcess, project_root: &std::path::Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": project_root,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": {
                     "bash": {
                         "background": true,

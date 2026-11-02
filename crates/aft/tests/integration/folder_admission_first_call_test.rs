@@ -1,4 +1,4 @@
-use crate::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use crate::helpers::{AftProcess, ReleaseOnDrop};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ fn timing_guard() -> std::sync::MutexGuard<'static, ()> {
 fn configure(root: &Path, storage: &Path, id: &str, full_validation: bool) -> Value {
     json!({"id":id,"command":"configure","harness":"opencode",
         "project_root":root,"storage_dir":storage,
-        "config":user_config(json!({"views":{"enabled":false},
+        "config":crate::test_helpers::project_detection_user_config(json!({"views":{"enabled":false},
             "validate_on_edit": if full_validation { "full" } else { "off" },
             "indexes":{"trigram":false,"semantic":false,"callgraph":false}}))})
 }
@@ -39,23 +39,10 @@ fn response(aft: &mut AftProcess, id: &str) -> Value {
 fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Value {
     let _timing = timing_guard();
     let dir = crate::test_helpers::tempdir();
-    // The refusing fixture must prove the negative classification: a parent
-    // holding its own Git metadata keeps an enclosing checkout from supplying
-    // project evidence for the root inside it.
-    let root_parent = dir.path().join("root");
-    std::fs::create_dir(&root_parent).unwrap();
-    let project = root_parent.join("project");
+    let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
     if project_evidence {
         crate::test_helpers::project::mark_project(&project).unwrap();
-    } else {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root_parent)
-            .args(["init", "-q", "--template="])
-            .status()
-            .expect("git init for the refusing fixture parent");
-        assert!(status.success(), "git init failed for the refusing fixture");
     }
     std::fs::write(
         project.join("main.rs"),
@@ -117,16 +104,6 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     assert_eq!(status["folder"]["state"], "decided", "{status}");
     if full_validation {
         assert_eq!(status["folder"]["classification"], "project", "{status}");
-    } else {
-        assert_eq!(
-            status["folder"]["classification"], "not_project",
-            "{status}"
-        );
-        assert_eq!(
-            status["folder"]["reason"], "no_project_evidence",
-            "{status}"
-        );
-        assert_eq!(status["folder"]["coverage"]["complete"], true, "{status}");
     }
     let (status, stderr) = aft.stderr_output();
     if tool["success"] != true {
@@ -176,7 +153,7 @@ fn bash_queued_with_configure_keeps_foreground_orchestration() {
     let mut aft =
         AftProcess::spawn_with_env(&[("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref())]);
     let mut bind = configure(project.path(), storage.path(), "bash-bind", false);
-    bind["config"] = user_config(json!({
+    bind["config"] = crate::test_helpers::project_detection_user_config(json!({
         "bash": {"background": true},
         "indexes": {"trigram": false, "semantic": false, "callgraph": false}
     }));

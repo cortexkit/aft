@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 #[cfg(unix)]
 use super::helpers::link_cached_executable;
-use super::helpers::{link_cached_path, user_config, AftProcess};
+use super::helpers::{link_cached_path, AftProcess};
 
 const SEARCH_QUERY: &str = "where does standalone deferred cancellation stop remote embedding";
 
@@ -47,7 +47,7 @@ fn configure_without_indexes(project: &Path) -> String {
         "command": "configure",
         "harness": "opencode",
         "project_root": project.display().to_string(),
-        "config": user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false }
         }))
     }))
@@ -146,7 +146,7 @@ fn standalone_configure_replays_completed_task_before_queued_completion_drain() 
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "experimental": { "bash": { "background": true } }
             })),
@@ -278,7 +278,7 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "views": { "enabled": false }
             }))
@@ -441,7 +441,7 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
             "harness": "opencode",
             "project_root": project.display().to_string(),
             "storage_dir": storage.display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "inspect": {"diagnostics_timeout_ms": 15000}
             }))
@@ -762,7 +762,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
             "harness": "opencode",
             "project_root": project.display().to_string(),
             "lsp_paths_extra": [bin_dir.display().to_string()],
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 30000},
                 "lsp": {
@@ -829,7 +829,7 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 30000}
             }))
@@ -865,7 +865,7 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
             "harness": "opencode",
             "project_root": project.path().display().to_string(),
             "storage_dir": storage.path().display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "semantic": true },
                 "semantic": {
                     "backend": "openai_compatible",
@@ -1045,7 +1045,7 @@ fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
         "command": "configure",
         "harness": "opencode",
         "project_root": project.path().display().to_string(),
-        "config": user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": true, "semantic": false, "callgraph": false },
             "format_on_edit": true,
             "formatter": { "typescript": "biome" }
@@ -1168,7 +1168,7 @@ fn mutation_freshness_fixture_with_content(
         &json!({
             "id": "configure", "command": "configure", "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": true, "semantic": false, "callgraph": false },
                 "format_on_edit": false
             }))
@@ -1438,7 +1438,7 @@ fn warming_rust_inspect_response(
         &json!({
             "id": "configure-partial", "command": "configure", "harness": "opencode",
             "project_root": project, "storage_dir": temp.path().join("storage"),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": diagnostics_timeout_ms},
                 "lsp": {"servers": {
@@ -1610,7 +1610,7 @@ fn standalone_search_on_ready_index_answers_without_waiting_for_the_pending_poll
             "harness": "opencode",
             "project_root": project.display().to_string(),
             "storage_dir": storage.display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": true, "semantic": false, "callgraph": false }
             }))
         }))

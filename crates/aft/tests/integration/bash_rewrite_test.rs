@@ -29,9 +29,7 @@ use sha2::{Digest, Sha256};
 
 // Warn-level log capture is shared across all integration test modules via a
 // single process-global, thread-local-capturing logger. See test_helpers.
-use crate::test_helpers::{
-    init_test_logger, init_test_logger_with_level, take_logs, user_config, AftProcess,
-};
+use crate::test_helpers::{init_test_logger, init_test_logger_with_level, take_logs, AftProcess};
 
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(
@@ -420,7 +418,7 @@ fn standalone_rewrite_footer_names_each_sessions_own_command_tool() {
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
@@ -598,7 +596,7 @@ fn binary_rewrite_matches_bash_for_double_quoted_backslashes() {
             "harness": "runner",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
@@ -750,7 +748,7 @@ fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
             "harness": "runner",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),

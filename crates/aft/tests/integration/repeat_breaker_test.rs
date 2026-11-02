@@ -1052,7 +1052,7 @@ fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),
@@ -1107,7 +1107,7 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
             "command": "configure",
             "harness": "pi",
             "project_root": project.path(),
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),

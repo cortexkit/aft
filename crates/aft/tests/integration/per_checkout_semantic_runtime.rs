@@ -354,7 +354,7 @@ fn configure_payload(
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": { "trigram": true, "semantic": true, "callgraph": false },
             "views": { "enabled": views },
             "semantic": {
@@ -625,7 +625,7 @@ fn views_on_semantic_member_stores_no_call_graph_database() {
         .with_test_checkpoint_store(),
     );
     let mut payload = configure_payload(&repo.main, storage.path(), &server, true, MODEL, 5_000);
-    payload["config"] = crate::helpers::user_config(json!({
+    payload["config"] = crate::test_helpers::project_detection_user_config(json!({
         "indexes": { "trigram": true, "semantic": true, "callgraph": true },
         "views": { "enabled": true },
         "semantic": {

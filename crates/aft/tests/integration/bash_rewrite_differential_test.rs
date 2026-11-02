@@ -14,7 +14,7 @@ use aft::bash_rewrite::observation::{
 };
 use serde_json::{json, Value};
 
-use crate::test_helpers::{user_config, AftProcess};
+use crate::test_helpers::AftProcess;
 
 const CORPUS: &str = include_str!("../fixtures/bash_rewrite_diff/corpus.toml");
 const CONTROLLED_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin";
@@ -99,8 +99,8 @@ fn utility_available(row: &CorpusRow) -> bool {
 }
 
 fn run_row(row: &CorpusRow) -> Result<(), String> {
-    let oracle_root = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
-    let aft_root = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
+    let oracle_root = crate::test_helpers::tempdir();
+    let aft_root = crate::test_helpers::tempdir();
     let oracle_home = oracle_root.path().join("home");
     let aft_home = aft_root.path().join("home");
     fs::create_dir_all(&oracle_home).map_err(|error| error.to_string())?;
@@ -115,7 +115,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
 
     let oracle = run_oracle(row, oracle_root.path(), &oracle_home)?;
     let route_file = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-    let storage = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[
         ("PATH", OsStr::new(CONTROLLED_PATH)),
         ("LC_ALL", OsStr::new("C")),
@@ -134,7 +134,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
             "harness": "runner",
             "project_root": aft_root.path(),
             "storage_dir": storage.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "bash": { "rewrite": true },
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
             })),

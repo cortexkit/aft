@@ -5,7 +5,7 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::language::StubProvider;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn assert_error_code(resp: &serde_json::Value, code: &str) {
     assert_eq!(
@@ -44,7 +44,7 @@ fn configure_restricted(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.display().to_string(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }))
         .unwrap(),
     );

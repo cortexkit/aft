@@ -41,7 +41,7 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 use subc_transport::{authenticate_server, read_frame, write_frame};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 /// Hard timeout Broca assumes when a `bash` call omits `timeout`.
 const CONSUMER_DEFAULT_HARD_TIMEOUT_MS: u64 = 1_800_000;
@@ -951,7 +951,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path) {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "bash": { "background": true } })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "bash": { "background": true } })),
         })
         .to_string(),
     );
@@ -1065,6 +1065,7 @@ fn write_user_config(config_home: &Path) {
     std::fs::write(
         config_dir.join("aft.jsonc"),
         serde_json::to_string(&json!({
+            "project_detection": { "mode": "project" },
             "bash": { "background": true },
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
         }))

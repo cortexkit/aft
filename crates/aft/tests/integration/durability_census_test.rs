@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 const SESSION: &str = "durability-census";
 const INTERPOSER_SOURCE: &str = include_str!("durability_census_interposer.c");
@@ -494,7 +494,7 @@ fn run_scenario(trace: bool, verify_counts: bool) -> String {
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(json!({ "experimental": { "bash": { "background": true } } })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "experimental": { "bash": { "background": true } } })),
         }),
     );
     assert_eq!(configured["success"], true, "{configured:?}");

@@ -8,7 +8,7 @@ use aft::bash_background::persistence::{
     read_exit_marker, resolve_task_layout, session_tasks_dir, ExitMarker,
 };
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnDrop};
+use super::helpers::{wait_for_task_metadata, AftProcess, ReleaseOnDrop};
 
 const SESSION: &str = "bash-arch-session";
 
@@ -21,7 +21,7 @@ fn configure(aft: &mut AftProcess, project: &std::path::Path, storage: &std::pat
             "harness": "opencode",
             "project_root": project,
             "storage_dir": storage,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
             "max_background_bash_tasks": 32,
@@ -338,7 +338,7 @@ fn long_running_reminder_frame_fires_after_configured_interval() {
             "harness": "opencode",
             "project_root": project.path(),
             "storage_dir": storage.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": {
                     "bash": {
                         "background": true,

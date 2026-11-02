@@ -88,7 +88,7 @@ impl Fixture {
             "session_id": "rollback-safety",
             "project_root": self.project,
             "storage_dir": self.storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::test_helpers::project_detection_user_config(doc),
         }))
         .expect("configure request");
         let response = aft::commands::configure::handle_configure(&request, &ctx);

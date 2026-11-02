@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 
-use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
+use super::helpers::{link_cached_path, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = if files.iter().any(|(path, _)| path.starts_with(".git/")) {
@@ -44,7 +44,7 @@ fn configure(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "indexes": { "trigram": false } }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "indexes": { "trigram": false } }))
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
@@ -60,7 +60,7 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "indexes": { "trigram": true } }))
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "indexes": { "trigram": true } }))
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
@@ -1212,7 +1212,7 @@ fn semantic_search_with_both_lanes_off_refuses_instead_of_walking() {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "indexes": { "trigram": false, "semantic": false }
             })),
         }),
@@ -1273,7 +1273,7 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
             "harness": "opencode",
             "project_root": project.path(),
             "lsp_paths_extra": [fake_bin_dir],
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "lsp": {
                     "disabled": ["typescript", "oxlint", "biome"],
                     "servers": {
@@ -1704,7 +1704,7 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "restrict_to_project_root": true,
                 "indexes": { "trigram": false }
             })),
@@ -1931,7 +1931,7 @@ mod explicit_target_regressions {
             &mut aft,
             json!({
                 "id":"restricted", "command":"configure", "harness":"opencode", "project_root":project.path(),
-                "config":user_config(json!({"restrict_to_project_root":true, "indexes":{"trigram":false}}))
+                "config":crate::test_helpers::project_detection_user_config(json!({"restrict_to_project_root":true, "indexes":{"trigram":false}}))
             }),
         );
         assert_eq!(response["success"], true, "{response}");

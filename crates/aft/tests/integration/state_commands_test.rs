@@ -657,7 +657,7 @@ fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     let bind = json!({
         "id": "cfg", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage.path(),
-        "config": super::helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": {"trigram": true, "semantic": true, "callgraph": true},
             "views": {"enabled": true}
         }))

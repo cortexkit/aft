@@ -129,7 +129,7 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
             "harness": "opencode",
             "project_root": checkout,
             "storage_dir": storage,
-            "config": crate::test_helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
                 "views": { "enabled": views },
                 "worktree": { "ram_overlay": false }

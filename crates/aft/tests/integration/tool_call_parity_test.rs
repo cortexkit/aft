@@ -391,7 +391,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
     let configure: aft::protocol::RawRequest = serde_json::from_value(json!({
         "id": "configure-forced-pair", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage.path(),
-        "config": crate::helpers::user_config(json!({
+        "config": crate::test_helpers::project_detection_user_config(json!({
             "indexes": {"trigram": false, "semantic": false, "callgraph": false},
             "views": {"enabled": false}
         }))
@@ -1153,7 +1153,7 @@ fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
             "arguments": {
                 "project_root": project.path().to_string_lossy(),
                 "harness": "opencode",
-                "config": crate::helpers::user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))
             }
@@ -1356,7 +1356,7 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": crate::helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         }),

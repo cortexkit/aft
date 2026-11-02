@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use super::helpers::{user_config, wait_for_task_metadata, AftProcess};
+use super::helpers::{wait_for_task_metadata, AftProcess};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ fn configure(aft: &mut AftProcess, dir: &tempfile::TempDir, enabled: bool) {
         &json!({
             "id": "db-cfg", "command": "configure", "harness": "opencode",
             "project_root": dir.path(), "storage_dir": dir.path().join("storage"),
-            "config": user_config(json!({"bash": {"db_schema_hints": enabled}}))
+            "config": crate::test_helpers::project_detection_user_config(json!({"bash": {"db_schema_hints": enabled}}))
         })
         .to_string(),
     );

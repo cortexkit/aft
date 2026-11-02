@@ -5,7 +5,7 @@
 
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn semantic_feature_after_configure(
     aft: &mut AftProcess,
@@ -41,7 +41,9 @@ fn default_spawn_configures_semantic_off() {
     // A test's own user config without a semantic decision gets the same default.
     assert!(!semantic_feature_after_configure(
         &mut aft,
-        Some(user_config(json!({ "format_on_edit": true })))
+        Some(crate::test_helpers::project_detection_user_config(
+            json!({ "format_on_edit": true })
+        ))
     ));
     assert!(aft.shutdown().success());
 }
@@ -58,7 +60,9 @@ fn an_explicit_semantic_choice_in_the_request_is_respected() {
     let mut aft = AftProcess::spawn();
     assert!(semantic_feature_after_configure(
         &mut aft,
-        Some(user_config(json!({ "indexes": { "semantic": true } })))
+        Some(crate::test_helpers::project_detection_user_config(
+            json!({ "indexes": { "semantic": true } })
+        ))
     ));
     assert!(aft.shutdown().success());
 }

@@ -7,7 +7,6 @@ use super::helpers::AftProcess;
 // Only the unix-gated symlink tests below take this route; on Windows every
 // caller is compiled out, so an unconditional import trips deny-warnings.
 #[cfg(unix)]
-use super::helpers::user_config;
 #[cfg(unix)]
 use aft::commands::checkpoint::handle_checkpoint;
 #[cfg(unix)]
@@ -865,7 +864,7 @@ fn symlink_file_delete_is_undoable_with_project_restriction() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.display().to_string(),
-            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({ "restrict_to_project_root": true })),
         }),
     );
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");

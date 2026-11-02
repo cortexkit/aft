@@ -121,7 +121,7 @@ fn spawn_configured_with_tmp(root: &Path, lsp_paths_extra: &[PathBuf], tmp: &Pat
             "lsp_paths_extra": lsp_paths_extra,
             // Keep the assertions about the TypeScript servers: linters that
             // happen to be on PATH would add their own gaps.
-            "config": super::helpers::user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "lsp": { "disabled": ["biome", "oxlint"] }
             })),
         })

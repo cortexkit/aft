@@ -624,7 +624,7 @@ mod session_owned_artifacts {
                 "harness": "opencode",
                 "project_root": project,
                 "storage_dir": storage,
-                "config": super::super::helpers::user_config(json!({
+                "config": crate::test_helpers::project_detection_user_config(json!({
                     "experimental": { "bash": { "background": true } }
                 })),
             }))

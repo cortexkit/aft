@@ -16,7 +16,7 @@ use aft::inspect::{
 use aft::parser::SymbolCache;
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp_dir = crate::test_helpers::tempdir();
@@ -545,7 +545,7 @@ fn inspect_engine_command_returns_lane_a_shape() {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "lsp": { "disabled": ["rust"] }
             })),
         })

@@ -13,7 +13,7 @@ use serde_json::json;
 
 #[cfg(unix)]
 use super::helpers::warm_executable;
-use super::helpers::{link_cached_executable, user_config, AftProcess};
+use super::helpers::{link_cached_executable, AftProcess};
 
 // ============================================================================
 // Helpers
@@ -157,7 +157,7 @@ fn configure_real_rustfmt_test(aft: &mut AftProcess, project_root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": project_root.display().to_string(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "format_on_edit": true,
                 "formatter_timeout_secs": REAL_RUSTFMT_TEST_TIMEOUT_SECS,
             })),
@@ -1049,7 +1049,7 @@ fn validate_on_edit_full_from_config_runs_checker() {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "validate_on_edit": "full",
                 "checker": { "typescript": "tsc" }
             }))
@@ -1182,7 +1182,7 @@ fn validation_backlog_rejects_overflow_and_duplicate_without_hiding_status() {
     warm_executable(&stub, &["--version"]);
     let _release_guard = ReleaseOnDrop(release.clone());
     let mut aft = AftProcess::spawn();
-    let configured = aft.send(&json!({"id":"cfg-bounded","command":"configure","harness":"opencode","project_root":dir,"config":user_config(json!({"validate_on_edit":"full","checker":{"typescript":"tsc"}}))}).to_string());
+    let configured = aft.send(&json!({"id":"cfg-bounded","command":"configure","harness":"opencode","project_root":dir,"config":crate::test_helpers::project_detection_user_config(json!({"validate_on_edit":"full","checker":{"typescript":"tsc"}}))}).to_string());
     assert_eq!(configured["success"], true);
     aft.send_silent(&json!({"id":"blocked-edit","command":"write","file":target,"content":"const original = 1;\n"}).to_string());
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1286,7 +1286,7 @@ exit 2
             "command": "configure",
             "harness": "opencode",
             "project_root": dir,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "validate_on_edit": "full",
                 "checker": { "typescript": "tsc" }
             }))

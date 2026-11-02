@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 #[cfg(unix)]
-use super::helpers::user_config;
 use super::helpers::AftProcess;
 
 fn configured_aft(project: &Path) -> AftProcess {
@@ -34,7 +33,7 @@ fn configured_restricted_aft(project: &Path) -> AftProcess {
             "command": "configure",
             "harness": "opencode",
             "project_root": project,
-            "config": user_config(json!({ "restrict_to_project_root": true })),
+            "config": crate::test_helpers::project_detection_user_config(json!({ "restrict_to_project_root": true })),
         })
         .to_string(),
     );

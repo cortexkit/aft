@@ -1,4 +1,4 @@
-use super::helpers::{user_config, AftProcess};
+use super::helpers::AftProcess;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ fn exit_status_matrix(form: &str) {
             "command": "configure",
             "harness": "opencode",
             "project_root": project.path(),
-            "config": user_config(json!({
+            "config": crate::test_helpers::project_detection_user_config(json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

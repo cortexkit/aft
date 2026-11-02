@@ -366,6 +366,7 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
         )
         .with_test_checkpoint_store(),
     );
+
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-parent-folder",
@@ -373,7 +374,7 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::test_helpers::project_detection_user_config(doc),
         })),
         &ctx,
     );
@@ -397,10 +398,38 @@ fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
     aft::search_index::resolve_cache_dir_with_key(&key, Some(storage)).join("cache.bin")
 }
 
+/// Declare a fixture repository's project intent, then read its folder
+/// decision.
+///
+/// The index planes a session starts with belong to its folder decision, so a
+/// fixture's requested configuration is only real after that decision. The
+/// explicit intent keeps a temporary directory that happens to sit inside a
+/// checkout from changing what these repository fixtures measure. The negative
+/// classifier result for the same fixture is covered in the admission tests.
+fn admit_repository(ctx: &AppContext, root: &Path) {
+    let request = request(json!({
+        "id": "fixture-repository-admission",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root,
+        "config": crate::test_helpers::project_detection_user_config(
+            json!({"indexes": {"trigram": false, "semantic": false, "callgraph": false}}),
+        ),
+    }));
+    let response = aft::commands::configure::handle_configure(&request, ctx);
+    assert!(
+        response.success,
+        "repository admission failed: {response:?}"
+    );
+    let folder = crate::test_helpers::admission::settle(ctx);
+    assert_eq!(folder["classification"], "project", "{folder}");
+}
+
 /// Waits until the child session's trigram index is ready and persisted.
 /// The runtime drain also settles a bind whose identity was deferred by busy
 /// storage, so its index can start once the database is free.
 fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
+    admit_repository(ctx, root);
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
@@ -1018,7 +1047,7 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(views, TRIGRAM_ONLY, None)),
+            "config": crate::test_helpers::project_detection_user_config(config_doc(views, TRIGRAM_ONLY, None)),
         })
         .to_string()
     };
@@ -1683,7 +1712,7 @@ fn slow_discovery_never_delays_the_bind() {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        "config": crate::test_helpers::project_detection_user_config(config_doc(true, TRIGRAM_ONLY, None)),
     }));
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
@@ -1764,7 +1793,7 @@ fn standalone_view_open_never_blocks_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
+        "config": crate::test_helpers::project_detection_user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
     }).to_string())["success"], true);
     let deadline = Instant::now() + Duration::from_secs(15);
     while !started_file.exists() {
@@ -1852,7 +1881,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
+        "config": crate::test_helpers::project_detection_user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
     }).to_string())["success"], true);
     let mut grace_max = 0;
     let mut load_max = 0;
@@ -1959,7 +1988,7 @@ fn parent_folder_survives_a_real_process_restart() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+            "config": crate::test_helpers::project_detection_user_config(config_doc(true, TRIGRAM_ONLY, None)),
         })
         .to_string()
     };

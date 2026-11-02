@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use super::helpers::{AftProcess, ReleaseOnDrop};
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     let dir = crate::test_helpers::tempdir();
@@ -14,7 +14,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
             "command": "configure",
             "harness": "opencode",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })
@@ -36,7 +36,7 @@ fn configure_background_with_storage(
             "harness": "opencode",
             "project_root": project_root,
             "storage_dir": storage_dir,
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })
@@ -631,7 +631,7 @@ fn watch_and_status_survive_another_harness_configuring_the_root() {
             "command": "configure",
             "harness": "pi",
             "project_root": dir.path(),
-            "config": user_config(serde_json::json!({
+            "config": crate::test_helpers::project_detection_user_config(serde_json::json!({
                 "experimental": { "bash": { "background": true } }
             })),
         })

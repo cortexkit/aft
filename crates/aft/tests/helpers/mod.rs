@@ -99,16 +99,26 @@ fn prepare_fixture_temp_directory() {
         return;
     }
     drop(probe);
-    let relocated = inherited.join("aft-fixture-tmp");
-    if !temp_outside_git_work_tree(&relocated) {
-        panic!(
-            "the test temp directory {} is inside a Git work tree, and so is {}; folder \
-             admission would treat every bare fixture as a project. Point TMPDIR outside any \
-             repository",
-            inherited.display(),
-            relocated.display()
-        );
-    }
+    // The checkout enclosing the temp directory is itself a candidate: a
+    // directory outside its work tree carries no project evidence.
+    let within = git_work_tree_of(&inherited).expect("the temp probe found a work tree");
+    let relocated = within.parent().map(|parent| {
+        parent.join(format!(
+            "aft-fixture-tmp-{}",
+            std::process::id().to_string()
+        ))
+    });
+    let usable = relocated
+        .as_ref()
+        .is_some_and(|candidate| temp_outside_git_work_tree(candidate));
+    assert!(
+        usable,
+        "the test temp directory {} is inside the Git work tree {}; folder admission \
+         would treat every bare fixture as a project. Point TMPDIR outside any repository",
+        inherited.display(),
+        within.display()
+    );
+    let relocated = relocated.expect("a usable relocation was proven above");
     std::env::set_var("TMPDIR", &relocated);
     std::env::set_var("TEMP", &relocated);
     std::env::set_var("TMP", &relocated);
@@ -989,6 +999,17 @@ impl AftProcess {
         }
     }
 
+    /// Apply the fixture's folder decision after connecting to it.
+    ///
+    /// Folder admission reads its policy from user config, and a spawned bridge
+    /// starts from the indexes its last connection left behind. A fixture that
+    /// asks for a different index configuration therefore has to wait for the
+    /// decision (and its configuration replay) before it observes index state
+    /// or sends project tools.
+    pub fn apply_fixture_folder(&mut self) -> serde_json::Value {
+        self.wait_for_folder_admission()
+    }
+
     /// The configure acknowledgement precedes the folder decision. Fixtures
     /// that assert a non-project root must settle the decision and prove the
     /// root really carries no project evidence before they use it.
@@ -1721,6 +1742,47 @@ pub fn fixture_path(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+/// Copy a committed fixture into a fresh temporary directory.
+///
+/// The fixture files live inside this checkout, so a fixture used as a project
+/// root would inherit the checkout's own Git repository as project evidence.
+/// Tests that measure a folder's own evidence use this copy instead; tests
+/// about committed fixture content keep reading them in place.
+pub fn fixture_copy(name: &str) -> tempfile::TempDir {
+    let directory = tempdir();
+    copy_tree(&fixture_path(name), directory.path());
+    directory
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    for entry in std::fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("read fixture {}: {error}", source.display()))
+    {
+        let entry = entry.expect("read fixture entry");
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type().expect("fixture entry type");
+        if kind.is_dir() {
+            std::fs::create_dir_all(&target).expect("create fixture directory");
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target).expect("copy fixture file");
+        }
+    }
+}
+
+/// A user-tier config entry that declares the fixture's own project intent.
+///
+/// Folder admission reads the policy from user config alone. Fixtures whose
+/// subject is a tool's behavior, not folder classification, declare `project`
+/// so their result cannot depend on where the temporary directory happens to
+/// live (a build server keeps it inside the checkout it builds). Folders that
+/// are meant to be refused say so explicitly instead.
+pub fn project_detection_user_config(doc: serde_json::Value) -> serde_json::Value {
+    let mut doc = doc;
+    doc["project_detection"] = serde_json::json!({ "mode": "project" });
+    user_config(doc)
 }
 
 /// Build a user-tier config entry for configure requests.
