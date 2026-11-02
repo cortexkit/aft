@@ -10096,6 +10096,8 @@ mod views_import_tests;
 
 #[cfg(test)]
 mod tests {
+    #[path = "disk_reserve_tests.rs"]
+    mod disk_reserve_tests;
     #[test]
     fn issue1007_configure_skips_second_publish_only_when_nothing_pending() {
         use super::{persist_loaded_search_index, SearchIndex, SearchIndexPersist};

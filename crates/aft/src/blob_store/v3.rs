@@ -23,11 +23,49 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
-/// Free bytes a v3 reservation must leave on the device, or 5% of its
-/// capacity when that is larger. v3 sets no byte budget per family: how many
-/// copies a repository keeps is a matter of count and age, and this floor is
-/// what keeps the device from filling.
+/// Minimum free bytes a v3 reservation must leave on the device. The reserve
+/// is 5% of capacity, bounded by this minimum and [`MAX_FREE_BYTES`].
 pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_FREE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+pub(crate) fn free_disk_floor(capacity: u64) -> u64 {
+    (capacity / 20).clamp(MIN_FREE_BYTES, MAX_FREE_BYTES)
+}
+
+// View loaders carry refusal strings across their error boundaries. Preserve
+// the admission measurement separately so a later probe cannot turn an
+// unexpected probe failure into an ordinary reserve pause.
+static FLOOR_REFUSALS: Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn floor_refusal(storage: &Path, measurement: Option<(u64, u64)>) -> Error {
+    record_floor_refusal(storage, measurement);
+    Error::Refused("device_free_space_floor")
+}
+
+fn record_floor_refusal(storage: &Path, measurement: Option<(u64, u64)>) {
+    let mut refusals = FLOOR_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if measurement.is_none() && refusals.is_empty() {
+        return;
+    }
+    let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
+    if let Some(measurement) = measurement {
+        refusals.insert(key, measurement);
+    } else {
+        refusals.remove(&key);
+    }
+}
+
+pub(crate) fn floor_refusal_measurement(storage: &Path) -> Option<(u64, u64)> {
+    let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
+    FLOOR_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+}
 /// Sweep epochs a symbol-plane row survives without being touched. Symbol
 /// rows are a reusable cache that no manifest names, so the plane-row sweep
 /// ages them out by epoch instead of by marking.
@@ -284,7 +322,7 @@ struct FreeSpaceOverrides {
 }
 struct FreeSpaceOverride {
     canonical: Option<PathBuf>,
-    value: (u64, u64),
+    value: Option<(u64, u64)>,
 }
 static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
     storage: std::collections::BTreeMap::new(),
@@ -316,10 +354,19 @@ impl Drop for FreeSpaceTestGuard {
 /// Production never calls this setter.
 #[doc(hidden)]
 pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
+    set_free_space_probe_for_test(storage, Some((free, capacity)))
+}
+
+#[cfg(test)]
+pub(crate) fn set_free_space_probe_failure_for_test(storage: &Path) -> FreeSpaceTestGuard {
+    set_free_space_probe_for_test(storage, None)
+}
+
+fn set_free_space_probe_for_test(storage: &Path, value: Option<(u64, u64)>) -> FreeSpaceTestGuard {
     let storage = storage.to_path_buf();
     let entry = FreeSpaceOverride {
         canonical: canonical_free_space_path(&storage),
-        value: (free, capacity),
+        value,
     };
     let previous = FREE_SPACE
         .lock()
@@ -399,10 +446,10 @@ fn free_space(path: &Path) -> Option<(u64, u64)> {
             })
             .max_by_key(|(depth, _)| *depth)
             .map(|(_, value)| value)
-            .or_else(|| (overrides.unlimited > 0).then_some((u64::MAX, u64::MAX / 2)))
+            .or_else(|| (overrides.unlimited > 0).then_some(Some((u64::MAX, u64::MAX / 2))))
     };
     if let Some(value) = value {
-        return Some(value);
+        return value;
     }
     probe_free_space(path)
 }
@@ -1169,14 +1216,14 @@ fn for_each_registry(
     Ok(())
 }
 fn check_space(storage: &Path, request: u64, reserved: u64) -> Result<()> {
-    let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
-    let floor = MIN_FREE_BYTES.max(capacity / 20);
+    let (free, capacity) = free_space(storage).ok_or_else(|| floor_refusal(storage, None))?;
+    let floor = free_disk_floor(capacity);
     if free
         .checked_sub(request)
         .and_then(|bytes| bytes.checked_sub(reserved))
         .is_none_or(|bytes| bytes < floor)
     {
-        return Err(Error::Refused("device_free_space_floor"));
+        return Err(floor_refusal(storage, Some((free, capacity))));
     }
     Ok(())
 }
@@ -1192,7 +1239,7 @@ fn preflight_floor(storage: &Path, request: u64) -> Result<()> {
         {
             live = live
                 .checked_add(bytes)
-                .ok_or(Error::Refused("device_free_space_floor"))?;
+                .ok_or_else(|| floor_refusal(storage, None))?;
         }
         Ok(())
     })?;
@@ -1331,7 +1378,7 @@ fn recover_ledgers(storage: &Path, lock: &ReservationLock) -> Result<()> {
     })
 }
 fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) -> Result<()> {
-    let (free, capacity) = free_space(storage).ok_or(Error::Refused("device_free_space_floor"))?;
+    let (free, capacity) = free_space(storage).ok_or_else(|| floor_refusal(storage, None))?;
     let mut reserved = 0u64;
     let root = storage.join("blobs/v3");
     if root
@@ -1387,16 +1434,16 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
                 })?;
             reserved = reserved
                 .checked_add(ledger.reserved_bytes)
-                .ok_or(Error::Refused("device_free_space_floor"))?;
+                .ok_or_else(|| floor_refusal(storage, None))?;
         }
     }
-    let floor = MIN_FREE_BYTES.max(capacity / 20);
+    let floor = free_disk_floor(capacity);
     if free
         .checked_sub(request)
         .and_then(|v| v.checked_sub(reserved))
         .is_none_or(|v| v < floor)
     {
-        return Err(Error::Refused("device_free_space_floor"));
+        return Err(floor_refusal(storage, Some((free, capacity))));
     }
     Ok(())
 }

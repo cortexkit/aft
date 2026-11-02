@@ -91,7 +91,7 @@ fn child_view_failures_reach_the_parent_roots_health() {
         "call graph view unavailable: database is locked",
     );
 
-    let (counts, last) = try_child_load_failures(&root).unwrap().unwrap();
+    let (counts, last, _) = try_child_load_failures(&root).unwrap().unwrap();
     assert_eq!(counts.get("parent_trigram:io"), Some(&2), "{counts:?}");
     assert_eq!(counts.len(), 1, "a busy store must not count: {counts:?}");
     let last = last.unwrap();

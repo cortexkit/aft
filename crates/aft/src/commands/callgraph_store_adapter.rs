@@ -2340,6 +2340,11 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
     }
     match error {
         CallGraphStoreError::Aft(error) => Response::error(req_id, error.code(), error.to_string()),
+        CallGraphStoreError::Unavailable(message)
+            if crate::view_storage_reserve::is_message(&message) =>
+        {
+            Response::error(req_id, "callgraph_unavailable", message)
+        }
         CallGraphStoreError::Unavailable(message) => Response::error(
             req_id,
             "callgraph_unavailable",

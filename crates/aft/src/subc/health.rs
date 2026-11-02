@@ -1994,6 +1994,9 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
         && root["standing"] != true
         && !root["standing_refusal"].is_string()
         && root["cache_unavailable_reason"].is_null()
+        && root["view_storage_reserve"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
         && root["state"] == "ready"
         && ["search_index", "semantic_index", "callgraph_store", "tier2"]
             .iter()
@@ -2085,6 +2088,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
                 | "standing_entry"
                 | "standing_refusal"
                 | "cache_unavailable_reason"
+                | "view_storage_reserve"
                 | "search_index"
                 | "semantic_index"
                 | "callgraph_store"
@@ -3711,6 +3715,11 @@ fn build_health_diagnostic_rollup_from_actors(
     }
 
     let busy_roots = candidates.iter().filter(|candidate| candidate.busy).count();
+    let disk_reserve_detail = candidates
+        .iter()
+        .flat_map(|candidate| candidate.health.view_storage_reserve.values())
+        .next()
+        .map(|reserve| reserve.message.clone());
     let warming_roots = candidates
         .iter()
         .filter(|candidate| !candidate.busy && !candidate.fully_ready)
@@ -3906,21 +3915,12 @@ fn build_health_diagnostic_rollup_from_actors(
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     rollup_mark!(timer, "lifecycle OS probes");
     shared_app.publish_lifecycle_census(lifecycle.clone());
-    let detail = if busy_roots > 0 {
-        Some(format!(
-            "{busy_roots} root actor(s) could not be snapshotted without contention"
-        ))
-    } else if standing_refusals > 0 {
-        Some(format!(
-            "{standing_refusals} standing root(s) refused current resolved-path identity"
-        ))
-    } else if warming_roots > 0 {
-        Some(format!(
-            "{warming_roots} root(s) warming background indexes (serving normally)"
-        ))
-    } else {
-        None
-    };
+    let (status, detail) = root_health_rollup_state(
+        busy_roots,
+        standing_refusals,
+        warming_roots,
+        disk_reserve_detail,
+    );
 
     let storage_retention = lifecycle_contexts
         .iter()
@@ -4009,11 +4009,7 @@ fn build_health_diagnostic_rollup_from_actors(
             (None, None) => unreachable!("a census is measured whenever none is reused"),
         };
     HealthDiagnosticRollup {
-        status: if busy_roots > 0 || standing_refusals > 0 {
-            HealthStatus::Degraded
-        } else {
-            HealthStatus::Ok
-        },
+        status,
         detail,
         generated_at_ms: None,
         generation: 0,
@@ -4025,6 +4021,37 @@ fn build_health_diagnostic_rollup_from_actors(
         #[cfg(test)]
         tick,
     }
+}
+
+fn root_health_rollup_state(
+    busy_roots: usize,
+    standing_refusals: usize,
+    warming_roots: usize,
+    disk_reserve_detail: Option<String>,
+) -> (HealthStatus, Option<String>) {
+    let status = if busy_roots > 0 || standing_refusals > 0 || disk_reserve_detail.is_some() {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Ok
+    };
+    let detail = if busy_roots > 0 {
+        Some(format!(
+            "{busy_roots} root actor(s) could not be snapshotted without contention"
+        ))
+    } else if standing_refusals > 0 {
+        Some(format!(
+            "{standing_refusals} standing root(s) refused current resolved-path identity"
+        ))
+    } else if disk_reserve_detail.is_some() {
+        disk_reserve_detail
+    } else if warming_roots > 0 {
+        Some(format!(
+            "{warming_roots} root(s) warming background indexes (serving normally)"
+        ))
+    } else {
+        None
+    };
+    (status, detail)
 }
 
 fn render_cold_build_limiter_census(
@@ -4926,6 +4953,49 @@ mod tests {
             root[field] = value;
             assert!(!ordinary_ready_health_root(&root), "{field}");
         }
+    }
+
+    #[test]
+    fn disk_reserve_health_survives_ready_root_filtering_and_abbreviation() {
+        let storage = tempfile::tempdir().unwrap();
+        let _low = crate::blob_store::v3::set_free_space_for_test(
+            storage.path(),
+            21 * 1024 * 1024 * 1024,
+            3_900_000_000_000,
+        );
+        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
+            .unwrap_err();
+        let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
+            storage.path(),
+            "device_free_space_floor",
+        )
+        .unwrap();
+        let mut root = json!({
+            "project_root": "project", "state": "ready",
+            "search_index": {"status": "ready"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "ready"}, "tier2": {"status": "ready"},
+        });
+        assert!(ordinary_ready_health_root(&root));
+        root["view_storage_reserve"] = json!({"trigram": reserve});
+        assert!(!ordinary_ready_health_root(&root));
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(
+            root["view_storage_reserve"]["trigram"]["code"],
+            "device_free_space_floor"
+        );
+        assert_eq!(
+            root["view_storage_reserve"]["trigram"]["message"],
+            reserve.message
+        );
+        let (status, detail) = root_health_rollup_state(0, 0, 1, Some(reserve.message.clone()));
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(detail, Some(reserve.message));
+        let (status, detail) = root_health_rollup_state(0, 0, 1, None);
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(
+            detail.as_deref(),
+            Some("1 root(s) warming background indexes (serving normally)")
+        );
     }
 
     #[test]
@@ -10126,6 +10196,7 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         views: None,
         view_load_failures: Default::default(),
         view_load_failure_last: None,
+        view_storage_reserve: Default::default(),
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),
