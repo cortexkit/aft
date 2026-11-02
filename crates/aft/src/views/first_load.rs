@@ -2099,6 +2099,9 @@ impl CheckoutDriver {
                                 "v3 base build busy; retain direct-scan coverage and retry",
                             )
                         })?,
+                        super::base_builder::BaseBuild::AtCapacity => {
+                            return Err(SiblingLoader::error(super::trigram::BASE_CAP_BUSY))
+                        }
                         super::base_builder::BaseBuild::Strict(reason) => {
                             return Err(SiblingLoader::error(format!(
                                 "v3 base admission refused: {reason}"
@@ -2162,6 +2165,14 @@ impl CheckoutDriver {
                     if let Some(previous) = held.replace(claim) {
                         let _ = previous.release();
                     }
+                }
+                super::base_builder::ClaimOutcome::CapReached { .. } => {
+                    return Err(SiblingLoader::error(super::trigram::BASE_CAP_BUSY))
+                }
+                super::base_builder::ClaimOutcome::Reclaiming => {
+                    return Err(SiblingLoader::error(
+                        "v3 base build busy; retain direct-scan coverage and retry",
+                    ))
                 }
                 outcome => {
                     let reason =

@@ -45,6 +45,8 @@ fn absolute_member_path(
     }
     Ok(root.join(relative))
 }
+pub(crate) const BASE_CAP_BUSY: &str = "v3 base admission refused: live_base_cap";
+
 pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // Lexical snapshot errors carry strings. Match only the explicit retry
     // markers preserved by the v3 registry and base builder, including markers
@@ -56,9 +58,11 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // starts), and the next attempt cuts a fresh one. It is retried, not
     // counted as a failed load or reported as an AFT bug. The graph also waits
     // until the legacy import finishes, or AFT verifies pending writes and
-    // includes them in its installed snapshot.
+    // includes them in its installed snapshot. A repository at its live-base
+    // limit after cleanup (`BASE_CAP_BUSY`) is retried the same way.
     checkout_changed_during_load(reason)
         || reason.contains("legacy text and symbol import building")
+        || reason.contains(BASE_CAP_BUSY)
         || reason.contains("callgraph view has unverified writes (")
         || reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")

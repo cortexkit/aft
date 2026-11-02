@@ -236,7 +236,7 @@ fn typescript_5_inspect_resolves_module_created_by_aft_write() {
         assert_eq!(response["success"], true, "{response}");
         response
     };
-    let before = inspect(&mut aft);
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| inspect(&mut aft));
     assert_eq!(before["summary"]["diagnostics"]["errors"], 2, "{before}");
     assert!(
         before["details"]["diagnostics"]
@@ -287,13 +287,15 @@ fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
     // readable without an ask only because it sits under AFT's TMPDIR. This
     // fixture's own temp directory still gives its server a private temp dir.
     let mut aft = spawn_configured_with_tmp(&root, &[ts5.join(".bin")], &parent);
-    let response = aft.send(
-        &json!({
-            "id": "inspect-external", "command": "inspect", "scope": broken,
-            "sections": ["diagnostics"],
-        })
-        .to_string(),
-    );
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        aft.send(
+            &json!({
+                "id": "inspect-external", "command": "inspect", "scope": broken,
+                "sections": ["diagnostics"],
+            })
+            .to_string(),
+        )
+    });
     // The response only quotes the first stderr line on a startup crash. Drain
     // AFT's exit logs too so a failed assertion includes the Node error and path.
     let (_, stderr) = aft.stderr_output();
@@ -706,12 +708,14 @@ fn unscoped_typescript_5_inspect_keeps_the_empty_working_set_contract() {
         "export const answer: number = 42;\n",
     );
     let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
-    let response = aft.send(
-        &json!({
-            "id": "real-ts5-unscoped", "command": "inspect", "sections": "diagnostics"
-        })
-        .to_string(),
-    );
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        aft.send(
+            &json!({
+                "id": "real-ts5-unscoped", "command": "inspect", "sections": "diagnostics"
+            })
+            .to_string(),
+        )
+    });
     eprintln!("real TypeScript 5 unscoped: {response:#}");
     assert_eq!(response["success"], true, "{response:#}");
     assert!(
