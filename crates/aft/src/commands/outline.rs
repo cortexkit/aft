@@ -73,7 +73,8 @@ fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response 
 }
 
 fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
-    const MAX_OUTPUT_BYTES: usize = 30 * 1024;
+    // Multi-file outlines also reserve space for skipped-file disclosures.
+    const MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BYTES - 10 * 1024;
     if let Some(reference) = crate::revision_read::requested_ref(req) {
         return handle_revision_outline(req, ctx, reference);
     }

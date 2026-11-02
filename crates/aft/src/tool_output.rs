@@ -13,6 +13,9 @@ use crate::file_identity::FileIdentity;
 use crate::protocol::Response;
 
 pub const TEXT_LIMIT: usize = 50 * 1024;
+/// Existing list producers reserve 10 KiB for their envelope, disclosures,
+/// reminders and status bar rather than spending the final transport budget.
+pub(crate) const LIST_BODY_BYTES: usize = TEXT_LIMIT - 10 * 1024;
 pub const SAVED_FILE_LIMIT: usize = 64 * 1024 * 1024;
 pub const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
 // Agents see this trailer, and the project owner approved its exact wording;
@@ -503,6 +506,14 @@ pub(crate) fn cap_with_scope(
     text: &mut String,
 ) {
     if text.len() <= TEXT_LIMIT {
+        if let Some((start, envelope)) = native_envelope_line(&response.data, text) {
+            if start + envelope.len() < text.trim_end_matches('\n').len() {
+                text.replace_range(start..start + envelope.len(), "");
+                text.truncate(text.trim_end_matches('\n').len());
+                text.push('\n');
+                text.push_str(&envelope);
+            }
+        }
         return;
     }
     let total = text.len();
@@ -533,11 +544,27 @@ pub(crate) fn cap_with_scope(
     };
     // A list's pagination contract remains visible even if its rows exceed
     // the transport budget. Save the original text, including these lines.
-    let envelopes: Vec<_> = text
-        .lines()
-        .filter(|line| line.starts_with("shown ") && line.contains(" · narrow:"))
-        .collect();
-    let envelope = envelopes.join("\n");
+    let text_only = response.data.is_null()
+        || response
+            .data
+            .as_object()
+            .is_some_and(|object| object.is_empty());
+    let list_metadata = std::iter::once(&response.data)
+        .chain(response.data.get("details"))
+        .filter_map(serde_json::Value::as_object)
+        .any(|object| object.keys().any(|key| key.ends_with("_list_envelope")));
+    let envelope = native_envelope_line(&response.data, text)
+        .map(|(_, line)| line)
+        .unwrap_or_else(|| {
+            if text_only || list_metadata {
+                text.lines()
+                    .rfind(|line| envelope_parts(line).is_some())
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                String::new()
+            }
+        });
     let envelope_bytes = if envelope.is_empty() {
         0
     } else {
@@ -546,9 +573,9 @@ pub(crate) fn cap_with_scope(
     if trailer.len() + envelope_bytes + 1 > TEXT_LIMIT {
         // Pathological batches can contain more trailers than fit in a reply.
         // They remain intact in the saved result rather than hiding recovery.
-        render_cut(text, &trailer, "");
+        render_cut_with_data(text, &trailer, "", &response.data);
     } else {
-        render_cut(text, &trailer, &envelope);
+        render_cut_with_data(text, &trailer, &envelope, &response.data);
     }
 }
 
@@ -562,7 +589,17 @@ fn save_failed_trailer(total: usize, reason: &str) -> String {
         .replace("<reason>", &reason[..end])
 }
 
+#[cfg(test)]
 fn render_cut(text: &mut String, trailer: &str, envelope: &str) {
+    render_cut_with_data(text, trailer, envelope, &serde_json::Value::Null);
+}
+
+fn render_cut_with_data(
+    text: &mut String,
+    trailer: &str,
+    envelope: &str,
+    data: &serde_json::Value,
+) {
     let envelope_bytes = if envelope.is_empty() {
         0
     } else {
@@ -577,13 +614,288 @@ fn render_cut(text: &mut String, trailer: &str, envelope: &str) {
             end = newline;
         }
     }
+    let corrected = envelope_parts(envelope).map(|(shown, tail)| {
+        let start = text.rfind(envelope).expect("rendered envelope");
+        let visible = if start <= end {
+            shown
+        } else {
+            visible_list_rows(data, text, &text[..end], tail).min(shown)
+        };
+        (start, format!("shown {visible} of {tail}"))
+    });
     text.truncate(end);
-    if !envelope.is_empty() {
-        text.push('\n');
-        text.push_str(envelope);
+    if let Some((start, _)) = &corrected {
+        if *start < text.len() {
+            let finish = (*start + envelope.len()).min(text.len());
+            text.replace_range(*start..finish, "");
+        }
     }
+    text.truncate(text.trim_end_matches('\n').len());
     text.push('\n');
     text.push_str(trailer);
+    if let Some((_, envelope)) = corrected {
+        text.push('\n');
+        text.push_str(&envelope);
+    }
+}
+
+fn envelope_parts(line: &str) -> Option<(usize, &str)> {
+    let (shown, tail) = line.strip_prefix("shown ")?.split_once(" of ")?;
+    tail.contains(" (").then_some(())?;
+    Some((shown.parse().ok()?, tail))
+}
+
+fn native_envelope_line(data: &serde_json::Value, text: &str) -> Option<(usize, String)> {
+    std::iter::once(data)
+        .chain(data.get("details"))
+        .filter_map(serde_json::Value::as_object)
+        .flat_map(|object| object.iter())
+        .filter(|(key, _)| key.ends_with("_list_envelope"))
+        .filter_map(|(_, value)| {
+            if value.get("reason").is_none_or(serde_json::Value::is_null) {
+                return None;
+            }
+            let envelope =
+                serde_json::from_value::<crate::list_envelope::ListEnvelope>(value.clone()).ok()?;
+            let line = crate::list_envelope::render_trailer(&envelope)?;
+            let start = text
+                .match_indices(line.as_str())
+                .filter(|(start, _)| {
+                    (*start == 0 || text.as_bytes()[*start - 1] == b'\n')
+                        && text
+                            .as_bytes()
+                            .get(*start + line.len())
+                            .is_none_or(|byte| *byte == b'\n')
+                })
+                .map(|(start, _)| start)
+                .last()?;
+            Some((start, line))
+        })
+        .max_by_key(|(start, _)| *start)
+}
+
+fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: &str) -> usize {
+    let unit = tail
+        .split(" (")
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .last()
+        .unwrap_or("");
+    if unit == "results"
+        && data
+            .get("matches")
+            .and_then(serde_json::Value::as_array)
+            .is_some()
+    {
+        // AST entries are rendered by this same helper. Walking complete row
+        // strings avoids mistaking a captured source line for the next match.
+        let mut cursor = 0;
+        return data["matches"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| {
+                let rendered = crate::subc_format::format_ast_search_match(row);
+                let Some(offset) = full[cursor..].find(&rendered) else {
+                    return false;
+                };
+                let start = cursor + offset;
+                cursor = start + rendered.len();
+                start + rendered.find('\n').unwrap_or(rendered.len()) < visible.len()
+            })
+            .count();
+    }
+    if unit == "lines"
+        && data
+            .get("bash_output_list_envelope")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        let output = data
+            .get("output_preview")
+            .or_else(|| data.get("output"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim_end_matches('\n');
+        if !output.is_empty() {
+            if let Some(start) = full.find(output) {
+                let end = visible.len().saturating_sub(start).min(output.len());
+                return crate::list_surfaces::bash::count_output_lines(
+                    &output[..output.floor_char_boundary(end)],
+                );
+            }
+        }
+        return 0;
+    }
+    let numbered_row = |line: &str| {
+        line.trim_start()
+            .split_once(": ")
+            .is_some_and(|(number, _)| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    if matches!(unit, "rows" | "lines") && full.lines().any(numbered_row) {
+        return visible.lines().filter(|line| numbered_row(line)).count();
+    }
+    if unit == "results" {
+        return crate::subc_format::visible_search_result_count(data, visible);
+    }
+    if unit == "files" {
+        return crate::subc_format::visible_file_row_count(data, full, visible);
+    }
+    let tree_rows = data
+        .get("tree_list_envelope")
+        .is_some_and(serde_json::Value::is_object)
+        || (unit == "items"
+            && full
+                .lines()
+                .filter_map(|line| line.strip_prefix("  ↳ "))
+                .any(|line| line.contains(" [") || line.starts_with("+ ")));
+    if tree_rows {
+        return visible
+            .lines()
+            .filter_map(|line| line.strip_prefix("  ↳ "))
+            .map(|line| {
+                line.strip_prefix("+ ")
+                    .and_then(|line| line.split_once(" unresolved external call"))
+                    .and_then(|(count, _)| count.parse::<usize>().ok())
+                    .unwrap_or(1)
+            })
+            .sum();
+    }
+    if unit == "items"
+        && (data
+            .get("callers_list_envelope")
+            .is_some_and(serde_json::Value::is_object)
+            || full.lines().any(|line| line.starts_with("  ↳ ")))
+    {
+        return visible
+            .lines()
+            .filter_map(|line| line.strip_prefix("  ↳ "))
+            .map(|line| {
+                line.split(':')
+                    .find(|part| part.starts_with(|ch: char| ch.is_ascii_digit()))
+                    .map(|part| {
+                        part.chars()
+                            .take_while(|ch| ch.is_ascii_digit() || matches!(ch, ',' | ' '))
+                            .collect::<String>()
+                    })
+                    .map_or(0, |numbers| {
+                        numbers
+                            .split(',')
+                            .filter(|number| number.trim().parse::<u64>().is_ok())
+                            .count()
+                    })
+            })
+            .sum();
+    }
+    if unit == "sites" {
+        return visible
+            .lines()
+            .filter(|line| {
+                !line.starts_with(' ')
+                    && line
+                        .rsplit_once(':')
+                        .is_some_and(|(_, number)| number.parse::<u64>().is_ok())
+            })
+            .count();
+    }
+    if unit == "paths" {
+        return visible
+            .lines()
+            .filter(|line| {
+                line.strip_prefix("Path ")
+                    .is_some_and(|number| number.parse::<usize>().is_ok())
+            })
+            .count();
+    }
+    if unit == "hops" {
+        return visible
+            .lines()
+            .filter(|line| line.contains(" [") && line.contains(']'))
+            .count();
+    }
+    if unit == "items"
+        && (data
+            .get("details")
+            .is_some_and(serde_json::Value::is_object)
+            || full.lines().any(|line| {
+                line.starts_with("Dead code:") || line.starts_with("diagnostics details")
+            }))
+    {
+        return visible_inspect_rows(full, visible, tail);
+    }
+    // Text-only row lists carry one entry per non-empty line. Metadata and
+    // their envelope are not entries in that list.
+    visible
+        .lines()
+        .filter(|line| {
+            !line.trim().is_empty()
+                && envelope_parts(line).is_none()
+                && !line.starts_with("[output ")
+                && !line.starts_with("Found ")
+        })
+        .count()
+}
+
+fn visible_inspect_rows(full: &str, visible: &str, tail: &str) -> usize {
+    let footer = format!(" of {tail}");
+    let end = full.rfind(&footer).unwrap_or(full.len());
+    let mut section = "";
+    let mut start = 0;
+    let mut offset = 0;
+    let mut indent = 2;
+    for line in full[..end].split_inclusive('\n') {
+        let main = [
+            "Dead code:",
+            "Unused exports:",
+            "Duplicates:",
+            "Cyclomatic complexity:",
+            "Import cycles:",
+            "TODOs:",
+            "diagnostics details",
+            "Affected files:",
+        ]
+        .iter()
+        .find(|heading| line.starts_with(**heading))
+        .copied();
+        if let Some(main) = main {
+            section = main;
+            start = offset + line.len();
+            indent = 2;
+        }
+        if line.starts_with("  generated:") || line.starts_with("  test-only usage:") {
+            start = offset + line.len();
+            indent = 4;
+        }
+        offset += line.len();
+    }
+    if start >= visible.len() {
+        return 0;
+    }
+    visible[start..]
+        .lines()
+        .filter(|line| {
+            if section == "diagnostics details" {
+                return line.starts_with("- ");
+            }
+            if line.starts_with("shown ") {
+                return false;
+            }
+            let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+            if spaces != indent {
+                return false;
+            }
+            match section {
+                "Dead code:" | "Unused exports:" => line.contains("::"),
+                "Duplicates:" => line.contains(" == "),
+                "Cyclomatic complexity:" | "TODOs:" => line.contains(':'),
+                "Import cycles:" => line.contains(" ["),
+                "Affected files:" => !line.trim().is_empty(),
+                _ => false,
+            }
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -611,8 +923,9 @@ mod tests {
             text.rsplit_once("; full result saved to ")
                 .unwrap()
                 .1
-                .strip_suffix("; read it with read and a line range]")
-                .unwrap(),
+                .split_once("; read it with read and a line range]")
+                .unwrap()
+                .0,
         )
     }
 
@@ -623,6 +936,10 @@ mod tests {
         let format =
             crate::subc_format::FormatContext::from_tool_call(tool, &json!({}), temp.path());
         let original = crate::subc_format::format_response_with_context(tool, &response, &format);
+        eprintln!(
+            "uncut backstop fixture: tool={tool} bytes={}",
+            original.len()
+        );
         assert!(
             original.len() > TEXT_LIMIT,
             "fixture did not exceed budget for {tool}"
@@ -750,10 +1067,257 @@ mod tests {
                 assert!(text.len() >= TEXT_LIMIT - 6);
             }
         }
-        let envelope = "shown 100 of 200 symbols (cap) · narrow: symbols";
+        let envelope = "shown 20000 of 30000 rows (cap) · narrow: symbols";
         let mut text = format!("{}\n{envelope}", "row\n".repeat(20000));
         cap(&ctx, "owner", "zoom", &response, &mut text);
-        assert!(text.contains(&format!("\n{envelope}\n[output cut")));
+        let rows = text.lines().filter(|line| *line == "row").count();
+        assert!(rows > 0 && rows < 20000);
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!("shown {rows} of 30000 rows (cap) · narrow: symbols")
+        );
+        assert!(text
+            .lines()
+            .nth_back(1)
+            .unwrap()
+            .starts_with("[output cut at 50 KB of "));
+        assert!(text.len() <= TEXT_LIMIT);
+    }
+
+    #[test]
+    fn tool_output_cap_recounts_ast_and_grep_headers_and_keeps_envelope_last() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        for tool in ["ast_search", "grep"] {
+            let matches: Vec<_> = (1..=2000).map(|line| json!({
+                "file":"src/main.rs", "line":line, "text":"call(); ".repeat(30), "line_text":"call(); ".repeat(30),
+            })).collect();
+            let unit = if tool == "grep" {
+                crate::list_envelope::Unit::Rows
+            } else {
+                crate::list_envelope::Unit::Results
+            };
+            let envelope = crate::list_envelope::ListEnvelope::new(
+                2000,
+                crate::list_envelope::Total::Exact(3000),
+                unit,
+                vec![crate::list_envelope::Reason::Budget],
+                &["path"],
+            );
+            let mut data = json!({"matches":matches,"total_matches":3000,"files_searched":1,"files_with_matches":1,
+                "matches_list_envelope":envelope});
+            if tool == "grep" {
+                data["text"] = json!(format!(
+                    "src/main.rs\n{}",
+                    (1..=2000)
+                        .map(|line| format!("{line}: {}\n", "call(); ".repeat(30)))
+                        .collect::<String>()
+                ));
+            }
+            let response = Response::success("id", data.clone());
+            let original = crate::subc_format::format_response(tool, &response, false);
+            let mut text = original.clone();
+            cap(&ctx, "owner", tool, &response, &mut text);
+            let body = text.split_once("\n[output cut at ").unwrap().0;
+            let shown = body
+                .lines()
+                .filter(|line| {
+                    if tool == "grep" {
+                        line.split_once(": ")
+                            .is_some_and(|(number, _)| number.parse::<u64>().is_ok())
+                    } else {
+                        line.starts_with("src/main.rs:")
+                    }
+                })
+                .count();
+            assert!(shown > 0 && shown < 2000);
+            assert_eq!(
+                text.lines().last().unwrap(),
+                format!("shown {shown} of 3000 {unit} (budget) · narrow: path")
+            );
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("shown "))
+                    .count(),
+                1
+            );
+            assert_eq!(response.data, data, "structured content stays intact");
+            assert_eq!(
+                std::fs::read_to_string(saved_path(&text)).unwrap(),
+                original
+            );
+            assert!(text.len() <= TEXT_LIMIT);
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_keeps_native_list_envelope_after_finalization_notices_without_cutting() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let envelope = crate::list_envelope::ListEnvelope::new(
+            2,
+            crate::list_envelope::Total::Exact(3),
+            crate::list_envelope::Unit::Rows,
+            vec![crate::list_envelope::Reason::Cap],
+            &["path"],
+        );
+        let line = crate::list_envelope::render_trailer(&envelope).unwrap();
+        let response = Response::success("id", json!({"matches_list_envelope":envelope}));
+        let mut text = format!("1: first\n2: second\n{line}\ncompletion reminder\nstatus bar");
+        cap(&ctx, "owner", "grep", &response, &mut text);
+        assert!(text.ends_with(&line));
+        assert!(text.contains("completion reminder\nstatus bar"));
+        assert_eq!(
+            text.lines().filter(|row| row.starts_with("shown ")).count(),
+            1
+        );
+        assert!(!text.contains("[output cut"));
+        assert!(ctx.output_files().files.lock().is_empty());
+    }
+
+    #[test]
+    fn tool_output_cap_does_not_invent_envelopes_for_unbudgeted_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let original = format!(
+            "shown 1 of 2 files (cap) · narrow: path\n{}",
+            "symbol\n".repeat(20_000)
+        );
+        let response = Response::success("id", json!({"text":original}));
+        let mut text = original.clone();
+        cap(&ctx, "owner", "outline", &response, &mut text);
+        assert!(text.starts_with("shown 1 of 2 files (cap) · narrow: path\n"));
+        assert!(text.ends_with("; read it with read and a line range]"));
+    }
+
+    #[test]
+    fn tool_output_cap_recounts_legacy_flat_glob_file_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let files: Vec<_> = (0..20)
+            .map(|index| format!("{}file_{index}.rs", "deep/".repeat(600)))
+            .collect();
+        let envelope = crate::list_envelope::ListEnvelope::new(
+            20,
+            crate::list_envelope::Total::Exact(30),
+            crate::list_envelope::Unit::Files,
+            vec![crate::list_envelope::Reason::Cap],
+            &["path"],
+        );
+        let response = Response::success(
+            "id",
+            json!({"files":files,"text":format!("20 files matching *.rs\n\n{}",files.join("\n")),"files_list_envelope":envelope}),
+        );
+        let mut text = crate::subc_format::format_response("glob", &response, false);
+        cap(&ctx, "owner", "glob", &response, &mut text);
+        let shown = text
+            .split_once("\n[output cut")
+            .unwrap()
+            .0
+            .lines()
+            .filter(|line| line.starts_with("deep/") && line.ends_with(".rs"))
+            .count();
+        assert!(shown > 0 && shown < 20);
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!("shown {shown} of 30 files (cap) · narrow: path")
+        );
+        assert!(text.len() <= TEXT_LIMIT);
+    }
+
+    #[test]
+    fn tool_output_cap_recounts_search_results_with_repeated_symbol_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let results: Vec<_> = (0..1000).map(|i| json!({"file":format!("src/file_{i}.rs"), "name":"shared", "kind":"function", "start_line":1, "end_line":2})).collect();
+        let text = (0..1000)
+            .map(|i| {
+                format!(
+                    "src/file_{i}.rs\n  shared [function] lines 1-2\n      {}\n\n",
+                    "body ".repeat(50)
+                )
+            })
+            .collect::<String>();
+        let envelope = crate::list_envelope::ListEnvelope::new(
+            1000,
+            crate::list_envelope::Total::Exact(2000),
+            crate::list_envelope::Unit::Results,
+            vec![crate::list_envelope::Reason::Cap],
+            &["topK"],
+        );
+        let response = Response::success(
+            "id",
+            json!({"results":results,"text":text,"results_list_envelope":envelope}),
+        );
+        let mut text = crate::subc_format::format_response("search", &response, false);
+        cap(&ctx, "owner", "search", &response, &mut text);
+        let shown = text
+            .split_once("\n[output cut")
+            .unwrap()
+            .0
+            .lines()
+            .filter(|line| line.starts_with("  shared ["))
+            .count();
+        assert!(shown > 0 && shown < 1000);
+        assert_eq!(
+            text.lines().last().unwrap(),
+            format!("shown {shown} of 2000 results (cap) · narrow: topK")
+        );
+        assert!(text.len() <= TEXT_LIMIT);
+    }
+
+    #[test]
+    fn tool_output_cap_weights_coalesced_callers_and_unresolved_tree_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        for (key, row, weight) in [
+            ("callers_list_envelope", "  ↳ run:9, 12\n", 2),
+            (
+                "tree_list_envelope",
+                "  ↳ + 5 unresolved external calls: a, b\n",
+                5,
+            ),
+        ] {
+            let total = 10_000 * weight;
+            let envelope = format!("shown {total} of {} items (cap) · narrow: depth", total + 1);
+            let mut text = format!("root\n{}\n{envelope}", row.repeat(10_000));
+            let response = Response::success("id", json!({key:{}}));
+            cap(&ctx, "owner", "callgraph", &response, &mut text);
+            let count = text
+                .split_once("\n[output cut")
+                .unwrap()
+                .0
+                .lines()
+                .filter(|line| line.starts_with("  ↳ "))
+                .count()
+                * weight;
+            assert!(count > 0 && count < total);
+            assert_eq!(
+                text.lines().last().unwrap(),
+                format!("shown {count} of {} items (cap) · narrow: depth", total + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_does_not_count_an_unreached_inspect_section() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let mut text = format!("Dead code:\n{}\nshown 10000 of 20000 items (cap) · narrow: scope\n  generated: 10:\n{}\nshown 10 of 20 items (cap) · narrow: scope",
+            "  src/main.rs::unused\n".repeat(10_000), "    generated.rs::unused\n".repeat(10));
+        let envelope = crate::list_envelope::ListEnvelope::new(
+            10,
+            crate::list_envelope::Total::Exact(20),
+            crate::list_envelope::Unit::Items,
+            vec![crate::list_envelope::Reason::Cap],
+            &["scope"],
+        );
+        let response = Response::success(
+            "id",
+            json!({"details":{"dead_code_generated_list_envelope":envelope}}),
+        );
+        cap(&ctx, "owner", "inspect", &response, &mut text);
+        assert!(text.ends_with("shown 0 of 20 items (cap) · narrow: scope"));
         assert!(text.len() <= TEXT_LIMIT);
     }
 

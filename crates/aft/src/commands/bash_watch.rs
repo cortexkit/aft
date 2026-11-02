@@ -2031,11 +2031,12 @@ mod tests {
             .rsplit_once("; full result saved to ")
             .unwrap()
             .1
-            .strip_suffix("; read it with read and a line range]")
-            .unwrap();
+            .split_once("; read it with read and a line range]")
+            .unwrap()
+            .0;
         let saved = std::fs::read_to_string(path).unwrap();
         assert!(saved.starts_with(&original));
-        assert_eq!(text.lines().last().unwrap(), format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", saved.len() as f64 / 1024.0));
+        assert!(text.lines().any(|line| line == format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", saved.len() as f64 / 1024.0)));
         assert_eq!(
             response.data["output"], original,
             "structured output must remain uncut"

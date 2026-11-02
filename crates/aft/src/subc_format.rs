@@ -2022,31 +2022,7 @@ fn format_ast_search(data: &Value) -> String {
         );
         if let Some(matches) = matches {
             for m in matches {
-                let rel_file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
-                let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
-                output.push_str(&format!("{rel_file}:{line}\n"));
-                let match_text = m.get("text").and_then(Value::as_str).unwrap_or("");
-                if !match_text.is_empty() {
-                    output.push_str(&format!("  {}\n", match_text.trim()));
-                }
-                if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
-                    if !meta_vars.is_empty() {
-                        let capture_text = m.get("meta_variable_text").and_then(Value::as_object);
-                        for (key, value) in meta_vars {
-                            // A `$$$` capture shows its source text, not its
-                            // node list, when the engine supplied it.
-                            let value = capture_text
-                                .and_then(|texts| texts.get(key))
-                                .filter(|text| text.is_string())
-                                .unwrap_or(value);
-                            output.push_str(&format!(
-                                "  {}\n",
-                                format_ast_search_capture(key, value, match_text, line)
-                            ));
-                        }
-                    }
-                }
-                output.push('\n');
+                output.push_str(&format_ast_search_match(m));
             }
         }
         output
@@ -2067,6 +2043,33 @@ fn format_ast_search(data: &Value) -> String {
             output.push_str(&format!("\n\n{trailer}"));
         }
     }
+    output
+}
+
+pub(crate) fn format_ast_search_match(m: &Value) -> String {
+    let file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
+    let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
+    let mut output = format!("{file}:{line}\n");
+    let match_text = m.get("text").and_then(Value::as_str).unwrap_or("");
+    if !match_text.is_empty() {
+        output.push_str(&format!("  {}\n", match_text.trim()));
+    }
+    if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
+        let capture_text = m.get("meta_variable_text").and_then(Value::as_object);
+        for (key, value) in meta_vars {
+            // A $$$ capture keeps the engine's source text instead of joining
+            // its node list, which would lose original separators.
+            let value = capture_text
+                .and_then(|texts| texts.get(key))
+                .filter(|text| text.is_string())
+                .unwrap_or(value);
+            output.push_str(&format!(
+                "  {}\n",
+                format_ast_search_capture(key, value, match_text, line)
+            ));
+        }
+    }
+    output.push('\n');
     output
 }
 
@@ -4170,6 +4173,13 @@ pub fn rendered_grep_match_count(data: &Value) -> usize {
 
 /// Count of rendered file rows in a glob response after applying display-only selectors (R24).
 pub fn rendered_glob_file_count(data: &Value) -> usize {
+    if let Some(shown) = data.get("rendered_files").and_then(Value::as_u64) {
+        return (shown as usize).min(
+            data.get("files")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
+    }
     let files = data.get("files").and_then(Value::as_array);
     let Some(files) = files else {
         return 0;
@@ -4208,6 +4218,164 @@ pub fn report_rendered_row_count(command: &str, data: &Value) -> Option<usize> {
         "glob" => Some(rendered_glob_file_count(data)),
         _ => None,
     }
+}
+
+/// Count the result headers that survived a last-resort text cut. Snippet
+/// continuations are not results, and file summaries use a path header.
+pub(crate) fn visible_search_result_count(data: &Value, visible: &str) -> usize {
+    let matches_file = |file: &str, path: &str| {
+        !path.is_empty()
+            && (file == path
+                || file
+                    .strip_suffix(path)
+                    .is_some_and(|prefix| prefix.ends_with('/') || prefix.ends_with('\\')))
+    };
+    let Some(results) = data.get("results").and_then(Value::as_array) else {
+        return visible
+            .lines()
+            .filter(|line| {
+                (!line.starts_with(' ')
+                    && (line.contains(" [exact]") || line.contains(" [lexical match]")))
+                    || (line.starts_with("  ") && !line.starts_with("   ") && line.contains(" ["))
+                    || (!line.starts_with(' ')
+                        && line.rsplit_once(':').is_some_and(|(file, number)| {
+                            (file.contains('/') || file.contains('.'))
+                                && number.parse::<u64>().is_ok()
+                        }))
+            })
+            .count();
+    };
+    let mut headers: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    let mut current_file = None;
+    for row in visible.lines() {
+        if !row.starts_with(' ') {
+            let path = row.split(" [").next().unwrap_or(row);
+            let path = path
+                .rsplit_once(':')
+                .filter(|(_, number)| number.parse::<u64>().is_ok())
+                .map_or(path, |(path, _)| path);
+            if let Some(file) = results
+                .iter()
+                .filter_map(|result| result["file"].as_str())
+                .find(|file| matches_file(file, path))
+            {
+                current_file = Some(file);
+            }
+        } else if row.starts_with("  ") && !row.starts_with("   ") {
+            if let Some(file) = current_file {
+                headers.entry(file).or_default().push(row);
+            }
+        }
+    }
+    results
+        .iter()
+        .filter(|result| {
+            let file = result.get("file").and_then(Value::as_str).unwrap_or("");
+            let name = result.get("name").and_then(Value::as_str).unwrap_or("");
+            let location = result.get("location").and_then(Value::as_str).unwrap_or("");
+            let file_level = location == "matching line"
+                || location == "[file summary]"
+                || result
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| matches!(kind, "file_summary" | "FileSummary"));
+            if file_level || name.is_empty() {
+                let line = result
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .or_else(|| result.get("line").and_then(Value::as_u64));
+                visible.lines().any(|row| {
+                    if row.starts_with(' ') {
+                        return false;
+                    }
+                    let path = row.split(" [").next().unwrap_or(row);
+                    let path = match (line, path.rsplit_once(':')) {
+                        (Some(expected), Some((path, number)))
+                            if number.parse::<u64>() == Ok(expected) =>
+                        {
+                            path
+                        }
+                        (Some(_), _) => return false,
+                        _ => path,
+                    };
+                    matches_file(file, path)
+                        || (line.is_none()
+                            && path.rsplit_once(':').is_some_and(|(path, number)| {
+                                number.parse::<u64>().is_ok() && matches_file(file, path)
+                            }))
+                })
+            } else {
+                let Some(rows) = headers.get_mut(file) else {
+                    return false;
+                };
+                let found = rows.iter().position(|row| {
+                    row.trim_start().starts_with(&format!("{name} ["))
+                        && result
+                            .get("start_line")
+                            .and_then(Value::as_u64)
+                            .is_none_or(|line| row.contains(&format!(" lines {line}-")))
+                });
+                if let Some(index) = found {
+                    rows.remove(index);
+                    true
+                } else {
+                    false
+                }
+            }
+        })
+        .count()
+}
+
+pub(crate) fn visible_file_row_count(data: &Value, full: &str, visible: &str) -> usize {
+    let files = data
+        .get("files")
+        .or_else(|| data.get("content_files"))
+        .and_then(Value::as_array);
+    let names: std::collections::HashSet<_> = files
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|path| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .collect();
+    let glob = data.get("files").is_some();
+    let mut grouped = false;
+    let mut count = 0;
+    let mut offset = 0;
+    for line in visible.split_inclusive('\n') {
+        let row = line.trim_end_matches('\n');
+        offset += line.len();
+        let complete = line.ends_with('\n')
+            || full
+                .as_bytes()
+                .get(offset)
+                .is_none_or(|byte| *byte == b'\n');
+        if row.starts_with("shown ") || row.is_empty() || row.contains(" matching ") {
+            continue;
+        }
+        if glob && (row.ends_with(" files)") || row.ends_with(" file)")) {
+            grouped = true;
+        } else if glob && grouped && row.starts_with("  ") {
+            let parts: Vec<_> = row.trim_start().split(", ").collect();
+            for (index, name) in parts.iter().enumerate() {
+                if (complete || index + 1 < parts.len()) && names.contains(name) {
+                    count += 1;
+                }
+            }
+        } else if complete
+            && !row.trim_start().starts_with("E ")
+            && !row.trim_start().starts_with("- ")
+        {
+            let row = row.trim();
+            if names.iter().any(|name| {
+                row == *name
+                    || row.starts_with(&format!("{name} "))
+                    || row.ends_with(&format!("/{name}"))
+            }) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 fn join_non_empty(parts: &[Option<String>]) -> String {

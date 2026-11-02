@@ -24,7 +24,7 @@ const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
 pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
 /// Byte budget for the match rows of one grep reply (file headers included).
 /// Rows past the budget are left for the next page instead of being printed.
-pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BYTES;
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
 pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
@@ -920,6 +920,42 @@ pub(crate) fn grep_page_output<'a>(
         .collect();
     texts.prepare(&page);
 
+    let counted_matches: usize = counted
+        .iter()
+        .map(|&index| files[index].matches.len())
+        .sum();
+    let counted_text = if counted.is_empty() {
+        None
+    } else if first {
+        let mut block = format!(
+            "Counted only, not shown: {} in {}. To show them, pass a file below as path, or a pattern below as include.",
+            plural(counted_matches, "line"), plural(counted.len(), "file"),
+        );
+        for row in counted_entries(&counted, &files, request.project_root) {
+            block.push('\n');
+            block.push_str(&row);
+        }
+        Some(block)
+    } else {
+        Some(format!(
+            "Counted only, not shown: {} in {} (listed with offset=0).",
+            plural(counted_matches, "line"),
+            plural(counted.len(), "file")
+        ))
+    };
+    // Reserve the existing summaries and footer inside the page's one byte
+    // budget. The transport budget also needs room for finalization notices.
+    let metadata_bytes = counted_text.as_ref().map_or(0, String::len)
+        + only_counted_note.as_ref().map_or(0, String::len)
+        + grep_tool_footer(result).len()
+        + if first {
+            files_first_summary(&shown, &files, DEFAULT_MAX_RESULTS).len()
+        } else {
+            0
+        }
+        + 1024;
+    let byte_cap = byte_cap.min(GREP_MAX_OUTPUT_BYTES.saturating_sub(metadata_bytes));
+
     // Cut the page at the byte budget, counting each file's header once.
     let mut rendered = 0usize;
     let mut bytes = 0usize;
@@ -929,7 +965,7 @@ pub(crate) fn grep_page_output<'a>(
         if !headed.contains(&slot.0) {
             cost += files[slot.0].display.len() + 2;
         }
-        if rendered > 0 && bytes + cost > byte_cap {
+        if bytes + cost > byte_cap {
             break;
         }
         headed.insert(slot.0);
@@ -953,27 +989,8 @@ pub(crate) fn grep_page_output<'a>(
         lines_truncated = cut;
         sections.push(rows_text);
     }
-    let counted_matches: usize = counted
-        .iter()
-        .map(|&index| files[index].matches.len())
-        .sum();
-    if !counted.is_empty() {
-        let lines = plural(counted_matches, "line");
-        let in_files = plural(counted.len(), "file");
-        if first {
-            let mut block = format!(
-                "Counted only, not shown: {lines} in {in_files}. To show them, pass a file below as path, or a pattern below as include."
-            );
-            for row in counted_entries(&counted, &files, request.project_root) {
-                block.push('\n');
-                block.push_str(&row);
-            }
-            sections.push(block);
-        } else {
-            sections.push(format!(
-                "Counted only, not shown: {lines} in {in_files} (listed with offset=0)."
-            ));
-        }
+    if let Some(block) = counted_text {
+        sections.push(block);
     }
     sections.push(grep_tool_footer(result));
     if let Some(next) = next_offset {
@@ -1820,6 +1837,38 @@ mod tests {
 
     fn root() -> PathBuf {
         PathBuf::from("/project")
+    }
+
+    #[test]
+    fn list_body_budget_grep_counts_rows_before_the_transport_cap() {
+        let rows = (1..=1000)
+            .map(|line| grep_match("/project/a.rs", line, &"needle ".repeat(70)))
+            .collect();
+        let result = grep_result(rows, 1000, 1, 1, IndexStatus::Ready, false);
+        let root = root();
+        let output = grep_page_output(
+            &result,
+            &GrepPageRequest {
+                project_root: &root,
+                include: &[],
+                file_roots: &[],
+                offset: 0,
+                explicit_page_rows: Some(1000),
+            },
+        );
+        assert!(output.rendered > 0 && output.rendered < 1000);
+        assert!(output.text.len() <= GREP_MAX_OUTPUT_BYTES);
+        assert_eq!(
+            output
+                .text
+                .lines()
+                .filter(|line| line
+                    .split_once(": ")
+                    .is_some_and(|(number, _)| number.parse::<u64>().is_ok()))
+                .count(),
+            output.rendered
+        );
+        assert_eq!(output.next_offset, Some(output.rendered));
     }
 
     #[test]
