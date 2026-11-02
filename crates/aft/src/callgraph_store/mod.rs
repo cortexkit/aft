@@ -16632,7 +16632,7 @@ fn collect_reexport_refs_with_line_index(
                 surface_parts: Vec::new(),
             };
         };
-        let exports = callgraph::python::extract(source, tree.root_node()).reexports;
+        let exports = callgraph::python::reexports(source, tree.root_node());
         let mut raw_refs = build_import_refs(
             project_root,
             abs_path,

@@ -186,7 +186,8 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
         ("cycle_b.py", "from cycle_a import public\n"),
         ("deleted.py", "from pkg.source import target as public\ndel public\n"),
         ("with_alias.py", "from pkg.source import target as public\nwith unknown() as public:\n    pass\n"),
-        ("negative.py", "from hidden import public as hidden\nfrom shadowed import public as shadowed\nfrom ambiguous import public as ambiguous\nfrom cycle_a import public as cyclic\nfrom deleted import public as deleted\nfrom with_alias import public as with_alias\ndef rejected():\n    hidden()\n    shadowed()\n    ambiguous()\n    cyclic()\n    deleted()\n    with_alias()\n"),
+        ("header_shadow.py", "from pkg.source import target as public\ndef setup(value=(public := unknown)):\n    pass\n"),
+        ("negative.py", "from hidden import public as hidden\nfrom shadowed import public as shadowed\nfrom ambiguous import public as ambiguous\nfrom cycle_a import public as cyclic\nfrom deleted import public as deleted\nfrom with_alias import public as with_alias\nfrom header_shadow import public as header_shadow\ndef rejected():\n    hidden()\n    shadowed()\n    ambiguous()\n    cyclic()\n    deleted()\n    with_alias()\n    header_shadow()\n"),
     ]);
     let sites = store
         .direct_callers_of(Path::new("pkg/source.py"), "target")

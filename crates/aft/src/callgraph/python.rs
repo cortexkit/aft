@@ -45,30 +45,17 @@ struct Extractor<'a> {
     module_imports: HashSet<(usize, usize)>,
     declarations: HashMap<String, usize>,
     calls: Vec<(Node<'a>, usize)>,
+    module_only: bool,
 }
 
 pub(crate) struct Extraction {
     pub imports: ImportBlock,
     pub bindings: Vec<CallBinding>,
     pub owners: HashMap<usize, String>,
-    pub reexports: Vec<ImportStatement>,
 }
 
 pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
-    let mut extractor = Extractor {
-        source,
-        scopes: vec![Scope {
-            parent: None,
-            class: false,
-            owner: super::TOP_LEVEL_SYMBOL.to_string(),
-            classes: Vec::new(),
-            names: HashMap::new(),
-        }],
-        imports: Vec::new(),
-        module_imports: HashSet::new(),
-        declarations: HashMap::new(),
-        calls: Vec::new(),
-    };
+    let mut extractor = Extractor::new(source, false);
     extractor.visit(root, 0);
     let mut bindings: Vec<_> = extractor
         .calls
@@ -116,6 +103,23 @@ pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
         })
         .collect();
     bindings.sort_by_key(|binding| (binding.byte_start, binding.byte_end));
+    Extraction {
+        imports: ImportBlock {
+            imports: extractor.imports,
+            byte_range: None,
+        },
+        bindings,
+        owners: extractor
+            .calls
+            .iter()
+            .map(|(call, scope)| (call.start_byte(), extractor.scopes[*scope].owner.clone()))
+            .collect(),
+    }
+}
+
+pub(crate) fn reexports(source: &str, root: Node<'_>) -> Vec<ImportStatement> {
+    let mut extractor = Extractor::new(source, true);
+    extractor.visit(root, 0);
     let mut reexports = Vec::new();
     for import in &extractor.imports {
         if !extractor
@@ -146,22 +150,28 @@ pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
             reexports.push(exported);
         }
     }
-    Extraction {
-        imports: ImportBlock {
-            imports: extractor.imports,
-            byte_range: None,
-        },
-        bindings,
-        owners: extractor
-            .calls
-            .iter()
-            .map(|(call, scope)| (call.start_byte(), extractor.scopes[*scope].owner.clone()))
-            .collect(),
-        reexports,
-    }
+    reexports
 }
 
 impl<'a> Extractor<'a> {
+    fn new(source: &'a str, module_only: bool) -> Self {
+        Self {
+            source,
+            scopes: vec![Scope {
+                parent: None,
+                class: false,
+                owner: super::TOP_LEVEL_SYMBOL.to_string(),
+                classes: Vec::new(),
+                names: HashMap::new(),
+            }],
+            imports: Vec::new(),
+            module_imports: HashSet::new(),
+            declarations: HashMap::new(),
+            calls: Vec::new(),
+            module_only,
+        }
+    }
+
     fn bind(&mut self, scope: usize, name: &str, binding: Binding) {
         self.scopes[scope]
             .names
@@ -210,6 +220,17 @@ impl<'a> Extractor<'a> {
                         class: node.kind() == "class_definition",
                     },
                 );
+            }
+            if self.module_only {
+                // A module's exports do not depend on function or class locals.
+                // Headers still run here and can rebind names with assignment expressions.
+                let body = node.child_by_field_name("body");
+                for child in node.named_children(&mut node.walk()) {
+                    if Some(child) != body {
+                        self.visit(child, scope);
+                    }
+                }
+                return;
             }
             let id = self.scopes.len();
             let mut classes = self.scopes[scope].classes.clone();
@@ -278,7 +299,7 @@ impl<'a> Extractor<'a> {
                 self.shadow_pattern(child, scope);
             }
         }
-        if node.kind() == "call" {
+        if node.kind() == "call" && !self.module_only {
             self.calls.push((node, scope));
         }
         for child in node.named_children(&mut node.walk()) {
