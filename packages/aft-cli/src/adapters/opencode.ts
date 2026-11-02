@@ -19,6 +19,7 @@ import {
 } from "../lib/opencode-plugin-cache.js";
 import { getCortexKitStorageRoot } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { compareSemver } from "../lib/semver.js";
 import {
   detectOpenCodeHostGeneration,
   findExecutableOnPath,
@@ -29,6 +30,7 @@ import {
   aftHostReplacementEnabled,
   doctorNoDowngradeMessage,
   ensurePinnedPluginConfig,
+  exactPinnedVersion,
   hostToolPluginDisabled,
   isAftNpmEntry,
   OPENCODE_HOST_TOOLS,
@@ -317,11 +319,16 @@ export class OpenCodeAdapter implements HarnessAdapter {
     if (!policy.doctor) return policy;
     const cache = this.getPluginCacheInfo();
     const installedVersion = doctorInstalledVersion(cache);
-    const fallbackEntry = preserveDoctorPluginEntry(
-      getSelfVersion(),
-      cache.configuredEntry,
-      installedVersion,
-    )
+    const configuredVersion = cache.configuredEntry
+      ? exactPinnedVersion(cache.configuredEntry)
+      : null;
+    const newer =
+      (configuredVersion && (compareSemver(configuredVersion, getSelfVersion()) ?? 0) > 0) ||
+      (cache.cached && (compareSemver(cache.cached, getSelfVersion()) ?? 0) > 0);
+    // A missing TUI entry is a new registration, not a replacement of the
+    // server's unresolved tag. Only known newer versions require carrying
+    // that server spec over instead of registering this CLI's exact version.
+    const fallbackEntry = newer
       ? (cache.configuredEntry ?? (cache.cached ? pinnedPluginEntry(cache.cached) : undefined))
       : undefined;
     return { ...policy, installedVersion, fallbackEntry };

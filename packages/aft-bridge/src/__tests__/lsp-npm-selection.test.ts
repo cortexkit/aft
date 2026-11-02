@@ -25,6 +25,34 @@ function wrapper(version: string) {
 }
 
 describe("protected LSP npm selection", () => {
+  test("genuine npm returns before fallback discovery or iteration", async () => {
+    const npm = wrapper("11.6.0");
+    writeFileSync(
+      join(npm.binDir, "package.json"),
+      JSON.stringify({ name: "npm", version: "11.6.0", bin: { npm: "npm" } }),
+    );
+    const fallback: (typeof npm)[] = [];
+    Object.defineProperty(fallback, Symbol.iterator, {
+      value: () => {
+        throw new Error("fallback must not run");
+      },
+    });
+    expect((await selectLspNpm(npm, fallback)).npm?.command).toBe(npm.command);
+  });
+
+  test("shutdown during preferred-npm verification does not start fallback discovery", async () => {
+    const npm = wrapper("11.6.0");
+    const controller = new AbortController();
+    const fallback: (typeof npm)[] = [];
+    Object.defineProperty(fallback, Symbol.iterator, {
+      value: () => {
+        throw new Error("fallback must not run after shutdown");
+      },
+    });
+    const pending = selectLspNpm(npm, fallback, controller.signal);
+    controller.abort();
+    expect((await pending).refusal).toContain("installation aborted");
+  });
   test("direct Node invocations cache capability by npm CLI identity, not the Node executable", async () => {
     const npm = wrapper("11.6.0");
     const cliPath = join(npm.binDir, "npm.mjs");

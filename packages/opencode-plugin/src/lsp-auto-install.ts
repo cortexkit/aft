@@ -36,11 +36,12 @@ import {
   cachedFileSha256,
   cachedFileSha256Sync,
   isSafeVersion,
+  lspNpmInstallInvocation,
   lspNpmRefusal,
   lspPublicationCutoff,
   npmSpawnEnv,
-  prepareLspNpmInstall,
   resolveNpm,
+  selectLspNpm,
   spawn,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
@@ -319,16 +320,24 @@ async function runInstall(
     return false;
   }
 
-  const prepared = await prepareLspNpmInstall(preferredNpm, target, before);
+  const selected = await selectLspNpm(preferredNpm, undefined, signal);
+  if (signal?.aborted) return false;
+  if (!selected.npm) {
+    warn(`[lsp] ${selected.refusal}`);
+    return false;
+  }
+  const npm = selected.npm;
+  const invocation = await lspNpmInstallInvocation(npm, target, before);
   if (signal?.aborted) {
     warn(`[lsp] install ${target} aborted during npm capability probe`);
     return false;
   }
-  if (!prepared.npm) {
-    warn(`[lsp] ${prepared.refusal}`);
+  if (!invocation) {
+    warn(
+      `[lsp] ${lspNpmRefusal(npm.command, "probe failed: cannot verify publication-cutoff support")}`,
+    );
     return false;
   }
-  const { npm, invocation } = prepared;
   ensureInstallAnchor(cwd);
   return new Promise((resolve) => {
     const child = spawn(invocation.command, invocation.args, {

@@ -61,18 +61,28 @@ async function genuineNpm(candidate: ResolvedNpm): Promise<{ npm?: ResolvedNpm; 
 /** Verify package identity before either pinned or publication-filtered installs. */
 export async function selectLspNpm(
   preferred: ResolvedNpm,
-  candidates: readonly ResolvedNpm[] = npmCandidates(),
+  candidates?: readonly ResolvedNpm[],
+  signal?: AbortSignal,
 ): Promise<LspNpmSelection> {
-  let reason = "not npm";
-  const seen = new Set<string>();
-  for (const candidate of [preferred, ...candidates]) {
+  const aborted = (): LspNpmSelection => ({
+    refusal: lspNpmRefusal(preferred.command, "probe failed: installation aborted"),
+  });
+  if (signal?.aborted) return aborted();
+  const first = await genuineNpm(preferred);
+  if (signal?.aborted) return aborted();
+  if (first.npm) return { npm: first.npm };
+  // Do not scan version-manager/system directories on the genuine-npm fast
+  // path. Fallback discovery is needed only after the preferred command fails.
+  const seen = new Set([preferred.command]);
+  for (const candidate of candidates ?? npmCandidates()) {
+    if (signal?.aborted) return aborted();
     if (seen.has(candidate.command)) continue;
     seen.add(candidate.command);
     const result = await genuineNpm(candidate);
-    if (candidate === preferred) reason = result.reason;
+    if (signal?.aborted) return aborted();
     if (result.npm) return { npm: result.npm };
   }
-  return { refusal: lspNpmRefusal(preferred.command, reason) };
+  return { refusal: lspNpmRefusal(preferred.command, first.reason) };
 }
 
 export async function prepareLspNpmInstall(

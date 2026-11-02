@@ -57,6 +57,9 @@ export function preserveDoctorPluginEntry(
   const installedOrder = installed ? compareSemver(installed, cli) : undefined;
   if (installed && (installedOrder === undefined || installedOrder > 0)) return true;
   if (configured && (configuredOrder === undefined || configuredOrder > 0)) return true;
+  // A bare registration gains this CLI's exact pin unless installed evidence
+  // above shows that pinning would replace a newer or unreadable installation.
+  if (entry === AFT_OPENCODE_PACKAGE) return false;
   // A tag or range is not version evidence. An independently installed older
   // version can establish an upgrade; an unresolved entry alone cannot.
   return Boolean(entry && configuredOrder === undefined && installedOrder === undefined);

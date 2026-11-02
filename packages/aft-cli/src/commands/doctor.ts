@@ -957,7 +957,7 @@ function findPluginUpdateTargets(
     if (!harness.hostInstalled || !harness.pluginRegistered) continue;
     const cache = harness.pluginCache;
     if (cache.local) continue;
-    const cliVersion = cache.cliVersion ?? report.cliVersion;
+    const cliVersion = cache.cliVersion ?? cache.latest ?? report.cliVersion;
     if (!cache?.exists || !cache.cached) continue;
     if (preserveDoctorPluginEntry(cliVersion, cache.configuredEntry, doctorInstalledVersion(cache)))
       continue;
