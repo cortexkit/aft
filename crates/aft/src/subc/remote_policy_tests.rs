@@ -2498,6 +2498,12 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     head_stamp.kind = subc_protocol::scope::ScopeKind::Head;
     head_stamp.scope_ref = "siblings-head".into();
     access_grants::register(&head, &ctx).unwrap();
+    catalog(
+        json!({"preset":"head", "params":{"mode":"ask"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
     let mut worker = identity(root.path(), "siblings-worker", 7, true);
     Arc::get_mut(&mut worker.0)
         .unwrap()

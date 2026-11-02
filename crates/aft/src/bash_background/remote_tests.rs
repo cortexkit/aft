@@ -6471,6 +6471,10 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
     assert!(!response.success, "{response:?}");
     assert_eq!(response.data["code"], "remote_run_refused", "{response:?}");
     assert!(
+        ctx.bash_background().list(0).is_empty(),
+        "a refused sibling must not register a remote or local task"
+    );
+    assert!(
         response.data["message"]
             .as_str()
             .unwrap()
