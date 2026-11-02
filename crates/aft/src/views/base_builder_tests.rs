@@ -188,6 +188,32 @@ fn the_initial_reservation_follows_the_ruled_formula_and_cap() {
 }
 
 #[test]
+fn concurrent_different_bases_below_cap_never_wait_for_the_reclaim_gate() {
+    let _serial = v3::serial_for_test();
+    let storage = tempfile::tempdir().unwrap();
+    let cooldown = v3::floor_reclaim_cooldown(storage.path(), FAMILY);
+    // Keep the gate occupied so the regression is independent of thread timing.
+    // Below the family's live-base count limit, neither claim needs reclamation.
+    let _gate = cooldown.lock().unwrap();
+    let start = std::sync::Barrier::new(3);
+    std::thread::scope(|threads| {
+        let first = threads.spawn(|| {
+            start.wait();
+            claim_base(storage.path(), FAMILY, &scope(201), None).unwrap()
+        });
+        let second = threads.spawn(|| {
+            start.wait();
+            claim_base(storage.path(), FAMILY, &scope(202), None).unwrap()
+        });
+        start.wait();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(matches!(first, ClaimOutcome::Claimed(_)), "{first:?}");
+        assert!(matches!(second, ClaimOutcome::Claimed(_)), "{second:?}");
+    });
+}
+
+#[test]
 fn two_claimants_of_one_base_produce_exactly_one_build() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
