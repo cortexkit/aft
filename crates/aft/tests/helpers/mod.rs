@@ -99,26 +99,29 @@ fn prepare_fixture_temp_directory() {
         return;
     }
     drop(probe);
-    // The checkout enclosing the temp directory is itself a candidate: a
-    // directory outside its work tree carries no project evidence.
     let within = git_work_tree_of(&inherited).expect("the temp probe found a work tree");
-    let relocated = within.parent().map(|parent| {
-        parent.join(format!(
-            "aft-fixture-tmp-{}",
-            std::process::id().to_string()
-        ))
-    });
-    let usable = relocated
-        .as_ref()
-        .is_some_and(|candidate| temp_outside_git_work_tree(candidate));
-    assert!(
-        usable,
-        "the test temp directory {} is inside the Git work tree {}; folder admission \
-         would treat every bare fixture as a project. Point TMPDIR outside any repository",
-        inherited.display(),
-        within.display()
-    );
-    let relocated = relocated.expect("a usable relocation was proven above");
+    // A directory next to the checkout is preferred. `tempfile::tempdir()` would
+    // reuse the inherited path, so the fallback builds the same private layout
+    // by hand, and only when it carries no project evidence of its own.
+    let candidates = [
+        within
+            .parent()
+            .map(|parent| parent.join(format!("aft-fixture-tmp-{}", std::process::id()))),
+        Some(inherited.join(format!("aft-fixture-tmp-{}", std::process::id()))),
+    ];
+    let relocated = candidates
+        .into_iter()
+        .flatten()
+        .find(|candidate| temp_outside_git_work_tree(candidate))
+        .unwrap_or_else(|| {
+            panic!(
+                "the test temp directory {} is inside the Git work tree {}, and no directory \
+                 outside a work tree accepts new files; folder admission would treat every bare \
+                 fixture as a project. Point TMPDIR outside any repository",
+                inherited.display(),
+                within.display()
+            )
+        });
     std::env::set_var("TMPDIR", &relocated);
     std::env::set_var("TEMP", &relocated);
     std::env::set_var("TMP", &relocated);
