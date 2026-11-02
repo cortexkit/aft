@@ -952,7 +952,18 @@ mod tests {
         cap(&ctx, "owner", tool, &response, &mut text);
         let path = saved_path(&text);
         assert!(path.is_absolute());
-        assert!(path.starts_with(ctx.harness_dir().join("tool-results")));
+        // Compare resolved forms: on Windows the saved path and the storage
+        // folder can differ in spelling (8.3 short names, the \\?\ prefix)
+        // while naming the same folder.
+        let results_dir = std::fs::canonicalize(ctx.harness_dir().join("tool-results")).unwrap();
+        assert!(
+            std::fs::canonicalize(&path)
+                .unwrap()
+                .starts_with(&results_dir),
+            "{tool}: {} is not under {}",
+            path.display(),
+            results_dir.display()
+        );
         assert!(text.len() <= 51_200, "{tool}: {}", text.len());
         let trailer = format!("[output cut at 50 KB of {:.1} KB; full result saved to {}; read it with read and a line range]", original.len() as f64 / 1024.0, path.display());
         assert!(text.ends_with(&trailer), "{tool}: incorrect trailer");
