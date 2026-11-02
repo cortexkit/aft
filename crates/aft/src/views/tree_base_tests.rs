@@ -398,6 +398,44 @@ fn the_tree_proof_names_the_first_check_a_checkout_fails() {
 }
 
 #[test]
+fn unknown_policy_retries_instead_of_selecting_a_membership_base() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let root = checkout(true);
+    let _attributes = known_attribute_sources_for_test(root.path());
+    let storage = tempfile::tempdir().unwrap();
+    let route = crate::views::snapshot::V3Route {
+        storage: storage.path().to_owned(),
+        family: FAMILY.into(),
+        scope: WORKER.into(),
+    };
+    let paths: Vec<RelPath> = FILES.iter().map(|(name, _)| rel(name)).collect();
+    let producers = producers();
+    let slot = std::sync::Mutex::new(None);
+    let input = || super::TreeBaseInput {
+        route: &route,
+        root: root.path(),
+        paths: &paths,
+        policy: policy(),
+        producers: &producers,
+        ignore_fingerprint: None,
+    };
+    let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+    let reason = super::bootstrap(input(), &slot)
+        .err()
+        .expect("unknown policy is not an absent tree proof");
+    assert!(
+        reason.contains(crate::views::verification::POLICY_QUERY_UNDETERMINED),
+        "{reason}"
+    );
+    assert!(crate::views::trigram::bind_is_busy(&reason), "{reason}");
+    assert!(slot.lock().unwrap().is_none());
+
+    let base = super::bootstrap(input(), &slot).unwrap().unwrap();
+    assert_eq!(base.identity().kind(), BaseKind::Tree);
+    slot.lock().unwrap().take().unwrap().release().unwrap();
+}
+
+#[test]
 fn a_tree_proof_round_trips_and_refuses_another_application() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();

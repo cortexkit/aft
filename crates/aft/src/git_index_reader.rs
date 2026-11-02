@@ -624,6 +624,28 @@ pub struct GitQueries {
     spawned: AtomicU64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONFIG_TIMEOUT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ConfigTimeoutGuard(bool);
+
+#[cfg(test)]
+impl Drop for ConfigTimeoutGuard {
+    fn drop(&mut self) {
+        CONFIG_TIMEOUT_ONCE.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Make the next real `git config` child time out at once (a zero pipe
+/// timeout), so tests reach the timeout path without sleeping.
+#[cfg(test)]
+pub(crate) fn timeout_next_config_for_test() -> ConfigTimeoutGuard {
+    ConfigTimeoutGuard(CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(true)))
+}
+
 impl GitQueries {
     pub fn new(root: PathBuf, timeout: Duration) -> Self {
         Self {
@@ -714,7 +736,16 @@ impl GitQueries {
             .env("LC_ALL", "C");
         #[cfg(test)]
         crate::test_env::apply_hermetic_git_env(&mut command);
-        pump(&mut command, input, self.timeout, &self.spawned).map_err(|error| {
+        let timeout = self.timeout;
+        #[cfg(test)]
+        let timeout = if args.first() == Some(&"config")
+            && CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(false))
+        {
+            Duration::ZERO
+        } else {
+            timeout
+        };
+        pump(&mut command, input, timeout, &self.spawned).map_err(|error| {
             crate::views::io::at(
                 &format!("running git {} in", args.join(" ")),
                 &self.root,
