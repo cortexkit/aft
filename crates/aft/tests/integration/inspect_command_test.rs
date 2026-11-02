@@ -6094,6 +6094,42 @@ fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics()
     }
 }
 
+#[test]
+fn scoped_rust_inspect_retains_compiler_error_when_reopening_unchanged_file() {
+    let (_temp_dir, root, lib) = single_crate_fixture("reopen-compiler-error");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1500");
+
+    // Only the compiler push contains the error. Reopening unchanged bytes does
+    // not start another check, and the native pull is empty on both requests.
+    for id in ["compiler-before-close", "compiler-after-reopen"] {
+        let response = scoped_diagnostics_inspect(&ctx, id, "src/lib.rs");
+        assert_eq!(response["complete"], true, "{response:#}");
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], 1,
+            "{response:#}"
+        );
+        assert!(
+            diagnostic_messages_for(&response, "src/lib.rs")
+                .iter()
+                .any(|message| message == "fake compile error"),
+            "compiler result missing after {id}: {response:#}"
+        );
+        assert!(!ctx.lsp().document_is_open_for_test(&lib));
+    }
+}
+
 /// Pulls are sent several files at a time and then waited for in turn; each
 /// wait must end at the request budget, not restart its own timeout. With a
 /// server that never answers within the budget, a scope of many files still
