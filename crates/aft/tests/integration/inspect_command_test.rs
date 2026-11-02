@@ -10156,14 +10156,16 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
         let response = scoped_diagnostics_inspect(&ctx, "certified-error", "src");
-        let record = wait_for_completed_rust_check(&storage, 1, || {}).unwrap();
+        // The fake check pushes its default error and the compiler-only error;
+        // neither is returned by the content-based native pull.
+        let record = wait_for_completed_rust_check(&storage, 2, || {}).unwrap();
         println!(
             "{version_mode}: certified record {}: {response:#}",
             fs::read_to_string(record).unwrap()
         );
         assert_eq!(response["complete"], true, "{version_mode}: {response:#}");
         assert_eq!(
-            response["summary"]["diagnostics"]["errors"], 1,
+            response["summary"]["diagnostics"]["errors"], 2,
             "{version_mode}: {response:#}"
         );
         assert!(
