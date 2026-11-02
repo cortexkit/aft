@@ -469,8 +469,8 @@ impl PlaneAdapter for CallgraphPlane {
     }
 }
 /// Why a checkout view could not supply a reader. `busy` marks transient
-/// contention on a view database or its family ledger, so callers can retry
-/// rather than reporting a permanently unavailable graph.
+/// states such as pending write verification, a changed checkout, or database
+/// contention, so callers retry rather than report a failed graph load.
 #[derive(Clone, Debug)]
 pub(crate) struct CallgraphViewError {
     pub reason: String,
@@ -597,7 +597,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         // After a restart, start from this checkout's own published worker
         // generation; verification still reconciles it against the disk.
         let seed = if installed.generation().name() == "empty" {
-            match super::base_refs::open_foreign_v3(
+            match super::base_refs::open_callgraph_seed_v3(
                 &self.storage,
                 &self.family,
                 &self.scope,
@@ -605,13 +605,14 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
             ) {
                 Ok(Some(generation)) => generation,
                 Ok(None) => installed.generation().clone(),
-                Err(error) => {
-                    crate::slog_debug!(
-                        "callgraph v3 seed unavailable; reconciling current tree: {}",
-                        error
-                    );
-                    installed.generation().clone()
+                Err(error @ super::base_refs::BaseRefError::Unavailable(_)) => {
+                    return Err(CallgraphViewError {
+                        reason: error.to_string(),
+                        busy: true,
+                        completion_busy: false,
+                    });
                 }
+                Err(error) => return Err(error.to_string().into()),
             }
         } else {
             installed.generation().clone()
@@ -915,17 +916,6 @@ impl CallgraphView {
                 completion_busy: false,
             });
         }
-        if self
-            .legacy_import
-            .as_ref()
-            .is_some_and(|job| job.is_building())
-        {
-            return Err(CallgraphViewError {
-                reason: "legacy text and symbol import building".into(),
-                busy: true,
-                completion_busy: false,
-            });
-        }
         let mut retry = self
             .query
             .lock()
@@ -946,6 +936,15 @@ impl CallgraphView {
             now,
             |error| error.busy,
             || {
+                if self
+                    .legacy_import
+                    .as_ref()
+                    .is_some_and(|job| job.is_building())
+                {
+                    return Err(CallgraphViewError::from(
+                        "legacy text and symbol import building",
+                    ));
+                }
                 #[cfg(test)]
                 self.acquisitions
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1051,6 +1050,231 @@ mod tests {
 
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
+    }
+
+    #[test]
+    fn planned_callgraph_load_states_use_bounded_backoff_then_reset() {
+        for reason in [
+            "legacy text and symbol import building",
+            "callgraph view has unverified writes (pending=[RelPath([97, 46, 116, 115])], watcher=Healthy, unpublished=[])",
+            "view loader [driver]: checkout changed before snapshot installation: v3 worker publication failed or may have landed; revalidate: base unavailable",
+        ] {
+            let error = CallgraphViewError::from(reason);
+            assert!(error.busy, "{error}");
+            let mut retry = super::super::contracts::LoadRetry::default();
+            let mut now = std::time::Instant::now();
+            for seconds in [1, 2, 4, 8, 16, 30, 30] {
+                let result: Result<(), CallgraphViewError> = retry.run(
+                    || now, |error: &CallgraphViewError| error.busy, || Err(error.clone()),
+                );
+                assert!(result.is_err());
+                let deadline = now + std::time::Duration::from_secs(seconds);
+                assert_eq!(retry.pending.as_ref().unwrap().0, deadline);
+                let result: Result<(), CallgraphViewError> = retry.run(
+                    || deadline - std::time::Duration::from_nanos(1),
+                    |error| error.busy,
+                    || panic!("a pending graph load must wait until its retry deadline"),
+                );
+                assert!(result.is_err());
+                now = deadline;
+            }
+            assert!(retry.run(|| now, |error| error.busy, || Ok(())).is_ok());
+            assert!(retry.pending.is_none());
+            assert!(retry.delay.is_zero());
+        }
+    }
+
+    #[test]
+    fn legacy_import_uses_reader_backoff_until_it_finishes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
+            &root,
+            1 << 20,
+            &storage.join("index").join("donor-reuse"),
+        );
+        let limiter = crate::cold_build_limiter::isolated_limiter(1);
+        let slot = limiter.try_acquire().unwrap();
+        let graph = CallgraphView::new_with_import(
+            root,
+            crate::root_cache::StoragePaths::same(&storage),
+            "donor-reuse".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+            Arc::new(|| true),
+            limiter,
+        )
+        .unwrap();
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
+        assert_eq!(error.reason, "legacy text and symbol import building");
+        assert!(error.busy);
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            let error = graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .unwrap_err();
+            assert_eq!(error.reason, "legacy text and symbol import building");
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            assert!(graph.reader_with_clock(|| now).is_err());
+        }
+        drop(slot);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while graph.legacy_import.as_ref().unwrap().is_building() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "legacy import did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        now += std::time::Duration::from_secs(30);
+        let ready = graph.reader_with_clock(|| now).unwrap();
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
+    }
+
+    #[test]
+    fn older_callgraph_view_producer_rebuilds_but_newer_and_corrupt_views_fail_loudly() {
+        use super::super::manifest_v2::{GenerationName, Producers, PublishV2};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = view(&root, &storage);
+        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        drop(graph);
+        let dir =
+            crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&root)).unwrap();
+        let store = super::super::ViewStore::existing_dir(dir.clone()).unwrap();
+        let current = store.current_generation_read_only().unwrap().unwrap();
+        let pin = crate::pins::QueryPin::acquire(&dir, &current).unwrap();
+        super::super::wait_for_generation_maintenance_for_test(&dir);
+        let mut manifest = store.load_manifest_v2(&current).unwrap();
+        manifest.header_mut().producers.callgraph =
+            "ruled-callgraph-v11-callback-constructor-inline-test-items".into();
+        let expected = Producers {
+            callgraph: PRODUCER.into(),
+            ..manifest.header().producers.clone()
+        };
+        let mismatch = manifest
+            .ensure_producers(&expected)
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.starts_with("view producer mismatch: manifest was produced by Producers"));
+        assert!(mismatch.contains("ruled-callgraph-v11-callback-constructor-inline-test-items"));
+        assert!(mismatch.contains("ruled-callgraph-v13-python-import-bindings"));
+        let stale = GenerationName::for_manifest(&manifest).unwrap();
+        let prepared = store
+            .prepare_v2(&stale, Some(&current), &manifest, None)
+            .unwrap();
+        std::fs::copy(
+            super::super::resolve_derived_path(&dir, &current).unwrap(),
+            super::super::resolve_derived_path(&dir, &stale.to_string()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published { .. }
+        ));
+        assert!(!crate::callgraph_store::manifest_view_database_ready(
+            &dir,
+            &stale.to_string(),
+            std::time::Instant::now()
+        )
+        .unwrap());
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        assert!(super::super::callgraph_copies::needs_producer_rebuild(
+            &storage,
+            "donor-reuse",
+            policy,
+            &view_scope(&root)
+        ));
+        let (reason, busy) = super::super::callgraph_copies::open_published(
+            &storage,
+            "donor-reuse",
+            policy,
+            &view_scope(&root),
+            &root,
+        )
+        .unwrap_err();
+        assert!(busy, "{reason}");
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(CallgraphViewError {
+                reason, busy, completion_busy: false,
+            }))),
+            crate::context::CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention()
+        ));
+        let graph = view(&root, &storage);
+        assert!(!graph.is_ready());
+        let ready = graph.reader().unwrap();
+        assert!(graph.is_ready());
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        let rebuilt = store.current_generation_read_only().unwrap().unwrap();
+        assert_ne!(rebuilt, stale.to_string());
+        assert_eq!(
+            store.load_manifest_v2(&rebuilt).unwrap().header().producers,
+            expected
+        );
+        assert!(crate::callgraph_store::manifest_view_database_ready(
+            &dir,
+            &rebuilt,
+            std::time::Instant::now()
+        )
+        .unwrap());
+        drop(ready);
+        drop(graph);
+        drop(pin);
+
+        let mut newer = store.load_manifest_v2(&rebuilt).unwrap();
+        newer.header_mut().producers.callgraph = "ruled-callgraph-v999-future".into();
+        let name = GenerationName::for_manifest(&newer).unwrap();
+        let prepared = store
+            .prepare_v2(&name, Some(&rebuilt), &newer, None)
+            .unwrap();
+        assert!(matches!(
+            store.commit_v2(prepared, None).unwrap(),
+            PublishV2::Published { .. }
+        ));
+        let error = view(&root, &storage).reader().unwrap_err();
+        assert!(!error.busy);
+        assert!(error.reason.contains("view producer mismatch:"), "{error}");
+        assert!(crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
+        assert_eq!(
+            store.current_generation_read_only().unwrap().unwrap(),
+            name.to_string()
+        );
+
+        let path = store.manifest_path(&name.to_string()).unwrap();
+        // Valid JSON with the wrong content fingerprint is genuine corruption,
+        // not an upgrade or a checkout that is still being reconciled.
+        std::fs::write(&path, manifest.to_json_bytes().unwrap()).unwrap();
+        let error = view(&root, &storage).reader().unwrap_err();
+        assert!(!error.busy);
+        assert!(error.reason.contains("content fingerprint"), "{error}");
+        assert!(error.reason.contains(&name.to_string()), "{error}");
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.note_view_load_failure("callgraph", &error.reason);
+        let health = ctx.try_health_snapshot(&root);
+        assert_eq!(health.view_load_failures.values().sum::<u64>(), 1);
+        assert!(crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
     }
 
     /// With a steady watcher subscription and nothing recorded since the last
@@ -1492,6 +1716,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn callgraph_copies_idle_checkout_keeps_borrowed_main_and_shared_base() {
+        use std::time::{Duration, Instant};
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = checkout(&temp.path().join("main"));
+        setup_git(&main, &["init", "-q"]);
+        // Windows runners set core.autocrlf, which would check the linked
+        // worktree out with CRLF line endings and shift call-site byte offsets.
+        setup_git(&main, &["config", "core.autocrlf", "false"]);
+        setup_git(&main, &["add", "-A"]);
+        setup_git(&main, &["commit", "-q", "-m", "fixture"]);
+        let worker = temp.path().join("worker");
+        setup_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worker.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worker = std::fs::canonicalize(worker).unwrap();
+        let paths = crate::root_cache::StoragePaths::same(&storage);
+        let family = "donor-reuse";
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let main_view = view(&main, &storage);
+        let expected = callers(&main_view.reader().unwrap(), "a.ts", "target");
+        assert!(!expected.is_empty());
+        let worker_view = view(&worker, &storage);
+        worker_view.reader().unwrap();
+        let scope = view_scope(&main);
+        let (borrowed, _) = super::super::callgraph_copies::open_published(
+            &storage, family, policy, &scope, &worker,
+        )
+        .unwrap();
+        let used = crate::pins::now_ms();
+        crate::storage_retention::touch_view_checkout(&paths, family, &main, 1, used).unwrap();
+        drop(main_view);
+        let due = used + 3_600_000;
+        let sweep =
+            || crate::storage_retention::sweep_checkout_views_at_for_test(&paths, family, due);
+        let kept = sweep();
+        assert_eq!(kept.removed_roots, 0, "{kept:?}");
+        assert_eq!(callers(&borrowed, "a.ts", "target"), expected);
+        let main_dir = crate::blob_store::v3::view_dir(&storage, family, &scope).unwrap();
+        assert!(main_dir.exists());
+        drop(borrowed);
+        // Session teardown needs the same reservation lock as eviction. Poll
+        // read-only so repeated sweeps cannot starve the asynchronous cleanup.
+        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let sessions: u64 = ledger
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM view_sessions WHERE scope=?1",
+                        [&scope],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            if sessions == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "main checkout session stayed held: scope={scope}, sessions={sessions}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Keep the original idle clock: once the real holds end, one sweep
+        // must remove main while the worker still retains the shared base.
+        let released = sweep();
+        assert!(released.errors.is_empty(), "{released:?}");
+        assert!(
+            !main_dir.exists(),
+            "main checkout stayed held: {released:?}"
+        );
+        let bases: Vec<String> = ledger
+            .read(|connection| {
+                Ok(connection
+                    .prepare("SELECT scope FROM members WHERE kind='base'")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        assert!(
+            !bases.is_empty(),
+            "the worker's shared commit base must survive"
+        );
+        assert_eq!(
+            callers(&worker_view.reader().unwrap(), "a.ts", "target"),
+            expected
+        );
+        let rebuilt = view(&main, &storage);
+        assert_eq!(
+            callers(&rebuilt.reader().unwrap(), "a.ts", "target"),
+            expected
+        );
+    }
+
     /// `views.callgraph_copies`: a worktree past the limit borrows the main
     /// checkout's graph while every copy is in use, and takes the place of a
     /// copy once that copy's checkout lets go of it. A limit of 0 always
@@ -1502,6 +1833,9 @@ mod tests {
         use super::super::callgraph_copies::{self, Admission};
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
+        // The one-slot limit assumes reuse of the main checkout's base. Keep
+        // external Git attributes from disabling that proof.
+        let _attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
         let storage = temp.path().join("storage");
         let main = checkout(&temp.path().join("main"));
         setup_git(&main, &["init", "-q"]);

@@ -1,100 +1,67 @@
-//! Tool-provider v1 route selection through a real subc daemon.
+//! Tool-provider route selection and scoped project I/O through daemon 0.39.
 //!
-//! The consumer declares its role versions on `route.open`; the daemon
-//! forwards them, unverified, to AFT's bind. This test runs the configured
-//! `ck-subc` bytes from a stable content-addressed test cache under the
-//! `ckdev-subc` name (subc-daemon 0.29 or later, which advertises
-//! `route-role-versions/v1`) in a temporary, isolated home, runs it with the
-//! `aft` binary this package builds as its module, and checks from the
-//! consumer's side that:
+//! The daemon is embedded from the dev-only `subc-daemon` crate. It launches
+//! AFT and a test-only scope owner with isolated configuration and storage.
+//! The owner registers a workdir; project-free consumers then open scoped
+//! routes through daemon admission, which attaches the registered scope's
+//! workdir to the route bind AFT receives.
+//! AFT keeps compatibility folder fields enabled; an explicit / is a no-project
+//! sentinel, never a project spanning the filesystem.
 //!
-//! - a route opened with `role_versions: {"tool-provider": "v1"}` is served
-//!   the catalog and admits calls under the v1 grammar;
-//! - a route opened without role versions, and one that declares only some
-//!   other role, keep the legacy plugin grammar, and an ordinary plugin call
-//!   on them returns the same bytes;
-//! - a tool-provider version AFT does not serve refuses the route.
-//!
-//! The TypeScript bridge rig cannot drive this: `@cortexkit/subc-client`
-//! 0.20 has no role-versions option on `routeOpen`, so the consumer here is
-//! `subc-client-rs`, whose `CallOptions::role_versions` sends the field.
-//!
-//! Ignored by default because it needs a daemon binary. Run with, e.g.:
+//! Run the opt-in tests with:
 //!
 //! ```text
-//! AFT_E2E_SUBC_BIN=~/.local/share/cortexkit/bin/ck-subc \
-//! cargo test -p agent-file-tools --test rest tool_provider_subc_e2e -- \
-//!     --ignored --nocapture
+//! cargo test -p agent-file-tools --features test-scope-owner --test rest \
+//!     tool_provider_subc_e2e -- --ignored --nocapture
 //! ```
-//!
-//! The daemon never touches the operator's own: every XDG directory, `HOME`
-//! and `TMPDIR` point into a temporary directory, the port is kernel-assigned,
-//! and the daemon runs in its own process group, which is killed at the end.
 
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
-use subc_protocol::{BindIdentity, RouteTarget};
+use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget};
+use subc_transport::{authenticate_client, read_frame, write_frame};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
-/// A `ckdev-subc` daemon in its own process group under an isolated home.
-/// Dropping it kills the group, which includes the aft module it spawned.
+/// An embedded daemon with supervised children, all using fixture-only paths.
+/// Aborting its task drops the supervisor and its kill-on-drop children.
 struct HermeticDaemon {
-    child: Child,
+    task: tokio::task::JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
     connection_file: PathBuf,
 }
 
 impl HermeticDaemon {
-    fn start(subc_bin: &Path, home: &Path) -> Self {
-        let runtime = home.join("runtime");
-        let connection_file = runtime.join("subc-connection.json");
-        let test_bin = cache_test_daemon(subc_bin);
-        let child = Command::new(&test_bin)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", home.join("home"))
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_STATE_HOME", home.join("state"))
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("TMPDIR", home.join("tmp"))
-            .env("SUBC_PORT", "0")
-            .process_group(0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(home.join("subc.stderr.log")).unwrap(),
-            ))
-            .spawn()
-            .expect("start hermetic ckdev-subc");
+    async fn start(home: &Path) -> Self {
+        let connection_file = home.join("runtime/subc-connection.json");
+        let config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_file, 0)
+            .with_daemon_config_path(home.join("config/cortexkit/subc.jsonc"))
+            .expect("isolated daemon config")
+            .with_capture_logs_dir(home.join("logs"))
+            .with_terminal_journal_path(home.join("terminals.jsonl"));
+        let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(config));
         let deadline = Instant::now() + Duration::from_secs(60);
         while !connection_file.exists() {
+            assert!(!task.is_finished(), "embedded daemon exited during startup");
             assert!(
                 Instant::now() < deadline,
-                "hermetic ckdev-subc did not publish its connection file"
+                "embedded daemon did not publish its connection file"
             );
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         Self {
-            child,
+            task,
             connection_file,
         }
     }
-}
-
-fn cache_test_daemon(subc_bin: &Path) -> PathBuf {
-    let bytes = std::fs::read(subc_bin).expect("read daemon for the executable cache");
-    crate::test_helpers::executable_cache::cached_executable_named(&bytes, "ckdev-subc")
-        .expect("cache immutable test daemon")
 }
 
 #[test]
@@ -121,12 +88,7 @@ fn cached_test_daemon_keeps_ckdev_name() {
 
 impl Drop for HermeticDaemon {
     fn drop(&mut self) {
-        // The daemon's pid is its process group id (process_group(0)), so
-        // this also stops the aft module the daemon spawned.
-        unsafe {
-            libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL);
-        }
-        let _ = self.child.wait();
+        self.task.abort();
     }
 }
 
@@ -145,6 +107,17 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
     ] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
+    let module_env = json!({
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": home.join("home"),
+        "XDG_RUNTIME_DIR": home.join("runtime"),
+        "XDG_CONFIG_HOME": home.join("config"),
+        "XDG_DATA_HOME": home.join("data"),
+        "XDG_STATE_HOME": home.join("state"),
+        "XDG_CACHE_HOME": home.join("cache"),
+        "AFT_STORAGE_DIR": home.join("data/aft"),
+        "TMPDIR": home.join("tmp"),
+    });
     std::fs::write(
         home.join("config/cortexkit/subc.jsonc"),
         serde_json::to_vec_pretty(&json!({
@@ -154,6 +127,13 @@ fn hermetic_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
                 "program": aft_binary::aft_binary(),
                 "args": [],
                 "enabled": true,
+                "env": module_env,
+            }, "aft-test-scope-owner": {
+                "program": option_env!("CARGO_BIN_EXE_aft-test-scope-owner")
+                    .expect("build the test with --features test-scope-owner"),
+                "args": [],
+                "enabled": true,
+                "env": module_env,
             }},
         }))
         .unwrap(),
@@ -193,18 +173,55 @@ fn options(role_versions: Option<&[(&str, &str)]>) -> CallOptions {
     }
 }
 
+fn fixture_logs(directory: &Path) -> String {
+    let mut logs = String::new();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                logs.push_str(&fixture_logs(&path));
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                logs.push_str(&format!("{}:\n{text}\n", path.display()));
+            }
+        }
+    }
+    logs
+}
+
+async fn wait_for_scope_owner(project: &Path) {
+    let ready = project.parent().unwrap().join("scope-owner.ready");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "test scope owner did not register its workdir:\n{}",
+            fixture_logs(&project.parent().unwrap().join("logs"))
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn open(
     consumer: &SubcConsumer,
     project: &Path,
     session: &str,
     role_versions: Option<&[(&str, &str)]>,
 ) -> Result<RouteHandle, CallError> {
+    wait_for_scope_owner(project).await;
+    let scope = subc_protocol::scope::ScopeSelector::new(
+        subc_protocol::Principal::Reserved {
+            module_id: "aft-test-scope-owner".into(),
+        },
+        "e2e-project",
+        Some(1),
+    );
     consumer
-        .open_route(
+        .open_route_scoped(
             RouteTarget::ToolProvider {
                 module_id: "aft".into(),
             },
-            BindIdentity::new(project, "runner", session),
+            BindIdentity::new("runner", session),
+            scope,
             options(role_versions),
         )
         .await
@@ -213,8 +230,19 @@ async fn open(
 async fn request(
     consumer: &SubcConsumer,
     route: &RouteHandle,
-    body: Value,
+    mut body: Value,
 ) -> Result<Vec<u8>, CallError> {
+    // Scoped tool calls name their catalog preset; provider metadata does not.
+    if body
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name != "tool.catalog")
+    {
+        body.as_object_mut()
+            .unwrap()
+            .entry("preset")
+            .or_insert(json!("head"));
+    }
     consumer
         .request(route, serde_json::to_vec(&body).unwrap(), options(None))
         .await
@@ -275,13 +303,10 @@ fn legacy_reply_comparison_rejects_a_plugin_id_from_another_route() {
 }
 
 #[tokio::test]
-#[ignore = "needs a real ck-subc daemon (subc-daemon 0.29+); set AFT_E2E_SUBC_BIN"]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
 async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_unchanged() {
-    let subc_bin = PathBuf::from(
-        std::env::var_os("AFT_E2E_SUBC_BIN").expect("set AFT_E2E_SUBC_BIN to a ck-subc binary"),
-    );
     let (_temp, home, project) = hermetic_home();
-    let daemon = HermeticDaemon::start(&subc_bin, &home);
+    let daemon = HermeticDaemon::start(&home).await;
     let consumer = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
         .await
         .expect("connect to the hermetic daemon");
@@ -421,4 +446,213 @@ async fn tool_provider_subc_e2e_role_versions_select_v1_and_leave_legacy_routes_
     );
     drop(consumer);
     drop(daemon);
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_scope_workdir_compatibility_bind_serves_files() {
+    let (_temp, home, project) = hermetic_home();
+    let daemon = HermeticDaemon::start(&home).await;
+    let consumer = SubcConsumer::connect(&daemon.connection_file, ConsumerOptions::default())
+        .await
+        .expect("connect embedded daemon 0.39");
+    let route = open(
+        &consumer,
+        &project,
+        "project-free-e2e",
+        Some(&[("tool-provider", "v1")]),
+    )
+    .await
+    .expect("open project-free scoped route");
+    for (name, arguments) in [
+        ("read", json!({"path":"seed.txt"})),
+        ("grep", json!({"pattern":"seed line one", "path":"."})),
+    ] {
+        let bytes = request(
+            &consumer,
+            &route,
+            json!({"name":name, "arguments":arguments}),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("scoped {name}: {error}"));
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_ne!(reply["isError"], true, "{reply}");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("seed line one"),
+            "{reply}"
+        );
+        if name == "grep" {
+            assert!(
+                String::from_utf8_lossy(&bytes).contains("seed.txt"),
+                "{reply}"
+            );
+        }
+    }
+    consumer.close().await;
+    drop(daemon);
+}
+
+async fn legacy_rpc(
+    stream: &mut TcpStream,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    body: Value,
+) -> Frame {
+    let frame = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    write_frame(stream, &frame).await.unwrap();
+    stream.flush().await.unwrap();
+    loop {
+        let reply = tokio::time::timeout(Duration::from_secs(60), read_frame(stream))
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("legacy client connection closed");
+        if reply.header.ty == FrameType::Push {
+            continue;
+        }
+        assert_eq!((reply.header.channel, reply.header.corr), (channel, corr));
+        return reply;
+    }
+}
+
+async fn open_legacy_root(
+    connection_file: &Path,
+    root: &Path,
+    scope: Option<Value>,
+) -> (TcpStream, u16, u32) {
+    let info = subc_transport::read_for_client(connection_file).unwrap();
+    let endpoint = info.endpoints.first().unwrap();
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+    authenticate_client(&mut stream, &info, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        // The legacy root is raw JSON because protocol 0.34's BindIdentity no
+        // longer has a project field, while older consumers still send it.
+        let mut request = json!({
+            "op":"route.open",
+            "target":{"kind":"tool_provider", "module_id":"aft"},
+            "identity":{"harness":"opencode", "session":"unscoped-legacy-e2e", "project_root":root},
+        });
+        if let Some(scope) = &scope {
+            request["scope"] = scope.clone();
+        }
+        let reply = legacy_rpc(&mut stream, 0, 0, 1, request).await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if reply.header.ty == FrameType::Response {
+            return (
+                stream,
+                u16::try_from(body["route_channel"].as_u64().unwrap()).unwrap(),
+                u32::try_from(body["route_epoch"].as_u64().unwrap()).unwrap(),
+            );
+        }
+        let code = body["code"].as_str().unwrap_or_default();
+        assert!(
+            subc_protocol::error_codes::is_retryable_route_open(code)
+                && tokio::time::Instant::now() < deadline,
+            "legacy route open: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
+    let (_temp, home, project) = hermetic_home();
+    let daemon = HermeticDaemon::start(&home).await;
+    let root = if no_project {
+        Path::new("/")
+    } else {
+        project.as_path()
+    };
+    let scope = if scoped_without_workdir {
+        wait_for_scope_owner(&project).await;
+        Some(json!({
+            "owner":{"kind":"reserved", "module_id":"aft-test-scope-owner"},
+            "ref":"e2e-no-workdir", "scope_epoch":1,
+        }))
+    } else {
+        None
+    };
+    let (mut stream, channel, epoch) = open_legacy_root(&daemon.connection_file, root, scope).await;
+    for (corr, name, arguments) in [
+        (2, "read", json!({"path":project.join("seed.txt")})),
+        (
+            3,
+            "grep",
+            json!({"pattern":"seed line one", "path":project}),
+        ),
+    ] {
+        let reply = legacy_rpc(
+            &mut stream,
+            channel,
+            epoch,
+            corr,
+            json!({"name":name, "preset":"head", "arguments":arguments}),
+        )
+        .await;
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if no_project {
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "project_required");
+            assert_eq!(
+                body["message"].as_str().unwrap().as_bytes(),
+                b"This connection has no project folder, so AFT cannot run project tools on it."
+            );
+            assert_eq!(body["detail"]["cause"], "filesystem_root");
+            assert_eq!(body["detail"]["source"], "legacy_bind");
+            assert_eq!(body["detail"]["folder"], "/");
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_ne!(body["isError"], true, "{body}");
+            assert!(
+                String::from_utf8_lossy(&reply.body).contains("seed line one"),
+                "{body}"
+            );
+            if name == "grep" {
+                assert!(
+                    String::from_utf8_lossy(&reply.body).contains("seed.txt"),
+                    "{body}"
+                );
+            }
+        }
+    }
+    let catalog = legacy_rpc(&mut stream, channel, epoch, 4, json!({"op":"tool.catalog"})).await;
+    assert_eq!(catalog.header.ty, FrameType::Response);
+    let body: Value = serde_json::from_slice(&catalog.body).unwrap();
+    assert!(body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+    drop(stream);
+    drop(daemon);
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_unscoped_legacy_root_serves_files() {
+    legacy_root_case(false, false).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_unscoped_slash_refuses_files_but_serves_catalog() {
+    legacy_root_case(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "opt-in daemon 0.39 integration; run with --features test-scope-owner"]
+async fn tool_provider_subc_e2e_scope_without_workdir_uses_filled_legacy_root() {
+    legacy_root_case(false, true).await;
 }

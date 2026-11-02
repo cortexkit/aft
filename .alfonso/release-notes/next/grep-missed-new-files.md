@@ -1,0 +1,1 @@
+- `grep` and `aft_search` now find files inside a folder that was moved or renamed into a project on macOS or Windows. Before, those files could stay missing from results that were reported as complete.

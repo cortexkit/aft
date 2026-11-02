@@ -127,6 +127,24 @@ fn sleep_command(seconds: u64) -> String {
     #[cfg(not(windows))]
     format!("sleep {seconds}")
 }
+
+fn startup_debug_logs(directory: &Path) -> String {
+    let mut logs = String::new();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                logs.push_str(&startup_debug_logs(&path));
+            } else if path.extension().is_some_and(|extension| extension == "log") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    logs.push_str(&format!("{}:\n{text}\n", path.display()));
+                }
+            }
+        }
+    }
+    logs
+}
+
 impl Daemon {
     async fn spawn(root: &Path, ops: &[&str]) -> Self {
         let config = root.join("project/.cortexkit");
@@ -191,13 +209,15 @@ impl Daemon {
             std::fs::create_dir_all(&path).unwrap();
             command.env(variable, path);
         }
-        let child = command.spawn().unwrap();
+        let mut child = command.spawn().unwrap();
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "module did not attach: {error}; stderr: {}",
-                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                    "module did not attach: {error}; child status: {:?}; stderr: {}; AFT debug logs: {}",
+                    child.try_wait(),
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default(),
+                    startup_debug_logs(&root.join("data")),
                 )
             })
             .unwrap();
@@ -359,26 +379,32 @@ impl Daemon {
     ) {
         self.corr += 1;
         let corr = self.corr;
-        let bind = ModuleControlRequest::RouteBind {
-            route_channel: channel,
-            epoch: bind_epoch,
-            target: RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: BindIdentity::new(&self.root.join("project"), "runner", session),
-            principal: Some(if principal == "direct" {
-                Principal::Direct
-            } else {
-                Principal::Reserved {
-                    module_id: principal.into(),
-                }
-            }),
-            consumer_capabilities: Some(vec!["elicitation".into()]),
-            admission_facts: None,
-            scope,
-            role_versions: (!legacy)
-                .then(|| BTreeMap::from([("tool-provider".into(), "v1".into())])),
-            call_mode: None,
+        let bind = {
+            let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                route_channel: channel,
+                epoch: bind_epoch,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: BindIdentity::new("runner", session),
+                principal: Some(if principal == "direct" {
+                    Principal::Direct
+                } else {
+                    Principal::Reserved {
+                        module_id: principal.into(),
+                    }
+                }),
+                consumer_capabilities: Some(vec!["elicitation".into()]),
+                admission_facts: None,
+                scope,
+                role_versions: (!legacy)
+                    .then(|| BTreeMap::from([("tool-provider".into(), "v1".into())])),
+                call_mode: None,
+            })
+            .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!(&self.root.join("project"));
+
+            bind
         };
         self.send(
             FrameType::Request,

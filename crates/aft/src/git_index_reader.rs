@@ -272,6 +272,9 @@ fn wait_for_unlock(path: &Path, remaining: &mut Duration) -> Result<bool, Strict
                 *remaining = remaining.saturating_sub(start.elapsed());
                 return Ok(saw_lock);
             }
+            // Windows can deny metadata access to a delete-pending lock until its last handle closes.
+            #[cfg(windows)]
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => saw_lock = true,
             Err(error) => return Err(StrictReason::Unreadable(error.kind())),
             Ok(_) => saw_lock = true,
         }
@@ -1128,6 +1131,82 @@ mod tests {
         );
         writer.join().unwrap();
         assert!(matches!(result, IndexRead::Snapshot(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn released_delete_pending_index_lock_allows_snapshot() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_DISPOSITION_INFO,
+            FILE_READ_ATTRIBUTES,
+        };
+
+        let dir = fixture(ObjectFormat::Sha1);
+        let lock = dir.path().join(".git/index.lock");
+        fs::write(&lock, b"writer").unwrap();
+        let handle = fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .open(&lock)
+            .unwrap();
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // Legacy disposition keeps the name delete-pending until the handle closes.
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    handle.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of_val(&disposition) as u32,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        // Prevent std's directory-listing fallback from hiding the delete-pending error.
+        let (_denied, enforced) = crate::blob_store::v3::deny_read_for_test(
+            lock.parent().unwrap(),
+            "delete-pending index.lock metadata",
+            || fs::symlink_metadata(&lock),
+        );
+        // Some machines (GitHub's hosted Windows runners) don't apply the deny,
+        // so std's listing fallback still answers and the error 5 path can't be
+        // reached there; the helper has already printed that. The wait and
+        // recovery checks below still hold: the lock reads as present until its
+        // handle closes.
+        if enforced {
+            let error = fs::symlink_metadata(&lock).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.raw_os_error(), Some(5));
+            eprintln!("delete-pending index.lock metadata: {error:?}");
+        }
+
+        let options = ReadOptions {
+            lock_wait: Duration::from_millis(20),
+            ..ReadOptions::default()
+        };
+        let start = Instant::now();
+        assert_eq!(
+            read_index(&index(dir.path()), ObjectFormat::Sha1, options),
+            IndexRead::Strict(StrictReason::IndexLocked)
+        );
+        assert!(start.elapsed() >= options.lock_wait);
+
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(handle);
+        });
+        let result = read_index(
+            &index(dir.path()),
+            ObjectFormat::Sha1,
+            ReadOptions {
+                lock_wait: Duration::from_secs(5),
+                ..ReadOptions::default()
+            },
+        );
+        writer.join().unwrap();
+        assert!(matches!(result, IndexRead::Snapshot(_)), "{result:?}");
     }
 
     #[test]

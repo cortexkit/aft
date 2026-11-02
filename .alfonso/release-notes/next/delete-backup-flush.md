@@ -1,0 +1,1 @@
+- A recursive aft_delete of a large folder on macOS is about four times faster, and one that runs out of time now stops before deleting anything instead of after most of a minute.

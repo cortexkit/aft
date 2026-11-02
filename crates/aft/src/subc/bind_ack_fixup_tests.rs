@@ -37,25 +37,31 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for GateWrite<W> {
 }
 
 fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: 7,
-        epoch,
-        target: if tool {
-            RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            }
-        } else {
-            RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            }
-        },
-        identity: subc_protocol::BindIdentity::new(root, "opencode", "retracted-bind"),
-        principal: Some(subc_protocol::Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch,
+            target: if tool {
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                }
+            } else {
+                RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                }
+            },
+            identity: subc_protocol::BindIdentity::new("opencode", "retracted-bind"),
+            principal: Some(subc_protocol::Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root);
+
+        bind
     };
     Frame::build(
         FrameType::Request,

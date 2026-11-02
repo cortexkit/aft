@@ -234,6 +234,8 @@ mod idle_root_retention_tests;
 mod perf_sweep;
 mod route_census;
 mod secret_consent;
+#[cfg(test)]
+mod views_idle_checkout_tests;
 #[cfg(all(test, unix))]
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
@@ -244,6 +246,7 @@ pub(crate) use secret_consent::{
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
+mod keepalive;
 mod manifest;
 mod page_collect;
 mod persistence;
@@ -1506,7 +1509,9 @@ struct RootMeta {
     maintenance_last_submitted: Option<Instant>,
     maintenance_poisoned: bool,
     last_touched: Instant,
-    /// Diagnostic demand clocks; unlike last_touched, polling and teardown do not reset them.
+    /// The request stamp whose idle views have already been released.
+    views_released_for_request_at: Option<Instant>,
+    /// Tool demand clocks; unlike last_touched, polling and teardown do not reset them.
     last_tool_call: Option<Instant>,
     route_activity: HashMap<RouteChannel, route_census::RouteActivity>,
     diagnostics_on_edit: bool,
@@ -1597,6 +1602,11 @@ enum ManagementAdmission {
     #[default]
     FirstParty,
     FlowOnly,
+    /// Tool-provider metadata without a project root; grants no management authority.
+    ProjectFree {
+        workdir: Option<String>,
+        legacy_root: Option<PathBuf>,
+    },
 }
 
 impl RouteIdentity {
@@ -1608,7 +1618,7 @@ impl RouteIdentity {
 #[derive(Debug)]
 struct RouteIdentityData {
     root: ProjectRootId,
-    /// Resolved scope workdir, or the legacy bind root when no workdir is stamped.
+    /// Resolved scope workdir, or the daemon-filled root when no workdir is stamped.
     /// The daemon's project id is retained alongside it in `scope.project_id`;
     /// persisted state continues to use the root path, not that id.
     project_root: PathBuf,
@@ -1620,6 +1630,7 @@ struct RouteIdentityData {
     consumer_elicitation_capable: bool,
     held_reply: bool,
     held_update: bool,
+    call_keepalive: bool,
     tool_result_body: bool,
     /// `disabled_tools` resolved from the config files when this route bound.
     /// Every tool call on the route is checked against this snapshot, so a
@@ -1841,6 +1852,7 @@ impl RootMeta {
             maintenance_last_submitted: None,
             maintenance_poisoned: false,
             last_touched: now,
+            views_released_for_request_at: None,
             last_tool_call: None,
             route_activity: HashMap::new(),
             diagnostics_on_edit: false,
@@ -2571,6 +2583,32 @@ fn reap_idle_roots_with_presence(
             .get(root_id)
             .is_some_and(|channels| !channels.is_empty());
         let has_pending_bind = pending_bind_roots.contains(root_id);
+
+        // A connected route is not activity. Release only resident handles;
+        // keep the actor and watcher so its next call takes the normal reload
+        // path. Durable member deletion still rechecks every hold in retention.
+        if !deleted
+            && !has_pending_bind
+            && meta.active_bash_waits == 0
+            && !meta.maintenance_pending
+            && meta.maintenance_queued_kinds.is_empty()
+            && executor.try_actor_is_idle(root_id) == Some(true)
+        {
+            if let Some(Some(ctx)) = executor.try_actor_context(root_id) {
+                if let Some((requested, hours)) = ctx.try_views_idle_request() {
+                    let last_use = meta
+                        .last_tool_call
+                        .map_or(requested, |tool| tool.max(requested));
+                    if meta.views_released_for_request_at != Some(last_use)
+                        && now.saturating_duration_since(last_use)
+                            >= Duration::from_secs(u64::from(hours) * 60 * 60)
+                        && ctx.try_release_idle_checkout_views()
+                    {
+                        meta.views_released_for_request_at = Some(last_use);
+                    }
+                }
+            }
+        }
 
         if deleted {
             let mut retained = false;
@@ -6015,6 +6053,12 @@ where
                         // before any store, provider, or general tool dispatch.
                         // Tool routes retain their separate call-mode contract.
                         if let Some(identity) = management_routes.get(&route) {
+                            if let ManagementAdmission::ProjectFree { workdir, legacy_root } = &identity.admission {
+                                if let Err(error) = handle_project_free_request(&writer_tx, &decoded.frame, &dispatch_path_metrics, workdir.as_deref(), legacy_root.as_deref()).await {
+                                    break Err(error);
+                                }
+                                continue;
+                            }
                             if let Err(error) = admit_management_flow_request(identity, decoded.body().ok()) {
                                 if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, error).await {
                                     break Err(error);
@@ -8058,34 +8102,95 @@ fn normalized_scope_workdir(workdir: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_route_project_root(
-    identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
-) -> PathBuf {
-    match scope.and_then(|stamp| stamp.workdir.as_deref()) {
-        Some(workdir) => {
-            let workdir = Path::new(workdir);
-            // Invalid stamped paths still go through bind validation; they must
-            // never select a different project through the compatibility fallback.
-            normalized_scope_workdir(workdir).unwrap_or_else(|| workdir.to_path_buf())
+) -> Result<Option<PathBuf>, &'static str> {
+    let stamped_workdir = scope.and_then(|stamp| stamp.workdir.as_deref());
+    let root = stamped_workdir.map(Path::new).or(legacy_root);
+    match root {
+        Some(root) if root.as_os_str() == "/" => Ok(None),
+        Some(root) if root.is_absolute() => {
+            let normalized = normalized_scope_workdir(root).unwrap_or_else(|| root.to_path_buf());
+            // The daemon uses / when an opener has no project. Aliases of that
+            // sentinel must not accidentally configure or index the filesystem.
+            if normalized.as_os_str() == "/" {
+                Ok(None)
+            } else {
+                Ok(Some(if stamped_workdir.is_some() {
+                    normalized
+                } else {
+                    root.to_path_buf()
+                }))
+            }
         }
-        None => legacy_unstamped_bind_project_root(identity),
+        Some(_) => Err(PROJECT_REQUIRED),
+        None => Ok(None),
     }
 }
 
-// Older daemons and session hosts do not always stamp a workdir. Remove this
-// compatibility fallback when BindIdentity no longer carries project_root.
-fn legacy_unstamped_bind_project_root(identity: &subc_protocol::BindIdentity) -> PathBuf {
-    identity.project_root.clone()
+const PROJECT_REQUIRED: &str =
+    "This connection has no project folder, so AFT cannot run project tools on it.";
+const PROJECT_REQUIRED_CODE: &str = "project_required";
+
+fn project_folder_refusal(
+    code: &str,
+    workdir: Option<&str>,
+    legacy_root: Option<&Path>,
+    route: RouteChannel,
+    corr: u64,
+) -> ErrorBody {
+    let (source, folder) = match workdir {
+        Some(workdir) => ("scope_workdir", Some(workdir.to_owned())),
+        None => (
+            if legacy_root.is_some() {
+                "legacy_bind"
+            } else {
+                "none"
+            },
+            legacy_root.map(|root| root.to_string_lossy().into_owned()),
+        ),
+    };
+    let cause = if code == "invalid_workdir" {
+        "invalid_workdir"
+    } else if folder.is_some() {
+        "filesystem_root"
+    } else {
+        "project_folder_missing"
+    };
+    let detail = json!({
+        "cause": cause,
+        "source": source,
+        "folder": folder,
+        "requirement": "absolute_non_root_project_directory",
+    });
+    crate::slog_warn!(
+        "subc project folder refused: code={} route={} corr={} detail={}",
+        code,
+        route,
+        corr,
+        detail,
+    );
+    ErrorBody::new(code, PROJECT_REQUIRED).with_detail(detail)
+}
+
+fn legacy_route_project_root(frame: &Frame) -> Option<PathBuf> {
+    serde_json::from_slice::<Value>(&frame.body)
+        .ok()
+        .and_then(|body| body["identity"]["project_root"].as_str().map(PathBuf::from))
 }
 
 fn log_route_project_key_change(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     project_root: &Path,
     route: RouteChannel,
 ) {
     // Catalog and consent keys use literal display strings. Compare those strings
     // so aliases that canonicalize to one folder still produce a key-change log.
-    let bind_key = identity.project_root.display().to_string();
+    let Some(legacy_root) = legacy_root else {
+        return;
+    };
+    let bind_key = legacy_root.display().to_string();
     let resolved_key = project_root.display().to_string();
     if bind_key != resolved_key {
         crate::slog_info!(
@@ -8152,8 +8257,12 @@ impl Drop for ScopeWorkdirPermit {
 
 fn schedule_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: Option<&Path>,
     scope: Option<&subc_protocol::scope::ScopeStamp>,
 ) {
+    let Some(legacy_root) = legacy_root else {
+        return;
+    };
     let Some(stamp) = scope else { return };
     let Some(workdir) = stamp.workdir.as_deref() else {
         return;
@@ -8163,7 +8272,12 @@ fn schedule_scope_workdir_comparison(
     let permit = match SCOPE_WORKDIR_DIAGNOSTICS.try_admit(workdir) {
         Ok(permit) => permit,
         Err(reason) => {
-            log_scope_workdir_comparison(identity, stamp, Err(io::Error::other(reason)));
+            log_scope_workdir_comparison(
+                identity,
+                legacy_root,
+                stamp,
+                Err(io::Error::other(reason)),
+            );
             #[cfg(test)]
             if let Some(observed) = observed {
                 let _ = observed.send(());
@@ -8173,7 +8287,8 @@ fn schedule_scope_workdir_comparison(
     };
     let budget = crate::bounded_io::Budget::after(crate::bounded_io::IO_BUDGET);
     let deadline = tokio::time::Instant::from_std(budget.deadline);
-    let project_root = identity.project_root.clone();
+    let project_root = legacy_root.to_path_buf();
+    let legacy_root = legacy_root.to_path_buf();
     let workdir = workdir.to_owned();
     // A diagnostic must not delay frame processing or serialize project work. The
     // bounded helper owns all filesystem work; the blocking task only waits for it.
@@ -8195,7 +8310,7 @@ fn schedule_scope_workdir_comparison(
                 "filesystem comparison budget expired",
             )),
         };
-        log_scope_workdir_comparison(&identity, &stamp, result);
+        log_scope_workdir_comparison(&identity, &legacy_root, &stamp, result);
         #[cfg(test)]
         if let Some(observed) = observed {
             let _ = observed.send(());
@@ -8209,9 +8324,9 @@ fn compare_scope_workdir(
     budget: crate::bounded_io::Budget,
     permit: ScopeWorkdirPermit,
 ) -> io::Result<Option<(PathBuf, PathBuf)>> {
-    // A stamped folder can have a missing tail. Normalize its existing prefix
+    // Either folder can have a missing tail. Normalize each existing prefix
     // like a routing root, including Windows path spelling, then append that tail.
-    // Bound the whole walk, including direct canonicalization of the project root.
+    // Bound both walks so a diagnostic never waits indefinitely on filesystem I/O.
     let pool = permit
         .diagnostics
         .pool
@@ -8222,25 +8337,25 @@ fn compare_scope_workdir(
             // Keep both the capacity slot and this folder's deduplication key
             // until the actual filesystem job exits, not merely until timeout.
             let _permit = permit;
-            let (Ok(project_root), Some(workdir)) = (
-                ProjectRootId::from_path(project_root),
+            let (Some(project_root), Some(workdir)) = (
+                normalized_scope_workdir(&project_root),
                 normalized_scope_workdir(&workdir),
             ) else {
                 return Ok(None);
             };
-            Ok((workdir.as_path() != project_root.as_path())
-                .then(|| (project_root.into_path_buf(), workdir)))
+            Ok((workdir != project_root).then_some((project_root, workdir)))
         })
     })
 }
 
 fn log_scope_workdir_comparison(
     identity: &subc_protocol::BindIdentity,
+    legacy_root: &Path,
     stamp: &subc_protocol::scope::ScopeStamp,
     result: io::Result<Option<(PathBuf, PathBuf)>>,
 ) {
     match result {
-        Ok(Some((project_root, workdir))) => crate::slog_info!(
+        Ok(Some((project_root, workdir))) => crate::slog_warn!(
             "subc scope workdir differs: project_root={} workdir={} session={} project_id={}",
             project_root.display(),
             workdir.display(),
@@ -8250,7 +8365,7 @@ fn log_scope_workdir_comparison(
         Ok(None) => {}
         Err(error) => crate::slog_info!(
             "subc scope workdir comparison skipped: project_root={} workdir={} session={} project_id={} reason={}",
-            identity.project_root.display(),
+            legacy_root.display(),
             stamp.workdir.as_deref().unwrap_or("none"),
             identity.session,
             stamp.project_id.as_deref().unwrap_or("none"),
@@ -8336,7 +8451,10 @@ async fn handle_control_request(
                 ),
                 if role_versions.is_some() { "declared" } else { "none" }
             );
-            schedule_scope_workdir_comparison(&identity, scope.as_ref());
+            // Protocol 0.34 drops project fields from BindIdentity. Read the
+            // legacy claim separately for compatibility clients and mismatch
+            // logging; it must never override an explicit stamped workdir.
+            let legacy_root = legacy_route_project_root(frame);
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -8384,11 +8502,37 @@ async fn handle_control_request(
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await
                 }
             };
-            if let RouteTarget::ManagementSurface { module_id } = &target {
-                if let Err(refusal) = flow_read::admit_management(scope.as_ref()) {
+            // Refuse an exhausted bind budget before probing project folders.
+            let bind_project_root = if matches!(target, RouteTarget::ToolProvider { .. }) {
+                match resolve_route_project_root(legacy_root.as_deref(), scope.as_ref()) {
+                    Ok(root) => root,
+                    Err(_) => {
+                        let refusal = project_folder_refusal(
+                            "invalid_workdir",
+                            scope.as_ref().and_then(|stamp| stamp.workdir.as_deref()),
+                            legacy_root.as_deref(),
+                            route_id,
+                            frame.header.corr,
+                        );
+                        return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
+                    }
+                }
+            } else {
+                None
+            };
+            let project_free =
+                matches!(target, RouteTarget::ToolProvider { .. }) && bind_project_root.is_none();
+            schedule_scope_workdir_comparison(&identity, legacy_root.as_deref(), scope.as_ref());
+            if matches!(target, RouteTarget::ManagementSurface { .. }) || project_free {
+                if let Err(refusal) = if project_free {
+                    Ok(())
+                } else {
+                    flow_read::admit_management(scope.as_ref())
+                } {
                     return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
                 }
-                if module_id != "aft" {
+                if !matches!(&target, RouteTarget::ManagementSurface { module_id } | RouteTarget::ToolProvider { module_id } if module_id == "aft")
+                {
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -8398,7 +8542,8 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                if !matches!(bind_trust, BindTrust::FirstParty)
+                if !project_free
+                    && !matches!(bind_trust, BindTrust::FirstParty)
                     && diagnostics_findings::admit_flow(scope.as_ref()).is_err()
                 {
                     return send_route_bind_error(
@@ -8410,7 +8555,12 @@ async fn handle_control_request(
                     )
                     .await;
                 }
-                let admission = if scope
+                let admission = if project_free {
+                    ManagementAdmission::ProjectFree {
+                        workdir: scope.as_ref().and_then(|stamp| stamp.workdir.clone()),
+                        legacy_root: legacy_root.clone(),
+                    }
+                } else if scope
                     .as_ref()
                     .is_some_and(diagnostics_findings::is_flow_scope)
                 {
@@ -8528,7 +8678,8 @@ async fn handle_control_request(
                 .await;
             }
 
-            let bind_project_root = resolve_route_project_root(&identity, scope.as_ref());
+            let bind_project_root =
+                bind_project_root.expect("rootless tool routes install without an actor");
             let mut bind_root_id = None;
             if let Some(installed_epoch) = installed_route_epochs.get(&route_channel).copied() {
                 if installed_epoch >= epoch {
@@ -8614,7 +8765,12 @@ async fn handle_control_request(
                     }
                 },
             };
-            log_route_project_key_change(&identity, &bind_project_root, route_id);
+            log_route_project_key_change(
+                &identity,
+                legacy_root.as_deref(),
+                &bind_project_root,
+                route_id,
+            );
 
             // Reconcile RootConfig using the resolved project and the local
             // config tiers, then run it through the executor.
@@ -8633,6 +8789,10 @@ async fn handle_control_request(
             let held_update = cortexkit_role_tool_provider::consumer_reads_held_update_v1(
                 consumer_capabilities.as_deref(),
             );
+            let call_keepalive = consumer_capabilities.as_ref().is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap == cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY)
+            });
             let held_reply = consumer_capabilities
                 .as_ref()
                 .is_some_and(|caps| caps.iter().any(|cap| cap == "held-reply/v1"));
@@ -8728,6 +8888,7 @@ async fn handle_control_request(
                 tool_result_body,
                 held_reply,
                 held_update,
+                call_keepalive,
                 disabled_tools: bind_disabled_tools,
                 run_scope: OnceLock::new(),
                 call_mode: call_mode.unwrap_or(subc_protocol::call_mode::CallMode::Classic),
@@ -8909,6 +9070,69 @@ async fn handle_control_request(
                 .summary(),
             )
             .await
+        }
+    }
+}
+
+/// Metadata is static on a project-free route. Task handles, including those
+/// used to read a bash task's status, belong to a project's registry and cannot
+/// be resolved here.
+async fn handle_project_free_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    metrics: &DispatchPathMetrics,
+    workdir: Option<&str>,
+    legacy_root: Option<&Path>,
+) -> Result<(), SubcError> {
+    let mut body = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+    let operation = body
+        .get("op")
+        .or_else(|| body.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let arguments = if body.get("op").is_some() {
+        body.as_object_mut().unwrap().remove("op");
+        body
+    } else {
+        body.get("arguments").cloned().unwrap_or_else(|| json!({}))
+    };
+    let result = match operation.as_deref() {
+        Some("role.describe") => Ok(tool_provider::describe()),
+        Some("tool.catalog") => {
+            tool_provider::validate_catalog_request(arguments).and_then(|(request, preset)| {
+                tool_provider::catalog_for_request(
+                    request,
+                    preset,
+                    &[],
+                    false,
+                    false,
+                    false,
+                    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                )
+            })
+        }
+        _ => Err(project_folder_refusal(
+            PROJECT_REQUIRED_CODE,
+            workdir,
+            legacy_root,
+            route_key(frame.header.channel, frame.header.epoch),
+            frame.header.corr,
+        )),
+    };
+    match result {
+        Err(error) => send_provider_error(tx, metrics, frame, error).await,
+        Ok(answer) => {
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                frame.header.flags,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                serde_json::to_vec(&answer).map_err(SubcError::Json)?,
+            )
+            .map_err(SubcError::FrameBuild)?;
+            send_reliable_writer_frame(tx, metrics, response, "project-free metadata").await
         }
     }
 }
@@ -10236,6 +10460,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
+    progress: Option<crate::run_tool_call::progress::Progress>,
     speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
@@ -10269,6 +10494,7 @@ impl PlainToolRun {
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
+                progress,
                 speech_seed,
                 bare_name,
                 mut arguments,
@@ -10283,6 +10509,11 @@ impl PlainToolRun {
                 approved_io_window,
                 reply_deadline,
             } = run_spec;
+            if let (Some(progress), Some(token)) =
+                (progress, crate::executor::current_job_cancellation())
+            {
+                token.set_progress(progress);
+            }
             if identity_for_run.run_owner.is_some() {
                 if let Err(response) = tool_provider::check_program_scope(
                     ctx,
@@ -10815,6 +11046,13 @@ async fn handle_tool_call_with_capabilities(
         flags: frame.header.flags,
         deadline: queued_call::Deadline::from_envelope(phase_trace.received_at(), &envelope),
     };
+    let progress = keepalive::channel(
+        tx,
+        metrics,
+        active_tool_calls,
+        frame,
+        identity.call_keepalive,
+    );
     if let Some(error) = occipital_session_refusal(&identity, &envelope) {
         return send_provider_error(tx, metrics, frame, error).await;
     }
@@ -11648,7 +11886,8 @@ async fn handle_tool_call_with_capabilities(
 
     // Catalog role controls tool behavior, but a stamped worker must never
     // enable Cargo indirectly by selecting a head catalog on its route.
-    if access_grants::alfonso_worker(&identity) {
+    // Inspect applies the policy inside its deadline-bounded deferred body.
+    if access_grants::alfonso_worker(&identity) && bare_name != "inspect" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             ctx.disable_rust_cargo_for_worker();
         }
@@ -11709,6 +11948,7 @@ async fn handle_tool_call_with_capabilities(
                 | crate::access_policy::AskRoute::Elicitation { .. }
         )
         .then(|| PlainToolRun {
+            progress: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
@@ -11796,7 +12036,13 @@ async fn handle_tool_call_with_capabilities(
                         });
                         response
                     }
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
+                        if bare_name_for_run == "inspect"
+                            && access_grants::alfonso_worker(&identity_for_run)
+                        {
+                            prepared.request.params[crate::protocol::WORKER_SESSION_FIELD] =
+                                Value::Bool(true);
+                        }
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
                                 &prepared.request,
@@ -11925,6 +12171,7 @@ async fn handle_tool_call_with_capabilities(
         });
         let deferred_setup_guard =
             PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
+        let job = keepalive::job(progress, job);
         let rx = submit_active_tool_call(
             executor.as_ref(),
             active_tool_calls,
@@ -12113,6 +12360,7 @@ async fn handle_tool_call_with_capabilities(
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
     let plain_run = PlainToolRun {
+        progress,
         speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
         bare_name,
         arguments,
@@ -13036,6 +13284,16 @@ pub(crate) mod test_support {
         ctx: &Arc<AppContext>,
         request_id: &str,
     ) -> (PendingResponse, JobCancellation) {
+        submit_deferred_inspect_setup_with_clock(executor, root, ctx, request_id, Instant::now)
+    }
+
+    fn submit_deferred_inspect_setup_with_clock(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        ctx: &Arc<AppContext>,
+        request_id: &str,
+        now: impl Fn() -> Instant + Send + 'static,
+    ) -> (PendingResponse, JobCancellation) {
         let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
         let request = inspect_request(request_id);
         let inspect_ctx = Arc::clone(ctx);
@@ -13045,10 +13303,12 @@ pub(crate) mod test_support {
             request_id.to_string(),
             Box::new(move |_| {
                 let DispatchOutcome::Deferred(pending) =
-                    crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                    crate::commands::inspect::handle_inspect_deferred_with_clock(
                         &request,
                         inspect_ctx,
                         true,
+                        None,
+                        now,
                     )
                 else {
                     panic!("inspect setup must defer")
@@ -13080,6 +13340,24 @@ pub(crate) mod test_support {
             assert!(Instant::now() < deadline, "inspect terminal timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_deferred_inspect_cleanup(ctx: &AppContext, request_id: &str) {
+        // A pending callback can acknowledge cancellation before the worker
+        // observes it. The worker drops its root permit before its restriction
+        // guard, so guard removal is the teardown barrier, not the terminal reply.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while ctx.request_force_restrict(request_id) {
+            assert!(
+                Instant::now() < deadline,
+                "detached force-restrict guard leaked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::commands::inspect::deferred_inspect_root_count_for_test(ctx),
+            0
+        );
     }
 
     fn cold_navigation_context(root: &Path) -> (Arc<AppContext>, PathBuf) {
@@ -13193,7 +13471,7 @@ pub(crate) mod test_support {
             );
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "writer admissions must not finish the detached inspect"
         );
@@ -13208,6 +13486,70 @@ pub(crate) mod test_support {
     }
 
     #[test]
+    fn bounded_scoped_inspect_abandoned_discovery_releases_reader_for_rebind() {
+        let executor = Arc::new(Executor::new());
+        let (dir, root) = test_root("inspect-abandoned-discovery");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        executor.register_actor(root.clone(), ctx.clone());
+        let held_manager = ctx.lsp();
+        let inspect_ctx = ctx.clone();
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::SerialLspStatus,
+            "inspect-abandoned-discovery".into(),
+            "inspect",
+            Box::new(move |_| {
+                let request = serde_json::from_value(json!({
+                    "id": "inspect-abandoned-discovery", "command": "inspect",
+                    "scope": "README.md", "sections": "diagnostics"
+                }))
+                .unwrap();
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::inspect::handle_inspect_deferred(&request, inspect_ctx)
+                else {
+                    panic!("inspect must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("inspect-abandoned-discovery", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(1));
+        if pending.is_err() {
+            drop(held_manager);
+            panic!("inspect discovery kept the executor reader while waiting for the LSP manager");
+        }
+        let mut pending = pending.unwrap();
+        // Both route abandonment and CANCEL reach this same cancellation token.
+        executor.cancel_job(&root, &cancellation);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let terminal = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled discovery did not stop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(terminal.data["inspect_terminal"], "interrupted");
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-after-abandoned-discovery".into(),
+            Box::new(|_| Response::success("subc-bind-after-abandoned-discovery", json!({}))),
+        );
+        assert!(
+            bind.recv_timeout(Duration::from_secs(1))
+                .expect("the released request no longer holds an executor reader")
+                .success
+        );
+        drop(held_manager);
+    }
+
+    #[test]
     fn deferred_inspect_honors_the_shared_request_deadline() {
         let _serial = crate::commands::inspect::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
@@ -13216,23 +13558,42 @@ pub(crate) mod test_support {
         let ctx = inspect_context_with_timeout(dir.path(), Some(10_000));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-deadline",
+            );
         let started = Instant::now();
-        let (mut pending, _cancellation) =
-            submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-deadline");
+        let clock = Arc::new(StdMutex::new(started));
+        let now = Arc::clone(&clock);
+        let (mut pending, cancellation) = submit_deferred_inspect_setup_with_clock(
+            &executor,
+            &root,
+            &ctx,
+            "subc-inspect-deadline",
+            move || *now.lock().expect("inspect test clock"),
+        );
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("deferred inspect body starts");
 
-        let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
-        assert_eq!(terminal.data["inspect_terminal"], "phase_failed");
-        assert_eq!(terminal.data["failure_reason"], "inspect_request_timeout");
-        assert_eq!(terminal.data["failed_phase"], "tier2_rescan");
-        assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "deferred inspect missed its terminal reserve: {:?}",
-            started.elapsed()
-        );
+        assert_eq!(pending.poll_interval(), Some(Duration::from_millis(50)));
+        assert!((pending.poll)(&ctx).is_none());
+        assert!(ctx.request_force_restrict("subc-inspect-deadline"));
+        // The 10s request budget reserves 5s for replying. Exhausting work
+        // returns incomplete analysis, not a failed phase or clean zero counts.
+        *clock.lock().expect("inspect test clock") = started + Duration::from_secs(5);
+        let terminal = (pending.poll)(&ctx).expect("held inspect must answer at its work deadline");
+        assert!(terminal.success, "{terminal:?}");
+        assert_eq!(terminal.data["inspect_terminal"], "partial");
+        assert_eq!(terminal.data["complete"], false);
+        assert_eq!(terminal.data["summary"]["dead_code"]["complete"], false);
+        assert!(terminal.data["summary"]["dead_code"].get("count").is_none());
+        assert!(terminal.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("analysis did not finish within its wait budget"));
+        assert!(cancellation.cancel_requested_before_commit());
+        assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+        wait_for_deferred_inspect_cleanup(&ctx, "subc-inspect-deadline");
     }
 
     #[test]
@@ -13604,6 +13965,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             run_scope: OnceLock::new(),
@@ -14076,7 +14438,7 @@ pub(crate) mod test_support {
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-second");
 
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "only one detached body may run for a root"
         );
@@ -14085,7 +14447,7 @@ pub(crate) mod test_support {
         let second_terminal = wait_for_inspect_terminal(&mut second, &ctx);
         assert_eq!(second_terminal.data["inspect_terminal"], "interrupted");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "cancelling the queued request must not release the active flight"
         );
@@ -14094,7 +14456,7 @@ pub(crate) mod test_support {
         let first_terminal = wait_for_inspect_terminal(&mut first, &ctx);
         assert_eq!(first_terminal.data["inspect_terminal"], "fresh");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             0
         );
     }
@@ -14214,7 +14576,9 @@ pub(crate) mod test_support {
             epoch: 1,
         };
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+                "subc-inspect-abandoned",
+            );
         let (mut pending, cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-abandoned");
         active.lock().expect("active tool call map").insert(
@@ -14244,20 +14608,10 @@ pub(crate) mod test_support {
         .is_some());
         let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
         assert_eq!(terminal.data["inspect_terminal"], "interrupted");
-        assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
-            0
-        );
         assert!(executor.actor_is_idle(&root));
         assert!(active.lock().expect("active tool call map").is_empty());
-        let restriction_deadline = Instant::now() + Duration::from_secs(1);
-        while ctx.request_force_restrict("subc-inspect-abandoned") {
-            assert!(
-                Instant::now() < restriction_deadline,
-                "detached force-restrict guard leaked"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!((pending.poll)(&ctx).is_none(), "only one terminal reply");
+        wait_for_deferred_inspect_cleanup(&ctx, "subc-inspect-abandoned");
     }
 
     #[test]
@@ -14535,7 +14889,7 @@ pub(crate) mod test_support {
         );
         finish_active_tool_call(&active, route, 42);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0 {
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx) != 0 {
             assert!(Instant::now() < deadline, "shutdown cancellation was inert");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -14684,7 +15038,7 @@ pub(crate) mod test_support {
         assert_eq!(by_corr[&52].data["retryable"], true);
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&inspect_ctx) != 0
             || crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0
         {
             assert!(
@@ -14885,6 +15239,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -15106,23 +15461,28 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = ModuleControlRequest::RouteBind {
-                route_channel: 75,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    healthy_root.as_path(),
-                    "opencode",
-                    "standing-busy-root-isolation",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 75,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "opencode",
+                        "standing-busy-root-isolation",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(healthy_root.as_path());
+
+                bind
             };
             let bind = Frame::build(
                 FrameType::Request,
@@ -15276,23 +15636,25 @@ mod tests {
             write_frame(&mut daemon, &ack)
                 .await
                 .map_err(|e| e.to_string())?;
-            let bind = ModuleControlRequest::RouteBind {
-                route_channel: 71,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    root.as_path(),
-                    "opencode",
-                    "standing-isolation",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
+            let bind = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 71,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("opencode", "standing-isolation"),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+
+                bind
             };
             let bind = Frame::build(
                 FrameType::Request,
@@ -15349,23 +15711,25 @@ mod tests {
         holder.join().unwrap();
         let recovery: Result<(), String> = if while_held.is_ok() {
             async {
-                let bind = ModuleControlRequest::RouteBind {
-                    route_channel: 73,
-                    epoch: 1,
-                    target: RouteTarget::ToolProvider {
-                        module_id: "aft".into(),
-                    },
-                    identity: subc_protocol::BindIdentity::new(
-                        root.as_path(),
-                        "opencode",
-                        "standing-recovery",
-                    ),
-                    principal: Some(subc_protocol::Principal::Direct),
-                    consumer_capabilities: None,
-                    admission_facts: Default::default(),
-                    scope: None,
-                    role_versions: None,
-                    call_mode: None,
+                let bind = {
+                    let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                        route_channel: 73,
+                        epoch: 1,
+                        target: RouteTarget::ToolProvider {
+                            module_id: "aft".into(),
+                        },
+                        identity: subc_protocol::BindIdentity::new("opencode", "standing-recovery"),
+                        principal: Some(subc_protocol::Principal::Direct),
+                        consumer_capabilities: None,
+                        admission_facts: Default::default(),
+                        scope: None,
+                        role_versions: None,
+                        call_mode: None,
+                    })
+                    .unwrap();
+                    bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+
+                    bind
                 };
                 let frame = Frame::build(
                     FrameType::Request,
@@ -15686,23 +16050,28 @@ mod tests {
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = ModuleControlRequest::RouteBind {
-                route_channel: 1,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
-                    module_id: "aft".to_string(),
-                },
-                identity: subc_protocol::BindIdentity::new(
-                    root.as_path(),
-                    "opencode",
-                    "bind-health-work-count",
-                ),
-                principal: Some(subc_protocol::Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: None,
-                role_versions: None,
-                call_mode: None,
+            let request = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 1,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".to_string(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        "opencode",
+                        "bind-health-work-count",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+
+                bind
             };
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,
@@ -20002,6 +20371,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -20136,6 +20506,7 @@ mod tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             run_scope: OnceLock::new(),
@@ -21708,7 +22079,21 @@ mod tests {
                 );
                 let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
-                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                // The standing pass may still be writing aft.db. A busy probe
+                // reschedules the retry, so drive its zero-delay attempts until
+                // the retry disarms, as the module loop does on later ticks.
+                let retry_deadline = Instant::now() + Duration::from_secs(10);
+                while ctx.provisional_identity_retry().is_armed() {
+                    crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "identity retry did not finish: {:?}",
+                        ctx.degraded_reasons()
+                    );
+                    if ctx.provisional_identity_retry().is_armed() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 assert!(
                     ctx.artifact_identity_provisional_reason().is_none(),
                     "{:?}",

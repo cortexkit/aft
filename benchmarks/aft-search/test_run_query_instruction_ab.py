@@ -1,4 +1,8 @@
+import struct
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from run_query_instruction_ab import (
     CODE_SEARCH_TASK,
@@ -7,6 +11,7 @@ from run_query_instruction_ab import (
     arm_definitions,
     content_tokens,
     query_text,
+    resolve_no_vocabulary_band,
 )
 
 
@@ -40,6 +45,32 @@ class QueryInstructionAbRunnerTests(unittest.TestCase):
         self.assertEqual(aggregate["relevance_rate_inside_band"], 0.3)
         self.assertEqual(aggregate["query_embed_latency_ms_p50"], 10.0)
         self.assertEqual(aggregate["query_embed_latency_ms_p95"], 20.0)
+
+    def test_semantic_versions_and_v8_skipped_file_trailer(self) -> None:
+        path = b"src/refused.rs"
+        field = struct.pack("<I", len(path)) + path
+        # No vectors are needed to test format parsing; keep this test stdlib-only.
+        numpy = MagicMock()
+        numpy.isfinite.return_value.all.return_value = True
+        with tempfile.TemporaryDirectory() as directory, patch.dict("sys.modules", {"numpy": numpy}):
+            index = Path(directory) / "semantic.bin"
+            for version, refused in [(7, False), (8, False), (8, True)]:
+                with self.subTest(version=version, refused=refused):
+                    data = struct.pack("<BIIII", version, 1, 0, 0, 1) + field + bytes(8 + 4 + 8 + 32)
+                    if version == 8:
+                        data += struct.pack("<QI", int(refused), int(refused))
+                        if refused:
+                            data += field + struct.pack("<Q", 1)
+                        data += struct.pack("<I", 0)
+                    index.write_bytes(data)
+                    resolve_no_vocabulary_band(index, [])
+                    index.write_bytes(data + b"trailing")
+                    with self.assertRaisesRegex(ValueError, "trailing bytes"):
+                        resolve_no_vocabulary_band(index, [])
+                    if version == 8:
+                        index.write_bytes(data[:-1])
+                        with self.assertRaises(ValueError):
+                            resolve_no_vocabulary_band(index, [])
 
 
 if __name__ == "__main__":

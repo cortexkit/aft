@@ -33,25 +33,31 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
             );
         }
     }
-    let request = ModuleControlRequest::RouteBind {
-        route_channel: 7,
-        epoch: 1,
-        target: if tool {
-            RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            }
-        } else {
-            RouteTarget::ManagementSurface {
-                module_id: "aft".into(),
-            }
-        },
-        identity: subc_protocol::BindIdentity::new(root.as_path(), "pi", "capacity"),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
-        admission_facts: Default::default(),
-        scope: None,
-        role_versions: None,
-        call_mode: None,
+    let request = {
+        let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+            route_channel: 7,
+            epoch: 1,
+            target: if tool {
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                }
+            } else {
+                RouteTarget::ManagementSurface {
+                    module_id: "aft".into(),
+                }
+            },
+            identity: subc_protocol::BindIdentity::new("pi", "capacity"),
+            principal: Some(Principal::Direct),
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+            call_mode: None,
+        })
+        .unwrap();
+        bind["identity"]["project_root"] = serde_json::json!(root.as_path());
+
+        bind
     };
     let frame = Frame::build(
         FrameType::Request,

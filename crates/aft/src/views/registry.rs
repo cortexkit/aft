@@ -1017,9 +1017,9 @@ pub struct ViewRegistration {
     session: Arc<ViewSession>,
 }
 
-/// One process's live use of a view. Dropping it removes its session row and
-/// records the time as the view's most recent use (`last_bind_ms`), which is
-/// what least-recently-used eviction orders by.
+/// One process's live use of a view. Dropping it removes its session row.
+/// V3 request activity, rather than the lifetime of a connection, updates
+/// `last_bind_ms`; releasing idle resident handles must not renew their age.
 #[derive(Debug)]
 struct ViewSession {
     registry: FamilyRegistry,
@@ -1078,9 +1078,9 @@ impl Drop for ViewSession {
     }
 }
 
-/// Writes every queued session end: deletes its row and records its end as
-/// the member's latest use. Called with the connection mutex held and no
-/// transaction open on it.
+/// Writes every queued session end. Legacy members also record the end as
+/// their latest use; v3 members retain their last request's stamp. Called with
+/// the registry connection held.
 fn flush_ended_sessions(inner: &RegistryInner, connection: &rusqlite::Connection) {
     let ended = std::mem::take(&mut *lock(&inner.ended_sessions));
     for session in ended {
@@ -1088,10 +1088,12 @@ fn flush_ended_sessions(inner: &RegistryInner, connection: &rusqlite::Connection
             "DELETE FROM view_sessions WHERE session_id = ?1",
             params![session.session_id],
         );
-        let _ = connection.execute(
-            "UPDATE members SET last_bind_ms = MAX(last_bind_ms, ?2) WHERE scope = ?1",
-            params![session.scope, session.ended_at_ms as i64],
-        );
+        if inner.connection.is_some() {
+            let _ = connection.execute(
+                "UPDATE members SET last_bind_ms = MAX(last_bind_ms, ?2) WHERE scope = ?1",
+                params![session.scope, session.ended_at_ms as i64],
+            );
+        }
     }
 }
 

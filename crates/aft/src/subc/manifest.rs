@@ -475,14 +475,15 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // entry, because a required capability with no provider would hold AFT
     // not-ready.
     //
-    // A subc daemon older than 0.17.20 refuses this manifest, so that version
-    // is the minimum supported daemon version.
+    // The Subconscious transport requires daemon 0.39 for project-free route
+    // opens. The manifest's wire shape itself first required daemon 0.17.20.
     let mut manifest = ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
+                cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.to_owned(),
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
@@ -863,6 +864,7 @@ mod tests {
         assert_eq!(
             capabilities.provides,
             vec![
+                "call-keepalive/v1".to_string(),
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
                 "flow-scopes/v1".to_string(),
@@ -876,6 +878,7 @@ mod tests {
         assert_eq!(
             wire.pointer("/capabilities/provides"),
             Some(&serde_json::json!([
+                "call-keepalive/v1",
                 "tool-provider/v1",
                 "call-modes/v1",
                 "flow-scopes/v1",
@@ -1177,7 +1180,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

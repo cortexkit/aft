@@ -1310,6 +1310,9 @@ pub(super) fn convert_semantic_file(
     summary_budget: Option<usize>,
     file: super::LegacyFile,
 ) -> Option<BundleEntry> {
+    if file.incomplete {
+        return None;
+    }
     let rel_path = super::legacy_path_to_rel_path(&file.path, root)?;
     let relative = segment_store::rel_path_to_os(&rel_path).ok()?;
     let absolute = root.join(&relative);

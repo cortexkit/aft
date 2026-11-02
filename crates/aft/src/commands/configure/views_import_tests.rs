@@ -130,14 +130,18 @@ fn views_import_warm_symbol_donor_avoids_full_extraction() {
 }
 
 #[test]
-fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
+fn views_import_borrow_only_root_imports_family_without_changing_legacy() {
     let _serial = crate::blob_store::v3::serial_for_test();
     let (_checkout, storage, root) = warm_fixture();
     let policy = crate::blob_store::v2::TrigramPolicy {
         max_file_size: LIMIT,
     };
     crate::root_cache::configure_artifact_access(&root, KEY, true);
-    assert!(crate::migration::views_background::BackgroundImport::start(
+    let legacy_text = storage.path().join("index").join(KEY).join("cache.bin");
+    let legacy_symbols = storage.path().join("symbols").join(KEY).join("symbols.bin");
+    let before_text = std::fs::read(&legacy_text).unwrap();
+    let before_symbols = std::fs::read(&legacy_symbols).unwrap();
+    let job = crate::migration::views_background::BackgroundImport::start(
         storage.path(),
         KEY,
         &root,
@@ -145,7 +149,12 @@ fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
         Arc::new(|| true),
         crate::cold_build_limiter::global_limiter(),
     )
-    .is_none());
+    .expect("borrow-only roots may import into the v3 family");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while job.is_building() {
+        assert!(Instant::now() < deadline, "family import did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
     let request = crate::migration::v3_ledger::V3ImportRequest::full_plane(
         storage.path().to_path_buf(),
         KEY.into(),
@@ -154,24 +163,81 @@ fn views_import_borrow_only_and_unbound_roots_do_not_start_imports() {
         policy,
         None,
     );
-    assert!(matches!(
-        crate::migration::v3_ledger::run_v3_import(&request, None),
-        Err(crate::migration::v3_import::V3ImportError::Store(
-            crate::blob_store::v3::Error::Refused("legacy_import_borrow_only")
-        ))
-    ));
-    crate::root_cache::configure_artifact_access(&root, KEY, false);
+    let report = crate::migration::v3_ledger::run_v3_import(&request, None).unwrap();
+    for artifact in [
+        crate::migration::v3_import::LegacyArtifact::Trigram,
+        crate::migration::v3_import::LegacyArtifact::Symbols,
+    ] {
+        assert!(
+            matches!(
+                report.outcomes[&artifact],
+                crate::migration::v3_ledger::ArtifactOutcome::AlreadyComplete(
+                    crate::migration::per_checkout::ImportState::Done
+                )
+            ),
+            "{report:?}"
+        );
+    }
+    assert_eq!(std::fs::read(legacy_text).unwrap(), before_text);
+    assert_eq!(std::fs::read(legacy_symbols).unwrap(), before_symbols);
+}
+
+#[test]
+fn views_import_unbound_roots_do_not_start_imports() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    crate::root_cache::configure_artifact_access(&root, KEY, true);
     assert!(crate::migration::views_background::BackgroundImport::start(
         storage.path(),
         KEY,
         &root,
-        policy,
+        crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT
+        },
         Arc::new(|| false),
         crate::cold_build_limiter::global_limiter(),
     )
     .is_none());
     assert!(!storage.path().join("blobs/v3").exists());
     assert!(!storage.path().join("migration/v3").exists());
+}
+
+#[test]
+fn views_import_semantic_prefill_borrower_uses_family_ledger() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    crate::root_cache::configure_artifact_access(&root, KEY, true);
+    let config = crate::views::semantic_runtime::WorkerConfig {
+        root: root.clone(),
+        storage: crate::root_cache::StoragePaths::same(storage.path()),
+        family: KEY.into(),
+        scope: crate::path_identity::project_scope_key(&root),
+        semantic: crate::config::SemanticBackendConfig::default(),
+        trigram_policy: crate::blob_store::v2::TrigramPolicy {
+            max_file_size: LIMIT,
+        },
+        status: Arc::new(std::sync::RwLock::new(SemanticIndexStatus::Disabled)),
+        drivers: crate::views::first_load::InstalledDriver::default(),
+        schedule: crate::views::semantic_runtime::FillSchedule {
+            root,
+            quiet_window: Duration::ZERO,
+            retry_initial: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            limiter: crate::cold_build_limiter::isolated_limiter(1),
+            paused: Box::new(|| false),
+            max_batch: 1,
+        },
+    };
+    assert!(import_legacy_set_into_v3(&config, Arc::new(|| true)));
+    let rows = crate::migration::v3_ledger::read_rows(storage.path(), KEY)
+        .unwrap()
+        .expect("semantic prefill must import rather than skip borrowed donors");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|row| row.state == crate::migration::per_checkout::ImportState::Done),
+        "{rows:?}"
+    );
 }
 
 fn query_context(root: &Path, storage: &Path) -> AppContext {
@@ -185,6 +251,107 @@ fn query_context(root: &Path, storage: &Path) -> AppContext {
     let context = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     context.set_canonical_cache_root(root.to_path_buf());
     context
+}
+
+#[test]
+fn views_import_building_retries_callgraph_without_load_failures_then_answers() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let (_checkout, storage, root) = warm_fixture();
+    let ctx = query_context(&root, storage.path());
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    let mut config = (*ctx.config()).clone();
+    config.indexes.callgraph = true;
+    ctx.set_config(config);
+    ctx.mark_subc_bound();
+    let family = ctx.memoized_artifact_cache_key(&root);
+    crate::root_cache::configure_artifact_access(&root, &family, false);
+    let destination = storage.path().join("index").join(&family);
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::copy(
+        storage.path().join("index").join(KEY).join("cache.bin"),
+        destination.join("cache.bin"),
+    )
+    .unwrap();
+    ctx.isolate_cold_build_limiter_for_test(1);
+    let slot = ctx.take_cold_build_slot_for_test().unwrap();
+
+    let error = ctx.callgraph_view_reader().unwrap().unwrap_err();
+    assert_eq!(error.reason, "legacy text and symbol import building");
+    assert!(error.busy, "{error}");
+    let request = |command: &str, params| RawRequest {
+        id: format!("import-building-{command}"),
+        command: command.into(),
+        lsp_hints: None,
+        session_id: None,
+        params,
+    };
+    let callers_request = request(
+        "callers",
+        serde_json::json!({"file": root.join("lib.rs"), "symbol": "beta"}),
+    );
+    let callers = crate::commands::callers::handle_callers(&callers_request, &ctx);
+    assert!(!callers.success, "{:?}", callers.data);
+    assert_eq!(callers.data["code"], "callgraph_building");
+    let zoom_request = request(
+        "zoom",
+        serde_json::json!({"file": root.join("lib.rs"), "symbol": "alpha", "callgraph": true}),
+    );
+    let zoom = crate::commands::zoom::handle_zoom(&zoom_request, &ctx);
+    assert!(zoom.success, "{:?}", zoom.data);
+    assert_eq!(zoom.data["callgraph"]["code"], "callgraph_building");
+    let inspect = crate::commands::inspect::handle_inspect(
+        &request(
+            "inspect",
+            serde_json::json!({"scope": root, "sections": ["dead_code", "unused_exports"]}),
+        ),
+        &ctx,
+    );
+    assert!(inspect.success, "{:?}", inspect.data);
+    assert_eq!(inspect.data["complete"], false, "{:?}", inspect.data);
+    assert!(
+        inspect.data.to_string().contains("callgraph_building"),
+        "{:?}",
+        inspect.data
+    );
+    for response in [&callers, &zoom, &inspect] {
+        assert!(!response.data.to_string().contains("This is an AFT bug"));
+    }
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+    assert!(!ctx
+        .degraded_reasons()
+        .contains(&crate::context::VIEW_LOAD_DEGRADED_REASON.to_string()));
+
+    assert!(!crate::context::view_load_failure_message(&error).contains("This is an AFT bug"));
+
+    drop(slot);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        ctx.view_load_retry_due_for_test();
+        let response = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        if response.success {
+            assert!(
+                response.data.to_string().contains("alpha"),
+                "{:?}",
+                response.data
+            );
+            break;
+        }
+        assert_eq!(
+            response.data["code"], "callgraph_building",
+            "{:?}",
+            response.data
+        );
+        assert!(Instant::now() < deadline, "legacy import did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let zoom = crate::commands::zoom::handle_zoom(&zoom_request, &ctx);
+    assert!(zoom.success, "{:?}", zoom.data);
+    assert!(zoom.data.get("callgraph").is_none(), "{:?}", zoom.data);
+    let health = ctx.try_health_snapshot(&root);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
 }
 
 #[test]

@@ -1,0 +1,1 @@
+- With views on, a project whose files change while AFT is loading its view is retried instead of failing `grep` and `aft_search` with an error.

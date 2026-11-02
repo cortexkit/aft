@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subc_protocol::{BindIdentity, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
 
+// Protocol 0.34 clients require numeric daemon versions of at least 0.39.0
+// before sending project-free opens. Keep this stand-in's metadata compatible
+// so its scripts exercise executor traffic rather than the version refusal.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
@@ -340,7 +345,7 @@ pub(crate) async fn daemon_with_capabilities(
                 &mut socket,
                 &server_key,
                 &daemon_id,
-                "exec-client-test",
+                FAKE_DAEMON_VERSION,
                 Duration::from_secs(5),
             )
             .await
@@ -1024,7 +1029,7 @@ pub(crate) async fn daemon_with_capabilities(
             key,
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "exec-client-test".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         },
     )
     .unwrap();
@@ -1228,7 +1233,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
                     &mut socket,
                     &key,
                     &daemon_id,
-                    "exec-client-test",
+                    FAKE_DAEMON_VERSION,
                     Duration::from_secs(5),
                 )
                 .await
@@ -1397,7 +1402,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
             key,
             daemon_id,
             pid: std::process::id(),
-            daemon_ver: "exec-client-test".into(),
+            daemon_ver: FAKE_DAEMON_VERSION.into(),
         },
     )
     .unwrap();
@@ -1417,12 +1422,9 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
 }
 
 async fn client(daemon: &Daemon) -> ExecRemoteClient {
-    ExecRemoteClient::connect(
-        &daemon.connection,
-        BindIdentity::new("/workspace", "aft-test", "session"),
-    )
-    .await
-    .unwrap()
+    ExecRemoteClient::connect(&daemon.connection, BindIdentity::new("aft-test", "session"))
+        .await
+        .unwrap()
 }
 
 async fn drain(stream: &mut RemoteStream, sink: &mut MemorySink) -> Result<Verdict, Error> {
@@ -1536,11 +1538,9 @@ async fn remote_progress_is_requested_only_with_the_advertised_capability() {
 #[tokio::test]
 async fn dotted_capability_is_not_a_discovery_claim() {
     let daemon = daemon(Script::Lost, "exec.remote/v1").await;
-    let result = ExecRemoteClient::connect(
-        &daemon.connection,
-        BindIdentity::new("/workspace", "aft-test", "session"),
-    )
-    .await;
+    let result =
+        ExecRemoteClient::connect(&daemon.connection, BindIdentity::new("aft-test", "session"))
+            .await;
     assert!(matches!(
         result,
         Err(Error::Transport(
@@ -1600,7 +1600,7 @@ async fn interrupted_call_reattaches_with_next_durable_seq_without_resubmission(
 #[tokio::test]
 async fn accepted_transport_loss_reconnects_and_replays_terminal_exactly_once() {
     let daemon = outage_daemon().await;
-    let identity = subc_protocol::BindIdentity::new("/workspace/task", "test", "session");
+    let identity = subc_protocol::BindIdentity::new("test", "session");
     let client = ExecRemoteClient::connect(&daemon.connection, identity.clone())
         .await
         .unwrap();

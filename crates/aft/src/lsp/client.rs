@@ -2824,14 +2824,33 @@ impl PendingLspRequest {
     /// remove the pending response handler and notify the server with
     /// `$/cancelRequest` so it can stop work.
     pub(crate) fn wait(self, timeout: Duration) -> Result<Value, LspError> {
-        let response = match self.rx.recv_timeout(timeout) {
+        let deadline = Instant::now() + timeout;
+        let response = loop {
+            // Transport cancellation and caller abandonment both signal
+            // JobCancellation. Poll it so a slow server cannot leave an abandoned
+            // request holding the project's reader lock until its reply deadline.
+            if crate::executor::current_job_cancelled() {
+                break Err(RecvTimeoutError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self
+                .rx
+                .recv_timeout(remaining.min(Duration::from_millis(50)))
+            {
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                response => break response,
+            }
+        };
+        let response = match response {
             Ok(response) => response,
             Err(RecvTimeoutError::Timeout) => {
                 self.remove_pending();
                 let notification =
                     Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
-                self.writer
-                    .mark_unresponsive_if_silent(self.received_before_request);
+                if !crate::executor::current_job_cancelled() {
+                    self.writer
+                        .mark_unresponsive_if_silent(self.received_before_request);
+                }
                 self.writer
                     .send_best_effort(serde_json::to_string(&notification)?);
                 return Err(LspError::Timeout(format!(

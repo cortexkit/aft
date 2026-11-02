@@ -1119,6 +1119,29 @@ pub fn open_foreign_v3(
     scope: &str,
     producers: &super::manifest_v2::Producers,
 ) -> Result<Option<Arc<ComposedGeneration>>> {
+    open_v3(storage, family, scope, producers, false)
+}
+
+/// An older extractor's publication cannot be reused because its graph keys
+/// are incompatible. Rebuild it rather than using it for reconciliation;
+/// callers borrowing another checkout's graph wait or build a current copy.
+/// Newer and unknown producer mismatches remain errors.
+pub(crate) fn open_callgraph_seed_v3(
+    storage: &Path,
+    family: &str,
+    scope: &str,
+    producers: &super::manifest_v2::Producers,
+) -> Result<Option<Arc<ComposedGeneration>>> {
+    open_v3(storage, family, scope, producers, true)
+}
+
+fn open_v3(
+    storage: &Path,
+    family: &str,
+    scope: &str,
+    producers: &super::manifest_v2::Producers,
+    rebuild_older_callgraph: bool,
+) -> Result<Option<Arc<ComposedGeneration>>> {
     let mut last = None;
     for _ in 0..RESOLVE_ATTEMPTS {
         let Some((kind, state, stored)) = member_row(storage, family, scope)? else {
@@ -1144,6 +1167,14 @@ pub fn open_foreign_v3(
             continue;
         }
         let manifest = store.load_manifest_v2(&generation)?;
+        if rebuild_older_callgraph
+            && manifest
+                .header()
+                .producers
+                .has_older_callgraph_than(producers)
+        {
+            return Ok(None);
+        }
         manifest.ensure_producers(producers)?;
         let Some(header) = manifest.base_header().cloned() else {
             return Ok(Some(Arc::new(

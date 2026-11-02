@@ -106,19 +106,24 @@ fn bind_observed(
                 lossy_seq: Arc::new(AtomicU64::new(0)),
                 fleet_status_client: FleetStatusClient::channel(1).0,
             };
-            let request = ModuleControlRequest::RouteBind {
-                route_channel: 7,
-                epoch: 1,
-                target: RouteTarget::ToolProvider {
-                    module_id: "aft".into(),
-                },
-                identity: subc_protocol::BindIdentity::new(root, "opencode", "folder-session"),
-                principal: Some(Principal::Direct),
-                consumer_capabilities: None,
-                admission_facts: Default::default(),
-                scope: scope.clone(),
-                role_versions: None,
-                call_mode: None,
+            let request = {
+                let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+                    route_channel: 7,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("opencode", "folder-session"),
+                    principal: Some(Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: scope.clone(),
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+                bind["identity"]["project_root"] = serde_json::json!(root);
+                bind
             };
             let frame = Frame::build(
                 FrameType::Request,
@@ -172,10 +177,14 @@ fn bind_observed(
                     }
                     Response::success(request.id, request.params)
                 },
-                // The bind identity folder may not exist (stamp-only binds), so the
-                // user config file goes in the project folder the route resolves to.
+                // Exercise config loading in the selected project, but keep
+                // rootless fixture files in temporary storage rather than /.
                 Some(&test_support::bind_config_without_indexes(
-                    expected_project_root,
+                    if expected_project_root.as_os_str() == "/" {
+                        storage.path()
+                    } else {
+                        expected_project_root
+                    },
                 )),
                 usize::MAX,
                 None,
@@ -183,6 +192,17 @@ fn bind_observed(
             )
             .await
             .unwrap();
+            if expected_project_root.as_os_str() == "/" {
+                // No actor means no configured context or index can own /.
+                assert_eq!(executor.actor_count(), 0);
+                assert!(executor.actor_entries().is_empty());
+                assert_eq!(app.watcher_count(), 0);
+                assert!(completion_rx.try_recv().is_err());
+                let ack = writer_rx.recv().await.expect("project-free bind ACK");
+                assert_eq!(ack.header.ty, FrameType::Response);
+                assert_eq!((ack.header.channel, ack.header.corr), (0, 91));
+                return ack.body.clone();
+            }
             let completion = tokio::time::timeout(Duration::from_secs(30), completion_rx.recv())
                 .await
                 .unwrap()
@@ -462,7 +482,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
                 held.reached.recv_timeout(Duration::from_secs(2)).unwrap();
                 busy_reads.push((held, worker));
             }
-            let identity = subc_protocol::BindIdentity::new(&root, "opencode", "capacity-session");
+            let identity = subc_protocol::BindIdentity::new("opencode", "capacity-session");
             let mut held_diagnostics = Vec::new();
             let mut observed = Vec::new();
             for index in 0..MAX_SCOPE_WORKDIR_DIAGNOSTICS {
@@ -470,7 +490,7 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
                 let held = crate::bounded_io::stall_running_helper(&path);
                 observed.push(observe_next_comparison());
                 let scope = stamp().with_workdir(Some(path.to_string_lossy().into_owned()));
-                schedule_scope_workdir_comparison(&identity, Some(&scope));
+                schedule_scope_workdir_comparison(&identity, Some(&root), Some(&scope));
                 held.reached.recv_timeout(Duration::from_secs(1)).unwrap();
                 held_diagnostics.push(held);
             }
@@ -481,11 +501,11 @@ fn scope_workdir_full_diagnostic_capacity_preserves_shared_file_reads() {
             let scope = stamp().with_workdir(Some(
                 root.join("another-workdir").to_string_lossy().into_owned(),
             ));
-            schedule_scope_workdir_comparison(&identity, Some(&scope));
+            schedule_scope_workdir_comparison(&identity, Some(&root), Some(&scope));
             let duplicate = stamp().with_workdir(Some(
                 root.join("held-workdir-0").to_string_lossy().into_owned(),
             ));
-            schedule_scope_workdir_comparison(&identity, Some(&duplicate));
+            schedule_scope_workdir_comparison(&identity, Some(&root), Some(&duplicate));
             let bytes = crate::bounded_io::with_budget(
                 Some(crate::bounded_io::Budget::after(Duration::from_secs(1))),
                 || crate::bounded_io::read(&healthy_file, None),
@@ -585,7 +605,7 @@ fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert!(
-        line.starts_with("INFO subc scope workdir differs:"),
+        line.starts_with("WARN subc scope workdir differs:"),
         "{line}"
     );
     for value in [
@@ -599,7 +619,7 @@ fn scope_workdir_mismatch_logs_once_and_binds_stamped_project() {
 }
 
 #[test]
-fn scope_workdir_old_stamp_is_silent_and_preserves_project_root() {
+fn scope_workdir_old_stamp_preserves_daemon_filled_project_root() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -609,18 +629,17 @@ fn scope_workdir_old_stamp_is_silent_and_preserves_project_root() {
     assert!(old_stamp.workdir.is_none());
     assert!(old_stamp.project_id.is_none());
     assert_eq!(serde_json::to_vec(&old_stamp).unwrap(), br#"{"owner":{"kind":"direct"},"ref":"session-scope","scope_epoch":4,"kind":"head","owner_authorized":false}"#);
-    let (lines, old_reply) = bind(&root, Some(old_stamp), &root);
-    let (unscoped_lines, unscoped_reply) = bind(&root, None, &root);
+    let (lines, _) = bind(&root, Some(old_stamp), &root);
     assert!(lines.is_empty(), "{lines:?}");
+    let (unscoped_lines, _) = bind(&root, None, &root);
     assert!(unscoped_lines.is_empty(), "{unscoped_lines:?}");
-    assert_eq!(old_reply, unscoped_reply);
     let literal_root = root.join(".");
     let (lines, _) = bind(&literal_root, None, &literal_root);
     assert!(lines.is_empty(), "{lines:?}");
 }
 
 #[test]
-fn scope_workdir_stamp_binds_without_a_valid_bind_identity_folder() {
+fn scope_workdir_stamp_binds_and_warns_without_a_valid_bind_identity_folder() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -630,7 +649,11 @@ fn scope_workdir_stamp_binds_without_a_valid_bind_identity_folder() {
         Some(stamp().with_workdir(Some(root.to_string_lossy().into_owned()))),
         &root,
     );
-    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("WARN subc scope workdir differs:"),
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -741,5 +764,93 @@ fn scope_workdir_bind_reply_is_byte_for_byte_unchanged() {
     ] {
         let (_, reply) = bind(&root, scope, expected);
         assert_eq!(reply, br#"{"op":"route.bind"}"#);
+    }
+}
+
+#[test]
+fn scope_workdir_slash_bind_creates_no_project_actor_index_or_watcher() {
+    let _serial = serial();
+    let (lines, reply) = bind(Path::new("/"), None, Path::new("/"));
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(reply, br#"{"op":"route.bind"}"#);
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_workdir_alias_of_slash_is_not_a_project() {
+    assert_eq!(
+        resolve_route_project_root(Some(Path::new("/.")), None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn scope_workdir_project_required_sentence_and_detail_are_pinned() {
+    let _serial = serial();
+    let (errors, lines) = crate::logging::capture_log_lines(|| {
+        vec![
+            project_folder_refusal(PROJECT_REQUIRED_CODE, None, None, route_key(7, 1), 20),
+            project_folder_refusal(
+                PROJECT_REQUIRED_CODE,
+                None,
+                Some(Path::new("/")),
+                route_key(7, 1),
+                21,
+            ),
+            project_folder_refusal(
+                "invalid_workdir",
+                Some("."),
+                Some(Path::new("/ignored")),
+                route_key(7, 1),
+                22,
+            ),
+        ]
+    });
+    for error in &errors {
+        assert_eq!(
+            error.message.as_bytes(),
+            b"This connection has no project folder, so AFT cannot run project tools on it."
+        );
+        assert_eq!(
+            error.detail.as_ref().unwrap()["requirement"],
+            "absolute_non_root_project_directory"
+        );
+    }
+    assert_eq!(errors[0].code, "project_required");
+    assert_eq!(
+        errors[0].detail.as_ref().unwrap()["cause"],
+        "project_folder_missing"
+    );
+    assert_eq!(errors[0].detail.as_ref().unwrap()["source"], "none");
+    assert!(errors[0].detail.as_ref().unwrap()["folder"].is_null());
+    assert_eq!(errors[1].code, "project_required");
+    assert_eq!(
+        errors[1].detail.as_ref().unwrap()["cause"],
+        "filesystem_root"
+    );
+    assert_eq!(errors[1].detail.as_ref().unwrap()["source"], "legacy_bind");
+    assert_eq!(errors[1].detail.as_ref().unwrap()["folder"], "/");
+    assert_eq!(errors[2].code, "invalid_workdir");
+    assert_eq!(
+        errors[2].detail.as_ref().unwrap()["cause"],
+        "invalid_workdir"
+    );
+    assert_eq!(
+        errors[2].detail.as_ref().unwrap()["source"],
+        "scope_workdir"
+    );
+    assert_eq!(errors[2].detail.as_ref().unwrap()["folder"], ".");
+    let warnings: Vec<_> = lines
+        .iter()
+        .filter(|line| line.contains("subc project folder refused:"))
+        .collect();
+    assert_eq!(warnings.len(), 3, "{lines:?}");
+    for (line, cause) in warnings.iter().zip([
+        "project_folder_missing",
+        "filesystem_root",
+        "invalid_workdir",
+    ]) {
+        assert!(line.starts_with("WARN "), "{line}");
+        assert!(line.contains("detail=") && line.contains(cause), "{line}");
     }
 }

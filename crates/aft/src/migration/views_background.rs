@@ -23,10 +23,7 @@ impl BackgroundImport {
         current: ImportControl,
         limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
     ) -> Option<Arc<Self>> {
-        let access = crate::root_cache::ArtifactAccess::for_root(root);
-        let writable = access.allows_write(family, &storage.join("blobs/v3").join(family));
-        if !writable
-            || !current()
+        if !current()
             || ![LegacyArtifact::Trigram, LegacyArtifact::Symbols]
                 .iter()
                 .any(|artifact| artifact.source_path(storage, family).is_file())

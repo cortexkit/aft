@@ -5057,19 +5057,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(stamp.attributes.flow_id.as_deref(), Some("flow-1"));
-        let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
-            route_channel: 1,
-            epoch: 1,
-            target: subc_protocol::RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            identity: subc_protocol::BindIdentity::new("/tmp/project", "runner", "session"),
-            principal: Some(subc_protocol::Principal::Direct),
-            consumer_capabilities: None,
-            admission_facts: Default::default(),
-            scope: Some(stamp.clone()),
-            role_versions: None,
-            call_mode: None,
+        let bind = {
+            let mut bind =
+                serde_json::to_value(subc_protocol::session::ModuleControlRequest::RouteBind {
+                    route_channel: 1,
+                    epoch: 1,
+                    target: subc_protocol::RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new("runner", "session"),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: Some(stamp.clone()),
+                    role_versions: None,
+                    call_mode: None,
+                })
+                .unwrap();
+            bind["identity"]["project_root"] = serde_json::json!("/tmp/project");
+
+            bind
         };
         let decoded: subc_protocol::session::ModuleControlRequest =
             serde_json::from_slice(&serde_json::to_vec(&bind).unwrap()).unwrap();
@@ -5326,6 +5333,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(disabled),
             scope,
@@ -6618,6 +6626,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::default(),
             scope: None,
@@ -7314,6 +7323,7 @@ pub(in crate::subc) mod route_tests {
             consumer_elicitation_capable: false,
             held_reply: false,
             held_update: false,
+            call_keepalive: false,
             tool_result_body: false,
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
@@ -7400,6 +7410,7 @@ pub(in crate::subc) mod route_tests {
                 worker_mode
             };
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": "pub fn edited() {}\n"}),
@@ -7522,6 +7533,7 @@ pub(in crate::subc) mod route_tests {
         };
         let call = |content: &str, profile_reads: usize| -> Value {
             let run = PlainToolRun {
+                progress: None,
                 speech_seed: None,
                 bare_name: "write".into(),
                 arguments: json!({"path": "pin.rs", "content": content}),

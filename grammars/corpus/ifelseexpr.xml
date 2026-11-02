@@ -1,0 +1,916 @@
+<sources>
+  <source name="ifelseexpr.luau">
+    <chunk srow="0" scol="0" erow="80" ecol="0">
+      <comment srow="0" scol="0" erow="0" ecol="116">
+        --
+        <comment_content field="content" srow="0" scol="2" erow="0" ecol="116"> This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details</comment_content>
+      </comment>
+      <comment srow="1" scol="0" erow="1" ecol="87">
+        --
+        <comment_content field="content" srow="1" scol="2" erow="1" ecol="87"> This file is based on Lua 5.x tests -- https://github.com/lua/lua/tree/master/testes</comment_content>
+      </comment>
+      <function_call srow="2" scol="0" erow="2" ecol="36">
+        <identifier field="name" srow="2" scol="0" erow="2" ecol="5">print</identifier>
+        <arguments field="arguments" srow="2" scol="5" erow="2" ecol="36">
+          (
+          <string srow="2" scol="6" erow="2" ecol="35">
+            "
+            <string_content field="content" srow="2" scol="7" erow="2" ecol="34">testing if-else expressions</string_content>
+            "
+          </string>
+          )
+        </arguments>
+      </function_call>
+      <function_declaration srow="4" scol="0" erow="6" ecol="3">
+        function
+        <identifier field="name" srow="4" scol="9" erow="4" ecol="13">True</identifier>
+        <parameters field="parameters" srow="4" scol="13" erow="4" ecol="15">
+          (
+          )
+        </parameters>
+        <block field="body" srow="5" scol="2" erow="5" ecol="13">
+          <return_statement srow="5" scol="2" erow="5" ecol="13">
+            return
+            <expression_list srow="5" scol="9" erow="5" ecol="13">
+              <true srow="5" scol="9" erow="5" ecol="13">true</true>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <function_declaration srow="8" scol="0" erow="10" ecol="3">
+        function
+        <identifier field="name" srow="8" scol="9" erow="8" ecol="14">False</identifier>
+        <parameters field="parameters" srow="8" scol="14" erow="8" ecol="16">
+          (
+          )
+        </parameters>
+        <block field="body" srow="9" scol="2" erow="9" ecol="14">
+          <return_statement srow="9" scol="2" erow="9" ecol="14">
+            return
+            <expression_list srow="9" scol="9" erow="9" ecol="14">
+              <false srow="9" scol="9" erow="9" ecol="14">false</false>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <function_declaration srow="12" scol="0" erow="14" ecol="3">
+        function
+        <identifier field="name" srow="12" scol="9" erow="12" ecol="24">EvalElseifChain</identifier>
+        <parameters field="parameters" srow="12" scol="24" erow="12" ecol="60">
+          (
+          <binding srow="12" scol="25" erow="12" ecol="35">
+            <identifier field="name" srow="12" scol="25" erow="12" ecol="35">condition1</identifier>
+          </binding>
+          ,
+          <binding srow="12" scol="37" erow="12" ecol="47">
+            <identifier field="name" srow="12" scol="37" erow="12" ecol="47">condition2</identifier>
+          </binding>
+          ,
+          <binding srow="12" scol="49" erow="12" ecol="59">
+            <identifier field="name" srow="12" scol="49" erow="12" ecol="59">condition3</identifier>
+          </binding>
+          )
+        </parameters>
+        <block field="body" srow="13" scol="2" erow="13" ecol="90">
+          <return_statement srow="13" scol="2" erow="13" ecol="90">
+            return
+            <expression_list srow="13" scol="9" erow="13" ecol="90">
+              <if_else_expression srow="13" scol="9" erow="13" ecol="90">
+                if
+                <identifier field="condition" srow="13" scol="12" erow="13" ecol="22">condition1</identifier>
+                then
+                <number field="consequence" srow="13" scol="28" erow="13" ecol="30">10</number>
+                <elseif_expression field="alternative" srow="13" scol="31" erow="13" ecol="56">
+                  elseif
+                  <identifier field="condition" srow="13" scol="38" erow="13" ecol="48">condition2</identifier>
+                  then
+                  <number field="consequence" srow="13" scol="54" erow="13" ecol="56">20</number>
+                </elseif_expression>
+                <elseif_expression field="alternative" srow="13" scol="57" erow="13" ecol="82">
+                  elseif
+                  <identifier field="condition" srow="13" scol="64" erow="13" ecol="74">condition3</identifier>
+                  then
+                  <number field="consequence" srow="13" scol="80" erow="13" ecol="82">30</number>
+                </elseif_expression>
+                else
+                <number field="alternative" srow="13" scol="88" erow="13" ecol="90">40</number>
+              </if_else_expression>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <function_declaration srow="16" scol="0" erow="18" ecol="3">
+        function
+        <identifier field="name" srow="16" scol="9" erow="16" ecol="25">EvalElse_IfChain</identifier>
+        <parameters field="parameters" srow="16" scol="25" erow="16" ecol="61">
+          (
+          <binding srow="16" scol="26" erow="16" ecol="36">
+            <identifier field="name" srow="16" scol="26" erow="16" ecol="36">condition1</identifier>
+          </binding>
+          ,
+          <binding srow="16" scol="38" erow="16" ecol="48">
+            <identifier field="name" srow="16" scol="38" erow="16" ecol="48">condition2</identifier>
+          </binding>
+          ,
+          <binding srow="16" scol="50" erow="16" ecol="60">
+            <identifier field="name" srow="16" scol="50" erow="16" ecol="60">condition3</identifier>
+          </binding>
+          )
+        </parameters>
+        <block field="body" srow="17" scol="2" erow="17" ecol="92">
+          <return_statement srow="17" scol="2" erow="17" ecol="92">
+            return
+            <expression_list srow="17" scol="9" erow="17" ecol="92">
+              <if_else_expression srow="17" scol="9" erow="17" ecol="92">
+                if
+                <identifier field="condition" srow="17" scol="12" erow="17" ecol="22">condition1</identifier>
+                then
+                <number field="consequence" srow="17" scol="28" erow="17" ecol="30">10</number>
+                else
+                <if_else_expression field="alternative" srow="17" scol="36" erow="17" ecol="92">
+                  if
+                  <identifier field="condition" srow="17" scol="39" erow="17" ecol="49">condition2</identifier>
+                  then
+                  <number field="consequence" srow="17" scol="55" erow="17" ecol="57">20</number>
+                  else
+                  <if_else_expression field="alternative" srow="17" scol="63" erow="17" ecol="92">
+                    if
+                    <identifier field="condition" srow="17" scol="66" erow="17" ecol="76">condition3</identifier>
+                    then
+                    <number field="consequence" srow="17" scol="82" erow="17" ecol="84">30</number>
+                    else
+                    <number field="alternative" srow="17" scol="90" erow="17" ecol="92">40</number>
+                  </if_else_expression>
+                </if_else_expression>
+              </if_else_expression>
+            </expression_list>
+          </return_statement>
+        </block>
+        end
+      </function_declaration>
+      <function_declaration srow="20" scol="0" erow="36" ecol="3">
+        function
+        <identifier field="name" srow="20" scol="9" erow="20" ecol="38">CheckForConditionalEvaluation</identifier>
+        <parameters field="parameters" srow="20" scol="38" erow="20" ecol="49">
+          (
+          <binding srow="20" scol="39" erow="20" ecol="48">
+            <identifier field="name" srow="20" scol="39" erow="20" ecol="48">condition</identifier>
+          </binding>
+          )
+        </parameters>
+        <block field="body" srow="21" scol="4" erow="35" ecol="29">
+          <local_variable_declaration srow="21" scol="4" erow="21" ecol="21">
+            local
+            <binding_list srow="21" scol="10" erow="21" ecol="17">
+              <binding srow="21" scol="10" erow="21" ecol="17">
+                <identifier field="name" srow="21" scol="10" erow="21" ecol="17">counter</identifier>
+              </binding>
+            </binding_list>
+            =
+            <expression_list srow="21" scol="20" erow="21" ecol="21">
+              <number srow="21" scol="20" erow="21" ecol="21">0</number>
+            </expression_list>
+          </local_variable_declaration>
+          <local_function_declaration srow="23" scol="4" erow="26" ecol="7">
+            local
+            function
+            <identifier field="name" srow="23" scol="19" erow="23" ecol="31">AddToCounter</identifier>
+            <parameters field="parameters" srow="23" scol="31" erow="23" ecol="38">
+              (
+              <binding srow="23" scol="32" erow="23" ecol="37">
+                <identifier field="name" srow="23" scol="32" erow="23" ecol="37">count</identifier>
+              </binding>
+              )
+            </parameters>
+            <block field="body" srow="24" scol="6" erow="25" ecol="20">
+              <compound_assignment_statement srow="24" scol="6" erow="24" ecol="22">
+                <identifier field="left" srow="24" scol="6" erow="24" ecol="13">counter</identifier>
+                <compound_operator field="operator" srow="24" scol="14" erow="24" ecol="16">
+                  +=
+                </compound_operator>
+                <identifier field="right" srow="24" scol="17" erow="24" ecol="22">count</identifier>
+              </compound_assignment_statement>
+              <return_statement srow="25" scol="6" erow="25" ecol="20">
+                return
+                <expression_list srow="25" scol="13" erow="25" ecol="20">
+                  <identifier srow="25" scol="13" erow="25" ecol="20">counter</identifier>
+                </expression_list>
+              </return_statement>
+            </block>
+            end
+          </local_function_declaration>
+          <local_variable_declaration srow="28" scol="4" erow="28" ecol="74">
+            local
+            <binding_list srow="28" scol="10" erow="28" ecol="16">
+              <binding srow="28" scol="10" erow="28" ecol="16">
+                <identifier field="name" srow="28" scol="10" erow="28" ecol="16">result</identifier>
+              </binding>
+            </binding_list>
+            =
+            <expression_list srow="28" scol="19" erow="28" ecol="74">
+              <if_else_expression srow="28" scol="19" erow="28" ecol="74">
+                if
+                <identifier field="condition" srow="28" scol="22" erow="28" ecol="31">condition</identifier>
+                then
+                <function_call field="consequence" srow="28" scol="37" erow="28" ecol="52">
+                  <identifier field="name" srow="28" scol="37" erow="28" ecol="49">AddToCounter</identifier>
+                  <arguments field="arguments" srow="28" scol="49" erow="28" ecol="52">
+                    (
+                    <number srow="28" scol="50" erow="28" ecol="51">7</number>
+                    )
+                  </arguments>
+                </function_call>
+                else
+                <function_call field="alternative" srow="28" scol="58" erow="28" ecol="74">
+                  <identifier field="name" srow="28" scol="58" erow="28" ecol="70">AddToCounter</identifier>
+                  <arguments field="arguments" srow="28" scol="70" erow="28" ecol="74">
+                    (
+                    <number srow="28" scol="71" erow="28" ecol="73">17</number>
+                    )
+                  </arguments>
+                </function_call>
+              </if_else_expression>
+            </expression_list>
+          </local_variable_declaration>
+          <if_statement srow="29" scol="4" erow="33" ecol="7">
+            if
+            <identifier field="condition" srow="29" scol="7" erow="29" ecol="16">condition</identifier>
+            then
+            <block field="consequence" srow="30" scol="6" erow="30" ecol="25">
+              <function_call srow="30" scol="6" erow="30" ecol="25">
+                <identifier field="name" srow="30" scol="6" erow="30" ecol="12">assert</identifier>
+                <arguments field="arguments" srow="30" scol="12" erow="30" ecol="25">
+                  (
+                  <binary_expression srow="30" scol="13" erow="30" ecol="24">
+                    <identifier field="left" srow="30" scol="13" erow="30" ecol="19">result</identifier>
+                    ==
+                    <number field="right" srow="30" scol="23" erow="30" ecol="24">7</number>
+                  </binary_expression>
+                  )
+                </arguments>
+              </function_call>
+            </block>
+            <else_statement field="alternative" srow="31" scol="4" erow="32" ecol="26">
+              else
+              <block field="body" srow="32" scol="6" erow="32" ecol="26">
+                <function_call srow="32" scol="6" erow="32" ecol="26">
+                  <identifier field="name" srow="32" scol="6" erow="32" ecol="12">assert</identifier>
+                  <arguments field="arguments" srow="32" scol="12" erow="32" ecol="26">
+                    (
+                    <binary_expression srow="32" scol="13" erow="32" ecol="25">
+                      <identifier field="left" srow="32" scol="13" erow="32" ecol="19">result</identifier>
+                      ==
+                      <number field="right" srow="32" scol="23" erow="32" ecol="25">17</number>
+                    </binary_expression>
+                    )
+                  </arguments>
+                </function_call>
+              </block>
+            </else_statement>
+            end
+          </if_statement>
+          <comment srow="34" scol="4" erow="34" ecol="83">
+            --
+            <comment_content field="content" srow="34" scol="6" erow="34" ecol="83"> ensure the counter value matches the result of the clause that was evaluated</comment_content>
+          </comment>
+          <function_call srow="35" scol="4" erow="35" ecol="29">
+            <identifier field="name" srow="35" scol="4" erow="35" ecol="10">assert</identifier>
+            <arguments field="arguments" srow="35" scol="10" erow="35" ecol="29">
+              (
+              <binary_expression srow="35" scol="11" erow="35" ecol="28">
+                <identifier field="left" srow="35" scol="11" erow="35" ecol="18">counter</identifier>
+                ==
+                <identifier field="right" srow="35" scol="22" erow="35" ecol="28">result</identifier>
+              </binary_expression>
+              )
+            </arguments>
+          </function_call>
+        </block>
+        end
+      </function_declaration>
+      <comment srow="38" scol="0" erow="38" ecol="39">
+        --
+        <comment_content field="content" srow="38" scol="2" erow="38" ecol="39"> Test expression using only constants</comment_content>
+      </comment>
+      <function_call srow="39" scol="0" erow="39" ecol="36">
+        <identifier field="name" srow="39" scol="0" erow="39" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="39" scol="6" erow="39" ecol="36">
+          (
+          <if_else_expression srow="39" scol="7" erow="39" ecol="35">
+            if
+            <true field="condition" srow="39" scol="10" erow="39" ecol="14">true</true>
+            then
+            <true field="consequence" srow="39" scol="20" erow="39" ecol="24">true</true>
+            else
+            <false field="alternative" srow="39" scol="30" erow="39" ecol="35">false</false>
+          </if_else_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="40" scol="0" erow="40" ecol="37">
+        <identifier field="name" srow="40" scol="0" erow="40" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="40" scol="6" erow="40" ecol="37">
+          (
+          <if_else_expression srow="40" scol="7" erow="40" ecol="36">
+            if
+            <false field="condition" srow="40" scol="10" erow="40" ecol="15">false</false>
+            then
+            <false field="consequence" srow="40" scol="21" erow="40" ecol="26">false</false>
+            else
+            <true field="alternative" srow="40" scol="32" erow="40" ecol="36">true</true>
+          </if_else_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="41" scol="0" erow="41" ecol="35">
+        <identifier field="name" srow="41" scol="0" erow="41" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="41" scol="6" erow="41" ecol="35">
+          (
+          <if_else_expression srow="41" scol="7" erow="41" ecol="34">
+            if
+            <nil field="condition" srow="41" scol="10" erow="41" ecol="13">nil</nil>
+            then
+            <false field="consequence" srow="41" scol="19" erow="41" ecol="24">false</false>
+            else
+            <true field="alternative" srow="41" scol="30" erow="41" ecol="34">true</true>
+          </if_else_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="42" scol="0" erow="42" ecol="43">
+        <identifier field="name" srow="42" scol="0" erow="42" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="42" scol="6" erow="42" ecol="43">
+          (
+          <binary_expression srow="42" scol="7" erow="42" ecol="42">
+            <parenthesized_expression field="left" srow="42" scol="7" erow="42" ecol="36">
+              (
+              <binary_expression srow="42" scol="8" erow="42" ecol="35">
+                <number field="left" srow="42" scol="8" erow="42" ecol="9">7</number>
+                +
+                <if_else_expression field="right" srow="42" scol="12" erow="42" ecol="35">
+                  if
+                  <true field="condition" srow="42" scol="15" erow="42" ecol="19">true</true>
+                  then
+                  <number field="consequence" srow="42" scol="25" erow="42" ecol="27">10</number>
+                  else
+                  <number field="alternative" srow="42" scol="33" erow="42" ecol="35">20</number>
+                </if_else_expression>
+              </binary_expression>
+              )
+            </parenthesized_expression>
+            ==
+            <number field="right" srow="42" scol="40" erow="42" ecol="42">17</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <comment srow="44" scol="0" erow="44" ecol="47">
+        --
+        <comment_content field="content" srow="44" scol="2" erow="44" ecol="47"> Test expression using non-constant condition</comment_content>
+      </comment>
+      <function_call srow="45" scol="0" erow="45" ecol="38">
+        <identifier field="name" srow="45" scol="0" erow="45" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="45" scol="6" erow="45" ecol="38">
+          (
+          <if_else_expression srow="45" scol="7" erow="45" ecol="37">
+            if
+            <function_call field="condition" srow="45" scol="10" erow="45" ecol="16">
+              <identifier field="name" srow="45" scol="10" erow="45" ecol="14">True</identifier>
+              <arguments field="arguments" srow="45" scol="14" erow="45" ecol="16">
+                (
+                )
+              </arguments>
+            </function_call>
+            then
+            <true field="consequence" srow="45" scol="22" erow="45" ecol="26">true</true>
+            else
+            <false field="alternative" srow="45" scol="32" erow="45" ecol="37">false</false>
+          </if_else_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="46" scol="0" erow="46" ecol="39">
+        <identifier field="name" srow="46" scol="0" erow="46" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="46" scol="6" erow="46" ecol="39">
+          (
+          <if_else_expression srow="46" scol="7" erow="46" ecol="38">
+            if
+            <function_call field="condition" srow="46" scol="10" erow="46" ecol="17">
+              <identifier field="name" srow="46" scol="10" erow="46" ecol="15">False</identifier>
+              <arguments field="arguments" srow="46" scol="15" erow="46" ecol="17">
+                (
+                )
+              </arguments>
+            </function_call>
+            then
+            <false field="consequence" srow="46" scol="23" erow="46" ecol="28">false</false>
+            else
+            <true field="alternative" srow="46" scol="34" erow="46" ecol="38">true</true>
+          </if_else_expression>
+          )
+        </arguments>
+      </function_call>
+      <comment srow="48" scol="0" erow="48" ecol="66">
+        --
+        <comment_content field="content" srow="48" scol="2" erow="48" ecol="66"> Test evaluation of a "chain" of if/elseif/else in an expression</comment_content>
+      </comment>
+      <function_call srow="49" scol="0" erow="49" ecol="50">
+        <identifier field="name" srow="49" scol="0" erow="49" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="49" scol="6" erow="49" ecol="50">
+          (
+          <binary_expression srow="49" scol="7" erow="49" ecol="49">
+            <function_call field="left" srow="49" scol="7" erow="49" ecol="43">
+              <identifier field="name" srow="49" scol="7" erow="49" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="49" scol="22" erow="49" ecol="43">
+                (
+                <false srow="49" scol="23" erow="49" ecol="28">false</false>
+                ,
+                <false srow="49" scol="30" erow="49" ecol="35">false</false>
+                ,
+                <false srow="49" scol="37" erow="49" ecol="42">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="49" scol="47" erow="49" ecol="49">40</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="50" scol="0" erow="50" ecol="49">
+        <identifier field="name" srow="50" scol="0" erow="50" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="50" scol="6" erow="50" ecol="49">
+          (
+          <binary_expression srow="50" scol="7" erow="50" ecol="48">
+            <function_call field="left" srow="50" scol="7" erow="50" ecol="42">
+              <identifier field="name" srow="50" scol="7" erow="50" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="50" scol="22" erow="50" ecol="42">
+                (
+                <false srow="50" scol="23" erow="50" ecol="28">false</false>
+                ,
+                <false srow="50" scol="30" erow="50" ecol="35">false</false>
+                ,
+                <true srow="50" scol="37" erow="50" ecol="41">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="50" scol="46" erow="50" ecol="48">30</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="51" scol="0" erow="51" ecol="49">
+        <identifier field="name" srow="51" scol="0" erow="51" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="51" scol="6" erow="51" ecol="49">
+          (
+          <binary_expression srow="51" scol="7" erow="51" ecol="48">
+            <function_call field="left" srow="51" scol="7" erow="51" ecol="42">
+              <identifier field="name" srow="51" scol="7" erow="51" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="51" scol="22" erow="51" ecol="42">
+                (
+                <false srow="51" scol="23" erow="51" ecol="28">false</false>
+                ,
+                <true srow="51" scol="30" erow="51" ecol="34">true</true>
+                ,
+                <false srow="51" scol="36" erow="51" ecol="41">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="51" scol="46" erow="51" ecol="48">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="52" scol="0" erow="52" ecol="48">
+        <identifier field="name" srow="52" scol="0" erow="52" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="52" scol="6" erow="52" ecol="48">
+          (
+          <binary_expression srow="52" scol="7" erow="52" ecol="47">
+            <function_call field="left" srow="52" scol="7" erow="52" ecol="41">
+              <identifier field="name" srow="52" scol="7" erow="52" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="52" scol="22" erow="52" ecol="41">
+                (
+                <false srow="52" scol="23" erow="52" ecol="28">false</false>
+                ,
+                <true srow="52" scol="30" erow="52" ecol="34">true</true>
+                ,
+                <true srow="52" scol="36" erow="52" ecol="40">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="52" scol="45" erow="52" ecol="47">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="53" scol="0" erow="53" ecol="49">
+        <identifier field="name" srow="53" scol="0" erow="53" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="53" scol="6" erow="53" ecol="49">
+          (
+          <binary_expression srow="53" scol="7" erow="53" ecol="48">
+            <function_call field="left" srow="53" scol="7" erow="53" ecol="42">
+              <identifier field="name" srow="53" scol="7" erow="53" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="53" scol="22" erow="53" ecol="42">
+                (
+                <true srow="53" scol="23" erow="53" ecol="27">true</true>
+                ,
+                <false srow="53" scol="29" erow="53" ecol="34">false</false>
+                ,
+                <false srow="53" scol="36" erow="53" ecol="41">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="53" scol="46" erow="53" ecol="48">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="54" scol="0" erow="54" ecol="48">
+        <identifier field="name" srow="54" scol="0" erow="54" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="54" scol="6" erow="54" ecol="48">
+          (
+          <binary_expression srow="54" scol="7" erow="54" ecol="47">
+            <function_call field="left" srow="54" scol="7" erow="54" ecol="41">
+              <identifier field="name" srow="54" scol="7" erow="54" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="54" scol="22" erow="54" ecol="41">
+                (
+                <true srow="54" scol="23" erow="54" ecol="27">true</true>
+                ,
+                <false srow="54" scol="29" erow="54" ecol="34">false</false>
+                ,
+                <true srow="54" scol="36" erow="54" ecol="40">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="54" scol="45" erow="54" ecol="47">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="55" scol="0" erow="55" ecol="48">
+        <identifier field="name" srow="55" scol="0" erow="55" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="55" scol="6" erow="55" ecol="48">
+          (
+          <binary_expression srow="55" scol="7" erow="55" ecol="47">
+            <function_call field="left" srow="55" scol="7" erow="55" ecol="41">
+              <identifier field="name" srow="55" scol="7" erow="55" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="55" scol="22" erow="55" ecol="41">
+                (
+                <true srow="55" scol="23" erow="55" ecol="27">true</true>
+                ,
+                <true srow="55" scol="29" erow="55" ecol="33">true</true>
+                ,
+                <false srow="55" scol="35" erow="55" ecol="40">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="55" scol="45" erow="55" ecol="47">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="56" scol="0" erow="56" ecol="47">
+        <identifier field="name" srow="56" scol="0" erow="56" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="56" scol="6" erow="56" ecol="47">
+          (
+          <binary_expression srow="56" scol="7" erow="56" ecol="46">
+            <function_call field="left" srow="56" scol="7" erow="56" ecol="40">
+              <identifier field="name" srow="56" scol="7" erow="56" ecol="22">EvalElseifChain</identifier>
+              <arguments field="arguments" srow="56" scol="22" erow="56" ecol="40">
+                (
+                <true srow="56" scol="23" erow="56" ecol="27">true</true>
+                ,
+                <true srow="56" scol="29" erow="56" ecol="33">true</true>
+                ,
+                <true srow="56" scol="35" erow="56" ecol="39">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="56" scol="44" erow="56" ecol="46">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <comment srow="58" scol="0" erow="58" ecol="69">
+        --
+        <comment_content field="content" srow="58" scol="2" erow="58" ecol="69"> Test evaluation of a "chain" of if/"else if"/else in an expression</comment_content>
+      </comment>
+      <function_call srow="59" scol="0" erow="59" ecol="51">
+        <identifier field="name" srow="59" scol="0" erow="59" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="59" scol="6" erow="59" ecol="51">
+          (
+          <binary_expression srow="59" scol="7" erow="59" ecol="50">
+            <function_call field="left" srow="59" scol="7" erow="59" ecol="44">
+              <identifier field="name" srow="59" scol="7" erow="59" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="59" scol="23" erow="59" ecol="44">
+                (
+                <false srow="59" scol="24" erow="59" ecol="29">false</false>
+                ,
+                <false srow="59" scol="31" erow="59" ecol="36">false</false>
+                ,
+                <false srow="59" scol="38" erow="59" ecol="43">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="59" scol="48" erow="59" ecol="50">40</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="60" scol="0" erow="60" ecol="50">
+        <identifier field="name" srow="60" scol="0" erow="60" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="60" scol="6" erow="60" ecol="50">
+          (
+          <binary_expression srow="60" scol="7" erow="60" ecol="49">
+            <function_call field="left" srow="60" scol="7" erow="60" ecol="43">
+              <identifier field="name" srow="60" scol="7" erow="60" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="60" scol="23" erow="60" ecol="43">
+                (
+                <false srow="60" scol="24" erow="60" ecol="29">false</false>
+                ,
+                <false srow="60" scol="31" erow="60" ecol="36">false</false>
+                ,
+                <true srow="60" scol="38" erow="60" ecol="42">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="60" scol="47" erow="60" ecol="49">30</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="61" scol="0" erow="61" ecol="50">
+        <identifier field="name" srow="61" scol="0" erow="61" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="61" scol="6" erow="61" ecol="50">
+          (
+          <binary_expression srow="61" scol="7" erow="61" ecol="49">
+            <function_call field="left" srow="61" scol="7" erow="61" ecol="43">
+              <identifier field="name" srow="61" scol="7" erow="61" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="61" scol="23" erow="61" ecol="43">
+                (
+                <false srow="61" scol="24" erow="61" ecol="29">false</false>
+                ,
+                <true srow="61" scol="31" erow="61" ecol="35">true</true>
+                ,
+                <false srow="61" scol="37" erow="61" ecol="42">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="61" scol="47" erow="61" ecol="49">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="62" scol="0" erow="62" ecol="49">
+        <identifier field="name" srow="62" scol="0" erow="62" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="62" scol="6" erow="62" ecol="49">
+          (
+          <binary_expression srow="62" scol="7" erow="62" ecol="48">
+            <function_call field="left" srow="62" scol="7" erow="62" ecol="42">
+              <identifier field="name" srow="62" scol="7" erow="62" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="62" scol="23" erow="62" ecol="42">
+                (
+                <false srow="62" scol="24" erow="62" ecol="29">false</false>
+                ,
+                <true srow="62" scol="31" erow="62" ecol="35">true</true>
+                ,
+                <true srow="62" scol="37" erow="62" ecol="41">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="62" scol="46" erow="62" ecol="48">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="63" scol="0" erow="63" ecol="50">
+        <identifier field="name" srow="63" scol="0" erow="63" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="63" scol="6" erow="63" ecol="50">
+          (
+          <binary_expression srow="63" scol="7" erow="63" ecol="49">
+            <function_call field="left" srow="63" scol="7" erow="63" ecol="43">
+              <identifier field="name" srow="63" scol="7" erow="63" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="63" scol="23" erow="63" ecol="43">
+                (
+                <true srow="63" scol="24" erow="63" ecol="28">true</true>
+                ,
+                <false srow="63" scol="30" erow="63" ecol="35">false</false>
+                ,
+                <false srow="63" scol="37" erow="63" ecol="42">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="63" scol="47" erow="63" ecol="49">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="64" scol="0" erow="64" ecol="49">
+        <identifier field="name" srow="64" scol="0" erow="64" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="64" scol="6" erow="64" ecol="49">
+          (
+          <binary_expression srow="64" scol="7" erow="64" ecol="48">
+            <function_call field="left" srow="64" scol="7" erow="64" ecol="42">
+              <identifier field="name" srow="64" scol="7" erow="64" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="64" scol="23" erow="64" ecol="42">
+                (
+                <true srow="64" scol="24" erow="64" ecol="28">true</true>
+                ,
+                <false srow="64" scol="30" erow="64" ecol="35">false</false>
+                ,
+                <true srow="64" scol="37" erow="64" ecol="41">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="64" scol="46" erow="64" ecol="48">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="65" scol="0" erow="65" ecol="49">
+        <identifier field="name" srow="65" scol="0" erow="65" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="65" scol="6" erow="65" ecol="49">
+          (
+          <binary_expression srow="65" scol="7" erow="65" ecol="48">
+            <function_call field="left" srow="65" scol="7" erow="65" ecol="42">
+              <identifier field="name" srow="65" scol="7" erow="65" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="65" scol="23" erow="65" ecol="42">
+                (
+                <true srow="65" scol="24" erow="65" ecol="28">true</true>
+                ,
+                <true srow="65" scol="30" erow="65" ecol="34">true</true>
+                ,
+                <false srow="65" scol="36" erow="65" ecol="41">false</false>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="65" scol="46" erow="65" ecol="48">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="66" scol="0" erow="66" ecol="48">
+        <identifier field="name" srow="66" scol="0" erow="66" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="66" scol="6" erow="66" ecol="48">
+          (
+          <binary_expression srow="66" scol="7" erow="66" ecol="47">
+            <function_call field="left" srow="66" scol="7" erow="66" ecol="41">
+              <identifier field="name" srow="66" scol="7" erow="66" ecol="23">EvalElse_IfChain</identifier>
+              <arguments field="arguments" srow="66" scol="23" erow="66" ecol="41">
+                (
+                <true srow="66" scol="24" erow="66" ecol="28">true</true>
+                ,
+                <true srow="66" scol="30" erow="66" ecol="34">true</true>
+                ,
+                <true srow="66" scol="36" erow="66" ecol="40">true</true>
+                )
+              </arguments>
+            </function_call>
+            ==
+            <number field="right" srow="66" scol="45" erow="66" ecol="47">10</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <comment srow="68" scol="0" erow="68" ecol="84">
+        --
+        <comment_content field="content" srow="68" scol="2" erow="68" ecol="84"> Test nesting of if-else expressions inside the condition of an if-else expression</comment_content>
+      </comment>
+      <function_call srow="69" scol="0" erow="69" ecol="67">
+        <identifier field="name" srow="69" scol="0" erow="69" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="69" scol="6" erow="69" ecol="67">
+          (
+          <binary_expression srow="69" scol="7" erow="69" ecol="66">
+            <parenthesized_expression field="left" srow="69" scol="7" erow="69" ecol="60">
+              (
+              <if_else_expression srow="69" scol="8" erow="69" ecol="59">
+                if
+                <parenthesized_expression field="condition" srow="69" scol="11" erow="69" ecol="43">
+                  (
+                  <if_else_expression srow="69" scol="12" erow="69" ecol="42">
+                    if
+                    <function_call field="condition" srow="69" scol="15" erow="69" ecol="21">
+                      <identifier field="name" srow="69" scol="15" erow="69" ecol="19">True</identifier>
+                      <arguments field="arguments" srow="69" scol="19" erow="69" ecol="21">
+                        (
+                        )
+                      </arguments>
+                    </function_call>
+                    then
+                    <false field="consequence" srow="69" scol="27" erow="69" ecol="32">false</false>
+                    else
+                    <true field="alternative" srow="69" scol="38" erow="69" ecol="42">true</true>
+                  </if_else_expression>
+                  )
+                </parenthesized_expression>
+                then
+                <number field="consequence" srow="69" scol="49" erow="69" ecol="51">10</number>
+                else
+                <number field="alternative" srow="69" scol="57" erow="69" ecol="59">20</number>
+              </if_else_expression>
+              )
+            </parenthesized_expression>
+            ==
+            <number field="right" srow="69" scol="64" erow="69" ecol="66">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="70" scol="0" erow="70" ecol="65">
+        <identifier field="name" srow="70" scol="0" erow="70" ecol="6">assert</identifier>
+        <arguments field="arguments" srow="70" scol="6" erow="70" ecol="65">
+          (
+          <binary_expression srow="70" scol="7" erow="70" ecol="64">
+            <parenthesized_expression field="left" srow="70" scol="7" erow="70" ecol="58">
+              (
+              <if_else_expression srow="70" scol="8" erow="70" ecol="57">
+                if
+                <if_else_expression field="condition" srow="70" scol="11" erow="70" ecol="41">
+                  if
+                  <function_call field="condition" srow="70" scol="14" erow="70" ecol="20">
+                    <identifier field="name" srow="70" scol="14" erow="70" ecol="18">True</identifier>
+                    <arguments field="arguments" srow="70" scol="18" erow="70" ecol="20">
+                      (
+                      )
+                    </arguments>
+                  </function_call>
+                  then
+                  <false field="consequence" srow="70" scol="26" erow="70" ecol="31">false</false>
+                  else
+                  <true field="alternative" srow="70" scol="37" erow="70" ecol="41">true</true>
+                </if_else_expression>
+                then
+                <number field="consequence" srow="70" scol="47" erow="70" ecol="49">10</number>
+                else
+                <number field="alternative" srow="70" scol="55" erow="70" ecol="57">20</number>
+              </if_else_expression>
+              )
+            </parenthesized_expression>
+            ==
+            <number field="right" srow="70" scol="62" erow="70" ecol="64">20</number>
+          </binary_expression>
+          )
+        </arguments>
+      </function_call>
+      <comment srow="73" scol="0" erow="73" ecol="62">
+        --
+        <comment_content field="content" srow="73" scol="2" erow="73" ecol="62"> Ensure that if/else expressions are conditionally evaluated</comment_content>
+      </comment>
+      <comment srow="74" scol="0" erow="74" ecol="91">
+        --
+        <comment_content field="content" srow="74" scol="2" erow="74" ecol="91"> i.e. verify the evaluated expression doesn't evaluate the true and false expressions and</comment_content>
+      </comment>
+      <comment srow="75" scol="0" erow="75" ecol="34">
+        --
+        <comment_content field="content" srow="75" scol="2" erow="75" ecol="34"> merely select the proper value.</comment_content>
+      </comment>
+      <function_call srow="76" scol="0" erow="76" ecol="35">
+        <identifier field="name" srow="76" scol="0" erow="76" ecol="29">CheckForConditionalEvaluation</identifier>
+        <arguments field="arguments" srow="76" scol="29" erow="76" ecol="35">
+          (
+          <true srow="76" scol="30" erow="76" ecol="34">true</true>
+          )
+        </arguments>
+      </function_call>
+      <function_call srow="77" scol="0" erow="77" ecol="36">
+        <identifier field="name" srow="77" scol="0" erow="77" ecol="29">CheckForConditionalEvaluation</identifier>
+        <arguments field="arguments" srow="77" scol="29" erow="77" ecol="36">
+          (
+          <false srow="77" scol="30" erow="77" ecol="35">false</false>
+          )
+        </arguments>
+      </function_call>
+      <return_statement srow="79" scol="0" erow="79" ecol="12">
+        return
+        <expression_list srow="79" scol="6" erow="79" ecol="12">
+          <parenthesized_expression srow="79" scol="6" erow="79" ecol="12">
+            (
+            <string srow="79" scol="7" erow="79" ecol="11">
+              '
+              <string_content field="content" srow="79" scol="8" erow="79" ecol="10">OK</string_content>
+              '
+            </string>
+            )
+          </parenthesized_expression>
+        </expression_list>
+      </return_statement>
+    </chunk>
+  </source>
+</sources>

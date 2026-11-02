@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "language": "luau",
+  "extensions": [
+    "luau"
+  ],
+  "grammar_repository": "https://github.com/4teapo/tree-sitter-luau",
+  "grammar_commit": "4f09f79945de3d5575b079103d86a515030c62ab",
+  "abi": 15,
+  "license": "MIT",
+  "sha256": "f6f3202866d526271c77db197349595d9719ab92745c0f706b2505797b04f950",
+  "size": 135228,
+  "file": "f6f3202866d526271c77db197349595d9719ab92745c0f706b2505797b04f950.wasm",
+  "role": "B",
+  "url": "https://github.com/cortexkit/aft/releases/download/grammars-1/f6f3202866d526271c77db197349595d9719ab92745c0f706b2505797b04f950.wasm",
+  "test_only": true
+}

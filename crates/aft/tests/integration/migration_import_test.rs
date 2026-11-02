@@ -30,9 +30,19 @@ fn write_legacy_snapshot(
     rows: &[(&[u8], &[u8])],
     version: u8,
 ) {
+    write_legacy_snapshot_with_refusals(path, model_fingerprint, rows, version, &[]);
+}
+
+fn write_legacy_snapshot_with_refusals(
+    path: &Path,
+    model_fingerprint: &str,
+    rows: &[(&[u8], &[u8])],
+    version: u8,
+    refused: &[(&[u8], u64)],
+) {
     let mut bytes = Vec::new();
     bytes.push(version);
-    if version != 6 && version != 7 {
+    if !(6..=8).contains(&version) {
         fs::write(path, bytes).unwrap();
         return;
     }
@@ -50,7 +60,7 @@ fn write_legacy_snapshot(
     for (legacy_path, _source) in rows {
         put_bytes(&mut bytes, legacy_path);
         put_bytes(&mut bytes, b"entry");
-        if version == 7 {
+        if version >= 7 {
             put_bytes(&mut bytes, b"");
         }
         bytes.push(0);
@@ -62,12 +72,33 @@ fn write_legacy_snapshot(
         bytes.extend_from_slice(&1.0f32.to_le_bytes());
         bytes.extend_from_slice(&0.0f32.to_le_bytes());
     }
+    if version >= 8 {
+        bytes.extend_from_slice(
+            &refused
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<u64>()
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&(refused.len() as u32).to_le_bytes());
+        for (path, count) in refused {
+            put_bytes(&mut bytes, path);
+            bytes.extend_from_slice(&count.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
 }
 
 #[test]
 fn compatible_same_root_snapshot_publishes_a_view_without_reembedding() {
+    for version in 6..=8 {
+        assert_compatible_snapshot_imports(version);
+    }
+}
+
+fn assert_compatible_snapshot_imports(version: u8) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let source = root.join("src/lib.rs");
@@ -79,7 +110,7 @@ fn compatible_same_root_snapshot_publishes_a_view_without_reembedding() {
         &request.legacy_semantic_path(),
         &request.configured_model_fingerprint,
         &[(b"src/lib.rs", b"pub fn entry() {}\n")],
-        7,
+        version,
     );
 
     let report = import_legacy_semantic(&request).unwrap();
@@ -115,6 +146,52 @@ fn compatible_same_root_snapshot_publishes_a_view_without_reembedding() {
         request.legacy_semantic_path().is_file(),
         "rollback deletes only the view; the legacy artifact remains available"
     );
+}
+
+#[test]
+fn v8_refused_files_are_skipped_not_published_as_fully_covered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let source = b"pub fn entry() {}\n";
+    fs::write(root.join("src/healthy.rs"), source).unwrap();
+    fs::write(root.join("src/refused.rs"), source).unwrap();
+    let storage = temp.path().join("storage");
+    let request = SemanticMigrationRequest::for_root(&storage, &root, fingerprint());
+    write_legacy_snapshot_with_refusals(
+        &request.legacy_semantic_path(),
+        &request.configured_model_fingerprint,
+        &[(b"src/healthy.rs", source), (b"src/refused.rs", source)],
+        8,
+        &[(b"src/refused.rs", 1)],
+    );
+    let original = fs::read(request.legacy_semantic_path()).unwrap();
+    let report = import_legacy_semantic(&request).unwrap();
+    assert_eq!(report.outcome, SemanticMigrationOutcome::Imported);
+    assert_eq!(report.imported_rows, 1);
+    assert_eq!(report.skipped_rows, 1);
+    assert_eq!(report.reembedded_rows, 0);
+    let view = ViewStore::open(&storage, &request.view).unwrap();
+    let manifest = view
+        .load_manifest(&view.current_generation().unwrap().unwrap())
+        .unwrap();
+    assert!(manifest
+        .get(&RelPath::new(b"src/healthy.rs".to_vec()).unwrap())
+        .is_some());
+    assert!(manifest
+        .get(&RelPath::new(b"src/refused.rs".to_vec()).unwrap())
+        .is_none());
+    let refused_key = SemanticKey::from_bytes(
+        source,
+        b"src/refused.rs",
+        &request.chunker_version,
+        &request.embed_template_version,
+        &request.configured_model_fingerprint,
+    )
+    .full_key();
+    let store = BlobStore::open(&storage, request.family.clone(), BlobPlane::Semantic).unwrap();
+    assert!(store.get(&refused_key).unwrap().is_none());
+    assert_eq!(fs::read(request.legacy_semantic_path()).unwrap(), original);
 }
 
 #[test]

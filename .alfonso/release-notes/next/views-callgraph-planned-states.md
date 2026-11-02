@@ -1,0 +1,1 @@
+- With views on, call-graph queries retry while edits are being verified or a checkout changes during loading, and rebuild older call-graph views after an upgrade instead of reporting a load failure.

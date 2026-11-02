@@ -231,6 +231,60 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     ctx
 }
 
+#[test]
+#[ignore = "manual cold-checkout timing with installed language servers"]
+fn scoped_inspect_cold_checkout_phase_timings() {
+    let root = PathBuf::from(std::env::var_os("AFT_INSPECT_REPRO_ROOT").expect("checkout root"));
+    let started = Instant::now();
+    let ctx = configured_context(&root);
+    eprintln!("configure_ms={}", started.elapsed().as_millis());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_finished = finished.clone();
+    let monitor = thread::spawn(move || {
+        let started = Instant::now();
+        let mut previous = String::new();
+        while !monitor_finished.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(log) = inspect_phase_log_for_request("cold-checkout-timings") {
+                let current = format!("{:?}", log.records);
+                if current != previous {
+                    eprintln!(
+                        "elapsed_ms={} phases={current}",
+                        started.elapsed().as_millis()
+                    );
+                    previous = current;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let started = Instant::now();
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "cold-checkout-timings", "command": "inspect", "worker_session": true,
+            "sections": "diagnostics",
+            "scope": ["crates/aft/src/commands/inspect.rs", "packages/opencode-plugin/src/tools/inspect.ts"]
+        }),
+    );
+    finished.store(true, std::sync::atomic::Ordering::Release);
+    monitor.join().unwrap();
+    eprintln!(
+        "inspect_ms={} response={response:#}",
+        started.elapsed().as_millis()
+    );
+    for phase in inspect_phase_log_for_request("cold-checkout-timings")
+        .unwrap()
+        .records
+    {
+        eprintln!(
+            "phase={:?} duration_ms={:?} error={:?}",
+            phase.entry,
+            phase.duration_ms(),
+            phase.terminal_error
+        );
+    }
+}
+
 fn drain_callgraph_store_for_test(ctx: &AppContext) {
     let (latest, disconnected) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
@@ -4540,7 +4594,9 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
         native_only["complete"], false,
         "native diagnostics alone must stay partial: {native_only:#}"
     );
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-explicit-cargo", "src");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "inspect-explicit-cargo", "src")
+    });
     let messages = diagnostic_messages_for(&response, "src/lib.rs");
     assert!(
         messages
@@ -4582,12 +4638,14 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
     drop(ctx);
 
     let ctx = make_context();
-    let restarted = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "inspect-explicit-cargo-restart", "command": "inspect", "sections": "diagnostics"
-        }),
-    );
+    let restarted = crate::helpers::inspect_retrying_cold_deadline(|| {
+        inspect_tool_call(
+            &ctx,
+            json!({
+                "id": "inspect-explicit-cargo-restart", "command": "inspect", "sections": "diagnostics"
+            }),
+        )
+    });
     assert!(
         diagnostic_messages_for(&restarted, "src/lib.rs")
             .iter()
@@ -4698,7 +4756,9 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
 
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-push", "src");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "inspect-sweep-push", "src")
+    });
 
     assert!(
         diagnostic_messages_for(&response, "src/lib.rs")
@@ -5831,7 +5891,9 @@ fn scoped_typescript_sync_empty_then_real_reports_the_semantic_error() {
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "empty_then_real");
 
-    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-error", "broken.ts");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "ts-sync-error", "broken.ts")
+    });
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,
         "{response:#}"
@@ -5852,7 +5914,9 @@ fn scoped_typescript_sync_clean_file_is_authoritative() {
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "clean");
 
-    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-clean", "broken.ts");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "ts-sync-clean", "broken.ts")
+    });
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 0,
         "{response:#}"
@@ -5891,7 +5955,9 @@ fn scoped_typescript_sync_collects_every_category_without_changing_warm_counts()
     configure_fake_rust_and_typescript_lsp(&ctx);
     ctx.lsp()
         .set_extra_env("AFT_FAKE_LSP_TYPESCRIPT_SYNC", "categories");
-    let response = scoped_diagnostics_inspect(&ctx, "ts-sync-categories", "broken.ts");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "ts-sync-categories", "broken.ts")
+    });
     let diagnostics = &response["summary"]["diagnostics"];
     assert_eq!(diagnostics["errors"], 1, "{response:#}");
     assert_eq!(diagnostics["warnings"], 1, "{response:#}");
@@ -5954,7 +6020,9 @@ fn scoped_blocking_inspect_pulls_diagnostics_from_a_pull_server() {
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
 
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull", "src/lib.rs");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull", "src/lib.rs")
+    });
 
     assert_eq!(
         diagnostic_messages_for(&response, "src/lib.rs"),
@@ -5978,7 +6046,9 @@ fn scoped_blocking_inspect_waits_for_rust_analyzer_cargo_check() {
     configure_fake_rust_lsp(&ctx);
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
 
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck", "src");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck", "src")
+    });
 
     let messages = diagnostic_messages_for(&response, "src/lib.rs");
     assert!(
@@ -6011,7 +6081,9 @@ fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics()
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
 
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-flycheck", "src");
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-flycheck", "src")
+    });
 
     let messages = diagnostic_messages_for(&response, "src/lib.rs");
     for expected in ["test pull diagnostic", "flycheck diagnostic"] {
@@ -6020,6 +6092,56 @@ fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics()
             "{expected} missing: {response:#}"
         );
     }
+}
+
+#[test]
+fn scoped_rust_inspect_retains_compiler_error_when_reopening_unchanged_file() {
+    let (_temp_dir, root, lib) = single_crate_fixture("reopen-compiler-error");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_FROM_CONTENT", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1500");
+
+    // The compiler error arrives only in a push. Reopening unchanged bytes does
+    // not start another check, and the native pull is empty on both requests.
+    for id in ["compiler-before-close", "compiler-after-reopen"] {
+        let response = scoped_diagnostics_inspect(&ctx, id, "src/lib.rs");
+        assert_eq!(response["complete"], true, "{response:#}");
+        assert!(
+            diagnostic_messages_for(&response, "src/lib.rs")
+                .iter()
+                .any(|message| message == "fake compile error"),
+            "compiler result missing after {id}: {response:#}"
+        );
+        assert!(!ctx.lsp().document_is_open_for_test(&lib));
+        // The pull-only fake sends no close reply. Deliver its empty clearing
+        // publication explicitly before the next request reopens the file.
+        ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: root.clone(),
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(json!({"uri": file_uri(&lib), "diagnostics": []})),
+        });
+        ctx.lsp().drain_events();
+    }
+
+    fs::write(&lib, "pub fn f() {}\n").unwrap();
+    let changed = scoped_diagnostics_inspect(&ctx, "compiler-after-content-change", "src/lib.rs");
+    assert!(
+        !diagnostic_messages_for(&changed, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "an old compiler push must not borrow the changed file's pull proof: {changed:#}"
+    );
 }
 
 /// Pulls are sent several files at a time and then waited for in turn; each
@@ -6049,6 +6171,95 @@ fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
     assert_eq!(
         response["summary"]["diagnostics"]["complete"], false,
         "unanswered pulls are gaps: {response:#}"
+    );
+}
+
+#[test]
+fn bounded_scoped_inspect_slow_server_returns_partial_before_transport_deadline() {
+    let (_temp, root, _lib) = single_crate_fixture("bounded-slow-inspect");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+
+    let started = Instant::now();
+    let response = scoped_diagnostics_inspect(&ctx, "bounded-slow-inspect", "src/lib.rs");
+    assert!(started.elapsed() < Duration::from_secs(30), "{response:#}");
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert_eq!(uncovered_files(&response).len(), 1, "{response:#}");
+    assert!(
+        response.to_string().contains(
+            "no diagnostics for the current file content arrived in time; retry aft_inspect"
+        ),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn bounded_scoped_inspect_abandoned_pull_releases_reader_for_same_root_rebind() {
+    use aft::executor::{Executor, Lane};
+    use aft::path_identity::ProjectRootId;
+
+    let (_temp, root, _lib) = single_crate_fixture("bounded-abandoned-inspect");
+    let ctx = Arc::new(configured_context(&root));
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+    let signal = root.join("pull-started");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_SIGNAL", signal.to_str().unwrap());
+    let executor = Executor::new();
+    let root_id = ProjectRootId::from_path(&root).unwrap();
+    executor.register_actor(root_id.clone(), ctx.clone());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (_reply, cancellation) = executor.submit_tool_call_cancellable_async(
+        root_id.clone(),
+        Lane::SerialLspStatus,
+        "abandoned-inspect".into(),
+        "inspect",
+        Box::new(move |ctx| {
+            let response = handle_inspect_tool_call(
+                &request(json!({
+                    "id": "abandoned-inspect", "command": "inspect",
+                    "scope": "src/lib.rs", "sections": "diagnostics"
+                })),
+                ctx,
+            );
+            done_tx.send(response.data.clone()).unwrap();
+            response
+        }),
+    );
+    wait_for_path_event(&signal, "the language server's in-flight pull");
+    let bind = executor.submit(
+        root_id.clone(),
+        Lane::Mutating,
+        "subc-bind-after-abandon".into(),
+        Box::new(|_| aft::protocol::Response::success("subc-bind-after-abandon", json!({}))),
+    );
+    assert!(
+        matches!(
+            bind.recv_timeout(Duration::ZERO),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ),
+        "the active inspect must hold its reader"
+    );
+    // Route release and explicit CANCEL both signal this exact job token.
+    executor.cancel_job(&root_id, &cancellation);
+    let response = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("abandoned inspect stops without waiting for its diagnostics deadline");
+    assert_eq!(response["inspect_terminal"], "interrupted", "{response:?}");
+    assert!(
+        bind.recv_timeout(Duration::from_secs(2))
+            .expect("same-root bind proceeds after the abandoned reader exits")
+            .success
     );
 }
 
@@ -6696,8 +6907,9 @@ fn scoped_diagnostics_outside_project_root_report_error_or_named_gap() {
     let ctx = configured_context(&root);
     configure_fake_rust_and_typescript_lsp(&ctx);
 
-    let response =
-        scoped_diagnostics_inspect_outside(&ctx, "inspect-outside-error", file.to_str().unwrap());
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect_outside(&ctx, "inspect-outside-error", file.to_str().unwrap())
+    });
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,
@@ -6778,13 +6990,15 @@ fn scoped_diagnostics_mixed_inside_and_outside_project_root() {
     let unreported = write_file(&external_root, "unreported.ts", "export const other = 1;\n");
     let ctx = configured_context(&root);
     configure_fake_rust_and_typescript_lsp(&ctx);
-    let response = inspect_tool_call_outside(
-        &ctx,
-        json!({
-            "id": "inspect-mixed-errors", "command": "inspect", "sections": ["diagnostics"],
-            "scope": [inside, outside],
-        }),
-    );
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        inspect_tool_call_outside(
+            &ctx,
+            json!({
+                "id": "inspect-mixed-errors", "command": "inspect", "sections": ["diagnostics"],
+                "scope": [inside, outside],
+            }),
+        )
+    });
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 2,
         "{response:#}"
@@ -7017,7 +7231,9 @@ fn unscoped_inspect_checks_current_content_after_outside_edits_without_a_watcher
     let ctx = configured_context(&root);
     configure_content_pull_typescript_lsp(&ctx, native);
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "100");
-    let before = scoped_diagnostics_inspect(&ctx, "current-before", "broken.ts");
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "current-before", "broken.ts")
+    });
     assert_eq!(before["complete"], true, "{before:#}");
     assert_eq!(before["summary"]["diagnostics"]["errors"], 1, "{before:#}");
 
@@ -7097,7 +7313,9 @@ fn unscoped_inspect_rejects_late_server_reports_after_an_aft_edit() {
             let native = install_content_pull_native_typescript(&root);
             let ctx = configured_context(&root);
             configure_content_pull_typescript_lsp(&ctx, native.clone());
-            let before = scoped_diagnostics_inspect(&ctx, "late-current-before", "broken.ts");
+            let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+                scoped_diagnostics_inspect(&ctx, "late-current-before", "broken.ts")
+            });
             assert_eq!(before["complete"], true, "{before:#}");
             edit_match_as_opencode(&ctx, "late-current-edit", &file, initial, replacement);
             let diagnostics = if initial == "BROKEN" {
@@ -7204,8 +7422,9 @@ fn scoped_inspect_outside_project_drops_an_error_fixed_by_an_aft_edit() {
     let ctx = configured_context(&root);
     configure_content_pull_typescript_lsp(&ctx, native.clone());
 
-    let before =
-        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-before", file.to_str().unwrap());
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect_outside(&ctx, "fixed-outside-before", file.to_str().unwrap())
+    });
     assert_eq!(before["complete"], true, "{before:#}");
     assert_eq!(
         diagnostic_messages_for(&before, &diagnostic_path(&file)),
@@ -7238,8 +7457,9 @@ fn scoped_inspect_outside_project_sees_a_disk_write_after_an_aft_edit() {
     let ctx = configured_context(&root);
     configure_content_pull_typescript_lsp(&ctx, native.clone());
 
-    let before =
-        scoped_diagnostics_inspect_outside(&ctx, "append-outside-before", file.to_str().unwrap());
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect_outside(&ctx, "append-outside-before", file.to_str().unwrap())
+    });
     assert_eq!(before["complete"], true, "{before:#}");
     assert!(
         diagnostic_messages_for(&before, &diagnostic_path(&file)).is_empty(),
@@ -7281,7 +7501,9 @@ fn scoped_inspect_inside_project_drops_an_error_fixed_by_an_aft_edit_without_a_w
     let ctx = configured_context(&root);
     configure_content_pull_typescript_lsp(&ctx, native.clone());
 
-    let before = scoped_diagnostics_inspect(&ctx, "fixed-inside-before", "a.ts");
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "fixed-inside-before", "a.ts")
+    });
     assert_eq!(before["complete"], true, "{before:#}");
     assert_eq!(
         diagnostic_messages_for(&before, "a.ts"),
@@ -9395,7 +9617,9 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_
     let (_temp_dir, root, s) = field_removal_crate();
     let ctx = configured_context(&root);
     enable_automatic_rust_checks(&ctx);
-    let warm = scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src");
+    let warm = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src")
+    });
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
 
     let user_edit = aft::commands::edit_match::handle_edit_match(
@@ -9450,7 +9674,9 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     // `src/s.rs`. Its change then reaches rust-analyzer only through the
     // watcher path, not through the resync AFT does for files it has
     // diagnostics for.
-    let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs");
+    let warm = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs")
+    });
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
 
     fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
@@ -9622,7 +9848,9 @@ fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
             .iter()
             .any(|(_, message)| message.contains("moved value"))
     };
-    let before = scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src");
+    let before = crate::helpers::inspect_retrying_cold_deadline(|| {
+        scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src")
+    });
     assert!(
         moved_value(&before),
         "control: the first check reports the error: {before:#}"
@@ -9810,7 +10038,10 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             .unwrap();
         writer_gate.lock().unwrap();
         let ctx = new_context();
-        let warm = scoped_diagnostics_inspect(&ctx, "gated-warm", "src");
+        let warm = crate::helpers::inspect_retrying_cold_deadline(|| {
+            scoped_diagnostics_inspect(&ctx, "gated-warm", "src")
+        });
+        assert_eq!(warm["complete"], true, "{warm:#}");
         assert_eq!(
             warm["summary"]["diagnostics"]["errors"], expected_errors,
             "{warm:#}"
@@ -9847,7 +10078,10 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
             assert!(record.is_file());
         });
         let ctx = new_context();
-        let cold = scoped_diagnostics_inspect(&ctx, "gated-cold", "src");
+        let cold = crate::helpers::inspect_retrying_cold_deadline(|| {
+            scoped_diagnostics_inspect(&ctx, "gated-cold", "src")
+        });
+        assert_eq!(cold["complete"], true, "{cold:#}");
         assert_eq!(
             cold["summary"]["diagnostics"]["errors"], expected_errors,
             "{cold:#}"
@@ -10420,12 +10654,14 @@ fn unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_
         &ctx,
         &["dead_code", "unused_exports", "duplicates", "cycles"],
     );
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "unscoped-real-clean", "command": "inspect", "sections": "diagnostics"
-        }),
-    );
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        inspect_tool_call(
+            &ctx,
+            json!({
+                "id": "unscoped-real-clean", "command": "inspect", "sections": "diagnostics"
+            }),
+        )
+    });
     eprintln!("real Rust clean unscoped: {response:#}");
     assert!(
         !ctx.lsp().has_any_diagnostic_reports(),
@@ -10467,12 +10703,14 @@ fn unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer() {
         &ctx,
         &["dead_code", "unused_exports", "duplicates", "cycles"],
     );
-    let response = inspect_tool_call(
-        &ctx,
-        json!({
-            "id": "unscoped-real-error", "command": "inspect", "sections": "diagnostics"
-        }),
-    );
+    let response = crate::helpers::inspect_retrying_cold_deadline(|| {
+        inspect_tool_call(
+            &ctx,
+            json!({
+                "id": "unscoped-real-error", "command": "inspect", "sections": "diagnostics"
+            }),
+        )
+    });
     eprintln!("real Rust compile error unscoped: {response:#}");
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 1,

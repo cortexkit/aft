@@ -14019,7 +14019,7 @@ async fn submission_key_mismatch_preserves_existing_job_for_cancel() {
         .unwrap();
     let client = ExecRemoteClient::connect(
         &daemon.connection,
-        subc_protocol::BindIdentity::new(dir.path().display().to_string(), "broca", "session"),
+        subc_protocol::BindIdentity::new("broca", "session"),
     )
     .await
     .unwrap();

@@ -3,6 +3,11 @@ use std::sync::{Arc, Condvar};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 
+// Protocol 0.34 clients require numeric daemon versions of at least 0.39.0
+// before sending project-free opens. This fixture already handles those opens;
+// matching version metadata lets its scope and lease behavior be exercised.
+const FAKE_DAEMON_VERSION: &str = "0.39.0";
+
 #[derive(Default)]
 pub(crate) struct Counts {
     pub opens: usize,
@@ -55,7 +60,7 @@ impl Daemon {
                 key: key.clone(),
                 daemon_id,
                 pid: std::process::id(),
-                daemon_ver: "route-test".into(),
+                daemon_ver: FAKE_DAEMON_VERSION.into(),
             },
         )
         .unwrap();
@@ -82,7 +87,7 @@ impl Daemon {
                             let mut disconnected = disconnected.clone();
                             let held_open_scope = held_open_scope.clone();
                             tasks.spawn(async move {
-                                subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "route-test", Duration::from_secs(2)).await.unwrap();
+                                subc_transport::authenticate_server(&mut stream, &key, &daemon_id, FAKE_DAEMON_VERSION, Duration::from_secs(2)).await.unwrap();
                                 let connection = {
                                     let mut count = counts.0.lock().unwrap();
                                     count.connections += 1;

@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Only opt-in test measurement code changes in the fenced semantic-search module. The production parser-memo prototype is deferred because strict views-on and views-off product parity was not obtained within the bounded replay job. Existing ranking, routing, snippets, evidence and result envelopes remain unchanged. The search-only tool-call fixture retains the broad comparator without weakening unrelated cases."
+}

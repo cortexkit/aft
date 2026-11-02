@@ -1291,6 +1291,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
             }
         }
         admission.finish_hunk();
+        crate::run_tool_call::progress::report();
     }
 
     drop(admission);

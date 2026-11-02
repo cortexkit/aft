@@ -1546,10 +1546,10 @@ fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming()
 #[test]
 fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
     // Inspect's own cargo check must run while inspect waits for the analyzer
-    // to settle, not after. With a 36 s budget (31 s of work time) that wait
-    // lasts about 15 s for an analyzer that never settles; a check started
-    // only after it would have about 7.5 s. The cargo below spends 9 s before
-    // checking anything, so only a check that ran during the wait can finish.
+    // to settle, not after. The 20 s request cap leaves 15 s of work time;
+    // waiting for an analyzer that never settles uses about 7.5 s. A check
+    // started only after that wait cannot finish the 9 s delay below within
+    // the remaining budget, but one started concurrently can finish.
     let temp = tempfile::tempdir().unwrap();
     let real_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let slow_cargo = temp.path().join("slow-cargo");

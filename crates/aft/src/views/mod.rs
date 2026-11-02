@@ -53,6 +53,9 @@ pub mod symbol_store;
 // documented empty module that its plane fills in.
 pub mod callgraph;
 pub(crate) mod callgraph_copies;
+
+#[cfg(test)]
+mod cap_tests;
 pub mod first_load;
 pub mod intent;
 pub mod live_delta;

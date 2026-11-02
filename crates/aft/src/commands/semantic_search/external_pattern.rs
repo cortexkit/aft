@@ -383,6 +383,11 @@ pub(super) fn handle(
         }
         let semantic_served = plan.contains(SearchLaneKind::Semantic);
         corpus.disclose(&mut response, semantic_served);
+        if let (Some(data), Some(index)) =
+            (response.data.as_object_mut(), corpus.semantic_index(ctx))
+        {
+            disclose_skipped_semantic_rows(data, index);
+        }
         attach_search_execution_metadata(
             &mut response,
             &plan,

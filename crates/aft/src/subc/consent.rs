@@ -354,9 +354,13 @@ struct ConsentRouteKey {
 }
 
 impl ConsentRouteKey {
-    fn new(identity: &subc_protocol::BindIdentity, scope: &ScopeSelector) -> Self {
+    fn new(
+        identity: &subc_protocol::BindIdentity,
+        scope: &ScopeSelector,
+        project_root: &Path,
+    ) -> Self {
         Self {
-            project_root: identity.project_root.clone(),
+            project_root: project_root.to_path_buf(),
             harness: identity.harness.clone(),
             session: identity.session.clone(),
             scope_owner: serde_json::to_string(&scope.owner)
@@ -533,11 +537,7 @@ impl SubcConsentTransport {
         use subc_client_rs::{CallError, CallOptions};
         let body = encode(call.method, &call.params)?;
         let consumer = self.consumer().await?;
-        let identity = subc_protocol::BindIdentity::new(
-            call.project_root.clone(),
-            "aft-consent",
-            call.session.clone(),
-        );
+        let identity = subc_protocol::BindIdentity::new("aft-consent", call.session.clone());
         let options = CallOptions {
             consumer_identity: crate::launch_nonce::consumer_identity(),
             timeout: call.timeout,
@@ -550,7 +550,11 @@ impl SubcConsentTransport {
         // The SDK may return the same cached handle for overlapping calls with
         // the same scope stamp. Lease it until the last call settles, then close
         // immediately rather than leaving an idle consent route in the daemon.
-        let route_identity = self.route_identity(ConsentRouteKey::new(&identity, &call.scope));
+        let route_identity = self.route_identity(ConsentRouteKey::new(
+            &identity,
+            &call.scope,
+            &call.project_root,
+        ));
         let gate = route_identity.state.gate.lock().await;
         let route = match consumer
             .open_route_scoped(

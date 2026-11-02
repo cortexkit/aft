@@ -130,6 +130,138 @@ fn publish(root: &Path, storage: &Path) {
     assert!(report.published);
 }
 
+fn family_writes_in_child(name: &str, expects_legacy_denial: bool) -> bool {
+    if std::env::var("AFT_TEST_FAMILY_WRITES_CHILD").as_deref() == Ok(name) {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Warn)
+            .init();
+        aft::slog_warn!("family writes log capture control");
+        return false;
+    }
+    // A separate process isolates both the logger and every default storage
+    // location, without changing the environment of parallel tests.
+    let fixture = tempfile::tempdir().unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            &format!("callgraph_worktree_test::{name}"),
+            "--nocapture",
+        ])
+        .env("AFT_TEST_FAMILY_WRITES_CHILD", name)
+        .env("AFT_TEST_FAMILY_WRITES_ROOT", fixture.path())
+        .env_remove("AFT_STORAGE_DIR");
+    for (variable, directory) in [
+        ("HOME", "home"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_DATA_DIRS", "data-dirs"),
+        ("XDG_CONFIG_DIRS", "config-dirs"),
+    ] {
+        let path = fixture.path().join(directory);
+        std::fs::create_dir_all(&path).unwrap();
+        command.env(variable, path);
+    }
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("family writes log capture control"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.contains("borrow-only root denied shared artifact write"),
+        expects_legacy_denial,
+        "{stdout}\n{stderr}"
+    );
+    true
+}
+
+#[test]
+fn views_worktree_family_writes_publish_without_legacy_denial() {
+    if family_writes_in_child(
+        "views_worktree_family_writes_publish_without_legacy_denial",
+        false,
+    ) {
+        return;
+    }
+    let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
+    let checkout = linked_checkout(&fixture);
+    let storage = fixture.join("storage");
+    let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, true);
+    assert!(!owner.shared_artifacts_read_only());
+    std::fs::write(checkout.join("index.ts"), source("workerCaller")).unwrap();
+    let ctx = configure(&checkout, &storage, true);
+    let response = callgraph_when_ready("callers", || {
+        query(&ctx, &checkout, "callers", "workerCaller")
+    });
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["total_callers"], 1);
+    assert!(response.data.to_string().contains("workerCaller"));
+    assert!(!response.data.to_string().contains("ownerCaller"));
+    let scope = format!(
+        "{}.callgraph",
+        aft::path_identity::project_scope_key(&checkout)
+    );
+    let family = ctx.memoized_artifact_cache_key(&checkout);
+    let view_dir = aft::blob_store::v3::view_dir(&storage, &family, &scope).unwrap();
+    let pointer = rusqlite::Connection::open_with_flags(
+        view_dir.join("pointer.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let generation: String = pointer
+        .query_row(
+            "SELECT generation FROM pointer WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!generation.is_empty());
+    assert!(view_dir
+        .join(format!("manifest-{generation}.json"))
+        .is_file());
+    let health = ctx.try_health_snapshot(&checkout);
+    assert!(health.view_load_failures.is_empty(), "{health:?}");
+    assert!(health.view_load_failure_last.is_none(), "{health:?}");
+    assert!(!ctx
+        .degraded_reasons()
+        .contains(&"view_load_failed".to_string()));
+    println!("worker view published; callers succeeded; view load failures: 0");
+}
+
+#[test]
+fn views_worktree_family_writes_off_refuses_legacy_writer() {
+    if family_writes_in_child(
+        "views_worktree_family_writes_off_refuses_legacy_writer",
+        true,
+    ) {
+        return;
+    }
+    let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
+    let checkout = linked_checkout(&fixture);
+    let storage = fixture.join("storage");
+    let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, false);
+    assert!(!owner.shared_artifacts_read_only());
+    let ctx = configure_deferred(&checkout, &storage, false);
+    assert_eq!(
+        ctx.memoized_artifact_cache_key(&checkout),
+        owner.memoized_artifact_cache_key(&fixture.join("owner"))
+    );
+    let result = aft::callgraph_store::CallGraphStore::open(ctx.callgraph_store_dir(), checkout);
+    let error = result.err().expect("legacy writer must be refused");
+    assert!(
+        error.to_string().contains("writer capability denied"),
+        "{error}"
+    );
+    assert!(!ctx.callgraph_store_dir().join("writer.lease").exists());
+    assert!(!storage.join("blobs/v3").exists());
+}
+
 const OPERATIONS: [&str; 6] = [
     "callers",
     "impact",

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "readiness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "views-checkout-changed-retry"
+  ],
+  "note": "Views lexical load: a checkout that changed during its load is retried as busy instead of reported as a failed load. No ranking file changes."
+}

@@ -1878,6 +1878,8 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
             }
             SemanticRefreshEvent::Completed {
                 mut added_entries,
+                mut refused_rows,
+                mut context_skipped,
                 mut updated_metadata,
                 mut completed_paths,
             } => {
@@ -1904,6 +1906,8 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 added_entries.retain(|entry| !stale.contains(entry.file()));
                 updated_metadata.retain(|(path, _)| !stale.contains(path));
                 completed_paths.retain(|path| !stale.contains(path));
+                refused_rows.retain(|path, _| completed_paths.contains(path));
+                context_skipped.retain(|path, _| completed_paths.contains(path));
                 // Rows are only installed together with the freshness record of
                 // their file. A row without one (a file deleted while its batch
                 // was in flight) would be unreachable by every later freshness
@@ -1918,6 +1922,8 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     .as_mut()
                 {
                     index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
+                    index.apply_refused_rows_update(refused_rows);
+                    index.apply_context_skips_update(context_skipped);
                 }
                 mark_semantic_refresh_success(ctx, &completed_paths);
                 view_refresh_completed = true;
@@ -3980,6 +3986,24 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         return outcome;
     }
 
+    if state.rescan_required {
+        let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
+            // The old search index cannot rule out matches in files whose
+            // changes were lost. Stop using it before deferred reconciliation,
+            // including when a retained rescan resumes after a route rebind.
+            if !ctx.config().views.enabled {
+                if let Some(index) = ctx
+                    .search_index()
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                {
+                    index.ready = false;
+                }
+                ctx.search_exact_memo().clear();
+            }
+        });
+    }
     if state.rescan_required && receiver_has_more_after_receive {
         outcome.has_more = true;
         *ctx.watcher_drain_slice().lock() = Some(state);
@@ -5962,6 +5986,52 @@ mod tests {
             pushed,
             crate::protocol::PushFrame::StatusChanged(_)
         ));
+    }
+
+    #[test]
+    fn watcher_rescan_stops_serving_old_trigrams_before_reconciliation() {
+        for received_now in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            std::fs::write(root.join("seed.rs"), "// seed\n").unwrap();
+            let (ctx, tx) = watcher_context(&root);
+            let mut index = crate::search_index::SearchIndex::build(&root);
+            index.ready = true;
+            *ctx.search_index().write().unwrap() = Some(index);
+            std::fs::create_dir(root.join("new-crate")).unwrap();
+            std::fs::write(root.join("new-crate/lib.rs"), "// pending_child_marker\n").unwrap();
+
+            // Keep ignore reconciliation unfinished: receipt of a rescan must stop
+            // stale candidate filtering before the replacement build can begin.
+            let (_ignore_tx, ignore_rx) = crossbeam_channel::unbounded();
+            let mut state = WatcherDrainSliceState::new(
+                ctx.configure_generation(),
+                ctx.configure_content_generation(),
+            );
+            state.ignore_scan = Some(ignore_rx);
+            state.rescan_required = !received_now;
+            *ctx.watcher_drain_slice().lock() = Some(state);
+            if received_now {
+                tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+                    .unwrap();
+            }
+            assert!(drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more);
+            assert!(!ctx.search_index().read().unwrap().as_ref().unwrap().ready);
+            assert!(ctx.watcher_query_has_pending_changes());
+
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "pending-child", "command": "grep", "pattern": "pending_child_marker"
+            }))
+            .unwrap();
+            let response = crate::commands::grep::handle_grep(&request, &ctx);
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["total_matches"], 1, "{}", response.data);
+            assert_eq!(response.data["files_read_directly"], 2);
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("searched all 2 files directly"));
+        }
     }
 
     #[test]
@@ -8031,6 +8101,8 @@ mod tests {
         );
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -8176,6 +8248,8 @@ mod tests {
         );
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: update.added_entries,
                 updated_metadata: update.updated_metadata,
                 completed_paths: update.completed_paths,
@@ -8254,6 +8328,8 @@ mod tests {
                 }
             } else {
                 SemanticRefreshEvent::Completed {
+                    refused_rows: Default::default(),
+                    context_skipped: Default::default(),
                     added_entries: first.added_entries,
                     updated_metadata: first.updated_metadata,
                     completed_paths: first.completed_paths,
@@ -8282,6 +8358,8 @@ mod tests {
             .unwrap();
         event_tx
             .send(SemanticRefreshEvent::Completed {
+                refused_rows: Default::default(),
+                context_skipped: Default::default(),
                 added_entries: second.added_entries,
                 updated_metadata: second.updated_metadata,
                 completed_paths: second.completed_paths,

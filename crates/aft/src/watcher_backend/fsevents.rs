@@ -761,6 +761,24 @@ fn translate_event(flags: fs::FSEventStreamEventFlags, path: &Path) -> Vec<Event
     if has_flag(flags, fs::kFSEventStreamEventFlagUnmount) {
         events.push(Event::new(EventKind::Remove(RemoveKind::Other)).set_info("unmount"));
     }
+    if has_flag(flags, fs::kFSEventStreamEventFlagItemIsDir)
+        && (has_flag(flags, fs::kFSEventStreamEventFlagItemCreated)
+            || has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed))
+    {
+        // A populated directory can arrive without child notifications. One
+        // arrival marker discovers its files; redundant data flags must not
+        // also send the directory itself through per-file invalidation.
+        let kind = if has_flag(flags, fs::kFSEventStreamEventFlagItemRenamed) {
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+        } else {
+            EventKind::Create(CreateKind::Folder)
+        };
+        events.push(Event::new(kind).set_info(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO));
+        return events
+            .into_iter()
+            .map(|event| event.add_path(path.to_path_buf()))
+            .collect();
+    }
     if has_flag(flags, fs::kFSEventStreamEventFlagItemCreated) {
         events.push(Event::new(EventKind::Create(item_create_kind(flags))));
     }
@@ -1146,6 +1164,31 @@ mod tests {
     }
 
     #[test]
+    fn fsevents_directory_rename_requires_child_reconciliation() {
+        let renamed = fs::kFSEventStreamEventFlagItemRenamed;
+        let directory = translate_event(
+            renamed | fs::kFSEventStreamEventFlagItemIsDir,
+            Path::new("/project/crates/new-crate"),
+        );
+        assert!(directory
+            .iter()
+            .any(|event| event.info() == Some(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)));
+        assert!(directory.iter().all(|event| !event.need_rescan()));
+        assert!(directory.iter().any(|event| {
+            event.paths == [PathBuf::from("/project/crates/new-crate")]
+                && matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
+        }));
+        let file = translate_event(
+            renamed | fs::kFSEventStreamEventFlagItemIsFile,
+            Path::new("/project/crates/file.rs"),
+        );
+        assert!(file.iter().all(|event| !event.need_rescan()));
+        assert!(file
+            .iter()
+            .all(|event| event.info() != Some(crate::watcher_filter::DIRECTORY_ARRIVAL_INFO)));
+    }
+
+    #[test]
     fn fsevents_item_topology_flags_refresh_exclusions_even_with_modified_flag() {
         for (flag, expected_kind) in [
             (
@@ -1176,9 +1219,17 @@ mod tests {
                 &foo,
             );
             assert!(events.iter().any(|event| event.kind == expected_kind));
-            assert!(events
-                .iter()
-                .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            if flag == fs::kFSEventStreamEventFlagItemRemoved {
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            } else {
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "one directory arrival must start only one discovery"
+                );
+            }
             let changed: Vec<_> = events
                 .iter()
                 .flat_map(|event| state.refresh_event(event))

@@ -2,17 +2,17 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.13.3",
+      "version": "0.14.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "87da4efe4e1f29ada4ecc51206b319b7708973fe32565af1c6b20c3c20201d8d",
+      "checksum": "8b95ff0bf302237d110aba060076a12817712c59f9d9ce9536e38af0646af6b0",
       "dependency_kind": "normal",
       "release_tag": "cortexkit-role-tool-provider-v0.13.0"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.13.1",
+      "version": "0.14.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "f6775f73511eaa32fca482b0c862e8949252fc9d1fd3edf1026832efe481881c",
+      "checksum": "0bfdbb55deb87b991f5fecf6d363ca46419c0c3a9259e08c90c41620d782c55e",
       "dependency_kind": "dev",
       "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.1"
     },

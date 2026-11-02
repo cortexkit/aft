@@ -832,16 +832,21 @@ jobs:
               "cargo", "metadata", "--format-version", "1", "--no-deps",
           ], text=True))
           crate_dir = Path(metadata["target_directory"]) / "package"
-          crates = sorted(crate_dir.glob("*.crate"))
+          # Multi-package publish stages archives in tmp-crate and tmp-registry;
+          # single-package packaging leaves them directly in the package folder.
+          crates = sorted(crate_dir.rglob("*.crate"))
           expected = {"aft-tokenizer", "aft-secret-rules", "agent-file-tools"}
-          for package in metadata["packages"]:
-              if package["name"] in expected:
-                  assert crate_dir / f"{package['name']}-{package['version']}.crate" in crates, package["name"]
-          assert len(crates) >= len(expected), "missing packaged crates"
+          filenames = {crate.name for crate in crates}
+          found = {
+              package["name"] for package in metadata["packages"]
+              if package["name"] in expected
+              and f"{package['name']}-{package['version']}.crate" in filenames
+          }
+          assert found == expected, f"missing packaged crates: {', '.join(sorted(expected - found))} under {crate_dir}"
           limit = 10 * 1024 * 1024
           for crate in crates:
               size = crate.stat().st_size
-              print(f"{crate.name}: {size} bytes ({size / limit:.1%} of 10 MiB)")
+              print(f"{crate.relative_to(crate_dir)}: {size} bytes ({size / limit:.1%} of 10 MiB)")
               if size >= limit:
                   raise SystemExit(f"::error::{crate.name} must be under {limit} bytes")
           PY
