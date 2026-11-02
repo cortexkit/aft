@@ -40,6 +40,12 @@ pub(super) fn complete_symbols(
         })
         .collect::<HashMap<_, _>>();
     for &node in nodes {
+        if !matches!(
+            node.kind(),
+            "method_definition" | "arrow_function" | "function_expression" | "generator_function"
+        ) {
+            continue;
+        }
         let Some((object, name)) = object_member(node, source) else {
             continue;
         };
@@ -136,35 +142,6 @@ pub(super) fn object_member<'a>(node: Node<'a>, source: &str) -> Option<(Node<'a
     Some((object, text(key, source).to_string()))
 }
 
-fn scope(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "program" | "statement_block" | "for_statement" | "for_in_statement" | "catch_clause"
-    ) || FUNCTIONS.contains(&node.kind())
-}
-
-fn binding_scope(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "catch_clause" {
-        return Some(node);
-    }
-    let function_scoped = node.kind() == "for_in_statement"
-        || node.kind() == "variable_declarator"
-            && node
-                .parent()
-                .is_some_and(|p| p.kind() == "variable_declaration");
-    let mut parent = node.parent()?;
-    loop {
-        if scope(parent)
-            && (!function_scoped
-                || parent.kind() == "program"
-                || FUNCTIONS.contains(&parent.kind()))
-        {
-            return Some(parent);
-        }
-        parent = parent.parent()?;
-    }
-}
-
 pub(super) struct Objects<'nodes, 'tree, 'source> {
     nodes: &'nodes [Node<'tree>],
     source: &'source str,
@@ -181,6 +158,11 @@ pub(super) struct Objects<'nodes, 'tree, 'source> {
     generics: HashSet<&'source str>,
     object_methods: Vec<MethodHint>,
     needed_objects: HashSet<usize>,
+    identifier_scopes: HashMap<usize, usize>,
+    scope_parents: HashMap<usize, Option<usize>>,
+    function_owners: HashMap<usize, Option<usize>>,
+    write_scopes: HashMap<usize, (usize, usize)>,
+    selected_bindings: std::cell::RefCell<HashMap<(usize, &'source str), Option<Node<'tree>>>>,
 }
 
 impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
@@ -206,6 +188,11 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             generics: HashSet::new(),
             object_methods: Vec::new(),
             needed_objects: HashSet::new(),
+            identifier_scopes: HashMap::new(),
+            scope_parents: HashMap::new(),
+            function_owners: HashMap::new(),
+            write_scopes: HashMap::new(),
+            selected_bindings: Default::default(),
             imports: parse
                 .imports
                 .iter()
@@ -350,24 +337,77 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
     // Build source-wide indexes once. Receiver queries only follow lexical
     // ancestors and indexed declarations, never rescan a function's descendants.
     fn index_nodes(&mut self) {
+        let mut scopes = Vec::<Node<'tree>>::new();
+        let mut functions = Vec::<Node<'tree>>::new();
         for &node in self.nodes {
-            if node.kind() == "type_parameter" {
+            let kind = node.kind();
+            let is_function = FUNCTIONS.contains(&kind);
+            let is_scope = matches!(
+                kind,
+                "program"
+                    | "statement_block"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "catch_clause"
+            ) || is_function;
+            let contains = |parent: &Node<'tree>| {
+                parent.start_byte() <= node.start_byte() && node.end_byte() <= parent.end_byte()
+            };
+            while scopes.last().is_some_and(|parent| !contains(parent)) {
+                scopes.pop();
+            }
+            while functions.last().is_some_and(|parent| !contains(parent)) {
+                functions.pop();
+            }
+            let parent_scope = scopes.last().copied();
+            if is_scope {
+                self.scope_parents
+                    .insert(node.id(), parent_scope.map(|scope| scope.id()));
+                scopes.push(node);
+            }
+            if is_function {
+                functions.push(node);
+            }
+            if kind == "identifier" {
+                if let Some(scope) = scopes.last() {
+                    self.identifier_scopes.insert(node.id(), scope.id());
+                }
+            }
+            if is_function
+                || matches!(
+                    kind,
+                    "variable_declarator"
+                        | "required_parameter"
+                        | "optional_parameter"
+                        | "call_expression"
+                        | "jsx_opening_element"
+                        | "jsx_self_closing_element"
+                )
+            {
+                self.function_owners
+                    .insert(node.id(), functions.last().map(|function| function.id()));
+            }
+            if kind == "type_parameter" {
                 if let Some(name) = field(node, &["name"]) {
                     self.generics.insert(text(name, self.source));
                 }
             }
-            if node.kind() == "import_statement" && self.import_node.is_none() {
+            if kind == "import_statement" && self.import_node.is_none() {
                 self.import_node = Some(node);
+                if let Some(scope) = parent_scope {
+                    self.write_scopes
+                        .insert(node.id(), (scope.start_byte(), scope.end_byte()));
+                }
             }
-            if node.kind() == "return_statement" {
-                if let Some(function) = enclosing(node, FUNCTIONS) {
+            if kind == "return_statement" {
+                if let Some(function) = functions.last() {
                     self.return_statements
                         .entry(function.id())
                         .or_default()
                         .push(node);
                 }
             }
-            if node.kind() == "object" {
+            if kind == "object" {
                 for child in node.named_children(&mut node.walk()) {
                     if child.kind() == "spread_element" {
                         self.unsafe_objects.insert(node.id());
@@ -382,7 +422,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 }
             }
             if matches!(
-                node.kind(),
+                kind,
                 "variable_declarator"
                     | "required_parameter"
                     | "optional_parameter"
@@ -393,33 +433,55 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     | "enum_declaration"
                     | "internal_module"
             ) {
+                let function_scoped = kind == "for_in_statement"
+                    || kind == "variable_declarator"
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "variable_declaration");
+                let owner = if kind == "catch_clause" {
+                    Some(node)
+                } else if function_scoped {
+                    functions
+                        .last()
+                        .copied()
+                        .or_else(|| scopes.first().copied())
+                } else {
+                    parent_scope
+                };
                 if let (Some(pattern), Some(owner)) = (
                     field(node, &["name", "pattern", "parameter", "left"]),
-                    binding_scope(node),
+                    owner,
                 ) {
+                    self.write_scopes
+                        .insert(node.id(), (owner.start_byte(), owner.end_byte()));
                     self.index_binding(owner.id(), pattern, node);
-                    if node.kind() == "for_in_statement" {
+                    if kind == "for_in_statement" {
                         self.index_binding(node.id(), pattern, node);
                     }
                 }
             }
-            if FUNCTIONS.contains(&node.kind()) {
+            if is_function {
+                if let Some(scope) = parent_scope {
+                    self.write_scopes
+                        .entry(node.id())
+                        .or_insert((scope.start_byte(), scope.end_byte()));
+                }
                 if let Some(parameter) = field(node, &["parameter"]) {
                     self.index_binding(node.id(), parameter, node);
                 }
-                if node.kind() == "function_expression" {
+                if kind == "function_expression" {
                     if let Some(name) = field(node, &["name"]) {
                         self.index_binding(node.id(), name, node);
                     }
                 }
             }
-            if node.kind() == "variable_declarator" {
+            if kind == "variable_declarator" {
                 if let Some(value) = field(node, &["value"]).filter(|n| n.kind() == "identifier") {
                     self.aliases.insert(text(value, self.source));
                 }
             }
             if matches!(
-                node.kind(),
+                kind,
                 "assignment_expression"
                     | "augmented_assignment_expression"
                     | "update_expression"
@@ -529,18 +591,27 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
 
     fn binding(&self, identifier: Node<'tree>) -> Option<Node<'tree>> {
         let name = text(identifier, self.source);
-        let mut current = identifier.parent();
-        while let Some(ancestor) = current {
-            if let Some(binding) = self.bindings.get(&(ancestor.id(), name)) {
-                return Some(binding.unwrap_or(identifier));
-            }
-            current = ancestor.parent();
+        let start = *self.identifier_scopes.get(&identifier.id())?;
+        if let Some(selected) = self.selected_bindings.borrow().get(&(start, name)) {
+            return *selected;
         }
-        None
+        let mut current = Some(start);
+        let mut selected = None;
+        while let Some(scope) = current {
+            if let Some(binding) = self.bindings.get(&(scope, name)) {
+                selected = Some(binding.unwrap_or(identifier));
+                break;
+            }
+            current = self.scope_parents.get(&scope).copied().flatten();
+        }
+        self.selected_bindings
+            .borrow_mut()
+            .insert((start, name), selected);
+        selected
     }
 
     fn written(&self, binding: Node<'tree>, name: &str) -> bool {
-        let Some(scope) = binding_scope(binding) else {
+        let Some(&(start, end)) = self.write_scopes.get(&binding.id()) else {
             return true;
         };
         if self.aliases.contains(name) {
@@ -549,10 +620,10 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let Some(writes) = self.writes.get(name) else {
             return false;
         };
-        let index = writes.partition_point(|(start, _)| *start < scope.start_byte());
+        let index = writes.partition_point(|(position, _)| *position < start);
         writes
             .get(index)
-            .is_some_and(|(_, end)| *end <= scope.end_byte())
+            .is_some_and(|(_, position)| *position <= end)
     }
 
     pub(super) fn receiver(&self, expression: Node<'tree>, call: Node<'tree>) -> Option<String> {
@@ -565,7 +636,15 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             return None;
         }
         let binding = self.binding(expression)?;
-        if enclosing(binding, FUNCTIONS) != enclosing(call, FUNCTIONS) {
+        if !matches!(
+            binding.kind(),
+            "variable_declarator" | "required_parameter" | "optional_parameter"
+        ) {
+            return None;
+        }
+        if self.function_owners.get(&binding.id()).copied().flatten()
+            != self.function_owners.get(&call.id()).copied().flatten()
+        {
             return None;
         }
         let annotation = field(binding, &["type"]).or_else(|| {

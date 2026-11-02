@@ -1,6 +1,59 @@
 use super::*;
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
+#[test]
+fn typescript_object_unknown_liveness_stream_matches_reference_and_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("objects.sqlite");
+    let connection = blobs(&blob_path);
+    let base = manifest_of(
+        &connection,
+        &[
+            (
+                "types.ts",
+                "export class A { run() {} } export class B { run() {} }",
+            ),
+            (
+                "caller.ts",
+                "export function caller(x) { x.run(); x.run(); }",
+            ),
+        ],
+    );
+    let next = manifest_of(
+        &connection,
+        &[
+            (
+                "types.ts",
+                "export class A { run() {} } export class B { run() {} }",
+            ),
+            ("caller.ts", "export function caller(x) { x.run(); }"),
+        ],
+    );
+    drop(connection);
+    let streamed = dir.path().join("streamed.sqlite");
+    let reference = dir.path().join("reference.sqlite");
+    materialize_manifest_view_database(&streamed, &blob_path, &base).unwrap();
+    dispatch::WRITE_ROW_BY_ROW.with(|flag| flag.set(true));
+    let result = materialize_manifest_view_database(&reference, &blob_path, &base);
+    dispatch::WRITE_ROW_BY_ROW.with(|flag| flag.set(false));
+    result.unwrap();
+    parity::assert_logical_parity(&streamed, &reference);
+    let count = |path: &Path| {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM view_unknown_live", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(count(&streamed), 4);
+    apply_manifest_diff(&streamed, &base, &next, &blob_path).unwrap();
+    let cold = dir.path().join("cold-next.sqlite");
+    materialize_manifest_view_database(&cold, &blob_path, &next).unwrap();
+    assert_eq!(count(&streamed), 2);
+    parity::assert_logical_parity(&streamed, &cold);
+}
+
 fn manifest(connection: &Connection, types: &str) -> Manifest {
     // Dispatch assertions read these blobs after setup; batch fixture writes
     // rather than paying for a durable commit for each input on Windows.

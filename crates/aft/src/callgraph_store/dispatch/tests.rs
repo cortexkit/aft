@@ -292,6 +292,7 @@ fn typescript_object_ambiguous_or_mutated_values_do_not_gain_edges() {
         "const make = function*() { return { run() {} }; }; make().run();",
         "const value = { run: function internal() {} }; value.internal();",
         "const value = { run: () => this.other(), other() {} };",
+        "class Target { run() {} } function make(): Target { make.run(); return new Target(); }",
         "const value = { run() {} }; function caller(values) { for(const value of values) { value.run(); } }",
         "import {make} from './producer'; function caller(values) { for(const make of values) { make().run(); } }",
         "import {make} from './producer'; function caller(values) { for(var make of values) {} make().run(); }",
