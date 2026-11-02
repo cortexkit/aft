@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "../child-process.js";
@@ -50,7 +50,9 @@ describe("protected LSP npm selection", () => {
         throw new Error("fallback must not run");
       },
     });
-    expect((await selectLspNpm(npm, fallback)).npm?.command).toBe(npm.command);
+    // Selection returns the resolved path; on macOS the temp folder is under
+    // /var, a symlink to /private/var, so compare against the resolved form.
+    expect((await selectLspNpm(npm, fallback)).npm?.command).toBe(realpathSync(npm.command));
   });
 
   test("shutdown during preferred-npm verification does not start fallback discovery", async () => {
