@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/external_exact.rs"
+  ],
+  "slices": [
+    "tool-result-cap"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/lib.rs, which declares the new tool_output module, and two aft_search rendering files. The search renderer now stops adding results once the rendered text would pass its existing 40 KiB budget (the first result is always kept) and reports how many results it printed; the 50 KB reply cap applies after rendering. Scores, candidate selection, ordering and routing are unchanged, and benchmark replies are far below 40 KiB, so ranked rows must remain byte-identical to the committed reference."
+}

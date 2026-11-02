@@ -133,7 +133,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     use rayon::prelude::*;
     let bounded = crate::subc::result_body::active();
     let mut budget = MatchBudget {
-        remaining: bounded.then_some(256 * 1024),
+        remaining: bounded.then_some(crate::tool_output::LIST_BODY_BYTES),
         cut: false,
     };
     let progress = crate::executor::current_job_cancellation();
@@ -344,7 +344,12 @@ fn search_file_compiled(
             }
 
             if let Some(remaining) = &mut budget.remaining {
-                let bytes = serde_json::to_vec(&result).expect("match is JSON").len();
+                // The native result and its rendered row share this budget.
+                // Escaping and capture previews can make either form larger.
+                let bytes = serde_json::to_vec(&result)
+                    .expect("match is JSON")
+                    .len()
+                    .max(crate::subc_format::format_ast_search_match(&result).len());
                 if bytes > *remaining {
                     *remaining = 0;
                     budget.cut = true;
@@ -391,5 +396,37 @@ mod tests {
         let response = serde_json::to_value(handle_ast_search(&request, &ctx)).unwrap();
         assert_eq!(PATTERN_COMPILES.with(|count| count.get()) - before, 1);
         assert_eq!(response["total_matches"], 2, "{response}");
+    }
+
+    #[test]
+    fn list_body_budget_ast_search_does_not_need_the_transport_backstop() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("large.js"), "console.log(1);\n".repeat(24_000)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root),
+                storage_dir: Some(temp.path().join("storage")),
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id":"budget", "command":"ast_search", "pattern":"console.log($X)", "lang":"javascript"
+        }))
+        .unwrap();
+        let _budget = crate::subc::result_body::enter(true);
+        let response = handle_ast_search(&req, &ctx);
+        assert!(response.success);
+        let shown = response.data["matches"].as_array().unwrap().len();
+        assert!(shown > 0 && shown < 24_000);
+        assert_eq!(response.data["matches_list_envelope"]["shown"], shown);
+        let mut text = crate::subc_format::format_response("ast_search", &response, false);
+        assert!(text.len() < crate::tool_output::LIST_BODY_BYTES + 1024);
+        crate::tool_output::cap(&ctx, "owner", "ast_search", &response, &mut text);
+        assert!(!text.contains("[output cut at"));
+        assert!(text.ends_with(&format!(
+            "shown {shown} of 24000 results (budget) · narrow: paths, globs, pattern"
+        )));
     }
 }

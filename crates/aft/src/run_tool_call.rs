@@ -622,7 +622,6 @@ pub(crate) fn finish_tool_call_response(
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_finalize_done();
     }
-    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
     ToolCallResult { text, response }
 }
 
@@ -832,7 +831,6 @@ pub fn run_tool_call(
         }
     }
 
-    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut result.text);
     ToolCallOutcome::Unary(result)
 }
 
@@ -1042,7 +1040,6 @@ fn tool_call_result_from_response(
     if surface_downgraded {
         append_hashline_downgrade_text(&mut text);
     }
-    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
     ToolCallResult { text, response }
 }
 

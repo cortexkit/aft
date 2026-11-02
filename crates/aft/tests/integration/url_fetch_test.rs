@@ -1224,31 +1224,48 @@ fn url_json_top_level_value_is_capped() {
 }
 
 #[test]
-fn reply_ceiling_cuts_fake_tool_and_warns() {
-    crate::test_helpers::init_test_logger();
-    let response = aft::protocol::Response::success(
+fn tool_output_cap_formatter_defers_until_finalization() {
+    let mut response = aft::protocol::Response::success(
         "oversized",
         json!({"text": "界".repeat(5 * 1024 * 1024 / 3)}),
     );
-    let original = serde_json::to_string(&response).unwrap().len();
-    let text = aft::subc_format::format_response("fake_oversized_tool", &response, false);
-    assert!(
-        text.len() <= 2 * 1024 * 1024,
-        "reply ceiling failed to bound fake tool"
+    let original = serde_json::to_string(&response).unwrap();
+    let mut text = aft::subc_format::format_response("fake_oversized_tool", &response, false);
+    assert_eq!(
+        text, original,
+        "formatting must not discard text before it can be saved"
     );
-    assert!(text.contains(&format!("of {original} bytes by AFT's reply ceiling")));
-    assert!(text.ends_with("the tool's own cap failed, please report"));
-    let logs = crate::test_helpers::take_logs();
-    assert!(
-        logs.iter()
-            .any(|line| line.contains("fake_oversized_tool") && line.contains("reply ceiling")),
-        "missing WARN: {logs:?}"
+    let storage = crate::test_helpers::tempdir();
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .with_test_checkpoint_store();
+    aft::response_finalize::finalize_tool_response(
+        &mut response,
+        &mut text,
+        &ctx,
+        "session",
+        "fake_oversized_tool",
+        false,
     );
+    assert!(text.len() <= 51_200);
+    let path = text
+        .rsplit_once("; full result saved to ")
+        .unwrap()
+        .1
+        .strip_suffix("; read it with read and a line range]")
+        .unwrap();
+    assert!(std::fs::read_to_string(path)
+        .unwrap()
+        .starts_with(&original));
 }
 
 #[test]
-fn reply_ceiling_finalization_bounds_late_text() {
-    crate::test_helpers::init_test_logger();
+fn tool_output_cap_finalization_bounds_late_text() {
     let storage = crate::test_helpers::tempdir();
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
@@ -1268,8 +1285,8 @@ fn reply_ceiling_finalization_bounds_late_text() {
         "late_tool",
         false,
     );
-    assert!(text.len() <= 2 * 1024 * 1024);
-    assert!(text.contains("by AFT's reply ceiling"));
+    assert!(text.len() <= 51_200);
+    assert!(text.contains("[output cut at 50 KB of "));
     let mut response =
         aft::protocol::Response::success("direct", json!({"text":"x".repeat(5 * 1024 * 1024)}));
     aft::response_finalize::finalize_response_with_bg_completions(
@@ -1279,15 +1296,9 @@ fn reply_ceiling_finalization_bounds_late_text() {
         "direct_tool",
         false,
     );
-    assert!(response.data["text"].as_str().unwrap().len() <= 2 * 1024 * 1024);
-    let logs = crate::test_helpers::take_logs();
-    for tool in ["late_tool", "direct_tool"] {
-        assert!(
-            logs.iter()
-                .any(|line| line.contains(tool) && line.contains("reply ceiling")),
-            "missing WARN for {tool}: {logs:?}"
-        );
-    }
+    let text = response.data["text"].as_str().unwrap();
+    assert!(text.len() <= 51_200);
+    assert!(text.contains("[output cut at 50 KB of "));
 }
 
 #[test]

@@ -986,6 +986,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
     let width = end.to_string().len();
     for (offset, line) in lines[start..end].iter().enumerate() {
         let line_number = start + offset + 1;
@@ -1003,6 +1004,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         output_bytes = output_bytes.saturating_add(display.len());
         if output_bytes > MAX_BYTES {
             truncated_by_size = true;
+            read_output_tail = Some(output.len());
             output.push_str(&format!(
                 "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                 MAX_BYTES / 1024
@@ -1024,6 +1026,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
             "start_line": start_line,
             "end_line": actual_end,
             "truncated": truncated,
+            "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
     )
@@ -1594,6 +1597,13 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             _ => None,
         });
     let selection = read_selection(req, &response);
+    // Hashline evidence is published before completion/repeated-call reminders
+    // and the status bar are appended. Reserve room before rendering; the final
+    // cap can shorten those notices, never published rows.
+    let render_options = crate::hashline::snapshot::RenderOptions {
+        reserved_bytes: 10 * 1024,
+        ..Default::default()
+    };
     let publication = guard.with_binding_mut(|binding| {
         if let Some(captured) = &captured_source {
             #[cfg(test)]
@@ -1606,13 +1616,13 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     &path,
                     requested_path.clone(),
                     selection,
-                    crate::hashline::snapshot::RenderOptions::default(),
+                    render_options,
                     &captured.source,
                 );
             }
         }
         if let Some(kind) = bash_kind {
-            crate::hashline::snapshot::capture_bash_rewrite_read(
+            crate::hashline::snapshot::capture_bash_rewrite_read_with_options(
                 binding.snapshots_mut(),
                 &path,
                 requested_path.clone(),
@@ -1620,13 +1630,15 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.config().experimental_bash_rewrite,
                 true,
                 true,
+                render_options,
             )
         } else {
-            crate::hashline::snapshot::capture_taggable_read(
+            crate::hashline::snapshot::capture_taggable_read_with_options(
                 binding.snapshots_mut(),
                 &path,
                 requested_path.clone(),
                 selection,
+                render_options,
             )
         }
     });
@@ -1652,6 +1664,12 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .copied()
                     .unwrap_or(first_line);
                 data.insert("content".into(), Value::String(rendering.text));
+                data.remove("read_output_tail");
+                if rendering.elided_range.is_some() {
+                    data.insert("read_output_frozen".into(), Value::Bool(true));
+                    data.insert("complete".into(), Value::Bool(false));
+                    data.insert("truncated".into(), Value::Bool(true));
+                }
                 data.insert(
                     "requested_path".into(),
                     Value::String(rendering.requested_path),
@@ -1667,7 +1685,26 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             crate::hashline::snapshot::ReadPublication::Tagless { rendering, reason } => {
                 if !rendering.text.is_empty() {
+                    let first_line = rendering.rendered_lines.iter().next().copied().unwrap_or(1);
+                    let last_line = rendering
+                        .rendered_lines
+                        .iter()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(first_line);
+                    data.insert(
+                        "lines_read".into(),
+                        Value::from(rendering.rendered_lines.len()),
+                    );
+                    data.insert("start_line".into(), Value::from(first_line));
+                    data.insert("end_line".into(), Value::from(last_line));
                     data.insert("content".into(), Value::String(rendering.text));
+                    data.remove("read_output_tail");
+                    if rendering.elided_range.is_some() {
+                        data.insert("read_output_frozen".into(), Value::Bool(true));
+                        data.insert("complete".into(), Value::Bool(false));
+                        data.insert("truncated".into(), Value::Bool(true));
+                    }
                 }
                 data.insert(
                     "requested_path".into(),
@@ -1890,6 +1927,17 @@ fn handle_read_local(
         Ok(path) => path,
         Err(resp) => return resp,
     };
+
+    if let Some(result) = ctx.output_files().read(req.session(), &path) {
+        return match result {
+            Ok(bytes) => handle_registered_artifact_read(req, bytes),
+            Err(error) => Response::error(
+                &req.id,
+                "artifact_refused",
+                format!("read: tool result refused: {error}"),
+            ),
+        };
+    }
 
     if let Some(result) = ctx
         .bash_background()
@@ -2188,6 +2236,7 @@ fn render_text_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
 
     let line_num_width = format!("{}", end_idx).len();
 
@@ -2233,6 +2282,7 @@ fn render_text_read(
             truncated_by_size = true;
             // Add truncation notice
             if !skip_render {
+                read_output_tail = Some(output.len());
                 output.push_str(&format!(
                     "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                     MAX_BYTES / 1024
@@ -2260,6 +2310,7 @@ fn render_text_read(
             "start_line": start_line,
             "end_line": actual_end,
             "truncated": has_more,
+            "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
     )
@@ -2495,6 +2546,7 @@ fn handle_streaming_range_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
     let line_num_width = format!("{}", requested_start_idx + selected_lines.len()).len();
 
     for (i, line) in selected_lines.iter().enumerate() {
@@ -2514,6 +2566,7 @@ fn handle_streaming_range_read(
         output_bytes += display_line.len();
         if output_bytes > MAX_BYTES {
             truncated_by_size = true;
+            read_output_tail = Some(output.len());
             output.push_str(&format!(
                 "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                 MAX_BYTES / 1024
@@ -2529,6 +2582,7 @@ fn handle_streaming_range_read(
     let has_more = requested_start_idx > 0 || has_more_after_range;
     let truncated = has_more || truncated_by_size || scan_gap;
     if scan_gap {
+        read_output_tail.get_or_insert(output.len());
         output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
     }
 
@@ -2541,6 +2595,7 @@ fn handle_streaming_range_read(
         "start_line": start_line,
         "end_line": actual_end,
         "truncated": truncated,
+        "read_output_tail": read_output_tail,
         "byte_size": byte_size as usize,
     });
     if let Some(total_lines) = exact_total_lines {

@@ -930,6 +930,7 @@ mod tests {
         }))
         .unwrap();
         let worker = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: unscoped.project_root.clone(),
             harness: unscoped.harness.clone(),

@@ -120,7 +120,7 @@ use crate::feature_status::{
 };
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
-use crate::list_envelope::ListEnvelope;
+use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
@@ -1766,12 +1766,13 @@ fn handle_split_search<'a>(
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
     let more_available = ranked.more_available || semantic.more_available;
     let display_root = external.map(|_| absolute_display_root(project_root));
-    let mut text = format_semantic_text_with_display_root(
+    let (mut text, rendered_results) = format_ranked_text_counted(
         &ranked.results,
         display_root.as_deref().unwrap_or(project_root),
         more_available,
         snippets_incomplete,
         Some(ctx),
+        None,
     );
     let summary = patterns.summary_line(
         &prose_found,
@@ -1800,6 +1801,10 @@ fn handle_split_search<'a>(
         &ranked.results_list_envelope,
     );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "rendered_results".to_string(),
+        serde_json::json!(rendered_results),
+    );
     extras.insert("pattern".to_string(), serde_json::json!(pattern));
     if std::env::var_os("AFT_SEARCH_SPLIT_TRACE").is_some() {
         // Benchmark diagnostics: where each leading entry of the first block
@@ -3565,7 +3570,7 @@ fn handle_external_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
     let display_root = absolute_display_root(&external_root);
-    let mut text = format_ranked_text(
+    let (mut text, rendered_results) = format_ranked_text_counted(
         &ranked.results,
         &display_root,
         more_available,
@@ -3606,6 +3611,10 @@ fn handle_external_semantic_or_hybrid_search(
         &ranked.results_list_envelope,
     );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "rendered_results".to_string(),
+        serde_json::json!(rendered_results),
+    );
     extras.insert(
         "lexical_only_fallback".to_string(),
         serde_json::json!(semantic_status != "ready"),
@@ -6433,7 +6442,7 @@ fn handle_engine_only_search(
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
     drop(enrich_cost);
     let format_cost = telemetry::CostPhase::start("format");
-    let mut text = format_ranked_text(
+    let (mut text, rendered_results) = format_ranked_text_counted(
         &ranked.results,
         project_root,
         ranked.more_available,
@@ -6460,6 +6469,10 @@ fn handle_engine_only_search(
         &ranked.results_list_envelope,
     );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "rendered_results".to_string(),
+        serde_json::json!(rendered_results),
+    );
     if let Some(mut audit) = ranked.recall_audit {
         // This route runs no semantic lane. The audit still reports where
         // semantic retrieval would have ranked the targets, which is the
@@ -6850,7 +6863,7 @@ fn handle_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut results, project_root, Some(ctx));
 
-    let mut text = format_ranked_text(
+    let (mut text, rendered_results) = format_ranked_text_counted(
         &results,
         project_root,
         more_available,
@@ -6873,6 +6886,10 @@ fn handle_semantic_or_hybrid_search(
     extras.insert(
         "structuredContent".to_string(),
         engine_ranking.structured_content,
+    );
+    extras.insert(
+        "rendered_results".to_string(),
+        serde_json::json!(rendered_results),
     );
     if let Some(audit) = engine_ranking.recall_audit {
         extras.insert("recall_audit".to_string(), audit);
@@ -7002,7 +7019,7 @@ fn zero_result_escalation_response(
     }
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-    let mut text = format_ranked_text(
+    let (mut text, rendered_results) = format_ranked_text_counted(
         &ranked.results,
         display_root,
         ranked.more_available,
@@ -7034,6 +7051,10 @@ fn zero_result_escalation_response(
     disclose_exact_gaps(&ranked.exact_disclosures, &mut text, &mut extras);
     disclose_index_gaps(&ranked.index_disclosures, &mut text, &mut extras);
     extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "rendered_results".to_string(),
+        serde_json::json!(rendered_results),
+    );
     search_response(
         req,
         SearchResponseParts {
@@ -7058,11 +7079,45 @@ fn zero_result_escalation_response(
     )
 }
 
-fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response {
+fn search_response(req: &RawRequest, mut parts: SearchResponseParts<'_>) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
     let result_count = parts.result_count();
+    if let Some(shown) = parts
+        .extras
+        .get("rendered_results")
+        .and_then(serde_json::Value::as_u64)
+        .map(|shown| shown as usize)
+        .filter(|shown| *shown < result_count)
+    {
+        let key = crate::list_surfaces::search::SEARCH_WIRE_KEY;
+        let mut envelope = parts
+            .extras
+            .get(key)
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ListEnvelope>(value).ok())
+            .unwrap_or_else(|| {
+                ListEnvelope::new(
+                    result_count,
+                    Total::Exact(result_count),
+                    Unit::Results,
+                    Vec::new(),
+                    crate::list_surfaces::search::SEARCH_NARROW,
+                )
+            });
+        envelope.shown = shown;
+        envelope.causes.push(Reason::Budget);
+        envelope
+            .causes
+            .sort_by_key(|reason| std::cmp::Reverse(reason.precedence()));
+        envelope.causes.dedup();
+        envelope.reason = envelope.causes.first().copied();
+        parts.extras.insert(
+            key.to_owned(),
+            serde_json::to_value(envelope).expect("list envelope"),
+        );
+    }
     let envelope_supplied = parts
         .extras
         .contains_key(crate::list_surfaces::search::SEARCH_WIRE_KEY);
@@ -7122,6 +7177,41 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
         object.insert(key, value);
     }
     Response::success(&req.id, serde_json::Value::Object(object))
+}
+
+/// Build protocol fixtures with the production ranked renderer and its own
+/// admitted-result count, without requiring matching files in a search index.
+#[cfg(test)]
+pub(crate) fn ranked_response_for_test(
+    req: &RawRequest,
+    root: &Path,
+    results: Vec<HybridResult>,
+) -> Response {
+    let (text, shown) = format_ranked_text_counted(&results, root, false, false, None, None);
+    let mut extras = serde_json::Map::new();
+    extras.insert("rendered_results".into(), serde_json::json!(shown));
+    search_response(
+        req,
+        SearchResponseParts {
+            query: req
+                .params
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("fixture"),
+            interpreted_as: "lexical",
+            query_kind: "identifier",
+            semantic_status: "ready",
+            status: "ready",
+            complete: true,
+            text,
+            results: results.iter().map(result_to_json).collect(),
+            more_available: false,
+            engine_capped: false,
+            fully_degraded: false,
+            warnings: Vec::new(),
+            extras,
+        },
+    )
 }
 
 fn artifact_contention_fallback_response(
@@ -7196,7 +7286,7 @@ fn semantic_unavailable_or_fallback_response(
         };
         let snippets_incomplete =
             enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
-        let mut text = format_lexical_unavailable_text(
+        let (mut text, rendered_results) = format_lexical_unavailable_text_counted(
             &detail,
             &ranked.results,
             project_root,
@@ -7224,6 +7314,10 @@ fn semantic_unavailable_or_fallback_response(
             &ranked.results_list_envelope,
         );
         extras.insert("structuredContent".to_string(), ranked.structured_content);
+        extras.insert(
+            "rendered_results".to_string(),
+            serde_json::json!(rendered_results),
+        );
         disclose_missing_on_disk(ranked.missing_on_disk, &mut text, &mut extras);
         disclose_rerank_note(&ranked.rerank_note, &mut text);
         disclose_anchored_admission(ranked.anchored_admission, &mut text, &mut extras);
@@ -8286,6 +8380,7 @@ fn retry_nudge_for_unavailable_detail(detail: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn format_lexical_unavailable_text(
     detail: &str,
     results: &[HybridResult],
@@ -8293,28 +8388,51 @@ fn format_lexical_unavailable_text(
     footer_reason: &str,
     literal_absent: Option<&str>,
 ) -> String {
+    format_lexical_unavailable_text_counted(
+        detail,
+        results,
+        project_root,
+        footer_reason,
+        literal_absent,
+    )
+    .0
+}
+
+fn format_lexical_unavailable_text_counted(
+    detail: &str,
+    results: &[HybridResult],
+    project_root: &Path,
+    footer_reason: &str,
+    literal_absent: Option<&str>,
+) -> (String, usize) {
     if results.is_empty() {
         let retry = retry_nudge_for_unavailable_detail(detail);
-        return format!(
+        return (format!(
             "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic.{retry} [semantic: {footer_reason}]"
-        );
+        ), 0);
     }
 
     // A literal no file contains opens the list with that fact, and the
     // list's files are labelled similar rather than matches.
-    let sections = match literal_absent {
-        Some(literal) => format!(
-            "{}\n\n{}",
-            absent_literal_line(literal),
-            format_result_sections_labelled(results, project_root, None, TextualHits::Similar)
-        ),
-        None => format_result_sections(results, project_root),
-    };
-    format!(
+    let (mut sections, shown) = format_result_sections_counted(
+        results,
+        project_root,
+        None,
+        snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+        if literal_absent.is_some() {
+            TextualHits::Similar
+        } else {
+            TextualHits::Matches
+        },
+    );
+    if let Some(literal) = literal_absent {
+        sections = format!("{}\n\n{sections}", absent_literal_line(literal));
+    }
+    (format!(
         "{detail}\nSemantic search unavailable; returning lexical-only fallback results.\n\n{}\n\nFound {} lexical fallback result(s). [semantic: {footer_reason}]",
         sections,
         results.len()
-    )
+    ), shown)
 }
 
 fn format_grep_lexical_unavailable_text(
@@ -8735,6 +8853,7 @@ fn format_semantic_text(
     )
 }
 
+#[cfg(test)]
 fn format_semantic_text_with_display_root(
     results: &[HybridResult],
     display_root: &Path,
@@ -8755,6 +8874,7 @@ fn format_semantic_text_with_display_root(
 /// The reply text for ranked results. `literal_absent` names a code literal
 /// that occurs in no indexed file: the reply then opens by saying so and
 /// calls its results similar, never matches.
+#[cfg(test)]
 fn format_ranked_text(
     results: &[HybridResult],
     display_root: &Path,
@@ -8763,18 +8883,43 @@ fn format_ranked_text(
     ctx: Option<&AppContext>,
     literal_absent: Option<&str>,
 ) -> String {
+    format_ranked_text_counted(
+        results,
+        display_root,
+        more_available,
+        snippets_incomplete,
+        ctx,
+        literal_absent,
+    )
+    .0
+}
+
+fn format_ranked_text_counted(
+    results: &[HybridResult],
+    display_root: &Path,
+    more_available: bool,
+    snippets_incomplete: bool,
+    ctx: Option<&AppContext>,
+    literal_absent: Option<&str>,
+) -> (String, usize) {
     if results.is_empty() {
-        return "Found 0 results.".to_string();
+        return ("Found 0 results.".to_string(), 0);
     }
 
-    let mut text = match literal_absent {
-        Some(literal) => format!(
-            "{}\n\n{}",
-            absent_literal_line(literal),
-            format_result_sections_labelled(results, display_root, ctx, TextualHits::Similar)
-        ),
-        None => format_result_sections_with_context(results, display_root, ctx),
-    };
+    let (mut text, shown) = format_result_sections_counted(
+        results,
+        display_root,
+        ctx,
+        snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+        if literal_absent.is_some() {
+            TextualHits::Similar
+        } else {
+            TextualHits::Matches
+        },
+    );
+    if let Some(literal) = literal_absent {
+        text = format!("{}\n\n{text}", absent_literal_line(literal));
+    }
     // Drop the unconditional "[index: ready]" tag — it was pure per-call tax on
     // the common path. Degraded/building/unavailable paths carry their own
     // distinct "[semantic: ...]" labels, so absence of a label means ready.
@@ -8804,7 +8949,7 @@ fn format_ranked_text(
             text.push_str("\nRead any result for full source: read <file> [startLine..endLine].");
         }
     }
-    text
+    (text, shown)
 }
 
 fn format_grep_search_text(
@@ -9394,6 +9539,7 @@ fn should_expand_rank0_snippet(rank: usize, result: &HybridResult, project_root:
         && !path_is_test_support_file(&result.file, project_root)
 }
 
+#[cfg(test)]
 fn format_result_sections(results: &[HybridResult], project_root: &Path) -> String {
     format_result_sections_with_context(results, project_root, None)
 }
@@ -9420,6 +9566,7 @@ fn absent_literal_line(literal: &str) -> String {
     ABSENT_LITERAL_LINE.replace("{literal}", literal)
 }
 
+#[cfg(test)]
 fn format_result_sections_with_context(
     results: &[HybridResult],
     project_root: &Path,
@@ -9428,6 +9575,7 @@ fn format_result_sections_with_context(
     format_result_sections_labelled(results, project_root, ctx, TextualHits::Matches)
 }
 
+#[cfg(test)]
 fn format_result_sections_labelled(
     results: &[HybridResult],
     project_root: &Path,
@@ -9465,6 +9613,7 @@ fn format_result_sections_within_budget(
 
 /// [`format_result_sections_within_budget`], labelling each file that holds
 /// a lexical hit as a match or, for an absent literal, as similar.
+#[cfg(test)]
 fn format_result_sections_within_budget_labelled(
     results: &[HybridResult],
     project_root: &Path,
@@ -9472,6 +9621,16 @@ fn format_result_sections_within_budget_labelled(
     max_bytes: usize,
     textual_hits: TextualHits,
 ) -> String {
+    format_result_sections_counted(results, project_root, ctx, max_bytes, textual_hits).0
+}
+
+fn format_result_sections_counted(
+    results: &[HybridResult],
+    project_root: &Path,
+    ctx: Option<&AppContext>,
+    max_bytes: usize,
+    textual_hits: TextualHits,
+) -> (String, usize) {
     // Results arrive sorted by fused score desc. Group by file preserving
     // first-appearance order so the most relevant file's group renders first.
     // A BTreeMap would re-sort groups alphabetically by path and scramble the
@@ -9598,7 +9757,7 @@ fn format_result_sections_within_budget_labelled(
             results.len()
         ));
     }
-    text
+    (text, shown)
 }
 
 /// Append a result's snippet lines at the snippet indent, each line capped by
@@ -15052,6 +15211,63 @@ mod tests {
             format_result_sections_within_budget(&results, Path::new("/project"), None, usize::MAX);
         assert!(uncut.contains("census_019"));
         assert!(!uncut.contains("Output reached"));
+    }
+
+    #[test]
+    fn list_body_budget_search_envelope_uses_the_existing_renderer_count() {
+        let results: Vec<_> = (0..500)
+            .map(|index| long_line_result(index, "snippet ".repeat(100)))
+            .collect();
+        let (text, shown) =
+            format_ranked_text_counted(&results, Path::new("/project"), false, true, None, None);
+        assert!(shown > 0 && shown < results.len());
+        assert!(text.len() < crate::tool_output::LIST_BODY_BYTES + 1024);
+        let mut extras = serde_json::Map::new();
+        extras.insert("rendered_results".into(), serde_json::json!(shown));
+        crate::list_surfaces::search::attach_projected_search_envelope(
+            &mut extras,
+            &ListEnvelope::new(
+                results.len(),
+                Total::Exact(1000),
+                Unit::Results,
+                vec![Reason::Cap],
+                crate::list_surfaces::search::SEARCH_NARROW,
+            ),
+        );
+        let request: RawRequest =
+            serde_json::from_value(serde_json::json!({"id":"budget","command":"semantic_search"}))
+                .unwrap();
+        let response = search_response(
+            &request,
+            SearchResponseParts {
+                query: "snippet",
+                interpreted_as: "lexical",
+                query_kind: "literal",
+                semantic_status: "ready",
+                status: "ready",
+                complete: true,
+                text,
+                results: results.iter().map(result_to_json).collect(),
+                more_available: false,
+                engine_capped: false,
+                fully_degraded: false,
+                warnings: Vec::new(),
+                extras,
+            },
+        );
+        assert_eq!(response.data["results_list_envelope"]["shown"], shown);
+        assert_eq!(response.data["results_list_envelope"]["reason"], "budget");
+        assert_eq!(
+            response.data["results"].as_array().unwrap().len(),
+            500,
+            "native results stay complete"
+        );
+        let text = crate::subc_format::format_response("search", &response, false);
+        assert!(text.len() < crate::tool_output::TEXT_LIMIT);
+        assert!(text.ends_with(&format!(
+            "shown {shown} of 1000 results (budget) · narrow: offset, topK, path, includeTests"
+        )));
+        assert!(!text.contains("[output cut at"));
     }
 
     #[test]

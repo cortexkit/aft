@@ -324,7 +324,7 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
         .expect("write embedding response");
 }
 
-fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+pub(super) fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => {
             if let Some(delay) = configure_sleep_delay(&req) {
@@ -2310,7 +2310,7 @@ fn artifact_storm_config(storage_dir: &Path) -> Value {
     })
 }
 
-fn storm_project_config(
+pub(super) fn storm_project_config(
     search: bool,
     semantic: bool,
     changed: bool,
@@ -2392,7 +2392,7 @@ fn send_interactive_tool(
     }
 }
 
-fn start_io(
+pub(super) fn start_io(
     stream: tokio::net::TcpStream,
 ) -> (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
@@ -2421,7 +2421,7 @@ fn start_io(
     (out_tx, in_rx)
 }
 
-fn send_bind(
+pub(super) fn send_bind(
     tx: &mpsc::UnboundedSender<Frame>,
     channel: u16,
     corr: u64,
@@ -2617,7 +2617,7 @@ fn send_control<T: serde::Serialize>(tx: &mpsc::UnboundedSender<Frame>, corr: u6
     .expect("send control frame");
 }
 
-fn send_tool(
+pub(super) fn send_tool(
     tx: &mpsc::UnboundedSender<Frame>,
     channel: u16,
     corr: u64,
@@ -2650,7 +2650,7 @@ fn send_tool_epoch(
     .expect("send tool frame");
 }
 
-fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64) {
+pub(super) fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64) {
     tx.send(
         Frame::build(
             FrameType::Goodbye,
@@ -2665,7 +2665,7 @@ fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64
     .expect("send route goodbye");
 }
 
-async fn send_goodbye_and_wait(tx: &mpsc::UnboundedSender<Frame>) {
+pub(super) async fn send_goodbye_and_wait(tx: &mpsc::UnboundedSender<Frame>) {
     send_goodbye(tx);
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
@@ -3106,7 +3106,7 @@ fn assert_bind_stats(latencies: &[Duration]) {
     );
 }
 
-async fn expect_lifecycle_event(
+pub(super) async fn expect_lifecycle_event(
     events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
     expected: SubcLifecycleEvent,
 ) {
@@ -3117,7 +3117,7 @@ async fn expect_lifecycle_event(
     assert_eq!(actual, expected, "unexpected detach/rebind lifecycle event");
 }
 
-async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
+pub(super) async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
     loop {
         let frame = rx.recv().await.expect("EOF waiting for RouteBindAck");
         if is_ack(&frame, corr) {
@@ -3126,7 +3126,7 @@ async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u
     }
 }
 
-async fn expect_tool_response_or_watchdog(
+pub(super) async fn expect_tool_response_or_watchdog(
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     corr: u64,
 ) -> Value {

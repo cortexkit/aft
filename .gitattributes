@@ -20,6 +20,8 @@ crates/aft/tests/fixtures/pty_render/*.xterm.txt eol=lf
 # Truncation-contract goldens are compared byte-exact against rendered
 # text (`\n` line ends) on every platform; the same Windows autocrlf rule.
 crates/aft/tests/fixtures/callgraph/truncation/*.txt text eol=lf
+# The tool-result cap golden is compared byte-exact against rendered text.
+crates/aft/tests/fixtures/tool-result-cap.txt text eol=lf
 # Outline source fixtures and byte-exact renderer goldens use LF even when
 # Windows checks out the surrounding repository with core.autocrlf=true.
 crates/aft/tests/fixtures/outline_summaries/** text eol=lf

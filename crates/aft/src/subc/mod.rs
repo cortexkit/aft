@@ -1380,6 +1380,7 @@ pub(crate) fn recovered_bash_frame(
     snapshot: crate::bash_background::registry::BgTaskSnapshot,
     key: &crate::db::call_ledger::Key,
     project_root: &Path,
+    output_scope: Option<crate::tool_output::OutputScope>,
 ) -> Option<(
     crate::db::call_ledger::RecordedFrame,
     String,
@@ -1413,10 +1414,13 @@ pub(crate) fn recovered_bash_frame(
     .to_string();
     let context =
         crate::subc_format::FormatContext::from_tool_call("bash", &json!({}), project_root);
-    let result = ToolCallResult {
+    let mut result = ToolCallResult {
         text: crate::subc_format::format_response_with_context("bash", &response, &context),
         response,
     };
+    if let Some(scope) = output_scope {
+        crate::tool_output::cap_with_scope(&scope, "bash", &result.response, &mut result.text);
+    }
     let frame = build_tool_response_frame(
         PROTOCOL_VERSION,
         route_key(1, 1),
@@ -1478,6 +1482,7 @@ pub(crate) fn project_held_ledger_result(
             // This is a stored terminal body, not delivery to a route. Late
             // readers and keyed replays apply their own recipient policy.
             model_only: false,
+            output_scope: None,
         },
         None,
         source.map(|source| source.to_vec()),
@@ -1612,6 +1617,7 @@ impl RouteIdentity {
 
 #[derive(Debug)]
 struct RouteIdentityData {
+    output_scope: OnceLock<Arc<crate::tool_output::OutputScope>>,
     root: ProjectRootId,
     /// Resolved scope workdir, or the daemon-filled root when no workdir is stamped.
     /// The daemon's project id is retained alongside it in `scope.project_id`;
@@ -8871,6 +8877,7 @@ async fn handle_control_request(
             };
 
             let route_identity = RouteIdentity(Arc::new(RouteIdentityData {
+                output_scope: Default::default(),
                 root: bind_root_id.clone(),
                 project_root: PathBuf::from(&bind_project_root),
                 harness: bind_harness.clone(),
@@ -8941,6 +8948,7 @@ async fn handle_control_request(
                 configure_request_id.clone(),
                 {
                     let standing_actor = Arc::clone(standing_actor);
+                    let output_identity = route_identity.clone();
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
@@ -8953,6 +8961,13 @@ async fn handle_control_request(
                                 None => dispatch(configure_req.clone(), ctx),
                             };
                             if response.success {
+                                output_identity.output_scope.get_or_init(|| {
+                                    Arc::new(crate::tool_output::OutputScope::new(
+                                        ctx,
+                                        &output_identity.session,
+                                        Some(&output_identity.harness),
+                                    ))
+                                });
                                 job_snapshot.store(
                                     ctx.config_live().applied_bind_snapshot().unwrap_or(0),
                                     Ordering::Release,
@@ -10505,6 +10520,13 @@ impl PlainToolRun {
                     // A UI copy must leave completions and cancellation notices
                     // available to the session that actually owns the command.
                     if observation_only {
+                        crate::tool_output::cap(
+                            ctx,
+                            &identity_for_run.session,
+                            &bare_name,
+                            response,
+                            text,
+                        );
                         return;
                     }
                     crate::response_finalize::finalize_tool_response_with_visibility(
@@ -11029,6 +11051,15 @@ async fn handle_tool_call_with_capabilities(
     let restore_watcher = live_roots
         .get(&identity.root)
         .is_some_and(|meta| meta.idle_artifacts_evicted);
+    if let Some(ctx) = executor.actor_context(&identity.root) {
+        identity.output_scope.get_or_init(|| {
+            Arc::new(crate::tool_output::OutputScope::new(
+                &ctx,
+                &identity.session,
+                Some(&identity.harness),
+            ))
+        });
+    }
     if let Some(meta) = live_roots.get_mut(&identity.root) {
         meta.reactivate_bound();
     }
@@ -12045,6 +12076,13 @@ async fn handle_tool_call_with_capabilities(
                                 phase_trace.mark_execute_done();
                                 let finalizer = |response: &mut Response, text: &mut String| {
                                     if carrier_read_only::restricted(&identity_for_run) {
+                                        crate::tool_output::cap(
+                                            ctx,
+                                            &identity_for_run.session,
+                                            &bare_name_for_run,
+                                            response,
+                                            text,
+                                        );
                                         return;
                                     }
                                     crate::response_finalize::finalize_tool_response(
@@ -12798,6 +12836,9 @@ async fn deliver_resolved_subc_response(
         // A rich-UI result is a copy, not delivery to the worker: finalization
         // must not acknowledge completions or consume cancellation notices.
         if carrier_read_only::restricted(identity) {
+            if let Some(ctx) = &ctx {
+                crate::tool_output::cap(ctx, &entry.session_id, &entry.bare_name, response, text);
+            }
             return;
         }
         if let Some(ctx) = &ctx {
@@ -13911,6 +13952,7 @@ pub(crate) mod test_support {
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().into(),
             harness: "runner".into(),
@@ -15182,6 +15224,7 @@ pub(crate) mod test_support {
         harness: &str,
     ) -> RouteIdentity {
         RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
             harness: harness.to_string(),
@@ -20328,6 +20371,7 @@ mod tests {
         let (_dir, root) = test_root("route-bind-b2-ordering");
         let route = route_key(7, 3);
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
@@ -20463,6 +20507,7 @@ mod tests {
         let (_dir, root) = test_root("route-bind-ack-latency");
         let route = route_key(8, 1);
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            output_scope: Default::default(),
             root: root.clone(),
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),

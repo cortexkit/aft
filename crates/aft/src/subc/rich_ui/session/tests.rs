@@ -28,6 +28,7 @@ struct Fixture {
 
 fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
     RouteIdentity(Arc::new(RouteIdentityData {
+        output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
         harness: "mcp:runner/raw harness".into(),

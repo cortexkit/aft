@@ -35,7 +35,7 @@ const GLOB_TRUNCATED_MESSAGE: &str =
 const MAX_FLAT_FILES: usize = 20;
 const MAX_FILES_PER_DIRECTORY: usize = 7;
 const MAX_DISPLAY_FILES_PER_DIRECTORY: usize = 5;
-const MAX_DIRECTORY_SECTIONS: usize = 8;
+const MAX_DIRECTORY_SECTIONS: usize = MAX_DISPLAY_DIRECTORIES;
 const MAX_DISPLAY_DIRECTORIES: usize = 6;
 
 pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -328,8 +328,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let safe_confined_total = all_candidates_checked && !presence_budget_exhausted;
     let walk_truncated = walk_truncated || (confined && !safe_confined_total);
 
+    let (text, rendered_files) =
+        format_glob_output(&files, pattern, &project_root, result_truncated);
     let mut body = serde_json::json!({
-        "text": format_glob_text(&files, pattern, &project_root, result_truncated),
+        "text": text,
+        "rendered_files": rendered_files,
         "complete": all_candidates_checked && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
         "no_files_matched_scope": !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
@@ -864,12 +867,42 @@ fn fallback_glob(
     }
 }
 
+#[cfg(test)]
 fn format_glob_text(
     files: &[PathBuf],
     pattern: &str,
     project_root: &Path,
     truncated: bool,
 ) -> String {
+    format_glob_output(files, pattern, project_root, truncated).0
+}
+
+fn format_glob_output(
+    files: &[PathBuf],
+    pattern: &str,
+    project_root: &Path,
+    truncated: bool,
+) -> (String, usize) {
+    // The existing file-prefix selector must fit long paths too, not only a
+    // fixed number of names. The envelope counts only filenames actually printed.
+    let mut end = files.len();
+    loop {
+        let output =
+            format_glob_selected(&files[..end], files.len(), pattern, project_root, truncated);
+        if output.0.len() <= crate::tool_output::LIST_BODY_BYTES || end == 0 {
+            return output;
+        }
+        end -= 1;
+    }
+}
+
+fn format_glob_selected(
+    files: &[PathBuf],
+    reported_files: usize,
+    pattern: &str,
+    project_root: &Path,
+    truncated: bool,
+) -> (String, usize) {
     // Convert to relative paths within project
     let relative_files: Vec<PathBuf> = files
         .iter()
@@ -878,18 +911,16 @@ fn format_glob_text(
 
     let header = format!(
         "{} {} matching {}",
-        relative_files.len(),
-        if relative_files.len() == 1 {
-            "file"
-        } else {
-            "files"
-        },
+        reported_files,
+        if reported_files == 1 { "file" } else { "files" },
         pattern
     );
 
+    let mut shown = 0;
     let text = if relative_files.is_empty() {
         header
     } else if relative_files.len() <= MAX_FLAT_FILES {
+        shown = relative_files.len();
         let body = relative_files
             .iter()
             .map(|path| path.display().to_string())
@@ -907,6 +938,11 @@ fn format_glob_text(
 
         let mut sections = Vec::new();
         for (directory, names) in grouped.iter().take(displayed_directories) {
+            shown += if names.len() > MAX_FILES_PER_DIRECTORY {
+                MAX_DISPLAY_FILES_PER_DIRECTORY
+            } else {
+                names.len()
+            };
             let file_word = if names.len() == 1 { "file" } else { "files" };
             let names_text = if names.len() > MAX_FILES_PER_DIRECTORY {
                 format!(
@@ -960,9 +996,9 @@ fn format_glob_text(
     };
 
     if truncated {
-        format!("{}\n\n{}", text, GLOB_TRUNCATED_MESSAGE)
+        (format!("{}\n\n{}", text, GLOB_TRUNCATED_MESSAGE), shown)
     } else {
-        text
+        (text, shown)
     }
 }
 
@@ -993,6 +1029,25 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_body_budget_glob_counts_the_long_path_prefix_it_renders() {
+        let root = Path::new("/project");
+        let files: Vec<_> = (0..20)
+            .map(|i| root.join("deep/".repeat(600)).join(format!("file_{i}.rs")))
+            .collect();
+        let (text, shown) = format_glob_output(&files, "**/*.rs", root, false);
+        assert!(shown > 0 && shown < files.len());
+        assert!(text.len() <= crate::tool_output::LIST_BODY_BYTES);
+        assert_eq!(
+            shown,
+            text.lines()
+                .filter(|line| line.ends_with(".rs") && !line.contains(" matching "))
+                .count()
+        );
+        let data = serde_json::json!({"files":files,"text":text,"rendered_files":shown});
+        assert_eq!(crate::subc_format::rendered_glob_file_count(&data), shown);
+    }
 
     #[test]
     fn glob_bulk_fixture_preserves_examined_lower_bound() {
