@@ -11397,6 +11397,8 @@ fn direct_caller_count_for_tuple(
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
+// One reference can emit several edges. Preserve positional order, then break
+// ties by stored target identity so graph construction and patching agree.
 fn direct_callers_for_tuple(
     conn: &Connection,
     target_file: &str,
@@ -11418,7 +11420,8 @@ fn direct_callers_for_tuple(
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
          WHERE e.kind IN ('call', 'callback_ref') AND e.target_file = ?1 AND e.target_symbol = ?2
-         ORDER BY e.source_node, r.byte_start, r.line, r.ref_id",
+         ORDER BY e.source_node, r.byte_start, r.line, r.ref_id,
+                  e.target_file, e.target_symbol, e.target_node, e.provenance, e.kind",
     )?;
     let rows = stmt.query_map(
         params![target_file, target_symbol],
@@ -11473,7 +11476,8 @@ fn direct_callers_batch_sql(requested_values: &str) -> String {
             AND tgt.file_path IN (SELECT path FROM files)
          LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path
          ORDER BY e.target_file, e.target_symbol, e.source_node,
-                  r.byte_start, r.line, r.ref_id"
+                  r.byte_start, r.line, r.ref_id,
+                  e.target_node, e.provenance, e.kind"
     )
 }
 
@@ -11555,7 +11559,8 @@ fn outgoing_calls_for_symbol_tuples(
              LEFT JOIN nodes tgt ON tgt.id = e.target_node
              LEFT JOIN files tgt_file ON tgt_file.path = tgt.file_path
              WHERE e.kind = 'call' AND e.source_node IN ({placeholders})
-             ORDER BY e.source_node, r.byte_start, r.line, r.ref_id"
+             ORDER BY e.source_node, r.byte_start, r.line, r.ref_id,
+                      e.target_file, e.target_symbol, e.target_node, e.provenance"
         );
         let bindings = chunk.iter().map(|node| node.node_id.as_str());
         let mut stmt = conn.prepare(&sql)?;
@@ -11700,7 +11705,8 @@ fn outgoing_calls_for_node_limited(
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.source_node = ?1
-          ORDER BY r.byte_start, r.line, r.ref_id LIMIT ?2",
+          ORDER BY r.byte_start, r.line, r.ref_id,
+                   e.target_file, e.target_symbol, e.target_node, e.provenance LIMIT ?2",
     )?;
     let rows = stmt.query_map(
         params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)],
