@@ -42,12 +42,10 @@ fn reusable_content_stat(stat: &NativeStat, observed_ns: u128) -> bool {
     #[cfg(unix)]
     let regular = stat.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32;
     #[cfg(windows)]
-    let regular = {
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        };
-        stat.mode & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
-    };
+    // NativeStat reads FILE_BASIC_INFO.ChangeTime, but it is a clock timestamp,
+    // not a write counter: rapid writes can keep both it and LastWriteTime.
+    // Windows must re-hash even when all native metadata compares equal.
+    let regular = false;
     #[cfg(not(any(unix, windows)))]
     let regular = false;
     regular
@@ -1415,6 +1413,7 @@ mod tests {
         assert_eq!(store.verified_content_hash(&file), hash("again"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn inspect_freshness_progress_shares_proofs_across_reports_and_evicts_with_them() {
         let temp = tempfile::tempdir().unwrap();
@@ -1434,6 +1433,28 @@ mod tests {
         assert_eq!(store.estimated_memory(), store.recounted_memory());
         assert_eq!(store.verified_content.lock().entries.len(), 1);
         store.publish(key, temp.path().join("b.ts"), Vec::new());
+        assert!(store.verified_content.lock().entries.is_empty());
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inspect_freshness_progress_windows_rehashes_even_unchanged_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a.ts");
+        std::fs::write(&file, "first").unwrap();
+        let key = server_key(ServerKind::TypeScript);
+        let mut store = DiagnosticsStore::new();
+        store.publish(key.clone(), file.clone(), Vec::new());
+        let before = super::super::document::CONTENT_HASH_READS.with(|reads| reads.get());
+        let hash = Some(*blake3::hash(b"first").as_bytes());
+        assert_eq!(store.verified_content_hash(&file), hash);
+        store.publish(key, file.clone(), Vec::new());
+        assert_eq!(store.verified_content_hash(&file), hash);
+        assert_eq!(
+            super::super::document::CONTENT_HASH_READS.with(|reads| reads.get()),
+            before + 2
+        );
         assert!(store.verified_content.lock().entries.is_empty());
         assert_eq!(store.estimated_memory(), store.recounted_memory());
     }
