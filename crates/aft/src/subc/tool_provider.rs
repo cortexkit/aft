@@ -4026,6 +4026,12 @@ mod tests {
     #[test]
     #[ignore = "explicit fixture regeneration, not a verification gate"]
     fn regenerate_tool_provider_catalog() {
+        let output_root = std::env::var_os("AFT_GENERATED_OUTPUT_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+            });
+        std::fs::create_dir_all(&output_root).unwrap();
         for (relative, _) in CATALOG_FIXTURES {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
             let mut fixtures: Value =
@@ -4043,7 +4049,7 @@ mod tests {
                 .unwrap();
             }
             std::fs::write(
-                path,
+                output_root.join(path.file_name().unwrap()),
                 format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
             )
             .unwrap();

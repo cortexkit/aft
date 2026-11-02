@@ -27,7 +27,8 @@ import {
 } from "../packages/pi-plugin/src/config.ts";
 
 const REPO_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
-const FIXTURES_ROOT = join(REPO_ROOT, "crates/aft/tests/fixtures/config_parity");
+const FIXTURES_ROOT =
+  process.env.AFT_GENERATED_OUTPUT_DIR ?? join(REPO_ROOT, "crates/aft/tests/fixtures/config_parity");
 
 type TierContent = string | Record<string, unknown> | undefined;
 
