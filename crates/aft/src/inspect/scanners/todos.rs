@@ -811,6 +811,30 @@ mod tests {
         }
     }
 
+    /// Run in its own process under `/usr/bin/time -v`; fixtures are prepared
+    /// separately so their allocation and write cost do not enter the peak
+    /// resident set size (RSS).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "large-input RSS probe; requires AFT_TODO_RSS_ROOT on Linux"]
+    fn todos_large_json_rss_probe() {
+        let root = PathBuf::from(std::env::var_os("AFT_TODO_RSS_ROOT").expect("fixture root"));
+        let paths = ["data-100.json", "data-125.json", "data-150.json", "small.rs"]
+            .map(|name| root.join(name))
+            .to_vec();
+        reset_file_read_count_for_debug(&root);
+        let result = run_todos_scan_with_memo(&todos_job(&root, paths), &Tier1FileMemo::default())
+            .outcome
+            .expect("TODO scan");
+        assert_eq!(result.aggregate["count"], 1);
+        eprintln!(
+            "TODO RSS probe: reads={}, scanned={}, aggregate={}",
+            file_read_count_for_debug(&root),
+            result.scanned_files.len(),
+            result.aggregate
+        );
+    }
+
     #[test]
     fn quiesced_root_aborts_real_executor_todos_scan_mid_parse() {
         executor_todos_abandonment(false, false);
