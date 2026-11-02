@@ -3,7 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/src/gh_shim.rs"
+    "harness-goldens"
   ],
   "slices": [
     "land-gh-status-audit-summary"
