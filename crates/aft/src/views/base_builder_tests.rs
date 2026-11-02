@@ -34,12 +34,16 @@ fn dead_claim(storage: &Path, scope: &str, token: &str, attempt: i64) {
 }
 
 fn capped_bases(storage: &Path) -> Vec<String> {
+    crate::root_cache::register_durable_owner(&crate::root_cache::StoragePaths::same(storage))
+        .unwrap();
     let scopes: Vec<_> = (0..LIVE_BASES_PER_FAMILY)
         .map(|index| crate::views::base_refs::base_scope_for(&[index as u8; 32]))
         .collect();
     with_base_barrier(storage, FAMILY, |tx| {
         for scope in &scopes {
-            register_base_in(tx, storage, FAMILY, scope)?;
+            let (dir, _) = register_base_in(tx, storage, FAMILY, scope)?;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("base-payload"), b"unused base")?;
         }
         Ok(())
     })
@@ -63,7 +67,7 @@ fn registered_bases(storage: &Path) -> Vec<String> {
 fn live_base_cap_reclaims_unreferenced_bases_then_admits() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
-    capped_bases(storage.path());
+    let scopes = capped_bases(storage.path());
     let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _hook = crate::storage_retention::observe_test_hook(
         storage.path(),
@@ -86,6 +90,11 @@ fn live_base_cap_reclaims_unreferenced_bases_then_admits() {
         ClaimOutcome::Claimed(_)
     ));
     assert!(registered_bases(storage.path()).len() < LIVE_BASES_PER_FAMILY as usize);
+    assert!(scopes
+        .iter()
+        .any(|scope| !v3::view_dir(storage.path(), FAMILY, scope)
+            .unwrap()
+            .exists()));
     assert_eq!(concurrent.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
@@ -108,6 +117,12 @@ fn live_base_cap_reclaim_preserves_pins_and_live_builds() {
     assert!(remaining.contains(&scopes[0]));
     assert!(remaining.contains(&scopes[1]));
     assert!(remaining.len() < scopes.len());
+    assert!(v3::view_dir(storage.path(), FAMILY, &scopes[0])
+        .unwrap()
+        .exists());
+    assert!(v3::view_dir(storage.path(), FAMILY, &scopes[1])
+        .unwrap()
+        .exists());
 }
 
 #[test]

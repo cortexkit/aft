@@ -182,15 +182,36 @@ fn views_live_base_cap_held_callgraph_borrows_main_with_existing_note() {
     assert!(response.success, "{:#}", response.data);
     let text = response.data.to_string();
     assert!(text.contains("borrowed from"), "{text}");
-    assert!(
-        response.data["borrowed_coverage"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("lib.rs")),
+    assert_eq!(
+        response.data["borrowed_coverage"]["differing_files"], 1,
         "{text}"
     );
+    assert_eq!(
+        response.data["borrowed_coverage"]["name_matched"], 1,
+        "{text}"
+    );
+    assert_eq!(response.data["callers"][0]["file"], "lib.rs", "{text}");
     assert_eq!(response.data["complete"], false, "{text}");
     assert!(!text.contains("This is an AFT bug"), "{text}");
     assert!(f.worker.borrowed_callgraph_view().is_some());
+    let empty = crate::commands::callers::handle_callers(
+        &RawRequest {
+            id: "cap-empty".into(),
+            command: "callers".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: serde_json::json!({"file": f.root.join("lib.rs"), "symbol": "caller"}),
+        },
+        &f.worker,
+    );
+    assert!(empty.success, "{:#}", empty.data);
+    assert!(
+        empty.data["borrowed_coverage"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("lib.rs")),
+        "{:#}",
+        empty.data
+    );
     assert!(f.cap_hits() > 0);
     f.assert_no_failure();
 }
