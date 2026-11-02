@@ -156,7 +156,11 @@ fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() 
     let tool = call_while_probe_is_held(false, false);
     assert_eq!(tool["success"], false, "{tool}");
     assert_eq!(tool["code"], "folder_not_admitted", "{tool}");
-    assert_eq!(tool["reason"], "no_project_evidence", "{tool}");
+    // The fixture declares not-project intent, so the decision it was held for
+    // is the declared one. Evidence rules for the same bare folder are covered
+    // by the classifier's own tests, which do not depend on where TMPDIR is.
+    assert_eq!(tool["reason"], "user_override", "{tool}");
+    assert_eq!(tool["folder"]["override_mode"], "off", "{tool}");
     assert_eq!(
         tool["message"],
         aft::folder_admission_runtime::OFF_TEXT,
