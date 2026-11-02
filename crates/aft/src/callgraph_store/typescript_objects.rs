@@ -66,7 +66,7 @@ impl<'a> ObjectDispatch<'a> {
                         &import.module_path,
                         &lazy.module_resolution_memo,
                         &facts,
-                        &|path| lazy.contains_file(path),
+                        &|path: &str| lazy.contains_file(path),
                     ),
                 );
             }
