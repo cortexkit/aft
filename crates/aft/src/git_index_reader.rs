@@ -639,7 +639,8 @@ impl Drop for ConfigTimeoutGuard {
     }
 }
 
-/// Expire one real config child at its native pipe deadline without a sleep.
+/// Make the next real `git config` child time out at once (a zero pipe
+/// timeout), so tests reach the timeout path without sleeping.
 #[cfg(test)]
 pub(crate) fn timeout_next_config_for_test() -> ConfigTimeoutGuard {
     ConfigTimeoutGuard(CONFIG_TIMEOUT_ONCE.with(|slot| slot.replace(true)))
