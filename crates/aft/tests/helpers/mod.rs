@@ -127,15 +127,11 @@ fn prepare_fixture_temp_directory() {
     std::env::set_var("TMP", &relocated);
 }
 
+/// Whether fixtures can be created in `directory` without inheriting project
+/// evidence. An unwritable candidate is simply unusable, so the caller can try
+/// the next one; the last check reports why nothing worked.
 fn temp_outside_git_work_tree(directory: &Path) -> bool {
-    match std::fs::create_dir_all(directory) {
-        Ok(()) => {}
-        Err(error) => panic!(
-            "create test temp directory {}: {error}",
-            directory.display()
-        ),
-    }
-    git_work_tree_of(directory).is_none()
+    std::fs::create_dir_all(directory).is_ok() && git_work_tree_of(directory).is_none()
 }
 
 /// The work tree Git reports for `path`, or `None` when it is outside one.
