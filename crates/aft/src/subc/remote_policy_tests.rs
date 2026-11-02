@@ -2572,6 +2572,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     init_remote_git_fixture(root.path());
     std::fs::create_dir(sibling.path().join(".git")).unwrap();
     let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    ctx.update_config(|config| config.restrict_to_project_root = false);
     let mut head = identity(root.path(), "siblings-submit-head", 7, true);
     let stamp = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
     stamp.kind = subc_protocol::scope::ScopeKind::Head;
@@ -2604,6 +2605,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     catalog(
         json!({"preset":"worker", "params":{
             "remote_exec":{"enabled":true}, "siblings":[path],
+            "mode":"ask",
             "allow_paths":[{"path":path, "mode":"read"}]
         }}),
         &worker,
@@ -2617,15 +2619,33 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
             .unwrap(),
         1
     );
-    let _scope = crate::access_policy::scope_guard(Some(scope));
+    let _scope = crate::access_policy::scope_guard(Some(scope.clone()));
     let _ask =
         crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
             once: vec![],
             launch: access_grants::launch_key(&worker, "worker"),
         }));
+    let read = ctx
+        .validate_read_path("siblings-read-control", &worker.session, &path)
+        .unwrap_err();
+    assert_eq!(read.data["code"], crate::access_policy::ACCESS_ASK_REQUIRED);
+    let asks_before_submit = crate::context::confinement::ask_calls();
     crate::bash_background::registry::remote::assert_siblings_submit_refused_before_connect(
         &ctx, launch, &daemon,
     );
+    assert_eq!(
+        crate::context::confinement::ask_calls(),
+        asks_before_submit,
+        "sibling submission must not enter the consent ask handler"
+    );
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert!(crate::db::access_asks::for_scope(&conn, &scope)
+        .unwrap()
+        .is_empty());
+    assert!(crate::db::access_grants::list(&conn, &scope)
+        .unwrap()
+        .is_empty());
 }
 
 #[cfg(unix)]

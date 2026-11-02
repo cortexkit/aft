@@ -6496,6 +6496,32 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
     );
 }
 
+#[test]
+fn runon_siblings_refusal_line_is_pinned_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let folder = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .join("not-a-checkout");
+    std::fs::create_dir(&folder).unwrap();
+    let mut policy = launch(dir.path().join("unused-connection.json"));
+    policy.params.siblings = vec![folder.to_str().unwrap().into()];
+    let response = handle_with_policy(
+        &ctx,
+        Some(policy),
+        serde_json::json!({"command":"true", "runon":"linux", "background":true}),
+    );
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_run_refused");
+    assert_eq!(
+        response.data["message"].as_str().unwrap().as_bytes(),
+        b"runon refused: siblings must be git checkout roots the session's file tools may read; the command was not run"
+    );
+}
+
 #[tokio::test]
 async fn runon_windows_not_advertised_refuses_without_remote_or_local_spawn() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;

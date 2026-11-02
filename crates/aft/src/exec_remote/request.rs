@@ -36,8 +36,9 @@ pub enum RootConfinement {
 }
 
 impl FrozenParams {
-    /// Authorize snapshot inputs with the file tools' read gate. A permission
-    /// request is a refusal here, not authority to export an outside checkout.
+    /// Authorize snapshot inputs with the file tools' read policy. Paths needing
+    /// approval are refused without triggering consent prompts or plugin approval
+    /// requests.
     pub(crate) fn validate_siblings(
         &mut self,
         ctx: &crate::context::AppContext,
@@ -54,7 +55,7 @@ impl FrozenParams {
                 }
                 let path = crate::bounded_io::canonicalize(path).map_err(|_| SIBLINGS_REFUSAL)?;
                 let path = ctx
-                    .validate_read_path(request_id, session_id, &path)
+                    .validate_read_path_without_approval(request_id, session_id, &path)
                     .map_err(|_| SIBLINGS_REFUSAL)?;
                 let marker = crate::bounded_io::metadata(&path.join(".git"))
                     .map_err(|_| SIBLINGS_REFUSAL)?;
@@ -109,6 +110,7 @@ impl FrozenParams {
     }
 }
 
+// Agent-visible refusal wording. Approved by Ufuk (2026-11-02).
 pub(crate) const SIBLINGS_REFUSAL: &str =
     "siblings must be git checkout roots the session's file tools may read; the command was not run";
 
