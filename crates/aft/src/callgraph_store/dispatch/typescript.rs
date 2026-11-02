@@ -68,10 +68,11 @@ fn binding_scope(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "catch_clause" {
         return Some(node);
     }
-    let function_scoped = node.kind() == "variable_declarator"
-        && node
-            .parent()
-            .is_some_and(|p| p.kind() == "variable_declaration");
+    let function_scoped = node.kind() == "for_in_statement"
+        || node.kind() == "variable_declarator"
+            && node
+                .parent()
+                .is_some_and(|p| p.kind() == "variable_declaration");
     let mut parent = node.parent()?;
     loop {
         if scope(parent)
@@ -239,6 +240,18 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let mut current = identifier.parent();
         while let Some(ancestor) = current {
             if scope(ancestor) {
+                if ancestor.kind() == "for_in_statement"
+                    && field(ancestor, &["left"]).is_some_and(|left| {
+                        descendants(left).iter().any(|n| {
+                            matches!(
+                                n.kind(),
+                                "identifier" | "shorthand_property_identifier_pattern"
+                            ) && text(*n, self.source) == name
+                        })
+                    })
+                {
+                    return Some(ancestor);
+                }
                 if FUNCTIONS.contains(&ancestor.kind())
                     && field(ancestor, &["parameter"]).is_some_and(|p| text(p, self.source) == name)
                 {
@@ -261,15 +274,20 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                                 | "function_declaration"
                                 | "class_declaration"
                                 | "catch_clause"
-                        ) && field(**n, &["name", "pattern", "parameter"]).is_some_and(|key| {
-                            text(key, self.source) == name
-                                || descendants(key).iter().any(|n| {
-                                    matches!(
-                                        n.kind(),
-                                        "identifier" | "shorthand_property_identifier_pattern"
-                                    ) && text(*n, self.source) == name
-                                })
-                        }) && binding_scope(**n) == Some(ancestor)
+                                | "for_in_statement"
+                                | "enum_declaration"
+                                | "internal_module"
+                        ) && field(**n, &["name", "pattern", "parameter", "left"]).is_some_and(
+                            |key| {
+                                text(key, self.source) == name
+                                    || descendants(key).iter().any(|n| {
+                                        matches!(
+                                            n.kind(),
+                                            "identifier" | "shorthand_property_identifier_pattern"
+                                        ) && text(*n, self.source) == name
+                                    })
+                            },
+                        ) && binding_scope(**n) == Some(ancestor)
                     })
                     .copied()
                     .collect::<Vec<_>>();
@@ -371,7 +389,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     };
                     self.returned_object(function).map(object_identity)
                 } else if self.imports.contains(name) {
-                    Some(format!("@return:{name}"))
+                    let import = self.nodes.iter().find(|n| n.kind() == "import_statement")?;
+                    (!self.written(*import, name)).then(|| format!("@return:{name}"))
                 } else {
                     None
                 }
