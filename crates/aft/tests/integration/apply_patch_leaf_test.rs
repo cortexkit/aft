@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-#[cfg(unix)]
 use super::helpers::AftProcess;
 
 fn configured_aft(project: &Path) -> AftProcess {
