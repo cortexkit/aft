@@ -3113,7 +3113,7 @@ fn write_task_in_dir(
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    if sync_unchanged_metadata(dir, name, &content, sync)? {
+    if sync_unchanged_metadata(dir, name, &content, sync) {
         return Ok(());
     }
     #[cfg(test)]
@@ -3127,31 +3127,32 @@ fn write_task_in_dir(
 /// Compare the file, not an in-memory cache: another registry can acknowledge
 /// a completed task through the same pinned directory. Equal bytes need no
 /// replacement, but a durable state write must still sync an earlier checkpoint
-/// whose rename may not have reached disk yet.
+/// whose rename may not have reached disk yet. A failed shortcut sync falls
+/// back to replacement with the same durability requirements.
 fn sync_unchanged_metadata(
     dir: &PinnedDir,
     name: &OsStr,
     content: &[u8],
     sync: ReplaceSync,
-) -> io::Result<bool> {
+) -> bool {
     let Ok(mut file) = dir.open_file(name, sync != ReplaceSync::None) else {
         // Missing, unreadable or non-regular metadata can still be replaced.
-        return Ok(false);
+        return false;
     };
     let mut previous = vec![0; content.len()];
     if file.read_exact(&mut previous).is_err()
         || previous != content
         || file.read(&mut [0]).ok() != Some(0)
     {
-        return Ok(false);
+        return false;
     }
-    if sync != ReplaceSync::None {
-        sync_task_file(&file)?;
+    if sync != ReplaceSync::None && sync_task_file(&file).is_err() {
+        return false;
     }
-    if sync == ReplaceSync::FileAndDirectory {
-        sync_task_file(&dir.file)?;
+    if sync == ReplaceSync::FileAndDirectory && sync_task_directory(dir).is_err() {
+        return false;
     }
-    Ok(true)
+    true
 }
 
 #[cfg(test)]
@@ -3161,6 +3162,7 @@ pub(crate) enum TaskIoFault {
     RecordWriteNotFound,
     OutputHandlesEnospc,
     OutputHandlesMisleadingText,
+    SyncFailureAfter(usize),
     RunningEnospc,
     #[cfg(unix)]
     RunningDelay(std::time::Duration),
@@ -4916,11 +4918,60 @@ pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
     #[cfg(test)]
+    if TASK_IO_FAULT.with(|slot| match slot.get() {
+        Some(TaskIoFault::SyncFailureAfter(0)) => {
+            slot.set(None);
+            true
+        }
+        Some(TaskIoFault::SyncFailureAfter(remaining)) => {
+            slot.set(Some(TaskIoFault::SyncFailureAfter(remaining - 1)));
+            false
+        }
+        _ => false,
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected task sync failure",
+        ));
+    }
+    #[cfg(test)]
     let started = std::time::Instant::now();
     let result = file.sync_all();
     #[cfg(test)]
     work_counts::record_sync_time(started.elapsed());
     result
+}
+
+fn sync_task_directory(dir: &PinnedDir) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        sync_task_file(&dir.file)
+    }
+    #[cfg(windows)]
+    {
+        // FlushFileBuffers requires GENERIC_WRITE even for a directory. Keep
+        // ordinary pinned opens read-only; acquire write access only to flush,
+        // and verify that the reopened handle still names the pinned folder.
+        let writable = PinnedDir {
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&dir.path)?,
+            path: dir.path.clone(),
+            #[cfg(test)]
+            cache_device_override: dir.cache_device_override,
+        };
+        validate_directory_handle(&writable.file)?;
+        if !dir.same_identity(&writable)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pinned directory path identity changed",
+            ));
+        }
+        sync_task_file(&writable.file)?;
+        dir.ensure_current_identity()
+    }
 }
 
 fn atomic_replace(
@@ -4950,7 +5001,7 @@ fn atomic_replace(
             #[cfg(test)]
             atomic_replace_crash_for_test(true);
             if sync == ReplaceSync::FileAndDirectory {
-                sync_task_file(&dir.file)?;
+                sync_task_directory(dir)?;
             }
             Ok(())
         })();

@@ -59,6 +59,66 @@ fn metadata_persistence_equal_checkpoint_keeps_durability_upgrade() {
     );
 }
 
+#[test]
+fn metadata_persistence_shortcut_sync_failure_retries_durable_replacement() {
+    for failed_sync in [0, 1] {
+        let storage = tempfile::tempdir().unwrap();
+        let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+        let metadata = metadata(&task);
+        write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
+        work_counts::reset();
+        with_task_io_fault(TaskIoFault::SyncFailureAfter(failed_sync), || {
+            write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory)
+        })
+        .unwrap();
+        let counts = work_counts::get();
+        assert_eq!(counts.metadata_writes, 1);
+        assert_eq!(counts.renames, 1);
+        // The shortcut reaches the injected file/directory failure, then the
+        // replacement must successfully sync both its new file and directory.
+        assert_eq!(counts.syncs, failed_sync + 3);
+        assert_eq!(
+            fs::read(&task.paths.json).unwrap(),
+            serde_json::to_vec_pretty(&metadata).unwrap()
+        );
+    }
+}
+
+#[test]
+fn metadata_persistence_replacement_sync_failure_preserves_old_record() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let mut metadata = metadata(&task);
+    write_task_at_with(&task, &metadata, ReplaceSync::File).unwrap();
+    let old = fs::read(&task.paths.json).unwrap();
+    metadata.command.push_str(" changed");
+    work_counts::reset();
+    let error = with_task_io_fault(TaskIoFault::SyncFailureAfter(0), || {
+        write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory)
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(work_counts::get().metadata_writes, 1);
+    assert_eq!(work_counts::get().syncs, 1);
+    assert_eq!(work_counts::get().renames, 0);
+    assert_eq!(fs::read(&task.paths.json).unwrap(), old);
+}
+
+#[cfg(windows)]
+#[test]
+fn metadata_persistence_directory_sync_refuses_replaced_pinned_directory() {
+    let storage = tempfile::tempdir().unwrap();
+    let path = storage.path().join("pinned");
+    fs::create_dir(&path).unwrap();
+    let dir = PinnedDir::open(&path).unwrap();
+    fs::rename(&path, storage.path().join("moved")).unwrap();
+    fs::create_dir(&path).unwrap();
+    work_counts::reset();
+    let error = sync_task_directory(&dir).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(work_counts::get().syncs, 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn metadata_persistence_compare_open_failure_falls_back_to_durable_replacement() {
