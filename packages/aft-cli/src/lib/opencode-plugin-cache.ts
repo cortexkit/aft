@@ -47,7 +47,8 @@ export function discoverOpenCodePluginCache(
   configuredEntry?: string,
 ): PluginCacheInfo {
   const v1 = join(root, "packages", entry);
-  const v2 = join(root, "npm", entry);
+  // OpenCode normalizes a bare registry name to the `latest` cache key.
+  const v2 = join(root, "npm", entry === AFT_OPENCODE_PACKAGE ? `${entry}@latest` : entry);
   const paths: string[] = [];
   if (generation !== "v1") {
     try {

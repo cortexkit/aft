@@ -76,4 +76,13 @@ describe("OpenCode plugin cache discovery", () => {
     installed(join(cache, "npm", entry, "10"), "0.64.0");
     expect(discoverOpenCodePluginCache(cache, entry, "v1", "0.63.4", entry).cached).toBe("0.63.5");
   });
+
+  test("V2 resolves a bare configured package through the latest cache key", () => {
+    const cache = root();
+    installed(join(cache, "npm", `${name}@latest`, "10"), "0.63.5");
+    const found = discoverOpenCodePluginCache(cache, name, "v2", "0.63.4", name);
+    expect(found.cached).toBe("0.63.5");
+    expect(found.configuredEntry).toBe(name);
+    expect(found.path).toBe(join(cache, "npm", `${name}@latest`, "10"));
+  });
 });

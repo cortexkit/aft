@@ -39,8 +39,8 @@ async function genuineNpm(candidate: ResolvedNpm): Promise<{ npm?: ResolvedNpm; 
         if (!major) return { reason: "probe failed: npm manifest has an unknown version" };
         if (Number(major) < 7)
           return { reason: `old npm: ${pkg.version} (requires npm 7 or newer)` };
-        if (windowsShim) {
-          const node = join(dirname(executable), "node.exe");
+        if (windowsShim || (process.platform === "win32" && /\.[cm]?js$/i.test(cli))) {
+          const node = join(candidate.binDir ?? dirname(executable), "node.exe");
           if (!(await stat(node)).isFile())
             return { reason: "probe failed: adjacent Node is missing" };
           return { npm: { command: node, binDir: dirname(node), cliPath: cli }, reason: "" };

@@ -416,13 +416,14 @@ describe("doctor never downgrades OpenCode", () => {
     { host: V2, spec: newer, installed: undefined },
     { host: V2, spec: newer, installed: newer },
     { host: V2, spec: "latest", installed: newer },
+    { host: V2, spec: "bare", installed: newer },
     { host: V2, spec: "latest", installed: undefined },
     { host: V2, spec: "^0.63.0", installed: undefined },
     { host: V2, spec: `${newer}-beta.2`, installed: `${newer}-beta.2` },
   ];
   for (const { host, spec, installed } of cases) {
     test(`${host.status} ${spec} installed=${installed ?? "missing"}: diagnosis, plan and --fix --yes preserve bytes`, async () => {
-      const entry = `${AFT_OPENCODE_PACKAGE}@${spec}`;
+      const entry = spec === "bare" ? AFT_OPENCODE_PACKAGE : `${AFT_OPENCODE_PACKAGE}@${spec}`;
       const { adapter, report } = fixture(entry, installed ?? newer);
       rmSync(join(root, "xdg-cache"), { recursive: true, force: true });
       adapter.useHostDetection(host);
@@ -437,7 +438,12 @@ describe("doctor never downgrades OpenCode", () => {
         // Independently construct the host's layout, not the adapter's returned path.
         const path =
           host.status === "v2"
-            ? join(root, "xdg-cache/opencode/npm", entry, "1793616638229")
+            ? join(
+                root,
+                "xdg-cache/opencode/npm",
+                spec === "bare" ? `${AFT_OPENCODE_PACKAGE}@latest` : entry,
+                "1793616638229",
+              )
             : join(root, "xdg-cache/opencode/packages", entry);
         writeInstalledPlugin(path, installed);
       }

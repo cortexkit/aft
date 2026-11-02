@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "../child-process.js";
@@ -25,6 +25,23 @@ function wrapper(version: string) {
 }
 
 describe("protected LSP npm selection", () => {
+  test("direct Node invocations cache capability by npm CLI identity, not the Node executable", async () => {
+    const npm = wrapper("11.6.0");
+    const cliPath = join(npm.binDir, "npm.mjs");
+    const otherCli = join(npm.binDir, "other-npm.mjs");
+    writeFileSync(cliPath, 'console.log("11.6.0");\n');
+    writeFileSync(otherCli, 'console.log("6.14.0");\n');
+    const direct = { command: process.execPath, cliPath, binDir: null };
+    const before = "2020-01-01T00:00:00.000Z";
+    expect(await lspNpmInstallInvocation(direct, "fixture", before)).not.toBeNull();
+    expect(
+      await lspNpmInstallInvocation({ ...direct, cliPath: otherCli }, "fixture", before),
+    ).toBeNull();
+    writeFileSync(cliPath, 'console.log("6.14.0");\n');
+    const changed = new Date(Date.now() + 1000);
+    utimesSync(cliPath, changed, changed);
+    expect(await lspNpmInstallInvocation(direct, "fixture", before)).toBeNull();
+  });
   for (const version of ["pnpm/11.1.2", "11.1.2"]) {
     for (const pinned of [false, true]) {
       test(`refuses ${version} wrapper for ${pinned ? "pinned" : "unpinned"} installs`, async () => {
