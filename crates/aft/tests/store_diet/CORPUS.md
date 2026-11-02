@@ -31,8 +31,8 @@ program pins same-named overload/arity behavior. The Rust default-trait/dynamic
 receiver program exercises default-method dispatch. The actual writer probe
 separately supplies one dispatch identity with two provenances and checks its
 last-write winner. The top-level TS and final Java inputs cover the otherwise
-missing file-summary/top-caller values and `closed=true`, the flag indicating
-a final class cannot have overriding subclasses. Each authored input has
+missing top-level-call and `closed=true` values, the latter indicating a final
+class cannot have overriding subclasses. Each authored input has
 a `new_for` obligation in the manifest. A one-byte invalid
 UTF-8 source in the lifecycle probe exists solely to exercise the legitimate
 `undecodable` backend status. Its valid Rust companion reuses the established
@@ -67,6 +67,13 @@ expose bare GROUP BY representatives, unordered node selection, tied ambiguity
 candidates, duplicate ordinals, target replacement order and prefix paths.
 Those consumer probes supplement, rather than alter, the copied source inputs.
 See `order.md` for the key and row/write-order obligations.
+
+The compatible-stored-shape control supplies three valid schema cases that
+ordinary source fixtures do not emit: `file_summary` node kind (normally a
+semantic-index synthesized value), a dispatch hint with no caller, and a dispatch
+site with no BlobRef/refs row. It uses the real row writer and materializer and
+records the stored values and shape counts. These are explicit structured input
+fixtures, not claims that a new language parser now produces those cases.
 
 ## Reproduce
 

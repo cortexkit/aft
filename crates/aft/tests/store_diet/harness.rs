@@ -1044,3 +1044,61 @@ fn reordered_site_manifest(
     }
     (Manifest::new(entries.clone()).unwrap(), entries)
 }
+
+#[test]
+fn store_diet_stored_shape_controls() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Path::new(ASSETS)
+        .join("corpus/smoke-typescript")
+        .canonicalize()
+        .unwrap();
+    let file = root.join("a.ts");
+    let store = CallGraphStore::open(temp.path().join("legacy"), root.clone()).unwrap();
+    store.cold_build(std::slice::from_ref(&file)).unwrap();
+    let mut extract = build_file_extract(&root, &file).unwrap();
+    // FileSummary is a valid stored kind, but source parsing does not emit the
+    // semantic index's synthetic summary chunks. Pin that compatible row value.
+    let mut summary = extract.nodes[0].clone();
+    summary.kind = "file_summary".into();
+    summary.name = "__schema_summary__".into();
+    summary.scoped_name = summary.name.clone();
+    summary.id = node_id("a.ts", &summary.kind, &summary.scoped_name);
+    summary.range_ordinal += 200;
+    extract.nodes.push(summary);
+    {
+        let mut connection = store.conn.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut statements = ColdBuildInsertStatements::new(&transaction).unwrap();
+        insert_file_graph_rows_prepared(&mut statements, &extract).unwrap();
+        drop(statements);
+        transaction.commit().unwrap();
+    }
+    let legacy = stored_values(&store);
+    let root = Path::new(ASSETS)
+        .join("corpus/receiver-typescript")
+        .canonicalize()
+        .unwrap();
+    let directory = temp.path().join("view");
+    fs::create_dir_all(&directory).unwrap();
+    let built = view_store_custom(&directory, &root, &fixture_files(&root), |_, blob| {
+        let join::CallgraphBlob::Parse(parsed) = blob else {
+            return;
+        };
+        assert!(parsed.dispatch.sites.len() >= 2);
+        parsed.dispatch.sites[0].caller = None;
+        let ordinal = parsed.dispatch.sites[1].ordinal;
+        parsed
+            .refs
+            .retain(|reference| reference.ordinal as u64 != ordinal as u64);
+        parsed.dispatch.sites[1].ordinal = 1_000_000;
+    });
+    let values = stored_values(&built.store);
+    assert!(values["edges.without_ref_row"].as_i64().unwrap() > 0);
+    golden(
+        "stored-shape-values.json",
+        &serde_json::to_vec_pretty(
+            &json!({"legacy": legacy, "views": values, "dispatch_shapes": built.shapes}),
+        )
+        .unwrap(),
+    );
+}

@@ -37,6 +37,16 @@ def inventory():
     assert ordering['ref_row_exists'] is False
     locations.setdefault('edges.ref_row_presence', {}).setdefault('absent', []).append({'case': 'sqlite-writer', 'mode': 'views', 'observation': 'actual row-by-row writer, transaction rolled back after observation', 'count': 1})
     shapes['target:duplicate_provenance=true'] = [{'case': 'sqlite-writer', 'mode': 'views', 'count': 1}]
+    stored = json.loads((HERE / 'stored-shape-values.json').read_text(encoding='utf-8'))
+    for mode in ['legacy', 'views']:
+        for column, counts in stored[mode].items():
+            if isinstance(counts, dict):
+                for value, count in counts.items():
+                    if count:
+                        locations.setdefault(column, {}).setdefault(value, []).append({'case': 'compatible-stored-shape', 'mode': mode, 'count': count})
+    for shape, count in stored['dispatch_shapes'].items():
+        if count:
+            shapes.setdefault(shape, []).append({'case': 'compatible-stored-shape', 'mode': 'views', 'count': count})
     required = json.loads((HERE / 'required_values.json').read_text(encoding='utf-8'))
     missing, domains = [], {}
     for name, domain in required['domains'].items():

@@ -1,12 +1,11 @@
 {
-  "backend_file_state": 28,
+  "backend_file_state": 29,
   "dispatch_hints": 23,
   "edges": 25,
   "emitted_view_rows": null,
   "file_dependencies": 123,
-  "files": 28,
-  "meta": 11,
-  "nodes": 39,
+  "files": 29,
+  "nodes": 46,
   "refs": 59,
   "resolution_config_fields": 0,
   "staging_file_inventory": 0,
@@ -19,9 +18,7 @@
   "view_file_surfaces": null,
   "view_module_digest_inputs": null,
   "view_module_path_targets": null,
-  "view_sessions": null,
   "view_tokens": null,
   "view_unknown_live": null,
-  "view_usage": null,
   "refs_unresolved": 34
 }

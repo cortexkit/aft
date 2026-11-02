@@ -1,11 +1,10 @@
 {
   "backend_file_state": 0,
   "dispatch_hints": 0,
-  "edges": 19,
+  "edges": 25,
   "emitted_view_rows": null,
-  "file_dependencies": 250,
+  "file_dependencies": 320,
   "files": 28,
-  "meta": 10,
   "nodes": 39,
   "refs": 58,
   "resolution_config_fields": 0,
@@ -17,11 +16,9 @@
   "view_dispatch_files": 28,
   "view_dispatch_sites": 10,
   "view_file_surfaces": 28,
-  "view_module_digest_inputs": 18,
+  "view_module_digest_inputs": 19,
   "view_module_path_targets": 0,
-  "view_sessions": null,
   "view_tokens": null,
   "view_unknown_live": 0,
-  "view_usage": null,
-  "refs_unresolved": 39
+  "refs_unresolved": 33
 }

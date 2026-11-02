@@ -852,6 +852,9 @@
     "sql-285d131106488649d19c:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
+    "sql-285d28faffc09858a5df:literal/0": {
+      "unprepared": "near \"WHERE\": syntax error in EXPLAIN QUERY PLAN DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1 at offset 111"
+    },
     "sql-286f90985e96b9e4b6f6:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
@@ -1183,9 +1186,6 @@
     "sql-37b2e15aa9e260e2859c:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM files WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
-    "sql-37b2e15aa9e260e2859c:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM meta WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 51"
-    },
     "sql-37b2e15aa9e260e2859c:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM nodes WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
@@ -1225,17 +1225,11 @@
     "sql-37b2e15aa9e260e2859c:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 71"
     },
-    "sql-37b2e15aa9e260e2859c:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_sessions WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 60"
-    },
     "sql-37b2e15aa9e260e2859c:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_tokens WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 58"
     },
     "sql-37b2e15aa9e260e2859c:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 64"
-    },
-    "sql-37b2e15aa9e260e2859c:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_usage WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 57"
     },
     "sql-37d6ba62d1a230f19fbd:literal/0": {
       "unprepared": "no such table: {name}"
@@ -1850,7 +1844,6 @@
     "sql-582225072411852f66b4:emitted_view_rows/0": [],
     "sql-582225072411852f66b4:file_dependencies/0": [],
     "sql-582225072411852f66b4:files/0": [],
-    "sql-582225072411852f66b4:meta/0": [],
     "sql-582225072411852f66b4:nodes/0": [],
     "sql-582225072411852f66b4:refs/0": [],
     "sql-582225072411852f66b4:resolution_config_fields/0": [],
@@ -1864,10 +1857,8 @@
     "sql-582225072411852f66b4:view_file_surfaces/0": [],
     "sql-582225072411852f66b4:view_module_digest_inputs/0": [],
     "sql-582225072411852f66b4:view_module_path_targets/0": [],
-    "sql-582225072411852f66b4:view_sessions/0": [],
     "sql-582225072411852f66b4:view_tokens/0": [],
     "sql-582225072411852f66b4:view_unknown_live/0": [],
-    "sql-582225072411852f66b4:view_usage/0": [],
     "sql-583c9344cc4ab49bf684:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT COUNT(*) FROM (\n                SELECT task.harness, task.session_id, task.task_id\n                FROM bash_pattern_watches AS watch\n                CROSS JOIN bash_tasks AS task\n                  ON task.harness = watch.harness\n                 AND task.session_id = watch.session_id\n                 AND task.task_id = watch.task_id\n                WHERE {TERMINAL_ROW_PREDICATE}\n                GROUP BY task.harness, task.session_id, task.task_id\n             ) at offset 384"
     },
@@ -2102,6 +2093,9 @@
     "sql-63d6d7f779d185f71549:literal/0": [],
     "sql-64191ead457f03deea8e:literal/0": [
       "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=? AND caller_file=?)"
+    ],
+    "sql-6424dc0eabc6ee1f0b4a:literal/0": [
+      "SEARCH edges USING INDEX idx_edges_ref_id (ref_id>? AND ref_id<?)"
     ],
     "sql-646e581d21db7cc623b1:literal/0": {
       "unprepared": "no such column: value in EXPLAIN QUERY PLAN SELECT value FROM t at offset 26"
@@ -2354,7 +2348,6 @@
     "sql-72bf5d4b84c150a353f5:emitted_view_rows/0": [],
     "sql-72bf5d4b84c150a353f5:file_dependencies/0": [],
     "sql-72bf5d4b84c150a353f5:files/0": [],
-    "sql-72bf5d4b84c150a353f5:meta/0": [],
     "sql-72bf5d4b84c150a353f5:nodes/0": [],
     "sql-72bf5d4b84c150a353f5:refs/0": [],
     "sql-72bf5d4b84c150a353f5:resolution_config_fields/0": [],
@@ -2368,10 +2361,8 @@
     "sql-72bf5d4b84c150a353f5:view_file_surfaces/0": [],
     "sql-72bf5d4b84c150a353f5:view_module_digest_inputs/0": [],
     "sql-72bf5d4b84c150a353f5:view_module_path_targets/0": [],
-    "sql-72bf5d4b84c150a353f5:view_sessions/0": [],
     "sql-72bf5d4b84c150a353f5:view_tokens/0": [],
     "sql-72bf5d4b84c150a353f5:view_unknown_live/0": [],
-    "sql-72bf5d4b84c150a353f5:view_usage/0": [],
     "sql-7359efe23b4c600bfd68:literal/0": [
       "SEARCH breaker_records USING INDEX sqlite_autoindex_breaker_records_1 (root_id=? AND domain=? AND corpus_fingerprint=?)"
     ],
@@ -3245,9 +3236,6 @@
     "sql-9d6e45ffd0e9cf1223c5:files/0": [
       "SCAN files USING COVERING INDEX sqlite_autoindex_files_1"
     ],
-    "sql-9d6e45ffd0e9cf1223c5:meta/0": [
-      "SCAN meta USING COVERING INDEX sqlite_autoindex_meta_1"
-    ],
     "sql-9d6e45ffd0e9cf1223c5:nodes/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
@@ -3287,17 +3275,11 @@
     "sql-9d6e45ffd0e9cf1223c5:view_module_path_targets/0": [
       "SCAN view_module_path_targets USING COVERING INDEX idx_view_module_path_targets_source"
     ],
-    "sql-9d6e45ffd0e9cf1223c5:view_sessions/0": [
-      "SCAN view_sessions USING COVERING INDEX view_sessions_scope"
-    ],
     "sql-9d6e45ffd0e9cf1223c5:view_tokens/0": [
       "SCAN view_tokens USING COVERING INDEX sqlite_autoindex_view_tokens_1"
     ],
     "sql-9d6e45ffd0e9cf1223c5:view_unknown_live/0": [
       "SCAN view_unknown_live"
-    ],
-    "sql-9d6e45ffd0e9cf1223c5:view_usage/0": [
-      "SCAN view_usage USING COVERING INDEX sqlite_autoindex_view_usage_1"
     ],
     "sql-9d91f20c31f7724a02e3:literal/0": [
       "SEARCH bash_pattern_watches USING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)",
@@ -3354,10 +3336,6 @@
       "SCAN files",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-a0038b3dde96b6f9dd4c:meta/0": [
-      "SCAN meta USING INDEX sqlite_autoindex_meta_1",
-      "USE TEMP B-TREE FOR LAST TERM OF ORDER BY"
-    ],
     "sql-a0038b3dde96b6f9dd4c:nodes/0": [
       "SCAN nodes",
       "USE TEMP B-TREE FOR ORDER BY"
@@ -3404,17 +3382,11 @@
     "sql-a0038b3dde96b6f9dd4c:view_module_path_targets/0": [
       "SCAN view_module_path_targets"
     ],
-    "sql-a0038b3dde96b6f9dd4c:view_sessions/0": [
-      "SCAN view_sessions USING INDEX sqlite_autoindex_view_sessions_1"
-    ],
     "sql-a0038b3dde96b6f9dd4c:view_tokens/0": [
       "SCAN view_tokens USING INDEX sqlite_autoindex_view_tokens_1"
     ],
     "sql-a0038b3dde96b6f9dd4c:view_unknown_live/0": [
       "SCAN view_unknown_live USING COVERING INDEX sqlite_autoindex_view_unknown_live_1"
-    ],
-    "sql-a0038b3dde96b6f9dd4c:view_usage/0": [
-      "SCAN view_usage USING INDEX sqlite_autoindex_view_usage_1"
     ],
     "sql-a04cb035eb29893b1336:literal/0": [
       "SEARCH members"
@@ -3737,9 +3709,6 @@
     "sql-ab1235c6ce8a3b5a2417:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
-    "sql-ab1235c6ce8a3b5a2417:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM meta WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
     "sql-ab1235c6ce8a3b5a2417:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM nodes WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
@@ -3779,17 +3748,11 @@
     "sql-ab1235c6ce8a3b5a2417:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
-    "sql-ab1235c6ce8a3b5a2417:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_sessions WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
     "sql-ab1235c6ce8a3b5a2417:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
     "sql-ab1235c6ce8a3b5a2417:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_usage WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
     "sql-ab1491124f8de3f3353e:literal/0": [
       "SEARCH nodes USING INDEX idx_nodes_file (file_path=?)"
@@ -4282,6 +4245,9 @@
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
+    "sql-c2996b772556ae036d09:literal/0": [
+      "SCAN edges"
+    ],
     "sql-c2bd9a60247a7b13f7d2:literal/0": [
       "SEARCH view_sessions USING COVERING INDEX view_sessions_scope (scope=?)"
     ],
@@ -4656,7 +4622,6 @@
     "sql-d682d1eaf2d7e9020aca:emitted_view_rows/0": [],
     "sql-d682d1eaf2d7e9020aca:file_dependencies/0": [],
     "sql-d682d1eaf2d7e9020aca:files/0": [],
-    "sql-d682d1eaf2d7e9020aca:meta/0": [],
     "sql-d682d1eaf2d7e9020aca:nodes/0": [],
     "sql-d682d1eaf2d7e9020aca:refs/0": [],
     "sql-d682d1eaf2d7e9020aca:resolution_config_fields/0": [],
@@ -4670,10 +4635,8 @@
     "sql-d682d1eaf2d7e9020aca:view_file_surfaces/0": [],
     "sql-d682d1eaf2d7e9020aca:view_module_digest_inputs/0": [],
     "sql-d682d1eaf2d7e9020aca:view_module_path_targets/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_sessions/0": [],
     "sql-d682d1eaf2d7e9020aca:view_tokens/0": [],
     "sql-d682d1eaf2d7e9020aca:view_unknown_live/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_usage/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/1": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN \n             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{task_rows})\n             INSERT INTO bash_tasks\n               (harness, session_id, task_id, project_key, command, cwd, status,\n                started_at, completed_at, completion_delivered, metadata)\n             SELECT 'opencode', 's' || (i % 1000), 't' || i, 'p' || (i % 100),\n                    'echo history', '.', 'completed', 0,\n                    CASE WHEN i<=64 THEN 0 ELSE {NOW}-1 END, 1, '{{}}' FROM n; at offset 103"
@@ -4788,6 +4751,11 @@
       "SEARCH s USING INDEX sqlite_autoindex_access_scopes_1 (owner=? AND scope_ref=? AND epoch=?)",
       "SEARCH a USING INDEX sqlite_autoindex_access_scope_agents_1 (owner=? AND scope_ref=? AND epoch=?)"
     ],
+    "sql-dc1047533d4132ad46ac:literal/0": [
+      "SCAN CONSTANT ROW",
+      "SCALAR SUBQUERY 1",
+      "SEARCH refs USING COVERING INDEX sqlite_autoindex_refs_1 (ref_id=?)"
+    ],
     "sql-dc411512c8e02fe6b9de:literal/0": [],
     "sql-dc4c4b3fd3d9919bdf9a:literal/0": [
       "SEARCH sweep_schedule USING INTEGER PRIMARY KEY (rowid=?)"
@@ -4872,9 +4840,6 @@
     "sql-ddf8d5d50e827e5e7b58:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM files at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM meta at offset 26"
-    },
     "sql-ddf8d5d50e827e5e7b58:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM nodes at offset 26"
     },
@@ -4914,20 +4879,17 @@
     "sql-ddf8d5d50e827e5e7b58:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_module_path_targets at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_sessions at offset 26"
-    },
     "sql-ddf8d5d50e827e5e7b58:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_tokens at offset 26"
     },
     "sql-ddf8d5d50e827e5e7b58:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_unknown_live at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_usage at offset 26"
-    },
     "sql-de0b9ec124ad87bf6b7e:literal/0": [
       "SEARCH reservations USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    "sql-de16060e23234ee5a5c2:literal/0": [
+      "SEARCH edges USING INDEX sqlite_autoindex_edges_1 (edge_id=?)"
     ],
     "sql-de19192cc65250b8a8df:literal/0": {
       "unprepared": "no such trigger: fail_restore"
@@ -6407,6 +6369,9 @@
     "sql-285d131106488649d19c:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
+    "sql-285d28faffc09858a5df:literal/0": {
+      "unprepared": "near \"WHERE\": syntax error in EXPLAIN QUERY PLAN DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1 at offset 111"
+    },
     "sql-286f90985e96b9e4b6f6:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
@@ -6738,9 +6703,6 @@
     "sql-37b2e15aa9e260e2859c:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM files WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
-    "sql-37b2e15aa9e260e2859c:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM meta WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 51"
-    },
     "sql-37b2e15aa9e260e2859c:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM nodes WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
@@ -6780,17 +6742,11 @@
     "sql-37b2e15aa9e260e2859c:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 71"
     },
-    "sql-37b2e15aa9e260e2859c:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_sessions WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 60"
-    },
     "sql-37b2e15aa9e260e2859c:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_tokens WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 58"
     },
     "sql-37b2e15aa9e260e2859c:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 64"
-    },
-    "sql-37b2e15aa9e260e2859c:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM view_usage WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 57"
     },
     "sql-37d6ba62d1a230f19fbd:literal/0": {
       "unprepared": "no such table: {name}"
@@ -7405,7 +7361,6 @@
     "sql-582225072411852f66b4:emitted_view_rows/0": [],
     "sql-582225072411852f66b4:file_dependencies/0": [],
     "sql-582225072411852f66b4:files/0": [],
-    "sql-582225072411852f66b4:meta/0": [],
     "sql-582225072411852f66b4:nodes/0": [],
     "sql-582225072411852f66b4:refs/0": [],
     "sql-582225072411852f66b4:resolution_config_fields/0": [],
@@ -7419,10 +7374,8 @@
     "sql-582225072411852f66b4:view_file_surfaces/0": [],
     "sql-582225072411852f66b4:view_module_digest_inputs/0": [],
     "sql-582225072411852f66b4:view_module_path_targets/0": [],
-    "sql-582225072411852f66b4:view_sessions/0": [],
     "sql-582225072411852f66b4:view_tokens/0": [],
     "sql-582225072411852f66b4:view_unknown_live/0": [],
-    "sql-582225072411852f66b4:view_usage/0": [],
     "sql-583c9344cc4ab49bf684:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT COUNT(*) FROM (\n                SELECT task.harness, task.session_id, task.task_id\n                FROM bash_pattern_watches AS watch\n                CROSS JOIN bash_tasks AS task\n                  ON task.harness = watch.harness\n                 AND task.session_id = watch.session_id\n                 AND task.task_id = watch.task_id\n                WHERE {TERMINAL_ROW_PREDICATE}\n                GROUP BY task.harness, task.session_id, task.task_id\n             ) at offset 384"
     },
@@ -7657,6 +7610,9 @@
     "sql-63d6d7f779d185f71549:literal/0": [],
     "sql-64191ead457f03deea8e:literal/0": [
       "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=? AND caller_file=?)"
+    ],
+    "sql-6424dc0eabc6ee1f0b4a:literal/0": [
+      "SEARCH edges USING INDEX idx_edges_ref_id (ref_id>? AND ref_id<?)"
     ],
     "sql-646e581d21db7cc623b1:literal/0": {
       "unprepared": "no such column: value in EXPLAIN QUERY PLAN SELECT value FROM t at offset 26"
@@ -7909,7 +7865,6 @@
     "sql-72bf5d4b84c150a353f5:emitted_view_rows/0": [],
     "sql-72bf5d4b84c150a353f5:file_dependencies/0": [],
     "sql-72bf5d4b84c150a353f5:files/0": [],
-    "sql-72bf5d4b84c150a353f5:meta/0": [],
     "sql-72bf5d4b84c150a353f5:nodes/0": [],
     "sql-72bf5d4b84c150a353f5:refs/0": [],
     "sql-72bf5d4b84c150a353f5:resolution_config_fields/0": [],
@@ -7923,10 +7878,8 @@
     "sql-72bf5d4b84c150a353f5:view_file_surfaces/0": [],
     "sql-72bf5d4b84c150a353f5:view_module_digest_inputs/0": [],
     "sql-72bf5d4b84c150a353f5:view_module_path_targets/0": [],
-    "sql-72bf5d4b84c150a353f5:view_sessions/0": [],
     "sql-72bf5d4b84c150a353f5:view_tokens/0": [],
     "sql-72bf5d4b84c150a353f5:view_unknown_live/0": [],
-    "sql-72bf5d4b84c150a353f5:view_usage/0": [],
     "sql-7359efe23b4c600bfd68:literal/0": [
       "SEARCH breaker_records USING INDEX sqlite_autoindex_breaker_records_1 (root_id=? AND domain=? AND corpus_fingerprint=?)"
     ],
@@ -8800,9 +8753,6 @@
     "sql-9d6e45ffd0e9cf1223c5:files/0": [
       "SCAN files USING COVERING INDEX sqlite_autoindex_files_1"
     ],
-    "sql-9d6e45ffd0e9cf1223c5:meta/0": [
-      "SCAN meta USING COVERING INDEX sqlite_autoindex_meta_1"
-    ],
     "sql-9d6e45ffd0e9cf1223c5:nodes/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
@@ -8842,17 +8792,11 @@
     "sql-9d6e45ffd0e9cf1223c5:view_module_path_targets/0": [
       "SCAN view_module_path_targets USING COVERING INDEX idx_view_module_path_targets_source"
     ],
-    "sql-9d6e45ffd0e9cf1223c5:view_sessions/0": [
-      "SCAN view_sessions USING COVERING INDEX view_sessions_scope"
-    ],
     "sql-9d6e45ffd0e9cf1223c5:view_tokens/0": [
       "SCAN view_tokens USING COVERING INDEX sqlite_autoindex_view_tokens_1"
     ],
     "sql-9d6e45ffd0e9cf1223c5:view_unknown_live/0": [
       "SCAN view_unknown_live"
-    ],
-    "sql-9d6e45ffd0e9cf1223c5:view_usage/0": [
-      "SCAN view_usage USING COVERING INDEX sqlite_autoindex_view_usage_1"
     ],
     "sql-9d91f20c31f7724a02e3:literal/0": [
       "SEARCH bash_pattern_watches USING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)",
@@ -8909,10 +8853,6 @@
       "SCAN files",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-a0038b3dde96b6f9dd4c:meta/0": [
-      "SCAN meta USING INDEX sqlite_autoindex_meta_1",
-      "USE TEMP B-TREE FOR LAST TERM OF ORDER BY"
-    ],
     "sql-a0038b3dde96b6f9dd4c:nodes/0": [
       "SCAN nodes",
       "USE TEMP B-TREE FOR ORDER BY"
@@ -8959,17 +8899,11 @@
     "sql-a0038b3dde96b6f9dd4c:view_module_path_targets/0": [
       "SCAN view_module_path_targets"
     ],
-    "sql-a0038b3dde96b6f9dd4c:view_sessions/0": [
-      "SCAN view_sessions USING INDEX sqlite_autoindex_view_sessions_1"
-    ],
     "sql-a0038b3dde96b6f9dd4c:view_tokens/0": [
       "SCAN view_tokens USING INDEX sqlite_autoindex_view_tokens_1"
     ],
     "sql-a0038b3dde96b6f9dd4c:view_unknown_live/0": [
       "SCAN view_unknown_live USING COVERING INDEX sqlite_autoindex_view_unknown_live_1"
-    ],
-    "sql-a0038b3dde96b6f9dd4c:view_usage/0": [
-      "SCAN view_usage USING INDEX sqlite_autoindex_view_usage_1"
     ],
     "sql-a04cb035eb29893b1336:literal/0": [
       "SEARCH members"
@@ -9292,9 +9226,6 @@
     "sql-ab1235c6ce8a3b5a2417:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
-    "sql-ab1235c6ce8a3b5a2417:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM meta WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
     "sql-ab1235c6ce8a3b5a2417:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM nodes WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
@@ -9334,17 +9265,11 @@
     "sql-ab1235c6ce8a3b5a2417:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
-    "sql-ab1235c6ce8a3b5a2417:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_sessions WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
     "sql-ab1235c6ce8a3b5a2417:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
     "sql-ab1235c6ce8a3b5a2417:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_usage WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
     },
     "sql-ab1491124f8de3f3353e:literal/0": [
       "SEARCH nodes USING INDEX idx_nodes_file (file_path=?)"
@@ -9837,6 +9762,9 @@
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
+    "sql-c2996b772556ae036d09:literal/0": [
+      "SCAN edges"
+    ],
     "sql-c2bd9a60247a7b13f7d2:literal/0": [
       "SEARCH view_sessions USING COVERING INDEX view_sessions_scope (scope=?)"
     ],
@@ -10211,7 +10139,6 @@
     "sql-d682d1eaf2d7e9020aca:emitted_view_rows/0": [],
     "sql-d682d1eaf2d7e9020aca:file_dependencies/0": [],
     "sql-d682d1eaf2d7e9020aca:files/0": [],
-    "sql-d682d1eaf2d7e9020aca:meta/0": [],
     "sql-d682d1eaf2d7e9020aca:nodes/0": [],
     "sql-d682d1eaf2d7e9020aca:refs/0": [],
     "sql-d682d1eaf2d7e9020aca:resolution_config_fields/0": [],
@@ -10225,10 +10152,8 @@
     "sql-d682d1eaf2d7e9020aca:view_file_surfaces/0": [],
     "sql-d682d1eaf2d7e9020aca:view_module_digest_inputs/0": [],
     "sql-d682d1eaf2d7e9020aca:view_module_path_targets/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_sessions/0": [],
     "sql-d682d1eaf2d7e9020aca:view_tokens/0": [],
     "sql-d682d1eaf2d7e9020aca:view_unknown_live/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_usage/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/1": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN \n             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{task_rows})\n             INSERT INTO bash_tasks\n               (harness, session_id, task_id, project_key, command, cwd, status,\n                started_at, completed_at, completion_delivered, metadata)\n             SELECT 'opencode', 's' || (i % 1000), 't' || i, 'p' || (i % 100),\n                    'echo history', '.', 'completed', 0,\n                    CASE WHEN i<=64 THEN 0 ELSE {NOW}-1 END, 1, '{{}}' FROM n; at offset 103"
@@ -10343,6 +10268,11 @@
       "SEARCH s USING INDEX sqlite_autoindex_access_scopes_1 (owner=? AND scope_ref=? AND epoch=?)",
       "SEARCH a USING INDEX sqlite_autoindex_access_scope_agents_1 (owner=? AND scope_ref=? AND epoch=?)"
     ],
+    "sql-dc1047533d4132ad46ac:literal/0": [
+      "SCAN CONSTANT ROW",
+      "SCALAR SUBQUERY 1",
+      "SEARCH refs USING COVERING INDEX sqlite_autoindex_refs_1 (ref_id=?)"
+    ],
     "sql-dc411512c8e02fe6b9de:literal/0": [],
     "sql-dc4c4b3fd3d9919bdf9a:literal/0": [
       "SEARCH sweep_schedule USING INTEGER PRIMARY KEY (rowid=?)"
@@ -10427,9 +10357,6 @@
     "sql-ddf8d5d50e827e5e7b58:files/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM files at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:meta/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM meta at offset 26"
-    },
     "sql-ddf8d5d50e827e5e7b58:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM nodes at offset 26"
     },
@@ -10469,20 +10396,17 @@
     "sql-ddf8d5d50e827e5e7b58:view_module_path_targets/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_module_path_targets at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:view_sessions/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_sessions at offset 26"
-    },
     "sql-ddf8d5d50e827e5e7b58:view_tokens/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_tokens at offset 26"
     },
     "sql-ddf8d5d50e827e5e7b58:view_unknown_live/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_unknown_live at offset 26"
     },
-    "sql-ddf8d5d50e827e5e7b58:view_usage/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM view_usage at offset 26"
-    },
     "sql-de0b9ec124ad87bf6b7e:literal/0": [
       "SEARCH reservations USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    "sql-de16060e23234ee5a5c2:literal/0": [
+      "SEARCH edges USING INDEX sqlite_autoindex_edges_1 (edge_id=?)"
     ],
     "sql-de19192cc65250b8a8df:literal/0": {
       "unprepared": "no such trigger: fail_restore"

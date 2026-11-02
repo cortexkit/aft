@@ -7,7 +7,7 @@
       "file": "rust_bin_targets/src/bin/tool.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -145,7 +145,7 @@
         }
       ],
       "total_callers": 6,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -254,7 +254,7 @@
       "file": "test_helpers.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -381,7 +381,7 @@
         }
       ],
       "total_callers": 5,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -490,7 +490,7 @@
       "file": "data_flow_kills.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -553,7 +553,7 @@
       "file": "data_flow_kills.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -616,7 +616,7 @@
       "file": "data_flow_kills.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -679,7 +679,7 @@
       "file": "rust_bin_targets/src/bin/support/admin_client.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -742,7 +742,7 @@
       "file": "main.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -834,7 +834,7 @@
       "file": "rust_bin_targets/examples/demo.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -885,7 +885,7 @@
       "file": "service.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -989,7 +989,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1043,7 +1043,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1119,7 +1119,7 @@
       "file": "rust_bin_targets/src/bin/other/main.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1170,7 +1170,7 @@
       "file": "rust_bin_targets/src/main.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1203,6 +1203,38 @@
     }
   },
   {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::name",
+    "callers": {
+      "symbol": "bin::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "bin::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 7,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "bin::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
     "file": "data_flow.ts",
     "symbol": "transformData",
     "callers": {
@@ -1210,7 +1242,7 @@
       "file": "data_flow.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1292,7 +1324,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1336,7 +1368,7 @@
       "file": "rust_bin_targets/src/bin/support/admin_client.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1409,7 +1441,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1453,7 +1485,7 @@
       "file": "rust_bin_targets/src/bin/support/admin_client.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1526,7 +1558,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1580,7 +1612,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -1624,7 +1656,7 @@
       "file": "data_flow_kills.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1681,6 +1713,38 @@
     }
   },
   {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::path",
+    "callers": {
+      "symbol": "bin::path",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "bin::path",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 8,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "bin::path",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
     "file": "aliased.ts",
     "symbol": "runCheck",
     "callers": {
@@ -1688,7 +1752,7 @@
       "file": "aliased.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1762,7 +1826,7 @@
       "file": "rust_bin_targets/src/route_client.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1814,7 +1878,7 @@
       "file": "data_flow.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1875,7 +1939,7 @@
       "file": "rust_bin_targets/tests/standalone.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1926,7 +1990,7 @@
       "file": "rust_bin_targets/src/lib.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -1996,7 +2060,7 @@
         }
       ],
       "total_callers": 2,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2065,6 +2129,70 @@
     }
   },
   {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package",
+    "callers": {
+      "symbol": "package",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "package",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 1,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "package",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::version",
+    "callers": {
+      "symbol": "package::version",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "package::version",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 3,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "package::version",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
     "file": "rust_bin_targets/src/bin/support/route_client.rs",
     "symbol": "error_reason",
     "callers": {
@@ -2121,7 +2249,7 @@
         }
       ],
       "total_callers": 7,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2241,7 +2369,7 @@
       "file": "rust_bin_targets/benches/perf.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -2285,6 +2413,38 @@
     }
   },
   {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::name",
+    "callers": {
+      "symbol": "package::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "package::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 2,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "package::name",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
     "file": "data_flow_kills.ts",
     "symbol": "usedBeforeOverwrite",
     "callers": {
@@ -2292,7 +2452,7 @@
       "file": "data_flow_kills.ts",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -2355,7 +2515,7 @@
       "file": "rust_bin_targets/tools/custom.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -2399,6 +2559,70 @@
     }
   },
   {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin",
+    "callers": {
+      "symbol": "bin",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "bin",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 6,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "bin",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::edition",
+    "callers": {
+      "symbol": "package::edition",
+      "file": "rust_bin_targets/Cargo.toml",
+      "callers": [],
+      "total_callers": 0,
+      "scanned_files": 29,
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "call_tree": {
+      "name": "package::edition",
+      "file": "rust_bin_targets/Cargo.toml",
+      "line": 4,
+      "resolved": true,
+      "children": [],
+      "depth_limited": false,
+      "truncated": 0
+    },
+    "impact": {
+      "symbol": "package::edition",
+      "file": "rust_bin_targets/Cargo.toml",
+      "parameters": [],
+      "total_affected": 0,
+      "affected_files": 0,
+      "callers": [],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  {
     "file": "data_processor.ts",
     "symbol": "processInput",
     "callers": {
@@ -2416,7 +2640,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2493,7 +2717,7 @@
         }
       ],
       "total_callers": 1,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2537,7 +2761,7 @@
       "file": "rust_bin_targets/src/bin/support/route_client.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -2600,7 +2824,7 @@
       "file": "rust_bin_targets/src/binx/caller.rs",
       "callers": [],
       "total_callers": 0,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0,
       "complete": false,
@@ -2671,7 +2895,7 @@
         }
       ],
       "total_callers": 2,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2795,7 +3019,7 @@
         }
       ],
       "total_callers": 5,
-      "scanned_files": 28,
+      "scanned_files": 29,
       "depth_limited": false,
       "truncated": 0
     },
@@ -2891,10 +3115,221 @@
     }
   },
   {
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "to_file": "rust_bin_targets/tools/custom_support.rs",
+    "to_symbol": "custom_target",
+    "trace_to": {
+      "target_symbol": "must_not_cross_bin_boundary",
+      "target_file": "rust_bin_targets/src/binx/caller.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "must_not_cross_bin_boundary",
+              "file": "rust_bin_targets/src/binx/caller.rs",
+              "line": 1,
+              "signature": "pub fn must_not_cross_bin_boundary(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "utils.ts",
+    "symbol": "processData",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "conditionallyOverwritten",
+    "trace_to": {
+      "target_symbol": "processData",
+      "target_file": "utils.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 3,
+      "entry_points_found": 3,
+      "max_depth_reached": false,
+      "truncated_paths": 2
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin::path",
+    "trace_to": {
+      "target_symbol": "sink",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "augmented",
+              "file": "data_flow_kills.ts",
+              "line": 31,
+              "signature": "function augmented(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "conditionallyOverwritten",
+              "file": "data_flow_kills.ts",
+              "line": 23,
+              "signature": "function conditionallyOverwritten(raw: string, condition: boolean): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "derived",
+              "file": "data_flow_kills.ts",
+              "line": 11,
+              "signature": "function derived(raw: { field: string }): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "overwritten",
+              "file": "data_flow_kills.ts",
+              "line": 5,
+              "signature": "function overwritten(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "usedBeforeOverwrite",
+              "file": "data_flow_kills.ts",
+              "line": 17,
+              "signature": "function usedBeforeOverwrite(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 5,
+      "entry_points_found": 5,
+      "max_depth_reached": false,
+      "truncated_paths": 5
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
     "file": "rust_bin_targets/src/bin/tool.rs",
     "symbol": "main",
-    "to_file": "helpers.ts",
-    "to_symbol": "checkFormat",
+    "to_file": "aliased.ts",
+    "to_symbol": "runCheck",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/src/bin/tool.rs",
@@ -2920,20 +3355,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/tool.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "helpers.ts",
     "symbol": "checkFormat",
-    "to_file": "test_helpers.ts",
-    "to_symbol": "testValidation",
+    "to_file": "rust_bin_targets/src/route_client.rs",
+    "to_symbol": "error_reason",
     "trace_to": {
       "target_symbol": "checkFormat",
       "target_file": "helpers.ts",
@@ -3105,20 +3533,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "helpers.ts",
-      "origin_symbol": "checkFormat",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "test_helpers.ts",
     "symbol": "testValidation",
-    "to_file": "helpers.ts",
-    "to_symbol": "validate",
+    "to_file": "data_flow.ts",
+    "to_symbol": "complexFlow",
     "trace_to": {
       "target_symbol": "testValidation",
       "target_file": "test_helpers.ts",
@@ -3141,33 +3562,16 @@
       "truncated_paths": 0
     },
     "trace_to_symbol": {
-      "path": [
-        {
-          "symbol": "testValidation",
-          "file": "test_helpers.ts",
-          "line": 3
-        },
-        {
-          "symbol": "validate",
-          "file": "helpers.ts",
-          "line": 1
-        }
-      ],
-      "complete": true
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "test_helpers.ts",
-      "origin_symbol": "testValidation",
-      "hops": [],
-      "depth_limited": false
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "helpers.ts",
     "symbol": "validate",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "overwritten",
+    "to_file": "rust_bin_targets/tests/standalone.rs",
+    "to_symbol": "integration_caller",
     "trace_to": {
       "target_symbol": "validate",
       "target_file": "helpers.ts",
@@ -3297,20 +3701,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "helpers.ts",
-      "origin_symbol": "validate",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "overwritten",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "derived",
+    "to_file": "rust_bin_targets/src/lib.rs",
+    "to_symbol": "tests::calls_lib_target",
     "trace_to": {
       "target_symbol": "overwritten",
       "target_file": "data_flow_kills.ts",
@@ -3336,20 +3733,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow_kills.ts",
-      "origin_symbol": "overwritten",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "derived",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "augmented",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "first",
     "trace_to": {
       "target_symbol": "derived",
       "target_file": "data_flow_kills.ts",
@@ -3375,20 +3765,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow_kills.ts",
-      "origin_symbol": "derived",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "augmented",
-    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-    "to_symbol": "via_crate",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package",
     "trace_to": {
       "target_symbol": "augmented",
       "target_file": "data_flow_kills.ts",
@@ -3414,20 +3797,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow_kills.ts",
-      "origin_symbol": "augmented",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/admin_client.rs",
     "symbol": "via_crate",
-    "to_file": "main.ts",
-    "to_symbol": "main",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::version",
     "trace_to": {
       "target_symbol": "via_crate",
       "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
@@ -3453,20 +3829,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-      "origin_symbol": "via_crate",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "main.ts",
     "symbol": "main",
-    "to_file": "rust_bin_targets/examples/demo.rs",
-    "to_symbol": "main",
+    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "to_symbol": "error_reason",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "main.ts",
@@ -3492,20 +3861,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "main.ts",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/examples/demo.rs",
     "symbol": "main",
-    "to_file": "service.ts",
-    "to_symbol": "handleRequest",
+    "to_file": "rust_bin_targets/benches/perf.rs",
+    "to_symbol": "main",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/examples/demo.rs",
@@ -3531,20 +3893,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/examples/demo.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "service.ts",
     "symbol": "handleRequest",
-    "to_file": "rust_bin_targets/tests/test_support.rs",
-    "to_symbol": "integration_target",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::name",
     "trace_to": {
       "target_symbol": "handleRequest",
       "target_file": "service.ts",
@@ -3570,20 +3925,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "service.ts",
-      "origin_symbol": "handleRequest",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/tests/test_support.rs",
     "symbol": "integration_target",
-    "to_file": "rust_bin_targets/src/bin/support/mod.rs",
-    "to_symbol": "run",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "usedBeforeOverwrite",
     "trace_to": {
       "target_symbol": "integration_target",
       "target_file": "rust_bin_targets/tests/test_support.rs",
@@ -3609,19 +3957,12 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/tests/test_support.rs",
-      "origin_symbol": "integration_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/mod.rs",
     "symbol": "run",
-    "to_file": "rust_bin_targets/src/bin/other/main.rs",
+    "to_file": "rust_bin_targets/tools/custom.rs",
     "to_symbol": "main",
     "trace_to": {
       "target_symbol": "run",
@@ -3666,20 +4007,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/mod.rs",
-      "origin_symbol": "run",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/other/main.rs",
     "symbol": "main",
-    "to_file": "rust_bin_targets/src/main.rs",
-    "to_symbol": "main",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/src/bin/other/main.rs",
@@ -3705,20 +4039,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/other/main.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/main.rs",
     "symbol": "main",
-    "to_file": "data_flow.ts",
-    "to_symbol": "transformData",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::edition",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/src/main.rs",
@@ -3744,20 +4071,33 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::name",
+    "to_file": "data_processor.ts",
+    "to_symbol": "processInput",
+    "trace_to": {
+      "target_symbol": "bin::name",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/main.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "data_flow.ts",
     "symbol": "transformData",
-    "to_file": "rust_bin_targets/examples/demo_support.rs",
-    "to_symbol": "example_target",
+    "to_file": "rust_bin_targets/src/lib.rs",
+    "to_symbol": "lib_target",
     "trace_to": {
       "target_symbol": "transformData",
       "target_file": "data_flow.ts",
@@ -3783,20 +4123,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow.ts",
-      "origin_symbol": "transformData",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/examples/demo_support.rs",
     "symbol": "example_target",
-    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-    "to_symbol": "second",
+    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "to_symbol": "local",
     "trace_to": {
       "target_symbol": "example_target",
       "target_file": "rust_bin_targets/examples/demo_support.rs",
@@ -3840,20 +4173,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/examples/demo_support.rs",
-      "origin_symbol": "example_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/admin_client.rs",
     "symbol": "second",
-    "to_file": "rust_bin_targets/benches/bench_support.rs",
-    "to_symbol": "bench_target",
+    "to_file": "rust_bin_targets/src/binx/caller.rs",
+    "to_symbol": "must_not_cross_bin_boundary",
     "trace_to": {
       "target_symbol": "second",
       "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
@@ -3879,20 +4205,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-      "origin_symbol": "second",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/benches/bench_support.rs",
     "symbol": "bench_target",
-    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-    "to_symbol": "via_super",
+    "to_file": "utils.ts",
+    "to_symbol": "processData",
     "trace_to": {
       "target_symbol": "bench_target",
       "target_file": "rust_bin_targets/benches/bench_support.rs",
@@ -3936,20 +4255,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/benches/bench_support.rs",
-      "origin_symbol": "bench_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/admin_client.rs",
     "symbol": "via_super",
-    "to_file": "rust_bin_targets/src/bin/other/nested.rs",
-    "to_symbol": "nested_target",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "sink",
     "trace_to": {
       "target_symbol": "via_super",
       "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
@@ -3975,77 +4287,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-      "origin_symbol": "via_super",
-      "hops": [],
-      "depth_limited": false
-    }
-  },
-  {
-    "file": "rust_bin_targets/src/bin/other/nested.rs",
-    "symbol": "nested_target",
-    "to_file": "rust_bin_targets/tools/custom_support.rs",
-    "to_symbol": "custom_target",
-    "trace_to": {
-      "target_symbol": "nested_target",
-      "target_file": "rust_bin_targets/src/bin/other/nested.rs",
-      "paths": [
-        {
-          "hops": [
-            {
-              "symbol": "main",
-              "file": "rust_bin_targets/src/bin/other/main.rs",
-              "line": 3,
-              "signature": "fn main()",
-              "is_entry_point": true
-            },
-            {
-              "symbol": "nested_target",
-              "file": "rust_bin_targets/src/bin/other/nested.rs",
-              "line": 1,
-              "signature": "pub fn nested_target() {}",
-              "is_entry_point": false
-            }
-          ]
-        },
-        {
-          "hops": [
-            {
-              "symbol": "nested_target",
-              "file": "rust_bin_targets/src/bin/other/nested.rs",
-              "line": 1,
-              "signature": "pub fn nested_target() {}",
-              "is_entry_point": true
-            }
-          ]
-        }
-      ],
-      "total_paths": 2,
-      "entry_points_found": 2,
-      "max_depth_reached": false,
-      "truncated_paths": 1
-    },
-    "trace_to_symbol": {
-      "path": null,
-      "complete": true,
-      "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/other/nested.rs",
-      "origin_symbol": "nested_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/tools/custom_support.rs",
     "symbol": "custom_target",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "conditionallyOverwritten",
+    "to_file": "rust_bin_targets/src/bin/tool.rs",
+    "to_symbol": "main",
     "trace_to": {
       "target_symbol": "custom_target",
       "target_file": "rust_bin_targets/tools/custom_support.rs",
@@ -4089,20 +4337,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/tools/custom_support.rs",
-      "origin_symbol": "custom_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "conditionallyOverwritten",
-    "to_file": "aliased.ts",
-    "to_symbol": "runCheck",
+    "to_file": "helpers.ts",
+    "to_symbol": "checkFormat",
     "trace_to": {
       "target_symbol": "conditionallyOverwritten",
       "target_file": "data_flow_kills.ts",
@@ -4128,20 +4369,33 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::path",
+    "to_file": "test_helpers.ts",
+    "to_symbol": "testValidation",
+    "trace_to": {
+      "target_symbol": "bin::path",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow_kills.ts",
-      "origin_symbol": "conditionallyOverwritten",
-      "hops": [],
-      "depth_limited": false
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "aliased.ts",
     "symbol": "runCheck",
-    "to_file": "rust_bin_targets/src/route_client.rs",
-    "to_symbol": "error_reason",
+    "to_file": "helpers.ts",
+    "to_symbol": "validate",
     "trace_to": {
       "target_symbol": "runCheck",
       "target_file": "aliased.ts",
@@ -4164,23 +4418,26 @@
       "truncated_paths": 0
     },
     "trace_to_symbol": {
-      "path": null,
-      "complete": true,
-      "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "aliased.ts",
-      "origin_symbol": "runCheck",
-      "hops": [],
-      "depth_limited": false
+      "path": [
+        {
+          "symbol": "runCheck",
+          "file": "aliased.ts",
+          "line": 3
+        },
+        {
+          "symbol": "validate",
+          "file": "helpers.ts",
+          "line": 1
+        }
+      ],
+      "complete": true
     }
   },
   {
     "file": "rust_bin_targets/src/route_client.rs",
     "symbol": "error_reason",
-    "to_file": "data_flow.ts",
-    "to_symbol": "complexFlow",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "overwritten",
     "trace_to": {
       "target_symbol": "error_reason",
       "target_file": "rust_bin_targets/src/route_client.rs",
@@ -4206,20 +4463,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/route_client.rs",
-      "origin_symbol": "error_reason",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow.ts",
     "symbol": "complexFlow",
-    "to_file": "rust_bin_targets/tests/standalone.rs",
-    "to_symbol": "integration_caller",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "derived",
     "trace_to": {
       "target_symbol": "complexFlow",
       "target_file": "data_flow.ts",
@@ -4245,29 +4495,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow.ts",
-      "origin_symbol": "complexFlow",
-      "hops": [
-        {
-          "file": "data_flow.ts",
-          "symbol": "log",
-          "variable": "value",
-          "line": 11,
-          "flow_type": "parameter",
-          "approximate": true
-        }
-      ],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/tests/standalone.rs",
     "symbol": "integration_caller",
-    "to_file": "rust_bin_targets/src/lib.rs",
-    "to_symbol": "tests::calls_lib_target",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "augmented",
     "trace_to": {
       "target_symbol": "integration_caller",
       "target_file": "rust_bin_targets/tests/standalone.rs",
@@ -4281,20 +4515,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/tests/standalone.rs",
-      "origin_symbol": "integration_caller",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/lib.rs",
     "symbol": "tests::calls_lib_target",
     "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-    "to_symbol": "first",
+    "to_symbol": "via_crate",
     "trace_to": {
       "target_symbol": "tests::calls_lib_target",
       "target_file": "rust_bin_targets/src/lib.rs",
@@ -4308,20 +4535,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/lib.rs",
-      "origin_symbol": "tests::calls_lib_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/admin_client.rs",
     "symbol": "first",
-    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
-    "to_symbol": "error_reason",
+    "to_file": "main.ts",
+    "to_symbol": "main",
     "trace_to": {
       "target_symbol": "first",
       "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
@@ -4387,33 +4607,56 @@
       "truncated_paths": 1
     },
     "trace_to_symbol": {
-      "path": [
-        {
-          "symbol": "first",
-          "file": "rust_bin_targets/src/bin/support/admin_client.rs",
-          "line": 3
-        },
-        {
-          "symbol": "error_reason",
-          "file": "rust_bin_targets/src/bin/support/route_client.rs",
-          "line": 1
-        }
-      ],
-      "complete": true
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package",
+    "to_file": "rust_bin_targets/examples/demo.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "package",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
-      "origin_symbol": "first",
-      "hops": [],
-      "depth_limited": false
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::version",
+    "to_file": "service.ts",
+    "to_symbol": "handleRequest",
+    "trace_to": {
+      "target_symbol": "package::version",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/route_client.rs",
     "symbol": "error_reason",
-    "to_file": "rust_bin_targets/benches/perf.rs",
-    "to_symbol": "main",
+    "to_file": "rust_bin_targets/tests/test_support.rs",
+    "to_symbol": "integration_target",
     "trace_to": {
       "target_symbol": "error_reason",
       "target_file": "rust_bin_targets/src/bin/support/route_client.rs",
@@ -4586,20 +4829,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
-      "origin_symbol": "error_reason",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/benches/perf.rs",
     "symbol": "main",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "usedBeforeOverwrite",
+    "to_file": "rust_bin_targets/src/bin/support/mod.rs",
+    "to_symbol": "run",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/benches/perf.rs",
@@ -4625,19 +4861,32 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::name",
+    "to_file": "rust_bin_targets/src/bin/other/main.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "package::name",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/benches/perf.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "usedBeforeOverwrite",
-    "to_file": "rust_bin_targets/tools/custom.rs",
+    "to_file": "rust_bin_targets/src/main.rs",
     "to_symbol": "main",
     "trace_to": {
       "target_symbol": "usedBeforeOverwrite",
@@ -4664,20 +4913,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_flow_kills.ts",
-      "origin_symbol": "usedBeforeOverwrite",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/tools/custom.rs",
     "symbol": "main",
-    "to_file": "data_processor.ts",
-    "to_symbol": "processInput",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin::name",
     "trace_to": {
       "target_symbol": "main",
       "target_file": "rust_bin_targets/tools/custom.rs",
@@ -4703,20 +4945,53 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin",
+    "to_file": "data_flow.ts",
+    "to_symbol": "transformData",
+    "trace_to": {
+      "target_symbol": "bin",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/tools/custom.rs",
-      "origin_symbol": "main",
-      "hops": [],
-      "depth_limited": false
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::edition",
+    "to_file": "rust_bin_targets/examples/demo_support.rs",
+    "to_symbol": "example_target",
+    "trace_to": {
+      "target_symbol": "package::edition",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
     }
   },
   {
     "file": "data_processor.ts",
     "symbol": "processInput",
-    "to_file": "rust_bin_targets/src/lib.rs",
-    "to_symbol": "lib_target",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "second",
     "trace_to": {
       "target_symbol": "processInput",
       "target_file": "data_processor.ts",
@@ -4760,20 +5035,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "data_processor.ts",
-      "origin_symbol": "processInput",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/lib.rs",
     "symbol": "lib_target",
-    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
-    "to_symbol": "local",
+    "to_file": "rust_bin_targets/benches/bench_support.rs",
+    "to_symbol": "bench_target",
     "trace_to": {
       "target_symbol": "lib_target",
       "target_file": "rust_bin_targets/src/lib.rs",
@@ -4799,20 +5067,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/lib.rs",
-      "origin_symbol": "lib_target",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/bin/support/route_client.rs",
     "symbol": "local",
-    "to_file": "rust_bin_targets/src/binx/caller.rs",
-    "to_symbol": "must_not_cross_bin_boundary",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "via_super",
     "trace_to": {
       "target_symbol": "local",
       "target_file": "rust_bin_targets/src/bin/support/route_client.rs",
@@ -4838,20 +5099,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
-      "origin_symbol": "local",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "rust_bin_targets/src/binx/caller.rs",
     "symbol": "must_not_cross_bin_boundary",
-    "to_file": "utils.ts",
-    "to_symbol": "processData",
+    "to_file": "rust_bin_targets/src/bin/other/nested.rs",
+    "to_symbol": "nested_target",
     "trace_to": {
       "target_symbol": "must_not_cross_bin_boundary",
       "target_file": "rust_bin_targets/src/binx/caller.rs",
@@ -4877,20 +5131,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "rust_bin_targets/src/binx/caller.rs",
-      "origin_symbol": "must_not_cross_bin_boundary",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "utils.ts",
     "symbol": "processData",
-    "to_file": "data_flow_kills.ts",
-    "to_symbol": "sink",
+    "to_file": "rust_bin_targets/tools/custom_support.rs",
+    "to_symbol": "custom_target",
     "trace_to": {
       "target_symbol": "processData",
       "target_file": "utils.ts",
@@ -4952,20 +5199,13 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
-    },
-    "trace_data": {
-      "expression": "value",
-      "origin_file": "utils.ts",
-      "origin_symbol": "processData",
-      "hops": [],
-      "depth_limited": false
     }
   },
   {
     "file": "data_flow_kills.ts",
     "symbol": "sink",
-    "to_file": "rust_bin_targets/src/bin/tool.rs",
-    "to_symbol": "main",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "conditionallyOverwritten",
     "trace_to": {
       "target_symbol": "sink",
       "target_file": "data_flow_kills.ts",
@@ -5070,11 +5310,3715 @@
       "path": null,
       "complete": true,
       "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin::path",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/src/bin/tool.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/tool.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
     },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "to_file": "aliased.ts",
+    "to_symbol": "runCheck",
+    "trace_to": {
+      "target_symbol": "checkFormat",
+      "target_file": "helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "runCheck",
+              "file": "aliased.ts",
+              "line": 3,
+              "signature": "function runCheck(data: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 6,
+      "entry_points_found": 6,
+      "max_depth_reached": false,
+      "truncated_paths": 4
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "to_file": "rust_bin_targets/src/route_client.rs",
+    "to_symbol": "error_reason",
+    "trace_to": {
+      "target_symbol": "testValidation",
+      "target_file": "test_helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "to_file": "data_flow.ts",
+    "to_symbol": "complexFlow",
+    "trace_to": {
+      "target_symbol": "validate",
+      "target_file": "helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "runCheck",
+              "file": "aliased.ts",
+              "line": 3,
+              "signature": "function runCheck(data: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 6,
+      "entry_points_found": 6,
+      "max_depth_reached": false,
+      "truncated_paths": 4
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "to_file": "rust_bin_targets/tests/standalone.rs",
+    "to_symbol": "integration_caller",
+    "trace_to": {
+      "target_symbol": "overwritten",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "overwritten",
+              "file": "data_flow_kills.ts",
+              "line": 5,
+              "signature": "function overwritten(raw: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "to_file": "rust_bin_targets/src/lib.rs",
+    "to_symbol": "tests::calls_lib_target",
+    "trace_to": {
+      "target_symbol": "derived",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "derived",
+              "file": "data_flow_kills.ts",
+              "line": 11,
+              "signature": "function derived(raw: { field: string }): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "first",
+    "trace_to": {
+      "target_symbol": "augmented",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "augmented",
+              "file": "data_flow_kills.ts",
+              "line": 31,
+              "signature": "function augmented(raw: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package",
+    "trace_to": {
+      "target_symbol": "via_crate",
+      "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "via_crate",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 15,
+              "signature": "pub fn via_crate(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "main.ts",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::version",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "main.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "to_symbol": "error_reason",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/examples/demo.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/examples/demo.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "to_file": "rust_bin_targets/benches/perf.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "handleRequest",
+      "target_file": "service.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::name",
+    "trace_to": {
+      "target_symbol": "integration_target",
+      "target_file": "rust_bin_targets/tests/test_support.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "integration_target",
+              "file": "rust_bin_targets/tests/test_support.rs",
+              "line": 1,
+              "signature": "pub fn integration_target() {}",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "usedBeforeOverwrite",
+    "trace_to": {
+      "target_symbol": "run",
+      "target_file": "rust_bin_targets/src/bin/support/mod.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/tool.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 2,
+      "entry_points_found": 2,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/tools/custom.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/src/bin/other/main.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/other/main.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/src/main.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/main.rs",
+              "line": 1,
+              "signature": "fn main() {}",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::name",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "package::edition",
+    "trace_to": {
+      "target_symbol": "bin::name",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "to_file": "data_processor.ts",
+    "to_symbol": "processInput",
+    "trace_to": {
+      "target_symbol": "transformData",
+      "target_file": "data_flow.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "transformData",
+              "file": "data_flow.ts",
+              "line": 3,
+              "signature": "function transformData(rawInput: string): string",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": [
+        {
+          "symbol": "transformData",
+          "file": "data_flow.ts",
+          "line": 3
+        },
+        {
+          "symbol": "processInput",
+          "file": "data_processor.ts",
+          "line": 1
+        }
+      ],
+      "complete": true
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "to_file": "rust_bin_targets/src/lib.rs",
+    "to_symbol": "lib_target",
+    "trace_to": {
+      "target_symbol": "example_target",
+      "target_file": "rust_bin_targets/examples/demo_support.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "example_target",
+              "file": "rust_bin_targets/examples/demo_support.rs",
+              "line": 1,
+              "signature": "pub fn example_target() {}",
+              "is_entry_point": true
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/examples/demo.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "example_target",
+              "file": "rust_bin_targets/examples/demo_support.rs",
+              "line": 1,
+              "signature": "pub fn example_target() {}",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 2,
+      "entry_points_found": 2,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "to_file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "to_symbol": "local",
+    "trace_to": {
+      "target_symbol": "second",
+      "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "second",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 7,
+              "signature": "pub fn second(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "to_file": "rust_bin_targets/src/binx/caller.rs",
+    "to_symbol": "must_not_cross_bin_boundary",
+    "trace_to": {
+      "target_symbol": "bench_target",
+      "target_file": "rust_bin_targets/benches/bench_support.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "bench_target",
+              "file": "rust_bin_targets/benches/bench_support.rs",
+              "line": 1,
+              "signature": "pub fn bench_target() {}",
+              "is_entry_point": true
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/benches/perf.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "bench_target",
+              "file": "rust_bin_targets/benches/bench_support.rs",
+              "line": 1,
+              "signature": "pub fn bench_target() {}",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 2,
+      "entry_points_found": 2,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "to_file": "utils.ts",
+    "to_symbol": "processData",
+    "trace_to": {
+      "target_symbol": "via_super",
+      "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "via_super",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 11,
+              "signature": "pub fn via_super(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "sink",
+    "trace_to": {
+      "target_symbol": "nested_target",
+      "target_file": "rust_bin_targets/src/bin/other/nested.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/other/main.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "nested_target",
+              "file": "rust_bin_targets/src/bin/other/nested.rs",
+              "line": 1,
+              "signature": "pub fn nested_target() {}",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "nested_target",
+              "file": "rust_bin_targets/src/bin/other/nested.rs",
+              "line": 1,
+              "signature": "pub fn nested_target() {}",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 2,
+      "entry_points_found": 2,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "to_file": "rust_bin_targets/src/bin/tool.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "conditionallyOverwritten",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "conditionallyOverwritten",
+              "file": "data_flow_kills.ts",
+              "line": 23,
+              "signature": "function conditionallyOverwritten(raw: string, condition: boolean): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::path",
+    "to_file": "helpers.ts",
+    "to_symbol": "checkFormat",
+    "trace_to": {
+      "target_symbol": "bin::path",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "to_file": "test_helpers.ts",
+    "to_symbol": "testValidation",
+    "trace_to": {
+      "target_symbol": "runCheck",
+      "target_file": "aliased.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "runCheck",
+              "file": "aliased.ts",
+              "line": 3,
+              "signature": "function runCheck(data: string): boolean",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "to_file": "helpers.ts",
+    "to_symbol": "validate",
+    "trace_to": {
+      "target_symbol": "error_reason",
+      "target_file": "rust_bin_targets/src/route_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "overwritten",
+    "trace_to": {
+      "target_symbol": "complexFlow",
+      "target_file": "data_flow.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "complexFlow",
+              "file": "data_flow.ts",
+              "line": 9,
+              "signature": "function complexFlow(data: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "derived",
+    "trace_to": {
+      "target_symbol": "integration_caller",
+      "target_file": "rust_bin_targets/tests/standalone.rs",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "augmented",
+    "trace_to": {
+      "target_symbol": "tests::calls_lib_target",
+      "target_file": "rust_bin_targets/src/lib.rs",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "via_crate",
+    "trace_to": {
+      "target_symbol": "first",
+      "target_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/tool.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 3,
+      "entry_points_found": 3,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package",
+    "to_file": "main.ts",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "package",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::version",
+    "to_file": "rust_bin_targets/examples/demo.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "package::version",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "to_file": "service.ts",
+    "to_symbol": "handleRequest",
+    "trace_to": {
+      "target_symbol": "error_reason",
+      "target_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "local",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 5,
+              "signature": "pub fn local(body: &[u8]) -> String",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/tool.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "run",
+              "file": "rust_bin_targets/src/bin/support/mod.rs",
+              "line": 4,
+              "signature": "pub fn run()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "first",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 3,
+              "signature": "pub fn first(body: &[u8]) -> String",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "second",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 7,
+              "signature": "pub fn second(body: &[u8]) -> String",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "via_crate",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 15,
+              "signature": "pub fn via_crate(body: &[u8]) -> String",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "via_super",
+              "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+              "line": 11,
+              "signature": "pub fn via_super(body: &[u8]) -> String",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "error_reason",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 1,
+              "signature": "pub fn error_reason(_body: &[u8]) -> String",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 8,
+      "entry_points_found": 8,
+      "max_depth_reached": false,
+      "truncated_paths": 5
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/tests/test_support.rs",
+    "to_symbol": "integration_target",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/benches/perf.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/benches/perf.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::name",
+    "to_file": "rust_bin_targets/src/bin/support/mod.rs",
+    "to_symbol": "run",
+    "trace_to": {
+      "target_symbol": "package::name",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "to_file": "rust_bin_targets/src/bin/other/main.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "usedBeforeOverwrite",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "usedBeforeOverwrite",
+              "file": "data_flow_kills.ts",
+              "line": 17,
+              "signature": "function usedBeforeOverwrite(raw: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "to_file": "rust_bin_targets/src/main.rs",
+    "to_symbol": "main",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/tools/custom.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/tools/custom.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin::name",
+    "trace_to": {
+      "target_symbol": "bin",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::edition",
+    "to_file": "data_flow.ts",
+    "to_symbol": "transformData",
+    "trace_to": {
+      "target_symbol": "package::edition",
+      "target_file": "rust_bin_targets/Cargo.toml",
+      "paths": [],
+      "total_paths": 0,
+      "entry_points_found": 0,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "to_file": "rust_bin_targets/examples/demo_support.rs",
+    "to_symbol": "example_target",
+    "trace_to": {
+      "target_symbol": "processInput",
+      "target_file": "data_processor.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "processInput",
+              "file": "data_processor.ts",
+              "line": 1,
+              "signature": "function processInput(input: string): string",
+              "is_entry_point": true
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "transformData",
+              "file": "data_flow.ts",
+              "line": 3,
+              "signature": "function transformData(rawInput: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processInput",
+              "file": "data_processor.ts",
+              "line": 1,
+              "signature": "function processInput(input: string): string",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 2,
+      "entry_points_found": 2,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "second",
+    "trace_to": {
+      "target_symbol": "lib_target",
+      "target_file": "rust_bin_targets/src/lib.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "lib_target",
+              "file": "rust_bin_targets/src/lib.rs",
+              "line": 3,
+              "signature": "pub fn lib_target() {}",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 1
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "to_file": "rust_bin_targets/benches/bench_support.rs",
+    "to_symbol": "bench_target",
+    "trace_to": {
+      "target_symbol": "local",
+      "target_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "local",
+              "file": "rust_bin_targets/src/bin/support/route_client.rs",
+              "line": 5,
+              "signature": "pub fn local(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "to_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "to_symbol": "via_super",
+    "trace_to": {
+      "target_symbol": "must_not_cross_bin_boundary",
+      "target_file": "rust_bin_targets/src/binx/caller.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "must_not_cross_bin_boundary",
+              "file": "rust_bin_targets/src/binx/caller.rs",
+              "line": 1,
+              "signature": "pub fn must_not_cross_bin_boundary(body: &[u8]) -> String",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "utils.ts",
+    "symbol": "processData",
+    "to_file": "rust_bin_targets/src/bin/other/nested.rs",
+    "to_symbol": "nested_target",
+    "trace_to": {
+      "target_symbol": "processData",
+      "target_file": "utils.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 3,
+      "entry_points_found": 3,
+      "max_depth_reached": false,
+      "truncated_paths": 2
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "to_file": "rust_bin_targets/tools/custom_support.rs",
+    "to_symbol": "custom_target",
+    "trace_to": {
+      "target_symbol": "sink",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "augmented",
+              "file": "data_flow_kills.ts",
+              "line": 31,
+              "signature": "function augmented(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "conditionallyOverwritten",
+              "file": "data_flow_kills.ts",
+              "line": 23,
+              "signature": "function conditionallyOverwritten(raw: string, condition: boolean): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "derived",
+              "file": "data_flow_kills.ts",
+              "line": 11,
+              "signature": "function derived(raw: { field: string }): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "overwritten",
+              "file": "data_flow_kills.ts",
+              "line": 5,
+              "signature": "function overwritten(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "usedBeforeOverwrite",
+              "file": "data_flow_kills.ts",
+              "line": 17,
+              "signature": "function usedBeforeOverwrite(raw: string): void",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "sink",
+              "file": "data_flow_kills.ts",
+              "line": 1,
+              "signature": "function sink(input: string): void",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 5,
+      "entry_points_found": 5,
+      "max_depth_reached": false,
+      "truncated_paths": 5
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "to_file": "data_flow_kills.ts",
+    "to_symbol": "conditionallyOverwritten",
+    "trace_to": {
+      "target_symbol": "main",
+      "target_file": "rust_bin_targets/src/bin/tool.rs",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "rust_bin_targets/src/bin/tool.rs",
+              "line": 3,
+              "signature": "fn main()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "to_file": "rust_bin_targets/Cargo.toml",
+    "to_symbol": "bin::path",
+    "trace_to": {
+      "target_symbol": "checkFormat",
+      "target_file": "helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "runCheck",
+              "file": "aliased.ts",
+              "line": 3,
+              "signature": "function runCheck(data: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "checkFormat",
+              "file": "helpers.ts",
+              "line": 5,
+              "signature": "function checkFormat(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        }
+      ],
+      "total_paths": 6,
+      "entry_points_found": 6,
+      "max_depth_reached": false,
+      "truncated_paths": 4
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "to_file": "aliased.ts",
+    "to_symbol": "runCheck",
+    "trace_to": {
+      "target_symbol": "testValidation",
+      "target_file": "test_helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "to_file": "rust_bin_targets/src/route_client.rs",
+    "to_symbol": "error_reason",
+    "trace_to": {
+      "target_symbol": "validate",
+      "target_file": "helpers.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "handleRequest",
+              "file": "service.ts",
+              "line": 3,
+              "signature": "function handleRequest(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "main",
+              "file": "main.ts",
+              "line": 3,
+              "signature": "function main()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": false
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "processData",
+              "file": "utils.ts",
+              "line": 3,
+              "signature": "function processData(input: string): string",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "runCheck",
+              "file": "aliased.ts",
+              "line": 3,
+              "signature": "function runCheck(data: string): boolean",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "testValidation",
+              "file": "test_helpers.ts",
+              "line": 3,
+              "signature": "function testValidation()",
+              "is_entry_point": true
+            },
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": false
+            }
+          ]
+        },
+        {
+          "hops": [
+            {
+              "symbol": "validate",
+              "file": "helpers.ts",
+              "line": 1,
+              "signature": "function validate(input: string): boolean",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 6,
+      "entry_points_found": 6,
+      "max_depth_reached": false,
+      "truncated_paths": 4
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "to_file": "data_flow.ts",
+    "to_symbol": "complexFlow",
+    "trace_to": {
+      "target_symbol": "overwritten",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "overwritten",
+              "file": "data_flow_kills.ts",
+              "line": 5,
+              "signature": "function overwritten(raw: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "to_file": "rust_bin_targets/tests/standalone.rs",
+    "to_symbol": "integration_caller",
+    "trace_to": {
+      "target_symbol": "derived",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "derived",
+              "file": "data_flow_kills.ts",
+              "line": 11,
+              "signature": "function derived(raw: { field: string }): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "to_file": "rust_bin_targets/src/lib.rs",
+    "to_symbol": "tests::calls_lib_target",
+    "trace_to": {
+      "target_symbol": "augmented",
+      "target_file": "data_flow_kills.ts",
+      "paths": [
+        {
+          "hops": [
+            {
+              "symbol": "augmented",
+              "file": "data_flow_kills.ts",
+              "line": 31,
+              "signature": "function augmented(raw: string): void",
+              "is_entry_point": true
+            }
+          ]
+        }
+      ],
+      "total_paths": 1,
+      "entry_points_found": 1,
+      "max_depth_reached": false,
+      "truncated_paths": 0
+    },
+    "trace_to_symbol": {
+      "path": null,
+      "complete": true,
+      "reason": "no_path_found"
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "expression": "x",
+    "trace_data": {
+      "expression": "x",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "overwritten",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/src/binx/caller.rs",
+      "origin_symbol": "must_not_cross_bin_boundary",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "rust_bin_targets/src/route_client.rs",
+      "origin_symbol": "error_reason",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/src/lib.rs",
+      "origin_symbol": "tests::calls_lib_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/src/route_client.rs",
+      "origin_symbol": "error_reason",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/src/lib.rs",
+      "origin_symbol": "lib_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "rust_bin_targets/src/bin/other/main.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "local",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "local",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/examples/demo.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/tests/standalone.rs",
+      "origin_symbol": "integration_caller",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "local",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "augmented",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "service.ts",
+      "origin_symbol": "handleRequest",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/benches/perf.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/src/bin/other/main.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "usedBeforeOverwrite",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "usedBeforeOverwrite",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "service.ts",
+      "origin_symbol": "handleRequest",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::path",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "bin::path",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "rust_bin_targets/src/route_client.rs",
+      "origin_symbol": "error_reason",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "usedBeforeOverwrite",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "via_crate",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "expression": "x",
+    "trace_data": {
+      "expression": "x",
+      "origin_file": "rust_bin_targets/src/bin/tool.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "error_reason",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "first",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::version",
+    "expression": "value",
+    "trace_data": {
+      "expression": "value",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "package::version",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "data_flow.ts",
+      "origin_symbol": "complexFlow",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "second",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "main.ts",
+    "symbol": "main",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "main.ts",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "validate",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "checkFormat",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/examples/demo.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "first",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "service.ts",
+      "origin_symbol": "handleRequest",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/src/bin/tool.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "expression": "value",
+    "trace_data": {
+      "expression": "value",
+      "origin_file": "rust_bin_targets/src/bin/other/main.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "validate",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/tests/standalone.rs",
+      "origin_symbol": "integration_caller",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/src/bin/other/main.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/tests/test_support.rs",
+      "origin_symbol": "integration_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "augmented",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/benches/perf.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "service.ts",
+      "origin_symbol": "handleRequest",
+      "hops": [
+        {
+          "file": "utils.ts",
+          "symbol": "processData",
+          "variable": "input",
+          "line": 3,
+          "flow_type": "parameter",
+          "approximate": false
+        },
+        {
+          "file": "utils.ts",
+          "symbol": "processData",
+          "variable": "valid",
+          "line": 4,
+          "flow_type": "assignment",
+          "approximate": false
+        },
+        {
+          "file": "helpers.ts",
+          "symbol": "validate",
+          "variable": "input",
+          "line": 1,
+          "flow_type": "parameter",
+          "approximate": false
+        },
+        {
+          "file": "helpers.ts",
+          "symbol": "checkFormat",
+          "variable": "input",
+          "line": 5,
+          "flow_type": "parameter",
+          "approximate": false
+        },
+        {
+          "file": "helpers.ts",
+          "symbol": "test",
+          "variable": "input",
+          "line": 6,
+          "flow_type": "parameter",
+          "approximate": true
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "rust_bin_targets/examples/demo.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "sink",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "conditionallyOverwritten",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "expression": "value",
+    "trace_data": {
+      "expression": "value",
+      "origin_file": "rust_bin_targets/src/lib.rs",
+      "origin_symbol": "lib_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "rust_bin_targets/benches/perf.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "expression": "value",
     "trace_data": {
       "expression": "value",
       "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "conditionallyOverwritten",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "expression": "value",
+    "trace_data": {
+      "expression": "value",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "augmented",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/benches/perf.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "utils.ts",
+    "symbol": "processData",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "utils.ts",
+      "origin_symbol": "processData",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "rust_bin_targets/tests/test_support.rs",
+      "origin_symbol": "integration_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "data_flow.ts",
+      "origin_symbol": "complexFlow",
+      "hops": [
+        {
+          "file": "data_flow.ts",
+          "symbol": "complexFlow",
+          "variable": "{ name, value }",
+          "line": 10,
+          "flow_type": "assignment",
+          "approximate": true
+        }
+      ],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/src/lib.rs",
+      "origin_symbol": "tests::calls_lib_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "usedBeforeOverwrite",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/src/main.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::name",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "package::name",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "second",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "checkFormat",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::edition",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "package::edition",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "local",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "rust_bin_targets/tests/standalone.rs",
+      "origin_symbol": "integration_caller",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/tools/custom.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "derived",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "expression": "x",
+    "trace_data": {
+      "expression": "x",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "augmented",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "error_reason",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "data_flow_kills.ts",
       "origin_symbol": "sink",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "data_flow.ts",
+      "origin_symbol": "complexFlow",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "rust_bin_targets/src/bin/support/route_client.rs",
+      "origin_symbol": "local",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "derived",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/tools/custom.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/src/bin/tool.rs",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "checkFormat",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "data_processor.ts",
+      "origin_symbol": "processInput",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "rust_bin_targets/tools/custom_support.rs",
+      "origin_symbol": "custom_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "main.ts",
+    "symbol": "main",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "main.ts",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "utils.ts",
+    "symbol": "processData",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "utils.ts",
+      "origin_symbol": "processData",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "expression": "x",
+    "trace_data": {
+      "expression": "x",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "second",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "rust_bin_targets/examples/demo_support.rs",
+      "origin_symbol": "example_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "bin::path",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "bin::path",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "expression": "rawInput",
+    "trace_data": {
+      "expression": "rawInput",
+      "origin_file": "rust_bin_targets/src/bin/support/mod.rs",
+      "origin_symbol": "run",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "service.ts",
+      "origin_symbol": "handleRequest",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/benches/bench_support.rs",
+      "origin_symbol": "bench_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "via_super",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "aliased.ts",
+      "origin_symbol": "runCheck",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "main.ts",
+    "symbol": "main",
+    "expression": "data",
+    "trace_data": {
+      "expression": "data",
+      "origin_file": "main.ts",
+      "origin_symbol": "main",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "helpers.ts",
+      "origin_symbol": "checkFormat",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "data_flow.ts",
+      "origin_symbol": "transformData",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "derived",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/Cargo.toml",
+    "symbol": "package::name",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "rust_bin_targets/Cargo.toml",
+      "origin_symbol": "package::name",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "expression": "input",
+    "trace_data": {
+      "expression": "input",
+      "origin_file": "test_helpers.ts",
+      "origin_symbol": "testValidation",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "utils.ts",
+    "symbol": "processData",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "utils.ts",
+      "origin_symbol": "processData",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "expression": "this",
+    "trace_data": {
+      "expression": "this",
+      "origin_file": "rust_bin_targets/tools/custom_support.rs",
+      "origin_symbol": "custom_target",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "expression": "self",
+    "trace_data": {
+      "expression": "self",
+      "origin_file": "rust_bin_targets/src/bin/support/mod.rs",
+      "origin_symbol": "run",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "items",
+    "trace_data": {
+      "expression": "items",
+      "origin_file": "data_flow_kills.ts",
+      "origin_symbol": "usedBeforeOverwrite",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "expression": "callback",
+    "trace_data": {
+      "expression": "callback",
+      "origin_file": "aliased.ts",
+      "origin_symbol": "runCheck",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "expression": "y",
+    "trace_data": {
+      "expression": "y",
+      "origin_file": "rust_bin_targets/src/bin/support/admin_client.rs",
+      "origin_symbol": "via_super",
+      "hops": [],
+      "depth_limited": false
+    }
+  },
+  {
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "expression": "result",
+    "trace_data": {
+      "expression": "result",
+      "origin_file": "aliased.ts",
+      "origin_symbol": "runCheck",
       "hops": [],
       "depth_limited": false
     }
