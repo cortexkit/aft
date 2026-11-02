@@ -583,8 +583,12 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
         1
     );
     let text = body["content"][0]["text"].as_str().unwrap();
+    // Result paths are rendered with the platform's separator.
     assert!(
-        text.starts_with("oversized-first-result/"),
+        text.starts_with(&format!(
+            "oversized-first-result{}",
+            std::path::MAIN_SEPARATOR
+        )),
         "first result start was lost"
     );
     assert!(text.len() <= 51_200);
