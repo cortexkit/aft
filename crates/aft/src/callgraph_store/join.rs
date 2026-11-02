@@ -1391,6 +1391,7 @@ impl ParseBlob {
             },
             lang: data.lang,
             data,
+            typescript_objects: None,
             nodes,
             raw_refs,
             dispatch_hints: Vec::new(),
@@ -1634,7 +1635,7 @@ fn manifest_payloads(
 /// look up through ordinary Rust path binding: declared types and their bases,
 /// method owners and traits, field and return types, and each call site's
 /// receiver with any field or return-value wrapper removed.
-fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
+pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for ty in &parse.dispatch.types {
         names.insert(ty.name.clone());

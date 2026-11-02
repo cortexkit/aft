@@ -96,13 +96,33 @@ const TS_QUERY: &str = r#"
       name: (_) @interface_property.name) @interface_property.def))
 
 ;; callable object-literal properties
-(object
-  (pair
-    key: (_) @object_property.name
-    value: [(arrow_function) (function_expression) (generator_function)] @object_property.value) @object_property.def) @object_property.object
-(object
-  (method_definition
-    name: (_) @object_property.name) @object_property.def) @object_property.object
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (arrow_function) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (function_expression) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (generator_function) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (method_definition
+        name: (_) @object_property.name) @object_property.def)))
 
 ;; enum declarations
 (enum_declaration
@@ -2555,7 +2575,7 @@ pub fn extract_symbols_from_tree(
 
 /// Cut a signature to [`MAX_SIGNATURE_BYTES`] on a character boundary and mark
 /// the cut with an ellipsis so readers can tell it was shortened.
-fn truncate_signature(signature: &mut String) {
+pub(crate) fn truncate_signature(signature: &mut String) {
     if signature.len() <= MAX_SIGNATURE_BYTES {
         return;
     }
@@ -3027,7 +3047,7 @@ fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) 
 }
 
 /// Extract the first line of a node as its signature.
-fn extract_signature(source: &str, node: &Node) -> String {
+pub(crate) fn extract_signature(source: &str, node: &Node) -> String {
     let text = node_text(source, node);
     let first_line = text.lines().next().unwrap_or(text);
     // Trim trailing opening brace if present
@@ -3078,33 +3098,6 @@ fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
             }
         }
     }
-}
-
-pub(crate) fn ts_object_scope(source: &str, object: Node<'_>) -> String {
-    // Preserve existing module-level const/let identities. Other literals need
-    // source-qualified owners so unrelated properties cannot bind bare calls.
-    if let Some(declaration) = object
-        .parent()
-        .filter(|n| n.kind() == "variable_declarator")
-    {
-        let top_level = declaration
-            .parent()
-            .filter(|n| n.kind() == "lexical_declaration")
-            .and_then(|n| n.parent())
-            .is_some_and(|n| {
-                n.kind() == "program"
-                    || n.kind() == "export_statement"
-                        && n.parent().is_some_and(|p| p.kind() == "program")
-            });
-        if let Some(name) = declaration
-            .child_by_field_name("name")
-            .filter(|n| top_level && n.kind() == "identifier")
-        {
-            return node_text(source, &name).to_string();
-        }
-    }
-    let position = object.start_position();
-    format!("@object:{}:{}", position.row, position.column)
 }
 
 fn push_ts_member_symbol(
@@ -3167,7 +3160,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut interface_property_interface_name_node = None;
         let mut interface_property_name_node = None;
         let mut interface_property_def_node = None;
-        let mut object_property_object_node = None;
+        let mut object_property_object_name_node = None;
         let mut object_property_name_node = None;
         let mut object_property_value_node = None;
         let mut object_property_def_node = None;
@@ -3211,7 +3204,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 }
                 "interface_property.name" => interface_property_name_node = Some(cap.node),
                 "interface_property.def" => interface_property_def_node = Some(cap.node),
-                "object_property.object" => object_property_object_node = Some(cap.node),
+                "object_property.object_name" => object_property_object_name_node = Some(cap.node),
                 "object_property.name" => object_property_name_node = Some(cap.node),
                 "object_property.value" => object_property_value_node = Some(cap.node),
                 "object_property.def" => object_property_def_node = Some(cap.node),
@@ -3356,19 +3349,19 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         // Callable object-literal property. The property key is the public callable name.
-        if let (Some(object_node), Some(name_node), Some(def_node)) = (
-            object_property_object_node,
+        if let (Some(object_name_node), Some(name_node), Some(def_node)) = (
+            object_property_object_name_node,
             object_property_name_node,
             object_property_def_node,
         ) {
-            let object_name = ts_object_scope(source, object_node);
+            let object_name = node_text(source, &object_name_node);
             let property_name = node_text(source, &name_node);
             push_ts_member_symbol(
                 &mut symbols,
                 source,
                 name_node,
                 def_node,
-                &object_name,
+                object_name,
                 SymbolKind::Method,
             );
 
@@ -3381,7 +3374,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                             source,
                             function_name_node,
                             value_node,
-                            &object_name,
+                            object_name,
                             SymbolKind::Function,
                         );
                     }

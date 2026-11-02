@@ -12,6 +12,137 @@ use crate::parser::LangId;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
 
+/// Complete the graph builder's owned symbols without changing navigation or
+/// semantic-search symbol tables supplied by the shared parser.
+pub(crate) fn complete_typescript_symbols<'tree>(
+    source: &str,
+    lang: LangId,
+    root: Node<'tree>,
+    symbols: &mut Vec<crate::symbols::Symbol>,
+) -> Vec<Node<'tree>> {
+    if matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        let nodes = descendants(root);
+        typescript::complete_symbols(&nodes, source, symbols);
+        nodes
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build compact, temporary TypeScript object facts from the supplied syntax
+/// tree and attributed call sites, avoiding a second graph extraction.
+pub(crate) fn typescript_objects_from_data(
+    source: &str,
+    lang: LangId,
+    nodes: &[Node<'_>],
+    data: &crate::callgraph::FileCallData,
+) -> Option<ParseBlob> {
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        return None;
+    }
+    let mut refs = Vec::new();
+    for (caller, calls) in &data.calls_by_symbol {
+        for call in calls.iter().filter(|call| {
+            call.kind == crate::callgraph::CallSiteKind::Call && call.full_callee.contains('.')
+        }) {
+            refs.push(BlobRef {
+                ordinal: refs.len() as u32,
+                kind: BlobRefKind::Call,
+                caller_symbol: Some(caller.clone()),
+                short_name: Some(call.callee_name.clone()),
+                full_ref: Some(call.full_callee.clone()),
+                module_path: None,
+                line: call.line,
+                byte_start: call.byte_start,
+                byte_end: call.byte_end,
+                path_override: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                import_kind: None,
+            });
+        }
+    }
+    let mut parse = ParseBlob {
+        entry_point_symbols: Vec::new(),
+        dispatch: DispatchFacts::default(),
+        extractor_version: String::new(),
+        language: if lang == LangId::Tsx {
+            "tsx"
+        } else {
+            "typescript"
+        }
+        .into(),
+        ast_nodes: Vec::new(),
+        symbols: super::blob_symbols(data),
+        default_export_symbol: data.default_export_symbol.clone(),
+        exported_symbols: data.exported_symbols.clone(),
+        callable_symbols: Vec::new(),
+        imports: super::blob_imports(data),
+        python_bindings: Vec::new(),
+        refs,
+    };
+    let objects = typescript::Objects::new(nodes, source, &parse);
+    let mut facts = DispatchFacts::default();
+    objects.extract(&mut facts);
+    facts.methods.extend_from_slice(objects.methods());
+    let call_kinds = crate::calls::call_node_kinds(lang);
+    let calls = nodes
+        .iter()
+        .filter(|node| call_kinds.contains(&node.kind()))
+        .map(|node| ((node.start_byte(), node.end_byte()), *node))
+        .collect::<HashMap<_, _>>();
+    for reference in &parse.refs {
+        let Some(&call) = calls.get(&(reference.byte_start, reference.byte_end)) else {
+            continue;
+        };
+        let Some(callee) = field(call, &["function", "name"]) else {
+            continue;
+        };
+        if field(callee, &["property"]).is_none() {
+            continue;
+        }
+        let Some(receiver) = field(callee, &["object"]) else {
+            continue;
+        };
+        let ty = if text(receiver, source) == "this" {
+            enclosing(call, FUNCTIONS)
+                .filter(|function| function.kind() == "method_definition")
+                .and_then(|function| typescript::object_member(function, source))
+                .map(|(object, _)| typescript::object_identity(object))
+        } else {
+            objects.receiver(receiver, call)
+        };
+        if !ty.as_ref().is_some_and(|ty| {
+            ty.starts_with("@object:") || ty.starts_with("@return:") || ty.starts_with("@field:")
+        }) {
+            continue;
+        }
+        facts.sites.push(SiteHint {
+            ordinal: reference.ordinal,
+            caller: reference.caller_symbol.clone(),
+            line: reference.line,
+            member: field(callee, &["property"]).map(|member| text(member, source).to_string()),
+            receiver: ty,
+            dynamic: false,
+        });
+    }
+    if facts.methods.is_empty() && facts.sites.is_empty() && facts.returns.is_empty() {
+        return None;
+    }
+    let site_ordinals = facts
+        .sites
+        .iter()
+        .map(|site| site.ordinal)
+        .collect::<HashSet<_>>();
+    parse
+        .refs
+        .retain(|reference| site_ordinals.contains(&reference.ordinal));
+    parse.dispatch = facts;
+    Some(parse)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
     pub types: Vec<TypeHint>,

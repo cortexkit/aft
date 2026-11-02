@@ -5484,6 +5484,8 @@ struct FileExtract {
     source_identity: Option<String>,
     lang: LangId,
     data: FileCallData,
+    // In-memory only: never written to the store or blob payload.
+    typescript_objects: Option<Arc<join::ParseBlob>>,
     nodes: Vec<NodeRecord>,
     raw_refs: Vec<RawRef>,
     dispatch_hints: Vec<DispatchHint>,
@@ -8369,6 +8371,7 @@ impl CallGraphStore {
                         )?;
                         for extract in &build.extracts {
                             retained_callers.retain(&extract.rel_path, &extract.data);
+                            retained_callers.retain_objects(extract);
                         }
                         #[cfg(test)]
                         notify_cold_build_resident_extract_observer(
@@ -8558,8 +8561,12 @@ impl CallGraphStore {
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
-        let _supplemental_edge_count =
-            insert_method_dispatch_edges_chunked(&tx, &self.project_root, batch_files)?;
+        let _supplemental_edge_count = insert_method_dispatch_edges_chunked(
+            &tx,
+            &self.project_root,
+            batch_files,
+            &retained_callers.objects,
+        )?;
         set_meta_ready(&tx, true)?;
         set_staged_build_phase(&tx, "ready")?;
         tx.execute("DELETE FROM staging_file_inventory", [])?;
@@ -15549,6 +15556,7 @@ fn retained_caller_budget() -> usize {
 /// resolution pass does not parse the file again.
 struct RetainedCallerData {
     by_file: HashMap<String, FileCallData>,
+    objects: typescript_objects::FactsCache,
     retained_bytes: usize,
     max_bytes: usize,
 }
@@ -15557,6 +15565,7 @@ impl RetainedCallerData {
     fn new(max_bytes: usize) -> Self {
         Self {
             by_file: HashMap::new(),
+            objects: HashMap::new(),
             retained_bytes: 0,
             max_bytes,
         }
@@ -15570,6 +15579,23 @@ impl RetainedCallerData {
         self.retained_bytes += weight;
         self.by_file
             .insert(rel_path.to_string(), resolution_caller_data(data));
+    }
+
+    fn retain_objects(&mut self, extract: &FileExtract) {
+        if !matches!(extract.lang, LangId::TypeScript | LangId::Tsx) {
+            return;
+        }
+        let weight = extract
+            .typescript_objects
+            .as_ref()
+            .map_or(96, |facts| typescript_objects::facts_weight(facts))
+            .saturating_add(extract.rel_path.len());
+        if self.retained_bytes.saturating_add(weight) > self.max_bytes {
+            return;
+        }
+        self.retained_bytes += weight;
+        self.objects
+            .insert(extract.rel_path.clone(), extract.typescript_objects.clone());
     }
 
     fn contains(&self, rel_path: &str) -> bool {
@@ -15719,7 +15745,8 @@ fn build_file_extract_in_corpus(
         }
         result => result?,
     };
-    let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
+    let (mut data, typescript_objects) =
+        callgraph::build_file_data_with_typescript_objects(&abs_path, &source)?;
     let lang = data.lang;
     if lang == LangId::Rust {
         extend_rust_imports_with_nested_uses(&source, &mut data);
@@ -15835,6 +15862,7 @@ fn build_file_extract_in_corpus(
         source_identity,
         lang,
         data,
+        typescript_objects: typescript_objects.map(Arc::new),
         nodes,
         raw_refs,
         dispatch_hints,
@@ -20120,6 +20148,22 @@ fn insert_method_dispatch_edges_cached(
     caller_files: Option<&BTreeSet<String>>,
     candidates_by_name: &mut DispatchCandidateCache,
 ) -> Result<BTreeSet<String>> {
+    insert_method_dispatch_edges_with_objects(
+        tx,
+        project_root,
+        caller_files,
+        candidates_by_name,
+        None,
+    )
+}
+
+fn insert_method_dispatch_edges_with_objects(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    caller_files: Option<&BTreeSet<String>>,
+    candidates_by_name: &mut DispatchCandidateCache,
+    cached: Option<&typescript_objects::FactsCache>,
+) -> Result<BTreeSet<String>> {
     let references = load_name_match_refs(tx, caller_files)?;
     if references.is_empty() {
         return Ok(BTreeSet::new());
@@ -20129,7 +20173,7 @@ fn insert_method_dispatch_edges_cached(
     }
 
     let mut source_cache: DispatchSourceCache = HashMap::new();
-    let mut objects = typescript_objects::ObjectDispatch::new(tx, project_root);
+    let mut objects = typescript_objects::ObjectDispatch::new(tx, project_root, cached);
     objects.prepare(&references)?;
     let mut edge_ids = BTreeSet::new();
     for reference in references {
@@ -20229,6 +20273,7 @@ fn insert_method_dispatch_edges_chunked(
     tx: &Transaction<'_>,
     project_root: &Path,
     chunk_size: usize,
+    objects: &typescript_objects::FactsCache,
 ) -> Result<usize> {
     let total_files = query_count(
         tx,
@@ -20257,11 +20302,12 @@ fn insert_method_dispatch_edges_chunked(
         let Some(last_file) = caller_files.last().cloned() else {
             break;
         };
-        inserted += insert_method_dispatch_edges_cached(
+        inserted += insert_method_dispatch_edges_with_objects(
             tx,
             project_root,
             Some(&caller_files),
             &mut candidates,
+            Some(objects),
         )?
         .len();
         after_file = last_file;
@@ -31404,6 +31450,7 @@ pub fn run() {
                 python_bindings: Vec::new(),
                 lang: LangId::TypeScript,
             },
+            typescript_objects: None,
             nodes: vec![node.clone()],
             raw_refs: vec![raw_ref],
             dispatch_hints: vec![DispatchHint {

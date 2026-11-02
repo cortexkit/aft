@@ -196,6 +196,35 @@ fn typescript_object_store_var_definitions_are_not_bare_name_bindings() {
 }
 
 #[test]
+fn typescript_object_cold_cache_avoids_reextraction() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run() {} });"),
+        ("caller.ts", "import {make} from './producer'; function caller() { const adapter=make(); adapter.run(); }"),
+    ]);
+    let mut retained = RetainedCallerData::new(1024 * 1024);
+    for path in source_files(&fixture.root) {
+        let extract = build_file_extract(&fixture.root, &path).unwrap();
+        retained.retain_objects(&extract);
+    }
+    let connection = fixture.store.conn.lock().unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    let references = load_name_match_refs(&transaction, None).unwrap();
+    assert!(references
+        .iter()
+        .any(|reference| reference.method_name == "run"));
+    let mut objects = typescript_objects::ObjectDispatch::new(
+        &transaction,
+        &fixture.root,
+        Some(&retained.objects),
+    );
+    objects.prepare(&references).unwrap();
+    assert_eq!(objects.source_extracts(), 0);
+    assert!(references
+        .iter()
+        .any(|reference| objects.resolve(&transaction, reference).unwrap().is_some()));
+}
+
+#[test]
 fn typescript_object_views_and_legacy_answers_are_identical() {
     use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
     fn answers(connection: &Connection) -> Vec<(String, String, String, String, u32, bool)> {

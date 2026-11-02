@@ -13,6 +13,85 @@ pub(super) fn object_identity(object: Node<'_>) -> String {
     format!("@object:{}:{}", position.row, position.column)
 }
 
+pub(super) fn complete_symbols(
+    nodes: &[Node<'_>],
+    source: &str,
+    symbols: &mut Vec<crate::symbols::Symbol>,
+) {
+    use crate::symbols::{Symbol, SymbolKind};
+    let mut identities = HashMap::new();
+    for symbol in symbols.iter() {
+        *identities
+            .entry((symbol.scope_chain.clone(), symbol.name.clone()))
+            .or_insert(0usize) += 1;
+    }
+    let mut positions = symbols
+        .iter()
+        .enumerate()
+        .map(|(index, symbol)| {
+            (
+                (
+                    symbol.range.end_line,
+                    symbol.range.end_col,
+                    symbol.name.clone(),
+                ),
+                index,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for &node in nodes {
+        let Some((object, name)) = object_member(node, source) else {
+            continue;
+        };
+        let owner = object_identity(object);
+        let definition = node.parent().filter(|p| p.kind() == "pair").unwrap_or(node);
+        let mut declarations = vec![(name.clone(), definition, SymbolKind::Method)];
+        if let Some(alias) = field(node, &["name"]).filter(|_| node.kind() != "method_definition") {
+            if text(alias, source) != name {
+                declarations.push((text(alias, source).to_string(), node, SymbolKind::Function));
+            }
+        }
+        for (name, definition, kind) in declarations {
+            let key = (
+                definition.end_position().row as u32,
+                definition.end_position().column as u32,
+                name.clone(),
+            );
+            if let Some(&index) = positions.get(&key) {
+                let symbol = &mut symbols[index];
+                // Preserve a previously selectable declaration unless its old
+                // qualified identity combines different source declarations.
+                if identities
+                    .get(&(symbol.scope_chain.clone(), symbol.name.clone()))
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    symbol.scope_chain = vec![owner.clone()];
+                    symbol.parent = Some(owner.clone());
+                }
+                continue;
+            }
+            let mut signature = crate::parser::extract_signature(source, &definition);
+            crate::parser::truncate_signature(&mut signature);
+            positions.insert(key, symbols.len());
+            symbols.push(Symbol {
+                name,
+                kind,
+                range: crate::parser::node_range_with_decorators(
+                    &definition,
+                    source,
+                    LangId::TypeScript,
+                ),
+                signature: Some(signature),
+                scope_chain: vec![owner.clone()],
+                exported: false,
+                parent: Some(owner.clone()),
+            });
+        }
+    }
+}
+
 fn unwrap(mut node: Node<'_>) -> Node<'_> {
     loop {
         let child = match node.kind() {
@@ -100,6 +179,8 @@ pub(super) struct Objects<'nodes, 'tree, 'source> {
     members: HashMap<(usize, &'source str), usize>,
     unsafe_objects: HashSet<usize>,
     generics: HashSet<&'source str>,
+    object_methods: Vec<MethodHint>,
+    needed_objects: HashSet<usize>,
 }
 
 impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
@@ -121,6 +202,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             members: HashMap::new(),
             unsafe_objects: HashSet::new(),
             generics: HashSet::new(),
+            object_methods: Vec::new(),
+            needed_objects: HashSet::new(),
             imports: parse
                 .imports
                 .iter()
@@ -134,6 +217,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         };
         result.index_nodes();
         let mut symbols = HashMap::new();
+        let mut members = HashMap::new();
         for symbol in parse
             .symbols
             .iter()
@@ -142,10 +226,34 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             symbols
                 .entry((symbol.end_line, symbol.end_col))
                 .or_insert(symbol);
+            members.insert(
+                (symbol.end_line, symbol.end_col, symbol.name.as_str()),
+                symbol,
+            );
         }
         let mut ambiguous = HashSet::new();
         let mut seen = HashSet::new();
         for node in nodes.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
+            if let Some((object, name)) = object_member(*node, source) {
+                if result.unambiguous_member(object, &name) {
+                    if let Some(symbol) = members.get(&(
+                        node.end_position().row as u32,
+                        node.end_position().column as u32,
+                        name.as_str(),
+                    )) {
+                        result.object_methods.push(MethodHint {
+                            owner: object_identity(object),
+                            trait_name: None,
+                            name,
+                            symbol: symbol.scoped_name.clone(),
+                            has_body: field(*node, &["body"]).is_some(),
+                            shape: String::new(),
+                            private: false,
+                        });
+                        result.need_object(object);
+                    }
+                }
+            }
             if let Some(object) = result.literal_return(*node) {
                 result.returned_literals.insert(node.id(), object);
             }
@@ -170,7 +278,38 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         result
             .returns
             .retain(|symbol, _| !ambiguous.contains(symbol));
+        let owners = nodes
+            .iter()
+            .filter(|node| node.kind() == "object" && result.needed_objects.contains(&node.id()))
+            .map(|node| object_identity(*node))
+            .collect::<HashSet<_>>();
+        result.returns.retain(|_, ty| owners.contains(ty));
         result
+    }
+
+    fn need_object(&mut self, mut object: Node<'tree>) {
+        // Keep type records only for literals that supply callables and the
+        // literal field containers needed to reach them.
+        loop {
+            if !self.needed_objects.insert(object.id()) {
+                return;
+            }
+            let mut expression = object;
+            while let Some(parent) = expression.parent().filter(|p| unwrap(*p) == object) {
+                expression = parent;
+            }
+            let Some(pair) = expression.parent().filter(|p| p.kind() == "pair") else {
+                return;
+            };
+            let Some(parent) = pair.parent().filter(|p| p.kind() == "object") else {
+                return;
+            };
+            object = parent;
+        }
+    }
+
+    pub(super) fn methods(&self) -> &[MethodHint] {
+        &self.object_methods
     }
 
     fn index_binding(&mut self, owner: usize, pattern: Node<'tree>, binding: Node<'tree>) {
@@ -330,7 +469,11 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
     }
 
     pub(super) fn extract(&self, facts: &mut DispatchFacts) {
-        for &object in self.nodes.iter().filter(|n| n.kind() == "object") {
+        for &object in self
+            .nodes
+            .iter()
+            .filter(|n| n.kind() == "object" && self.needed_objects.contains(&n.id()))
+        {
             facts.types.push(TypeHint {
                 name: object_identity(object),
                 bases: Vec::new(),
@@ -353,7 +496,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 }
                 if let Some(value) = field(pair, &["value"])
                     .map(unwrap)
-                    .filter(|n| n.kind() == "object")
+                    .filter(|n| n.kind() == "object" && self.needed_objects.contains(&n.id()))
                 {
                     facts.fields.push(FieldHint {
                         owner: object_identity(object),
