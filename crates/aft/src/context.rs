@@ -18404,7 +18404,10 @@ mod memory_estimate_tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config::default(),
         );
-        let path = PathBuf::from("/memory-rollup/lib.rs");
+        // The project root must be absolute on every platform; a bare
+        // "/memory-rollup" has no drive letter on Windows.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
         let assert_memory = || {
             let expected = ctx.symbol_cache.read().unwrap().recounted_memory_for_test();
             assert_eq!(ctx.memory_root_snapshot().symbols, expected);
@@ -18424,7 +18427,7 @@ mod memory_estimate_tests {
         ctx.symbol_cache
             .write()
             .unwrap()
-            .set_project_root(PathBuf::from("/memory-rollup"));
+            .set_project_root(root.path().to_path_buf());
         assert_memory();
         ctx.symbol_cache.write().unwrap().invalidate(&path);
         assert_memory();
