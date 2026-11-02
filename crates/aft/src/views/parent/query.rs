@@ -622,6 +622,8 @@ mod disk_reserve_tests {
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,
         );
+        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
+            .unwrap_err();
         let reserve = crate::view_storage_reserve::DiskReserveCondition::observed(
             storage.path(),
             "device_free_space_floor",

@@ -22,7 +22,7 @@ impl DiskReserveCondition {
         }
         // A failed probe has no sizes to disclose. Keep its unexpected-error
         // treatment rather than inventing a free-space measurement.
-        let (free_bytes, capacity) = crate::blob_store::v3::free_space(storage)?;
+        let (free_bytes, capacity) = crate::blob_store::v3::floor_refusal_measurement(storage)?;
         let floor_bytes = crate::blob_store::v3::free_disk_floor(capacity);
         let human_bytes = crate::migration::prune_legacy::human_bytes;
         let message = APPROVED_MESSAGE
@@ -55,6 +55,8 @@ mod tests {
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,
         );
+        crate::blob_store::v3::publish(storage.path(), &"f".repeat(64), 1, None, |_| Ok(()))
+            .unwrap_err();
         let condition = DiskReserveCondition::observed(storage.path(), CODE).unwrap();
         assert_eq!(condition.message, "View storage is paused: 21.0 GiB (22548578304 bytes) is free on this disk and AFT keeps 32.0 GiB (34359738368 bytes) free. Unused view data is being cleaned up; retry later.");
     }

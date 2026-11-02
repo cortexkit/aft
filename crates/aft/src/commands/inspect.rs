@@ -871,6 +871,12 @@ fn handle_inspect_payload(
         {
             (crate::feature_status::IndexObservation::building(), true)
         }
+        crate::context::CallgraphStoreAccess::Error(
+            crate::callgraph_store::CallGraphStoreError::Unavailable(message),
+        ) if crate::view_storage_reserve::is_message(message) => (
+            crate::feature_status::IndexObservation::unavailable(message.clone()),
+            false,
+        ),
         crate::context::CallgraphStoreAccess::Error(error) => (
             crate::feature_status::IndexObservation::unavailable(error.to_string()),
             false,

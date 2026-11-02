@@ -120,6 +120,7 @@ fn disk_reserve_callgraph_routes_use_the_approved_sentence() {
         21 * 1024 * 1024 * 1024,
         3_900_000_000_000,
     );
+    crate::blob_store::v3::publish(&storage, &"f".repeat(64), 1, None, |_| Ok(())).unwrap_err();
     ctx.install_callgraph_source_for_test(Arc::new(Refused(
         "view loader [driver]: device_free_space_floor".into(),
     )));
@@ -149,6 +150,31 @@ fn disk_reserve_callgraph_routes_use_the_approved_sentence() {
     assert!(answer.success, "{:?}", answer.data);
     assert_eq!(answer.data["callgraph"]["code"], "callgraph_unavailable");
     assert_eq!(answer.data["callgraph"]["index"]["reason"], MESSAGE);
+    let inspect: RawRequest = serde_json::from_value(json!({
+        "id": "reserve-inspect", "command": "inspect", "scope": ["a.ts"],
+        "sections": ["dead_code", "unused_exports"],
+    }))
+    .unwrap();
+    let answer = crate::commands::inspect::handle_inspect(&inspect, &ctx);
+    assert!(answer.success, "{:?}", answer.data);
+    assert_eq!(answer.data["complete"], false);
+    assert!(
+        serde_json::to_string(&answer.data["summary"])
+            .unwrap()
+            .contains(MESSAGE),
+        "{:?}",
+        answer.data
+    );
+    assert!(
+        !serde_json::to_string(&answer.data)
+            .unwrap()
+            .contains("callgraph store unavailable:"),
+        "{:?}",
+        answer.data
+    );
+    assert!(!serde_json::to_string(&answer.data)
+        .unwrap()
+        .contains("This is an AFT bug"));
     let health = ctx.try_health_snapshot(&root);
     assert!(health.view_load_failures.is_empty());
     assert!(health.view_load_failure_last.is_none());
@@ -177,6 +203,14 @@ fn disk_reserve_probe_failure_keeps_the_existing_bug_treatment() {
         .unwrap_err()
         .to_string();
     assert_eq!(error, "device_free_space_floor");
+    // Even if probing starts working before the reply, the failed admission
+    // has no measurement and must retain the unexpected-error treatment.
+    drop(_failed_probe);
+    let _now_measured = crate::blob_store::v3::set_free_space_for_test(
+        &storage,
+        21 * 1024 * 1024 * 1024,
+        3_900_000_000_000,
+    );
     ctx.note_view_load_failure("trigram", &error);
     let message = crate::context::view_load_failure_message(&error);
     assert_eq!(message, "device_free_space_floor\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.");
