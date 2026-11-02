@@ -1048,6 +1048,25 @@ mod tests {
         .unwrap()
     }
 
+    // A cold load may not be ready while metadata or publication is pending.
+    // Keep the production reader's backoff instead of requiring the
+    // first attempt to finish, and bound the fixture's total retry time.
+    fn ready_reader(view: &CallgraphView) -> Arc<ReadonlyCallGraphStore> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match view.reader() {
+                Ok(reader) => return reader,
+                Err(error) => {
+                    assert!(error.busy, "{error}");
+                    let now = std::time::Instant::now();
+                    assert!(now < deadline, "callgraph stayed pending: {error}");
+                    let retry_at = view.query.lock().unwrap().pending.as_ref().unwrap().0;
+                    std::thread::sleep(retry_at.min(deadline).saturating_duration_since(now));
+                }
+            }
+        }
+    }
+
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
     }
@@ -1102,7 +1121,10 @@ mod tests {
         let planned = CallgraphViewError::from(error.to_string());
         assert!(planned.busy, "{planned}");
         let after = super::super::verification::BindGuard::capture(&root, None).unwrap();
-        assert_eq!(before, after, "a timed-out query must not write the checkout");
+        assert_eq!(
+            before, after,
+            "a timed-out query must not write the checkout"
+        );
         before.validate(&root).unwrap();
 
         // Repeated failures must not compare equal as if both read the policy.
@@ -1111,6 +1133,22 @@ mod tests {
             let error = super::super::verification::BindGuard::capture(&root, None).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
         }
+
+        let graph = view(&root, &temp.path().join("storage"));
+        let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+        let pending = graph.reader().unwrap_err();
+        assert!(pending.busy, "{pending}");
+        assert!(!pending.reason.contains("changed"), "{pending}");
+        assert!(!graph.is_ready());
+        assert!(matches!(
+            crate::context::checkout_view_callgraph_access(Some(Err(pending))),
+            crate::context::CallgraphStoreAccess::Error(
+                crate::callgraph_store::CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+            ) if error.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        assert_eq!(callers(&ready_reader(&graph), "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        before.validate(&root).unwrap();
     }
 
     #[test]
@@ -2194,11 +2232,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let main_view = view(&main, &storage);
         assert_eq!(
-            callers(&main_view.reader().unwrap(), "a.ts", "target").len(),
+            callers(&ready_reader(&main_view), "a.ts", "target").len(),
             1
         );
         let linked_view = view(&linked, &storage);
-        let patched = callers(&linked_view.reader().unwrap(), "a.ts", "target");
+        let patched = callers(&ready_reader(&linked_view), "a.ts", "target");
         assert_eq!(patched.len(), 2, "{patched:?}");
         assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
         let base_events = events(&base_dir(&storage, &linked));
@@ -2218,7 +2256,7 @@ mod tests {
         let cold_storage = temp.path().join("cold-storage");
         let cold_view = view(&linked, &cold_storage);
         assert_eq!(
-            callers(&cold_view.reader().unwrap(), "a.ts", "target"),
+            callers(&ready_reader(&cold_view), "a.ts", "target"),
             patched
         );
         assert!(!events(&base_dir(&cold_storage, &linked))

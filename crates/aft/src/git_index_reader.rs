@@ -842,8 +842,6 @@ fn pump(
         }
     })();
     if result.is_err() {
-        #[cfg(test)]
-        eprintln!("metadata child pid={} cwd={:?} args={:?} failed: {result:?}", child.id(), command.get_current_dir(), command.get_args().collect::<Vec<_>>());
         crate::format::kill_process_tree(&mut child);
         let _ = child.wait();
     }
