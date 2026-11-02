@@ -6123,7 +6123,15 @@ fn scoped_rust_inspect_retains_compiler_error_when_reopening_unchanged_file() {
             "compiler result missing after {id}: {response:#}"
         );
         assert!(!ctx.lsp().document_is_open_for_test(&lib));
-        wait_for_close_reply(&ctx);
+        // The pull-only fake sends no close reply. Deliver its empty clearing
+        // publication explicitly before the next request reopens the file.
+        ctx.lsp().enqueue_event_for_test(LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: root.clone(),
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(json!({"uri": file_uri(&lib), "diagnostics": []})),
+        });
+        ctx.lsp().drain_events();
     }
 
     fs::write(&lib, "pub fn f() {}\n").unwrap();
