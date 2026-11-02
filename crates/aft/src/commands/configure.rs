@@ -24973,8 +24973,8 @@ mod tests {
         );
         settle_configure_for_test(&ctx);
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], "not_project");
-        assert_eq!(folder["state"], "decided");
+        assert_eq!(folder["classification"], "not_project", "{folder}");
+        assert_eq!(folder["state"], "decided", "{folder}");
         assert!(ctx
             .degraded_reasons()
             .contains(&"folder_not_admitted".into()));
