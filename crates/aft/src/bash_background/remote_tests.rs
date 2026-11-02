@@ -1219,12 +1219,41 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     let capture = crate::bash_changed_files::Capture::start(&ctx).unwrap();
     let mut launch = launch(daemon.connection.clone());
     launch.explicit_runon = !fallback;
+    // Only the local fallback shell creates local.txt. The explicit remote
+    // command writes disposable output outside the project; its local change
+    // report comes from the observer event injected below.
+    let write = if fallback {
+        "printf local-change > local.txt".to_owned()
+    } else {
+        format!(
+            "printf remote-change > '{}'",
+            storage.path().join("remote-output.txt").display()
+        )
+    };
+    let command =
+        format!("{write}; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done");
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
-        ctx.bash_background().spawn_remote(launch, SpawnPlan::Unsandboxed, "printf local-change > local.txt; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done", resolve_posix_shell(), "session".into(), project.path().into(), HashMap::from([(
-            "CHANGED_FILES_RELEASE".into(),
-            storage.path().join("release").display().to_string(),
-        )]), crate::bash_background::HardKill::from_timeout_ms(Some(20_000)), None, storage.path().into(), crate::bash_background::TaskSlot::Background { max: 10 }, true, false, Some(project.path().into()))
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                &command,
+                resolve_posix_shell(),
+                "session".into(),
+                project.path().into(),
+                HashMap::from([(
+                    "CHANGED_FILES_RELEASE".into(),
+                    storage.path().join("release").display().to_string(),
+                )]),
+                crate::bash_background::HardKill::from_timeout_ms(Some(20_000)),
+                None,
+                storage.path().into(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.path().into()),
+            )
             .unwrap()
     };
     if fallback {
