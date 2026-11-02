@@ -3,7 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/src/bash_permissions/writes.rs"
+    "harness-goldens"
   ],
   "slices": [
     "land-runon-edit-refusal"
