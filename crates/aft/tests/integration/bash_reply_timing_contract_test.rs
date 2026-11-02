@@ -790,6 +790,71 @@ fn subc_worker_bash_watch_blocks_until_the_task_completes() {
 }
 
 #[test]
+fn subc_runner_cancel_of_bash_watch_leaves_the_watched_child_running() {
+    run_subc_with_role(&[], true, |mut harness| async move {
+        let release = harness.project.path().join("watch-cancel-release");
+        let command = format!(
+            "while [ ! -f {} ]; do sleep 0.02; done; exit 7",
+            shell_quote(&release),
+        );
+        let task = launch_worker_background(&mut harness.stream, 180, &command).await;
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            181,
+            "bash_watch",
+            json!({"taskId": task}),
+            Some("worker"),
+        )
+        .await;
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            182,
+            "bash_status",
+            json!({"taskId": task}),
+            Some("worker"),
+        )
+        .await;
+        let before = read_tool_response(&mut harness.stream, 182, HANG_CATCH).await;
+        assert_eq!(tool_response_json(&before)["status"], "running");
+        send_frame(
+            &mut harness.stream,
+            Frame::build(
+                FrameType::Cancel,
+                control_flags(),
+                ROUTE_CHANNEL,
+                1,
+                181,
+                vec![],
+            )
+            .unwrap(),
+        )
+        .await;
+        let cancelled =
+            read_non_push_frame(&mut harness.stream, HANG_CATCH, "watch cancellation").await;
+        assert_eq!(cancelled.header.corr, 181);
+        assert_eq!(cancelled.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cancelled.body).unwrap()["code"],
+            "cancelled"
+        );
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            183,
+            "bash_status",
+            json!({"taskId": task}),
+            Some("worker"),
+        )
+        .await;
+        let after = read_tool_response(&mut harness.stream, 183, HANG_CATCH).await;
+        assert_eq!(tool_response_json(&after)["status"], "running");
+        std::fs::write(release, "").unwrap();
+        let terminal = subc_status_until_terminal(&mut harness.stream, 184, &task).await;
+        assert_eq!(terminal["exit_code"], 7, "{terminal}");
+        harness
+    });
+}
+
+#[test]
 fn subc_worker_bash_watch_returns_when_the_pattern_matches() {
     run_subc(|mut harness| async move {
         let task =
