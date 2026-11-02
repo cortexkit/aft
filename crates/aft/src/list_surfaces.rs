@@ -727,6 +727,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
     },
     ExclusionEntry {
+        file: "views/callgraph_copies.rs",
+        enclosing_item: "evict_for",
+        location_or_primitive: "EVICTION_CANDIDATES and five-second deadline",
+        reason: "internal database admission maintenance, not result lists; exhausted eviction work makes the checkout borrow the main graph",
+    },
+    ExclusionEntry {
+        file: "storage_retention.rs",
+        enclosing_item: "evict_least_recent_v3_member, reclaim_v3_admission_family",
+        location_or_primitive: "SQL LIMIT and take(max_examined), 64-removal loop and five-second admission deadline",
+        reason: "internal LRU database reclamation, not result lists; every deletion rechecks references and live holds and insufficient reclaim preserves the device-space refusal",
+    },
+    ExclusionEntry {
         file: "cache_location.rs",
         enclosing_item: "candidates_and_durable, candidates_and_durable_with_budget, deletion_protections, deletion_protections_with_budget, retention_protections_with_budget, ensure_cache_idle",
         location_or_primitive: "RepairBudget",

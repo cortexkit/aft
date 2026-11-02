@@ -1,23 +1,23 @@
-//! `views.callgraph_copies`: how many checkouts of one repository keep their
-//! own call graph, besides the main checkout.
+//! `views.callgraph_copies`: extra call-graph databases kept by a repository.
 //!
 //! A checkout's call-graph view costs a base database for its commit plus a
 //! member database for its edits. Where the filesystem clones files the member
 //! shares unchanged pages with its base, but a commit the repository has no
 //! base for, or one edit to a file most of the code depends on, still costs
 //! most of a full graph (1.3 to 2 GB for AFT's own repository). So the number
-//! of checkouts that build one is limited. A checkout over the limit reads the
-//! main checkout's published graph instead, and its answers say which of its
+//! of databases is limited, including filesystem clones. A checkout over the
+//! limit reads the main checkout's published graph instead, and its answers say which of its
 //! files differ (`commands::callgraph_borrowed`).
 //!
-//! The limit counts the repository's active `<scope>.callgraph` members other
-//! than the main checkout's. When it is reached, the least recently used
-//! member nobody holds (no live session, pin, reader or open handle) is
-//! evicted to make room; when every member is held, the new checkout borrows.
+//! The main checkout's member and current base are exempt. Other checkout
+//! copies and bases count, with each shared base counted once. At the limit,
+//! the least recently used database nobody holds (no reference, live build,
+//! session, pin, reader or open handle) is evicted to make room; when every
+//! member is held, the new checkout borrows.
 //! A checkout whose files equal the graph it would borrow borrows without
 //! counting, since a copy of its own would hold the same graph. Admission and
 //! registration are separate steps, so checkouts starting at the same moment
-//! can overshoot the limit by their number; later admissions evict back down.
+//! can overshoot the limit; later admissions evict back down.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -113,10 +113,6 @@ pub(crate) fn admit(
     {
         return Ok(borrow);
     }
-    let owned = members.iter().filter(|m| m.scope != target.scope).count();
-    if owned < copies as usize {
-        return Ok(Admission::Own);
-    }
     // At the limit: make room by evicting copies nobody is using. When none
     // can go, or eviction fails, this checkout borrows, so the limit holds.
     match evict_for(
@@ -124,7 +120,9 @@ pub(crate) fn admit(
         family,
         &target.scope,
         &own,
-        owned + 1 - copies as usize,
+        copies as usize,
+        root,
+        policy,
     ) {
         Ok(true) => Ok(Admission::Own),
         Ok(false) => Ok(borrow),
@@ -137,14 +135,16 @@ pub(crate) fn admit(
     }
 }
 
-/// Evicts `needed` idle call-graph copies other than `target` and `own`.
+/// Counts and evicts idle databases under the same storage lock.
 /// `Ok(false)` when every remaining copy is in use.
 fn evict_for(
     paths: &crate::root_cache::StoragePaths,
     family: &str,
     target: &str,
     own: &str,
-    needed: usize,
+    copies: usize,
+    root: &Path,
+    policy: crate::blob_store::v2::TrigramPolicy,
 ) -> Result<bool, String> {
     let storage = paths.artifacts.as_path();
     // View-directory removal refuses a cache whose durable owner is unknown;
@@ -153,15 +153,34 @@ fn evict_for(
     let deadline = Instant::now() + EVICTION_BUDGET;
     let lock = crate::blob_store::v3::ReservationLock::acquire_until(storage, deadline)
         .map_err(|error| error.to_string())?;
-    let mut registry = crate::blob_store::v3::open_base_refs_registry(storage, family, &lock, None)
-        .map_err(|error| error.to_string())?;
-    for _ in 0..needed {
+    let mut registry =
+        crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, &lock)
+            .map_err(|error| error.to_string())?;
+    for _ in 0..EVICTION_CANDIDATES {
+        let (owned, exempt_base, reusable) =
+            database_count(storage, family, &mut registry, target, root, policy)?;
+        // A different base and the checkout's mutable copy are two databases,
+        // even on filesystems where their initial pages are cloned.
+        let needed = if reusable.is_some() { 1 } else { 2 };
+        if owned + needed <= copies {
+            registry
+                .covering_measurement_until(deadline)
+                .map_err(|error| error.to_string())?;
+            return Ok(true);
+        }
+        let mut keep = vec![target, own];
+        if let Some(base) = exempt_base.as_deref() {
+            keep.push(base);
+        }
+        if let Some(base) = reusable.as_deref() {
+            keep.push(base);
+        }
         let evicted = crate::storage_retention::evict_least_recent_v3_member(
             storage,
             family,
             &mut registry,
             SUFFIX,
-            &[target, own],
+            &keep,
             EVICTION_CANDIDATES,
             deadline,
         )
@@ -173,7 +192,95 @@ fn evict_for(
             None => return Ok(false),
         }
     }
-    Ok(true)
+    Ok(false)
+}
+
+/// Count member identities, not referrer edges: several checkouts can share
+/// one base. Only the target's current base is exempt; its old bases count.
+fn database_count(
+    storage: &Path,
+    family: &str,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    target: &str,
+    root: &Path,
+    policy: crate::blob_store::v2::TrigramPolicy,
+) -> Result<(usize, Option<String>, Option<String>), String> {
+    let target_dir = crate::blob_store::v3::view_dir(storage, family, target)
+        .map_err(|error| error.to_string())?;
+    let exempt_base = super::ViewStore::existing_dir(target_dir).and_then(|store| {
+        let generation = store.current_generation_read_only().ok()??;
+        let manifest = store.load_manifest_v2(&generation).ok()?;
+        Some(manifest.base_header()?.scope.clone())
+    });
+    let members: Vec<(String, String, String)> = registry.with_barrier(|tx| {
+        Ok(tx.prepare("SELECT scope,kind,view_dir FROM members WHERE state!='evicting' AND (kind='base' OR (kind='view' AND scope LIKE '%.callgraph'))")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }).map_err(|error| error.to_string())?;
+    let mut count = 0;
+    let mut reusable = None;
+    for (scope, kind, stored) in members {
+        if scope == target {
+            continue;
+        }
+        if kind == "view" {
+            count += 1;
+            continue;
+        }
+        let dir = crate::blob_store::v3::view_dir(storage, family, &scope)
+            .map_err(|error| error.to_string())?;
+        if dir != Path::new(&stored) {
+            return Err("unexpected base directory".into());
+        }
+        let Some(store) = super::ViewStore::existing_dir(dir) else {
+            continue;
+        };
+        let Some(generation) = store
+            .current_generation_read_only()
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        if store
+            .derived_path(&generation)
+            .map_err(|error| error.to_string())?
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        {
+            if exempt_base.as_deref() != Some(scope.as_str()) {
+                count += 1;
+            }
+            if reusable.is_none() {
+                let manifest = store
+                    .load_manifest_v2(&generation)
+                    .map_err(|error| error.to_string())?;
+                let producers = super::manifest_v2::Producers {
+                    trigram: policy.fingerprint_hex(),
+                    semantic: None,
+                    callgraph: super::callgraph::PRODUCER.into(),
+                };
+                let route = super::snapshot::V3Route {
+                    storage: storage.to_path_buf(),
+                    family: family.to_owned(),
+                    scope: scope.clone(),
+                };
+                let paths: Vec<_> = manifest.entries().map(|(path, _)| path.clone()).collect();
+                let candidate =
+                    super::tree_base::identity_for_admission(super::tree_base::TreeBaseInput {
+                        route: &route,
+                        root,
+                        paths: &paths,
+                        policy,
+                        producers: &producers,
+                        ignore_fingerprint: manifest.header().ignore_fingerprint.clone(),
+                    });
+                if candidate.is_some_and(|identity| identity.scope == scope) {
+                    reusable = Some(scope);
+                }
+            }
+        }
+    }
+    Ok((count, exempt_base, reusable))
 }
 
 /// True when the checkout's known files equal the target's published graph,
@@ -333,5 +440,273 @@ fn decode_root(root: &[u8]) -> Option<PathBuf> {
     #[cfg(not(unix))]
     {
         std::str::from_utf8(root).ok().map(PathBuf::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob_store::v3;
+    use crate::views::base_refs::tests::{
+        bind, publish_test_base, published, worker_delta, FAMILY,
+    };
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        paths: crate::root_cache::StoragePaths,
+        main: PathBuf,
+        worker: PathBuf,
+        _main_view: super::super::callgraph::CallgraphView,
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    fn fixture() -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        std::fs::write(
+            main.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "core.autocrlf", "false"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "add",
+                "-A",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        let worker = temp.path().join("worker");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worker.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::write(worker.join("extra.ts"), "export function extra() {}\n").unwrap();
+        let paths = crate::root_cache::StoragePaths::same(temp.path().join("storage"));
+        let main = std::fs::canonicalize(main).unwrap();
+        let worker = std::fs::canonicalize(worker).unwrap();
+        let main_view = super::super::callgraph::CallgraphView::new(
+            main.clone(),
+            paths.clone(),
+            FAMILY.into(),
+            policy(),
+        )
+        .unwrap();
+        main_view.reader().unwrap();
+        Fixture {
+            _temp: temp,
+            paths,
+            main,
+            worker,
+            _main_view: main_view,
+        }
+    }
+
+    fn policy() -> crate::blob_store::v2::TrigramPolicy {
+        crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        }
+    }
+
+    fn admission(f: &Fixture, copies: u32) -> Admission {
+        admit(&f.paths, FAMILY, policy(), &f.worker, copies, || None).unwrap()
+    }
+
+    fn graph_base(
+        f: &Fixture,
+        text: &[u8],
+        last_used: i64,
+    ) -> (super::super::base_refs::BaseIdentity, String) {
+        let storage = &f.paths.artifacts;
+        let (base, generation) = publish_test_base(storage, &[("src/a.rs", text)]);
+        let dir = v3::view_dir(storage, FAMILY, &base.scope).unwrap();
+        let store = super::super::ViewStore::existing_dir(dir).unwrap();
+        // Copy accounting only inspects the file's presence. No graph reader
+        // opens these payloads; the fixture's main graph above is a real DB.
+        std::fs::write(store.derived_path(&generation).unwrap(), b"graph payload").unwrap();
+        super::super::base_refs::with_base_barrier(storage, FAMILY, |tx| {
+            tx.execute(
+                "UPDATE members SET last_bind_ms=?2 WHERE scope=?1",
+                rusqlite::params![base.scope, last_used],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        (base, generation)
+    }
+
+    #[test]
+    fn callgraph_copies_over_limit_evicts_lru_bases_but_keeps_references_and_pins() {
+        let _serial = v3::serial_for_test();
+        let f = fixture();
+        let (pinned, _) = graph_base(&f, b"pinned", 0);
+        let _pin =
+            crate::pins::LivePin::create_v3(&f.paths.artifacts, FAMILY, &pinned.scope).unwrap();
+        let (referenced, generation) = graph_base(&f, b"referenced", 1);
+        drop(published(
+            bind(
+                &f.paths.artifacts,
+                "holder",
+                &referenced,
+                &generation,
+                worker_delta(&referenced, &generation, b"referenced"),
+                None,
+            )
+            .unwrap(),
+        ));
+        let (oldest, _) = graph_base(&f, b"oldest", 2);
+        let (older, _) = graph_base(&f, b"older", 3);
+        let (newest, _) = graph_base(&f, b"newest", 4);
+        assert_eq!(admission(&f, 4), Admission::Own);
+        for (base, exists) in [
+            (&pinned, true),
+            (&referenced, true),
+            (&oldest, false),
+            (&older, false),
+            (&newest, true),
+        ] {
+            assert_eq!(
+                v3::view_dir(&f.paths.artifacts, FAMILY, &base.scope)
+                    .unwrap()
+                    .exists(),
+                exists,
+                "{}",
+                base.scope
+            );
+        }
+    }
+
+    #[test]
+    fn callgraph_copies_shared_base_counts_once_and_main_base_is_exempt() {
+        let _serial = v3::serial_for_test();
+        let f = fixture();
+        let (base, generation) = graph_base(&f, b"shared", 0);
+        for holder in ["holder-a", "holder-b"] {
+            drop(published(
+                bind(
+                    &f.paths.artifacts,
+                    holder,
+                    &base,
+                    &generation,
+                    worker_delta(&base, &generation, b"shared"),
+                    None,
+                )
+                .unwrap(),
+            ));
+        }
+        assert_eq!(
+            admission(&f, 1),
+            Admission::Borrow {
+                root: f.main.clone(),
+                scope: super::super::callgraph::view_scope(&f.main),
+            }
+        );
+        assert_eq!(
+            admission(&f, 2),
+            Admission::Own,
+            "one base shared by two holders costs one slot"
+        );
+    }
+
+    #[test]
+    fn callgraph_copies_new_commit_reserves_base_and_checkout_databases() {
+        let _serial = v3::serial_for_test();
+        let f = fixture();
+        git(&f.worker, &["add", "-A"]);
+        git(
+            &f.worker,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-qm",
+                "diverged",
+            ],
+        );
+        assert!(matches!(admission(&f, 1), Admission::Borrow { .. }));
+        assert_eq!(admission(&f, 2), Admission::Own);
+    }
+
+    #[test]
+    fn callgraph_copies_all_databases_in_use_borrows_main_with_note_without_refusal() {
+        let _serial = v3::serial_for_test();
+        let f = fixture();
+        let family = crate::search_index::artifact_cache_key(&f.main);
+        let main_view = super::super::callgraph::CallgraphView::new(
+            f.main.clone(),
+            f.paths.clone(),
+            family.clone(),
+            policy(),
+        )
+        .unwrap();
+        main_view.reader().unwrap();
+        let held_root = f._temp.path().join("held");
+        std::fs::create_dir(&held_root).unwrap();
+        std::fs::write(held_root.join("held.ts"), "export function held() {}\n").unwrap();
+        let held = super::super::callgraph::CallgraphView::new(
+            held_root,
+            f.paths.clone(),
+            family,
+            policy(),
+        )
+        .unwrap();
+        held.reader().unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(f.worker.clone());
+        config.storage_dir = Some(f.paths.artifacts.clone());
+        config.views.enabled = true;
+        config.views.callgraph_copies = 2;
+        config.indexes.callgraph = true;
+        config.search_index_max_file_size = 1 << 20;
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        );
+        let reader = ctx
+            .callgraph_view_reader()
+            .expect("views route")
+            .expect("must not refuse");
+        assert!(reader.file_identities().unwrap().contains_key("a.ts"));
+        let borrowed = crate::commands::callgraph_borrowed::borrowed_callgraph(&ctx)
+            .expect("the held base and checkout copy fill the two slots");
+        assert_eq!(borrowed.owner_checkout, Some(f.main.clone()));
+        assert!(borrowed
+            .summary_line()
+            .starts_with("callgraph: borrowed from "));
     }
 }

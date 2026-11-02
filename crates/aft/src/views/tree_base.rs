@@ -39,6 +39,17 @@ pub(crate) struct TreeBaseInput<'a> {
     pub ignore_fingerprint: Option<String>,
 }
 
+/// Read-only counterpart of bootstrap for copy admission. It proves the
+/// checkout would use an existing tree base without claiming or building it.
+pub(crate) fn identity_for_admission(input: TreeBaseInput<'_>) -> Option<BaseIdentity> {
+    let guard = BindGuard::capture(input.root, None).ok()?;
+    if input.ignore_fingerprint.as_deref() != Some(guard.policy.base_digest.as_str()) {
+        return None;
+    }
+    let proven = prove(&input, &guard).ok()?;
+    BaseIdentity::of(&input.route.family, &proven.manifest).ok()
+}
+
 /// A base manifest whose every member was read and matched to the index,
 /// with the bytes read and their receipts.
 struct ProvenMembers {

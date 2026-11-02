@@ -6055,9 +6055,8 @@ enum V3IdleStep {
     Unknown(String),
 }
 
-/// Evicts the least recently used active view member whose scope ends with
-/// `suffix` and is not in `keep`, so a new checkout can take its place under
-/// `views.callgraph_copies`. A member with a live session, pin, protected read
+/// Evicts the least recently used unreferenced base or active view member
+/// whose scope ends with `suffix`, excluding `keep`. A live session, pin, protected read
 /// marker, worker intent or open SQLite handle is skipped, exactly as idle
 /// eviction skips it. At most `max_examined` members are looked at, oldest
 /// first. Returns the evicted scope, or `None` when every candidate examined
@@ -6077,7 +6076,7 @@ pub(crate) fn evict_least_recent_v3_member(
         .with_barrier(|tx| {
             let mut statement = tx.prepare(
                 "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members
-                 WHERE kind='view' AND state='active' AND scope LIKE ?1
+                 WHERE state='active' AND (kind='base' OR (kind='view' AND scope LIKE ?1))
                  ORDER BY last_bind_ms,scope LIMIT ?2",
             )?;
             let rows = statement
@@ -6100,20 +6099,98 @@ pub(crate) fn evict_least_recent_v3_member(
         let expected = crate::blob_store::v3::view_dir(storage, family, &member.scope);
         let Some(view_dir) = expected.ok().filter(|path| {
             Path::new(&member.view_dir) == path
-                && member.root.as_deref().and_then(v3_root_path).is_some()
+                && (member.kind == "base"
+                    || member.root.as_deref().and_then(v3_root_path).is_some())
         }) else {
             continue;
         };
         let step = registry
-            .with_barrier(|tx| Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?))
+            .with_barrier(|tx| {
+                if member.kind != "base" {
+                    return Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?);
+                }
+                let Some(current) = v3_member(tx, &member.scope)? else {
+                    return Ok(V3IdleStep::Held);
+                };
+                if current.kind != "base"
+                    || current.state != "active"
+                    || current.last_bind_ms != member.last_bind_ms
+                    || current.view_dir != member.view_dir
+                    || crate::views::eviction::v3_base_hold(tx, &member.scope, &view_dir).is_some()
+                {
+                    return Ok(V3IdleStep::Held);
+                }
+                let _files = crate::db::file_identity::filesystem_guard();
+                if crate::db::file_identity::has_open_connections_under(&view_dir) {
+                    return Ok(V3IdleStep::Held);
+                }
+                tx.execute(
+                    "UPDATE members SET state='evicting' WHERE scope=?1",
+                    [&member.scope],
+                )?;
+                Ok(V3IdleStep::Evicting)
+            })
             .map_err(v3)?;
         if !matches!(step, V3IdleStep::Evicting) {
             continue;
         }
-        v3_finish_eviction(storage, registry, &member.scope, &view_dir, deadline)?;
+        if member.kind == "base" {
+            crate::views::base_sweep::finish_base_reclaim(registry, &member.scope, &view_dir)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        } else {
+            v3_remove_evicting(storage, registry, &member.scope, &view_dir)?;
+        }
         return Ok(Some(member.scope));
     }
     Ok(None)
+}
+
+/// Give a write refused for insufficient free device space a bounded chance
+/// to free its family's unused databases. The reservation lock stays held through the
+/// caller's subsequent space check; no registry barrier is held on entry.
+pub(crate) fn reclaim_v3_admission_family(
+    storage: &Path,
+    family: &str,
+    lock: &crate::blob_store::v3::ReservationLock,
+    deadline: Instant,
+) -> io::Result<()> {
+    #[cfg(test)]
+    test_hook(storage, "v3-pressure-reclaim-started");
+    if !crate::blob_store::v3::family_dir(storage, family)
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .join("members.sqlite")
+        .try_exists()?
+    {
+        return Ok(());
+    }
+    let mut registry =
+        crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, lock)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    for _ in 0..64 {
+        if Instant::now() >= deadline
+            || evict_least_recent_v3_member(
+                storage,
+                family,
+                &mut registry,
+                ".callgraph",
+                &[],
+                64,
+                deadline,
+            )?
+            .is_none()
+        {
+            break;
+        }
+        #[cfg(test)]
+        test_hook(storage, "v3-pressure-reclaimed");
+    }
+    // Refresh family byte accounting after the removals. If the deadline
+    // interrupts the walk, the next admission must measure the family again;
+    // the incomplete walk never replaces the ledger's total.
+    registry
+        .covering_measurement_until(deadline)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
 }
 
 fn report_v3_idle_unknown(
@@ -16378,6 +16455,77 @@ mod v3_base_reference_collector_tests {
             .member(scope)
             .unwrap()
             .is_some()
+    }
+
+    #[test]
+    fn blob_store_admission_at_floor_reclaims_family_base_then_succeeds() {
+        use crate::blob_store::v3;
+        let _serial = v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        crate::root_cache::register_durable_owner(&StoragePaths::same(storage.path())).unwrap();
+        let (unused, _) = publish_test_base(storage.path(), &[("src/a.rs", b"unused")]);
+        let (pinned, _) = publish_test_base(storage.path(), &[("src/a.rs", b"pinned")]);
+        let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &pinned.scope).unwrap();
+        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let _hook = observe_test_hook(
+            storage.path(),
+            Arc::new({
+                let probes = probes.clone();
+                let storage = storage.path().to_path_buf();
+                move |step| {
+                    if step == "v3-pressure-reclaimed" {
+                        probes.lock().unwrap().push(v3::set_free_space_for_test(
+                            &storage,
+                            u64::MAX,
+                            1 << 30,
+                        ));
+                    }
+                }
+            }),
+        );
+        v3::publish(storage.path(), FAMILY, 1 << 20, None, |_| Ok(())).unwrap();
+        assert!(!registered(storage.path(), &unused.scope));
+        assert!(!v3::view_dir(storage.path(), FAMILY, &unused.scope)
+            .unwrap()
+            .exists());
+        assert!(registered(storage.path(), &pinned.scope));
+        assert_eq!(
+            probes.lock().unwrap().len(),
+            1,
+            "exactly one database freed"
+        );
+    }
+
+    #[test]
+    fn blob_store_admission_at_floor_without_reclaimable_data_keeps_refusal_code() {
+        use crate::blob_store::v3;
+        let _serial = v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (held, _) = publish_test_base(storage.path(), &[("src/a.rs", b"held")]);
+        let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &held.scope).unwrap();
+        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _hook = observe_test_hook(
+            storage.path(),
+            Arc::new({
+                let attempts = attempts.clone();
+                move |step| {
+                    if step == "v3-pressure-reclaim-started" {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }),
+        );
+        let result = v3::publish(storage.path(), FAMILY, 1, None, |_| -> v3::Result<()> {
+            panic!("refused admission ran the writer")
+        });
+        assert!(
+            matches!(result, Err(v3::Error::Refused("device_free_space_floor"))),
+            "{result:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(registered(storage.path(), &held.scope));
     }
 
     #[test]
