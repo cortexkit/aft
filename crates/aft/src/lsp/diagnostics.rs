@@ -186,27 +186,29 @@ thread_local! {
 
 impl DiagnosticsStore {
     pub(crate) fn verified_content_hash(&self, file: &Path) -> Option<[u8; 32]> {
-        let mut memo = self.verified_content.lock();
         let observed_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let before = NativeStat::read(file).ok();
-        if let (Some(cached), Some(current)) = (memo.entries.get(file), before.as_ref()) {
-            if reusable_content_stat(current, cached.observed_ns)
-                && cached.stat.reusable(current, cached.observed_ns)
-            {
-                return Some(cached.hash);
+        {
+            let mut memo = self.verified_content.lock();
+            if let (Some(cached), Some(current)) = (memo.entries.get(file), before.as_ref()) {
+                if reusable_content_stat(current, cached.observed_ns)
+                    && cached.stat.reusable(current, cached.observed_ns)
+                {
+                    return Some(cached.hash);
+                }
             }
+            memo.remove(file);
         }
-        memo.remove(file);
         let hash = super::document::file_content_hash(file)?;
         if let Some(before) = before.filter(|stat| reusable_content_stat(stat, observed_ns)) {
+            let after = NativeStat::read(file).ok();
+            let mut memo = self.verified_content.lock();
             // Never save a hash read across a write or replacement. Links and
             // filesystems without precise native change evidence stay strict.
-            if self.by_file.contains_key(file)
-                && NativeStat::read(file).ok().as_ref() == Some(&before)
-            {
+            if self.by_file.contains_key(file) && after.as_ref() == Some(&before) {
                 memo.insert(
                     file.to_path_buf(),
                     VerifiedContent {
@@ -1456,6 +1458,35 @@ mod tests {
             Some(*blake3::hash(b"other").as_bytes())
         );
         assert!(store.verified_content.lock().entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_freshness_progress_does_not_lock_memo_during_content_reads() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("held.ts");
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live, NUL-terminated string and mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut store = DiagnosticsStore::new();
+        store.publish(server_key(ServerKind::TypeScript), file.clone(), Vec::new());
+
+        let unlocked = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| store.verified_content_hash(&file));
+            // Opening the writer pairs with the reader's open. Keeping it open
+            // without data holds the content read without a timer or sleep.
+            let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            let unlocked = store.verified_content.try_lock().is_some();
+            drop(writer);
+            assert_eq!(reader.join().unwrap(), Some(*blake3::hash(b"").as_bytes()));
+            unlocked
+        });
+        assert!(
+            unlocked,
+            "a blocked content read must not hold the memo lock"
+        );
     }
 
     #[test]
