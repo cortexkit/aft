@@ -916,17 +916,6 @@ impl CallgraphView {
                 completion_busy: false,
             });
         }
-        if self
-            .legacy_import
-            .as_ref()
-            .is_some_and(|job| job.is_building())
-        {
-            return Err(CallgraphViewError {
-                reason: "legacy text and symbol import building".into(),
-                busy: true,
-                completion_busy: false,
-            });
-        }
         let mut retry = self
             .query
             .lock()
@@ -947,6 +936,15 @@ impl CallgraphView {
             now,
             |error| error.busy,
             || {
+                if self
+                    .legacy_import
+                    .as_ref()
+                    .is_some_and(|job| job.is_building())
+                {
+                    return Err(CallgraphViewError::from(
+                        "legacy text and symbol import building",
+                    ));
+                }
                 #[cfg(test)]
                 self.acquisitions
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1057,6 +1055,7 @@ mod tests {
     #[test]
     fn planned_callgraph_load_states_use_bounded_backoff_then_reset() {
         for reason in [
+            "legacy text and symbol import building",
             "callgraph view has unverified writes (pending=[RelPath([97, 46, 116, 115])], watcher=Healthy, unpublished=[])",
             "view loader [driver]: checkout changed before snapshot installation: v3 worker publication failed or may have landed; revalidate: base unavailable",
         ] {
@@ -1083,6 +1082,68 @@ mod tests {
             assert!(retry.pending.is_none());
             assert!(retry.delay.is_zero());
         }
+    }
+
+    #[test]
+    fn legacy_import_uses_reader_backoff_until_it_finishes() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let root = checkout(&temp.path().join("checkout"));
+        crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
+            &root,
+            1 << 20,
+            &storage.join("index").join("donor-reuse"),
+        );
+        let limiter = crate::cold_build_limiter::isolated_limiter(1);
+        let slot = limiter.try_acquire().unwrap();
+        let graph = CallgraphView::new_with_import(
+            root,
+            crate::root_cache::StoragePaths::same(&storage),
+            "donor-reuse".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+            Arc::new(|| true),
+            limiter,
+        )
+        .unwrap();
+        let mut now = std::time::Instant::now();
+        let error = graph.reader_with_clock(|| now).unwrap_err();
+        assert_eq!(error.reason, "legacy text and symbol import building");
+        assert!(error.busy);
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            let error = graph
+                .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
+                .unwrap_err();
+            assert_eq!(error.reason, "legacy text and symbol import building");
+            assert_eq!(
+                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
+                deadline
+            );
+            now = deadline;
+            assert!(graph.reader_with_clock(|| now).is_err());
+        }
+        drop(slot);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while graph.legacy_import.as_ref().unwrap().is_building() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "legacy import did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        now += std::time::Duration::from_secs(30);
+        let ready = graph.reader_with_clock(|| now).unwrap();
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+        assert!(graph.query.lock().unwrap().pending.is_none());
+        assert!(graph.query.lock().unwrap().delay.is_zero());
     }
 
     #[test]
@@ -1708,19 +1769,37 @@ mod tests {
         let main_dir = crate::blob_store::v3::view_dir(&storage, family, &scope).unwrap();
         assert!(main_dir.exists());
         drop(borrowed);
-        // Resident-reader teardown writes its session end asynchronously. The
-        // clock stays fixed while the sweep waits for that actual hold to go.
+        // Session teardown needs the same reservation lock as eviction. Poll
+        // read-only so repeated sweeps cannot starve the asynchronous cleanup.
+        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while main_dir.exists() {
-            let report = sweep();
-            assert!(report.errors.is_empty(), "{report:?}");
+        loop {
+            let sessions: u64 = ledger
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM view_sessions WHERE scope=?1",
+                        [&scope],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            if sessions == 0 {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "main checkout stayed held: {report:?}"
+                "main checkout session stayed held: scope={scope}, sessions={sessions}"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
+        // Keep the original idle clock: once the real holds end, one sweep
+        // must remove main while the worker still retains the shared base.
+        let released = sweep();
+        assert!(released.errors.is_empty(), "{released:?}");
+        assert!(
+            !main_dir.exists(),
+            "main checkout stayed held: {released:?}"
+        );
         let bases: Vec<String> = ledger
             .read(|connection| {
                 Ok(connection
@@ -1754,6 +1833,9 @@ mod tests {
         use super::super::callgraph_copies::{self, Admission};
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
+        // The one-slot limit assumes reuse of the main checkout's base. Keep
+        // external Git attributes from disabling that proof.
+        let _attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
         let storage = temp.path().join("storage");
         let main = checkout(&temp.path().join("main"));
         setup_git(&main, &["init", "-q"]);

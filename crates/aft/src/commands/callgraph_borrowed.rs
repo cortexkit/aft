@@ -338,16 +338,23 @@ fn view_borrowed_callgraph(ctx: &AppContext) -> Option<BorrowedCallgraph> {
     let (owner, store) = ctx.borrowed_callgraph_view()?;
     let checkout_root = canonical(&ctx.config().project_root.clone()?);
     let owner = canonical(&owner);
-    let differing = store.file_identities().ok().and_then(|graph| {
-        let checkout = crate::views::callgraph::callgraph_inputs(ctx.lexical_file_identities()?);
-        Some(compare_with_graph(
+    let differing = store.file_identities().ok().map(|graph| {
+        let checkout = ctx.lexical_file_identities();
+        let has_inventory = checkout.is_some();
+        let checkout = crate::views::callgraph::callgraph_inputs(checkout.unwrap_or_default());
+        let mut differing = compare_with_graph(
             &graph,
             checkout,
             &checkout_root,
             Some(&owner),
             MAX_DISK_HASHES,
             Some(&views_graph_key),
-        ))
+        );
+        // Without a lexical base, compare the graph's own paths using the
+        // existing bounded disk hashes. New checkout-only files remain unknown,
+        // so the differing-file list must not claim complete membership coverage.
+        differing.complete &= has_inventory;
+        differing
     });
     let owner_head = checkout_head(&owner);
     let checkout_head = checkout_head(&checkout_root);

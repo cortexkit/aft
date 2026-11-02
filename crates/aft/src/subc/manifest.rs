@@ -483,6 +483,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
         .ready(false)
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
+                cortexkit_role_tool_provider::CALL_KEEPALIVE_CAPABILITY.to_owned(),
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
                 "tool-views/v1".to_string(),
@@ -864,6 +865,7 @@ mod tests {
         assert_eq!(
             capabilities.provides,
             vec![
+                "call-keepalive/v1".to_string(),
                 "tool-provider/v1".to_string(),
                 "call-modes/v1".to_string(),
                 "tool-views/v1".to_string(),
@@ -878,6 +880,7 @@ mod tests {
         assert_eq!(
             wire.pointer("/capabilities/provides"),
             Some(&serde_json::json!([
+                "call-keepalive/v1",
                 "tool-provider/v1",
                 "call-modes/v1",
                 "tool-views/v1",
@@ -1180,7 +1183,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1", "call-modes/v1", "tool-views/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["call-keepalive/v1", "tool-provider/v1", "call-modes/v1", "tool-views/v1", "flow-scopes/v1", "worker-runs/v1", "scope-workdir/v1", "page-collect/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

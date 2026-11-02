@@ -255,6 +255,7 @@ impl Walk<'_> {
             self.count_entry()?;
             // `DirEntry::metadata` does not follow a symlink either.
             let identity = recorded_identity(&entry.metadata()?);
+            crate::run_tool_call::progress::report();
             if file_type.is_dir() {
                 if self.boundary.should_descend(&path)? {
                     self.manifest.entries.push(TreeEntry {
@@ -446,6 +447,16 @@ struct DeleteProgress {
 }
 
 impl DeleteProgress {
+    fn removed(&mut self, directory: bool) {
+        if directory {
+            self.directories += 1;
+        } else {
+            self.files += 1;
+        }
+        if let Some(token) = &self.token {
+            token.report_progress();
+        }
+    }
     fn checkpoint(&mut self, path: &Path) -> Result<(), DeleteStopped> {
         #[cfg(test)]
         DELETE_OBSERVER.with(|observer| {
@@ -697,7 +708,7 @@ mod platform {
         drop(root_fd);
         progress.checkpoint(root)?;
         if remove_recorded_dir(&parent_fd, &name, root_entry)? {
-            progress.directories += 1;
+            progress.removed(true);
         }
         Ok(())
     }
@@ -784,13 +795,13 @@ mod platform {
                 drop(child_fd);
                 progress.checkpoint(&entry.path)?;
                 if remove_recorded_dir(dir_fd, &name, entry)? {
-                    progress.directories += 1;
+                    progress.removed(true);
                 }
             } else {
                 // unlinkat does not follow a leaf symlink, and without
                 // AT_REMOVEDIR refuses a directory swapped in since the check.
                 match unlink(dir_fd, &name, false) {
-                    Ok(()) => progress.files += 1,
+                    Ok(()) => progress.removed(false),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(stopped(&entry.path, e)),
                 }
@@ -1046,7 +1057,7 @@ mod platform {
         crate::commands::delete_file::count_unlink_for_test();
         dispose(&root_handle).map_err(|e| stopped(root, not_empty_reason(e)))?;
         drop(root_handle);
-        progress.directories += 1;
+        progress.removed(true);
         Ok(())
     }
 
@@ -1088,7 +1099,7 @@ mod platform {
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
                     dispose(&handle).map_err(|e| stopped(&entry.path, not_empty_reason(e)))?;
-                    progress.directories += 1;
+                    progress.removed(true);
                 }
                 NodeKind::Directory => return Err(replaced(&entry.path)),
                 _ if metadata.is_dir() && !is_link => return Err(replaced(&entry.path)),
@@ -1096,7 +1107,7 @@ mod platform {
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
                     dispose(&handle).map_err(|e| stopped(&entry.path, e))?;
-                    progress.files += 1;
+                    progress.removed(false);
                 }
             }
         }
@@ -1165,6 +1176,42 @@ mod tests {
             .iter()
             .filter(|entry| matches!(entry.kind, NodeKind::File { .. }))
             .count()
+    }
+
+    #[test]
+    fn call_keepalive_delete_preflight_reports_examined_entries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let clock = Arc::new(AtomicU64::new(0));
+        let sent = Arc::new(AtomicU64::new(0));
+        let origin = Instant::now();
+        let token = crate::executor::JobCancellation::new();
+        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+            {
+                let clock = clock.clone();
+                move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))
+            },
+            {
+                let sent = sent.clone();
+                move |_| {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+        ));
+        let _token = crate::executor::install_job_cancellation(token);
+        let manifest = walk(dir.path(), BackupPolicy::default(), 100, 100).unwrap();
+        assert_eq!(files(&manifest), 3);
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            3,
+            "enumeration is work before the first unlink"
+        );
     }
 
     #[test]

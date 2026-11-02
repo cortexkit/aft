@@ -1536,8 +1536,8 @@ struct ConfigureWarmState {
 /// change that leaves every counter alone can show.
 const HEALTH_MEMORY_REUSE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The three per-entry index walks of a memory estimate (semantic, trigram,
-/// symbols). `measured_at` is when the oldest of them was taken.
+/// The three resident-index estimates (semantic, trigram, symbols).
+/// `measured_at` is when the oldest of them was taken.
 #[derive(Clone, Debug)]
 struct WalkedMemory {
     measured_at: Instant,
@@ -1558,14 +1558,13 @@ struct IndexMemoryWalk<S> {
 
 /// The health rollup's reusable walks, kept per index. Reads add files to the
 /// symbol cache far more often than edits change the trigram or semantic
-/// index, and the symbol cache is cheap to walk while the other two visit
-/// every indexed file; keeping them apart means a read re-walks only the
-/// symbol cache.
+/// index. Keeping their estimates apart means a read refreshes only the
+/// constant-time symbol totals rather than walking the other indexes.
 #[derive(Clone, Debug, Default)]
 struct HealthMemoryWalks {
     semantic: Option<IndexMemoryWalk<Option<[u64; 9]>>>,
     trigram: Option<IndexMemoryWalk<Option<[u64; 11]>>>,
-    symbols: Option<IndexMemoryWalk<[u64; 3]>>,
+    symbols: Option<IndexMemoryWalk<[u64; 5]>>,
 }
 
 /// The immutable health projection of one installed runtime and ledger version.
@@ -10052,6 +10051,11 @@ impl AppContext {
         self.remove_degraded_reason(VIEW_LOAD_DEGRADED_REASON);
     }
 
+    #[cfg(test)]
+    pub(crate) fn view_load_failure_total_for_test(&self) -> u64 {
+        self.view_load_health.lock().total
+    }
+
     /// Suppressed error-log repeats for `plane` since its last emission.
     /// Tests use it to prove the per-minute throttle without wall-clock waits.
     #[cfg(test)]
@@ -11266,20 +11270,33 @@ impl AppContext {
     }
 
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_capped(None)
+    }
+
+    /// Keep inspect's graph wait inside its request budget. Retain the checkout
+    /// wait outcome so inspect can name files whose edits are not in the graph.
+    pub(crate) fn callgraph_store_for_ops_until(&self, deadline: Instant) -> CallgraphStoreAccess {
+        if Instant::now() >= deadline {
+            return CallgraphStoreAccess::Building;
+        }
+        self.callgraph_store_for_ops_capped(Some(deadline))
+    }
+
+    fn callgraph_store_for_ops_capped(&self, deadline: Option<Instant>) -> CallgraphStoreAccess {
         let active = self
             .checkout_query_runtime
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        self.callgraph_store_for_ops_with_wait(
-            if active {
-                crate::views::contracts::CALLGRAPH_QUERY_WAIT
-            } else {
-                self.callgraph_build_wait_window()
-            },
-            true,
-            None,
-        )
+        let wait = if active {
+            crate::views::contracts::CALLGRAPH_QUERY_WAIT
+        } else {
+            self.callgraph_build_wait_window()
+        };
+        let wait = deadline.map_or(wait, |deadline| {
+            wait.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        self.callgraph_store_for_ops_with_wait(wait, true, None)
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
@@ -11654,7 +11671,17 @@ impl AppContext {
         // rather than answer from the store as it was before.
         if self.callgraph_catch_up.outstanding() {
             let deadline = Instant::now() + wait;
+            let mut progress = crate::run_tool_call::progress::BuildProgress::new(
+                self.config()
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(Path::new(".")),
+            );
             while self.callgraph_catch_up.outstanding() && Instant::now() < deadline {
+                if crate::executor::current_job_cancelled() {
+                    return CallgraphStoreAccess::Building;
+                }
+                progress.observe();
                 std::thread::sleep(Duration::from_millis(5).min(wait));
             }
             if self.callgraph_catch_up.outstanding() {
@@ -11836,8 +11863,24 @@ impl AppContext {
                 let Some(rx) = rx_ref.as_ref() else {
                     return CallgraphStoreAccess::Building;
                 };
+                let deadline = Instant::now() + wait;
+                let mut progress =
+                    crate::run_tool_call::progress::BuildProgress::new(&project_root);
+                let received = loop {
+                    if crate::executor::current_job_cancelled() {
+                        return CallgraphStoreAccess::Building;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let received = rx.recv_timeout(remaining.min(Duration::from_millis(50)));
+                    progress.observe();
+                    if !matches!(received, Err(crossbeam_channel::RecvTimeoutError::Timeout))
+                        || Instant::now() >= deadline
+                    {
+                        break received;
+                    }
+                };
                 (
-                    rx.recv_timeout(wait),
+                    received,
                     self.callgraph_store_rx_generation(),
                     self.callgraph_store_rx_epoch(),
                 )
@@ -12624,6 +12667,14 @@ impl AppContext {
         self.lexical_view.lock().as_ref().unwrap().source_for_test()
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn lexical_view_acquisitions_for_test(&self) -> usize {
+        self.lexical_view
+            .lock()
+            .as_ref()
+            .map_or(0, |view| view.acquisitions_for_test())
+    }
+
     #[cfg(test)]
     pub(crate) fn install_lexical_source_for_test(
         &self,
@@ -12742,8 +12793,8 @@ impl AppContext {
         }
     }
 
-    /// When this checkout is over `views.callgraph_copies`, the reader of the
-    /// call graph it borrows; `None` when it builds its own view. Admission
+    /// When this checkout is over `views.callgraph_copies` or the live-base cap,
+    /// the reader of the call graph it borrows; `None` when it builds its own view. Admission
     /// is decided again once a minute. A failed admission builds the
     /// checkout's own view, as before the limit existed, and logs why.
     fn borrowed_callgraph_view_reader(
@@ -12752,23 +12803,28 @@ impl AppContext {
         storage: &crate::root_cache::StoragePaths,
         family: &str,
         policy: crate::blob_store::v2::TrigramPolicy,
+        at_base_cap: bool,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
     {
         use crate::views::callgraph_copies::{self, Admission};
         let now = Instant::now();
-        let readmit =
-            self.callgraph_borrow.lock().as_ref().is_none_or(|borrow| {
+        let readmit = at_base_cap
+            || self.callgraph_borrow.lock().as_ref().is_none_or(|borrow| {
                 now.duration_since(borrow.decided_at) >= CALLGRAPH_READMIT_AFTER
             });
         if readmit {
-            let admission = callgraph_copies::admit(
-                storage,
-                family,
-                policy,
-                root,
-                self.config().views.callgraph_copies,
-                || self.lexical_file_identities(),
-            );
+            let admission = if at_base_cap {
+                callgraph_copies::borrow_at_base_cap(&storage.artifacts, family, policy, root)
+            } else {
+                callgraph_copies::admit(
+                    storage,
+                    family,
+                    policy,
+                    root,
+                    self.config().views.callgraph_copies,
+                    || self.lexical_file_identities(),
+                )
+            };
             let mut borrow = self.callgraph_borrow.lock();
             match admission {
                 Ok(Admission::Own) => {
@@ -12846,7 +12902,7 @@ impl AppContext {
     }
 
     /// The checkout whose call graph this one reads, and the open reader,
-    /// while this checkout is over `views.callgraph_copies`.
+    /// while this checkout is over `views.callgraph_copies` or the live-base cap.
     pub(crate) fn borrowed_callgraph_view(&self) -> Option<(PathBuf, Arc<ReadonlyCallGraphStore>)> {
         let borrow = self.callgraph_borrow.lock();
         let borrow = borrow.as_ref()?;
@@ -12935,8 +12991,10 @@ impl AppContext {
     }
 
     /// The call-graph reader of this checkout's view, acquired once per
-    /// pinned request. `None` means views do not route call-graph reads; an
-    /// acquisition error is final and never answered from another store.
+    /// pinned request. `None` means views do not route call-graph reads; a
+    /// genuine acquisition error is final. Capacity borrows the same published
+    /// graph as copy saturation, retaining the note naming the borrowed checkout
+    /// and differing files, and the readmission timer.
     pub(crate) fn callgraph_view_reader(
         &self,
     ) -> Option<Result<Arc<ReadonlyCallGraphStore>, crate::views::callgraph::CallgraphViewError>>
@@ -12965,9 +13023,9 @@ impl AppContext {
             .lock()
             .as_ref()
             .is_some_and(|view| view.matches(&root, &storage, &family, policy));
-        if !own_view_bound {
+        if !own_view_bound || self.callgraph_borrow.lock().is_some() {
             if let Some(borrowed) =
-                self.borrowed_callgraph_view_reader(&root, &storage, &family, policy)
+                self.borrowed_callgraph_view_reader(&root, &storage, &family, policy, false)
             {
                 if pinned_config_for(self.config_pin_key()).is_some() {
                     CALLGRAPH_QUERY_READERS.with(|readers| {
@@ -12997,9 +13055,9 @@ impl AppContext {
                     |error| error.busy,
                     || {
                         crate::views::callgraph::CallgraphView::new_with_import(
-                            root,
-                            storage,
-                            family,
+                            root.clone(),
+                            storage.clone(),
+                            family.clone(),
                             policy,
                             self.views_import_control(),
                             self.cold_build_limiter(),
@@ -13008,6 +13066,21 @@ impl AppContext {
                 ) {
                     Ok(view) => *slot = Some(Arc::new(view)),
                     Err(error) => {
+                        drop(slot);
+                        if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) {
+                            if let Some(borrowed) = self.borrowed_callgraph_view_reader(
+                                &root, &storage, &family, policy, true,
+                            ) {
+                                match &borrowed {
+                                    Ok(_) => self.note_view_load_success(),
+                                    Err(error) if !error.busy => {
+                                        self.note_view_load_failure("callgraph", &error.reason)
+                                    }
+                                    Err(_) => {}
+                                }
+                                return Some(borrowed);
+                            }
+                        }
                         // Like the lexical view, a failed callgraph load fails
                         // the query: no legacy store may answer for the view.
                         self.note_view_load_failure("callgraph", &error.reason);
@@ -13018,7 +13091,12 @@ impl AppContext {
             slot.as_ref().unwrap().clone()
         };
         self.record_checkout_pending_watcher_gap();
-        let result = view.reader();
+        let result = match view.reader() {
+            Err(error) if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) => self
+                .borrowed_callgraph_view_reader(&root, &storage, &family, policy, true)
+                .unwrap_or(Err(error)),
+            result => result,
+        };
         if pinned_config_for(self.config_pin_key()).is_some() {
             CALLGRAPH_QUERY_READERS.with(|readers| {
                 readers
@@ -17606,7 +17684,7 @@ impl AppContext {
     }
 
     /// Shape counters of the symbol cache; `None` means it is locked.
-    fn symbol_memory_shape(&self) -> Option<[u64; 3]> {
+    fn symbol_memory_shape(&self) -> Option<[u64; 5]> {
         Some(self.symbol_cache.try_read().ok()?.memory_shape())
     }
 
@@ -17646,7 +17724,7 @@ impl AppContext {
         }
     }
 
-    /// Walk every entry of the symbol cache for its memory estimate.
+    /// Read the symbol cache's running memory totals without visiting entries.
     fn walk_symbol_memory(&self) -> crate::memory::MemoryEstimate {
         #[cfg(test)]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[2] += 1);
@@ -17882,11 +17960,12 @@ impl AppContext {
     /// pre-aggregated root memory, computed from one estimate. Only the
     /// health rollup calls this.
     ///
-    /// The index walks inside an estimate visit every entry of the root's
-    /// resident indexes, and the rollup asks for every root every few seconds.
-    /// So each index's last walk is reused while that index's shape counters
-    /// stay the same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]; a change
-    /// to one index re-walks only that index. The cheap subsystem estimates
+    /// Semantic and trigram walks visit every entry of the root's resident
+    /// indexes; symbol bytes come from running totals. The rollup asks for
+    /// every root every few seconds, so each index's estimate is reused while
+    /// its shape counters stay the same, for at most
+    /// [`HEALTH_MEMORY_REUSE_INTERVAL`]; a change to one index refreshes only
+    /// that estimate. The cheap subsystem estimates
     /// are always taken fresh. The rollup's `measured_age_ms` is the age of
     /// the oldest walk in use. A missing index has nothing to walk, so it is
     /// never reused and never makes the figures look older.
@@ -18313,6 +18392,48 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
         .get(&(root.to_path_buf(), session_id.to_string()))
         .copied()
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod memory_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn symbol_memory_rollup_matches_recount_after_mutations() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        // The project root must be absolute on every platform; a bare
+        // "/memory-rollup" has no drive letter on Windows.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let assert_memory = || {
+            let expected = ctx.symbol_cache.read().unwrap().recounted_memory_for_test();
+            assert_eq!(ctx.memory_root_snapshot().symbols, expected);
+            let (snapshot, rollup) = ctx.memory_root_snapshot_and_rollup();
+            assert_eq!(snapshot.symbols, expected);
+            assert_eq!(rollup.attributed_bytes, snapshot.attributed_bytes);
+        };
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().insert(
+            path.clone(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            blake3::hash(b""),
+            Vec::new(),
+        );
+        assert_memory();
+        ctx.symbol_cache
+            .write()
+            .unwrap()
+            .set_project_root(root.path().to_path_buf());
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().invalidate(&path);
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().reset();
+        assert_memory();
+    }
 }
 
 #[cfg(test)]

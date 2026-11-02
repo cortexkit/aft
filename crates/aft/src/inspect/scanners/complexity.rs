@@ -329,10 +329,16 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
 
 pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
+    let progress = crate::run_tool_call::progress::FileProgress::current();
     let scans = job
         .scope_files
         .par_iter()
         .map(|path| scan_file(&job.project_root, path))
+        .inspect(|_| {
+            if let Some(progress) = &progress {
+                progress.finished();
+            }
+        })
         .collect::<Result<Vec<_>, _>>();
     let scans = match scans {
         // A file that vanished mid-scan yields no scan, as if it was deleted.

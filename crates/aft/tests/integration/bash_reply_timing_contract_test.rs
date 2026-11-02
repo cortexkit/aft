@@ -790,6 +790,90 @@ fn subc_worker_bash_watch_blocks_until_the_task_completes() {
 }
 
 #[test]
+fn subc_runner_cancel_of_bash_watch_leaves_the_watched_child_running() {
+    run_subc(|mut harness| async move {
+        let release = harness.project.path().join("watch-cancel-release");
+        let command = format!(
+            "while [ ! -f {} ]; do sleep 0.02; done; exit 7",
+            shell_quote(&release),
+        );
+        let task = launch_worker_background(&mut harness.stream, 180, &command).await;
+        // The tool-provider-v1 bash route replies on command completion, even
+        // for background launches. Start an independent task through legacy bash,
+        // then observe it through a tool-provider-v1 watch.
+        let watch_channel = ROUTE_CHANNEL + 1;
+        bind_route_on_channel(
+            &mut harness.stream,
+            harness.project.path(),
+            true,
+            watch_channel,
+        )
+        .await;
+        send_frame(
+            &mut harness.stream,
+            Frame::build(
+                FrameType::Request,
+                control_flags(),
+                watch_channel,
+                1,
+                181,
+                serde_json::to_vec(
+                    &json!({"name":"bash_watch", "preset":"worker", "arguments":{"taskId":task}}),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            182,
+            "bash_status",
+            json!({"taskId": task}),
+            Some("worker"),
+        )
+        .await;
+        let before = read_tool_response(&mut harness.stream, 182, HANG_CATCH).await;
+        assert_eq!(tool_response_json(&before)["status"], "running");
+        send_frame(
+            &mut harness.stream,
+            Frame::build(
+                FrameType::Cancel,
+                control_flags(),
+                watch_channel,
+                1,
+                181,
+                vec![],
+            )
+            .unwrap(),
+        )
+        .await;
+        let cancelled =
+            read_non_push_frame(&mut harness.stream, HANG_CATCH, "watch cancellation").await;
+        assert_eq!(cancelled.header.corr, 181);
+        assert_eq!(cancelled.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cancelled.body).unwrap()["code"],
+            "cancelled"
+        );
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            183,
+            "bash_status",
+            json!({"taskId": task}),
+            Some("worker"),
+        )
+        .await;
+        let after = read_tool_response(&mut harness.stream, 183, HANG_CATCH).await;
+        assert_eq!(tool_response_json(&after)["status"], "running");
+        std::fs::write(release, "").unwrap();
+        let terminal = subc_status_until_terminal(&mut harness.stream, 184, &task).await;
+        assert_eq!(terminal["exit_code"], 7, "{terminal}");
+        harness
+    });
+}
+
+#[test]
 fn subc_worker_bash_watch_returns_when_the_pattern_matches() {
     run_subc(|mut harness| async move {
         let task =
@@ -1215,6 +1299,10 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
 }
 
 async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
+    bind_route_on_channel(stream, root, v1, ROUTE_CHANNEL).await;
+}
+
+async fn bind_route_on_channel(stream: &mut TcpStream, root: &Path, v1: bool, channel: u16) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -1229,7 +1317,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
 
     let request = {
         let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
-            route_channel: ROUTE_CHANNEL,
+            route_channel: channel,
             epoch: 1,
             target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),

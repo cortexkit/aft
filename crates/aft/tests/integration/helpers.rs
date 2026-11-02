@@ -73,6 +73,121 @@ pub fn inspect_reasking_tier1_deadline(
     }
 }
 
+/// For fixtures starting a language server, re-ask inspect once on an explicit
+/// request-budget exhaustion reason.
+/// Keep all other partial answers visible to the caller's assertions, and require
+/// the retry to be complete without extending the product's deadline.
+#[allow(dead_code)] // Shared with watcher_integration, which has no inspect tests.
+pub fn inspect_retrying_cold_deadline(
+    mut inspect: impl FnMut() -> serde_json::Value,
+) -> serde_json::Value {
+    let response = inspect();
+    let deadline = response["failure_reason"] == "inspect_request_timeout"
+        || (response["complete"] == false
+            && response["gaps"].as_array().is_some_and(|gaps| {
+                gaps.iter().any(|gap| {
+                    let rust_reverification = gap["kind"] == "checking_producer"
+                        && gap["producer"] == "rust"
+                        && gap["reason"] == "cargo check for aft_inspect completed, but Rust inputs could not be re-verified before the inspect deadline; retry aft_inspect";
+                    let analysis_deadline = gap["kind"] == "analysis_incomplete"
+                        && gap["reason"] == "analysis did not finish within its wait budget";
+                    let stat_deadline = gap["kind"] == "stat_verification_incomplete"
+                        && gap["reason"] == "file freshness verification exceeded the request budget; retry aft_inspect";
+                    rust_reverification || analysis_deadline || stat_deadline
+                })
+            }));
+    if deadline {
+        let retried = inspect();
+        assert_eq!(
+            retried["complete"], true,
+            "cold inspect retry remained incomplete: {retried:#}"
+        );
+        retried
+    } else {
+        response
+    }
+}
+
+#[cfg(test)]
+mod cold_inspect_retry_tests {
+    use super::inspect_retrying_cold_deadline;
+    use serde_json::json;
+
+    #[test]
+    fn cold_inspect_retries_the_exact_reverification_deadline_once() {
+        let partial = json!({
+            "complete": false,
+            "gaps": [{
+                "kind": "checking_producer", "producer": "rust",
+                "reason": "cargo check for aft_inspect completed, but Rust inputs could not be re-verified before the inspect deadline; retry aft_inspect"
+            }]
+        });
+        let mut calls = 0;
+        let response = inspect_retrying_cold_deadline(|| {
+            calls += 1;
+            if calls == 1 {
+                partial.clone()
+            } else {
+                json!({"complete": true})
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(response["complete"], true);
+        calls = 0;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inspect_retrying_cold_deadline(|| {
+                calls += 1;
+                partial.clone()
+            })
+        }));
+        assert!(
+            result.is_err(),
+            "a second partial must fail, not pass or retry forever"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn cold_inspect_retries_only_explicit_shared_budget_reasons() {
+        for partial in [
+            json!({"success": false, "failure_reason": "inspect_request_timeout"}),
+            json!({"complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "analysis did not finish within its wait budget"}]}),
+            json!({"complete": false, "gaps": [{"kind": "stat_verification_incomplete", "reason": "file freshness verification exceeded the request budget; retry aft_inspect"}]}),
+        ] {
+            let mut calls = 0;
+            let response = inspect_retrying_cold_deadline(|| {
+                calls += 1;
+                if calls == 1 {
+                    partial.clone()
+                } else {
+                    json!({"complete": true})
+                }
+            });
+            assert_eq!(calls, 2);
+            assert_eq!(response["complete"], true);
+        }
+    }
+
+    #[test]
+    fn cold_inspect_does_not_retry_other_partial_answers_or_wrong_counts() {
+        for original in [
+            json!({"complete": true, "summary": {"diagnostics": {"errors": 99}}}),
+            json!({"complete": false, "gaps": [{"kind": "checking_producer", "producer": "rust", "reason": "cargo check running for aft_inspect; retry"}]}),
+            json!({"complete": false, "gaps": [{"kind": "failed_producer", "reason": "initialize failed"}]}),
+            json!({"complete": false, "gaps": [{"kind": "uncovered_file", "reason": "no diagnostics for the current file content arrived in time; retry aft_inspect"}]}),
+            json!({"success": false, "code": "access_required"}),
+        ] {
+            let mut calls = 0;
+            let response = inspect_retrying_cold_deadline(|| {
+                calls += 1;
+                original.clone()
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(response, original);
+        }
+    }
+}
+
 /// Retry a callgraph request only while its persisted reader is being installed.
 /// Other responses are returned unchanged so each fixture can assert its own result.
 #[allow(dead_code)] // Shared with watcher_integration, which has no callgraph tests.

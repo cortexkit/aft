@@ -44,6 +44,7 @@ pub struct DocumentEntry {
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     entries: HashMap<PathBuf, DocumentEntry>,
+    entry_bytes: u64,
     /// Higher than every version of a closed document. A scalar floor avoids
     /// retaining one path forever for every file an inspect briefly opened.
     reopen_version_floor: i32,
@@ -55,6 +56,12 @@ impl DocumentStore {
     }
 
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        crate::memory::MemoryEstimate::estimated(self.entry_bytes)
+            .count("documents", self.entries.len())
+    }
+
+    #[cfg(test)]
+    fn recounted_memory(&self) -> crate::memory::MemoryEstimate {
         let bytes = self.entries.keys().fold(0u64, |bytes, path| {
             bytes
                 .saturating_add(std::mem::size_of::<PathBuf>() as u64)
@@ -91,6 +98,9 @@ impl DocumentStore {
             content_hash: snapshot.content_hash(&path),
             sync_order: snapshot.sync_order,
         };
+        if !self.entries.contains_key(&path) {
+            self.entry_bytes = self.entry_bytes.saturating_add(Self::entry_bytes(&path));
+        }
         self.entries.insert(path, entry);
         version
     }
@@ -143,9 +153,18 @@ impl DocumentStore {
     /// Close a document and remove from tracking. Returns the last known
     /// version, or `None` if the document was not open.
     pub fn close(&mut self, path: &Path) -> Option<i32> {
-        let entry = self.entries.remove(path)?;
+        let (stored_path, entry) = self.entries.remove_entry(path)?;
+        self.entry_bytes = self
+            .entry_bytes
+            .saturating_sub(Self::entry_bytes(&stored_path));
         self.reopen_version_floor = self.reopen_version_floor.max(entry.version + 1);
         Some(entry.version)
+    }
+
+    fn entry_bytes(path: &Path) -> u64 {
+        (std::mem::size_of::<PathBuf>() as u64)
+            .saturating_add(std::mem::size_of::<DocumentEntry>() as u64)
+            .saturating_add(crate::memory::path_bytes(path))
     }
 
     /// Get all open document paths.
@@ -372,6 +391,27 @@ mod tests {
         let estimate = store.estimated_memory();
         assert!(estimate.estimated_bytes.unwrap() > 0);
         assert_eq!(estimate.counts["documents"], 1);
+    }
+
+    #[test]
+    fn document_memory_running_totals_match_recount() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("nested/first.rs");
+        let second = dir.path().join("longer-second.rs");
+        let mut store = DocumentStore::new();
+        for path in [&first, &second, &first] {
+            store.open(path.clone());
+            assert_eq!(store.estimated_memory(), store.recounted_memory());
+        }
+        store.bump_version(&first);
+        assert_eq!(store.estimated_memory(), store.recounted_memory());
+        let alias = dir.path().join("nested//first.rs");
+        assert_eq!(first, alias);
+        for path in [&second, &alias, &first] {
+            store.close(path);
+            assert_eq!(store.estimated_memory(), store.recounted_memory());
+        }
+        assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
     }
 
     #[test]

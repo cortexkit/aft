@@ -104,6 +104,9 @@ pub(crate) struct SweepReport {
     pub removed_blob_payload_bytes: u64,
     pub blob_reclaim_deferred: bool,
     pub examined_bindings: usize,
+    /// Progress of the bounded root-history protection census. No root is
+    /// retired from a partial census, even when its candidate is already due.
+    pub binding_history: RootHistoryProgress,
     pub pruned_bindings: usize,
     pub skipped_live: usize,
     pub skipped_recent: usize,
@@ -1879,6 +1882,153 @@ fn bindings_with_admission(
     bindings_with_root_resolver(storage, admission, &mut |root| roots.canonical_root(root))
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct RootHistoryProgress {
+    pub examined: usize,
+    pub accumulated: usize,
+    pub complete: bool,
+    pub restarted: bool,
+}
+
+#[derive(Default)]
+struct RootHistoryScan {
+    identity: Option<TreeNodeState>,
+    entries: Option<ReadDir>,
+    records: Vec<(String, Binding)>,
+    progress: RootHistoryProgress,
+    may_advance: bool,
+}
+
+fn root_history_scan(storage: &StoragePaths) -> Arc<Mutex<RootHistoryScan>> {
+    static SCANS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<RootHistoryScan>>>>> = OnceLock::new();
+    SCANS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(storage.durable.clone())
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(RootHistoryScan {
+                may_advance: true,
+                ..Default::default()
+            }))
+        })
+        .clone()
+}
+
+fn begin_root_history_pass(storage: &StoragePaths) {
+    let scan = root_history_scan(storage);
+    let mut scan = scan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    scan.may_advance = true;
+    scan.progress.examined = 0;
+    scan.progress.restarted = false;
+}
+
+/// Every supported binding update publishes by rename. A changed directory
+/// identity or modification time invalidates the census, including a rebind
+/// between candidate selection and the final admission-barrier recheck.
+/// Incomplete scans retain their iterator for the next pass, never their
+/// authority to delete. A process restart simply starts a fresh census.
+fn root_history(storage: &StoragePaths, admission: bool) -> io::Result<Vec<(String, Binding)>> {
+    let directory = storage.durable.join("retention/roots");
+    let scan = root_history_scan(storage);
+    let mut scan = scan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let identity = match TreeNodeState::read(&directory) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            *scan = RootHistoryScan::default();
+            scan.progress.complete = true;
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    if scan.identity.as_ref() != Some(&identity) {
+        let restarted = scan.identity.is_some();
+        // A completed small census may be refreshed after a bind in the same
+        // pass, but every refresh still spends that pass's remaining entries.
+        let may_advance = scan.may_advance
+            || (scan.progress.complete && scan.progress.examined < HISTORY_ENTRIES);
+        let examined = scan.progress.examined;
+        *scan = RootHistoryScan {
+            identity: Some(identity),
+            entries: Some(retention_read_dir(&directory)?),
+            may_advance,
+            progress: RootHistoryProgress {
+                examined,
+                restarted,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+    }
+    if !scan.progress.complete && scan.may_advance && !admission {
+        scan.may_advance = false;
+        let deadline = Instant::now() + PASS_BUDGET;
+        for _ in scan.progress.examined..HISTORY_ENTRIES {
+            if Instant::now() >= deadline || bind_pending(&storage.durable) {
+                break;
+            }
+            let Some(entry) = scan.entries.as_mut().and_then(Iterator::next) else {
+                scan.progress.complete = true;
+                scan.entries = None;
+                break;
+            };
+            scan.progress.examined += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    scan.identity = None;
+                    scan.entries = None;
+                    scan.records.clear();
+                    scan.progress.accumulated = 0;
+                    scan.progress.restarted = true;
+                    return Err(error);
+                }
+            };
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let scope = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let binding = match read_binding_record(&path) {
+                Ok((_, binding)) => binding,
+                Err(error) => {
+                    handle_binding_read_error(&storage.durable, &path, error, false, false);
+                    unreadable_binding_sentinel(&storage.durable, &scope)
+                }
+            };
+            scan.records.push((scope, binding));
+        }
+        scan.progress.accumulated = scan.records.len();
+        let unchanged = TreeNodeState::read(&directory)
+            .map(|identity| scan.identity.as_ref() == Some(&identity));
+        if !matches!(unchanged, Ok(true)) {
+            scan.progress.complete = false;
+            scan.progress.restarted = true;
+            scan.identity = None;
+            scan.entries = None;
+            scan.records.clear();
+            scan.progress.accumulated = 0;
+        }
+        unchanged?;
+    }
+    if !scan.progress.complete {
+        return Err(io::Error::other(format!(
+            "binding_history_incomplete: examined={} accumulated={} restarted={}",
+            scan.progress.examined, scan.progress.accumulated, scan.progress.restarted
+        )));
+    }
+    scan.may_advance = false;
+    Ok(scan.records.clone())
+}
+
 fn bindings_with_root_resolver(
     storage: &StoragePaths,
     admission: bool,
@@ -1929,37 +2079,8 @@ fn bindings_with_root_resolver(
         }
     }
     let mut root_binding_scopes = HashSet::new();
-    for entry in bounded_dirs(&storage.durable.join("retention/roots"), HISTORY_ENTRIES)? {
-        if admission {
-            yield_to_bind(&storage.durable)?;
-        }
-        if entry
-            .path()
-            .extension()
-            .is_none_or(|extension| extension != "json")
-        {
-            continue;
-        }
-        let path = entry.path();
-        let scope = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned();
+    for (scope, binding) in root_history(storage, admission)? {
         root_binding_scopes.insert(scope.clone());
-        let binding = match read_binding_record(&path) {
-            Ok((_, binding)) => binding,
-            Err(error) => {
-                handle_binding_read_error(&storage.durable, &path, error, false, false);
-                // The filename still identifies this scope. Keep it out of
-                // orphan cleanup until a readable binding replaces the record.
-                result
-                    .entry(scope.clone())
-                    .or_default()
-                    .push(unreadable_binding_sentinel(&storage.durable, &scope));
-                continue;
-            }
-        };
         if binding.linked_worktree {
             linked_roots.insert(
                 canonical_root(&binding.root),
@@ -5091,6 +5212,7 @@ fn run_pass_with_root_identities(
     roots: &mut RootIdentities,
 ) -> SweepReport {
     let started = Instant::now();
+    begin_root_history_pass(storage);
     let mut report = SweepReport {
         at_ms: crate::pins::now_ms(),
         ..Default::default()
@@ -5115,7 +5237,19 @@ fn run_pass_with_root_identities(
         if report.cancelled || bind_pending(&storage.durable) {
             return Ok(());
         }
-        prune_bindings(storage, cancelled, &mut report)?;
+        // Pruning must not invalidate a partial census on every followup.
+        // Once complete, keep the original prune-before-root-retirement order
+        // so a root's history survives the pass that removes its last cache.
+        let prune = {
+            let scan = root_history_scan(storage);
+            let scan = scan
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scan.progress.complete || scan.identity.is_none()
+        };
+        if prune {
+            prune_bindings(storage, cancelled, &mut report)?;
+        }
         let history = bindings(storage, roots)?;
         let domains = domain_paths(storage)?;
         for (directory, _) in &domains {
@@ -5307,6 +5441,12 @@ fn run_pass_with_root_identities(
         .timings_ms
         .insert("total".into(), started.elapsed().as_millis() as u64);
     report.cancelled |= cancelled();
+    report.binding_history = root_history_scan(storage)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .progress
+        .clone();
+    report.stopped_early |= !report.binding_history.complete;
     let mut states = states()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5751,6 +5891,20 @@ fn v3_finish_eviction(
     view_dir: &Path,
     deadline: Instant,
 ) -> io::Result<crate::blob_store::v3::Measurement> {
+    v3_remove_evicting(storage, registry, scope, view_dir)?;
+    registry
+        .covering_measurement_until(deadline)
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+/// Retention batches removals before measuring the family once. An oversized
+/// accounting walk must not prevent the next unreferenced base from being freed.
+fn v3_remove_evicting(
+    storage: &Path,
+    registry: &mut crate::blob_store::v3::RegistryWriter<'_>,
+    scope: &str,
+    view_dir: &Path,
+) -> io::Result<()> {
     #[cfg(test)]
     test_hook(storage, "v3-evicting-committed");
     #[cfg(not(test))]
@@ -5771,12 +5925,7 @@ fn v3_finish_eviction(
             Ok(())
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
-    // Under the pass deadline: the reservation lock held here is the one
-    // v3 publishers need, so a measurement that runs out of time is left
-    // owed rather than finished late.
-    registry
-        .covering_measurement_until(deadline)
-        .map_err(|error| io::Error::other(error.to_string()))
+    Ok(())
 }
 
 /// The v3 retention collector. Each pass visits one family under
@@ -5906,9 +6055,8 @@ enum V3IdleStep {
     Unknown(String),
 }
 
-/// Evicts the least recently used active view member whose scope ends with
-/// `suffix` and is not in `keep`, so a new checkout can take its place under
-/// `views.callgraph_copies`. A member with a live session, pin, protected read
+/// Evicts the least recently used unreferenced base or active view member
+/// whose scope ends with `suffix`, excluding `keep`. A live session, pin, protected read
 /// marker, worker intent or open SQLite handle is skipped, exactly as idle
 /// eviction skips it. At most `max_examined` members are looked at, oldest
 /// first. Returns the evicted scope, or `None` when every candidate examined
@@ -5928,7 +6076,7 @@ pub(crate) fn evict_least_recent_v3_member(
         .with_barrier(|tx| {
             let mut statement = tx.prepare(
                 "SELECT scope,kind,root,view_dir,last_bind_ms,state FROM members
-                 WHERE kind='view' AND state='active' AND scope LIKE ?1
+                 WHERE state='active' AND (kind='base' OR (kind='view' AND scope LIKE ?1))
                  ORDER BY last_bind_ms,scope LIMIT ?2",
             )?;
             let rows = statement
@@ -5951,20 +6099,102 @@ pub(crate) fn evict_least_recent_v3_member(
         let expected = crate::blob_store::v3::view_dir(storage, family, &member.scope);
         let Some(view_dir) = expected.ok().filter(|path| {
             Path::new(&member.view_dir) == path
-                && member.root.as_deref().and_then(v3_root_path).is_some()
+                && (member.kind == "base"
+                    || member.root.as_deref().and_then(v3_root_path).is_some())
         }) else {
             continue;
         };
         let step = registry
-            .with_barrier(|tx| Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?))
+            .with_barrier(|tx| {
+                if member.kind != "base" {
+                    return Ok(v3_mark_idle_evicting(tx, &member, &view_dir)?);
+                }
+                let Some(current) = v3_member(tx, &member.scope)? else {
+                    return Ok(V3IdleStep::Held);
+                };
+                if current.kind != "base"
+                    || current.state != "active"
+                    || current.last_bind_ms != member.last_bind_ms
+                    || current.view_dir != member.view_dir
+                    || crate::views::eviction::v3_base_hold(tx, &member.scope, &view_dir).is_some()
+                {
+                    return Ok(V3IdleStep::Held);
+                }
+                let _files = crate::db::file_identity::filesystem_guard();
+                if crate::db::file_identity::has_open_connections_under(&view_dir) {
+                    return Ok(V3IdleStep::Held);
+                }
+                tx.execute(
+                    "UPDATE members SET state='evicting' WHERE scope=?1",
+                    [&member.scope],
+                )?;
+                Ok(V3IdleStep::Evicting)
+            })
             .map_err(v3)?;
         if !matches!(step, V3IdleStep::Evicting) {
             continue;
         }
-        v3_finish_eviction(storage, registry, &member.scope, &view_dir, deadline)?;
+        if member.kind == "base" {
+            crate::views::base_sweep::finish_base_reclaim(registry, &member.scope, &view_dir)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        } else {
+            v3_remove_evicting(storage, registry, &member.scope, &view_dir)?;
+        }
         return Ok(Some(member.scope));
     }
     Ok(None)
+}
+
+/// Give admission blocked by the free-device-space floor or the family's
+/// live-base count limit a bounded chance to free unused databases. The reservation
+/// lock stays held through the caller's subsequent admission check; no registry
+/// barrier is held on entry.
+/// Returns whether any database was removed, so an unsuccessful walk can be throttled.
+pub(crate) fn reclaim_v3_admission_family(
+    storage: &Path,
+    family: &str,
+    lock: &crate::blob_store::v3::ReservationLock,
+    deadline: Instant,
+) -> io::Result<bool> {
+    #[cfg(test)]
+    test_hook(storage, "v3-pressure-reclaim-started");
+    if !crate::blob_store::v3::family_dir(storage, family)
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .join("members.sqlite")
+        .try_exists()?
+    {
+        return Ok(false);
+    }
+    let mut registry =
+        crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, lock)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut reclaimed = false;
+    for _ in 0..64 {
+        if Instant::now() >= deadline
+            || evict_least_recent_v3_member(
+                storage,
+                family,
+                &mut registry,
+                ".callgraph",
+                &[],
+                64,
+                deadline,
+            )?
+            .is_none()
+        {
+            break;
+        }
+        reclaimed = true;
+        #[cfg(test)]
+        test_hook(storage, "v3-pressure-reclaimed");
+    }
+    // Refresh family byte accounting after the removals. If the deadline
+    // interrupts the walk, the next admission must measure the family again;
+    // the incomplete walk never replaces the ledger's total.
+    registry
+        .covering_measurement_until(deadline)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(reclaimed)
 }
 
 fn report_v3_idle_unknown(
@@ -6284,17 +6514,48 @@ fn collect_v3_family_at(
         }
         Err(error) => return Err(v3(error)),
     };
-    // Opening the registry takes a covering measurement and releases the
-    // reservations of dead owners. Like every measurement here it stops at
-    // the pass deadline; one that runs out records nothing and is owed (see
-    // `Measurement::Owed`), and the visit ends so the lock is released.
-    let (mut registry, opened) =
-        RegistryWriter::open_existing_until(storage, family, &lock, deadline).map_err(v3)?;
-    if opened == Measurement::Owed {
-        report
-            .skipped_families
-            .push(format!("blobs/v3/{family}: measurement_owed"));
-        return Ok(V3Visit::Done);
+    // Reclamation depends on references and leases, not the byte ledger. Do it
+    // before accounting: large namespaces can exhaust every visit's budget in
+    // the full accounting walk, otherwise starving the cleanup that would shrink them.
+    // The final measurement still settles dead reservations and never records
+    // a partial total. No publication is admitted through this handle.
+    let mut registry = RegistryWriter::open_for_barrier(storage, family, &lock).map_err(v3)?;
+    // Base references get the first turn, before member cleanup or accounting
+    // can consume the visit. All three phases share the reservation lock.
+    if !cancelled()
+        && Instant::now() < deadline
+        && registry.registry_version().map_err(v3)?
+            >= crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION
+    {
+        let plane_cursor = cursor_root(paths)?
+            .join("v3-plane-rows")
+            .join(format!("{family}.json"));
+        let bounds = crate::views::base_sweep::SweepBounds {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        match crate::views::base_sweep::sweep_family_locked(
+            storage,
+            family,
+            &lock,
+            None,
+            bounds,
+            Some(&plane_cursor),
+        ) {
+            Ok(swept) => {
+                report.removed_roots += swept.reclaimed_bases.len();
+                report.removed_blobs += swept.plane_rows_deleted as usize;
+                report.examined_blobs += swept.plane_rows_examined as usize;
+                report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
+            }
+            Err(error) => {
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("v3 base sweep of family {family}: {error}"));
+                }
+            }
+        }
     }
     let mut owed = false;
     let cursor_path = v3_member_cursor_path(paths, family)?;
@@ -6365,10 +6626,8 @@ fn collect_v3_family_at(
         };
         if member.state == crate::views::registry::STATE_EVICTING {
             let bytes = retention_tree_bytes(&view_dir, deadline).ok();
-            let measured =
-                v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir, deadline)?;
+            v3_remove_evicting(storage, &mut registry, &member.scope, &view_dir)?;
             record_v3_removal(&mut domain, bytes);
-            owed |= measured == Measurement::Owed;
             continue;
         }
         let Some(root) = member.root.as_deref().and_then(v3_root_path) else {
@@ -6394,15 +6653,8 @@ fn collect_v3_family_at(
                     ),
                     V3IdleStep::Evicting => {
                         let bytes = retention_tree_bytes(&view_dir, deadline).ok();
-                        let measured = v3_finish_eviction(
-                            storage,
-                            &mut registry,
-                            &member.scope,
-                            &view_dir,
-                            deadline,
-                        )?;
+                        v3_remove_evicting(storage, &mut registry, &member.scope, &view_dir)?;
                         record_v3_removal(&mut domain, bytes);
-                        owed |= measured == Measurement::Owed;
                     }
                 }
                 continue;
@@ -6451,10 +6703,8 @@ fn collect_v3_family_at(
         match step {
             V3Step::Evicting => {
                 let bytes = retention_tree_bytes(&view_dir, deadline).ok();
-                let measured =
-                    v3_finish_eviction(storage, &mut registry, &member.scope, &view_dir, deadline)?;
+                v3_remove_evicting(storage, &mut registry, &member.scope, &view_dir)?;
                 record_v3_removal(&mut domain, bytes);
-                owed |= measured == Measurement::Owed;
             }
             V3Step::Retained if missing => domain.skipped_protected += 1,
             V3Step::Retained | V3Step::Present | V3Step::Gone | V3Step::Due { .. } => {}
@@ -6467,44 +6717,6 @@ fn collect_v3_family_at(
                 last_scope: Some(last_scope),
             },
         )?;
-    }
-    // The base-reference sweep: referrer reconciliation, the two-sweep base
-    // reclaim and the plane-row sweep. It needs the registry's base-reference
-    // tables and runs under the reservation lock this visit already holds.
-    if !cancelled()
-        && Instant::now() < deadline
-        && registry.registry_version().map_err(v3)?
-            >= crate::blob_store::v3::REGISTRY_BASE_REFS_VERSION
-    {
-        let plane_cursor = cursor_root(paths)?
-            .join("v3-plane-rows")
-            .join(format!("{family}.json"));
-        let bounds = crate::views::base_sweep::SweepBounds {
-            deadline: Some(deadline),
-            ..Default::default()
-        };
-        match crate::views::base_sweep::sweep_family_locked(
-            storage,
-            family,
-            &lock,
-            None,
-            bounds,
-            Some(&plane_cursor),
-        ) {
-            Ok(swept) => {
-                report.removed_roots += swept.reclaimed_bases.len();
-                report.removed_blobs += swept.plane_rows_deleted as usize;
-                report.examined_blobs += swept.plane_rows_examined as usize;
-                report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
-            }
-            Err(error) => {
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("v3 base sweep of family {family}: {error}"));
-                }
-            }
-        }
     }
     // Every collector pass ends with a covering measurement, so committed
     // usage also reflects files removed by anything else since the last one.
@@ -11350,6 +11562,102 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn storage_retention_large_history_reclaims_retired_views_and_keeps_live_roots() {
+        use crate::blob_store::v2::{FamilyKey, FamilyPlane, FamilyStoreReader};
+        let (temp, missing_root, missing_scope) = fixture();
+        let retired = cache(temp.path(), "views", &missing_scope);
+        fs::remove_dir(&missing_root).unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(temp.path(), &missing_scope).unwrap();
+        let registration = registry
+            .register_view_with_storage(temp.path(), &missing_scope, &missing_root)
+            .unwrap();
+        let v2_view = registration.view_dir().to_path_buf();
+        let key = FamilyKey::new(FamilyPlane::Callgraph, [7; 32]);
+        registration
+            .open_store(FamilyPlane::Callgraph)
+            .unwrap()
+            .put_or_touch(&key, b"retired payload")
+            .unwrap();
+        drop(registration);
+        // Registration has its own recency clock, independent of root history.
+        registry
+            .with_barrier(|tx| {
+                tx.execute("UPDATE members SET last_bind_ms=0", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let live_root = temp.path().join("live");
+        fs::create_dir(&live_root).unwrap();
+        let live_scope = crate::path_identity::project_scope_key(&live_root);
+        record_bind(temp.path(), &live_root, &live_scope).unwrap();
+        let live = cache(temp.path(), "views", &live_scope);
+        let binding: serde_json::Value = read_json(
+            &temp
+                .path()
+                .join(format!("retention/roots/{live_scope}.json")),
+        )
+        .unwrap();
+        // These are protection records, not a batch of deletion candidates.
+        // None may be dropped just because a candidate window is smaller.
+        for index in 0..=HISTORY_ENTRIES {
+            atomic_json(
+                &temp
+                    .path()
+                    .join(format!("retention/roots/{index:016x}.json")),
+                &binding,
+            )
+            .unwrap();
+        }
+        let first = run_pass_entry_bound(temp.path());
+        assert!(!first.binding_history.complete, "{first:?}");
+        assert!(first.binding_history.examined <= HISTORY_ENTRIES);
+        assert!(first.binding_history.accumulated > 0);
+        let incomplete_health = serde_json::to_value(snapshot(temp.path()).unwrap()).unwrap();
+        assert_eq!(incomplete_health["binding_history"]["complete"], false);
+        assert!(retired.exists(), "a partial census authorized deletion");
+        assert!(live.exists());
+        // A concurrent binder invalidates the partial census. Its new record
+        // must be included before the collector can retire anything.
+        record_bind(temp.path(), &live_root, &live_scope).unwrap();
+        let restarted = run_pass_entry_bound(temp.path());
+        assert!(!restarted.binding_history.complete, "{restarted:?}");
+        assert!(restarted.binding_history.restarted);
+        assert!(restarted.binding_history.examined <= HISTORY_ENTRIES);
+        assert!(retired.exists());
+        let report = run_pass_entry_bound(temp.path());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.binding_history.complete, "{report:?}");
+        assert!(report.binding_history.examined <= HISTORY_ENTRIES);
+        assert!(report.binding_history.accumulated > HISTORY_ENTRIES);
+        let health = serde_json::to_value(snapshot(temp.path()).unwrap()).unwrap();
+        assert_eq!(health["binding_history"]["complete"], true);
+        assert!(!retired.exists(), "retired view survived: {report:?}");
+        assert!(live.exists(), "live view was retired: {report:?}");
+        // Finish the existing consecutive-missing-sweep rule. The legacy
+        // registry remains, but its unused view and payload are reclaimed.
+        for _ in 0..2 {
+            crate::gc::family::sweep_family(
+                &registry,
+                None,
+                crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+                None,
+            )
+            .unwrap();
+        }
+        assert!(!v2_view.exists(), "retired v2 view survived");
+        assert!(!FamilyStoreReader::open_existing(
+            temp.path(),
+            &missing_scope,
+            FamilyPlane::Callgraph
+        )
+        .unwrap()
+        .unwrap()
+        .contains(&key)
+        .unwrap());
+    }
+
+    #[test]
     fn storage_retention_keeps_a_recently_bound_missing_root() {
         let (temp, root, scope) = fixture();
         record_bind(temp.path(), &root, &scope).unwrap();
@@ -14340,8 +14648,20 @@ pub(crate) fn schedule(
 /// backlog does not wait ten minutes between passes; protected or unreadable
 /// views stop the burst rather than spinning on an uncollectable directory.
 fn drain_due_views(mut pass: impl FnMut() -> SweepReport) {
+    let mut history_followups = 0;
     loop {
         let report = pass();
+        // Finish a bounded protection census promptly rather than waiting ten
+        // minutes per chunk. Churn or unreadable history cannot spin forever;
+        // the last incomplete progress remains in status and health.
+        if !report.cancelled
+            && !report.binding_history.complete
+            && report.binding_history.examined > 0
+            && history_followups < 4
+        {
+            history_followups += 1;
+            continue;
+        }
         if report.cancelled
             || report.due_views_remaining == 0
             || report
@@ -16139,6 +16459,129 @@ mod v3_base_reference_collector_tests {
             .member(scope)
             .unwrap()
             .is_some()
+    }
+
+    #[test]
+    fn blob_store_admission_at_floor_reclaims_family_base_then_succeeds() {
+        use crate::blob_store::v3;
+        let _serial = v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        crate::root_cache::register_durable_owner(&StoragePaths::same(storage.path())).unwrap();
+        let (unused, _) = publish_test_base(storage.path(), &[("src/a.rs", b"unused")]);
+        let (pinned, _) = publish_test_base(storage.path(), &[("src/a.rs", b"pinned")]);
+        let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &pinned.scope).unwrap();
+        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let _hook = observe_test_hook(
+            storage.path(),
+            Arc::new({
+                let probes = probes.clone();
+                let storage = storage.path().to_path_buf();
+                move |step| {
+                    if step == "v3-pressure-reclaimed" {
+                        probes.lock().unwrap().push(v3::set_free_space_for_test(
+                            &storage,
+                            u64::MAX,
+                            1 << 30,
+                        ));
+                    }
+                }
+            }),
+        );
+        v3::publish(storage.path(), FAMILY, 1 << 20, None, |_| Ok(())).unwrap();
+        assert!(!registered(storage.path(), &unused.scope));
+        assert!(!v3::view_dir(storage.path(), FAMILY, &unused.scope)
+            .unwrap()
+            .exists());
+        assert!(registered(storage.path(), &pinned.scope));
+        assert_eq!(
+            probes.lock().unwrap().len(),
+            1,
+            "exactly one database freed"
+        );
+    }
+
+    #[test]
+    fn blob_store_admission_at_floor_without_reclaimable_data_keeps_refusal_code() {
+        use crate::blob_store::v3;
+        let _serial = v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (held, _) = publish_test_base(storage.path(), &[("src/a.rs", b"held")]);
+        let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &held.scope).unwrap();
+        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _hook = observe_test_hook(
+            storage.path(),
+            Arc::new({
+                let attempts = attempts.clone();
+                move |step| {
+                    if step == "v3-pressure-reclaim-started" {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }),
+        );
+        let result = v3::publish(storage.path(), FAMILY, 1, None, |_| -> v3::Result<()> {
+            panic!("refused admission ran the writer")
+        });
+        assert!(
+            matches!(result, Err(v3::Error::Refused("device_free_space_floor"))),
+            "{result:?}"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(registered(storage.path(), &held.scope));
+    }
+
+    #[test]
+    fn retention_reclaims_unreferenced_bases_even_when_accounting_is_owed() {
+        use crate::blob_store::v3;
+        let _serial = v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let (unused, _) = publish_test_base(storage.path(), &[("src/a.rs", b"unused")]);
+        let (held, _) = publish_test_base(storage.path(), &[("src/a.rs", b"held")]);
+        let pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &held.scope).unwrap();
+        let (referenced, generation) =
+            publish_test_base(storage.path(), &[("src/a.rs", b"referenced")]);
+        put_rows(storage.path(), &[b"new"]);
+        let (_, composed) = published(
+            bind(
+                storage.path(),
+                "worker-a",
+                &referenced,
+                &generation,
+                worker_delta(&referenced, &generation, b"new"),
+                None,
+            )
+            .unwrap(),
+        );
+        drop(composed);
+        for sweep in 0..2 {
+            v3::set_walk_delay_for_test(Duration::from_millis(500));
+            let mut report = SweepReport::default();
+            let result = collect_one_v3_family(
+                &StoragePaths::same(storage.path()),
+                &|| false,
+                &mut report,
+                V3Bounds {
+                    budget: Duration::from_millis(250),
+                    ..V3Bounds::PASS
+                },
+            );
+            v3::set_walk_delay_for_test(Duration::ZERO);
+            result.unwrap();
+            assert!(report.errors.is_empty(), "{report:?}");
+            assert_eq!(
+                report.skipped_families,
+                [format!("blobs/v3/{FAMILY}: measurement_owed")]
+            );
+            assert_eq!(registered(storage.path(), &unused.scope), sweep == 0);
+            assert!(registered(storage.path(), &held.scope));
+            assert!(registered(storage.path(), &referenced.scope));
+        }
+        assert!(!v3::view_dir(storage.path(), FAMILY, &unused.scope)
+            .unwrap()
+            .exists());
+        drop(pin);
     }
 
     #[test]

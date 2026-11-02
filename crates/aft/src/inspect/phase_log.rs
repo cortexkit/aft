@@ -157,6 +157,7 @@ impl InspectPhaseLog {
     }
 
     pub fn start(&self, entry: InspectPhaseEntry) -> InspectPhaseHandle {
+        crate::run_tool_call::progress::report();
         let mut state = self.state.lock();
         let index = state.records.len();
         state.records.push(InspectPhaseRecord {
@@ -218,6 +219,7 @@ pub struct InspectPhaseHandle {
 
 impl InspectPhaseHandle {
     pub fn complete(mut self) {
+        crate::run_tool_call::progress::report();
         let mut state = self.log.state.lock();
         if let Some(record) = state.records.get_mut(self.index) {
             record.completed = Some(Instant::now());
@@ -226,6 +228,7 @@ impl InspectPhaseHandle {
     }
 
     pub fn fail(mut self, error: impl Into<String>) {
+        crate::run_tool_call::progress::report();
         let mut state = self.log.state.lock();
         if let Some(record) = state.records.get_mut(self.index) {
             record.completed = Some(Instant::now());

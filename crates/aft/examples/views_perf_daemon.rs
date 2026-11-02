@@ -242,7 +242,7 @@ async fn main() {
         if command["op"] == "batch" {
             let mut pending = HashMap::new();
             for request in command["requests"].as_array().expect("batch requests") {
-                corr += 1;
+                corr = request["corr"].as_u64().unwrap_or(corr + 1);
                 let channel = request["channel"].as_u64().unwrap_or(1) as u16;
                 let body = json!({"name":request["name"], "arguments":request["arguments"]});
                 pending.insert(corr, (request["id"].clone(), Instant::now()));
