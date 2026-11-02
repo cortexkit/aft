@@ -15370,6 +15370,144 @@ mod tests {
         );
     }
 
+    fn assert_callgraph_views_rematerialization_bounded(command: &str) {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        let write_callers = |prefix: &str| {
+            for index in 0..64 {
+                std::fs::write(
+                    root.join(format!("caller_{index}.ts")),
+                    format!("import {{ target }} from './a';\nexport function {prefix}_{index}() {{ return target(); }}\n"),
+                )
+                .unwrap();
+            }
+            assert!(git_command(&root)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success());
+            assert!(git_command(&root)
+                .args([
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    prefix
+                ])
+                .status()
+                .unwrap()
+                .success());
+        };
+        write_callers("before");
+        let root = std::fs::canonicalize(&root).unwrap();
+        let ctx = Arc::new(test_context());
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &temp.path().join("storage"), true),
+                &ctx,
+            )
+            .success
+        );
+        let callers_request: RawRequest = serde_json::from_value(json!({
+            "id": "rematerialization-callers", "command": "callers",
+            "file": root.join("a.ts"), "symbol": "target", "depth": 1,
+        }))
+        .unwrap();
+        let initial = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        assert!(initial.success, "{:?}", initial.data);
+        assert_eq!(initial.data["total_callers"], 64);
+        assert!(initial.data.to_string().contains("before_"));
+        write_callers("after");
+
+        // Hold the actual materializer until the request has answered. A timeout
+        // also releases it so a regression cannot leave a blocked test thread.
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "callgraph-materialize" {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }),
+        );
+        let request = if command == "zoom" {
+            serde_json::from_value(json!({
+                "id": "rematerialization-zoom", "command": "zoom", "file": root.join("a.ts"),
+                "symbols": ["target"], "callgraph": true,
+            }))
+            .unwrap()
+        } else {
+            callers_request.clone()
+        };
+        let (answer_tx, answer_rx) = crossbeam_channel::bounded(1);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let response = if request.command == "zoom" {
+                crate::commands::zoom::handle_zoom(&request, &worker_ctx)
+            } else {
+                crate::commands::callers::handle_callers(&request, &worker_ctx)
+            };
+            answer_tx.send((started.elapsed(), response)).unwrap();
+        });
+        let bound = crate::views::contracts::CALLGRAPH_QUERY_WAIT;
+        let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+        let bounded_answer = answer_rx.recv_timeout(bound + Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(entered.is_ok(), "request never reached materialization");
+        let answered_in_bound = bounded_answer.is_ok();
+        let (elapsed, answer) = bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
+        eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_in_bound}", elapsed.as_millis(), bound.as_millis());
+        assert!(
+            answered_in_bound,
+            "{command} waited {elapsed:?} for materialization past {bound:?}"
+        );
+        if command == "zoom" {
+            assert!(answer.success, "{:?}", answer.data);
+            assert!(answer.data.to_string().contains("export function target"));
+            assert_eq!(answer.data["callgraph"]["code"], "callgraph_building");
+        } else {
+            assert!(!answer.success, "{:?}", answer.data);
+            assert_eq!(answer.data["code"], "callgraph_building");
+        }
+
+        let started = Instant::now();
+        let next = crate::commands::callers::handle_callers(&callers_request, &ctx);
+        eprintln!("{command}: next_read_ms={}", started.elapsed().as_millis());
+        assert!(next.success, "{:?}", next.data);
+        assert_eq!(next.data["total_callers"], 64);
+        assert!(next.data.to_string().contains("after_"));
+        assert!(!next.data.to_string().contains("before_"));
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the next read started another materialization"
+        );
+    }
+
+    #[test]
+    fn callgraph_views_rematerialization_bounds_callers_then_serves_publication() {
+        assert_callgraph_views_rematerialization_bounded("callers");
+    }
+
+    #[test]
+    fn callgraph_views_rematerialization_bounds_zoom_then_serves_publication() {
+        assert_callgraph_views_rematerialization_bounded("zoom");
+    }
+
     #[test]
     fn callgraph_views_planned_load_states_retry_without_failure_or_footer() {
         let _git_env = crate::test_env::hermetic_git_env_guard();

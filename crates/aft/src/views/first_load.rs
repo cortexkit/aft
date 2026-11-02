@@ -5041,6 +5041,8 @@ impl CompositePlane for CallgraphBridge {
         };
         #[cfg(test)]
         let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
+        #[cfg(test)]
+        crate::storage_retention::test_hook(_owner.root(), "callgraph-materialize");
         let mut v3_readers = V3PlaneReaders::new(route);
         let mut attachments = Vec::new();
         for (path, entry) in observed {
