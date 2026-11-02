@@ -27,8 +27,8 @@ const READ_ONLY_FILE_COMMANDS: &[&str] = &["cat"];
 type ReadExemption<'a> = &'a dyn Fn(&Path) -> bool;
 
 #[derive(Debug, Clone)]
-struct Part {
-    text: String,
+pub(super) struct Part {
+    pub(super) text: String,
 }
 
 pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
@@ -308,7 +308,35 @@ pub(crate) fn top_level_directory_targets(
     cwd: &Path,
     known_directory: &dyn Fn(&Path) -> bool,
 ) -> Vec<DirectoryTarget> {
+    walk_shell_commands(command, cwd, known_directory, &mut |_, _| {})
+}
+
+/// Share the runon directory-flow model with checks of individual commands.
+/// An ambiguous working directory is reported as unknown, not guessed.
+#[cfg(any(unix, test))]
+pub(super) fn walk_shell_commands(
+    command: &str,
+    cwd: &Path,
+    known_directory: &dyn Fn(&Path) -> bool,
+    on_command: &mut dyn FnMut(Node<'_>, Option<&Path>),
+) -> Vec<DirectoryTarget> {
     const MAX_CWD_PATHS: usize = 8;
+
+    struct Targets<'a> {
+        directories: Vec<DirectoryTarget>,
+        on_command: &'a mut dyn FnMut(Node<'_>, Option<&Path>),
+    }
+    impl std::ops::Deref for Targets<'_> {
+        type Target = Vec<DirectoryTarget>;
+        fn deref(&self) -> &Self::Target {
+            &self.directories
+        }
+    }
+    impl std::ops::DerefMut for Targets<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.directories
+        }
+    }
 
     #[derive(Clone, PartialEq, Eq)]
     struct ShellState {
@@ -650,7 +678,7 @@ pub(crate) fn top_level_directory_targets(
         head: &str,
         parts: &[Part],
         incoming: Paths,
-        targets: &mut Vec<DirectoryTarget>,
+        targets: &mut Targets<'_>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         if head == "pushd" && !followable_pushd(parts) {
@@ -734,7 +762,7 @@ pub(crate) fn top_level_directory_targets(
         node: Node<'_>,
         source: &str,
         incoming: Paths,
-        targets: &mut Vec<DirectoryTarget>,
+        targets: &mut Targets<'_>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) {
         let mut cursor = node.walk();
@@ -746,7 +774,7 @@ pub(crate) fn top_level_directory_targets(
         node: Node<'_>,
         source: &str,
         incoming: &Paths,
-        targets: &mut Vec<DirectoryTarget>,
+        targets: &mut Targets<'_>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> bool {
         if matches!(node.kind(), "command_substitution" | "process_substitution") {
@@ -764,7 +792,7 @@ pub(crate) fn top_level_directory_targets(
         node: Node<'_>,
         source: &str,
         incoming: Paths,
-        targets: &mut Vec<DirectoryTarget>,
+        targets: &mut Targets<'_>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         if incoming.is_empty() {
@@ -822,6 +850,13 @@ pub(crate) fn top_level_directory_targets(
                 let inner = body
                     .map(|body| evaluate(body, source, incoming.clone(), targets, known_directory))
                     .unwrap_or_else(|| Flow::either(incoming.clone()));
+                if body.is_none() {
+                    let cwd = match &incoming {
+                        Paths::Known(states) if states.len() == 1 => Some(states[0].cwd.as_path()),
+                        _ => None,
+                    };
+                    (targets.on_command)(node, cwd);
+                }
                 // Redirection can fail before the body changes directory.
                 return Flow {
                     success: inner.success,
@@ -829,6 +864,14 @@ pub(crate) fn top_level_directory_targets(
                 };
             }
             "command" => {
+                let cwd = match &incoming {
+                    Paths::Known(states) => states
+                        .first()
+                        .filter(|first| states.iter().all(|state| state.cwd == first.cwd))
+                        .map(|state| state.cwd.as_path()),
+                    Paths::Unknown(_) => None,
+                };
+                (targets.on_command)(node, cwd);
                 let has_substitution =
                     inspect_substitutions(node, source, &incoming, targets, known_directory);
                 let parts = command_parts(source, node);
@@ -893,7 +936,7 @@ pub(crate) fn top_level_directory_targets(
         node: Node<'_>,
         source: &str,
         incoming: Paths,
-        targets: &mut Vec<DirectoryTarget>,
+        targets: &mut Targets<'_>,
         known_directory: &dyn Fn(&Path) -> bool,
     ) -> Flow {
         let mut flow: Option<Flow> = None;
@@ -966,7 +1009,10 @@ pub(crate) fn top_level_directory_targets(
         flow.unwrap_or_else(|| Flow::either(incoming))
     }
 
-    let mut targets = Vec::new();
+    let mut targets = Targets {
+        directories: Vec::new(),
+        on_command,
+    };
     if let Some(tree) = parse_tree(command) {
         let _ = evaluate(
             tree.root_node(),
@@ -976,10 +1022,10 @@ pub(crate) fn top_level_directory_targets(
             known_directory,
         );
     }
-    targets
+    targets.directories
 }
 
-fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
+pub(super) fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
     let mut out = Vec::new();
 
     let mut cursor = node.walk();

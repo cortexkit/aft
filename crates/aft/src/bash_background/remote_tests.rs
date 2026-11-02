@@ -12197,6 +12197,188 @@ fn runon_cd_snapshot_fixture() -> (tempfile::TempDir, RunRequest) {
 }
 
 #[test]
+fn runon_write_shapes_respect_snapshot_membership() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::write(root.join(".gitignore"), "ignored/\ntracked.rs\n").unwrap();
+    fs::write(root.join("tracked.rs"), "source\n").unwrap();
+    hermetic_git(root, &["add", "-f", "tracked.rs"]);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.rs"), "source\n").unwrap();
+    let shapes = [
+        "echo text > PATH",
+        "echo text >> PATH",
+        "echo text &> PATH",
+        "echo text >| PATH",
+        "cat > PATH <<'EOF'\nsource\nEOF",
+        "tee PATH",
+        "tee -a PATH",
+        "sed -i 's/a/b/' PATH",
+        "sed -i '' 's/a/b/' PATH",
+        "perl -i -pe 's/a/b/' PATH",
+        "ruby -i -pe 'gsub(/a/, \"b\")' PATH",
+        "cp input PATH",
+        "mv input PATH",
+        "install input PATH",
+        "ln input PATH",
+        "rm PATH",
+        "unlink PATH",
+        "truncate -s 0 PATH",
+        "touch PATH",
+        "patch -p0 <<'EOF'\n--- PATH\n+++ PATH\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        "git apply -p0 --unsafe-paths <<'EOF'\n--- PATH\n+++ PATH\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        "git checkout -- PATH",
+        "git restore PATH",
+        "rustfmt PATH",
+        "prettier --write PATH",
+        "biome format --write PATH",
+        "biome check --write PATH",
+        "gofmt -w PATH",
+        "black PATH",
+        "ruff format PATH",
+        "python -c 'open(\"PATH\", \"w\").write(\"source\")'",
+        "python3 -c 'open(\"PATH\", \"a\").write(\"source\")'",
+        "python3 - <<'PY'\nfrom pathlib import Path\nPath(\"PATH\").write_text(\"source\")\nPY",
+        "node -e 'require(\"fs\").writeFileSync(\"PATH\", \"source\")'",
+    ];
+    for shape in shapes {
+        for path in [
+            "tracked.rs",
+            "new.rs",
+            "target/out.rs",
+            "ignored/out.rs",
+            "/tmp/aft-runon-write-proof.rs",
+            "/dev/null",
+            "$FILE",
+        ] {
+            // touch only changes timestamps on an existing file; no source edit
+            // can be lost unless it creates a new snapshot member.
+            let expected = matches!(path, "tracked.rs" | "new.rs")
+                && !(shape == "touch PATH" && path == "tracked.rs");
+            let command = shape.replace("PATH", path);
+            assert_eq!(
+                runon_write_refusal(&command, &request).is_some(),
+                expected,
+                "{command}"
+            );
+        }
+    }
+    assert!(
+        runon_write_refusal("cd sub && sed -i 's/a/b/' file.rs", &request)
+            .unwrap()
+            .contains("sub/file.rs")
+    );
+    assert!(runon_write_refusal("cargo fmt", &request).is_some());
+    for command in [
+        "cargo fmt --check",
+        "cargo fmt -- --check",
+        "ruff format --check tracked.rs",
+        "black --check tracked.rs",
+        "rustfmt --check tracked.rs",
+        "cat tracked.rs",
+        "python3 -c 'open(\"tracked.rs\", \"r\").read()'",
+    ] {
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+    }
+    let expected = format!("runon refused: this command writes {} (and 1 more), and a build-server job runs on a throwaway copy, so the edit would be lost. Edit in a local call, then runon only the build or test.", root.join("tracked.rs").display());
+    assert_eq!(
+        runon_write_refusal("tee tracked.rs new.rs", &request).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn runon_write_return_paths_exempt_only_the_resolved_requested_file() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/golden.rs"), "golden\n").unwrap();
+    hermetic_git(root, &["add", "sub/golden.rs"]);
+    request.cwd = root.join("sub").to_string_lossy().into_owned();
+    request.return_paths = vec!["./golden.rs".into()];
+    assert!(runon_write_refusal(
+        "python3 -c 'open(\"golden.rs\", \"w\").write(\"new\")'",
+        &request
+    )
+    .is_none());
+    request.return_paths = vec!["other.rs".into()];
+    assert!(runon_write_refusal("echo new > golden.rs", &request).is_some());
+    request.return_paths = vec!["golden.rs".into()];
+    assert!(runon_write_refusal("echo new > ../other.rs", &request).is_some());
+}
+
+#[tokio::test]
+async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let command =
+        "python3 - <<'PY' && cargo nextest run\nopen('source.rs', 'w').write('source')\nPY";
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": command, "runon": "linux", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_eq!(done.exit_code, None);
+    assert_eq!(done.child_pid, None);
+    let refusal = refusal_response(done);
+    assert_eq!(refusal.data["code"], "runon_edits_checkout");
+    let expected = format!("runon refused: this command writes {}, and a build-server job runs on a throwaway copy, so the edit would be lost. Edit in a local call, then runon only the build or test.", dir.path().canonicalize().unwrap().join("source.rs").display());
+    assert_eq!(refusal.data["message"], expected);
+    let task = ctx.bash_background().task(task_id).unwrap();
+    let state = task.state.lock().unwrap();
+    let persisted = serde_json::to_value(&state.metadata).unwrap();
+    assert_eq!(persisted["remote"]["pre_start_refusal"]["ran"], "none");
+    assert!(persisted["remote"]["job_id"].is_null());
+    assert!(persisted["remote"]["terminal"].is_null());
+    let restored: PersistedTask = serde_json::from_value(persisted).unwrap();
+    assert_eq!(
+        remote_refusal(&restored).unwrap().code,
+        "runon_edits_checkout"
+    );
+    assert!(
+        exec_runs(&daemon).is_empty(),
+        "a refused edit must never submit"
+    );
+    assert!(
+        !dir.path().join("source.rs").exists(),
+        "a refused edit must never run locally"
+    );
+}
+
+#[tokio::test]
+async fn runon_write_check_never_refuses_without_runon() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": "printf source > source.rs", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[test]
 fn runon_cd_snapshot_ignored_existing_directories_keep_failure_branch() {
     let (_dir, mut request) = runon_cd_snapshot_fixture();
     let checkout = PathBuf::from(&request.workspace_key);
