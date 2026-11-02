@@ -55,9 +55,10 @@ pub(crate) fn bind_is_busy(reason: &str) -> bool {
     // moved past (for example the burst of events right after a watcher
     // starts), and the next attempt cuts a fresh one. It is retried, not
     // counted as a failed load or reported as an AFT bug. The graph also waits
-    // until AFT verifies pending writes and includes them in its installed
-    // snapshot.
+    // until the legacy import finishes, or AFT verifies pending writes and
+    // includes them in its installed snapshot.
     checkout_changed_during_load(reason)
+        || reason.contains("legacy text and symbol import building")
         || reason.contains("callgraph view has unverified writes (")
         || reason.contains(crate::blob_store::v3::BUSY_PREFIX)
         || reason.contains("reservation_ledger_busy:")
