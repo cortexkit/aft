@@ -15526,6 +15526,207 @@ mod tests {
         assert_callgraph_views_rematerialization_bounded("zoom");
     }
 
+    fn assert_callgraph_acquisition_lifecycle(daemon: bool) {
+        use crate::executor::{Executor, ExecutorConfig, Lane};
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        std::fs::write(
+            root.join("a.ts"),
+            "export function target() { return 1; }\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let storage = temp.path().join("storage");
+        let ctx = Arc::new(test_context());
+        let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+        let executor = daemon.then(|| {
+            Executor::with_config(ExecutorConfig {
+                pool_size: 2,
+                actor_cap: 1,
+                read_cap: 1,
+                heavy_permits: 1,
+                drr_quantum: 1,
+            })
+        });
+        if let Some(executor) = &executor {
+            executor.register_actor(root_id.clone(), ctx.clone());
+        }
+        assert!(
+            handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx)
+                .success
+        );
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "lifecycle-callers", "command": "callers", "file": root.join("a.ts"),
+            "symbol": "target", "depth": 1,
+        }))
+        .unwrap();
+        assert!(crate::commands::callers::handle_callers(&request, &ctx).success);
+        let family = crate::search_index::artifact_cache_key(&root);
+        let directory = crate::blob_store::v3::view_dir(
+            &storage,
+            &family,
+            &crate::views::callgraph::view_scope(&root),
+        )
+        .unwrap();
+        let store = crate::views::ViewStore::existing_dir(directory.clone()).unwrap();
+        let previous = store.current_generation_read_only().unwrap();
+        assert!(previous.is_some());
+        std::fs::write(
+            root.join("b.ts"),
+            "import { target } from './a';\nexport function caller() { return target(); }\n",
+        )
+        .unwrap();
+
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::unbounded();
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "callgraph-materialize" {
+                    entered_tx.send(()).unwrap();
+                    let cancellation = crate::executor::current_job_cancellation();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        if cancellation
+                            .as_ref()
+                            .is_some_and(|token| token.cancel_already_requested())
+                        {
+                            break;
+                        }
+                        if release_rx.recv_timeout(Duration::from_millis(10)).is_ok() {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "materializer was neither released nor cancelled"
+                        );
+                    }
+                } else if step == "callgraph-reader-acquired"
+                    || step == "callgraph-acquisition-failed"
+                {
+                    let _ = finished_tx.send(());
+                }
+            }),
+        );
+        let (answer_tx, answer_rx) = crossbeam_channel::bounded(1);
+        let worker_ctx = ctx.clone();
+        let read = std::thread::spawn(move || {
+            let _pin = worker_ctx.pin_config();
+            answer_tx
+                .send(crate::commands::callers::handle_callers(
+                    &request,
+                    &worker_ctx,
+                ))
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let interactive = executor.as_ref().map(|executor| {
+            let file = root.join("a.ts");
+            executor
+                .submit(
+                    root_id.clone(),
+                    Lane::PureRead,
+                    "same-root-read".into(),
+                    Box::new(move |_| {
+                        crate::protocol::Response::success(
+                            "same-root-read",
+                            json!({"text": std::fs::read_to_string(file).unwrap()}),
+                        )
+                    }),
+                )
+                .recv_timeout(Duration::from_millis(500))
+        });
+        let accounted = executor.as_ref().map(|executor| {
+            (
+                executor.try_root_job_snapshots(&root_id),
+                executor
+                    .try_dispatch_liveness_snapshot()
+                    .unwrap()
+                    .running
+                    .maintenance,
+            )
+        });
+        ctx.mark_subc_unbound();
+        if let Some(executor) = &executor {
+            executor.cancel_root_maintenance(&root_id);
+        }
+        let cancelled_answer = answer_rx.recv_timeout(Duration::from_secs(4));
+        // A broken cancellation path is released explicitly before assertions,
+        // so the regression cannot strand its materializer or fixture teardown.
+        let _ = release_tx.send(());
+        read.join().unwrap();
+        let prompt = cancelled_answer.is_ok();
+        let answer = cancelled_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
+        finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if let Some(executor) = &executor {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !executor.actor_is_idle(&root_id) {
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled maintenance did not drain"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            executor.remove_actor(&root_id);
+        }
+        drop(ctx);
+        assert_eq!(
+            store.current_generation_read_only().unwrap(),
+            previous,
+            "a quiesced root published a generation"
+        );
+        assert!(
+            prompt,
+            "shutdown did not settle the acquisition before manual release"
+        );
+        assert!(!answer.success, "{:?}", answer.data);
+        assert_eq!(answer.data["code"], "callgraph_building");
+        if let Some(interactive) = interactive {
+            assert!(
+                interactive.unwrap().success,
+                "same-root read stalled behind materialization"
+            );
+            let (jobs, running) = accounted.unwrap();
+            let jobs = jobs.unwrap();
+            assert!(
+                jobs.iter().any(|job| job.lane == Lane::HeavyInit),
+                "acquisition was not executor heavy work: {jobs:?}"
+            );
+            assert_eq!(running, 1, "acquisition was not executor maintenance");
+        }
+        let reserved = crate::blob_store::v3::LedgerReader::open_existing(&storage, &family)
+            .unwrap()
+            .accounting()
+            .unwrap()
+            .reserved_bytes;
+        assert_eq!(reserved, 0);
+        let pins = directory.join("pins");
+        if pins.exists() {
+            for entry in std::fs::read_dir(pins).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                assert!(
+                    !name.starts_with("staging-") && !name.starts_with("live-"),
+                    "unreleased acquisition pin: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_quiesce_fences_publication_and_preserves_reads() {
+        assert_callgraph_acquisition_lifecycle(true);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_standalone_shutdown_releases_protection() {
+        assert_callgraph_acquisition_lifecycle(false);
+    }
+
     #[test]
     fn callgraph_views_planned_load_states_retry_without_failure_or_footer() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
