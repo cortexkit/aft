@@ -10,10 +10,10 @@
 //! either direction. Operation gating is holder-side classification over the
 //! routed request, not a property of any token the shim can see or hold.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -774,7 +774,7 @@ fn run_with(
         return 0;
     }
     if is_reserved_self_report(args) {
-        print_self_report(&paths);
+        print_self_report(&paths, status_audit_requested(args));
         return 0;
     }
     if crate::environment::non_empty_var(crate::gh_shim_speech::start_view::WORKER_POLICY_ENV)
@@ -2374,6 +2374,10 @@ fn is_reserved_self_report(args: &[OsString]) -> bool {
     args.first()
         .and_then(|arg| arg.to_str())
         .is_some_and(|arg| RESERVED_SELF_REPORT.contains(&arg))
+}
+
+fn status_audit_requested(args: &[OsString]) -> bool {
+    args.first().and_then(|arg| arg.to_str()) == Some("--status") && has_exact_flag(args, "--audit")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -7764,7 +7768,8 @@ struct SelfReport {
     last_probe: Option<LastProbeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_read_lookup: Option<worker_reads::LookupRecord>,
-    bypass_audit: Option<Vec<Value>>,
+    #[serde(flatten)]
+    bypass_audit: BypassAuditReport,
     bypass_audit_error: Option<String>,
     executing_image: Option<String>,
     executing_image_error: Option<String>,
@@ -7772,6 +7777,18 @@ struct SelfReport {
     real_gh_resolution_error: Option<String>,
     manifests_retained: usize,
     manifests_dir: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum BypassAuditReport {
+    Recent {
+        bypass_audit_count: Option<usize>,
+        bypass_audit_recent: Option<VecDeque<Value>>,
+    },
+    Full {
+        bypass_audit: Option<Vec<Value>>,
+    },
 }
 
 #[derive(Serialize)]
@@ -7810,23 +7827,23 @@ struct RealGhResolution {
     shim_path_positions: Vec<usize>,
 }
 
-fn print_self_report(paths: &StatePaths) {
+fn print_self_report(paths: &StatePaths, full_audit: bool) {
     // This is deliberately one JSON document, rather than status lines, so a
     // later forensic process can consume it with jq while every dependency is down.
-    if let Ok(document) = render_self_report(paths) {
+    if let Ok(document) = render_self_report(paths, full_audit) {
         let mut stdout = io::stdout().lock();
         let _ = stdout.write_all(document.as_bytes());
     }
 }
 
-fn render_self_report(paths: &StatePaths) -> Result<String, serde_json::Error> {
-    let report = build_self_report(paths);
+fn render_self_report(paths: &StatePaths, full_audit: bool) -> Result<String, serde_json::Error> {
+    let report = build_self_report(paths, full_audit);
     let mut document = serde_json::to_string(&report)?;
     document.push('\n');
     Ok(document)
 }
 
-fn build_self_report(paths: &StatePaths) -> SelfReport {
+fn build_self_report(paths: &StatePaths, full_audit: bool) -> SelfReport {
     let image = self_report_executing_image();
     let (real_gh_resolution, real_gh_resolution_error) = match image.as_ref() {
         Ok(image) => match resolve_real_gh(image) {
@@ -7847,7 +7864,27 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         },
         Err(error) => (None, Some(format!("executing image unavailable: {error}"))),
     };
-    let (bypass_audit, bypass_audit_error) = read_bypass_audit(paths);
+    let (bypass_audit, bypass_audit_error) = if full_audit {
+        let (bypass_audit, error) = read_bypass_audit(paths);
+        (BypassAuditReport::Full { bypass_audit }, error)
+    } else {
+        match summarize_bypass_audit(paths) {
+            Ok((count, recent)) => (
+                BypassAuditReport::Recent {
+                    bypass_audit_count: Some(count),
+                    bypass_audit_recent: Some(recent),
+                },
+                None,
+            ),
+            Err(error) => (
+                BypassAuditReport::Recent {
+                    bypass_audit_count: None,
+                    bypass_audit_recent: None,
+                },
+                Some(error),
+            ),
+        }
+    };
     let seam_state = seam_state(paths);
     // When the operator hard-off is set, the shim is byte-transparent passthrough
     // and never probes the daemon or catalog, so the status report reflects that
@@ -8074,27 +8111,43 @@ fn unavailable_last_rung(error: String) -> LastRungReport {
 }
 
 fn read_bypass_audit(paths: &StatePaths) -> (Option<Vec<Value>>, Option<String>) {
-    let contents = match fs::read_to_string(&paths.bypass_audit) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Some(Vec::new()), None),
-        Err(error) => return (None, Some(format!("bypass audit is unavailable: {error}"))),
-    };
     let mut records = Vec::new();
-    for (line_number, line) in contents.lines().enumerate() {
-        match serde_json::from_str(line) {
-            Ok(record) => records.push(record),
-            Err(error) => {
-                return (
-                    None,
-                    Some(format!(
-                        "bypass audit is corrupt at line {}: {error}",
-                        line_number + 1
-                    )),
-                )
-            }
-        }
+    match visit_bypass_audit(paths, |record| records.push(record)) {
+        Ok(()) => (Some(records), None),
+        Err(error) => (None, Some(error)),
     }
-    (Some(records), None)
+}
+
+const BYPASS_AUDIT_RECENT_LIMIT: usize = 10;
+
+fn summarize_bypass_audit(paths: &StatePaths) -> Result<(usize, VecDeque<Value>), String> {
+    let mut count = 0;
+    let mut recent = VecDeque::with_capacity(BYPASS_AUDIT_RECENT_LIMIT);
+    visit_bypass_audit(paths, |record| {
+        count += 1;
+        // Count every record, but retain only the tail while reading the JSONL.
+        if recent.len() == BYPASS_AUDIT_RECENT_LIMIT {
+            recent.pop_front();
+        }
+        recent.push_back(record);
+    })?;
+    Ok((count, recent))
+}
+
+fn visit_bypass_audit(paths: &StatePaths, mut visit: impl FnMut(Value)) -> Result<(), String> {
+    let unavailable = |error| format!("bypass audit is unavailable: {error}");
+    let file = fs::File::open(&paths.bypass_audit).map_err(unavailable)?;
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(unavailable)?;
+        let record = serde_json::from_str(&line).map_err(|error| {
+            format!(
+                "bypass audit is corrupt at line {}: {error}",
+                line_number + 1
+            )
+        })?;
+        visit(record);
+    }
+    Ok(())
 }
 
 fn unexpected_gh_route_advertisers(paths: &StatePaths) -> Option<Vec<String>> {
@@ -8675,6 +8728,24 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn status_audit_option_is_local_to_the_reserved_status_form() {
+        assert!(status_audit_requested(&os_args(&["--status", "--audit"])));
+        for args in [
+            vec!["--status"],
+            vec!["--status", "--audit=true"],
+            vec!["--shim-version", "--audit"],
+            vec!["--audit", "--status"],
+            vec!["issue", "list", "--status", "--audit"],
+        ] {
+            assert!(!status_audit_requested(&os_args(&args)), "{args:?}");
+        }
+        assert!(!is_reserved_self_report(&os_args(&["--audit"])));
+        assert!(!is_reserved_self_report(&os_args(&[
+            "issue", "list", "--audit"
+        ])));
+    }
+
     #[cfg(unix)]
     #[test]
     fn real_gh_resolution_skips_the_managed_shims_directory_without_recursing() {
@@ -8828,7 +8899,7 @@ mod tests {
     fn status_serializes_one_json_document_with_the_exact_top_level_schema() {
         let directory = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(directory.path().to_path_buf());
-        let document = render_self_report(&paths).expect("self report serialization");
+        let document = render_self_report(&paths, false).expect("self report serialization");
         assert!(document.ends_with('\n'));
         let value: Value = serde_json::from_str(&document).expect("self report JSON");
         let keys = value
@@ -8849,7 +8920,8 @@ mod tests {
                 "cached_manifest",
                 "last_rung",
                 "last_probe",
-                "bypass_audit",
+                "bypass_audit_count",
+                "bypass_audit_recent",
                 "bypass_audit_error",
                 "executing_image",
                 "executing_image_error",
@@ -8859,6 +8931,135 @@ mod tests {
                 "manifests_dir",
             ]
         );
+    }
+
+    #[test]
+    fn status_default_counts_all_bypass_entries_and_keeps_only_the_newest_ten() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        for timestamp in 0..25 {
+            append_bypass_audit(&paths, "issue close", Some("owner/repo"), timestamp).unwrap();
+        }
+        let report: Value =
+            serde_json::from_str(&render_self_report(&paths, false).unwrap()).unwrap();
+        assert_eq!(report["bypass_audit_count"], 25);
+        assert_eq!(
+            report["bypass_audit_recent"],
+            json!((15..25)
+                .map(|timestamp| json!({
+                    "as_of_unix_secs": timestamp,
+                    "tuple": "issue close",
+                    "repository": "owner/repo",
+                }))
+                .collect::<Vec<_>>())
+        );
+        assert!(report.get("bypass_audit").is_none());
+        assert!(report["bypass_audit_error"].is_null());
+    }
+
+    #[test]
+    fn status_audit_option_prints_the_full_unchanged_bypass_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let records = (0..25)
+            .map(|timestamp| {
+                json!({
+                    "as_of_unix_secs": timestamp,
+                    "tuple": "issue edit",
+                    "repository": "owner/repo",
+                    "issue_number": 42,
+                    "labels_added": ["ready"],
+                    "labels_removed": [],
+                })
+            })
+            .collect::<Vec<_>>();
+        for record in &records {
+            append_bypass_audit_record(&paths, record).unwrap();
+        }
+        let full_audit = status_audit_requested(&os_args(&["--status", "--audit"]));
+        let report: Value =
+            serde_json::from_str(&render_self_report(&paths, full_audit).unwrap()).unwrap();
+        assert_eq!(report["bypass_audit"], json!(records));
+        assert!(report.get("bypass_audit_count").is_none());
+        assert!(report.get("bypass_audit_recent").is_none());
+        assert!(report["bypass_audit_error"].is_null());
+    }
+
+    #[test]
+    fn status_default_shows_every_bypass_entry_when_fewer_than_ten_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let records = [
+            json!({"as_of_unix_secs": 99, "tuple": "issue close", "repository": null}),
+            json!({"as_of_unix_secs": 100, "tuple": "issue edit", "repository": "owner/repo",
+                "issue_number": 42, "labels_added": ["ready"], "labels_removed": ["blocked"]}),
+        ];
+        for record in &records {
+            append_bypass_audit_record(&paths, record).unwrap();
+        }
+        let report: Value =
+            serde_json::from_str(&render_self_report(&paths, false).unwrap()).unwrap();
+        assert_eq!(report["bypass_audit_count"], 2);
+        assert_eq!(report["bypass_audit_recent"], json!(records));
+        assert!(report["bypass_audit_error"].is_null());
+    }
+
+    #[test]
+    fn status_empty_readable_bypass_audit_has_a_zero_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        fs::write(&paths.bypass_audit, "").unwrap();
+        let report: Value =
+            serde_json::from_str(&render_self_report(&paths, false).unwrap()).unwrap();
+        assert_eq!(report["bypass_audit_count"], 0);
+        assert_eq!(report["bypass_audit_recent"], json!([]));
+        assert!(report["bypass_audit_error"].is_null());
+    }
+
+    fn assert_status_audit_error(paths: &StatePaths, prefix: &str) {
+        for full_audit in [false, true] {
+            let report: Value =
+                serde_json::from_str(&render_self_report(paths, full_audit).unwrap()).unwrap();
+            assert!(
+                report["bypass_audit_error"]
+                    .as_str()
+                    .is_some_and(|error| error.starts_with(prefix)),
+                "{report}"
+            );
+            if full_audit {
+                assert!(report.get("bypass_audit").unwrap().is_null());
+            } else {
+                assert!(report.get("bypass_audit_count").unwrap().is_null());
+                assert!(report.get("bypass_audit_recent").unwrap().is_null());
+                assert!(report.get("bypass_audit").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn status_missing_bypass_audit_reports_an_error_instead_of_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        assert_status_audit_error(&paths, "bypass audit is unavailable: ");
+    }
+
+    #[test]
+    fn status_unreadable_bypass_audit_reports_an_error_instead_of_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // A directory is not readable as JSONL, even when tests run as root.
+        fs::create_dir(&paths.bypass_audit).unwrap();
+        assert_status_audit_error(&paths, "bypass audit is unavailable: ");
+    }
+
+    #[test]
+    fn status_corrupt_bypass_audit_does_not_report_a_partial_count_or_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        fs::write(&paths.bypass_audit, "not JSON\n{}").unwrap();
+        assert_status_audit_error(&paths, "bypass audit is corrupt at line 1: ");
+        fs::write(&paths.bypass_audit, "{}\n{}\nnot JSON").unwrap();
+        assert_status_audit_error(&paths, "bypass audit is corrupt at line 3: ");
     }
 
     #[test]
@@ -8894,7 +9095,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            build_self_report(&paths).unexpected_gh_route_advertiser,
+            build_self_report(&paths, false).unexpected_gh_route_advertiser,
             Some(vec![
                 "another-module".to_string(),
                 "other-module".to_string(),
@@ -14685,7 +14886,7 @@ INHERITED FLAGS
             },
         )
         .unwrap();
-        let report = build_self_report(&paths);
+        let report = build_self_report(&paths, false);
         assert_eq!(report.bound_holder, None);
         assert_eq!(report.agent_binding, Some(binding.clone()));
         assert_eq!(report.last_seam_refusal, None);
@@ -14702,7 +14903,7 @@ INHERITED FLAGS
             },
         )
         .unwrap();
-        let report = build_self_report(&paths);
+        let report = build_self_report(&paths, false);
         assert_eq!(
             report.bound_holder.as_deref(),
             Some(ROUTING_HOLDER_MODULE_ID)
@@ -14860,9 +15061,10 @@ INHERITED FLAGS
             Classification::Governed { tuple, .. } if tuple == "issue comment"
         ));
 
-        let report: Value =
-            serde_json::from_str(&render_self_report(&paths).expect("self report serialization"))
-                .expect("self report JSON");
+        let report: Value = serde_json::from_str(
+            &render_self_report(&paths, false).expect("self report serialization"),
+        )
+        .expect("self report JSON");
         assert_eq!(
             report["cached_manifest"]["issued_at_unix_secs"],
             FIXTURE_ISSUED_AT - 2_000_000
@@ -15229,7 +15431,7 @@ INHERITED FLAGS
             ]
         );
         // That rollback is also visible through the --status document.
-        let document = render_self_report(&paths).expect("self report");
+        let document = render_self_report(&paths, false).expect("self report");
         assert!(document.contains(SelfReportDiagnostic::ManifestRollback.as_str()));
 
         // Re-presenting the newest accepted version is not a rollback.
@@ -15426,7 +15628,7 @@ INHERITED FLAGS
         assert_eq!(versions, BTreeSet::from([11, 12]));
 
         // The self-report reflects the retained count and directory.
-        let document = render_self_report(&paths).expect("self report");
+        let document = render_self_report(&paths, false).expect("self report");
         let value: Value = serde_json::from_str(&document).expect("self report JSON");
         assert_eq!(value["manifests_retained"], json!(2));
         assert_eq!(
@@ -16012,7 +16214,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16061,7 +16263,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16165,7 +16367,7 @@ INHERITED FLAGS
         #[cfg(not(windows))]
         assert_eq!(last_probe.outcome, "unreachable");
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         #[cfg(windows)]
@@ -16216,7 +16418,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16266,7 +16468,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16316,7 +16518,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16367,7 +16569,7 @@ INHERITED FLAGS
             )
         );
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16417,7 +16619,7 @@ INHERITED FLAGS
         assert_eq!(last_probe.outcome, "timed_out");
         assert!(last_probe.elapsed_ms >= 2000);
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
@@ -16466,7 +16668,7 @@ INHERITED FLAGS
             Some("governance probe timed out after 2000 ms at open_route (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry")
         );
 
-        let report = render_self_report(&paths).expect("self report");
+        let report = render_self_report(&paths, false).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");

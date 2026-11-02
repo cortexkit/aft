@@ -6,6 +6,20 @@ BOTH the signed manifest declares it AND this build's classifier allowlist
 admits it at that manifest version, so a signed artifact alone cannot widen what
 the shim will speak.
 
+## Shim status
+
+`gh --status` prints one JSON document from local shim state, including
+`cached_manifest` and `last_rung`. The audit fields are `bypass_audit_count`
+(the total number of operator-bypass entries) and `bypass_audit_recent`
+(the newest 10 entries, or all entries when fewer exist, with the newest last).
+The summary streams the JSONL file and retains only those 10 entries in memory.
+
+Use `gh --status --audit` to print the full list in the original `bypass_audit`
+field instead of the count and recent entries. Both forms preserve each audit
+entry's fields. If the audit file is missing, unreadable or corrupt,
+`bypass_audit_error` describes the failure and the corresponding audit fields
+are `null`, not a zero count or an empty list. A readable empty file has count 0.
+
 ## Authority classes
 
 | Class | Tier | Identity the call runs under | Behavior |
