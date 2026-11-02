@@ -622,15 +622,6 @@ pub fn extract(
         .iter()
         .filter_map(|i| i.namespace_import.as_deref())
         .collect::<HashSet<_>>();
-    let python_bound_calls = if language == "python" {
-        parse
-            .python_bindings
-            .iter()
-            .map(|binding| (binding.byte_start, binding.byte_end))
-            .collect::<HashSet<_>>()
-    } else {
-        HashSet::new()
-    };
     for (reference, target) in references.into_iter().zip(targets) {
         let Some(call) = target.map(|i| calls[i]) else {
             continue;
@@ -658,13 +649,6 @@ pub fn extract(
         });
         // Java method invocations carry their receiver on the invocation itself.
         let receiver_node = receiver_node.or_else(|| field(call, &["object"]));
-        // Bare Python calls already have lexical binding decisions, including
-        // rejected shadowed names. Method dispatch must not overturn them.
-        if receiver_node.is_none()
-            && python_bound_calls.contains(&(reference.byte_start, reference.byte_end))
-        {
-            continue;
-        }
         if !dynamic && receiver_node.is_none() {
             // Token-tree calls already extracted by calls.rs have no receiver
             // expression in the outer syntax tree. Retain the written member

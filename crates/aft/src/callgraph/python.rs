@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
-/// A lexically selected binding for one call. An absent target means a local binding
-/// shadows an import, so resolution must not fall back to a same-named function.
+/// A lexically selected binding for one call. A missing target forbids name-based
+/// fallback when a local name shadows an import or a declaration is ambiguous.
 /// An empty target module names a declaration in the current file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CallBinding {

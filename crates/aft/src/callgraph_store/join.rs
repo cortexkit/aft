@@ -1833,12 +1833,15 @@ impl ViewBindingDependencies {
 /// Inputs that determine a reference's target, excluding call-site identity.
 /// Rust qualified imports are visible only after their declaration; the count
 /// of visible imports identifies that monotone prefix even across nested uses.
+/// Python calls include the selected lexical target or an explicit unresolved binding.
 #[derive(Hash, PartialEq, Eq)]
 struct ViewResolutionBinding {
     kind: String,
     full_ref: Option<String>,
     short_name: Option<String>,
     visible_rust_imports: usize,
+    // Distinguish no lexical binding from a binding that explicitly rejects resolution.
+    python_binding: Option<Option<(String, String)>>,
 }
 
 impl ViewResolutionBinding {
@@ -1847,6 +1850,17 @@ impl ViewResolutionBinding {
             kind: raw.kind.clone(),
             full_ref: raw.full_ref.clone(),
             short_name: raw.short_name.clone(),
+            python_binding: if caller.lang == LangId::Python {
+                caller
+                    .python_bindings
+                    .binary_search_by_key(&(raw.byte_start, raw.byte_end), |binding| {
+                        (binding.byte_start, binding.byte_end)
+                    })
+                    .ok()
+                    .map(|position| caller.python_bindings[position].target.clone())
+            } else {
+                None
+            },
             visible_rust_imports: if caller.lang == LangId::Rust {
                 caller
                     .import_block

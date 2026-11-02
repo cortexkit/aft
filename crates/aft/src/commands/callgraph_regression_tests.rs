@@ -272,6 +272,29 @@ fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
 }
 
 #[test]
+fn callgraph_python_view_memo_separates_local_imports_and_shadows() {
+    let (_temp, store) = fixture(&[
+        ("one.py", "def target():\n    pass\n"),
+        ("two.py", "def target():\n    pass\n"),
+        ("calls.py", "def first():\n    from one import target as pick\n    pick()\ndef second():\n    from two import target as pick\n    pick()\ndef shadow(pick):\n    pick()\n"),
+    ]);
+    for (file, caller) in [("one.py", "first"), ("two.py", "second")] {
+        let sites = store.direct_callers_of(Path::new(file), "target").unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].caller.symbol, caller);
+    }
+    assert_python_view_answers(
+        &store,
+        &[("one.py", "target"), ("two.py", "target")],
+        &[
+            ("calls.py", "first"),
+            ("calls.py", "second"),
+            ("calls.py", "shadow"),
+        ],
+    );
+}
+
+#[test]
 fn callgraph_python_definition_headers_use_defining_scope() {
     let (_temp, store) = fixture(&[
         ("mod.py", "def factory():\n    pass\n"),

@@ -32683,6 +32683,25 @@ edition = "2021"
     }
 
     #[test]
+    fn callgraph_python_receiver_header_dispatch_keeps_defining_caller() {
+        let blob = join::CallgraphBlob::extract(
+            "class Builder:\n    def make(self): pass\nbuilder = Builder()\ndef outer():\n    def inner(value=builder.make()):\n        builder.make()\n",
+            "python", "fixture",
+        ).unwrap();
+        let join::CallgraphBlob::Parse(parse) = blob else {
+            panic!("expected parse blob")
+        };
+        let sites = parse
+            .dispatch
+            .sites
+            .iter()
+            .filter(|site| site.member.as_deref() == Some("make"))
+            .map(|site| (site.caller.as_deref(), site.line))
+            .collect::<Vec<_>>();
+        assert_eq!(sites, [(Some("outer"), 5), (Some("inner"), 6)]);
+    }
+
+    #[test]
     fn callgraph_python_reexports_headers_and_constructors_match_manifest_view() {
         let dir = tempdir().unwrap();
         let root = crate::inspect::job::canonicalize_normalized(dir.path());
