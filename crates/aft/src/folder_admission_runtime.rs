@@ -279,6 +279,10 @@ fn timeout_cache(
 
 fn override_cache(root: &Path, mode: crate::folder_admission::DetectionMode) -> Option<Cache> {
     let decision = crate::folder_admission::override_decision(root, mode)?;
+    // User intent replaces evidence collection, not root-path validation.
+    if !root.is_dir() {
+        return None;
+    }
     Some(Cache {
         relative_paths: false,
         policy: mode_policy(mode),
@@ -1855,6 +1859,21 @@ pub(crate) fn artifacts_admitted(ctx: &AppContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_decisions_still_require_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for mode in [
+            crate::folder_admission::DetectionMode::Project,
+            crate::folder_admission::DetectionMode::Off,
+        ] {
+            assert!(override_cache(root.path(), mode).is_some());
+            assert!(override_cache(&file, mode).is_none());
+            assert!(override_cache(&root.path().join("missing"), mode).is_none());
+        }
+    }
 
     #[test]
     fn incomplete_retry_backoff_is_bounded_and_never_busy_spins() {
