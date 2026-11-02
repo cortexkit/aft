@@ -10167,10 +10167,18 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     // Inspect certifies the live result before its detached cache writer finishes.
     // A restart can restore only the record whose atomic write has completed.
     let record = wait_for_completed_rust_check(&storage, 0, || {}).unwrap();
+    println!(
+        "real restart: saved clean check {}",
+        fs::read_to_string(&record).unwrap()
+    );
     drop(ctx);
     let ctx = new_context();
     let started = std::time::Instant::now();
     let cold = scoped_diagnostics_inspect(&ctx, "saved-cold", "src");
+    println!(
+        "real restart: cold inspect {} ms: {cold:#}",
+        started.elapsed().as_millis()
+    );
     assert!(
         cold["text"]
             .as_str()
@@ -10230,15 +10238,20 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         }
         assert!(std::time::Instant::now() < deadline, "{response:#}");
     };
-    wait_for_completed_rust_check(
+    let error_record = wait_for_completed_rust_check(
         &storage,
         errors["summary"]["diagnostics"]["errors"].as_u64().unwrap(),
         || {},
     )
     .unwrap();
+    println!(
+        "real restart: saved errors {}",
+        fs::read_to_string(error_record).unwrap()
+    );
     drop(ctx);
     let ctx = new_context();
     let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
+    println!("real restart: restored errors: {restored_errors:#}");
     assert!(
         restored_errors["text"]
             .as_str()
