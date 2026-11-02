@@ -14,6 +14,10 @@ export interface BashPermissionAsk {
 export const BASH_PERMISSION_NOT_SETTLED =
   "bash permission not settled after {rounds} rounds: still asking for {kind} {path} (operation: {operation}; granted already: {granted})";
 
+// Approved by Ufuk: explain that a host refusal applies to the whole shell command.
+export const BASH_PERMISSION_DENIED =
+  "Permission denied for this shell command: {parts} ({host reason}). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.";
+
 export class BashPermissionLoopError extends Error {}
 
 export function bashPermissionRetryGrants(ask: BashPermissionAsk): string[] {
@@ -43,6 +47,15 @@ export function escalationAskText(ask: BashPermissionAsk): string {
   return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
 }
 
+function permissionAskPath(ask: BashPermissionAsk): string {
+  const paths = ask.patterns?.length ? ask.patterns : bashPermissionRetryGrants(ask);
+  return ask.kind === "escalation" && ask.command
+    ? `${ask.command}${ask.cwd ? ` @ ${ask.cwd}` : ""}`
+    : paths.length
+      ? paths.join(", ")
+      : "<no asks returned>";
+}
+
 /** Hosts provide approval UI; this helper passes approved grants to retries and limits rounds. */
 export async function withBashPermissionLoop(options: {
   request: (granted: readonly string[]) => Promise<Record<string, unknown>>;
@@ -68,33 +81,33 @@ export async function withBashPermissionLoop(options: {
         already_granted: alreadyGranted(ask),
       })),
     });
-    const unsettled = (cause?: unknown) => {
+    const unsettled = () => {
       const message = (asks.length ? asks : [{}])
         .map((ask) => {
-          const paths = ask.patterns?.length ? ask.patterns : bashPermissionRetryGrants(ask);
-          const path =
-            ask.kind === "escalation" && ask.command
-              ? `${ask.command}${ask.cwd ? ` @ ${ask.cwd}` : ""}`
-              : paths.length
-                ? paths.join(", ")
-                : "<no asks returned>";
           return BASH_PERMISSION_NOT_SETTLED.replace("{rounds}", String(round))
             .replace("{kind}", ask.kind ?? "unknown")
             .replace("{operation}", ask.operation ?? options.operation ?? "bash")
             .replace("{granted}", alreadyGranted(ask) ? "yes" : "no")
-            .replace("{path}", () => path);
+            .replace("{path}", () => permissionAskPath(ask));
         })
         .join("; ");
-      return new BashPermissionLoopError(
-        cause instanceof Error ? `${message}: ${cause.message}` : message,
-        { cause },
-      );
+      return new BashPermissionLoopError(message);
     };
     if (asks.length === 0 || asks.every(alreadyGranted) || round >= 8) throw unsettled();
+    const pendingAsks = asks.filter((ask) => !alreadyGranted(ask));
     try {
-      await options.approve(asks.filter((ask) => !alreadyGranted(ask)));
+      await options.approve(pendingAsks);
     } catch (error) {
-      throw unsettled(error);
+      const parts = pendingAsks.map(permissionAskPath).join(", ");
+      const reason =
+        error instanceof Error && error.message ? error.message : "no host reason provided";
+      throw new BashPermissionLoopError(
+        BASH_PERMISSION_DENIED.replace("{parts}", () => parts).replace(
+          "{host reason}",
+          () => reason,
+        ),
+        { cause: error },
+      );
     }
     for (const ask of asks) {
       for (const grant of bashPermissionRetryGrants(ask)) granted.add(grant);

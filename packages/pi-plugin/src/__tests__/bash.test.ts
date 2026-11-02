@@ -1887,6 +1887,46 @@ describe("bash tool adapter", () => {
     });
   });
 
+  test("permission loop reports host escalation refusal and preserves the denial code without retrying", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const command = "mkdir -p x && rm -rf x";
+    const { bridge, calls } = makeTrackableMockBridge({
+      success: false,
+      code: "permission_required",
+      asks: [
+        {
+          kind: "escalation",
+          command,
+          cwd: projectRoot,
+          grant_id: "esc_denied",
+        },
+      ],
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    let approvals = 0;
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          approvals++;
+          return false;
+        },
+      },
+    };
+    const error = await tools
+      .get("bash")!
+      .execute("denied", { command, sandbox: "host" }, undefined, undefined, extCtx)
+      .catch((error) => error);
+    expect(error).toBeInstanceOf(BridgeError);
+    expect(error.message).toBe(
+      `Permission denied for this shell command: mkdir -p x && rm -rf x @ ${projectRoot} (Permission denied: unsandboxed host execution was denied.). The parts are checked together, so one denied part denies the whole command; run the allowed parts in a separate call.`,
+    );
+    expect(error.code).toBe("permission_denied");
+    expect(calls).toHaveLength(1);
+    expect(approvals).toBe(1);
+  });
+
   test("permission loop stops early and names an already granted ask", async () => {
     const tools = new Map<string, MockToolDef>();
     let calls = 0;
