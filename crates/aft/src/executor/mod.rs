@@ -1642,6 +1642,27 @@ impl Executor {
         job: ExecutorJob,
         cancellation: JobCancellation,
     ) -> oneshot::Receiver<Response> {
+        // Views build on their own maintenance-heavy job. Graph reads must not
+        // hold or wait for that job's heavy permit, even in a one-permit pool.
+        let lane = if lane == Lane::HeavyInit
+            && matches!(
+                tool,
+                "callgraph"
+                    | "callers"
+                    | "call_tree"
+                    | "impact"
+                    | "trace_to"
+                    | "trace_to_symbol"
+                    | "trace_data"
+            )
+            && self
+                .actor_context(&root_id)
+                .is_some_and(|ctx| ctx.callgraph_views_enabled())
+        {
+            Lane::PureRead
+        } else {
+            lane
+        };
         let (completion_tx, completion_rx) = oneshot::channel();
         self.submit_labeled(
             root_id,

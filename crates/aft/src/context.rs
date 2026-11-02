@@ -13053,6 +13053,10 @@ impl AppContext {
         executor: crate::executor::RootMaintenanceExecutor,
     ) {
         *self.callgraph_executor.lock() = Some(executor);
+        let retired = self.callgraph_view.lock().take();
+        if let Some(view) = retired {
+            view.shutdown();
+        }
     }
 
     fn cancel_callgraph_acquisition(&self) {

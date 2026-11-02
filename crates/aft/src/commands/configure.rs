@@ -15419,7 +15419,15 @@ mod tests {
             },
         ));
         let _executor = daemon.then(|| {
-            let executor = crate::executor::Executor::new();
+            let executor = Arc::new(crate::executor::Executor::with_config(
+                crate::executor::ExecutorConfig {
+                    pool_size: 3,
+                    actor_cap: 2,
+                    read_cap: 2,
+                    heavy_permits: 1,
+                    drr_quantum: 1,
+                },
+            ));
             executor.register_actor(
                 crate::path_identity::ProjectRootId::from_path(&root).unwrap(),
                 ctx.clone(),
@@ -15474,13 +15482,38 @@ mod tests {
             let worker_ctx = ctx.clone();
             let request = request.clone();
             let answer_tx = answer_tx.clone();
+            let executor = _executor.clone();
+            let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
             std::thread::spawn(move || {
-                let _pin = worker_ctx.pin_config();
                 let started = Instant::now();
-                let response = if request.command == "zoom" {
-                    crate::commands::zoom::handle_zoom(&request, &worker_ctx)
+                let id = request.id.clone();
+                let zoom = request.command == "zoom";
+                let run = move |ctx: &AppContext| {
+                    let _pin = ctx.pin_config();
+                    if zoom {
+                        crate::commands::zoom::handle_zoom(&request, ctx)
+                    } else {
+                        crate::commands::callers::handle_callers(&request, ctx)
+                    }
+                };
+                let response = if let Some(executor) = executor {
+                    executor
+                        .submit_tool_call_with_cancellation_async(
+                            root_id,
+                            if zoom {
+                                crate::executor::Lane::PureRead
+                            } else {
+                                crate::executor::Lane::HeavyInit
+                            },
+                            id,
+                            if zoom { "zoom" } else { "callgraph" },
+                            Box::new(run),
+                            crate::executor::JobCancellation::new(),
+                        )
+                        .blocking_recv()
+                        .unwrap()
                 } else {
-                    crate::commands::callers::handle_callers(&request, &worker_ctx)
+                    run(&worker_ctx)
                 };
                 answer_tx.send((started.elapsed(), response)).unwrap();
             })
@@ -15550,7 +15583,11 @@ mod tests {
         assert_callgraph_views_rematerialization_bounded("zoom", true);
     }
 
-    fn assert_callgraph_acquisition_lifecycle(daemon: bool, stop_executor: bool) {
+    fn assert_callgraph_acquisition_lifecycle(
+        daemon: bool,
+        stop_executor: bool,
+        late_register: bool,
+    ) {
         use crate::executor::{Executor, ExecutorConfig, Lane};
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
@@ -15581,7 +15618,7 @@ mod tests {
                 drr_quantum: 1,
             })
         });
-        if let Some(executor) = &executor {
+        if let Some(executor) = executor.as_ref().filter(|_| !late_register) {
             executor.register_actor(root_id.clone(), ctx.clone());
         }
         assert!(
@@ -15594,6 +15631,9 @@ mod tests {
         }))
         .unwrap();
         assert!(crate::commands::callers::handle_callers(&request, &ctx).success);
+        if let Some(executor) = executor.as_ref().filter(|_| late_register) {
+            executor.register_actor(root_id.clone(), ctx.clone());
+        }
         let family = crate::search_index::artifact_cache_key(&root);
         let directory = crate::blob_store::v3::view_dir(
             &storage,
@@ -15679,8 +15719,16 @@ mod tests {
                 .recv_timeout(Duration::from_millis(500))
         });
         let accounted = executor.as_ref().map(|executor| {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let jobs = loop {
+                let jobs = executor.try_root_job_snapshots(&root_id, None);
+                if jobs.is_some() || Instant::now() >= deadline {
+                    break jobs;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
             (
-                executor.try_root_job_snapshots(&root_id, None),
+                jobs,
                 executor
                     .try_dispatch_liveness_snapshot()
                     .unwrap()
@@ -15778,17 +15826,22 @@ mod tests {
 
     #[test]
     fn callgraph_views_acquisition_quiesce_fences_publication_and_preserves_reads() {
-        assert_callgraph_acquisition_lifecycle(true, false);
+        assert_callgraph_acquisition_lifecycle(true, false, false);
     }
 
     #[test]
     fn callgraph_views_acquisition_standalone_shutdown_releases_protection() {
-        assert_callgraph_acquisition_lifecycle(false, false);
+        assert_callgraph_acquisition_lifecycle(false, false, false);
     }
 
     #[test]
     fn callgraph_views_acquisition_executor_shutdown_drains_protection() {
-        assert_callgraph_acquisition_lifecycle(true, true);
+        assert_callgraph_acquisition_lifecycle(true, true, false);
+    }
+
+    #[test]
+    fn callgraph_views_acquisition_adopts_executor_after_standalone_warmup() {
+        assert_callgraph_acquisition_lifecycle(true, false, true);
     }
 
     #[test]
