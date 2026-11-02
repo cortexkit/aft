@@ -10781,6 +10781,12 @@ async fn hold_for_consent(
             return Some((response, text));
         }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
+        // A held RESPONSE ends the original REQUEST (tool-provider CONTRACT.md
+        // §4.4). If the call is approved later, its result is delivered as a
+        // separate late result, so this request must send no more keepalives.
+        if let Some(progress) = &plain_run.progress {
+            progress.close();
+        }
         if send_reliable_writer_frame(writer, metrics, frame, "permission hold")
             .await
             .is_err()
@@ -11777,6 +11783,7 @@ async fn handle_tool_call_with_capabilities(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                keepalive: progress.clone(),
                 speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
@@ -11840,6 +11847,7 @@ async fn handle_tool_call_with_capabilities(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            keepalive: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
@@ -17477,6 +17485,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        keepalive: None,
                         speech_seed: None,
                         run_scope: None,
                         scope: None,
@@ -22112,7 +22121,21 @@ mod tests {
                 );
                 let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
-                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                // The standing pass may still be writing aft.db. A busy probe
+                // reschedules the retry, so drive its zero-delay attempts until
+                // the retry disarms, as the module loop does on later ticks.
+                let retry_deadline = Instant::now() + Duration::from_secs(10);
+                while ctx.provisional_identity_retry().is_armed() {
+                    crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "identity retry did not finish: {:?}",
+                        ctx.degraded_reasons()
+                    );
+                    if ctx.provisional_identity_retry().is_armed() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 assert!(
                     ctx.artifact_identity_provisional_reason().is_none(),
                     "{:?}",

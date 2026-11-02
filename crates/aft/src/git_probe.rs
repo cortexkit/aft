@@ -5,9 +5,9 @@
 //! module only decides which failures may be treated as certain absence.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureKind {
@@ -42,6 +42,60 @@ pub(crate) fn command() -> Command {
         }
     });
     builder.build()
+}
+
+/// Preserve the probes' ordinary output and unbounded wait, while observing the
+/// child on the calling thread. No new timeout or cancellation policy is added.
+pub(crate) fn supervised_output(command: &mut Command) -> io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (closed, events) = std::sync::mpsc::channel();
+    let drain = |mut pipe: Box<dyn Read + Send>, closed: std::sync::mpsc::Sender<()>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let _ = closed.send(());
+            result
+        })
+    };
+    let stdout = drain(Box::new(stdout), closed.clone());
+    let stderr = drain(Box::new(stderr), closed);
+    let mut pipes = 2;
+    let mut exit_poll = std::time::Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        // tool-provider CONTRACT.md §4.4: supervision is work even when Git
+        // is silent. A stuck try_wait cannot emit from a separate timer.
+        crate::run_tool_call::progress::report();
+        let pause = std::time::Duration::from_millis(50);
+        if pipes > 0 {
+            match events.recv_timeout(pause) {
+                Ok(()) => pipes -= 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => pipes = 0,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else {
+            std::thread::sleep(exit_poll);
+            exit_poll = (exit_poll * 2).min(pause);
+        }
+    };
+    let joined = |thread: std::thread::JoinHandle<io::Result<Vec<u8>>>| {
+        thread
+            .join()
+            .map_err(|_| io::Error::other("Git output reader panicked"))?
+    };
+    Ok(Output {
+        status,
+        stdout: joined(stdout)?,
+        stderr: joined(stderr)?,
+    })
 }
 
 /// `git rev-parse --show-toplevel`, run with `-C root` from AFT's own working
@@ -132,7 +186,7 @@ impl<'a> Probe<'a> {
                 crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON,
             ));
         }
-        let output = self.command().args(args).output()?;
+        let output = supervised_output(self.command().args(args))?;
         self.spawned += 1;
         Ok(output)
     }
@@ -633,6 +687,52 @@ pub(crate) fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn call_keepalive_git_probe_supervises_quiet_child_without_changing_output() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        struct Release(PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "");
+            }
+        }
+        let release = Release(dir.path().join("release"));
+        let clock = Arc::new(AtomicU64::new(0));
+        let (tx, pushes) = std::sync::mpsc::channel();
+        let origin = Instant::now();
+        let token = crate::executor::JobCancellation::new();
+        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+            {
+                let clock = clock.clone();
+                move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))
+            },
+            move |_| tx.send(()).is_ok(),
+        ));
+        let root = dir.path().to_owned();
+        let work = std::thread::spawn(move || {
+            let _token = crate::executor::install_job_cancellation(token);
+            supervised_output(Command::new("sh").current_dir(root).args([
+                "-c",
+                "while [ ! -f release ]; do sleep 0.02; done; printf out; printf err >&2; exit 7",
+            ]))
+        });
+        for at in [30_000, 60_000, 90_000, 120_000] {
+            clock.store(at, Ordering::SeqCst);
+            pushes
+                .recv_timeout(Duration::from_secs(5))
+                .expect("quiet Git child is supervised");
+        }
+        drop(release);
+        let result = work.join().unwrap().unwrap();
+        assert_eq!(result.status.code(), Some(7));
+        assert_eq!(result.stdout, b"out");
+        assert_eq!(result.stderr, b"err");
+    }
+
     use super::*;
 
     fn failure_kind(result: Result<Vec<u8>, ProbeError>) -> FailureKind {

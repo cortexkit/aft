@@ -457,6 +457,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal Landlock read-grant snapshot; tasks beyond the 500-entry budget stay unreadable without a broader grant, not an agent-visible list",
     },
     ExclusionEntry {
+        file: "gh_shim.rs",
+        enclosing_item: "summarize_bypass_audit",
+        location_or_primitive: "BYPASS_AUDIT_RECENT_LIMIT (10), VecDeque::pop_front",
+        reason: "gh --status audit preview, not an AFT tool result list; bypass_audit_count discloses the exact total and --status --audit returns the full audit",
+    },
+    ExclusionEntry {
         file: "gh_shim/read_contract.rs",
         enclosing_item: "validate, validate_path",
         location_or_primitive: "MAX_REPLY_BYTES job ranges and per_page <= 100",

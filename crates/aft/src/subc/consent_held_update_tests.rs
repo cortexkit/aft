@@ -327,3 +327,68 @@ async fn classic_runner_consent_completion_is_slim_after_writer_projection() {
         assert!(!delivered.to_string().contains("display-only line"));
     }
 }
+
+#[tokio::test]
+async fn plain_consent_held_reply_closes_keepalive_before_approved_rerun() {
+    static REPORTED_RERUNS: AtomicU64 = AtomicU64::new(0);
+    fn progressing_read(request: RawRequest, ctx: &AppContext) -> Response {
+        let response = read_dispatch(request, ctx);
+        if response.success {
+            crate::run_tool_call::progress::report();
+            REPORTED_RERUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        response
+    }
+
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for held_reply in [false, true] {
+        REPORTED_RERUNS.store(0, Ordering::SeqCst);
+        let f = fixture(FakeCingulate::up());
+        let controlled = Controlled::install(f.fake.clone());
+        let mut caller = if held_reply {
+            program(&f, false, "run:keepalive-held")
+        } else {
+            identity(&f.worker.project_root, f.worker.scope.clone())
+        };
+        Arc::get_mut(&mut caller.0).unwrap().call_keepalive = true;
+        let clock = crate::subc::keepalive::TestClock::new();
+        let path = f.dir.path().join("elsewhere.txt");
+        let mut replies = f.send_with(&caller, &path, clock.corr, progressing_read).await;
+        if held_reply {
+            held(&mut replies).await;
+        }
+        let request = controlled.request(0).await;
+        clock.now.store(60_000, Ordering::SeqCst);
+        controlled.answer(&request, "allow_once");
+
+        if held_reply {
+            let result = late(&f, &caller, clock.corr).await;
+            assert_ne!(result["isError"], true, "{result}");
+            assert!(text(&result).contains("unheld contents"), "{result}");
+            // Rerun PUSHes are forwarded before the later result is recorded,
+            // so any rerun keepalive has reached replies by now.
+            let mut keepalives = 0;
+            while let Ok(frame) = replies.try_recv() {
+                assert_eq!(frame.header.corr, clock.corr);
+                if frame.header.ty == FrameType::Push {
+                    assert_eq!(frame.body, br#"{"kind":"keepalive"}"#);
+                    keepalives += 1;
+                }
+            }
+            assert_eq!(keepalives, 0, "held RESPONSE ended the original request");
+        } else {
+            // A consent wait without a held first reply still has an
+            // outstanding REQUEST and must retain its progress channel.
+            let push = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(push.header.corr, clock.corr);
+            assert_eq!(push.header.ty, FrameType::Push);
+            assert_eq!(push.body, br#"{"kind":"keepalive"}"#);
+            let terminal = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(terminal.header.ty, FrameType::Response);
+            assert!(text(&serde_json::from_slice(&terminal.body).unwrap()).contains("unheld contents"));
+        }
+        assert_eq!(REPORTED_RERUNS.load(Ordering::SeqCst), 1);
+    }
+}

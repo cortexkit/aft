@@ -1769,19 +1769,37 @@ mod tests {
         let main_dir = crate::blob_store::v3::view_dir(&storage, family, &scope).unwrap();
         assert!(main_dir.exists());
         drop(borrowed);
-        // Resident-reader teardown writes its session end asynchronously. The
-        // clock stays fixed while the sweep waits for that actual hold to go.
+        // Session teardown needs the same reservation lock as eviction. Poll
+        // read-only so repeated sweeps cannot starve the asynchronous cleanup.
+        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        while main_dir.exists() {
-            let report = sweep();
-            assert!(report.errors.is_empty(), "{report:?}");
+        loop {
+            let sessions: u64 = ledger
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT COUNT(*) FROM view_sessions WHERE scope=?1",
+                        [&scope],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            if sessions == 0 {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "main checkout stayed held: {report:?}"
+                "main checkout session stayed held: scope={scope}, sessions={sessions}"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let ledger = crate::blob_store::v3::LedgerReader::open_existing(&storage, family).unwrap();
+        // Keep the original idle clock: once the real holds end, one sweep
+        // must remove main while the worker still retains the shared base.
+        let released = sweep();
+        assert!(released.errors.is_empty(), "{released:?}");
+        assert!(
+            !main_dir.exists(),
+            "main checkout stayed held: {released:?}"
+        );
         let bases: Vec<String> = ledger
             .read(|connection| {
                 Ok(connection
