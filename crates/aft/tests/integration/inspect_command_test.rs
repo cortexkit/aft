@@ -6123,7 +6123,17 @@ fn scoped_rust_inspect_retains_compiler_error_when_reopening_unchanged_file() {
             "compiler result missing after {id}: {response:#}"
         );
         assert!(!ctx.lsp().document_is_open_for_test(&lib));
+        wait_for_close_reply(&ctx);
     }
+
+    fs::write(&lib, "pub fn f() {}\n").unwrap();
+    let changed = scoped_diagnostics_inspect(&ctx, "compiler-after-content-change", "src/lib.rs");
+    assert!(
+        !diagnostic_messages_for(&changed, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "an old compiler push must not borrow the changed file's pull proof: {changed:#}"
+    );
 }
 
 /// Pulls are sent several files at a time and then waited for in turn; each
