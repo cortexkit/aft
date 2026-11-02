@@ -230,7 +230,34 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tool-views-check");
         std::fs::create_dir_all(&dir).unwrap();
         for (index, (pin, entry)) in SHIPPED.iter().enumerate() {
-            std::fs::write(dir.join(format!("{index}.json")), serde_json::to_vec(&json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":[{"input":{}}]})).unwrap()).unwrap();
+            let input = match entry.tool.name.as_str() {
+                "bash" => json!({"command":"printf ok"}),
+                "edit" => {
+                    json!({"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]})
+                }
+                "write" => json!({"path":"src/a.rs","content":"new\n"}),
+                "apply_patch" => {
+                    json!({"patchText":"*** Begin Patch\n*** Add File: src/a.rs\n+new\n*** End Patch"})
+                }
+                _ => unreachable!(),
+            };
+            let (record, completion) = if entry.tool.name == "bash" {
+                (
+                    json!({"durationMs":8,"outcome":"success","phase":"background_started","taskId":"bash-demo1","outputBytes":0,"execution":"local"}),
+                    json!({"outcome":"success","phase":"background_finished","taskId":"bash-demo1","exitCode":0,"runDurationMs":2400,"outputBytes":3,"endReason":"exited","execution":"local"}),
+                )
+            } else {
+                (
+                    json!({"durationMs":1,"outcome":"held","reason":"consent"}),
+                    json!({"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"}),
+                )
+            };
+            let document = json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":[{"input":input,"record":record,"completion":completion}]});
+            std::fs::write(
+                dir.join(format!("{index}.json")),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
         }
     }
 }
