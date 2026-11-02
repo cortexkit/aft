@@ -58,6 +58,7 @@ fn tool_result_error_code_is_preserved_or_falls_back() {
 
 fn opted_in(trust: BindTrust) -> wire::ToolResponsePolicy {
     wire::ToolResponsePolicy {
+        output_scope: None,
         trust,
         tool_result_body: true,
         model_only: false,
@@ -894,6 +895,7 @@ fn tool_result_retained_legacy_replies_use_the_current_route() {
             let outgoing = wire::WriterFrame::retained_tool_response(
                 frame,
                 wire::ToolResponsePolicy {
+                    output_scope: None,
                     trust,
                     tool_result_body: enabled,
                     model_only: false,
@@ -1501,6 +1503,7 @@ fn tool_result_retention_is_bounded_trust_independent_and_keeps_legacy_view() {
                 trust: BindTrust::FirstParty,
                 tool_result_body: false,
                 model_only: false,
+                output_scope: None,
             },
             None,
             Some(vec![0xff])

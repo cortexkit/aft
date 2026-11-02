@@ -580,19 +580,19 @@ mod tests {
             params: json!({"file":path, "start_line":2,"end_line":2}),
         };
         let response = crate::context::confinement::with_root(&ctx, "read-cap", || {
-            Ok(crate::commands::read::handle(&request("owner"), &ctx))
+            Ok(crate::commands::read::handle_read(&request("owner"), &ctx))
         })
         .unwrap();
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["content"], "2: second\n");
-        let foreign = crate::commands::read::handle(&request("foreign"), &ctx);
+        let foreign = crate::commands::read::handle_read(&request("foreign"), &ctx);
         assert!(!foreign.success, "{foreign:?}");
         // A second context for the same session can recover a persisted result.
         let restored = context(&root, &temp.path().join("store"));
-        let restored_read = crate::commands::read::handle(&request("owner"), &restored);
+        let restored_read = crate::commands::read::handle_read(&request("owner"), &restored);
         assert!(restored_read.success, "{restored_read:?}");
         assert_eq!(restored_read.data["content"], "2: second\n");
-        assert!(!crate::commands::read::handle(&request("foreign"), &restored).success);
+        assert!(!crate::commands::read::handle_read(&request("foreign"), &restored).success);
         ctx.with_force_restrict("read-cap", || {
             assert!(ctx
                 .validate_read_path("read-cap", "foreign", &path)
