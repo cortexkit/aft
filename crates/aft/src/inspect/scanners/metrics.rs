@@ -31,6 +31,7 @@ struct CachedFileMetric {
     path: PathBuf,
     language: &'static str,
     loc: usize,
+    skipped_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,18 +91,10 @@ fn run_metrics_scan_with_memo(
     let started = Instant::now();
     memo.reserve_for_scan(job.scope_files.len());
     let progress = crate::run_tool_call::progress::FileProgress::current();
-    let per_file = job
+    let cached_files = job
         .scope_files
         .par_iter()
-        .map(|path| {
-            let cached = memo.get_or_insert_with(path, scan_file);
-            FileMetric {
-                path: cached.path,
-                language: cached.language,
-                symbol_count: cached_symbol_count(path, job),
-                loc: cached.loc,
-            }
-        })
+        .map(|path| memo.get_or_insert_with(path, scan_file))
         .inspect(|_| {
             if let Some(progress) = &progress {
                 progress.finished();
@@ -111,9 +104,29 @@ fn run_metrics_scan_with_memo(
     if job.is_full_project_scope() {
         memo.prune_to_scope(&job.project_root, &job.scope_files);
     }
-    let aggregate = aggregate_metrics(&job.project_root, &per_file);
+    let mut skipped_files = Vec::new();
+    let per_file = cached_files
+        .into_iter()
+        .filter_map(|cached| {
+            if let Some(reason) = cached.skipped_reason {
+                skipped_files.push((
+                    display_path(&job.project_root, &cached.path),
+                    reason.to_string(),
+                ));
+                return None;
+            }
+            Some(FileMetric {
+                symbol_count: cached_symbol_count(&cached.path, job),
+                path: cached.path,
+                language: cached.language,
+                loc: cached.loc,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut aggregate = aggregate_metrics(&job.project_root, &per_file);
+    super::source_text::write_skipped_files(&mut aggregate, skipped_files, None);
     let success = crate::inspect::InspectScanSuccess {
-        scanned_files: job.scope_files.clone(),
+        scanned_files: per_file.iter().map(|file| file.path.clone()).collect(),
         contributions: Vec::new(),
         aggregate,
     };
@@ -126,10 +139,12 @@ fn metrics_memo() -> &'static Tier1FileMemo<CachedFileMetric> {
 }
 
 fn scan_file(path: &Path) -> (Option<FileFreshness>, CachedFileMetric) {
+    let _permit = super::source_text::source_scan_permit();
     let metadata = fs::metadata(path).ok();
-    let bytes = read_file_bytes(path);
+    let (bytes, skipped_reason) = read_file_bytes(path);
     let freshness = metadata
         .as_ref()
+        .filter(|_| skipped_reason.is_none())
         .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
     let loc = bytes.as_deref().map(line_count_bytes).unwrap_or_default();
 
@@ -137,6 +152,7 @@ fn scan_file(path: &Path) -> (Option<FileFreshness>, CachedFileMetric) {
         path: path.to_path_buf(),
         language: language_key(path),
         loc,
+        skipped_reason,
     };
     (freshness, metric)
 }
@@ -158,10 +174,17 @@ fn freshness_from_metadata(metadata: &fs::Metadata, bytes: Option<&[u8]>) -> Fil
     }
 }
 
-fn read_file_bytes(path: &Path) -> Option<Vec<u8>> {
-    #[cfg(debug_assertions)]
-    bump_file_read_count(path);
-    crate::project_content::read(path).ok()
+fn read_file_bytes(path: &Path) -> (Option<Vec<u8>>, Option<&'static str>) {
+    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
+    match read_source_bytes(path) {
+        Ok(SourceBytes::Bytes(bytes)) => {
+            #[cfg(debug_assertions)]
+            bump_file_read_count(path);
+            (Some(bytes), None)
+        }
+        Ok(SourceBytes::TooLarge) => (None, Some(TOO_LARGE)),
+        _ => (None, None),
+    }
 }
 
 fn cached_symbol_count(path: &Path, job: &crate::inspect::InspectJob) -> usize {

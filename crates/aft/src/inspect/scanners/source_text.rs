@@ -10,14 +10,103 @@
 //! as the file's cached contribution, so it is not re-read until the file
 //! changes, and a changed file that is now valid UTF-8 is analyzed normally.
 
+use std::io::Read;
 use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+use std::sync::{Condvar, Mutex};
 
 use serde_json::{json, Value};
 
 /// Reason recorded for a file whose bytes are not valid UTF-8.
 pub(crate) const NOT_VALID_UTF8: &str = "not valid UTF-8";
+
+pub(crate) const MAX_SOURCE_BYTES: u64 = crate::search_index::DEFAULT_MAX_FILE_SIZE;
+// This agent-visible reason is pending Ufuk's approval.
+pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
+
+// Reserve a whole maximum-sized input per worker, even for a small file that
+// could grow after stat. Hold the permit through parsing and tree traversal:
+// at most two bounded inputs (2 MiB total) can be processed across these scans.
+static SOURCE_SCANS: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+const MAX_SOURCE_SCANS: usize = 2;
+
+pub(crate) struct SourceScanPermit;
+
+pub(crate) fn source_scan_permit() -> SourceScanPermit {
+    let mut active = SOURCE_SCANS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *active >= MAX_SOURCE_SCANS {
+        active = SOURCE_SCANS
+            .1
+            .wait(active)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    *active += 1;
+    SourceScanPermit
+}
+
+impl Drop for SourceScanPermit {
+    fn drop(&mut self) {
+        let mut active = SOURCE_SCANS.0.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        SOURCE_SCANS.1.notify_one();
+    }
+}
+
+pub(crate) enum SourceBytes {
+    Bytes(Vec<u8>),
+    TooLarge,
+    Vanished,
+}
+
+/// Admit by metadata before opening, then bound the read too: a file can grow
+/// between stat and read. The extra byte detects overflow, never a partial parse.
+pub(crate) fn read_source_bytes(path: &Path) -> std::io::Result<SourceBytes> {
+    if crate::project_content::is_excluded(path) {
+        return Ok(SourceBytes::Vanished);
+    }
+    let read = || -> std::io::Result<SourceBytes> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_SOURCE_BYTES {
+            return Ok(SourceBytes::TooLarge);
+        }
+        let file = crate::project_content::open(path)?;
+        if file.metadata()?.len() > MAX_SOURCE_BYTES {
+            return Ok(SourceBytes::TooLarge);
+        }
+        #[cfg(debug_assertions)]
+        bump_source_read_count(path);
+        let mut bytes = Vec::new();
+        file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut bytes)?;
+        crate::views::io::WORK
+            .content_read_bytes
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(if bytes.len() as u64 > MAX_SOURCE_BYTES {
+            SourceBytes::TooLarge
+        } else {
+            SourceBytes::Bytes(bytes)
+        })
+    };
+    match read() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SourceBytes::Vanished),
+        result => result,
+    }
+}
+
+/// Oversized contributions need metadata for invalidation, not a content hash.
+pub(crate) fn source_freshness(
+    path: &Path,
+) -> std::io::Result<crate::cache_freshness::FileFreshness> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_SOURCE_BYTES {
+        return Ok(crate::cache_freshness::FileFreshness {
+            mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            size: metadata.len(),
+            content_hash: crate::cache_freshness::zero_hash(),
+        });
+    }
+    crate::cache_freshness::collect(path)
+}
 
 /// Most skipped files named in a project-wide aggregate. The total is always
 /// reported in `skipped_files_count`, so a capped list is never mistaken for
@@ -31,6 +120,8 @@ pub(crate) enum SourceText {
     Text(String),
     /// The file was read but is not valid UTF-8; the scanner skips it.
     NotUtf8,
+    /// The file exceeds the source limit and was not parsed.
+    TooLarge,
     /// The file disappeared or is excluded from project source (for example,
     /// internal storage). No contribution, exactly as the next walk will see it.
     Vanished,
@@ -40,18 +131,13 @@ pub(crate) enum SourceText {
 /// example permission denied) are returned unchanged so each scanner keeps
 /// its existing contract for them.
 pub(crate) fn read_source_text(path: &Path) -> std::io::Result<SourceText> {
-    if crate::project_content::is_excluded(path) {
-        return Ok(SourceText::Vanished);
-    }
-    #[cfg(debug_assertions)]
-    bump_source_read_count(path);
-    match crate::project_content::read(path) {
-        Ok(bytes) => Ok(match String::from_utf8(bytes) {
+    match read_source_bytes(path)? {
+        SourceBytes::Bytes(bytes) => Ok(match String::from_utf8(bytes) {
             Ok(text) => SourceText::Text(text),
             Err(_) => SourceText::NotUtf8,
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SourceText::Vanished),
-        Err(error) => Err(error),
+        SourceBytes::TooLarge => Ok(SourceText::TooLarge),
+        SourceBytes::Vanished => Ok(SourceText::Vanished),
     }
 }
 
@@ -116,6 +202,85 @@ pub fn source_read_count_for_debug(path: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_size_limit_is_pinned_and_enforced_before_open() {
+        assert_eq!(MAX_SOURCE_BYTES, 1_048_576);
+        assert_eq!(TOO_LARGE, "over the 1 MiB size limit");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.rs");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        let probe = crate::project_content::Probe::new(dir.path());
+        assert!(matches!(
+            read_source_text(&path).unwrap(),
+            SourceText::TooLarge
+        ));
+        assert!(probe.paths().is_empty());
+        file.set_len(MAX_SOURCE_BYTES).unwrap();
+        assert!(
+            matches!(read_source_bytes(&path).unwrap(), SourceBytes::Bytes(bytes) if bytes.len() as u64 == MAX_SOURCE_BYTES)
+        );
+        assert_eq!(probe.paths(), vec![path]);
+    }
+
+    #[test]
+    fn oversized_sources_are_unopened_named_gaps_in_other_scanners() {
+        use crate::inspect::{InspectCategory, InspectJob, JobKey, JobScope};
+        use std::sync::{Arc, RwLock};
+        let dir = tempfile::tempdir().unwrap();
+        let large = dir.path().join("large.rs");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, "fn small() {}\n").unwrap();
+        let probe = crate::project_content::Probe::new(dir.path());
+        for category in [
+            InspectCategory::Metrics,
+            InspectCategory::Complexity,
+            InspectCategory::Duplicates,
+        ] {
+            let scope = JobScope::for_project(dir.path());
+            let job = InspectJob {
+                job_id: 1,
+                key: JobKey::for_category_scope(category, &scope),
+                category,
+                scope_files: vec![large.clone(), small.clone()],
+                project_root: dir.path().to_path_buf(),
+                inspect_dir: dir.path().join("inspect"),
+                config: Arc::new(crate::config::Config::default()),
+                symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
+                inspect_writer: true,
+                callgraph_writer: true,
+                callgraph_snapshot: None,
+            };
+            let result = match category {
+                InspectCategory::Metrics => super::super::metrics::run_metrics_scan(&job),
+                InspectCategory::Complexity => super::super::complexity::run_complexity_scan(&job),
+                InspectCategory::Duplicates => super::super::duplicates::run_duplicates_scan(&job),
+                _ => unreachable!(),
+            }
+            .outcome
+            .unwrap();
+            assert_eq!(result.scanned_files, vec![small.clone()], "{category:?}");
+            assert_eq!(result.aggregate["complete"], false, "{category:?}");
+            assert_eq!(
+                result.aggregate["skipped_files"],
+                json!([
+                    {"file": "large.rs", "reason": "over the 1 MiB size limit"}
+                ]),
+                "{category:?}"
+            );
+            if category == InspectCategory::Metrics {
+                assert_eq!(result.aggregate["files"], 1);
+            } else {
+                assert_eq!(result.aggregate["scanned_files"], 1);
+            }
+        }
+        assert!(!probe.paths().contains(&large));
+    }
 
     #[test]
     fn invalid_utf8_is_a_skip_and_a_missing_file_is_vanished() {

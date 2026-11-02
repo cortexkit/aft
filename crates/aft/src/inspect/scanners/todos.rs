@@ -41,6 +41,7 @@ struct TodoItem {
 #[derive(Debug, Clone)]
 struct FileScan {
     scanned_file: Option<PathBuf>,
+    skipped: Option<(PathBuf, &'static str)>,
     items: Vec<TodoItem>,
 }
 
@@ -99,9 +100,16 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     }
 
     let mut scanned_files = Vec::new();
+    let mut skipped_files = Vec::new();
     let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
     for scan in per_file {
+        if let Some((path, reason)) = scan.skipped {
+            skipped_files.push((
+                display_file_path(&job.project_root, &path),
+                reason.to_string(),
+            ));
+        }
         let file = scan
             .scanned_file
             .as_ref()
@@ -156,6 +164,7 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
         "drill_down_capped": drill_down_capped,
     });
     excluded.write_into(&mut aggregate);
+    super::source_text::write_skipped_files(&mut aggregate, skipped_files, None);
     let success = InspectScanSuccess {
         scanned_files,
         contributions: Vec::new(),
@@ -169,12 +178,30 @@ fn todos_memo() -> &'static Tier1FileMemo<FileScan> {
 }
 
 fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileScan) {
-    let (freshness, source) = read_text_file(path);
+    // Plain JSON cannot contain comments. Do not open it, even to sniff for a
+    // language; JSON with comments must use a comment-capable extension.
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return (
+            None,
+            FileScan {
+                scanned_file: None,
+                skipped: None,
+                items: Vec::new(),
+            },
+        );
+    }
+    let _permit = super::source_text::source_scan_permit();
+    let (freshness, source, skipped_reason) = read_text_file(path);
     let Some(source) = source else {
         return (
             freshness,
             FileScan {
                 scanned_file: None,
+                skipped: skipped_reason.map(|reason| (path.to_path_buf(), reason)),
                 items: Vec::new(),
             },
         );
@@ -190,6 +217,7 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
         freshness,
         FileScan {
             scanned_file: Some(path.to_path_buf()),
+            skipped: None,
             items,
         },
     )
@@ -520,22 +548,29 @@ fn next_char_len(line: &str, cursor: usize) -> usize {
         .unwrap_or_default()
 }
 
-fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>) {
+fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>, Option<&'static str>) {
+    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
     let metadata = std::fs::metadata(path).ok();
-    #[cfg(debug_assertions)]
-    bump_file_read_count(path);
-    let bytes = crate::project_content::read(path).ok();
+    let bytes = match read_source_bytes(path) {
+        Ok(SourceBytes::Bytes(bytes)) => {
+            #[cfg(debug_assertions)]
+            bump_file_read_count(path);
+            Some(bytes)
+        }
+        Ok(SourceBytes::TooLarge) => return (None, None, Some(TOO_LARGE)),
+        _ => None,
+    };
     let freshness = metadata
         .as_ref()
         .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
 
     let Some(bytes) = bytes else {
-        return (freshness, None);
+        return (freshness, None, None);
     };
     if bytes.contains(&0) {
-        return (freshness, None);
+        return (freshness, None, None);
     }
-    (freshness, String::from_utf8(bytes).ok())
+    (freshness, String::from_utf8(bytes).ok(), None)
 }
 
 fn freshness_from_metadata(metadata: &std::fs::Metadata, bytes: Option<&[u8]>) -> FileFreshness {
@@ -811,6 +846,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn oversized_todo_source_is_unopened_and_is_a_named_gap() {
+        let project = tempfile::tempdir().unwrap();
+        let large = project.path().join("large.rs");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(super::super::source_text::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        let small = project.path().join("small.rs");
+        fs::write(&small, "// TODO: small source still scanned\n").unwrap();
+        let probe = crate::project_content::Probe::new(project.path());
+        let job = todos_job(project.path(), vec![large.clone(), small.clone()]);
+        let memo = Tier1FileMemo::default();
+        for _ in 0..2 {
+            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+            assert_eq!(result.scanned_files, vec![small.clone()]);
+            assert_eq!(result.aggregate["count"], 1);
+            assert_eq!(result.aggregate["complete"], false);
+            assert_eq!(
+                result.aggregate["skipped_files"],
+                serde_json::json!([
+                    {"file": "large.rs", "reason": "over the 1 MiB size limit"}
+                ])
+            );
+        }
+        assert!(!probe.paths().contains(&large));
+        fs::write(&large, "// TODO: now small enough\n").unwrap();
+        let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+        assert_eq!(result.aggregate["count"], 2);
+        assert!(result.aggregate.get("skipped_files").is_none());
+    }
+
+    #[test]
+    fn plain_json_is_unopened_but_jsonc_comments_are_scanned() {
+        let project = tempfile::tempdir().unwrap();
+        let plain = project.path().join("data.json");
+        fs::write(&plain, "{\"value\": \"TODO: not a comment\"}").unwrap();
+        let commented = project.path().join("config.jsonc");
+        fs::write(
+            &commented,
+            "{\n// TODO: keep this comment\n\"value\": 1\n}\n",
+        )
+        .unwrap();
+        let probe = crate::project_content::Probe::new(project.path());
+        let job = todos_job(project.path(), vec![plain.clone(), commented.clone()]);
+        let memo = Tier1FileMemo::default();
+        for _ in 0..2 {
+            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+            assert_eq!(result.scanned_files, vec![commented.clone()]);
+            assert_eq!(result.aggregate["count"], 1);
+            assert_eq!(result.aggregate["items"][0]["file"], "config.jsonc");
+            assert!(result.aggregate.get("skipped_files").is_none());
+            assert_ne!(result.aggregate["complete"], false);
+        }
+        assert!(!probe.paths().contains(&plain));
+        assert!(probe.paths().contains(&commented));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn several_large_todo_files_hold_at_most_two_read_parse_permits() {
+        let project = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let paths = (0..6)
+            .map(|index| {
+                let path = project.path().join(format!("large-{index}.rs"));
+                let mut source = String::from("// TODO: bounded parallel parsing\n");
+                source.extend(std::iter::repeat_n(
+                    ' ',
+                    super::super::source_text::MAX_SOURCE_BYTES as usize - source.len(),
+                ));
+                fs::write(&path, source).unwrap();
+                PARSE_DELAYS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), (entered_tx.clone(), release_rx.clone()));
+                path
+            })
+            .collect();
+        reset_file_read_count_for_debug(project.path());
+        let job = todos_job(project.path(), paths);
+        let worker = std::thread::spawn(move || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .unwrap()
+                .install(|| {
+                    run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
+                        .outcome
+                        .unwrap()
+                })
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        entered_rx.recv_timeout(deadline).unwrap();
+        entered_rx.recv_timeout(deadline).unwrap();
+        let third = entered_rx.recv_timeout(std::time::Duration::from_millis(100));
+        let reads_while_blocked = file_read_count_for_debug(project.path());
+        for _ in 0..6 {
+            release_tx.send(()).unwrap();
+        }
+        let result = worker.join().unwrap();
+        assert!(
+            third.is_err(),
+            "a third parser ran while two parses held their permits"
+        );
+        assert_eq!(
+            reads_while_blocked, 2,
+            "permits must cover reads, not only parsing"
+        );
+        assert_eq!(result.scanned_files.len(), 6);
+        assert_eq!(result.aggregate["count"], 6);
+    }
+
     /// Run in its own process under `/usr/bin/time -v`; fixtures are prepared
     /// separately so their allocation and write cost do not enter the peak
     /// resident set size (RSS).
@@ -819,9 +969,14 @@ mod tests {
     #[ignore = "large-input RSS probe; requires AFT_TODO_RSS_ROOT on Linux"]
     fn todos_large_json_rss_probe() {
         let root = PathBuf::from(std::env::var_os("AFT_TODO_RSS_ROOT").expect("fixture root"));
-        let paths = ["data-100.json", "data-125.json", "data-150.json", "small.rs"]
-            .map(|name| root.join(name))
-            .to_vec();
+        let paths = [
+            "data-100.json",
+            "data-125.json",
+            "data-150.json",
+            "small.rs",
+        ]
+        .map(|name| root.join(name))
+        .to_vec();
         reset_file_read_count_for_debug(&root);
         let result = run_todos_scan_with_memo(&todos_job(&root, paths), &Tier1FileMemo::default())
             .outcome

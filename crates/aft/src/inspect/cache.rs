@@ -200,7 +200,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v42: corrected source-buffer freshness, impl scopes, complexity and cycles;
 /// an atomic epoch marker fences raw facts as well as derived findings, and
 /// undecodable dead-code rows remain explicit coverage gaps.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 42;
+/// v43: source-size admission excludes oversized complexity/duplicate inputs
+/// and reports their coverage gaps instead of reusing unbounded scan results.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 43;
 // Reserved metadata category: its integer is an epoch, never a scan timestamp.
 const CACHE_VERSION_CATEGORY: &str = "__cache_version__";
 
