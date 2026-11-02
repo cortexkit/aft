@@ -631,7 +631,10 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
     assert!(read["structuredContent"]["content"]
         .as_str()
         .unwrap()
-        .contains("oversized-first-result/"));
+        .contains(&format!(
+            "oversized-first-result{}",
+            std::path::MAIN_SEPARATOR
+        )));
     drop(daemon);
     module_thread.join().unwrap();
 }
