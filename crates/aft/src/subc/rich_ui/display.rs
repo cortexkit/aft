@@ -51,6 +51,7 @@ pub(crate) struct Capture {
 #[derive(Clone)]
 struct FileChange {
     path: PathBuf,
+    initial_path: PathBuf,
     old_path: Option<PathBuf>,
     before: Option<String>,
     after: Option<String>,
@@ -214,10 +215,13 @@ pub(crate) fn file(
             entry.path = path;
             if change != "modified" {
                 entry.change = change;
-                entry.old_path = old_path;
+                if entry.old_path.is_none() {
+                    entry.old_path = old_path;
+                }
             }
         } else {
             capture.files.push(FileChange {
+                initial_path: old_path.as_ref().unwrap_or(&path).clone(),
                 path,
                 old_path,
                 before: before.map(str::to_owned),
@@ -267,12 +271,13 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
         if !change.existed_before && !change.exists_after {
             continue;
         }
-        change.change = if change.change == "moved" {
-            "moved"
-        } else if !change.existed_before {
+        change.change = if !change.existed_before {
             "created"
         } else if !change.exists_after {
+            change.path = change.initial_path.clone();
             "deleted"
+        } else if change.path != change.initial_path {
+            "moved"
         } else {
             "modified"
         };
@@ -301,8 +306,10 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
             entry["diffOmitted"] = json!(true);
         } else {
             entry["path"] = json!(path);
-            if let Some(old_path) = old_path {
-                entry["oldPath"] = json!(old_path);
+            if change.change == "moved" {
+                if let Some(old_path) = old_path {
+                    entry["oldPath"] = json!(old_path);
+                }
             }
             if let (Some(masker), Some(before), Some(after)) = (
                 &capture.masker,
