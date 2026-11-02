@@ -1145,12 +1145,6 @@ fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
-    // A terminal task's stored view record rides `structuredContent` on
-    // tool-result/v1 routes only; the bash text renderer reads `output`, so
-    // the extra member leaves the model-visible content bytes unchanged.
-    // Running replies and legacy routes are skipped inside the attach.
-    ctx.bash_background()
-        .attach_terminal_view(&mut response.data, session_id);
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
@@ -1168,6 +1162,7 @@ fn finalized_bash_result(
         "bash",
         allow_bg_completions,
     );
+    ctx.bash_background().capture_display_reply(&response.data);
     ToolCallResult { text, response }
 }
 
@@ -1193,6 +1188,8 @@ fn observe_completed_bash_result(
     format_context: &crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
+    ctx.bash_background()
+        .capture_display_reply(&result.response.data);
     // Only the reply selected for delivery records the call in the repeat breaker.
     // Hash its bare command output, then restore the status bar and warning text
     // that the executor already appended, so changing counts do not change the hash.
@@ -2436,6 +2433,7 @@ pub(super) fn submit_deferred_bash(
                             }
                         }
                     }
+                    let _display = super::rich_ui::display::enter(ledger_key.as_ref());
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             // Declared first so its test-only drop check runs after

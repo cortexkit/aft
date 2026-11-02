@@ -1315,6 +1315,26 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         output_lines.push(summary);
     }
 
+    for result in &applied {
+        crate::subc::rich_ui::display::file(
+            &result.display_path.to_string_lossy(),
+            result
+                .move_path
+                .as_ref()
+                .and_then(|_| result.file_path.to_str()),
+            Some(&result.before),
+            Some(&result.after),
+            if result.move_path.is_some() {
+                "moved"
+            } else {
+                match result.kind {
+                    "add" => "created",
+                    "delete" => "deleted",
+                    _ => "modified",
+                }
+            },
+        );
+    }
     let root = project_root_for_relative_paths(ctx);
     let (diff, mut files) = metadata_files(&applied, root.as_deref(), &created_checks);
     // A partial patch keeps successful writes, but is not a completed project

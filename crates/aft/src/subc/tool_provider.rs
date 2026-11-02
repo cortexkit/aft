@@ -51,6 +51,7 @@ pub(super) fn recognized_operation(op: &str) -> bool {
         op,
         "role.describe"
             | "tool.catalog"
+            | "tool.views"
             | "tool.call"
             | "tool.withdraw"
             | "late_results"
@@ -180,6 +181,7 @@ pub(super) fn describe() -> Value {
                 ops: vec![
                     "role.describe".into(),
                     "tool.catalog".into(),
+                    "tool.views".into(),
                     "tool.call".into(),
                     "tool.withdraw".into(),
                     "late_results".into(),
@@ -189,7 +191,10 @@ pub(super) fn describe() -> Value {
             }],
             env!("CARGO_PKG_VERSION"),
         )
-        .with_capabilities(vec!["tool-catalog-confine/v1".into()]),
+        .with_capabilities(vec![
+            "tool-catalog-confine/v1".into(),
+            "tool-views/v1".into(),
+        ]),
     )
     .expect("the commons role declaration is JSON")
 }
@@ -2229,6 +2234,7 @@ impl LedgerEdge {
             let result = result_rx.await.unwrap_or(Err(response));
             match result {
                 Ok(Admission::New) => {
+                    super::rich_ui::display::register(&response_key, &identity, &call);
                     let admitted = {
                         let waiting = edge.waiting.lock().unwrap();
                         let admitted = waiting.contains_key(&(route, decoded.frame.header.corr));
@@ -2969,6 +2975,14 @@ impl LedgerEdge {
                         body.get("held").is_some() && body.get("isError").is_none()
                     });
                 if permission_hold {
+                    if let Some(call) = edge
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .get(&(route, outgoing.header.corr))
+                    {
+                        super::rich_ui::display::reply(&call.key, true, false, None);
+                    }
                     let running = serde_json::from_slice::<Value>(&outgoing.body)
                         .is_ok_and(|body| body["held"]["reason"] == "running");
                     {
@@ -2998,6 +3012,16 @@ impl LedgerEdge {
                     }
                     continue;
                 };
+                let display_result =
+                    serde_json::from_slice::<Value>(&outgoing.body).unwrap_or(Value::Null);
+                super::rich_ui::display::reply(
+                    &call.key,
+                    false,
+                    outgoing.header.ty == FrameType::Error || display_result["isError"] == true,
+                    display_result["code"]
+                        .as_str()
+                        .or_else(|| display_result["errorCode"].as_str()),
+                );
                 if outgoing.header.ty == FrameType::Error
                     && serde_json::from_slice::<Value>(&outgoing.body)
                         .is_ok_and(|body| body["code"] == "detached")

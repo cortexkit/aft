@@ -5,21 +5,33 @@ use cortexkit_role_tool_display::{canonical_body, FieldKind, RecordSchema};
 use serde_json::{json, Map, Value};
 
 pub(crate) fn bash_schema() -> RecordSchema {
-    RecordSchema::new("aft/bash/1", 1, BTreeMap::from([
-        ("taskId".into(), FieldKind::Id),
-        ("phase".into(), FieldKind::Code),
-        ("exitCode".into(), FieldKind::Integer),
-        ("outputBytes".into(), FieldKind::Integer),
-        ("endReason".into(), FieldKind::Code),
-        ("runDurationMs".into(), FieldKind::Integer),
-        ("execution".into(), FieldKind::Code),
-        ("target".into(), FieldKind::Code),
-    ]))
+    RecordSchema::new(
+        "aft/bash/1",
+        1,
+        BTreeMap::from([
+            ("taskId".into(), FieldKind::Id),
+            ("phase".into(), FieldKind::Code),
+            ("exitCode".into(), FieldKind::Integer),
+            ("outputBytes".into(), FieldKind::Integer),
+            ("endReason".into(), FieldKind::Code),
+            ("runDurationMs".into(), FieldKind::Integer),
+            ("execution".into(), FieldKind::Code),
+            ("target".into(), FieldKind::Code),
+        ]),
+    )
 }
 
 pub(crate) fn files_schema() -> RecordSchema {
     let mut fields = BTreeMap::new();
-    for name in ["fileCount", "modifiedCount", "createdCount", "deletedCount", "movedCount", "addedLines", "removedLines"] {
+    for name in [
+        "fileCount",
+        "modifiedCount",
+        "createdCount",
+        "deletedCount",
+        "movedCount",
+        "addedLines",
+        "removedLines",
+    ] {
         fields.insert(name.into(), FieldKind::Integer);
     }
     fields.insert("path".into(), FieldKind::ProjectPath);
@@ -27,7 +39,10 @@ pub(crate) fn files_schema() -> RecordSchema {
 }
 
 pub(crate) fn object(value: Value) -> Map<String, Value> {
-    value.as_object().expect("display body is an object").clone()
+    value
+        .as_object()
+        .expect("display body is an object")
+        .clone()
 }
 
 fn size(value: &Value) -> usize {
@@ -37,7 +52,9 @@ fn size(value: &Value) -> usize {
 /// Budget the escaped canonical document, including omission counters, not just
 /// the unescaped text. Security omissions must be made before this size cut.
 pub(crate) fn cut_detail(mut body: Value, limit: usize) -> Option<Value> {
-    if size(&body) <= limit { return Some(body); }
+    if size(&body) <= limit {
+        return Some(body);
+    }
     let mut omitted_bytes = 0usize;
     let mut omitted_items = 0usize;
     body["truncated"] = json!(true);
@@ -56,7 +73,9 @@ pub(crate) fn cut_detail(mut body: Value, limit: usize) -> Option<Value> {
         body["omittedBytes"] = json!(omitted_bytes);
         while size(&body) > limit {
             let file = body["files"].as_array_mut()?.pop()?;
-            if let Some(diff) = file.get("diff").and_then(Value::as_str) { omitted_bytes += diff.len(); }
+            if let Some(diff) = file.get("diff").and_then(Value::as_str) {
+                omitted_bytes += diff.len();
+            }
             omitted_items += 1;
             body["omittedItems"] = json!(omitted_items);
             body["omittedBytes"] = json!(omitted_bytes);
@@ -65,10 +84,16 @@ pub(crate) fn cut_detail(mut body: Value, limit: usize) -> Option<Value> {
         let names = ["stderr", "stdout", "pty"];
         for name in names {
             while size(&body) > limit {
-                let Some(text) = body.get(name).and_then(Value::as_str) else { break; };
-                if text.is_empty() { break; }
+                let Some(text) = body.get(name).and_then(Value::as_str) else {
+                    break;
+                };
+                if text.is_empty() {
+                    break;
+                }
                 let mut keep = text.len().saturating_sub((size(&body) - limit).max(1));
-                while !text.is_char_boundary(keep) { keep -= 1; }
+                while !text.is_char_boundary(keep) {
+                    keep -= 1;
+                }
                 omitted_bytes += text.len() - keep;
                 let kept = text[..keep].to_owned();
                 body[name] = json!(kept);

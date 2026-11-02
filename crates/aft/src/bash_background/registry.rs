@@ -3260,6 +3260,7 @@ impl BgTaskRegistry {
         };
 
         let cache = self.ensure_terminal_output_cache(task);
+        self.capture_display_terminal(task, &metadata, &buffer);
         self.publish_uncaptured_drain_terminal(task, &metadata);
         self.enqueue_completion_from_parts(
             &metadata,
@@ -3271,6 +3272,126 @@ impl BgTaskRegistry {
         );
         release_terminal_io_handles(task);
         Ok(())
+    }
+
+    fn display_bodies(
+        &self,
+        task: &Arc<BgTask>,
+        metadata: &PersistedTask,
+        buffer: &BgBuffer,
+    ) -> (serde_json::Value, serde_json::Value) {
+        use super::buffer::StreamKind;
+        let bytes = metadata
+            .remote
+            .as_ref()
+            .filter(|_| !metadata.local_fallback_started)
+            .map(|remote| {
+                remote
+                    .stdout_len
+                    .saturating_add(remote.stderr_len)
+                    .saturating_add(remote.unknown_len)
+            })
+            .unwrap_or_else(|| {
+                buffer
+                    .stream_len(StreamKind::Stdout)
+                    .saturating_add(buffer.stream_len(StreamKind::Stderr))
+            });
+        let secrets = task.completion_secrets.lock().ok();
+        let masker = secrets.as_deref().and_then(Option::as_ref);
+        let safe = masker.is_some() || metadata.has_safe_completion_redaction_after_restart();
+        let streams = safe
+            .then(|| buffer.read_complete_for_notice())
+            .flatten()
+            .and_then(|(stdout, stderr)| {
+                let mask = |text: &str| -> Option<String> {
+                    let masked = masker.map_or_else(
+                        || crate::log_redact::aft_redactor(text),
+                        |masker| masker.redact(text),
+                    );
+                    crate::log_redact::redact_ticket_digest(
+                        &masked,
+                        metadata.completion_ticket_digest.as_deref(),
+                    )
+                    .ok()
+                    .map(|text| text.into_owned())
+                };
+                Some((mask(&stdout)?, mask(&stderr)?))
+            });
+        crate::subc::rich_ui::display::bash_bodies(metadata, Some(bytes), streams)
+    }
+
+    fn capture_display_terminal(
+        &self,
+        task: &Arc<BgTask>,
+        metadata: &PersistedTask,
+        buffer: &BgBuffer,
+    ) {
+        let Some(display) = metadata
+            .display
+            .as_ref()
+            .filter(|display| !display.attempted)
+        else {
+            return;
+        };
+        let bodies = self.display_bodies(task, metadata, buffer);
+        crate::subc::rich_ui::display::bash_terminal(
+            display,
+            bodies,
+            &metadata.task_id,
+            metadata.duration_ms,
+        );
+        if display.reply_produced && display.deferred {
+            let mut db = DeferredDbWrites::new(self, task);
+            if let Ok(mut state) = task.lock_state() {
+                if let Some(display) = state.metadata.display.as_mut() {
+                    display.attempted = true;
+                }
+                let _ = self.persist_task_locked(task, &state.metadata, &mut db);
+            }
+        }
+    }
+
+    /// The original handler chose its reply; polling/status calls never enter
+    /// this hook and cannot take ownership of that call's display identity.
+    pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
+        let Some(task_id) = response.get("task_id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(task) = self.task(task_id) else {
+            return;
+        };
+        let (mut metadata, buffer) = {
+            let Ok(state) = task.lock_state() else {
+                return;
+            };
+            if state
+                .metadata
+                .display
+                .as_ref()
+                .is_none_or(|display| display.reply_produced)
+            {
+                return;
+            }
+            (state.metadata.clone(), state.buffer.clone())
+        };
+        let bodies = self.display_bodies(&task, &metadata, &buffer);
+        let deferred = !Self::response_status_is_terminal(
+            response.get("status").and_then(serde_json::Value::as_str),
+        );
+        let Some(display) = metadata.display.as_mut() else {
+            return;
+        };
+        crate::subc::rich_ui::display::bash_reply(display, bodies, deferred);
+        {
+            let mut db = DeferredDbWrites::new(self, &task);
+            if let Ok(mut state) = task.lock_state() {
+                state.metadata.display = metadata.display.clone();
+                let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
+            }
+        }
+        if metadata.is_terminal() {
+            self.capture_display_terminal(&task, &metadata, &buffer);
+        }
     }
 
     fn publish_uncaptured_drain_terminal(&self, task: &Arc<BgTask>, metadata: &PersistedTask) {

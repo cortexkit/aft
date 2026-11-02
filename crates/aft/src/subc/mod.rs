@@ -12,6 +12,7 @@
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
 pub mod blob_store;
+pub(crate) mod tool_views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -257,7 +258,7 @@ mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
-mod rich_ui;
+pub(crate) mod rich_ui;
 pub(crate) mod watch_delivery;
 // Drives the chunk queries and Occipital's route shapes through the real
 // frame loop, so it lives beside the chunk module but runs as a child of this
@@ -5454,6 +5455,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    rich_ui::display::start(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -10230,6 +10232,8 @@ async fn submit_provider_read(
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation == "tool.views" {
+                tool_views::answer(body)
             } else if job_operation.starts_with("grants.") && ctx.database_runtime_initializing() {
                 Err(subc_protocol::ErrorBody::new(
                     "grants_unavailable",
@@ -10540,6 +10544,7 @@ impl PlainToolRun {
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
+            let _display = rich_ui::display::enter(ledger_key.as_ref());
             let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
@@ -11100,7 +11105,7 @@ async fn handle_tool_call_with_capabilities(
     {
         if matches!(
             operation,
-            "role.describe" | "tool.catalog" | "grants.list" | "grants.revoke"
+            "role.describe" | "tool.catalog" | "tool.views" | "grants.list" | "grants.revoke"
         ) {
             let body = if envelope.get("op").is_some() {
                 let mut body = envelope.clone();

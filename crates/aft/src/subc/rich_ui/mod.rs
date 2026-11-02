@@ -33,13 +33,13 @@ pub(crate) mod canonical;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod carrier;
 pub(crate) mod chunks;
-pub(crate) mod records;
-pub(crate) mod outbox;
 pub(crate) mod display;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod jcs_number;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod operations;
+pub(crate) mod outbox;
+pub(crate) mod records;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod schema;
 pub(super) mod session;

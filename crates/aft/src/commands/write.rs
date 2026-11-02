@@ -250,6 +250,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // byte-identical to `original`, surface `no_op: true` so UIs can render
     // "wrote, but no net change" instead of a bare "File updated". See
     // GitHub #45.
+    let rolled_back = write_result.rolled_back;
     let final_content = write_result
         .final_content(path.as_path())
         .unwrap_or(content);
@@ -259,6 +260,15 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Some(original) = original {
         edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
+    }
+    if !rolled_back {
+        crate::subc::rich_ui::display::file(
+            &path.to_string_lossy(),
+            None,
+            if existed { original } else { Some("") },
+            Some(final_content),
+            if existed { "modified" } else { "created" },
+        );
     }
     Response::success(&req.id, result)
 }

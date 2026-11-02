@@ -1,0 +1,484 @@
+{
+  "tp1:apply_patch:fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548:1": {
+    "tool": {
+      "name": "apply_patch",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "patchText": {
+            "description": "The full patch text including Begin/End markers",
+            "type": "string"
+          }
+        },
+        "required": [
+          "patchText"
+        ]
+      },
+      "semantics": 1
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 0,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT apply_patch\" maxLines={1} />"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT apply_patch\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:bash:019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f:2": {
+    "tool": {
+      "name": "bash",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "workdir": {
+            "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+            "type": "string"
+          },
+          "wait": {
+            "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+            "type": "boolean"
+          },
+          "sandbox": {
+            "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+            "type": "string",
+            "const": "host"
+          },
+          "background": {
+            "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "boolean"
+          },
+          "compressed": {
+            "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+            "type": "boolean"
+          },
+          "pty": {
+            "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write \u2014 its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+            "type": "boolean"
+          },
+          "ptyRows": {
+            "description": "PTY terminal height in rows \u2014 ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60
+          },
+          "ptyCols": {
+            "description": "PTY terminal width in columns \u2014 ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 140
+          },
+          "runon": {
+            "type": "string",
+            "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+          },
+          "return_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "semantics": 2
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 1,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          }
+        },
+        "reads": [],
+        "template_revision": 0,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT bash\" maxLines={1} />"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:bash:da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a:2": {
+    "tool": {
+      "name": "bash",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "workdir": {
+            "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+            "type": "string"
+          },
+          "description": {
+            "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+            "type": "string"
+          },
+          "wait": {
+            "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+            "type": "boolean"
+          },
+          "sandbox": {
+            "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+            "type": "string",
+            "const": "host"
+          },
+          "background": {
+            "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+            "type": "boolean"
+          },
+          "compressed": {
+            "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+            "type": "boolean"
+          },
+          "pty": {
+            "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write \u2014 its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+            "type": "boolean"
+          },
+          "ptyRows": {
+            "description": "PTY terminal height in rows \u2014 ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60
+          },
+          "ptyCols": {
+            "description": "PTY terminal width in columns \u2014 ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 140
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "semantics": 2
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/bash/1",
+          "revision": 1,
+          "fields": {
+            "taskId": "id",
+            "phase": "code",
+            "exitCode": "integer",
+            "outputBytes": "integer",
+            "endReason": "code",
+            "runDurationMs": "integer",
+            "execution": "code",
+            "target": "code"
+          }
+        },
+        "reads": [],
+        "template_revision": 0,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT bash\" maxLines={1} />"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT bash\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:edit:20dfe0eb13e87c68a0d54412e2e9605a3c1ce7935d36acf1c6df8e8660609ef8:1": {
+    "tool": {
+      "name": "edit",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "path": {
+            "description": "Path to the file to edit (absolute or relative to project root)",
+            "type": "string"
+          },
+          "symbol": {
+            "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
+            "type": "string"
+          },
+          "content": {
+            "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
+            "type": "string"
+          },
+          "appendContent": {
+            "description": "Text to append to the end of path; creates the file if needed",
+            "type": "string"
+          },
+          "edits": {
+            "description": "Batch edits \u2014 non-empty array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "oldString": {
+                  "description": "Text to find for a batch find/replace edit",
+                  "type": "string"
+                },
+                "newString": {
+                  "description": "Replacement text for a batch find/replace edit",
+                  "type": "string"
+                },
+                "replaceAll": {
+                  "description": "Replace every occurrence for this batch item",
+                  "type": "boolean"
+                },
+                "occurrence": {
+                  "description": "1-based occurrence for this batch item (1 = first match)",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "startLine": {
+                  "description": "1-based start line for a batch line-range edit",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "endLine": {
+                  "description": "1-based end line for a batch line-range edit",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "content": {
+                  "description": "Replacement text for a batch line-range edit",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "semantics": 1
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 0,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT edit\" maxLines={1} />"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT edit\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      }
+    ]
+  },
+  "tp1:write:e4b3deed1a39fc2a5b990b319b17e1f19c84c891a770c219d97d9cdefe6181cf:1": {
+    "tool": {
+      "name": "write",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "path": {
+            "description": "Path to the file to write (absolute or relative to project root)",
+            "type": "string"
+          },
+          "content": {
+            "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      },
+      "semantics": 1
+    },
+    "history": [
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 0,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT write\" maxLines={1} />"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf"
+            },
+            "reads": [],
+            "source": "<TextContent text=\"AFT write\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      }
+    ]
+  }
+}

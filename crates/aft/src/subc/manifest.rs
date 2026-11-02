@@ -485,6 +485,7 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
             provides: vec![
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+                "tool-views/v1".to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),

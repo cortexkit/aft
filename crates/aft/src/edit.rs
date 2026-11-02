@@ -1400,6 +1400,7 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
+    crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
     result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
 }
 
@@ -1506,6 +1507,7 @@ pub(crate) fn attach_edit_diff(
     before: &str,
     after: &str,
 ) {
+    crate::subc::rich_ui::display::file(file, None, Some(before), Some(after), "modified");
     if wants_diff(params) {
         let (patch, info) = response_diff(params, file, before, after);
         result["metadata"] = serde_json::json!({ "diff": patch });
