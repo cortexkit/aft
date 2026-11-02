@@ -3081,12 +3081,15 @@ fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
 }
 
 pub(crate) fn ts_object_scope(source: &str, object: Node<'_>) -> String {
+    // Preserve existing module-level const/let identities. Other literals need
+    // source-qualified owners so unrelated properties cannot bind bare calls.
     if let Some(declaration) = object
         .parent()
         .filter(|n| n.kind() == "variable_declarator")
     {
         let top_level = declaration
             .parent()
+            .filter(|n| n.kind() == "lexical_declaration")
             .and_then(|n| n.parent())
             .is_some_and(|n| {
                 n.kind() == "program"

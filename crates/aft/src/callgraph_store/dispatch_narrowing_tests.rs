@@ -173,6 +173,28 @@ fn typescript_object_store_factory_edits_match_a_cold_build() {
     );
 }
 
+#[test]
+fn typescript_object_store_var_definitions_are_not_bare_name_bindings() {
+    let fixture = Fixture::from_files(&[
+        ("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }"),
+    ]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM nodes WHERE name='unique' AND kind='method'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique'"
+        ),
+        1
+    );
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique' AND provenance='type_match'"), 1);
+}
+
 impl Fixture {
     fn new(matching: usize, unrelated: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();
