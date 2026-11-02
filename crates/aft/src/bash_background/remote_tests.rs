@@ -2832,6 +2832,7 @@ async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
         created_at_ms: metadata.started_at,
         request_digest: "digest".into(),
         attempts: 1,
+        recovery_started_at_ms: None,
         fresh_key_used: false,
         resuming: false,
         reattached: false,
@@ -4098,6 +4099,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
             created_at_ms: unix_millis(),
             request_digest: "unused-for-attach".into(),
             attempts: SUBMISSION_RECOVERY_ATTEMPTS,
+            recovery_started_at_ms: None,
             fresh_key_used: false,
             resuming: false,
             reattached: false,
@@ -14021,6 +14023,67 @@ async fn runon_preaccepted_exhausted_recovery_is_fate_unknown() {
     assert_eq!(daemon.methods("exec.run").len(), 1);
     assert!(daemon.methods("exec.attach").is_empty());
     assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
+async fn runon_preaccepted_ambiguous_keyed_answer_is_not_resubmitted() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let (_dir, daemon, registry, task_id) =
+        preaccepted_recovery_fixture(SubmissionOutage::Ambiguous).await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    let runs = daemon.methods("exec.run");
+    assert_eq!(
+        runs.len(),
+        2,
+        "an ambiguous answer cannot authorize another run"
+    );
+    assert_eq!(runs[0]["params"], runs[1]["params"]);
+    assert!(daemon.methods("exec.attach").is_empty());
+    assert!(done
+        .output_preview
+        .contains("remote outcome unknown; keyed recovery unavailable or exhausted"));
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
+async fn runon_preaccepted_recovery_window_is_persisted_and_retention_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused-connection"), "true");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.accepted = false;
+        remote.submission = Some(KeyedSubmission {
+            key: "aft:interrupted".into(),
+            created_at_ms: 100_000,
+            request_digest: "unused".into(),
+            attempts: 1,
+            recovery_started_at_ms: Some(200_000),
+            fresh_key_used: false,
+            resuming: true,
+            reattached: false,
+            refusal: None,
+        });
+    }
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.begin_submission_recovery().unwrap();
+    let metadata = read_task(&paths.json).unwrap();
+    let mut submission = metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .submission
+        .clone()
+        .unwrap();
+    assert_eq!(submission.recovery_started_at_ms, Some(200_000));
+    assert_eq!(submission.expires_at(&metadata), 230_000);
+    submission.created_at_ms = 1;
+    submission.recovery_started_at_ms = Some(86_400_000);
+    assert_eq!(submission.expires_at(&metadata), 86_400_001);
 }
 
 #[tokio::test]

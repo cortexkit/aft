@@ -922,6 +922,8 @@ pub(crate) struct KeyedSubmission {
     created_at_ms: u64,
     request_digest: String,
     attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_started_at_ms: Option<u64>,
     fresh_key_used: bool,
     resuming: bool,
     reattached: bool,
@@ -932,6 +934,16 @@ pub(crate) struct KeyedSubmission {
 #[cfg(unix)]
 impl KeyedSubmission {
     fn expires_at(&self, metadata: &PersistedTask) -> u64 {
+        let retention_end = self.created_at_ms.saturating_add(SUBMISSION_RETENTION_MS);
+        if metadata.remote.as_ref().is_some_and(|r| !r.accepted) {
+            // Placement can wait longer than our queue estimate. Once that
+            // route closes, allow recovery time independent of the run timeout.
+            return retention_end.min(
+                self.recovery_started_at_ms
+                    .unwrap_or_else(unix_millis)
+                    .saturating_add(duration_ms(PRE_ACCEPTANCE_RECOVERY_WINDOW)),
+            );
+        }
         let run_timeout = metadata
             .timeout_ms
             .map(Duration::from_millis)
@@ -947,9 +959,7 @@ impl KeyedSubmission {
         let job_end_ms = submitted_at
             .saturating_add(duration_ms(recovery_queue_wait_allowance(run_timeout)))
             .saturating_add(duration_ms(run_timeout));
-        self.created_at_ms
-            .saturating_add(SUBMISSION_RETENTION_MS)
-            .min(job_end_ms)
+        retention_end.min(job_end_ms)
     }
 }
 
@@ -957,6 +967,14 @@ impl KeyedSubmission {
 const SUBMISSION_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 #[cfg(unix)]
 const SUBMISSION_RECOVERY_ATTEMPTS: u8 = 3;
+
+/// A provider restart takes seconds, not the subsecond three-attempt budget
+/// used for recovering an unknown terminal. Keep pre-acceptance recovery open
+/// for at most 30 seconds, with eight exponential pauses (100ms to 12.8s).
+#[cfg(unix)]
+const PRE_ACCEPTANCE_RECOVERY_WINDOW: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const PRE_ACCEPTANCE_RECOVERY_ATTEMPTS: u8 = 8;
 
 #[cfg(unix)]
 fn new_submission_key(task_id: &str) -> Result<String, String> {
@@ -1968,6 +1986,18 @@ impl OutputSink for TaskSink {
 
 #[cfg(unix)]
 impl TaskSink {
+    fn begin_submission_recovery(&mut self) -> io::Result<()> {
+        self.commit(|r| {
+            if let Some(submission) = &mut r.submission {
+                // Save the first interruption so an AFT restart cannot grant
+                // another recovery window to the same uncertain dispatch.
+                submission
+                    .recovery_started_at_ms
+                    .get_or_insert_with(unix_millis);
+            }
+        })
+    }
+
     fn settle_never_accepted(&mut self) -> io::Result<()> {
         let mut proven_never_accepted = false;
         self.commit(|r| {
@@ -2671,6 +2701,7 @@ impl BgTaskRegistry {
                 created_at_ms: unix_millis(),
                 request_digest: digest,
                 attempts: 0,
+                recovery_started_at_ms: None,
                 fresh_key_used: false,
                 resuming: false,
                 reattached: false,
@@ -2691,8 +2722,8 @@ impl BgTaskRegistry {
         Ok(request)
     }
 
-    /// Retry only a durable key, while both the caller's timeout and the
-    /// executor's key retention are open. Attempts survive AFT restarts too.
+    /// Recover only a durable key within its retention and recovery window.
+    /// Both the attempt count and first interruption survive AFT restarts.
     async fn recover_submission(
         &self,
         client: &mut ExecRemoteClient,
@@ -2700,6 +2731,8 @@ impl BgTaskRegistry {
         _root: &Path,
         mut fresh: bool,
     ) -> Result<Option<exec::RemoteStream>, String> {
+        sink.begin_submission_recovery()
+            .map_err(|e| e.to_string())?;
         sink.checkpoint_progress().map_err(|e| e.to_string())?;
         loop {
             let mut timings = exec::LaunchTimings::new(Instant::now(), "submission_recovery");
@@ -2716,10 +2749,18 @@ impl BgTaskRegistry {
             };
             let now = unix_millis();
             let expires = submission.expires_at(&metadata);
+            let attempt_limit = if remote.accepted {
+                SUBMISSION_RECOVERY_ATTEMPTS
+            } else {
+                PRE_ACCEPTANCE_RECOVERY_ATTEMPTS
+            };
             if remote.cancel_requested
                 || now >= expires
                 || now < submission.created_at_ms
-                || submission.attempts >= SUBMISSION_RECOVERY_ATTEMPTS
+                || submission
+                    .recovery_started_at_ms
+                    .is_some_and(|started| now < started)
+                || submission.attempts >= attempt_limit
             {
                 return Ok(None);
             }
@@ -2773,9 +2814,25 @@ impl BgTaskRegistry {
                 return Ok(None);
             }
             let submit = async {
+                // The SDK may have reconnected the transport while its old
+                // provider route remains closed. Reopen it before looking up
+                // capabilities; an absent provider during restart is retryable.
+                let identity = subc_protocol::BindIdentity::new(
+                    remote.harness.clone(),
+                    remote.session.clone(),
+                );
+                *client = match client.reopen_route(identity.clone()).await {
+                    Ok(reconnected) => reconnected,
+                    Err(error) => match &remote.connection_file {
+                        Some(path) => ExecRemoteClient::connect(path, identity).await?,
+                        None => return Err(error),
+                    },
+                };
                 timings.enter("supports_submission_key");
                 if !client.supports_submission_key().await? {
-                    return Ok(None);
+                    return Err(exec::Error::Protocol(
+                        "executor does not advertise submission keys".into(),
+                    ));
                 }
                 let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
@@ -2790,27 +2847,20 @@ impl BgTaskRegistry {
                 } else {
                     result
                 };
-                result.map(Some)
+                result
             };
             match tokio::time::timeout(Duration::from_millis(remaining), submit).await {
-                Ok(Ok(Some(stream))) => return Ok(Some(stream)),
-                Ok(Ok(None)) => return Ok(None),
-                _ => {
-                    // The SDK reconnects the transport after a daemon restart,
-                    // but its old route is stale. Reopen that route with the
-                    // same caller identity instead of dialing a second client.
-                    if let Ok(Ok(reconnected)) = tokio::time::timeout(
-                        Duration::from_millis(expires.saturating_sub(unix_millis())),
-                        client.reopen_route(subc_protocol::BindIdentity::new(
-                            remote.harness.clone(),
-                            remote.session.clone(),
-                        )),
-                    )
-                    .await
-                    {
-                        *client = reconnected;
-                    }
-                }
+                Ok(Ok(stream)) => return Ok(Some(stream)),
+                result => crate::slog_warn!(
+                    "runon: keyed recovery failed task_id={} attempt={} reason={}",
+                    sink.task.task_id,
+                    remote.submission.as_ref().unwrap().attempts + 1,
+                    match result {
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "remote connection timed out".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    },
+                ),
             }
         }
     }
@@ -3070,6 +3120,10 @@ impl BgTaskRegistry {
             .as_ref()
             .ok_or_else(|| "daemon connection file unavailable".to_string());
         let mut keyed_connect_attempts = 0;
+        if resume_submission {
+            sink.begin_submission_recovery()
+                .map_err(|e| e.to_string())?;
+        }
         let mut client = loop {
             let connect = async {
                 match &connection {
@@ -3092,7 +3146,13 @@ impl BgTaskRegistry {
                     .map_err(|_| "task lock poisoned")?
                     .metadata
                     .clone();
-                let submission = remote.submission.as_ref().unwrap();
+                let submission = metadata
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .submission
+                    .as_ref()
+                    .unwrap();
                 let now = unix_millis();
                 let expires = submission.expires_at(&metadata);
                 if now < submission.created_at_ms || now >= expires {
@@ -3115,7 +3175,12 @@ impl BgTaskRegistry {
                 Ok(c) => break c,
                 Err(error) => {
                     if resume_submission {
-                        if keyed_connect_attempts < SUBMISSION_RECOVERY_ATTEMPTS {
+                        let attempt_limit = if remote.accepted {
+                            SUBMISSION_RECOVERY_ATTEMPTS
+                        } else {
+                            PRE_ACCEPTANCE_RECOVERY_ATTEMPTS
+                        };
+                        if keyed_connect_attempts < attempt_limit {
                             tokio::time::sleep(Duration::from_millis(
                                 100 << (keyed_connect_attempts - 1),
                             ))
@@ -3302,6 +3367,7 @@ impl BgTaskRegistry {
             }
         };
         let mut cancelled = false;
+        let mut keyed_recovery_error = None;
         loop {
             // Poll intent even when every stream read is immediately ready.
             // A new sleep per read cannot provide fairness under steady output.
@@ -3530,6 +3596,21 @@ impl BgTaskRegistry {
                     if !platform_ok {
                         return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
                     }
+                    if verdict == Verdict::OutcomeUnknown
+                        && task.state.lock().is_ok_and(|state| {
+                            state.metadata.remote.as_ref().is_some_and(|remote| {
+                                !remote.accepted
+                                    && remote.submission.as_ref().is_some_and(|s| s.resuming)
+                            })
+                        })
+                    {
+                        // A keyed reply with no acceptance or no-start proof
+                        // cannot authorize a fresh command, even on a new key.
+                        return Err(match keyed_recovery_error {
+                            Some(error) => format!("remote outcome unknown; keyed recovery unavailable or exhausted: {error}"),
+                            None => "remote outcome unknown; keyed recovery unavailable or exhausted".into(),
+                        });
+                    }
                     // An attach already queried the existing job; an unknown
                     // terminal from it is not a reason to submit the command again.
                     if verdict == Verdict::OutcomeUnknown && !stream.is_attach() {
@@ -3566,6 +3647,7 @@ impl BgTaskRegistry {
                     // its key. The shorter key-recovery limit must not abandon a
                     // job that can still be queued or running on the executor.
                     if current.resubmit_for_recovery() && !current.accepted {
+                        keyed_recovery_error.get_or_insert_with(|| error.to_string());
                         if let Some(next) = self
                             .recover_submission(&mut client, &mut sink, &root, false)
                             .await?
