@@ -515,7 +515,7 @@ mod tests {
             ],
         );
         std::fs::write(worker.join("extra.ts"), "export function extra() {}\n").unwrap();
-        let paths = crate::root_cache::StoragePaths::same(temp.path().join("storage"));
+        let paths = crate::root_cache::StoragePaths::same(&temp.path().join("storage"));
         let main = std::fs::canonicalize(main).unwrap();
         let worker = std::fs::canonicalize(worker).unwrap();
         let main_view = super::super::callgraph::CallgraphView::new(
