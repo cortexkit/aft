@@ -354,14 +354,14 @@ fn fresh_connect_rechecks_changed_evidence_without_cache_cooldown() {
     let ctx = context(storage.path());
     isolated(root.path(), || {
         assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
-        settle(&ctx);
+        crate::test_admission::settle(&ctx);
         assert_eq!(
             admission::snapshot(&ctx).unwrap()["classification"],
             "not_project"
         );
         std::fs::write(root.path().join("Makefile"), "").unwrap();
         assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
-        settle(&ctx);
+        crate::test_admission::settle(&ctx);
         assert_eq!(
             admission::snapshot(&ctx).unwrap()["classification"],
             "project"
@@ -476,6 +476,14 @@ fn folder_admission_grep_glob_count_rejected_names_before_filtering() {
         let ctx = context(storage.path());
         assert!(configure(root.path(), storage.path(), &ctx, true, false).success);
         settle(&ctx);
+        let folder = admission::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], Value::Null, "{folder}");
+        assert_eq!(folder["state"], "pending", "{folder}");
+        let expected_notice = if folder["coverage"]["stop"] == "time" {
+            admission::INCOMPLETE_TEXT
+        } else {
+            "folder_not_admitted: evidence_budget_exhausted"
+        };
         crate::grep_executor::with_walk_limit(2, || {
             let grep = crate::commands::grep::handle_grep(
                 &request("grep", json!({"pattern": "absent", "include": "*.never"})),
@@ -489,7 +497,7 @@ fn folder_admission_grep_glob_count_rejected_names_before_filtering() {
             assert!(grep.data["text"]
                 .as_str()
                 .unwrap()
-                .contains(admission::OFF_TEXT));
+                .contains(expected_notice));
             let glob = crate::commands::glob::handle_glob(
                 &request("glob", json!({"pattern": "*.never"})),
                 &ctx,
@@ -503,7 +511,7 @@ fn folder_admission_grep_glob_count_rejected_names_before_filtering() {
             assert!(!glob.data["text"]
                 .as_str()
                 .unwrap()
-                .contains(admission::OFF_TEXT));
+                .contains(expected_notice));
         });
         assert_eq!(
             super::configure_artifact_load_attempts_for_root_for_test(root.path()),
@@ -938,10 +946,11 @@ fn folder_admission_only_user_config_can_force_an_export_to_index() {
             .iter()
             .any(|key| key["key"] == "project_detection"));
         settle(&ctx);
-        assert_eq!(
-            admission::snapshot(&ctx).unwrap()["classification"],
-            "not_project"
-        );
+        let folder = admission::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], Value::Null, "{folder}");
+        assert_eq!(folder["state"], "pending", "{folder}");
+        assert_eq!(folder["override_mode"], "auto", "{folder}");
+        assert!(!ctx.heavy_root_work_allowed());
         let mut user = base;
         user["project_detection"] =
             json!({"overrides": [{"path": root.path(), "mode": "project"}]});

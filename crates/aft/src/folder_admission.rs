@@ -1159,14 +1159,17 @@ mod tests {
         std::fs::create_dir(&child).unwrap();
         file(&child, "a.rs");
         file(&child, "b.rs");
-        let result = probe(
-            tree.path(),
-            &ProjectDetectionConfig::default(),
-            ProbeBudgets {
-                depth: 0,
-                ..ProbeBudgets::default()
-            },
-        );
+        // This case measures the depth cut, not the startup time of host Git.
+        let result = crate::developer_tools::with_git_usable_for_test(false, || {
+            probe(
+                tree.path(),
+                &ProjectDetectionConfig::default(),
+                ProbeBudgets {
+                    depth: 0,
+                    ..ProbeBudgets::default()
+                },
+            )
+        });
         assert_eq!(result.coverage.stop, ProbeStop::DepthLimit);
         assert_eq!(result.observed.files, 0);
     }

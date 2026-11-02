@@ -32,6 +32,20 @@ fn incomplete_notice(decision: &FolderAdmission) -> Option<&'static str> {
         .then_some(INCOMPLETE_TEXT)
 }
 
+fn incomplete_message(decision: &FolderAdmission) -> String {
+    incomplete_notice(decision)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "folder_not_admitted: {}",
+                serde_json::to_value(decision.reason)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+            )
+        })
+}
+
 pub(crate) struct State {
     binding: parking_lot::Mutex<Option<Binding>>,
     dirty: Arc<AtomicBool>,
@@ -876,15 +890,7 @@ fn snapshot_binding(binding: &Binding, watcher_active: bool) -> Value {
         .as_ref()
         .filter(|cache| !cache.decision.is_determined())
     {
-        value["message"] = json!(incomplete_notice(&cache.decision)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!(
-                "folder_not_admitted: {}",
-                serde_json::to_value(cache.decision.reason)
-                    .unwrap()
-                    .as_str()
-                    .unwrap()
-            )));
+        value["message"] = json!(incomplete_message(&cache.decision));
     }
     value
 }
@@ -1627,13 +1633,8 @@ pub fn refusal(ctx: &AppContext, id: &str, session: &str) -> Option<Response> {
         .as_ref()
         .and_then(|binding| binding.decision.as_ref())
         .filter(|cache| !cache.decision.is_determined())
-        .map(|cache| {
-            incomplete_notice(&cache.decision)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("folder_not_admitted: {reason}"))
-        });
-    let message =
-        incomplete.unwrap_or_else(|| notice(ctx, false, session).unwrap_or("").to_owned());
+        .map(|cache| incomplete_message(&cache.decision));
+    let message = incomplete.unwrap_or_else(|| notice(ctx, false, session).unwrap_or_default());
     Some(Response::error_with_data(
         id,
         "folder_not_admitted",
@@ -1642,24 +1643,24 @@ pub fn refusal(ctx: &AppContext, id: &str, session: &str) -> Option<Response> {
     ))
 }
 
-fn notice(ctx: &AppContext, configure: bool, session: &str) -> Option<&'static str> {
+fn notice(ctx: &AppContext, configure: bool, session: &str) -> Option<String> {
     let mut slot = ctx.folder_admission().binding.lock();
     let binding = slot.as_mut()?;
     let text = binding
         .decision
         .as_ref()
         .and_then(|cache| match cache.decision.classification {
-            FolderClassification::NotProject => Some(OFF_TEXT),
-            FolderClassification::Undetermined => incomplete_notice(&cache.decision),
+            FolderClassification::NotProject => Some(OFF_TEXT.to_owned()),
+            FolderClassification::Undetermined => Some(incomplete_message(&cache.decision)),
             _ => None,
         });
-    let off = !binding.pending && !binding.needs_apply && !binding.force && text.is_some();
+    let announce = !binding.pending && !binding.needs_apply && !binding.force && text.is_some();
     let announced = if configure {
         &mut binding.configure_announced
     } else {
         &mut binding.announced
     };
-    if off && announced.insert(session.to_owned()) {
+    if announce && announced.insert(session.to_owned()) {
         text
     } else {
         None
@@ -1689,7 +1690,7 @@ pub fn decorate(ctx: &AppContext, response: &mut Response, configure: bool, sess
         }
         if let Some(Value::String(text)) = response.data.get_mut("text") {
             text.push_str("\n\n");
-            text.push_str(message);
+            text.push_str(&message);
         }
     }
 }
