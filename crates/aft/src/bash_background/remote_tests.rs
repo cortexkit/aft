@@ -1219,12 +1219,41 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     let capture = crate::bash_changed_files::Capture::start(&ctx).unwrap();
     let mut launch = launch(daemon.connection.clone());
     launch.explicit_runon = !fallback;
+    // Only the local fallback shell creates local.txt. The explicit remote
+    // command writes disposable output outside the project; its local change
+    // report comes from the observer event injected below.
+    let write = if fallback {
+        "printf local-change > local.txt".to_owned()
+    } else {
+        format!(
+            "printf remote-change > '{}'",
+            storage.path().join("remote-output.txt").display()
+        )
+    };
+    let command =
+        format!("{write}; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done");
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
-        ctx.bash_background().spawn_remote(launch, SpawnPlan::Unsandboxed, "printf local-change > local.txt; while [ ! -e \"$CHANGED_FILES_RELEASE\" ]; do sleep 0.01; done", resolve_posix_shell(), "session".into(), project.path().into(), HashMap::from([(
-            "CHANGED_FILES_RELEASE".into(),
-            storage.path().join("release").display().to_string(),
-        )]), crate::bash_background::HardKill::from_timeout_ms(Some(20_000)), None, storage.path().into(), crate::bash_background::TaskSlot::Background { max: 10 }, true, false, Some(project.path().into()))
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                &command,
+                resolve_posix_shell(),
+                "session".into(),
+                project.path().into(),
+                HashMap::from([(
+                    "CHANGED_FILES_RELEASE".into(),
+                    storage.path().join("release").display().to_string(),
+                )]),
+                crate::bash_background::HardKill::from_timeout_ms(Some(20_000)),
+                None,
+                storage.path().into(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.path().into()),
+            )
             .unwrap()
     };
     if fallback {
@@ -7335,6 +7364,14 @@ fn git_fixture(root: &Path) {
     hermetic_git(root, &["init", "--quiet"]);
     hermetic_git(root, &["config", "user.name", "AFT Test"]);
     hermetic_git(root, &["config", "user.email", "aft-test@example.invalid"]);
+    // Execution sentinels are disposable output, not source edits. Keep them
+    // ignored so the checkout-write preflight does not mask the executor or cd
+    // refusal that each test is meant to exercise.
+    std::fs::write(
+        root.join(".git/info/exclude"),
+        "must-not-run-locally\nmust-not-run\nlocal-spawn-proof\n",
+    )
+    .unwrap();
     std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
     hermetic_git(root, &["add", "tracked.txt"]);
     hermetic_git(root, &["commit", "--quiet", "-m", "fixture"]);
@@ -12196,6 +12233,207 @@ fn runon_cd_snapshot_fixture() -> (tempfile::TempDir, RunRequest) {
     )
     .unwrap();
     (dir, request)
+}
+
+#[test]
+fn runon_write_shapes_respect_snapshot_membership() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::write(root.join(".gitignore"), "ignored/\ntracked.rs\n").unwrap();
+    fs::write(root.join("tracked.rs"), "source\n").unwrap();
+    hermetic_git(root, &["add", "-f", "tracked.rs"]);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.rs"), "source\n").unwrap();
+    let shapes = [
+        "echo text > PATH",
+        "echo text >> PATH",
+        "echo text &> PATH",
+        "echo text >| PATH",
+        "cat > PATH <<'EOF'\nsource\nEOF",
+        "tee PATH",
+        "tee -a PATH",
+        "sed -i 's/a/b/' PATH",
+        "sed -i '' 's/a/b/' PATH",
+        "perl -i -pe 's/a/b/' PATH",
+        "ruby -i -pe 'gsub(/a/, \"b\")' PATH",
+        "cp input PATH",
+        "mv input PATH",
+        "install input PATH",
+        "ln input PATH",
+        "rm PATH",
+        "rm -rf PATH",
+        "unlink PATH",
+        "truncate -s 0 PATH",
+        "touch PATH",
+        "patch -p0 <<'EOF'\n--- PATH\n+++ PATH\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        "git apply -p0 --unsafe-paths <<'EOF'\n--- PATH\n+++ PATH\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        "git checkout -- PATH",
+        "git restore PATH",
+        "rustfmt PATH",
+        "prettier --write PATH",
+        "biome format --write PATH",
+        "biome check --write PATH",
+        "gofmt -w PATH",
+        "black PATH",
+        "ruff format PATH",
+        "python -c 'open(\"PATH\", \"w\").write(\"source\")'",
+        "python3 -c 'open(\"PATH\", \"a\").write(\"source\")'",
+        "python3 - <<'PY'\nfrom pathlib import Path\nPath(\"PATH\").write_text(\"source\")\nPY",
+        "node -e 'require(\"fs\").writeFileSync(\"PATH\", \"source\")'",
+    ];
+    for shape in shapes {
+        for path in [
+            "tracked.rs",
+            "new.rs",
+            "target/out.rs",
+            "ignored/out.rs",
+            "/tmp/aft-runon-write-proof.rs",
+            "/dev/null",
+            "$FILE",
+        ] {
+            // touch only changes timestamps on an existing file; no source edit
+            // can be lost unless it creates a new snapshot member.
+            let expected = matches!(path, "tracked.rs" | "new.rs")
+                && !(shape == "touch PATH" && path == "tracked.rs");
+            let command = shape.replace("PATH", path);
+            assert_eq!(
+                runon_write_refusal(&command, &request).is_some(),
+                expected,
+                "{command}"
+            );
+        }
+    }
+    assert!(
+        runon_write_refusal("cd sub && sed -i 's/a/b/' file.rs", &request)
+            .unwrap()
+            .contains("sub/file.rs")
+    );
+    assert!(runon_write_refusal("cargo fmt", &request).is_some());
+    assert!(runon_write_refusal("cp $SOURCE tracked.rs", &request).is_some());
+    assert!(runon_write_refusal("cp input $DESTINATION", &request).is_none());
+    assert!(runon_write_refusal("black $UNKNOWN tracked.rs", &request).is_some());
+    assert!(runon_write_refusal(
+        "git apply <<'EOF'\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        &request
+    )
+    .is_some());
+    for command in [
+        "cargo fmt --check",
+        "cargo fmt -- --check",
+        "ruff format --check tracked.rs",
+        "black --check tracked.rs",
+        "rustfmt --check tracked.rs",
+        "cargo fmt --help",
+        "rustfmt --emit stdout tracked.rs",
+        "black --diff tracked.rs",
+        "black --code 'print(1)'",
+        "ruff format --diff tracked.rs",
+        "cat tracked.rs",
+        "python3 -c 'open(\"tracked.rs\", \"r\").read()'",
+        "python3 -c 'print(\"open(\\\"tracked.rs\\\", \\\"w\\\")\")'",
+        "python3 -c 'open(path, \"w\").write(\"source\")'",
+    ] {
+        assert!(
+            runon_write_refusal(command, &request).is_none(),
+            "{command}"
+        );
+    }
+    let expected = format!("runon refused: this command writes {} (and 1 more), and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.", root.join("tracked.rs").display());
+    assert_eq!(
+        runon_write_refusal("tee tracked.rs new.rs", &request).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn runon_write_return_paths_exempt_only_the_resolved_requested_file() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let root = Path::new(&request.workspace_key);
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/golden.rs"), "golden\n").unwrap();
+    hermetic_git(root, &["add", "sub/golden.rs"]);
+    request.cwd = root.join("sub").to_string_lossy().into_owned();
+    request.return_paths = vec!["./golden.rs".into()];
+    assert!(runon_write_refusal(
+        "python3 -c 'open(\"golden.rs\", \"w\").write(\"new\")'",
+        &request
+    )
+    .is_none());
+    request.return_paths = vec!["other.rs".into()];
+    assert!(runon_write_refusal("echo new > golden.rs", &request).is_some());
+    request.return_paths = vec!["golden.rs".into()];
+    assert!(runon_write_refusal("echo new > ../other.rs", &request).is_some());
+}
+
+#[tokio::test]
+async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let command = "python3 - <<'PY' && cargo nextest run\np = 'source.rs'\nt = 'source'\nopen(p, 'w').write(t)\nPY";
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": command, "runon": "linux", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_eq!(done.exit_code, None);
+    assert_eq!(done.child_pid, None);
+    let refusal = refusal_response(done);
+    assert_eq!(refusal.data["code"], "runon_edits_checkout");
+    let expected = format!("runon refused: this command writes {}, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.", dir.path().canonicalize().unwrap().join("source.rs").display());
+    assert_eq!(refusal.data["message"], expected);
+    let task = ctx.bash_background().task(task_id).unwrap();
+    let state = task.state.lock().unwrap();
+    let persisted = serde_json::to_value(&state.metadata).unwrap();
+    assert_eq!(persisted["remote"]["pre_start_refusal"]["ran"], "none");
+    assert!(persisted["remote"]["job_id"].is_null());
+    assert!(persisted["remote"]["terminal"].is_null());
+    let restored: PersistedTask = serde_json::from_value(persisted).unwrap();
+    assert_eq!(
+        remote_refusal(&restored).unwrap().code,
+        "runon_edits_checkout"
+    );
+    assert!(
+        exec_runs(&daemon).is_empty(),
+        "a refused edit must never submit"
+    );
+    assert!(
+        !dir.path().join("source.rs").exists(),
+        "a refused edit must never run locally"
+    );
+}
+
+#[tokio::test]
+async fn runon_write_check_never_refuses_without_runon() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": "printf source > source.rs", "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert!(done.remote_refusal.is_none(), "{done:?}");
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert!(exec_runs(&daemon).is_empty());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("source.rs")).unwrap(),
+        "source"
+    );
 }
 
 #[test]

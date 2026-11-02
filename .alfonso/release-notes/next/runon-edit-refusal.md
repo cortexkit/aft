@@ -1,0 +1,1 @@
+- AFT refuses a `runon` command that edits a checkout file before sending it to the build server, because the build server's changes are never copied back; the bash guidance now says what comes back from a `runon` job.

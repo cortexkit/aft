@@ -807,6 +807,8 @@ impl RemoteOutputIncomplete {
 pub(crate) enum RemotePreStartRefusal {
     #[serde(rename = "runon_cd_outside_checkout")]
     CdOutsideCheckout { message: String, ran: Ran },
+    #[serde(rename = "runon_edits_checkout")]
+    EditsCheckout { message: String, ran: Ran },
 }
 
 impl RemotePreStartRefusal {
@@ -814,6 +816,10 @@ impl RemotePreStartRefusal {
         match self {
             Self::CdOutsideCheckout { message, .. } => super::RemoteRefusal {
                 code: "runon_cd_outside_checkout",
+                message: message.clone(),
+            },
+            Self::EditsCheckout { message, .. } => super::RemoteRefusal {
+                code: "runon_edits_checkout",
                 message: message.clone(),
             },
         }
@@ -2186,6 +2192,7 @@ enum Attached {
 enum RemoteRequestError {
     Build(exec::Error),
     CdOutsideCheckout(String),
+    EditsCheckout(String),
 }
 
 #[cfg(unix)]
@@ -2193,7 +2200,7 @@ impl std::fmt::Display for RemoteRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Build(error) => error.fmt(f),
-            Self::CdOutsideCheckout(message) => f.write_str(message),
+            Self::CdOutsideCheckout(message) | Self::EditsCheckout(message) => f.write_str(message),
         }
     }
 }
@@ -2203,6 +2210,69 @@ const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command chan
 
 #[cfg(unix)]
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
+
+#[cfg(unix)]
+const RUNON_EDITS_CHECKOUT_MESSAGE: &str = "runon refused: this command writes <path>, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.";
+
+#[cfg(unix)]
+fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let checkout = Path::new(&request.workspace_key);
+    let cwd = Path::new(&request.cwd);
+    let returned: Vec<_> = request
+        .return_paths
+        .iter()
+        .map(|path| crate::bash_permissions::resolve_with_existing_ancestors(&cwd.join(path)))
+        .collect();
+    let paths = crate::bash_permissions::writes::literal_write_targets(command, cwd, &|path| {
+        runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline)
+    });
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|path| {
+            if returned.contains(path) {
+                return false;
+            }
+            runon_snapshot_write_target(checkout, path, deadline)
+        })
+        .collect();
+    let first = paths.first()?;
+    let mut display = first.display().to_string();
+    if paths.len() > 1 {
+        display.push_str(&format!(" (and {} more)", paths.len() - 1));
+    }
+    Some(RUNON_EDITS_CHECKOUT_MESSAGE.replace("<path>", &display))
+}
+
+/// Match the runner's tracked/non-ignored snapshot, including new output paths.
+/// Git's normal check-ignore behavior preserves tracked files even if ignored.
+#[cfg(unix)]
+fn runon_snapshot_write_target(checkout: &Path, path: &Path, deadline: Instant) -> bool {
+    let Ok(relative) = path.strip_prefix(checkout) else {
+        return false;
+    };
+    if relative.starts_with("target") || Instant::now() >= deadline {
+        return false;
+    }
+    if path.is_dir() && runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline) {
+        return true;
+    }
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(checkout)
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::format::isolate_in_process_group(&mut command);
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    crate::format::wait_with_deadline(child, "git", deadline, || false)
+        .is_ok_and(|output| output.status.code() == Some(1))
+}
 
 #[cfg(unix)]
 fn runon_snapshot_directory_known(
@@ -2662,6 +2732,9 @@ impl BgTaskRegistry {
                     {
                         return Err(RemoteRequestError::CdOutsideCheckout(message));
                     }
+                    if let Some(message) = runon_write_refusal(command, &request) {
+                        return Err(RemoteRequestError::EditsCheckout(message));
+                    }
                 }
                 Ok(request)
             });
@@ -3110,6 +3183,16 @@ impl BgTaskRegistry {
         }
         if let Some((Err(RemoteRequestError::CdOutsideCheckout(message)), _)) = initial.as_ref() {
             self.refuse_cd_before_start(&task, message);
+            return Ok(());
+        }
+        if let Some((Err(RemoteRequestError::EditsCheckout(message)), _)) = initial.as_ref() {
+            self.refuse_before_start(
+                &task,
+                RemotePreStartRefusal::EditsCheckout {
+                    message: message.clone(),
+                    ran: Ran::None,
+                },
+            );
             return Ok(());
         }
         if let Some((
@@ -4362,6 +4445,17 @@ impl BgTaskRegistry {
     /// The path check runs before runner connection or submission. Record that
     /// the command did not run, without a runner verdict or local fallback.
     fn refuse_cd_before_start(&self, task: &Arc<BgTask>, message: &str) {
+        self.refuse_before_start(
+            task,
+            RemotePreStartRefusal::CdOutsideCheckout {
+                message: message.to_owned(),
+                ran: Ran::None,
+            },
+        );
+    }
+
+    fn refuse_before_start(&self, task: &Arc<BgTask>, refusal: RemotePreStartRefusal) {
+        let message = refusal.as_response().message;
         {
             let mut db = DeferredDbWrites::new(self, task);
             let Ok(mut state) = task.state.lock() else {
@@ -4373,10 +4467,7 @@ impl BgTaskRegistry {
             let Some(remote) = state.metadata.remote.as_mut() else {
                 return;
             };
-            remote.pre_start_refusal = Some(RemotePreStartRefusal::CdOutsideCheckout {
-                message: message.to_owned(),
-                ran: Ran::None,
-            });
+            remote.pre_start_refusal = Some(refusal);
             state.metadata.execution_note = Some(message.to_owned());
             state
                 .metadata
