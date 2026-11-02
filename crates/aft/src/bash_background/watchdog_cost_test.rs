@@ -626,6 +626,9 @@ fn watchdog_cost_terminal_persist_retry_does_not_rewrite_a_successful_retry() {
         .insert_rehydrated_task(metadata, paths.clone(), false)
         .unwrap();
     let task = registry.task(&paths.task_id).unwrap();
+    // A dirty flag alone no longer requires a replacement when the terminal
+    // record already matches disk. Give the successful retry a real change.
+    task.lock_state().unwrap().metadata.status_reason = Some("retry persisted this reason".into());
     task.terminal_persist_dirty.store(true, Ordering::SeqCst);
     let (checked_tx, checked_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -655,11 +658,36 @@ fn watchdog_cost_terminal_persist_retry_does_not_rewrite_a_successful_retry() {
     let sequential = work_counts::get().metadata_writes;
     eprintln!("terminal persist writes: successful retry={first}, concurrent retry={concurrent}, 20 later retries={sequential}");
     assert_eq!(first, 1);
+    assert_eq!(
+        super::super::persistence::read_task(&paths.json)
+            .unwrap()
+            .status_reason
+            .as_deref(),
+        Some("retry persisted this reason")
+    );
+    assert!(!task.terminal_persist_dirty.load(Ordering::SeqCst));
     assert_eq!(sequential, 0);
     assert_eq!(
         concurrent, 0,
         "another caller already persisted this terminal state"
     );
+}
+
+#[test]
+fn metadata_persistence_equal_terminal_retry_clears_dirty_without_replacement() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (metadata, paths) = fixture(storage.path(), "session", false, 0);
+    registry
+        .insert_rehydrated_task(metadata, paths.clone(), false)
+        .unwrap();
+    let task = registry.task(&paths.task_id).unwrap();
+    task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+    work_counts::reset();
+    registry.retry_terminal_persist(&task).unwrap();
+    assert!(!task.terminal_persist_dirty.load(Ordering::SeqCst));
+    assert_eq!(work_counts::get().metadata_writes, 0);
+    assert_eq!(work_counts::get().renames, 0);
 }
 
 #[test]

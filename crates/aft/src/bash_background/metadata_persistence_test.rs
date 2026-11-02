@@ -59,6 +59,116 @@ fn metadata_persistence_equal_checkpoint_keeps_durability_upgrade() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn metadata_persistence_compare_open_failure_falls_back_to_durable_replacement() {
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Interrupted] {
+        let storage = tempfile::tempdir().unwrap();
+        let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+        let metadata = metadata(&task);
+        write_task_at(&task, &metadata).unwrap();
+        let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+        let injected = opens.clone();
+        work_counts::reset();
+        with_openat_file_hook(
+            Box::new(move |_, name, _| {
+                if name != OsStr::new(METADATA_FILE) {
+                    return None;
+                }
+                injected.set(injected.get() + 1);
+                Some(Err(io::Error::new(
+                    kind,
+                    "injected comparison open failure",
+                )))
+            }),
+            || write_task_at_with(&task, &metadata, ReplaceSync::FileAndDirectory),
+        )
+        .unwrap();
+        assert_eq!(opens.get(), 1);
+        let counts = work_counts::get();
+        assert_eq!(counts.metadata_writes, 1);
+        assert_eq!(counts.renames, 1);
+        assert_eq!(counts.syncs, 2);
+        assert_eq!(
+            fs::read(&task.paths.json).unwrap(),
+            serde_json::to_vec_pretty(&metadata).unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_persistence_compare_read_failure_falls_back_to_replacement() {
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    let path = task.paths.json.clone();
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0));
+    let injected = opens.clone();
+    work_counts::reset();
+    with_openat_file_hook(
+        Box::new(move |_, name, _| {
+            if name != OsStr::new(METADATA_FILE) {
+                return None;
+            }
+            injected.set(injected.get() + 1);
+            // A regular but write-only handle passes validation and makes the
+            // byte comparison's read fail with EBADF on both Linux and macOS.
+            Some(OpenOptions::new().write(true).open(&path))
+        }),
+        || write_task_at(&task, &metadata),
+    )
+    .unwrap();
+    assert_eq!(opens.get(), 1);
+    assert_eq!(work_counts::get().metadata_writes, 1);
+    assert_eq!(work_counts::get().renames, 1);
+    assert_eq!(
+        fs::read(&task.paths.json).unwrap(),
+        serde_json::to_vec_pretty(&metadata).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_persistence_compare_replaced_handle_falls_back_to_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    let storage = tempfile::tempdir().unwrap();
+    let task = allocate_task_layout(storage.path(), "metadata-persistence").unwrap();
+    let metadata = metadata(&task);
+    write_task_at(&task, &metadata).unwrap();
+    let path = task.paths.json.clone();
+    let control = PinnedDir::open(&task.paths.control_dir).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let replacements = std::rc::Rc::new(std::cell::Cell::new(0));
+    let injected = replacements.clone();
+    work_counts::reset();
+    with_artifact_validation_hook_for_test(
+        move |file| {
+            let opened = file.metadata().unwrap();
+            let current = fs::metadata(&path).unwrap();
+            if (opened.dev(), opened.ino()) == (current.dev(), current.ino()) {
+                randomized_atomic_replace(&control, OsStr::new(METADATA_FILE), &bytes).unwrap();
+                injected.set(injected.get() + 1);
+            }
+        },
+        || write_task_at(&task, &metadata),
+    )
+    .unwrap();
+    assert_eq!(replacements.get(), 1);
+    assert_eq!(work_counts::get().metadata_writes, 1);
+    assert_eq!(
+        work_counts::get().renames,
+        2,
+        "one racing writer plus the fallback"
+    );
+    assert_eq!(
+        fs::read(&task.paths.json).unwrap(),
+        serde_json::to_vec_pretty(&metadata).unwrap()
+    );
+}
+
 #[test]
 fn metadata_persistence_crash_child() {
     let Some(path) = std::env::var_os("AFT_METADATA_CRASH_PATH") else {
