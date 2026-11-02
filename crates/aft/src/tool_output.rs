@@ -1405,7 +1405,7 @@ mod tests {
                 ctx.hashline_bindings()
                     .register(
                         &root,
-                        "owner".into(),
+                        "owner",
                         crate::hashline::integration::RegistrationRequest {
                             configured_enabled: true,
                             edit_slot_survives: true,
@@ -1481,7 +1481,7 @@ mod tests {
             assert!(text.contains(&footer));
             let guard = ctx
                 .hashline_bindings()
-                .capture(root.clone(), "owner".into())
+                .capture(root.clone(), "owner")
                 .unwrap();
             guard.with_binding(|binding| {
                 let (_, snapshot) = binding.snapshots().iter().next().unwrap();
