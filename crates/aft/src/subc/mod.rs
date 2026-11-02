@@ -10768,7 +10768,8 @@ async fn hold_for_consent(
         }
         let frame = consent::held_frame(ver, route, corr, flags).ok()?;
         // A held RESPONSE ends the original REQUEST (tool-provider CONTRACT.md
-        // §4.4). Approved work continues through late_results, not keepalives.
+        // §4.4). If the call is approved later, its result is delivered as a
+        // separate late result, so this request must send no more keepalives.
         if let Some(progress) = &plain_run.progress {
             progress.close();
         }
