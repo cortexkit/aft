@@ -8946,6 +8946,7 @@ async fn handle_control_request(
                 configure_request_id.clone(),
                 {
                     let standing_actor = Arc::clone(standing_actor);
+                    let output_identity = route_identity.clone();
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
                             let bind_started = Instant::now();
@@ -8958,6 +8959,13 @@ async fn handle_control_request(
                                 None => dispatch(configure_req.clone(), ctx),
                             };
                             if response.success {
+                                output_identity.output_scope.get_or_init(|| {
+                                    Arc::new(crate::tool_output::OutputScope::new(
+                                        ctx,
+                                        &output_identity.session,
+                                        Some(&output_identity.harness),
+                                    ))
+                                });
                                 job_snapshot.store(
                                     ctx.config_live().applied_bind_snapshot().unwrap_or(0),
                                     Ordering::Release,

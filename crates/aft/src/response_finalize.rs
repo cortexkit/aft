@@ -158,6 +158,51 @@ pub(crate) fn finalize_tool_response_with_visibility(
     allow_bg_completions: bool,
     agent_visible: bool,
 ) {
+    finalize_tool_response_text(
+        response,
+        text,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+        agent_visible,
+        true,
+    );
+}
+
+/// Shell delivery can render the body again after checking whether the runner
+/// received the command.
+/// Leave it whole until the writer applies the budget to that final rendering.
+pub(crate) fn finalize_redisplayed_bash_response(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    allow_bg_completions: bool,
+) {
+    finalize_tool_response_text(
+        response,
+        text,
+        ctx,
+        session_id,
+        "bash",
+        allow_bg_completions,
+        true,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_tool_response_text(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+    agent_visible: bool,
+    cap_text: bool,
+) {
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -171,7 +216,9 @@ pub(crate) fn finalize_tool_response_with_visibility(
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
-    crate::tool_output::cap(ctx, session_id, attach_command, response, text);
+    if cap_text {
+        crate::tool_output::cap(ctx, session_id, attach_command, response, text);
+    }
 }
 
 /// Foreground and watch replies consume terminal results for their originating

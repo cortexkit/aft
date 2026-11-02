@@ -637,7 +637,7 @@ fn effective_identity(
         let _ = run_scope.set(Arc::clone(scope));
     }
     RouteIdentity(Arc::new(RouteIdentityData {
-        output_scope: Default::default(),
+        output_scope: owner.output_scope.clone(),
         root: owner.root.clone(),
         project_root: owner.project_root.clone(),
         harness: owner.harness.clone(),

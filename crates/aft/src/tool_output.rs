@@ -754,4 +754,32 @@ mod tests {
         assert!(!path.exists() && !persisted.exists());
         assert!(ctx.output_files().owner(&path).is_none());
     }
+
+    #[test]
+    fn tool_output_cap_redisplayed_bash_defers_cut_until_final_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let body = "shell output\n".repeat(20_000);
+        let mut response = Response::success("id", json!({"output":body}));
+        let mut text = format!("{body}\ncompletion reminder\nstatus bar");
+        crate::response_finalize::finalize_redisplayed_bash_response(
+            &mut response,
+            &mut text,
+            &ctx,
+            "owner",
+            false,
+        );
+        assert!(text.starts_with(&body));
+        assert!(
+            text.len() > TEXT_LIMIT,
+            "a redisplay still needs the whole body and suffix"
+        );
+        let original = text.clone();
+        cap(&ctx, "owner", "bash", &response, &mut text);
+        assert!(text.len() <= TEXT_LIMIT);
+        assert_eq!(
+            std::fs::read_to_string(saved_path(&text)).unwrap(),
+            original
+        );
+    }
 }

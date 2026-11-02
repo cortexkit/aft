@@ -170,6 +170,35 @@ fn codemode_reply_format_belongs_to_run_while_access_belongs_to_head() {
 }
 
 #[test]
+fn tool_output_cap_codemode_uses_the_owning_sessions_output_scope() {
+    let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            storage_dir: Some(storage.path().into()),
+            ..Default::default()
+        },
+    )
+    .with_test_checkpoint_store();
+    let scope = Arc::new(crate::tool_output::OutputScope::new(
+        &ctx,
+        "head-a-session",
+        Some("opencode"),
+    ));
+    f.routes[&channel(1)]
+        .output_scope
+        .set(scope.clone())
+        .unwrap();
+    let effective = owner(admit(
+        &f.routes,
+        channel(9),
+        Some(&call("read", json!({"path":"notes.txt"}))),
+    ));
+    assert!(Arc::ptr_eq(effective.output_scope.get().unwrap(), &scope));
+}
+
+#[test]
 fn codemode_call_to_tool_without_codemode_is_refused_call_mode_unsupported() {
     let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
     let body = call("bash_watch", json!({"taskId": "absent"}));

@@ -1160,12 +1160,11 @@ fn finalized_bash_result(
     if let Some(repeat) = repeat {
         repeat.observe(ctx, &mut text);
     }
-    crate::response_finalize::finalize_tool_response(
+    crate::response_finalize::finalize_redisplayed_bash_response(
         &mut response,
         &mut text,
         ctx,
         session_id,
-        "bash",
         allow_bg_completions,
     );
     ToolCallResult { text, response }

@@ -674,7 +674,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "tool_output.rs",
-        enclosing_item: "render_cut, read, cleanup_expired",
+        enclosing_item: "render_cut, read, cleanup_expired, SCAN_ENTRIES",
         location_or_primitive: "rendered reply and saved artifact byte bounds",
         reason: "a transport-independent text byte budget, not a list surface; preserves list envelopes and saves the uncut reply in a session-private file with a recovery trailer; artifact reads have a separate 64 MiB allocation guard and retention cleanup bounds each directory scan",
     },
