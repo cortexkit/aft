@@ -15540,7 +15540,13 @@ mod tests {
         .unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         let storage = temp.path().join("storage");
-        let ctx = Arc::new(test_context());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        ));
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
         let executor = daemon.then(|| {
             Executor::with_config(ExecutorConfig {
@@ -15643,7 +15649,7 @@ mod tests {
         });
         let accounted = executor.as_ref().map(|executor| {
             (
-                executor.try_root_job_snapshots(&root_id),
+                executor.try_root_job_snapshots(&root_id, None),
                 executor
                     .try_dispatch_liveness_snapshot()
                     .unwrap()
@@ -15656,8 +15662,8 @@ mod tests {
             executor.cancel_root_maintenance(&root_id);
         }
         let cancelled_answer = answer_rx.recv_timeout(Duration::from_secs(4));
-        // A broken cancellation path is released explicitly before assertions,
-        // so the regression cannot strand its materializer or fixture teardown.
+        // If cancellation fails, release the blocked graph builder before
+        // assertions so it cannot keep running or prevent fixture teardown.
         let _ = release_tx.send(());
         read.join().unwrap();
         let prompt = cancelled_answer.is_ok();
