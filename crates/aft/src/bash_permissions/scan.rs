@@ -997,16 +997,20 @@ fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
             continue;
         }
 
-        if matches!(
-            child.kind(),
-            "command_name"
-                | "command_name_expr"
-                | "word"
-                | "string"
-                | "raw_string"
-                | "concatenation"
-                | "number"
-        ) {
+        // Keep expansion operands even when their values are unknown. Dropping
+        // `$DEST` would turn `cd $DEST` into bare `cd` and invent HOME as its cwd.
+        if is_dynamic_node(child)
+            || matches!(
+                child.kind(),
+                "command_name"
+                    | "command_name_expr"
+                    | "word"
+                    | "string"
+                    | "raw_string"
+                    | "concatenation"
+                    | "number"
+            )
+        {
             out.push(Part {
                 text: node_text(source, child).to_string(),
             });
@@ -1668,6 +1672,8 @@ mod tests {
         let cwd = dir.path().canonicalize().unwrap();
         for prefix in [
             "cd \"$X\"",
+            "cd $X",
+            "cd ${X}",
             "pushd \"$X\"",
             "cd -",
             "pushd +1",
@@ -2677,6 +2683,12 @@ mod tests {
                 .all(|ask| ask.kind != PermissionKind::ExternalDirectory),
             "{asks:?}"
         );
+    }
+
+    #[test]
+    fn variable_directory_change_cannot_inherit_home_project_exemption() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        assert_unknown_cwd_ask("W=/usr; cd $W || exit 1; cp rel/a rel/b", &home);
     }
 
     #[test]
