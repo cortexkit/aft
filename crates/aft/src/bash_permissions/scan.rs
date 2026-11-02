@@ -2613,23 +2613,70 @@ mod tests {
     }
 
     #[test]
-    fn home_directory_change_guard_does_not_invent_external_targets() {
-        let project = tempfile::tempdir().unwrap();
-        for command in [
-            "cd ~/sub/dir || exit 1; cp rel/a rel/b",
-            r#"cd "$HOME/x"; cp rel/a rel/b"#,
+    fn home_directory_change_guards_preserve_known_targets() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        for (command, suffix) in [
+            ("cd ~/sub/dir || exit 1; cp rel/a rel/b", "sub/dir"),
+            ("cd ~/x && cp rel/a rel/b", "x"),
+            ("cd ~ && cp rel/a rel/b", ""),
         ] {
-            let asks = scan_with_project_root(command, project.path(), project.path());
+            let asks = scan_with_project_root(command, &home.join(suffix), cwd.path());
             assert!(
-                asks.iter().any(|ask| ask.reason.as_deref()
-                    == Some(UNKNOWN_CWD_PERMISSION_REASON)),
+                asks.iter().all(|ask| ask.reason.is_none()),
                 "{command}: {asks:?}"
             );
             assert!(
-                asks.iter().all(|ask| ask.kind != PermissionKind::ExternalDirectory),
+                asks.iter()
+                    .all(|ask| ask.kind != PermissionKind::ExternalDirectory),
                 "{command}: {asks:?}"
             );
         }
+    }
+
+    #[test]
+    fn variable_directory_changes_never_fall_back_to_home() {
+        let project = tempfile::tempdir().unwrap();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for command in [
+            "W=~/x/y; cd $W || exit 1; cp rel/a rel/b",
+            r#"W=~/x/y; cd "$W" || exit 1; cp rel/a rel/b"#,
+            "W=~/x/y; cd ${W} || exit 1; cp rel/a rel/b",
+        ] {
+            let asks = scan_with_project_root(command, project.path(), project.path());
+            let unknown = asks
+                .iter()
+                .any(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON));
+            let targets: Vec<_> = asks
+                .iter()
+                .flat_map(|ask| ask.targets.iter().map(|target| target.path.clone()))
+                .collect();
+            actual.push((command, unknown, targets));
+            expected.push((command, true, Vec::<PathBuf>::new()));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn variable_directory_change_in_worktree_command_keeps_paths_unknown() {
+        let project = tempfile::tempdir().unwrap();
+        let command = concat!(
+            "cd ~/Work/Projects/CortexKit/aft || exit 1; ",
+            "W=~/Work/Projects/CortexKit-scratch/aft-drop-stale-lock; ",
+            "[ -d $W ] && git worktree remove --force $W; ",
+            "git worktree add -q -b land/drop-stale-plugin-lockfile $W origin/main ",
+            "&& cd $W || exit 1; git rm -q packages/opencode-plugin/bun.lock; ",
+            "cp benchmarks/aft-search/slice-descriptors/a.json ",
+            "benchmarks/aft-search/slice-descriptors/b.json"
+        );
+        assert_unknown_cwd_ask(command, project.path());
+        let asks = scan_with_project_root(command, project.path(), project.path());
+        assert!(
+            asks.iter()
+                .all(|ask| ask.kind != PermissionKind::ExternalDirectory),
+            "{asks:?}"
+        );
     }
 
     #[test]
