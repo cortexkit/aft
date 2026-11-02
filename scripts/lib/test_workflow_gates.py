@@ -676,7 +676,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         job = suite["jobs"]["unit-macos-libtest-archive"]
         self.assertEqual(
             job["env"].get("LIBTEST_CARGO_CONFIG"),
-            "profile.test.package.agent-file-tools.codegen-units=16",
+            "profile.test.package.agent-file-tools.codegen-units=256",
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])

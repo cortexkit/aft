@@ -736,7 +736,7 @@ jobs:
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: macos-26
+    runs-on: blacksmith-6vcpu-macos-26
     # Keep the hang ceiling independent of compiler tuning: even a hot
     # dependency cache cannot cache the library's executable test harness.
     timeout-minutes: 45
@@ -745,10 +745,9 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
-      # Use the non-incremental default rather than 256 LLVM modules on the
-      # memory-constrained macOS runner. Keep dependency profiles and the
+      # Keep dependency profiles, debug assertions, unwind behavior, and the
       # backtrace probe's line tables unchanged.
-      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=16
+      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
 
