@@ -1478,6 +1478,104 @@ fn config_target_fallback_hashes_bounded_content_and_stops_when_attached() {
     );
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn config_target_shares_canonical_directory_watch_and_keeps_actual_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config");
+    let alias = dir.path().join("config-alias");
+    std::fs::create_dir(&config_dir).unwrap();
+    let original = config_dir.join("aft.jsonc");
+    std::fs::write(&original, "{}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&config_dir, &alias).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&config_dir, &alias).unwrap();
+    let file = alias.join("aft.jsonc");
+    let mut attachment = DirAttachment::new(alias.clone());
+    assert!(attachment.attach(&mut |_| Ok(())));
+    let (tx, _rx) = mpsc::channel();
+    let counters = Arc::new(crate::context::WatcherCounters::default());
+    let mut target = None;
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &attachment,
+        &tx,
+        &counters,
+        true,
+    ));
+    {
+        let target = target.as_ref().unwrap();
+        assert!(
+            target.watcher.is_none(),
+            "an ancestor alias shares the link's watch"
+        );
+        assert!(target.attachment.watched().is_none());
+        assert!(
+            target.fingerprint.is_none(),
+            "the shared watch needs no content poll"
+        );
+    }
+
+    let actual = config_dir.join("settings.jsonc");
+    std::fs::write(&actual, r#"{"bash":{"enabled":false}}"#).unwrap();
+    std::fs::remove_file(&original).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&actual, &original).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&actual, &original).unwrap();
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &attachment,
+        &tx,
+        &counters,
+        true,
+    ));
+    {
+        let target = target.as_mut().unwrap();
+        assert!(
+            target.watcher.is_none(),
+            "a same-folder file link also shares the watch"
+        );
+        assert_eq!(target.file, std::fs::canonicalize(&actual).unwrap());
+        let changes = std::cell::Cell::new(0);
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(target.file.clone());
+        assert!(handle_config_watch_event(
+            &target.file,
+            &event,
+            &mut target.attachment,
+            &|| changes.set(changes.get() + 1),
+        ));
+        assert_eq!(
+            changes.get(),
+            1,
+            "the shared watch recognizes the target's actual name"
+        );
+    }
+
+    let unattached = DirAttachment::new(alias);
+    assert!(refresh_config_target_watch(
+        &file,
+        &mut target,
+        &unattached,
+        &tx,
+        &counters,
+        true,
+    ));
+    assert!(target.as_ref().unwrap().watcher.is_none());
+    assert!(
+        target.as_ref().unwrap().fingerprint.is_some(),
+        "a failed shared attachment still polls"
+    );
+    refresh_config_target_watch(&file, &mut target, &attachment, &tx, &counters, true);
+    assert!(target.as_ref().unwrap().fingerprint.is_none());
+}
+
 #[test]
 fn reverting_the_project_file_releases_the_hold() {
     let fixture = Fixture::new(

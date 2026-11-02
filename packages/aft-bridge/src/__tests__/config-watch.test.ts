@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -255,7 +256,8 @@ describe("watchAftConfigFiles", () => {
       },
     });
     try {
-      expect(watched).toContain(dotfiles);
+      expect(watched.map((path) => realpathSync(path))).toContain(realpathSync(dotfiles));
+      expect(watched).toHaveLength(2);
       writeFileSync(target, '{ "bash": { "env": { "TEST": "edited" } } }');
       await waitUntil(() => changes >= 1, "symlink target edit reloaded");
 
@@ -275,7 +277,7 @@ describe("watchAftConfigFiles", () => {
       rmSync(file);
       symlinkSync(alternate, file, "file");
       await waitUntil(() => changes >= 5, "retargeted link reloaded");
-      expect(watched).toContain(other);
+      expect(watched.map((path) => realpathSync(path))).toContain(realpathSync(other));
       writeFileSync(alternate, '{ "bash": { "env": { "TEST": "edited again" } } }');
       await waitUntil(() => changes >= 6, "new target edit reloaded");
     } finally {
@@ -292,14 +294,24 @@ describe("watchAftConfigFiles", () => {
     const configDir = join(dir, "cortexkit");
     symlinkSync(dotfiles, configDir, "dir");
     let changes = 0;
+    const watched: string[] = [];
     const stop = watchAftConfigFiles({
       paths: [join(configDir, "aft.jsonc")],
       debounceMs: 20,
+      watchImpl: ((
+        path: string,
+        options: { persistent: boolean },
+        listener: (event: string, filename: string | null) => void,
+      ) => {
+        watched.push(path);
+        return watch(path, options, listener);
+      }) as unknown as typeof watch,
       onChange: () => {
         changes += 1;
       },
     });
     try {
+      expect(watched).toEqual([configDir]);
       writeFileSync(target, '{ "bash": { "enabled": false } }');
       await waitUntil(() => changes >= 1, "target under a directory symlink reloaded");
     } finally {
@@ -328,7 +340,7 @@ describe("watchAftConfigFiles", () => {
         options: { persistent: boolean },
         listener: (event: string, filename: string | null) => void,
       ) => {
-        if (String(path) === dotfiles) {
+        if (realpathSync(String(path)) === realpathSync(dotfiles)) {
           attempted = true;
           throw new Error("target watch unavailable");
         }
@@ -343,6 +355,39 @@ describe("watchAftConfigFiles", () => {
       writeFileSync(target, '{ "value": "after!" }');
       utimesSync(target, metadata.atime, metadata.mtime);
       await waitUntil(() => changes >= 1, "unwatchable target edit reloaded");
+    } finally {
+      stop();
+    }
+  });
+
+  test("a same-folder file symlink shares the directory watch and notices its actual name", async () => {
+    const dir = tempDir();
+    const file = join(dir, "aft.jsonc");
+    const target = join(dir, "settings.jsonc");
+    writeFileSync(target, "{}");
+    symlinkSync(target, file, "file");
+    const watched: string[] = [];
+    let changes = 0;
+    const stop = watchAftConfigFiles({
+      paths: [file],
+      debounceMs: 20,
+      watchImpl: ((
+        path: string,
+        options: { persistent: boolean },
+        listener: (event: string, filename: string | null) => void,
+      ) => {
+        watched.push(path);
+        return watch(path, options, listener);
+      }) as unknown as typeof watch,
+      onChange: () => {
+        changes += 1;
+      },
+    });
+    try {
+      expect(watched).toEqual([dir]);
+      writeFileSync(target, '{ "bash": { "enabled": false } }');
+      await waitUntil(() => changes >= 1, "same-folder target's actual name reloaded");
+      expect(watched).toEqual([dir]);
     } finally {
       stop();
     }

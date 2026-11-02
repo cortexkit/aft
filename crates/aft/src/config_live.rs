@@ -1394,7 +1394,8 @@ fn config_file_fingerprint(file: &Path) -> Result<ConfigFileFingerprint, std::io
 struct ConfigTargetWatch {
     file: PathBuf,
     // Native directory watchers replace their single attachment on watch(),
-    // so the target needs its own watcher to leave the link's watch intact.
+    // so a target in another physical folder needs its own watcher. Targets in
+    // the link's canonical folder share its watch but retain their actual name.
     watcher: Option<ConfigDirectoryWatcher>,
     attachment: DirAttachment,
     fingerprint: Option<Result<ConfigFileFingerprint, std::io::ErrorKind>>,
@@ -1415,9 +1416,17 @@ impl ConfigTargetWatch {
     }
 }
 
+fn config_directories_match(first: &Path, second: &Path) -> bool {
+    match (std::fs::canonicalize(first), std::fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
+}
+
 fn refresh_config_target_watch(
     file: &Path,
     target: &mut Option<ConfigTargetWatch>,
+    link_attachment: &DirAttachment,
     tx: &mpsc::Sender<notify::Result<notify::Event>>,
     counters: &Arc<crate::context::WatcherCounters>,
     poll_content: bool,
@@ -1445,6 +1454,29 @@ fn refresh_config_target_watch(
     let Some(target) = target else {
         return changed;
     };
+    if file
+        .parent()
+        .is_some_and(|parent| config_directories_match(parent, &target.attachment.dir))
+    {
+        // An ancestor alias such as /var -> /private/var does not need another
+        // native watch. Keep the target path for same-folder file symlinks whose
+        // actual filename differs from the configured filename.
+        if target.watcher.take().is_some() {
+            target.attachment = DirAttachment::new(target.attachment.dir.clone());
+        }
+        if poll_content {
+            let covered = !link_attachment.stale
+                && link_attachment.watched().is_some_and(|watched| {
+                    config_directories_match(watched, &target.attachment.dir)
+                });
+            if covered {
+                target.fingerprint = None;
+            } else {
+                changed |= target.poll_if_unattached(file);
+            }
+        }
+        return changed;
+    }
     if target.watcher.is_none() {
         target.watcher = new_config_directory_watcher(tx.clone(), Arc::clone(counters)).ok();
     }
@@ -1494,7 +1526,7 @@ fn run_config_file_watch(
     let mut attachment = DirAttachment::new(dir.clone());
     attach_config_directory(&mut watcher, &mut attachment);
     let mut target = None;
-    if refresh_config_target_watch(&file, &mut target, &tx, &counters, true) {
+    if refresh_config_target_watch(&file, &mut target, &attachment, &tx, &counters, true) {
         on_change();
     }
     let mut next_target_check = Instant::now() + CONFIG_TARGET_RECHECK;
@@ -1549,7 +1581,14 @@ fn run_config_file_watch(
             Instant::now(),
             refresh_target,
             |poll_content| {
-                refresh_config_target_watch(&file, &mut target, &tx, &counters, poll_content)
+                refresh_config_target_watch(
+                    &file,
+                    &mut target,
+                    &attachment,
+                    &tx,
+                    &counters,
+                    poll_content,
+                )
             },
         ) {
             on_change();

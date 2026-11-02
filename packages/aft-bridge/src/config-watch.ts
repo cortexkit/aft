@@ -318,6 +318,14 @@ function watchDirFor(file: string): string {
   return dir;
 }
 
+function canonicalDirectory(dir: string): string {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return resolve(dir);
+  }
+}
+
 /**
  * Watch config files the way editors save them: the parent directory is
  * watched, because an editor replaces the file by renaming a temporary
@@ -402,7 +410,17 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
 
   /** Bring the watches in line with the directories on disk. */
   function revalidate(): boolean {
-    const wanted = new Set(options.paths.map(watchDirFor));
+    const wanted = new Set<string>();
+    const wantedCanonical = new Set<string>();
+    const wantDirectory = (dir: string): void => {
+      const canonical = canonicalDirectory(dir);
+      if (wantedCanonical.has(canonical)) return;
+      wantedCanonical.add(canonical);
+      wanted.add(dir);
+    };
+    // Keep the literal folder watch when an ancestor alias (such as /var on
+    // macOS) resolves to the same folder as the target. One watch sees both names.
+    for (const path of options.paths) wantDirectory(watchDirFor(path));
     let moved = false;
     for (const path of options.paths) {
       try {
@@ -420,7 +438,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
         // target is noticed without an event in the link's directory.
       }
     }
-    for (const target of targets.values()) wanted.add(watchDirFor(target));
+    for (const target of targets.values()) wantDirectory(watchDirFor(target));
     for (const [dir, entry] of watchers) {
       // A directory that is no longer wanted (its child appeared) or that was
       // replaced under the watch is dropped and, if still wanted, re-armed.
@@ -468,8 +486,9 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
         // revalidation finds its nearest existing ancestor.
       }
     }
+    const watchedCanonical = new Set(Array.from(watchers.keys(), canonicalDirectory));
     for (const [path, target] of targets) {
-      if (watchers.has(dirname(target))) {
+      if (watchedCanonical.has(canonicalDirectory(dirname(target)))) {
         fallbackSeen.delete(path);
         continue;
       }
