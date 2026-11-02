@@ -11763,6 +11763,7 @@ async fn handle_tool_call_with_capabilities(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                keepalive: progress.clone(),
                 speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
                 run_scope: identity.run_scope.get().cloned(),
                 scope: identity.scope.clone(),
@@ -11826,6 +11827,7 @@ async fn handle_tool_call_with_capabilities(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            keepalive: progress.clone(),
             speech_seed: speech_launch_seed(&identity, route_id, daemon_control),
             run_scope: identity.run_scope.get().cloned(),
             scope: identity.scope.clone(),
@@ -17447,6 +17449,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        keepalive: None,
                         speech_seed: None,
                         run_scope: None,
                         scope: None,

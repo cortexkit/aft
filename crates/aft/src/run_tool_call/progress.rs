@@ -1,5 +1,5 @@
-//! A call-scoped, non-blocking progress channel. Only completed work reports here;
-//! waiting and cancellation probes are deliberately not progress.
+//! A call-scoped, non-blocking progress channel. Completed work and live child
+//! supervision report here; a blocked observation must not report progress.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

@@ -1,9 +1,9 @@
 use super::*;
 
 static JOBS: LazyLock<std::sync::Mutex<HashMap<u64, TestJob>>> = LazyLock::new(Default::default);
-static CLOCKS: LazyLock<std::sync::Mutex<HashMap<u64, Arc<AtomicU64>>>> =
+pub(super) static CLOCKS: LazyLock<std::sync::Mutex<HashMap<u64, Arc<AtomicU64>>>> =
     LazyLock::new(Default::default);
-static NEXT: AtomicU64 = AtomicU64::new(800_000);
+pub(super) static NEXT: AtomicU64 = AtomicU64::new(800_000);
 
 pub(super) fn clock(corr: u64) -> Option<Arc<AtomicU64>> {
     CLOCKS.lock().unwrap().get(&corr).cloned()
