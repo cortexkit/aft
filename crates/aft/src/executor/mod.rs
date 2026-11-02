@@ -1642,8 +1642,9 @@ impl Executor {
         job: ExecutorJob,
         cancellation: JobCancellation,
     ) -> oneshot::Receiver<Response> {
-        // Views build on their own maintenance-heavy job. Graph reads must not
-        // hold or wait for that job's heavy permit, even in a one-permit pool.
+        // Checkout callgraph views rebuild as Maintenance/HeavyInit jobs.
+        // Admit their tool reads as PureRead so a one-permit pool can answer
+        // Building while the rebuild owns the heavy permit.
         let lane = if lane == Lane::HeavyInit
             && matches!(
                 tool,
