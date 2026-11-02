@@ -81,6 +81,17 @@ pub enum Lane {
     ProviderMetadata,
 }
 
+/// Read-only navigation tools use the same lanes in both transports. Graph
+/// queries can initialize a large index, so they must not consume the read cap.
+pub fn parallel_tool_lane(command: &str) -> Option<Lane> {
+    match command {
+        "grep" | "glob" | "outline" | "zoom" => Some(Lane::PureRead),
+        "callgraph" | "callers" | "impact" | "call_tree" | "trace_to" | "trace_to_symbol"
+        | "trace_data" => Some(Lane::HeavyInit),
+        _ => None,
+    }
+}
+
 const ALL_LANES: [Lane; 6] = [
     Lane::PureRead,
     Lane::SerialLspStatus,
@@ -1571,6 +1582,34 @@ impl Executor {
             cancellation.clone(),
         );
         (completion_rx, cancellation)
+    }
+
+    /// Submit with a transport completion callback. The callback runs after the
+    /// terminal response exists, including admission refusals and cancellation,
+    /// so a synchronous transport can wake its frame loop without a waiter thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_tool_call_with_completion(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob,
+        cancellation: JobCancellation,
+        completion: Box<dyn FnOnce(Response) + Send>,
+    ) {
+        self.submit_labeled(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            tool.to_string(),
+            job,
+            CompletionSender::Callback(completion),
+            Some(cancellation),
+            None,
+            None,
+        );
     }
 
     /// Allows a receipt deadline to cancel admission even while submission is
@@ -3260,6 +3299,7 @@ fn panic_response(
 enum CompletionSender {
     Sync(Sender<Response>),
     Async(oneshot::Sender<Response>),
+    Callback(Box<dyn FnOnce(Response) + Send>),
 }
 
 impl CompletionSender {
@@ -3271,6 +3311,7 @@ impl CompletionSender {
             Self::Async(tx) => {
                 let _ = tx.send(response);
             }
+            Self::Callback(callback) => callback(response),
         }
     }
 }

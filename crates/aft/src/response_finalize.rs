@@ -3,7 +3,7 @@ pub mod alert_render;
 #[path = "repeat_breaker.rs"]
 pub mod repeat_breaker;
 
-use std::path::Path;
+use std::{cell::RefCell, path::Path};
 
 use serde_json::Value;
 
@@ -945,6 +945,42 @@ mod tests {
     use crate::protocol::Response;
 
     #[test]
+    fn query_pending_snapshot_covers_translated_graph_ops_and_restores_scope() {
+        let ctx = standalone_ctx();
+        let pending = (
+            true,
+            Some(crate::context::CallgraphUnappliedChanges {
+                whole_store: true,
+                ..Default::default()
+            }),
+        );
+        let install = || {
+            super::QueryPendingSnapshot {
+                context: &ctx as *const AppContext as usize,
+                command: "callgraph".into(),
+                pending: pending.clone(),
+            }
+            .install()
+        };
+        {
+            let _scope = install();
+            for command in ["callgraph", "callers", "trace_to_symbol"] {
+                // Both the tool runner and command dispatcher must reuse it.
+                assert_eq!(super::query_pending(&ctx, command), pending);
+                assert_eq!(super::query_pending(&ctx, command), pending);
+            }
+            assert_eq!(super::query_pending(&ctx, "tool_call"), (false, None));
+        }
+        assert!(super::PREPARED_QUERY.with(|slot| slot.borrow().is_none()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = install();
+            panic!("unwind worker request");
+        }));
+        assert!(result.is_err());
+        assert!(super::PREPARED_QUERY.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
     fn duplicate_registration_preserves_original_response_and_cancellation() {
         let ctx = standalone_ctx();
         let original_cancel = crate::executor::JobCancellation::new();
@@ -1351,6 +1387,45 @@ fn is_callgraph_command(command: &str) -> bool {
     )
 }
 
+type QueryPending = (bool, Option<crate::context::CallgraphUnappliedChanges>);
+
+/// Pending changes observed after standalone pre-read maintenance, before a
+/// request leaves the frame loop. The tool runner and command dispatcher must
+/// use the same observation even if maintenance resumes before the worker runs.
+pub struct QueryPendingSnapshot {
+    context: usize,
+    command: String,
+    pending: QueryPending,
+}
+
+thread_local! {
+    static PREPARED_QUERY: RefCell<Option<QueryPendingSnapshot>> = const { RefCell::new(None) };
+}
+
+impl QueryPendingSnapshot {
+    pub fn capture(ctx: &AppContext, command: &str) -> Self {
+        Self {
+            context: ctx as *const AppContext as usize,
+            command: command.to_owned(),
+            pending: query_pending(ctx, command),
+        }
+    }
+
+    pub fn install(self) -> QueryPendingScope {
+        QueryPendingScope(PREPARED_QUERY.with(|slot| slot.replace(Some(self))))
+    }
+}
+
+/// Restores the worker thread's previous pending-change observation on exit,
+/// including unwinding, so an executor worker cannot leak it to another call.
+pub struct QueryPendingScope(Option<QueryPendingSnapshot>);
+
+impl Drop for QueryPendingScope {
+    fn drop(&mut self) {
+        PREPARED_QUERY.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
 /// Two values captured together before a command runs, because a refresh that
 /// lands while the answer is computed does not make that answer current:
 /// whether unsorted watcher events exist (as [`watcher_query_pending`]
@@ -1369,6 +1444,19 @@ pub fn query_pending(
     ctx: &AppContext,
     command: &str,
 ) -> (bool, Option<crate::context::CallgraphUnappliedChanges>) {
+    let prepared = PREPARED_QUERY.with(|slot| {
+        slot.borrow().as_ref().and_then(|prepared| {
+            // The callgraph tool translates its `op` into the dispatched
+            // command; every graph operation observes the same pending state.
+            (prepared.context == ctx as *const AppContext as usize
+                && (prepared.command == command
+                    || (is_callgraph_command(&prepared.command) && is_callgraph_command(command))))
+            .then(|| prepared.pending.clone())
+        })
+    });
+    if let Some(pending) = prepared {
+        return pending;
+    }
     let watcher_command = is_watcher_query_command(command);
     let callgraph_command = is_callgraph_command(command);
     if !watcher_command && !callgraph_command {
