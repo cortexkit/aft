@@ -8127,15 +8127,14 @@ mod fresh_payload_tests {
     }
 }
 
-#[cfg(test)]
+// A retry finishes here because unchanged files are proven current from stat
+// evidence alone. Windows metadata can't prove that (a same-size rewrite can
+// keep both timestamps), so Windows re-reads every file and a retry under the
+// same one-read budget is honestly partial again.
+#[cfg(all(test, not(windows)))]
 mod inspect_freshness_progress_tests {
     use super::*;
 
-    // A retry finishes here because unchanged files are proven current from
-    // stat evidence alone. Windows metadata can't prove that (a same-size
-    // rewrite can keep both timestamps), so Windows re-reads every file and a
-    // retry under the same one-read budget is honestly partial again.
-    #[cfg(not(windows))]
     #[test]
     fn inspect_freshness_progress_retry_finishes_after_verification_budget_exhaustion() {
         let temp = tempfile::tempdir().unwrap();
