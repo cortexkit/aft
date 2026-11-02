@@ -1947,7 +1947,10 @@ fn root_history(storage: &StoragePaths, admission: bool) -> io::Result<Vec<(Stri
     };
     if scan.identity.as_ref() != Some(&identity) {
         let restarted = scan.identity.is_some();
-        let may_advance = scan.may_advance;
+        // A completed small census may be refreshed after a bind in the same
+        // pass, but every refresh still spends that pass's remaining entries.
+        let may_advance = scan.may_advance
+            || (scan.progress.complete && scan.progress.examined < HISTORY_ENTRIES);
         let examined = scan.progress.examined;
         *scan = RootHistoryScan {
             identity: Some(identity),
@@ -1964,7 +1967,7 @@ fn root_history(storage: &StoragePaths, admission: bool) -> io::Result<Vec<(Stri
     if !scan.progress.complete && scan.may_advance && !admission {
         scan.may_advance = false;
         let deadline = Instant::now() + PASS_BUDGET;
-        for _ in 0..HISTORY_ENTRIES {
+        for _ in scan.progress.examined..HISTORY_ENTRIES {
             if Instant::now() >= deadline || bind_pending(&storage.durable) {
                 break;
             }
@@ -5234,6 +5237,19 @@ fn run_pass_with_root_identities(
         if report.cancelled || bind_pending(&storage.durable) {
             return Ok(());
         }
+        // Pruning must not invalidate a partial census on every followup.
+        // Once complete, keep the original prune-before-root-retirement order
+        // so a root's history survives the pass that removes its last cache.
+        let prune = {
+            let scan = root_history_scan(storage);
+            let scan = scan
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scan.progress.complete || scan.identity.is_none()
+        };
+        if prune {
+            prune_bindings(storage, cancelled, &mut report)?;
+        }
         let history = bindings(storage, roots)?;
         let domains = domain_paths(storage)?;
         for (directory, _) in &domains {
@@ -5384,7 +5400,6 @@ fn run_pass_with_root_identities(
         report
             .timings_ms
             .insert("roots".into(), phase.elapsed().as_millis() as u64);
-        prune_bindings(storage, cancelled, &mut report)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -11540,12 +11555,16 @@ mod storage_retention_tests {
         assert!(live.exists(), "live view was retired: {report:?}");
         // Finish the existing consecutive-missing-sweep rule. The legacy
         // registry remains, but its unused view and payload are reclaimed.
-        let mut report = SweepReport::default();
         for _ in 0..2 {
-            collect_one_v2_family(&StoragePaths::same(temp.path()), &|| false, &mut report)
-                .unwrap();
+            crate::gc::family::sweep_family(
+                &registry,
+                None,
+                crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+                None,
+            )
+            .unwrap();
         }
-        assert!(!v2_view.exists(), "retired v2 view survived: {report:?}");
+        assert!(!v2_view.exists(), "retired v2 view survived");
         assert!(!FamilyStoreReader::open_existing(
             temp.path(),
             &missing_scope,
