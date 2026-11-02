@@ -39,7 +39,13 @@ const WATCHER_OBSERVED_CHILD_SCAN_CAP: usize = 256;
 /// says what the cap cost.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 const WATCHER_DROPPED_CANDIDATE_LOG_LIMIT: usize = 3;
-const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+// Root remove/rename events trigger an immediate check. Five seconds is the
+// backstop for missed events (FSEvents without WatchRoot, or Windows watching
+// the directory's contents rather than its parent). It caps idle probes at
+// 0.2 per second per root. With a draining dispatch receiver, RootDeleted is
+// dispatched within five seconds plus scheduling latency, even with no events.
+const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the watcher thread retries handing held events to a dispatch
@@ -2409,10 +2415,7 @@ impl WatcherFilterThread {
             if !self.retry_backlog() {
                 return;
             }
-            if self.project_root_was_deleted(Instant::now()) {
-                self.raw_paths.clear();
-                self.content_only_paths.clear();
-                let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
+            if self.stop_for_deleted_root(false) {
                 return;
             }
             if self.flush_deadline_reached() {
@@ -2427,6 +2430,22 @@ impl WatcherFilterThread {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
                     self.config.counters.note_raw_event();
+                    // inotify reports self-removal/rename; FSEvents can report
+                    // removal/rename too. Check before arrival expansion or
+                    // filtering can discard the root path. Rescans may have
+                    // lost the root event altogether.
+                    let root_deletion_hint = event.need_rescan()
+                        || (matches!(
+                            event.kind,
+                            notify::EventKind::Remove(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        ) && event
+                            .paths
+                            .iter()
+                            .any(|path| self.config.project_root.starts_with(path)));
+                    if root_deletion_hint && self.stop_for_deleted_root(true) {
+                        return;
+                    }
                     let cookies = self.take_cookie_paths(&mut event);
                     if self.config.counters.bash_changes.get().is_some()
                         && self.config.counters.bash_flush.observe(&event)
@@ -2526,6 +2545,11 @@ impl WatcherFilterThread {
                     }
                 }
                 Ok(Err(error)) => {
+                    // Windows may report root loss as a terminal I/O error
+                    // instead of a remove event. Do not exit before checking.
+                    if self.stop_for_deleted_root(true) {
+                        return;
+                    }
                     if let Some(journal) = self.config.counters.bash_changes.get() {
                         journal.gap();
                     }
@@ -2540,6 +2564,9 @@ impl WatcherFilterThread {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if !self.shutdown.load(Ordering::SeqCst) {
+                        if self.stop_for_deleted_root(true) {
+                            return;
+                        }
                         let _ = self.send_dispatch_final(WatcherDispatchEvent::Error(
                             "watcher channel disconnected".to_string(),
                         ));
@@ -2587,6 +2614,22 @@ impl WatcherFilterThread {
         #[cfg(test)]
         WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(calls.get() + 1));
         !self.config.project_root.exists()
+    }
+
+    fn stop_for_deleted_root(&mut self, force_check: bool) -> bool {
+        let now = Instant::now();
+        if force_check {
+            // Native events can be delayed until after a root is recreated;
+            // verify the pathname rather than treating the event as proof.
+            self.next_root_check = now;
+        }
+        if !self.project_root_was_deleted(now) {
+            return false;
+        }
+        self.raw_paths.clear();
+        self.content_only_paths.clear();
+        let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
+        true
     }
 
     fn record_recent_paths(&mut self, paths: &[PathBuf]) {
@@ -2834,9 +2877,12 @@ impl WatcherFilterThread {
     fn next_recv_timeout(&self) -> Duration {
         // Wake in time to flush a pending overflow summary, and sooner while
         // dispatch-backlogged events are waiting for room.
+        // Shutdown only sets an atomic flag, so preserve its 250 ms response
+        // independently of the much slower root-existence probes.
         let root_timeout = self
             .next_root_check
-            .saturating_duration_since(Instant::now());
+            .saturating_duration_since(Instant::now())
+            .min(WATCHER_SHUTDOWN_POLL_INTERVAL);
         let mut timeout = self.overflow_burst.as_ref().map_or(root_timeout, |burst| {
             (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
                 .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
@@ -2959,8 +3005,7 @@ impl WatcherFilterThread {
         while !self.shutdown.load(Ordering::SeqCst)
             && self.matcher_generation.load(Ordering::SeqCst) == observed_generation
         {
-            if self.project_root_was_deleted(Instant::now()) {
-                let _ = self.send_dispatch_final(WatcherDispatchEvent::RootDeleted);
+            if self.stop_for_deleted_root(false) {
                 return false;
             }
             if Instant::now() >= deadline {
@@ -4217,6 +4262,159 @@ mod tests {
             filter.next_recv_timeout().is_zero(),
             "continuous intake cannot postpone the next root check"
         );
+    }
+
+    #[test]
+    fn idle_watcher_root_probes_are_at_most_once_per_five_seconds() {
+        let root = TempDir::new().unwrap();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || {
+            WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(0));
+            assert!(!filter.project_root_was_deleted(Instant::now()));
+            ready_tx.send(()).unwrap();
+            filter.run(raw_rx);
+            WATCHER_TEST_ROOT_PROBES.with(|calls| calls.get())
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Cover a whole idle interval, not just a quiet slice between probes.
+        let idle_result = dispatch_rx.recv_timeout(Duration::from_millis(5250));
+        shutdown.store(true, Ordering::SeqCst);
+        let probes = handle.join().unwrap();
+        drop(raw_tx);
+        assert_eq!(
+            idle_result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        );
+        assert!(
+            (1..=2).contains(&probes),
+            "5.25 idle seconds should cost at most an initial probe and one backstop, got {probes}"
+        );
+    }
+
+    #[test]
+    fn root_deleted_without_events_is_detected_within_five_seconds() {
+        let root = TempDir::new().unwrap();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || {
+            assert!(!filter.project_root_was_deleted(Instant::now()));
+            ready_tx.send(()).unwrap();
+            filter.run(raw_rx);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Delete just after a successful probe to exercise the full idle bound.
+        fs::remove_dir(root.path()).unwrap();
+        let event = dispatch_rx.recv_timeout(Duration::from_millis(5500));
+        shutdown.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        drop(raw_tx);
+        assert_eq!(event.unwrap(), WatcherDispatchEvent::RootDeleted);
+    }
+
+    #[test]
+    fn root_loss_events_bypass_the_idle_deadline() {
+        use notify::event::{Flag, ModifyKind, RemoveKind, RenameMode};
+
+        for event in [
+            notify::Event::new(notify::EventKind::Remove(RemoveKind::Folder)),
+            notify::Event::new(notify::EventKind::Remove(RemoveKind::Any)),
+            notify::Event::new(notify::EventKind::Modify(ModifyKind::Name(
+                RenameMode::From,
+            ))),
+            notify::Event::new(notify::EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+                .set_info(DIRECTORY_ARRIVAL_INFO),
+            notify::Event::new(notify::EventKind::Other).set_flag(Flag::Rescan),
+        ] {
+            let root = TempDir::new().unwrap();
+            let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+            let (raw_tx, raw_rx) = mpsc::channel();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let mut filter = WatcherFilterThread::new(
+                WatcherFilterConfig::new(root.path().to_path_buf(), None),
+                Arc::new(RwLock::new(None)),
+                Arc::new(AtomicU64::new(0)),
+                dispatch_tx,
+                Arc::clone(&shutdown),
+            );
+            filter.next_root_check = Instant::now() + Duration::from_secs(60);
+            fs::remove_dir(root.path()).unwrap();
+            raw_tx
+                .send(Ok(event.add_path(root.path().to_path_buf())))
+                .unwrap();
+            let handle = thread::spawn(move || filter.run(raw_rx));
+            let event = dispatch_rx.recv_timeout(Duration::from_secs(2));
+            shutdown.store(true, Ordering::SeqCst);
+            handle.join().unwrap();
+            assert_eq!(event.unwrap(), WatcherDispatchEvent::RootDeleted);
+        }
+    }
+
+    #[test]
+    fn backend_failure_checks_root_before_exiting() {
+        for send_error in [false, true] {
+            let root = TempDir::new().unwrap();
+            let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+            let (raw_tx, raw_rx) = mpsc::channel();
+            let mut filter = WatcherFilterThread::new(
+                WatcherFilterConfig::new(root.path().to_path_buf(), None),
+                Arc::new(RwLock::new(None)),
+                Arc::new(AtomicU64::new(0)),
+                dispatch_tx,
+                Arc::new(AtomicBool::new(false)),
+            );
+            filter.next_root_check = Instant::now() + Duration::from_secs(60);
+            fs::remove_dir(root.path()).unwrap();
+            if send_error {
+                raw_tx
+                    .send(Err(notify::Error::generic("watcher stopped")))
+                    .unwrap();
+            }
+            drop(raw_tx);
+            filter.run(raw_rx);
+            assert_eq!(
+                dispatch_rx.recv().unwrap(),
+                WatcherDispatchEvent::RootDeleted
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_root_loss_hint_preserves_a_recreated_root() {
+        let root = TempDir::new().unwrap();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        filter.next_root_check = Instant::now() + Duration::from_secs(60);
+        fs::remove_dir(root.path()).unwrap();
+        fs::create_dir(root.path()).unwrap();
+        WATCHER_TEST_ROOT_PROBES.with(|calls| calls.set(0));
+        assert!(!filter.stop_for_deleted_root(true));
+        WATCHER_TEST_ROOT_PROBES.with(|calls| assert_eq!(calls.get(), 1));
+        assert!(dispatch_rx.is_empty());
     }
 
     #[test]
@@ -7216,7 +7414,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
 
         let event = dispatch_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(ROOT_DELETED_CHECK_INTERVAL + Duration::from_millis(500))
             .expect("root deleted event");
         assert_eq!(event, WatcherDispatchEvent::RootDeleted);
         shutdown.store(true, Ordering::SeqCst);

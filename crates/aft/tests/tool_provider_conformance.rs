@@ -4430,6 +4430,7 @@ fn registry_manifest_lock_fixture_equalities_and_independent_declaration() {
         json!([
             "role.describe",
             "tool.catalog",
+            "tool.views",
             "tool.call",
             "tool.withdraw",
             "late_results",

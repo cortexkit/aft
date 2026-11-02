@@ -139,7 +139,7 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
 #[tokio::test]
 async fn session_reads_serve_all_seven_from_heads_workers_and_flow_heads() {
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for shape in ["head", "non-core-head", "worker", "flow-head"] {
         let f = indexed_fixture(shape);
         for (name, args, expected) in [
@@ -191,7 +191,7 @@ async fn session_reads_serve_all_seven_from_heads_workers_and_flow_heads() {
 #[tokio::test]
 async fn session_reads_media_refused_before_native_handlers() {
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
     access_grants::register(&f.policy, &f.ctx).unwrap();
     std::fs::write(f.dir.path().join("main.rs"), SOURCE).unwrap();
@@ -233,7 +233,7 @@ async fn session_reads_media_refused_before_native_handlers() {
 #[tokio::test]
 async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for kind in ["head", "worker"] {
         for restrict in [false, true] {
             let f = Fixture::with_config(kind, |config| config.restrict_to_project_root = restrict);
@@ -303,7 +303,7 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
 #[tokio::test]
 async fn session_reads_confined_worker_keeps_native_fence_code() {
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("worker");
     remote_policy::catalog(
         json!({"preset":"worker", "params":{"confine":"root"}}),

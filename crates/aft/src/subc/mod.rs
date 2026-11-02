@@ -12,6 +12,7 @@
 //! own the reader/mutator epoch, while a writer task serializes outbound frames.
 
 pub mod blob_store;
+pub(crate) mod tool_views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -258,18 +259,12 @@ mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
 mod retained_result;
-mod rich_ui;
-pub(crate) mod watch_delivery;
-// Drives the chunk queries and Occipital's route shapes through the real
-// frame loop, so it lives beside the chunk module but runs as a child of this
-// module to reach the loop and its test fixtures.
-#[cfg(test)]
-#[path = "rich_ui/chunks/route_tests.rs"]
-mod rich_ui_chunk_route_tests;
+pub(crate) mod rich_ui;
 mod run_scope;
 mod scope_describe;
 #[cfg(test)]
 mod stack_budget_tests;
+pub(crate) mod watch_delivery;
 #[cfg(all(test, unix))]
 pub(crate) use scope_describe::confirm_secret_rebind_for_test;
 #[cfg(test)]
@@ -5456,6 +5451,7 @@ where
         crate::gh_shim_worker_broker::install(Arc::clone(&gh_relay));
     // Stamped workers' permission asks go to Cingulate over this daemon.
     consent::install_subc_transport(connection_file_path);
+    rich_ui::display::start(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -6072,16 +6068,6 @@ where
                             }
                         }
                         if let (Some(identity), Ok(body)) = (routes.get(&route), decoded.body()) {
-                            // Rich-UI chunk queries are provider reads that name no
-                            // session or tool, so they are answered here, before the
-                            // carrier gate and every tool-call admission step.
-                            if let Some((operation, query)) = chunk_query(body) {
-                                let db = shared_app.db();
-                                if let Err(error) = answer_chunk_query(&writer_tx, &dispatch_path_metrics, &decoded.frame, identity, operation, &query, db.as_deref()).await {
-                                    break Err(error);
-                                }
-                                continue;
-                            }
                             if diagnostics_findings::is_request(body) {
                                 if let Err(error) = diagnostics_findings::dispatch(
                                     &writer_tx, &dispatch_path_metrics, &decoded.frame,
@@ -8677,10 +8663,12 @@ async fn handle_control_request(
                 .await;
             }
             // Occipital reaches AFT only through tool-provider v1 routes: their
-            // provider reads and admitted carrier calls. The legacy grammar has
-            // neither the chunk queries nor carrier admission, so refuse it.
+            // provider reads and read-only calls checked against the stamped
+            // session's policy route. The legacy grammar cannot enforce those
+            // checks, so refuse it.
             if route_role == tool_provider::RouteRole::Legacy
-                && principal_id(&principal).as_deref() == Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+                && principal_id(&principal).as_deref()
+                    == Some(rich_ui::authorization::OCCIPITAL_PRINCIPAL)
             {
                 return send_route_bind_error(
                     tx,
@@ -10073,7 +10061,7 @@ async fn send_provider_error(
 /// codemode run principal: routes in the route table never carry a run owner.
 fn occipital_route(identity: &RouteIdentity) -> bool {
     matches!(&identity.spawn_principal, AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
-        if id == rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+        if id == rich_ui::authorization::OCCIPITAL_PRINCIPAL)
 }
 
 /// Whether an Occipital route carries another principal's session: it is
@@ -10083,7 +10071,7 @@ fn occipital_carrier_route(identity: &RouteIdentity) -> bool {
     occipital_route(identity)
         && identity.scope.as_ref().is_some_and(|scope| {
             principal_id(&Some(scope.owner.clone())).as_deref()
-                != Some(rich_ui::chunks::OCCIPITAL_PRINCIPAL)
+                != Some(rich_ui::authorization::OCCIPITAL_PRINCIPAL)
         })
 }
 
@@ -10114,10 +10102,7 @@ fn route_request_is_tool_call(envelope: &Value) -> bool {
         None => !envelope
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| {
-                tool_provider::recognized_operation(name)
-                    || rich_ui::chunks::is_chunk_operation(name)
-            }),
+            .is_some_and(|name| tool_provider::recognized_operation(name)),
     }
 }
 
@@ -10132,75 +10117,7 @@ fn occipital_session_refusal(
     (occipital_route(identity)
         && !occipital_carrier_route(identity)
         && route_request_is_tool_call(envelope))
-    .then(|| rich_ui::chunks::refusal("session_not_bound"))
-}
-
-/// The chunk query a route request names, either as `op` or, in the bare
-/// form, as `name`, with the request body that carries its digest and index.
-fn chunk_query(envelope: &Value) -> Option<(&str, Value)> {
-    match envelope.get("op").and_then(Value::as_str) {
-        Some(operation) if rich_ui::chunks::is_chunk_operation(operation) => {
-            let mut body = envelope.clone();
-            if let Some(body) = body.as_object_mut() {
-                body.remove("op");
-            }
-            Some((operation, body))
-        }
-        Some(_) => None,
-        None => {
-            let name = envelope.get("name").and_then(Value::as_str)?;
-            rich_ui::chunks::is_chunk_operation(name).then(|| {
-                (
-                    name,
-                    envelope
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({})),
-                )
-            })
-        }
-    }
-}
-
-/// Answer a rich-UI chunk query on the route it arrived on. Admission is by
-/// the route's authenticated principal alone, scoped or unscoped; the query
-/// names no session. A reply is a Response frame holding the chunk; every
-/// refusal is a typed Error frame through [`send_provider_error`].
-async fn answer_chunk_query(
-    tx: &WriterSender,
-    metrics: &DispatchPathMetrics,
-    frame: &Frame,
-    identity: &RouteIdentity,
-    operation: &str,
-    body: &Value,
-    db: Option<&StdMutex<crate::db::TrackedConnection>>,
-) -> Result<(), SubcError> {
-    let principal = match &identity.spawn_principal {
-        AuthenticatedPrincipal::RouteBind { principal_id, .. } => principal_id.as_deref(),
-        AuthenticatedPrincipal::FirstParty => None,
-    };
-    let answer = rich_ui::chunks::admit_principal(principal).and_then(|()| {
-        if operation == rich_ui::chunks::MANIFEST_CHUNK {
-            rich_ui::chunks::manifest_chunk(body)
-        } else {
-            rich_ui::chunks::template_chunk(body, db)
-        }
-    });
-    let answer = match answer {
-        Ok(answer) => answer,
-        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
-    };
-    let response = Frame::build_with_version(
-        frame.header.ver,
-        FrameType::Response,
-        frame.header.flags,
-        frame.header.channel,
-        frame.header.epoch,
-        frame.header.corr,
-        serde_json::to_vec(&answer).map_err(SubcError::Json)?,
-    )
-    .map_err(SubcError::FrameBuild)?;
-    send_reliable_writer_frame(tx, metrics, response, "rich-ui chunk").await
+    .then(|| rich_ui::authorization::refusal("session_not_bound"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10251,6 +10168,8 @@ async fn submit_provider_read(
             phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation == "tool.views" {
+                tool_views::answer(body)
             } else if job_operation.starts_with("grants.") && ctx.database_runtime_initializing() {
                 Err(subc_protocol::ErrorBody::new(
                     "grants_unavailable",
@@ -10504,6 +10423,11 @@ impl PlainToolRun {
         mut phase_trace: PhaseTrace,
         done: oneshot::Sender<ToolCallCompletion>,
     ) -> crate::executor::ExecutorJob {
+        if self.approved_io_window.is_some() {
+            if let Some(key) = &self.ledger_key {
+                rich_ui::display::person_answered(key);
+            }
+        }
         let run_spec = self.clone();
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
@@ -10568,6 +10492,7 @@ impl PlainToolRun {
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
+            let _display = rich_ui::display::enter(ledger_key.as_ref());
             let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
@@ -10686,6 +10611,7 @@ impl PlainToolRun {
                                 &result.response,
                             );
                             let response = result.response;
+                            rich_ui::display::handler_ready(ledger_key.as_ref(), response.success);
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
                                 phase_trace: phase_trace
@@ -11141,7 +11067,7 @@ async fn handle_tool_call_with_capabilities(
     {
         if matches!(
             operation,
-            "role.describe" | "tool.catalog" | "grants.list" | "grants.revoke"
+            "role.describe" | "tool.catalog" | "tool.views" | "grants.list" | "grants.revoke"
         ) {
             let body = if envelope.get("op").is_some() {
                 let mut body = envelope.clone();
