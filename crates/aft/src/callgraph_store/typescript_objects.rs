@@ -93,6 +93,8 @@ impl<'a> ObjectDispatch<'a> {
     }
 
     pub(super) fn prepare(&mut self, references: &[NameMatchRef]) -> Result<()> {
+        let mut profile =
+            crate::views::materialization::profile::StageTimer::new("typescript_objects");
         let callers = references
             .iter()
             .filter(|r| matches!(r.lang.as_str(), "typescript" | "tsx"))
@@ -101,6 +103,10 @@ impl<'a> ObjectDispatch<'a> {
         for file in &callers {
             self.load(file)?;
         }
+        profile.finish(
+            "load",
+            format_args!("callers={} parses={}", callers.len(), self.parses.len()),
+        );
         let mut resolver = join::dispatch::Resolver::new(
             self.parses
                 .iter()
@@ -108,6 +114,7 @@ impl<'a> ObjectDispatch<'a> {
                 .collect(),
         );
         resolver.type_targets = self.targets.clone();
+        profile.finish("resolver", format_args!("parses={}", self.parses.len()));
         for file in callers {
             let Some(parse) = self.parses.get(&file) else {
                 continue;
@@ -136,6 +143,7 @@ impl<'a> ObjectDispatch<'a> {
             }
             self.resolutions.insert(file, resolutions);
         }
+        profile.finish("resolve", format_args!("files={}", self.resolutions.len()));
         Ok(())
     }
 
