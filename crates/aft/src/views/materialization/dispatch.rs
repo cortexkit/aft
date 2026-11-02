@@ -1316,7 +1316,7 @@ pub fn counts(connection: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<St
 
 #[cfg(test)]
 pub(crate) fn store_diet_node_kind(
-    connection: &Connection,
+    connection: &rusqlite::Connection,
     file: &str,
     symbol: &str,
 ) -> Result<Option<String>> {
