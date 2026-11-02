@@ -1754,6 +1754,9 @@ mod tests {
         use super::super::callgraph_copies::{self, Admission};
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
+        // The one-slot limit assumes reuse of the main checkout's base. Keep
+        // external Git attributes from disabling that proof.
+        let _attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
         let storage = temp.path().join("storage");
         let main = checkout(&temp.path().join("main"));
         setup_git(&main, &["init", "-q"]);

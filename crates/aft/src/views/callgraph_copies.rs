@@ -476,6 +476,7 @@ mod tests {
 
     struct Fixture {
         _temp: tempfile::TempDir,
+        _attributes: super::super::verification::AttributeSourcesGuard,
         paths: crate::root_cache::StoragePaths,
         main: PathBuf,
         worker: PathBuf,
@@ -493,6 +494,9 @@ mod tests {
 
     fn fixture() -> Fixture {
         let temp = tempfile::tempdir().unwrap();
+        // These limits assume checkouts share a base for unchanged tracked files.
+        // System attributes shipped with Git for Windows disable that reuse proof.
+        let attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
         let main = temp.path().join("main");
         std::fs::create_dir(&main).unwrap();
         std::fs::write(
@@ -551,6 +555,7 @@ mod tests {
         main_view.reader().unwrap();
         Fixture {
             _temp: temp,
+            _attributes: attributes,
             paths,
             main,
             worker,
