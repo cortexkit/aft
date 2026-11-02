@@ -794,6 +794,37 @@ fn cwd_symlink_escape_is_rejected() {
 }
 
 #[test]
+fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let child = root.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..Default::default()
+        },
+    );
+    let mut params = FrozenParams {
+        siblings: vec![child.join("..").to_str().unwrap().into()],
+        ..Default::default()
+    };
+    assert!(params
+        .validate_siblings(&ctx, "siblings", "session")
+        .is_err());
+    std::fs::write(root.path().join(".git"), "gitdir: /checkout/metadata\n").unwrap();
+    params
+        .validate_siblings(&ctx, "siblings", "session")
+        .unwrap();
+    assert_eq!(
+        params.siblings,
+        [root.path().canonicalize().unwrap().to_str().unwrap()]
+    );
+}
+
+#[test]
 fn absent_metadata_stays_absent_and_remote_changes_stay_listed() {
     let before = TerminalRecord::new(
         job_id(),

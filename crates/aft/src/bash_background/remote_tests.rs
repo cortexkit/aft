@@ -6449,6 +6449,79 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
         .collect()
 }
 
+pub(crate) fn assert_siblings_submit_refused_before_connect(
+    ctx: &crate::context::AppContext,
+    launch: crate::bash_background::RemoteLaunch,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) {
+    let marker = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .join("must-not-run-locally");
+    let response = handle_with_policy(
+        ctx,
+        Some(launch),
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()), "runon":"linux",
+            "background":true, "compressed":false,
+        }),
+    );
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_run_refused", "{response:?}");
+    assert!(
+        ctx.bash_background().list(0).is_empty(),
+        "a refused sibling must not register a remote or local task"
+    );
+    assert!(
+        response.data["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("runon refused: siblings"),
+        "{response:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "a refused sibling must not trigger local fallback"
+    );
+    assert!(
+        daemon.log.lock().unwrap().is_empty(),
+        "no daemon frame may be sent"
+    );
+    assert_eq!(
+        daemon.connections.load(Ordering::SeqCst),
+        0,
+        "the daemon must not be contacted"
+    );
+}
+
+#[test]
+fn runon_siblings_refusal_line_is_pinned_byte_for_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let folder = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .join("not-a-checkout");
+    std::fs::create_dir(&folder).unwrap();
+    let mut policy = launch(dir.path().join("unused-connection.json"));
+    policy.params.siblings = vec![folder.to_str().unwrap().into()];
+    let response = handle_with_policy(
+        &ctx,
+        Some(policy),
+        serde_json::json!({"command":"true", "runon":"linux", "background":true}),
+    );
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_run_refused");
+    assert_eq!(
+        response.data["message"].as_str().unwrap().as_bytes(),
+        b"runon refused: siblings must be git checkout roots the session's file tools may read; the command was not run"
+    );
+}
+
 #[tokio::test]
 async fn runon_windows_not_advertised_refuses_without_remote_or_local_spawn() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
@@ -11445,6 +11518,45 @@ async fn runon_cd_refusal_has_distinct_code_and_no_execution() {
     assert!(!marker.exists(), "a refusal must never spawn locally");
 }
 
+// A declared sibling must already be readable: runon never asks for access.
+// Grant only that sibling so these cd tests reach directory validation without
+// depending on the host's temp exemptions or allowing other outside paths.
+fn grant_sibling_read(
+    ctx: &crate::context::AppContext,
+    sibling: &Path,
+) -> (tempfile::TempDir, crate::access_policy::ScopeGuard) {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    use crate::db::access_grants::{self as grants, ScopeKey};
+
+    assert!(ctx
+        .validate_read_path_without_approval(
+            "sibling-read",
+            "session",
+            &sibling.canonicalize().unwrap()
+        )
+        .is_err());
+    let storage = tempfile::tempdir().unwrap();
+    let conn = crate::db::open(&storage.path().join("grants.db")).unwrap();
+    let scope = ScopeKey {
+        owner: "reserved:prefrontal-core".into(),
+        scope_ref: "runon-siblings".into(),
+        epoch: 1,
+    };
+    grants::register_scope(&conn, &scope, None, &ctx.config()).unwrap();
+    grants::insert(
+        &conn,
+        &scope,
+        &AccessGrant {
+            path: sibling.to_path_buf(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(conn)));
+    (storage, crate::access_policy::scope_guard(Some(scope)))
+}
+
 #[tokio::test]
 async fn runon_cd_declared_siblings_are_allowed() {
     let dir = tempfile::tempdir().unwrap();
@@ -11454,14 +11566,21 @@ async fn runon_cd_declared_siblings_are_allowed() {
     fs::create_dir_all(commons.join("nested")).unwrap();
     git_fixture(&commons);
     let ctx = remote_test_context(&checkout);
+    // The grant arrives through a symlinked parent, while runon checks the
+    // canonical sibling spelling. Grant storage must give both one identity.
+    let alias = dir.path().join("parent-alias");
+    std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+    let granted = alias.join("commons");
+    assert_ne!(granted, commons.canonicalize().unwrap());
+    let _read = grant_sibling_read(&ctx, &granted);
     let commons = commons.canonicalize().unwrap();
-    for line in [
-        "cd ../commons && printf remote",
-        "pushd ../commons/nested; printf remote",
+    for (sibling, line) in [
+        (&commons, "cd ../commons && printf remote"),
+        (&granted, "pushd ../commons/nested; printf remote"),
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let mut policy = launch(daemon.connection.clone());
-        policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
+        policy.params.siblings = vec![sibling.to_str().unwrap().to_owned()];
         let response = handle_with_policy(
             &ctx,
             Some(policy),
@@ -11495,6 +11614,7 @@ async fn runon_cd_linked_worktree_sibling_alias_is_allowed() {
     let worktree = dir.path().join("worktrees/worker");
     add_git_worktree(&main, &worktree, "cd-sibling-alias");
     let ctx = remote_test_context(&worktree);
+    let _read = grant_sibling_read(&ctx, &commons);
     let worktree = worktree.canonicalize().unwrap();
     let commons = commons.canonicalize().unwrap();
     assert!(!worktree.parent().unwrap().join("commons").exists());
@@ -11539,6 +11659,7 @@ async fn runon_cd_windows_absolute_targets_are_refused() {
     git_fixture(&checkout);
     git_fixture(&commons);
     let ctx = remote_test_context(&checkout);
+    let _read = grant_sibling_read(&ctx, &commons);
     let checkout = checkout.canonicalize().unwrap();
     let commons = commons.canonicalize().unwrap();
     let marker = checkout.join("must-not-run-locally");
@@ -11586,6 +11707,7 @@ async fn runon_cd_windows_relative_targets_are_allowed() {
     git_fixture(&commons);
     fs::create_dir(checkout.join("nested")).unwrap();
     let ctx = remote_test_context(&checkout);
+    let _read = grant_sibling_read(&ctx, &commons);
     let commons = commons.canonicalize().unwrap();
     for line in [
         "cd nested && printf remote",
@@ -12170,6 +12292,7 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
     }
     git_fixture(&sibling);
     let ctx = remote_test_context(&checkout);
+    let _read = grant_sibling_read(&ctx, &sibling);
     let marker = checkout.join("must-not-run-locally");
     for (line, refused) in [
         ("cd packages/a && true; cd ../b", false),

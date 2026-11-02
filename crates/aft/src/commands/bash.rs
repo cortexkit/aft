@@ -265,6 +265,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if let Some(launch) = remote.as_mut() {
+        if let Err(message) = launch.params.validate_siblings(ctx, &req.id, req.session()) {
+            return Response::error(
+                &req.id,
+                "remote_run_refused",
+                format!("runon refused: {message}"),
+            );
+        }
         launch.configured_env_names = configured_env_names;
     }
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
