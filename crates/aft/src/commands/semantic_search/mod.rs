@@ -7176,6 +7176,41 @@ fn search_response(req: &RawRequest, mut parts: SearchResponseParts<'_>) -> Resp
     Response::success(&req.id, serde_json::Value::Object(object))
 }
 
+/// Build protocol fixtures with the production ranked renderer and its own
+/// admitted-result count, without requiring matching files in a search index.
+#[cfg(test)]
+pub(crate) fn ranked_response_for_test(
+    req: &RawRequest,
+    root: &Path,
+    results: Vec<HybridResult>,
+) -> Response {
+    let (text, shown) = format_ranked_text_counted(&results, root, false, false, None, None);
+    let mut extras = serde_json::Map::new();
+    extras.insert("rendered_results".into(), serde_json::json!(shown));
+    search_response(
+        req,
+        SearchResponseParts {
+            query: req
+                .params
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("fixture"),
+            interpreted_as: "lexical",
+            query_kind: "identifier",
+            semantic_status: "ready",
+            status: "ready",
+            complete: true,
+            text,
+            results: results.iter().map(result_to_json).collect(),
+            more_available: false,
+            engine_capped: false,
+            fully_degraded: false,
+            warnings: Vec::new(),
+            extras,
+        },
+    )
+}
+
 fn artifact_contention_fallback_response(
     req: &RawRequest,
     ctx: &AppContext,

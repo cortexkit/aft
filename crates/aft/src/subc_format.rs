@@ -4220,9 +4220,21 @@ pub fn report_rendered_row_count(command: &str, data: &Value) -> Option<usize> {
     }
 }
 
-/// Count the result headers that survived a last-resort text cut. Snippet
-/// continuations are not results, and file summaries use a path header.
-pub(crate) fn visible_search_result_count(data: &Value, visible: &str) -> usize {
+/// Count result headers whose start survived a last-resort text cut. Match
+/// against the uncut header so an oversized first result still counts as one.
+/// Snippet continuations are not results; file summaries use a path header.
+pub(crate) fn visible_search_result_count(data: &Value, full: &str, visible: &str) -> usize {
+    let mut offset = 0;
+    let rows: Vec<_> = full
+        .split_inclusive('\n')
+        .map(|row| {
+            let start = offset;
+            offset += row.len();
+            (start, row.trim_end_matches('\n'))
+        })
+        .take_while(|(start, _)| *start < visible.len())
+        .map(|(_, row)| row)
+        .collect();
     let matches_file = |file: &str, path: &str| {
         !path.is_empty()
             && (file == path
@@ -4231,8 +4243,9 @@ pub(crate) fn visible_search_result_count(data: &Value, visible: &str) -> usize 
                     .is_some_and(|prefix| prefix.ends_with('/') || prefix.ends_with('\\')))
     };
     let Some(results) = data.get("results").and_then(Value::as_array) else {
-        return visible
-            .lines()
+        return rows
+            .iter()
+            .copied()
             .filter(|line| {
                 (!line.starts_with(' ')
                     && (line.contains(" [exact]") || line.contains(" [lexical match]")))
@@ -4247,7 +4260,7 @@ pub(crate) fn visible_search_result_count(data: &Value, visible: &str) -> usize 
     };
     let mut headers: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     let mut current_file = None;
-    for row in visible.lines() {
+    for row in rows.iter().copied() {
         if !row.starts_with(' ') {
             let path = row.split(" [").next().unwrap_or(row);
             let path = path
@@ -4284,7 +4297,7 @@ pub(crate) fn visible_search_result_count(data: &Value, visible: &str) -> usize 
                     .get("start_line")
                     .and_then(Value::as_u64)
                     .or_else(|| result.get("line").and_then(Value::as_u64));
-                visible.lines().any(|row| {
+                rows.iter().copied().any(|row| {
                     if row.starts_with(' ') {
                         return false;
                     }

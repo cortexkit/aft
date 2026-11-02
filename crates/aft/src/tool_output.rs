@@ -738,7 +738,7 @@ fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: 
         return visible.lines().filter(|line| numbered_row(line)).count();
     }
     if unit == "results" {
-        return crate::subc_format::visible_search_result_count(data, visible);
+        return crate::subc_format::visible_search_result_count(data, full, visible);
     }
     if unit == "files" {
         return crate::subc_format::visible_file_row_count(data, full, visible);

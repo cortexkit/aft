@@ -408,6 +408,230 @@ async fn tool_result_ast_search_t6_complete_and_budget_cut_on_negotiated_route()
     }
 }
 
+#[tokio::test]
+async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_on_negotiated_route(
+) {
+    let _watcher_disabled = crate::test_env::without_project_watcher();
+    let (project, root_id) = test_support::test_root("oversized-first-search-result");
+    let root = project.path().to_path_buf();
+    let executor = Arc::new(Executor::new());
+    let _actors = FixtureActors(executor.clone());
+    let ctx = Arc::new(context(&root));
+    let app = ctx.app().clone();
+    executor.register_actor(root_id, ctx);
+    let module_root = root.clone();
+    let loop_executor = executor.clone();
+    let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+    let module_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (read, write) = tokio::io::split(module);
+        runtime
+            .block_on(run_module_loop(
+                read,
+                write,
+                &module_root.join("absent-connection.json"),
+                app,
+                loop_executor,
+                |request, ctx| match request.command.as_str() {
+                    "configure" => crate::commands::configure::handle_configure(&request, ctx),
+                    "read" => crate::commands::read::handle_read(&request, ctx),
+                    "semantic_search" => {
+                        use crate::commands::semantic_search::HybridResult;
+                        let root = ctx.config().project_root.clone().unwrap();
+                        let first = HybridResult {
+                            file: root
+                                .join("oversized-first-result")
+                                .join("x".repeat(60 * 1024)),
+                            name: "first".into(),
+                            kind: crate::symbols::SymbolKind::FileSummary,
+                            start_line: 1,
+                            end_line: 1,
+                            exported: false,
+                            score: 1.0,
+                            source: "lexical",
+                            semantic_score: None,
+                            lexical_score: Some(1.0),
+                            hybrid_boosted: false,
+                            exact: true,
+                            exact_phrase_count: 1,
+                            exact_window_lines: None,
+                            fusion_score: 1.0,
+                            snippet: "first match".into(),
+                        };
+                        let second = HybridResult {
+                            file: root.join("second.rs"),
+                            name: "second".into(),
+                            ..first.clone()
+                        };
+                        crate::commands::semantic_search::ranked_response_for_test(
+                            &request,
+                            &root,
+                            vec![first, second],
+                        )
+                    }
+                    _ => Response::error(&request.id, "unsupported", "unsupported fixture tool"),
+                },
+                Some(test_support::bind_config_without_indexes(&module_root)),
+                false,
+                usize::MAX,
+                None,
+                &module_root.join("storage"),
+                QuiescedLsp::ReapInBackground,
+                None,
+                None,
+            ))
+            .unwrap();
+    });
+    async fn receive(daemon: &mut tokio::io::DuplexStream, channel: u16, corr: u64) -> Frame {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let frame = read_frame(daemon).await.unwrap().unwrap();
+                if frame.header.channel == channel && frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("negotiated search response timed out")
+    }
+    assert_eq!(
+        receive(&mut daemon, 0, HELLO_CORR).await.header.ty,
+        FrameType::Hello
+    );
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            HELLO_CORR,
+            b"{}".to_vec(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".into(),
+        },
+        identity: subc_protocol::BindIdentity::new("opencode", "oversized-first-search"),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: Some(vec![result_body::RESULT_FORMAT.to_owned()]),
+        admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
+        call_mode: None,
+    })
+    .unwrap();
+    bind["identity"]["project_root"] = json!(&root);
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let ack = receive(&mut daemon, 0, 1).await;
+    assert!(matches!(
+        serde_json::from_slice::<ModuleControlResponse>(&ack.body).unwrap(),
+        ModuleControlResponse::RouteBindAck {}
+    ));
+    let call = json!({"name":"search", "arguments":{"query":"oversized first result"}});
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::Request,
+            control_flags(),
+            1,
+            1,
+            10,
+            serde_json::to_vec(&call).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let frame = receive(&mut daemon, 1, 10).await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    validate(&serde_json::from_slice::<ToolResult>(&frame.body).unwrap()).unwrap();
+    let body: Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(body["isError"], false, "{body}");
+    assert_eq!(body["structuredContent"]["rendered_results"], 1);
+    assert_eq!(
+        body["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        body["structuredContent"]["results_list_envelope"]["shown"],
+        1
+    );
+    let text = body["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("oversized-first-result/"),
+        "first result start was lost"
+    );
+    assert!(text.len() <= 51_200);
+    let envelope = "shown 1 of 2 results (budget) · narrow: offset, topK, path, includeTests";
+    assert!(text.ends_with(envelope), "{text}");
+    let cut = text.lines().nth_back(1).unwrap();
+    let path = cut
+        .split_once("; full result saved to ")
+        .unwrap()
+        .1
+        .strip_suffix("; read it with read and a line range]")
+        .unwrap();
+    let full = std::fs::read_to_string(path).unwrap();
+    assert!(
+        full.contains(&"x".repeat(60 * 1024)),
+        "saved first result is incomplete"
+    );
+    assert_eq!(cut, format!("[output cut at 50 KB of {:.1} KB; full result saved to {path}; read it with read and a line range]", full.len() as f64 / 1024.0));
+    let read = json!({"name":"read","arguments":{"path":path,"startLine":1,"endLine":1}});
+    write_frame(
+        &mut daemon,
+        &Frame::build(
+            FrameType::Request,
+            control_flags(),
+            1,
+            1,
+            11,
+            serde_json::to_vec(&read).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let read = receive(&mut daemon, 1, 11).await;
+    validate(&serde_json::from_slice::<ToolResult>(&read.body).unwrap()).unwrap();
+    let read: Value = serde_json::from_slice(&read.body).unwrap();
+    assert_eq!(read["isError"], false, "{read}");
+    assert_eq!(read["structuredContent"]["lines_read"], 1);
+    assert_eq!(read["structuredContent"]["byte_size"], full.len());
+    assert!(read["structuredContent"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("oversized-first-result/"));
+    drop(daemon);
+    module_thread.join().unwrap();
+}
+
 #[test]
 fn tool_result_builders_fit_large_images_and_bound_ast_matches() {
     let project = scratch_project();

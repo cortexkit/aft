@@ -142,9 +142,10 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 
 /// Result text under construction for one reply, bounded by a byte budget.
 ///
-/// Pieces are appended in reading order. A piece that would pass the budget
-/// is refused, including an oversized first header, and so is every later
-/// piece. The renderer reports how many result headers actually fit.
+/// Pieces are appended in reading order. The first piece is always accepted
+/// (a reply never comes back empty while results exist); after that, the first
+/// piece that would pass the budget is refused, and so is every later piece,
+/// so no text is rendered past the cut.
 pub(crate) struct BudgetedText {
     text: String,
     max_bytes: usize,
@@ -166,7 +167,7 @@ impl BudgetedText {
         if self.cut {
             return false;
         }
-        if self.text.len() + piece.len() > self.max_bytes {
+        if !self.text.is_empty() && self.text.len() + piece.len() > self.max_bytes {
             self.cut = true;
             return false;
         }
@@ -254,12 +255,12 @@ mod tests {
     }
 
     #[test]
-    fn budget_refuses_an_oversized_first_piece_and_everything_after_the_cut() {
+    fn budget_accepts_the_first_piece_and_refuses_everything_after_the_cut() {
         let mut text = BudgetedText::new(10);
-        assert!(!text.push("0123456789abc"));
+        assert!(text.push("0123456789abc"));
         assert!(!text.push("x"));
         assert!(text.is_cut());
         assert!(!text.push(""));
-        assert_eq!(text.into_string(), "");
+        assert_eq!(text.into_string(), "0123456789abc");
     }
 }
