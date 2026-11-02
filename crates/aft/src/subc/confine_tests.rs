@@ -768,6 +768,8 @@ fn confined_glob_count_shape_preserves_checked_and_partial_contracts() {
             "truncated",
             "index",
             "fallback",
+            // glob always reports how many files its text printed.
+            "rendered_files",
         ]);
         if partial {
             expected.insert("walk_truncated");
