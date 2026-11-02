@@ -294,9 +294,9 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
     let error = result.err().expect("legacy writer must be refused");
     assert!(
         error.to_string().contains("writer capability denied"),
-        "{error} {callgraph_dir:?}"
+        "{error}"
     );
-    assert!(!callgraph_dir.exists());
+    assert!(!callgraph_dir.exists(), "{}", callgraph_dir.display());
     assert!(!storage.join("blobs/v3").exists());
 }
 
