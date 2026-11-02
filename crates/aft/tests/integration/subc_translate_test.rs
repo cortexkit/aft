@@ -869,7 +869,7 @@ fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
     fs::write(root.join("lib.rs"), "pub fn load() {}\n").expect("write fixture");
 
     let mut aft = AftProcess::spawn();
-    let configure = aft.configure(root);
+    let configure = aft.configure_project(root);
     assert_eq!(
         configure["success"], true,
         "configure failed: {configure:#}"
