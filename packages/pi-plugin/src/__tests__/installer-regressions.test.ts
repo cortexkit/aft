@@ -15,8 +15,12 @@ async function cacheFixture(fn: (root: string) => Promise<void> | void): Promise
   const root = mkdtempSync(join(tmpdir(), "aft-install-regression-"));
   const bin = join(root, "bin");
   mkdirSync(bin);
-  // Only resolveNpm() sees this script; spawning is replaced where a test
-  // needs npm to stall.
+  // Model npm's package identity; spawning is replaced where a test needs
+  // npm to stall, so the deadline test never executes a system installer.
+  writeFileSync(
+    join(bin, "package.json"),
+    JSON.stringify({ name: "npm", version: "11.6.0", bin: { npm: "npm" } }),
+  );
   writeFileSync(join(bin, "npm"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   try {
     await withEnv(

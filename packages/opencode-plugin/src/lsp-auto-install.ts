@@ -36,9 +36,10 @@ import {
   cachedFileSha256,
   cachedFileSha256Sync,
   isSafeVersion,
-  lspNpmInstallInvocation,
+  lspNpmRefusal,
   lspPublicationCutoff,
   npmSpawnEnv,
+  prepareLspNpmInstall,
   resolveNpm,
   spawn,
   terminateNpmProcessTree,
@@ -312,21 +313,22 @@ async function runInstall(
   // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
   // reachable, and the shared policy safely routes Windows shims through cmd.exe
   // without enabling shell parsing on other platforms.
-  const npm = resolveNpm();
-  if (!npm) {
+  const preferredNpm = resolveNpm();
+  if (!preferredNpm) {
     warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
     return false;
   }
 
-  const invocation = await lspNpmInstallInvocation(npm, target, before);
+  const prepared = await prepareLspNpmInstall(preferredNpm, target, before);
   if (signal?.aborted) {
     warn(`[lsp] install ${target} aborted during npm capability probe`);
     return false;
   }
-  if (!invocation) {
-    warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
+  if (!prepared.npm) {
+    warn(`[lsp] ${prepared.refusal}`);
     return false;
   }
+  const { npm, invocation } = prepared;
   ensureInstallAnchor(cwd);
   return new Promise((resolve) => {
     const child = spawn(invocation.command, invocation.args, {
@@ -408,6 +410,9 @@ async function runInstall(
         log(`[lsp] installed ${target}`);
         finish(true);
       } else {
+        const rejectedOption = /--(?:no-save|before|ignore-scripts)\b/.exec(stderrBuf)?.[0];
+        if (rejectedOption)
+          warn(`[lsp] ${lspNpmRefusal(npm.command, `rejected option: ${rejectedOption}`)}`);
         error(
           `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
         );

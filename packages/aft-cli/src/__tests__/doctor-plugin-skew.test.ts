@@ -7,15 +7,20 @@
 // pinning policy replaces.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessConfigPaths } from "../adapters/types.js";
 import { buildDoctorFixPlan, runDoctor } from "../commands/doctor.js";
-import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
+import {
+  type DiagnosticReport,
+  type HarnessDiagnostic,
+  renderDiagnosticsMarkdown,
+} from "../lib/diagnostics.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { compareSemver } from "../lib/semver.js";
 import type { OpenCodeHostDetection } from "../setup/host-generation.js";
 import { AFT_OPENCODE_PACKAGE, MODERN_V1_VERSION } from "../setup/opencode-config.js";
 
@@ -390,5 +395,99 @@ describe("doctor --fix: updating an OpenCode plugin older than the CLI", () => {
     );
     expect(output).not.toContain("plugin updated");
     expect(output).not.toContain("plugin package update");
+  });
+});
+
+describe("doctor never downgrades OpenCode", () => {
+  const V2: OpenCodeHostDetection = {
+    ...V1,
+    status: "v2",
+    generations: ["v2"],
+    evidence: V1.evidence.map((e) => ({ ...e, generation: "v2" })),
+  };
+  const cases = [
+    { host: V1, spec: "0.63.5", installed: undefined },
+    { host: V1, spec: "0.63.5", installed: "0.63.5" },
+    { host: V2, spec: "0.63.5", installed: undefined },
+    { host: V2, spec: "0.63.5", installed: "0.63.5" },
+    { host: V2, spec: "latest", installed: "0.63.5" },
+    { host: V2, spec: "latest", installed: undefined },
+    { host: V2, spec: "^0.63.0", installed: undefined },
+    { host: V2, spec: "0.63.5-beta.2", installed: "0.63.5-beta.2" },
+  ];
+  for (const { host, spec, installed } of cases) {
+    test(`${host.status} ${spec} installed=${installed ?? "missing"}: diagnosis, plan and --fix --yes preserve bytes`, async () => {
+      expect(CLI_VERSION).toBe("0.63.4");
+      const entry = `${AFT_OPENCODE_PACKAGE}@${spec}`;
+      const { adapter, report } = fixture(entry, installed ?? "0.63.5");
+      rmSync(join(root, "xdg-cache"), { recursive: true, force: true });
+      adapter.useHostDetection(host);
+      const key = host.status === "v2" ? "plugins" : "plugin";
+      const packageEntry =
+        host.status === "v2"
+          ? { package: entry, options: { enabled: true } }
+          : [entry, { enabled: true }];
+      const bytes = `${JSON.stringify({ [key]: [packageEntry, "unrelated@1.0.0"], tools: { "-opencode.tool.shell": true, "-opencode.tool.patch": true } }, null, 2)}\n`;
+      writeFileSync(join(root, "opencode.json"), bytes);
+      if (installed) {
+        // Independently construct the host's layout, not the adapter's returned path.
+        const path =
+          host.status === "v2"
+            ? join(root, "xdg-cache/opencode/npm", entry, "1793616638229")
+            : join(root, "xdg-cache/opencode/packages", entry);
+        writeInstalledPlugin(path, installed);
+      }
+      const harness = report.harnesses[0]!;
+      harness.pluginCache = adapter.getPluginCacheInfo();
+      const plan = buildDoctorFixPlan([adapter], report);
+      expect(plan.filter((item) => item.kind === "plugin-update")).toEqual([]);
+      expect(plan.some((item) => item.message.includes(`update ${PINNED}`))).toBe(false);
+      const lines = captureOutput();
+      let npmCalls = 0;
+      for (const fix of [false, true]) {
+        await runDoctor({
+          clear: false,
+          fix,
+          force: false,
+          issue: false,
+          argv: fix ? ["--fix", "--yes"] : [],
+          resolveAdapters: async () => [adapter],
+          collectDiagnostics: async () => report,
+          collectRemovalHealth: async () => ({ available: false, message: "fixture" }),
+          detectOpenCodeHost: () => host,
+          applyOnnxFix: async () => null,
+          runNative: () => ({
+            ok: true,
+            stdout: JSON.stringify({ plan_version: 1, features: [] }),
+            stderr: "",
+            status: 0,
+          }),
+          runNpmInstall: async () => {
+            npmCalls++;
+          },
+        });
+        expect(readFileSync(join(root, "opencode.json"), "utf8")).toBe(bytes);
+      }
+      expect(npmCalls).toBe(0);
+      const output = stripAnsi(lines.join("\n"));
+      const approved = `This doctor is AFT 0.63.4; OpenCode is configured for AFT plugin ${installed ?? spec}. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.`;
+      expect(output).toContain(approved);
+      expect(output).not.toContain("to pin it to");
+      const markdown = renderDiagnosticsMarkdown(report);
+      expect(markdown).toContain(approved);
+      const source = installed ? "installed" : spec.startsWith("0.") ? "configured" : "unknown";
+      expect(output).toContain(`(${source}`);
+      expect(markdown).toContain(`(${source}`);
+      expect(markdown).not.toContain("not installed");
+    });
+  }
+
+  test("SemVer precedence includes prereleases, numeric identifiers and ignores build metadata", () => {
+    expect(compareSemver("0.63.5-beta.2", "0.63.4")).toBe(1);
+    expect(compareSemver("0.63.5-beta.2", "0.63.5")).toBe(-1);
+    expect(compareSemver("0.63.5-beta.10", "0.63.5-beta.2")).toBe(1);
+    expect(compareSemver("0.63.4+build.2", "0.63.4+build.1")).toBe(0);
+    expect(compareSemver("latest", "0.63.4")).toBeUndefined();
+    expect(compareSemver("0.63.5-beta.02", "0.63.4")).toBeUndefined();
   });
 });

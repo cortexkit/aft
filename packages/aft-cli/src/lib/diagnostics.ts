@@ -14,11 +14,17 @@ import {
 } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
-import { describePluginEntry, pinnedPluginEntry } from "../setup/opencode-config.js";
+import {
+  describePluginEntry,
+  doctorNoDowngradeMessage,
+  pinnedPluginEntry,
+  preserveDoctorPluginEntry,
+} from "../setup/opencode-config.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
-import { probeBinaryVersion } from "./binary-probe.js";
+import { probeAftBinary } from "./binary-probe.js";
 import { type BuildBreakerSuspension, readBuildBreakerSuspensions } from "./build-breaker.js";
 import { CLI } from "./cli.js";
+import { CLI_VERSION_CACHED_LABEL, describeCliBinary } from "./doctor-labels.js";
 import { readJsoncFile } from "./jsonc.js";
 import type { LegacyPartitionDuplicationSummary } from "./legacy-storage.js";
 import { summarizeLegacyPartitionDuplication } from "./legacy-storage.js";
@@ -33,6 +39,7 @@ import {
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
 } from "./onnx.js";
+import { describePluginVersion, doctorInstalledVersion } from "./opencode-plugin-cache.js";
 import {
   evaluatePluginLoad,
   type PluginLoadBlockerCode,
@@ -40,6 +47,7 @@ import {
 } from "./plugin-load.js";
 import { sanitizeValue } from "./sanitize.js";
 import { getSelfVersion } from "./self-version.js";
+import { compareSemver } from "./semver.js";
 
 export interface DiagnosticReport {
   timestamp: string;
@@ -48,6 +56,7 @@ export interface DiagnosticReport {
   nodeVersion: string;
   cliVersion: string;
   binaryVersion: string | null;
+  binaryPath?: string | null;
   harnesses: HarnessDiagnostic[];
   binaryCache: BinaryCacheInfo;
   /** LSP package and binary caches populated by plugin auto-install. */
@@ -134,7 +143,8 @@ export interface HarnessDiagnostic {
 
 export async function collectDiagnostics(adapters: HarnessAdapter[]): Promise<DiagnosticReport> {
   const cliVersion = getSelfVersion();
-  const binaryVersion = probeBinaryVersion(cliVersion);
+  const binaryProbe = probeAftBinary(cliVersion);
+  const binaryVersion = binaryProbe.version;
 
   const harnesses: HarnessDiagnostic[] = [];
   for (const adapter of adapters) {
@@ -148,6 +158,7 @@ export async function collectDiagnostics(adapters: HarnessAdapter[]): Promise<Di
     nodeVersion: process.version,
     cliVersion,
     binaryVersion,
+    binaryPath: binaryProbe.path,
     harnesses,
     binaryCache: getBinaryCacheInfo(cliVersion),
     lspCache: getLspCacheReport(),
@@ -279,11 +290,8 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
 export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
   const lines: string[] = [];
   lines.push(`- Timestamp: ${report.timestamp}`);
-  // Use explicit `AFT CLI` / `AFT binary` labels so users with multiple
-  // harnesses (Pi v0.74.0, OpenCode v0.x.y) can tell at a glance that
-  // these are AFT's own versions, not the host's.
   lines.push(`- AFT CLI: v${report.cliVersion}`);
-  lines.push(`- AFT binary: ${report.binaryVersion ?? "unknown"}`);
+  lines.push(`- ${describeCliBinary(report.binaryVersion, report.binaryPath)}`);
   lines.push(`- OS: ${report.platform} ${report.arch}`);
   lines.push(`- Node: ${report.nodeVersion}`);
 
@@ -308,7 +316,7 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
     lines.push(`- Host installed: ${h.hostInstalled}`);
     lines.push(`- Host version: ${h.hostVersion ?? "unknown"}`);
     lines.push(`- Plugin registered: ${h.pluginRegistered}`);
-    lines.push(`- Plugin version: ${h.pluginCache.cached ?? "not installed"}`);
+    lines.push(`- Plugin version: ${describePluginVersion(h.pluginCache)}`);
     lines.push(
       `- AFT enabled: ${h.aftConfig.enabled}${h.aftConfig.enabledSource ? ` (from ${h.aftConfig.enabledSource})` : ""}`,
     );
@@ -348,7 +356,10 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
   lines.push("");
   lines.push("### Binary cache");
   lines.push("```json");
-  lines.push(JSON.stringify(report.binaryCache, null, 2));
+  const { activeVersion, ...cacheInventory } = report.binaryCache;
+  lines.push(
+    JSON.stringify({ ...cacheInventory, [CLI_VERSION_CACHED_LABEL]: activeVersion }, null, 2),
+  );
   lines.push("```");
 
   lines.push("");
@@ -392,6 +403,14 @@ function pluginPackageNameForHarness(kind: string): string {
 function openCodeEntryToPin(harness: HarnessDiagnostic, cliVersion: string): string | null {
   if (harness.kind !== "opencode") return null;
   const entry = harness.pluginCache.configuredEntry;
+  if (
+    preserveDoctorPluginEntry(
+      normalizeVersion(cliVersion),
+      entry,
+      doctorInstalledVersion(harness.pluginCache),
+    )
+  )
+    return null;
   return entry && entry !== pinnedPluginEntry(normalizeVersion(cliVersion)) ? entry : null;
 }
 
@@ -424,11 +443,34 @@ function pluginVersionSkewIssue(
   harness: HarnessDiagnostic,
   cliVersion: string,
 ): DiagnosticIssue | null {
+  if (harness.pluginCache.local) return null;
+  if (
+    harness.kind === "opencode" &&
+    preserveDoctorPluginEntry(
+      normalizeVersion(cliVersion),
+      harness.pluginCache.configuredEntry,
+      doctorInstalledVersion(harness.pluginCache),
+    )
+  ) {
+    return {
+      code: "plugin_cli_version_skew",
+      severity: "info",
+      scope: harness.displayName,
+      message: doctorNoDowngradeMessage(
+        normalizeVersion(cliVersion),
+        harness.pluginCache.configuredEntry,
+        doctorInstalledVersion(harness.pluginCache),
+      ),
+      remediation: "",
+    };
+  }
   const pluginVersion = harness.pluginCache.cached;
   if (!pluginVersion) return null;
   if (normalizeVersion(pluginVersion) === normalizeVersion(cliVersion)) return null;
 
-  const older = compareLooseSemver(pluginVersion, cliVersion) < 0;
+  const older =
+    (compareSemver(normalizeVersion(pluginVersion), normalizeVersion(cliVersion)) ??
+      compareLooseSemver(pluginVersion, cliVersion)) < 0;
   const skew = older
     ? `Plugin version (${pluginVersion}) is older than CLI (${cliVersion}). New binary cache won't be used until you update the plugin.`
     : `Plugin version (${pluginVersion}) does not match CLI (${cliVersion}). New binary cache may not be used until the plugin and CLI match.`;

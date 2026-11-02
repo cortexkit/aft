@@ -9,6 +9,8 @@ import {
   AFT_OPENCODE_PACKAGE,
   acceptV1Entry,
   describePluginEntry,
+  doctorNoDowngradeMessage,
+  exactPinnedVersion,
   isAftNpmEntry,
   type OpenCodeConfigGeneration,
   type OpenCodePluginKey,
@@ -17,6 +19,7 @@ import {
   otherOpenCodePluginKey,
   pluginEntryFitsKey,
   pluginEntryPackage,
+  preserveDoctorPluginEntry,
 } from "../setup/opencode-config.js";
 
 export const OPENCODE_LOAD_PATHS = [
@@ -217,7 +220,14 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     null;
   const problems: string[] = [...describePluginKeyProblems(config, generation)];
   let entryPinProblem: string | null = null;
-  if (
+  const cli = input.expectedPluginEntry ? exactPinnedVersion(input.expectedPluginEntry) : null;
+  const installed =
+    input.cachedPluginVersion ??
+    (typeof manifest?.version === "string" ? manifest.version : undefined);
+  if (cli && entry && isAftNpmEntry(entry) && preserveDoctorPluginEntry(cli, entry, installed)) {
+    entryPinProblem = doctorNoDowngradeMessage(cli, entry, installed);
+    problems.push(entryPinProblem);
+  } else if (
     entry &&
     isAftNpmEntry(entry) &&
     input.expectedPluginEntry &&

@@ -323,6 +323,12 @@ export {
   type Platform,
 } from "./lsp-github-table.js";
 export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
+export {
+  LSP_NPM_REFUSAL,
+  lspNpmRefusal,
+  prepareLspNpmInstall,
+  selectLspNpm,
+} from "./lsp-npm-selection.js";
 // --- which incoming messages interrupt a blocking bash wait ---
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,

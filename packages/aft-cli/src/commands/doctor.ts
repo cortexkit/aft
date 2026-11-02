@@ -64,6 +64,7 @@ import {
   renderDiagnosticsMarkdown,
   tailLogFile,
 } from "../lib/diagnostics.js";
+import { CLI_VERSION_CACHED_LABEL, describeCliBinary } from "../lib/doctor-labels.js";
 import {
   explicitHarness,
   loadFeaturePlan,
@@ -85,10 +86,12 @@ import {
 } from "../lib/jsonc.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
 import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
+import { describePluginVersion, doctorInstalledVersion } from "../lib/opencode-plugin-cache.js";
 import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { compareSemver } from "../lib/semver.js";
 import { readLogHistory, readSessionLog } from "../lib/session-log.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
@@ -104,11 +107,13 @@ import {
 } from "../setup/host-generation.js";
 import {
   AFT_OPENCODE_PACKAGE,
+  doctorNoDowngradeMessage,
   exactPinnedVersion,
   OPENCODE_HOST_TOOL_NAMES,
   OPENCODE_HOST_TOOLS,
   type OpenCodeHostTool,
   pinnedPluginEntry,
+  preserveDoctorPluginEntry,
 } from "../setup/opencode-config.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
@@ -185,8 +190,9 @@ function refuseAmbiguousOpenCodeWrites(detection: OpenCodeHostDetection | null):
 
 function adapterConfigNeedsUpdate(adapter: HarnessAdapter, tui = false): boolean {
   const method = tui ? "needsTuiPluginEntryUpdate" : "needsPluginEntryUpdate";
-  const candidate = adapter as HarnessAdapter & Partial<Record<typeof method, () => boolean>>;
-  return candidate[method]?.() ?? false;
+  const candidate = adapter as HarnessAdapter &
+    Partial<Record<typeof method, (options?: { doctor: boolean }) => boolean>>;
+  return candidate[method]?.({ doctor: true }) ?? false;
 }
 
 export interface RemovalHealth {
@@ -309,18 +315,16 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           configPath: opencodeHarness.configPaths.harnessConfig,
           logPath: opencodeHarness.logFile.path,
           pluginCachePath: opencodeHarness.pluginCache.path,
-          cachedPluginVersion: opencodeHarness.pluginCache.cached,
-          // The entry doctor --fix writes on every host generation. On
-          // OpenCode 1, `@latest` or another exact version also loads, so the
-          // report does not call it a problem; --fix still pins it, and its
-          // plan says so.
+          cachedPluginVersion: doctorInstalledVersion(opencodeHarness.pluginCache),
           expectedPluginEntry: opencodeAdapter.pluginEntryWithVersion,
           acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
       : null;
   const opencodeSkew = opencodeHarness ? pluginVersionSkewFor(report, opencodeHarness) : null;
 
-  log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
+  log.info(
+    `AFT CLI v${report.cliVersion}, ${describeCliBinary(report.binaryVersion, report.binaryPath)}`,
+  );
   if (!report.binaryVersion) {
     const hasEnabledRegisteredHarness = report.harnesses.some(
       (h) => h.pluginRegistered && h.aftConfig.enabled,
@@ -347,7 +351,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     logUnmatchedBinaryCandidates(report.cliVersion);
   }
   log.info(
-    `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}`,
+    `Binary cache: ${report.binaryCache.versions.length} version(s), ${formatBytes(report.binaryCache.totalSize)} at ${report.binaryCache.path}; ${CLI_VERSION_CACHED_LABEL}: ${report.binaryCache.activeVersion ?? "no"}`,
   );
   logBuildBreakerSuspensions(report);
 
@@ -411,9 +415,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     } else {
       log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
     }
-    log.info(
-      `  plugin version: ${h.kind === "opencode" ? (opencodeDoctor?.pluginVersion ?? h.pluginCache.cached ?? "not installed") : (h.pluginCache.cached ?? "not installed")}`,
-    );
+    log.info(`  plugin version: ${describePluginVersion(h.pluginCache)}`);
     if (!h.aftConfig.enabled) {
       log.info(
         `  AFT disabled by config${h.aftConfig.enabledSource ? ` (${h.aftConfig.enabledSource})` : ""}; plugin will stay inert`,
@@ -953,8 +955,12 @@ function findPluginUpdateTargets(
     if (!harness.aftConfig.enabled) continue;
     if (!harness.hostInstalled || !harness.pluginRegistered) continue;
     const cache = harness.pluginCache;
-    if (!cache?.exists || !cache.cached || !cache.latest) continue;
-    if (cache.cached === cache.latest) continue;
+    if (cache.local) continue;
+    const cliVersion = cache.cliVersion ?? report.cliVersion;
+    if (!cache?.exists || !cache.cached) continue;
+    if (preserveDoctorPluginEntry(cliVersion, cache.configuredEntry, doctorInstalledVersion(cache)))
+      continue;
+    if ((compareSemver(cache.cached, cliVersion) ?? 0) >= 0) continue;
     const adapter = adaptersByKind.get(harness.kind);
     if (!adapter) continue;
     const pin = cache.configuredEntry ? exactPinnedVersion(cache.configuredEntry) : null;
@@ -962,8 +968,8 @@ function findPluginUpdateTargets(
       adapter,
       installDir: cache.path,
       cached: cache.cached,
-      latest: cache.latest,
-      oldPin: pin !== null && pin !== cache.latest ? pin : null,
+      latest: cliVersion,
+      oldPin: pin !== null && pin !== cliVersion ? pin : null,
     });
   }
   return targets;
@@ -1220,7 +1226,7 @@ export function buildDoctorFixPlan(
     } else {
       items.push({
         kind: "plugin",
-        message: `Will ${harness.pluginRegistered ? "update" : "add"} ${adapter.pluginEntryWithVersion} ${harness.pluginRegistered ? "in" : "to"} ${harness.configPaths.harnessConfig}`,
+        message: `Will ${harness.pluginRegistered ? "update" : "add"} ${adapter instanceof OpenCodeAdapter ? adapter.doctorPluginEntry() : adapter.pluginEntryWithVersion} ${harness.pluginRegistered ? "in" : "to"} ${harness.configPaths.harnessConfig}`,
       });
     }
   }
@@ -1236,7 +1242,7 @@ export function buildDoctorFixPlan(
     if (hasTuiEntry && !adapterConfigNeedsUpdate(adapter, true)) continue;
     items.push({
       kind: "plugin",
-      message: `Will ${hasTuiEntry ? "update" : "add"} ${adapter.pluginEntryWithVersion} ${hasTuiEntry ? "in" : "to"} ${harness.configPaths.tuiConfig} (TUI sidebar)`,
+      message: `Will ${hasTuiEntry ? "update" : "add"} ${adapter instanceof OpenCodeAdapter ? adapter.doctorPluginEntry(true) : adapter.pluginEntryWithVersion} ${hasTuiEntry ? "in" : "to"} ${harness.configPaths.tuiConfig} (TUI sidebar)`,
     });
   }
 
@@ -1422,6 +1428,25 @@ async function runFixFlow(
 
   log.info("Running diagnostics to identify auto-fixable issues…");
   const report = await collect(adapters);
+  for (const harness of report.harnesses) {
+    const cache = harness.pluginCache;
+    if (
+      harness.kind === "opencode" &&
+      preserveDoctorPluginEntry(
+        report.cliVersion,
+        cache.configuredEntry,
+        doctorInstalledVersion(cache),
+      )
+    ) {
+      log.info(
+        doctorNoDowngradeMessage(
+          report.cliVersion,
+          cache.configuredEntry,
+          doctorInstalledVersion(cache),
+        ),
+      );
+    }
+  }
   if (!report.binaryVersion) {
     logUnmatchedBinaryCandidates(report.cliVersion);
   }
@@ -1900,7 +1925,7 @@ async function maybeFixPlugin(
   if (!adapter.isInstalled()) return summary;
   if (!adapter.hasPluginEntry() || adapterConfigNeedsUpdate(adapter)) {
     log.info(`${adapter.displayName}: attempting to register or update plugin config…`);
-    const result = await adapter.ensurePluginEntry();
+    const result = await adapter.ensurePluginEntry({ doctor: true });
     if (result.ok) {
       if (result.action === "added" || result.action === "updated") summary.changed += 1;
       log.success(`${adapter.displayName}: ${result.message}`);
@@ -1918,7 +1943,7 @@ async function maybeFixPlugin(
   ) {
     const hasTuiEntry = adapter.hasTuiPluginEntry();
     if (!hasTuiEntry || adapterConfigNeedsUpdate(adapter, true)) {
-      const result = await adapter.ensureTuiPluginEntry();
+      const result = await adapter.ensureTuiPluginEntry({ doctor: true });
       if (result.ok && (result.action === "added" || result.action === "updated")) {
         summary.changed += 1;
         log.success(`${adapter.displayName}: ${result.message}`);
