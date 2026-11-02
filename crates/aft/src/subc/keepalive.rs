@@ -25,12 +25,9 @@ pub(super) fn channel(
         let Ok(calls) = active.try_lock() else {
             return false;
         };
-        if !calls
+        let active_call = calls
             .get(&(route, corr))
-            .is_some_and(|call| !call.answering && call.cancellation.has_progress_channel(key))
-        {
-            return false;
-        }
+            .is_some_and(|call| !call.answering && call.cancellation.has_progress_channel(key));
         // Queue under the same lock as terminal claiming, so a milestone can
         // never enqueue a PUSH after the call's terminal frame.
         let Ok(frame) = Frame::build(
@@ -43,10 +40,20 @@ pub(super) fn channel(
         ) else {
             return false;
         };
-        matches!(
-            wire::try_enqueue_writer_frame(&tx, &metrics, frame),
-            wire::WriterEnqueueOutcome::Enqueued
-        )
+        let send = || {
+            matches!(
+                wire::try_enqueue_writer_frame(&tx, &metrics, frame),
+                wire::WriterEnqueueOutcome::Enqueued
+            )
+        };
+        if active_call {
+            send()
+        } else {
+            drop(calls);
+            metrics
+                .held_bash_calls
+                .try_keepalive(route, corr, key, send)
+        }
     };
     #[cfg(test)]
     if let Some(clock) = tests::clock(corr) {
@@ -62,6 +69,29 @@ pub(super) fn channel(
 #[cfg(test)]
 #[path = "keepalive_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(super) struct TestClock {
+    pub(super) corr: u64,
+    pub(super) now: Arc<AtomicU64>,
+}
+
+#[cfg(all(test, unix))]
+impl TestClock {
+    pub(super) fn new() -> Self {
+        let corr = tests::NEXT.fetch_add(1, Ordering::SeqCst);
+        let now = Arc::new(AtomicU64::new(0));
+        tests::CLOCKS.lock().unwrap().insert(corr, now.clone());
+        Self { corr, now }
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for TestClock {
+    fn drop(&mut self) {
+        tests::CLOCKS.lock().unwrap().remove(&self.corr);
+    }
+}
 
 pub(super) fn job(
     progress: Option<Progress>,

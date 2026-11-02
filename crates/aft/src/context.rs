@@ -1536,8 +1536,8 @@ struct ConfigureWarmState {
 /// change that leaves every counter alone can show.
 const HEALTH_MEMORY_REUSE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The three per-entry index walks of a memory estimate (semantic, trigram,
-/// symbols). `measured_at` is when the oldest of them was taken.
+/// The three resident-index estimates (semantic, trigram, symbols).
+/// `measured_at` is when the oldest of them was taken.
 #[derive(Clone, Debug)]
 struct WalkedMemory {
     measured_at: Instant,
@@ -1558,14 +1558,13 @@ struct IndexMemoryWalk<S> {
 
 /// The health rollup's reusable walks, kept per index. Reads add files to the
 /// symbol cache far more often than edits change the trigram or semantic
-/// index, and the symbol cache is cheap to walk while the other two visit
-/// every indexed file; keeping them apart means a read re-walks only the
-/// symbol cache.
+/// index. Keeping their estimates apart means a read refreshes only the
+/// constant-time symbol totals rather than walking the other indexes.
 #[derive(Clone, Debug, Default)]
 struct HealthMemoryWalks {
     semantic: Option<IndexMemoryWalk<Option<[u64; 9]>>>,
     trigram: Option<IndexMemoryWalk<Option<[u64; 11]>>>,
-    symbols: Option<IndexMemoryWalk<[u64; 3]>>,
+    symbols: Option<IndexMemoryWalk<[u64; 5]>>,
 }
 
 /// The immutable health projection of one installed runtime and ledger version.
@@ -17717,7 +17716,7 @@ impl AppContext {
     }
 
     /// Shape counters of the symbol cache; `None` means it is locked.
-    fn symbol_memory_shape(&self) -> Option<[u64; 3]> {
+    fn symbol_memory_shape(&self) -> Option<[u64; 5]> {
         Some(self.symbol_cache.try_read().ok()?.memory_shape())
     }
 
@@ -17757,7 +17756,7 @@ impl AppContext {
         }
     }
 
-    /// Walk every entry of the symbol cache for its memory estimate.
+    /// Read the symbol cache's running memory totals without visiting entries.
     fn walk_symbol_memory(&self) -> crate::memory::MemoryEstimate {
         #[cfg(test)]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[2] += 1);
@@ -17993,11 +17992,12 @@ impl AppContext {
     /// pre-aggregated root memory, computed from one estimate. Only the
     /// health rollup calls this.
     ///
-    /// The index walks inside an estimate visit every entry of the root's
-    /// resident indexes, and the rollup asks for every root every few seconds.
-    /// So each index's last walk is reused while that index's shape counters
-    /// stay the same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]; a change
-    /// to one index re-walks only that index. The cheap subsystem estimates
+    /// Semantic and trigram walks visit every entry of the root's resident
+    /// indexes; symbol bytes come from running totals. The rollup asks for
+    /// every root every few seconds, so each index's estimate is reused while
+    /// its shape counters stay the same, for at most
+    /// [`HEALTH_MEMORY_REUSE_INTERVAL`]; a change to one index refreshes only
+    /// that estimate. The cheap subsystem estimates
     /// are always taken fresh. The rollup's `measured_age_ms` is the age of
     /// the oldest walk in use. A missing index has nothing to walk, so it is
     /// never reused and never makes the figures look older.
@@ -18424,6 +18424,48 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
         .get(&(root.to_path_buf(), session_id.to_string()))
         .copied()
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod memory_estimate_tests {
+    use super::*;
+
+    #[test]
+    fn symbol_memory_rollup_matches_recount_after_mutations() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        // The project root must be absolute on every platform; a bare
+        // "/memory-rollup" has no drive letter on Windows.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lib.rs");
+        let assert_memory = || {
+            let expected = ctx.symbol_cache.read().unwrap().recounted_memory_for_test();
+            assert_eq!(ctx.memory_root_snapshot().symbols, expected);
+            let (snapshot, rollup) = ctx.memory_root_snapshot_and_rollup();
+            assert_eq!(snapshot.symbols, expected);
+            assert_eq!(rollup.attributed_bytes, snapshot.attributed_bytes);
+        };
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().insert(
+            path.clone(),
+            SystemTime::UNIX_EPOCH,
+            0,
+            blake3::hash(b""),
+            Vec::new(),
+        );
+        assert_memory();
+        ctx.symbol_cache
+            .write()
+            .unwrap()
+            .set_project_root(root.path().to_path_buf());
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().invalidate(&path);
+        assert_memory();
+        ctx.symbol_cache.write().unwrap().reset();
+        assert_memory();
+    }
 }
 
 #[cfg(test)]

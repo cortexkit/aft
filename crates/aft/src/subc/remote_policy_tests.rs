@@ -1941,13 +1941,15 @@ async fn exercise_catalog_remote_bash(
     let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
     init_remote_git_fixture(root.path());
-    let marker = root.path().join("must-not-run-locally");
+    let storage = tempfile::tempdir().unwrap();
+    // Keep the execution sentinel outside the checkout so the write preflight
+    // does not mask the executor refusal this helper is meant to exercise.
+    let marker = storage.path().join("must-not-run-locally");
     let command = if refusal.is_some() {
         format!("printf local-proof > '{}'", marker.display())
     } else {
         "cargo test".into()
     };
-    let storage = tempfile::tempdir().unwrap();
     let bind = identity(root.path(), "one", 7, true);
     let root_id = bind.root.clone();
     let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));

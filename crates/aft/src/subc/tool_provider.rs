@@ -9046,6 +9046,7 @@ mod authorization_failure_tests {
             arguments: json!({"command":"printf must-not-run"}),
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
+                keepalive: None,
                 speech_seed: None,
                 run_scope: None,
                 scope: None,

@@ -612,6 +612,7 @@ impl SiblingLoader {
                         LiveEntry::new(super::snapshot::DiskState::Absent, checkout.revision),
                     );
                 }
+                crate::run_tool_call::progress::report();
             }
             for (path, entry) in checkout.entries {
                 if entry.reconciliation == super::readiness::ReconciledDelta::Pending {
@@ -619,9 +620,11 @@ impl SiblingLoader {
                 } else {
                     delta.apply(path, entry);
                 }
+                crate::run_tool_call::progress::report();
             }
             for (path, patch) in checkout.readiness {
                 delta.set_readiness(path, patch);
+                crate::run_tool_call::progress::report();
             }
             let strict_epoch = checkout.cut.as_ref().map_or(delta.epoch(), |cut| cut.epoch);
             let mut snapshot = delta.snapshot().with_reconciled_epoch(strict_epoch);
@@ -2033,6 +2036,7 @@ impl CheckoutDriver {
                     )
                     .map_err(|e| SiblingLoader::error(e.to_string()))?;
             }
+            crate::run_tool_call::progress::report();
         }
         let expected = super::base_refs::BaseIdentity::of(&route.family, &manifest)
             .map_err(|e| SiblingLoader::error(e.to_string()))?;
@@ -2679,6 +2683,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .seq;
             let before = self.source_stat(&absolute, recorded_ns)?;
+            crate::run_tool_call::progress::report();
             if !pending.contains(&path) {
                 if let (Some(old), Some(cached), Some(current)) = (
                     previous.entries.get(&path),
@@ -2853,6 +2858,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 );
             }
             entries.insert(path, entry);
+            crate::run_tool_call::progress::report();
         }
         *self
             .observed
@@ -5779,6 +5785,7 @@ impl MembershipWalker for ConfiguredMembershipWalker {
             if item.file_type().is_some_and(|kind| kind.is_file()) {
                 files.push(item.into_path());
             }
+            crate::run_tool_call::progress::report();
         }
         Ok(files)
     }

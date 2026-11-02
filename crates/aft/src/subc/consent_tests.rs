@@ -2157,16 +2157,23 @@ async fn consent_folder_grant_withdraws_sibling_after_delayed_request_reply() {
         .await
         .expect("sibling card exists while its request reply is held");
     // The two reads file their requests in either order, so b.txt's held
-    // reply can arrive before a.txt's request has been sent.
+    // reply can arrive before a.txt's request has been sent. Recovery can also
+    // resend a request under its original key before the first receipt is
+    // recorded, so wait for two distinct keys and count user asks by key.
     let requests_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let requests = loop {
-        let requests = f.fake.calls("consent.request");
-        if requests.len() >= 2 || tokio::time::Instant::now() >= requests_deadline {
-            break requests;
+    loop {
+        let keys: std::collections::HashSet<String> = f
+            .fake
+            .calls("consent.request")
+            .iter()
+            .filter_map(|request| request["call_key"].as_str().map(str::to_owned))
+            .collect();
+        if keys.len() >= 2 || tokio::time::Instant::now() >= requests_deadline {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    assert_eq!(requests.len(), 2);
+    }
+    let requests = assert_two_sibling_consent_asks(&f, &a, &b);
     let key1 = call_key_for_file(&requests, "a.txt");
     let key2 = call_key_for_file(&requests, "b.txt");
     let records = f.asks();

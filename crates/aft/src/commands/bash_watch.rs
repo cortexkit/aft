@@ -530,6 +530,11 @@ impl WatchJob {
             let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
+            if !terminal {
+                // tool-provider CONTRACT.md §4.4: the completed running-state
+                // observation proves supervision is live, even without output.
+                cancellation.report_progress();
+            }
             if let (Some(pattern), Some(snapshot)) = (&self.pattern, &snapshot) {
                 if let Some(found) = self.scan(pattern, snapshot, &mut stdout, &mut stderr) {
                     return Some(waited(WaitReason::Matched, Some(found)));
@@ -913,6 +918,10 @@ fn output_tail(output: &str) -> String {
     let start = lines.len().saturating_sub(WORKER_OUTPUT_TAIL_LINES);
     lines[start..].join("\n")
 }
+
+#[cfg(all(test, unix))]
+#[path = "bash_watch_keepalive_tests.rs"]
+mod keepalive_tests;
 
 #[cfg(test)]
 mod tests {

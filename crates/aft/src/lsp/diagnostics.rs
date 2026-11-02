@@ -102,6 +102,8 @@ pub struct DiagnosticEntry {
 pub struct DiagnosticsStore {
     /// Primary store keyed by `(ServerKey, canonical file path)`.
     entries: HashMap<(ServerKey, PathBuf), DiagnosticEntry>,
+    memory_bytes: u64,
+    diagnostic_count: usize,
     /// Secondary lookup from a file to every server with a cached report.
     /// Every mutation of `entries` must update this index in the same operation.
     by_file: HashMap<PathBuf, HashSet<ServerKey>>,
@@ -157,6 +159,8 @@ impl DiagnosticsStore {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            memory_bytes: 0,
+            diagnostic_count: 0,
             by_file: HashMap::new(),
             order: BTreeMap::new(),
             order_clock: 0,
@@ -194,6 +198,13 @@ impl DiagnosticsStore {
     }
 
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        crate::memory::MemoryEstimate::estimated(self.memory_bytes)
+            .count("diagnostic_entries", self.entries.len())
+            .count("diagnostics", self.diagnostic_count)
+    }
+
+    #[cfg(test)]
+    fn recounted_memory(&self) -> crate::memory::MemoryEstimate {
         let mut diagnostic_count = 0usize;
         let entry_bytes = self
             .entries
@@ -361,20 +372,46 @@ impl DiagnosticsStore {
             from_receive_order: false,
         };
 
-        self.last_publish_at_for_file
-            .insert(key.clone(), Instant::now());
-
-        if self.entries.contains_key(&key) {
+        let entry_bytes = if let Some((stored_key, previous)) = self.entries.get_key_value(&key) {
             #[cfg(test)]
             LRU_KEY_PROBES.with(|probes| probes.set(probes.get() + 1));
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_sub(Self::entry_memory_bytes(stored_key, previous));
+            self.diagnostic_count = self
+                .diagnostic_count
+                .saturating_sub(previous.diagnostics.len());
             if let Some(position) = self.order_positions.remove(&key) {
-                self.order.remove(&position);
+                if let Some(previous_key) = self.order.remove(&position) {
+                    self.memory_bytes = self
+                        .memory_bytes
+                        .saturating_sub(Self::key_memory_bytes(&previous_key));
+                }
             }
+            Self::entry_memory_bytes(stored_key, &entry)
         } else {
             // New entry — apply LRU cap before inserting.
             if self.capacity > 0 && self.entries.len() >= self.capacity {
                 self.evict_lru();
             }
+            Self::entry_memory_bytes(&key, &entry)
+        };
+        self.memory_bytes = self
+            .memory_bytes
+            .saturating_add(entry_bytes)
+            .saturating_add(Self::key_memory_bytes(&key));
+        self.diagnostic_count = self
+            .diagnostic_count
+            .saturating_add(entry.diagnostics.len());
+        if self
+            .last_publish_at_for_file
+            .insert(key.clone(), Instant::now())
+            .is_none()
+        {
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_add(Self::key_memory_bytes(&key))
+                .saturating_add(std::mem::size_of::<Instant>() as u64);
         }
         self.entries.insert(key.clone(), entry);
         self.index_entry(&key);
@@ -733,20 +770,16 @@ impl DiagnosticsStore {
     /// Prefer `clear_for_server` for real manager cleanup so peer roots of the
     /// same kind are not wiped.
     pub fn clear_server(&mut self, server: ServerKind) {
-        let before = self.entries.len();
-        self.entries
-            .retain(|(stored_key, _), _| stored_key.kind != server);
-        self.order
-            .retain(|_, (stored_key, _)| stored_key.kind != server);
-        self.order_positions
-            .retain(|(stored_key, _), _| stored_key.kind != server);
-        self.last_publish_at_for_file
-            .retain(|(stored_key, _), _| stored_key.kind != server);
-        self.by_file.retain(|_, servers| {
-            servers.retain(|stored_key| stored_key.kind != server);
-            !servers.is_empty()
-        });
-        if self.entries.len() != before {
+        let keys: Vec<_> = self
+            .entries
+            .keys()
+            .filter(|(key, _)| key.kind == server)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.remove_cached_entry(key);
+        }
+        if !keys.is_empty() {
             self.generation = self.generation.wrapping_add(1);
         }
         self.debug_assert_index_consistent();
@@ -755,15 +788,10 @@ impl DiagnosticsStore {
     /// Drop one cached report for a specific server/file pair.
     pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
         let cache_key = (key.clone(), file.to_path_buf());
-        if self.entries.remove(&cache_key).is_some() {
-            if let Some(position) = self.order_positions.remove(&cache_key) {
-                self.order.remove(&position);
-            }
-            self.unindex_entry(&cache_key);
+        if self.remove_cached_entry(&cache_key) {
             self.generation = self.generation.wrapping_add(1);
         }
 
-        self.last_publish_at_for_file.remove(&cache_key);
         self.debug_assert_index_consistent();
     }
 
@@ -773,21 +801,17 @@ impl DiagnosticsStore {
     /// exists), inflating the error/warning counts surfaced in the status bar
     /// and `aft_inspect`. Returns true if any entry was removed.
     pub fn clear_for_file(&mut self, file: &Path) -> bool {
-        let Some(servers) = self.by_file.remove(file) else {
+        let Some(servers) = self.by_file.get(file).cloned() else {
             self.debug_assert_index_consistent();
             return false;
         };
         let mut removed = false;
         for server in servers {
             let cache_key = (server, file.to_path_buf());
-            removed |= self.entries.remove(&cache_key).is_some();
-            self.last_publish_at_for_file.remove(&cache_key);
+            removed |= self.remove_cached_entry(&cache_key);
         }
         if removed {
             self.generation = self.generation.wrapping_add(1);
-            self.order.retain(|_, (_, stored_file)| stored_file != file);
-            self.order_positions
-                .retain(|(_, stored_file), _| stored_file != file);
         }
         self.debug_assert_index_consistent();
         removed
@@ -900,7 +924,11 @@ impl DiagnosticsStore {
         for ((server, _), entry) in &mut self.entries {
             if server == key && entry.from_document_pull {
                 entry.stale = true;
-                entry.result_id = None;
+                if let Some(result_id) = entry.result_id.take() {
+                    self.memory_bytes = self
+                        .memory_bytes
+                        .saturating_sub(crate::memory::usize_to_u64(result_id.len()));
+                }
                 changed = true;
             }
         }
@@ -973,16 +1001,16 @@ impl DiagnosticsStore {
 
     /// Drop all entries for a specific server instance.
     pub fn clear_for_server(&mut self, key: &ServerKey) {
-        let before = self.entries.len();
-        self.entries.retain(|(k, _), _| k != key);
-        self.order.retain(|_, (k, _)| k != key);
-        self.order_positions.retain(|(k, _), _| k != key);
-        self.last_publish_at_for_file.retain(|(k, _), _| k != key);
-        self.by_file.retain(|_, servers| {
-            servers.remove(key);
-            !servers.is_empty()
-        });
-        if self.entries.len() != before {
+        let keys: Vec<_> = self
+            .entries
+            .keys()
+            .filter(|(server, _)| server == key)
+            .cloned()
+            .collect();
+        for key in &keys {
+            self.remove_cached_entry(key);
+        }
+        if !keys.is_empty() {
             self.generation = self.generation.wrapping_add(1);
         }
         self.debug_assert_index_consistent();
@@ -996,14 +1024,8 @@ impl DiagnosticsStore {
 
     /// Remove the least-recently-used entry, returning its key for telemetry.
     fn evict_lru(&mut self) -> Option<(ServerKey, PathBuf)> {
-        if self.order.is_empty() {
-            return None;
-        }
-        let (_, evicted) = self.order.pop_first()?;
-        self.entries.remove(&evicted);
-        self.order_positions.remove(&evicted);
-        self.unindex_entry(&evicted);
-        self.last_publish_at_for_file.remove(&evicted);
+        let evicted = self.order.first_key_value()?.1.clone();
+        self.remove_cached_entry(&evicted);
         self.debug_assert_index_consistent();
         Some(evicted)
     }
@@ -1018,20 +1040,108 @@ impl DiagnosticsStore {
     }
 
     fn index_entry(&mut self, (server, file): &(ServerKey, PathBuf)) {
-        self.by_file
-            .entry(file.clone())
-            .or_default()
-            .insert(server.clone());
+        let servers = self.by_file.entry(file.clone()).or_default();
+        if servers.is_empty() {
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_add(Self::file_memory_bytes(file));
+        }
+        if servers.insert(server.clone()) {
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_add(Self::server_memory_bytes(server));
+        }
     }
 
     fn unindex_entry(&mut self, (server, file): &(ServerKey, PathBuf)) {
         let remove_file = self.by_file.get_mut(file).is_some_and(|servers| {
-            servers.remove(server);
+            if let Some(stored_server) = servers.take(server) {
+                self.memory_bytes = self
+                    .memory_bytes
+                    .saturating_sub(Self::server_memory_bytes(&stored_server));
+            }
             servers.is_empty()
         });
         if remove_file {
-            self.by_file.remove(file);
+            let (stored_file, _) = self.by_file.remove_entry(file).expect("empty file index");
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_sub(Self::file_memory_bytes(&stored_file));
         }
+    }
+
+    fn server_memory_bytes(server: &ServerKey) -> u64 {
+        (std::mem::size_of::<ServerKey>() as u64)
+            .saturating_add(crate::memory::path_bytes(&server.root))
+    }
+
+    fn file_memory_bytes(file: &Path) -> u64 {
+        (std::mem::size_of::<PathBuf>() as u64).saturating_add(crate::memory::path_bytes(file))
+    }
+
+    fn key_memory_bytes((server, file): &(ServerKey, PathBuf)) -> u64 {
+        Self::server_memory_bytes(server).saturating_add(Self::file_memory_bytes(file))
+    }
+
+    fn entry_memory_bytes(key: &(ServerKey, PathBuf), entry: &DiagnosticEntry) -> u64 {
+        let diagnostic_bytes = entry.diagnostics.iter().fold(0u64, |bytes, diagnostic| {
+            bytes
+                .saturating_add(std::mem::size_of::<StoredDiagnostic>() as u64)
+                .saturating_add(crate::memory::path_bytes(&diagnostic.file))
+                .saturating_add(crate::memory::usize_to_u64(diagnostic.message.len()))
+                .saturating_add(
+                    diagnostic
+                        .code
+                        .as_ref()
+                        .map_or(0, |code| crate::memory::usize_to_u64(code.len())),
+                )
+                .saturating_add(
+                    diagnostic
+                        .source
+                        .as_ref()
+                        .map_or(0, |source| crate::memory::usize_to_u64(source.len())),
+                )
+        });
+        Self::key_memory_bytes(key)
+            .saturating_add(std::mem::size_of::<DiagnosticEntry>() as u64)
+            .saturating_add(
+                entry
+                    .result_id
+                    .as_ref()
+                    .map_or(0, |id| crate::memory::usize_to_u64(id.len())),
+            )
+            .saturating_add(diagnostic_bytes)
+    }
+
+    // All report-removal paths retire the payload and its three secondary
+    // indexes together, so the running totals never retain evicted bytes.
+    fn remove_cached_entry(&mut self, key: &(ServerKey, PathBuf)) -> bool {
+        let removed = if let Some((stored_key, entry)) = self.entries.remove_entry(key) {
+            self.memory_bytes = self
+                .memory_bytes
+                .saturating_sub(Self::entry_memory_bytes(&stored_key, &entry));
+            self.diagnostic_count = self
+                .diagnostic_count
+                .saturating_sub(entry.diagnostics.len());
+            true
+        } else {
+            false
+        };
+        if let Some(position) = self.order_positions.remove(key) {
+            if let Some(stored_key) = self.order.remove(&position) {
+                self.memory_bytes = self
+                    .memory_bytes
+                    .saturating_sub(Self::key_memory_bytes(&stored_key));
+            }
+        }
+        if let Some((stored_key, _)) = self.last_publish_at_for_file.remove_entry(key) {
+            self.memory_bytes = self.memory_bytes.saturating_sub(
+                Self::key_memory_bytes(&stored_key)
+                    .saturating_add(std::mem::size_of::<Instant>() as u64),
+            );
+        }
+        self.unindex_entry(key);
+        removed
     }
 
     fn debug_assert_index_consistent(&self) {
@@ -1169,6 +1279,75 @@ mod tests {
         assert!(estimate.estimated_bytes.unwrap() > 0);
         assert_eq!(estimate.counts["diagnostic_entries"], 1);
         assert_eq!(estimate.counts["diagnostics"], 1);
+    }
+
+    #[test]
+    fn diagnostics_memory_running_totals_match_recount() {
+        let mut store = DiagnosticsStore::with_capacity(3);
+        let rust = server_key(ServerKind::Rust);
+        let python = server_key(ServerKind::Python);
+        let first = PathBuf::from("/memory/nested/first.rs");
+        let alias = PathBuf::from("/memory/nested//first.rs");
+        let mut rust_alias = rust.clone();
+        rust_alias.root = PathBuf::from("/tmp//repo");
+        assert_eq!(first, alias);
+        assert_eq!(rust, rust_alias);
+        let second = PathBuf::from("/memory/longer-second.rs");
+        let mut rich = diag(
+            "/memory/diagnostic.rs",
+            1,
+            "a diagnostic message",
+            DiagnosticSeverity::Error,
+        );
+        rich.code = Some("code".into());
+        rich.source = Some("server".into());
+        let check = |store: &DiagnosticsStore| {
+            assert_eq!(store.estimated_memory(), store.recounted_memory())
+        };
+        check(&store);
+        for (server, file, count) in [
+            (&rust, &first, 2),
+            (&python, &first, 1),
+            (&rust_alias, &alias, 5),
+            (&rust, &first, 0),
+            (&rust, &second, 3),
+            (&python, &second, 4),
+        ] {
+            store.publish_with_result_id(
+                server.clone(),
+                file.clone(),
+                vec![rich.clone(); count],
+                Some("result-identity".into()),
+            );
+            check(&store);
+        }
+        store.invalidate_document_pulls(&rust);
+        check(&store);
+        store.set_capacity(1);
+        check(&store);
+        store.clear_for_server_file(&python, &second);
+        check(&store);
+        for clear in 0..3 {
+            store.set_capacity(0);
+            for server in [&rust, &python] {
+                for file in [&first, &second] {
+                    store.publish(server.clone(), file.clone(), vec![rich.clone()]);
+                    check(&store);
+                }
+            }
+            match clear {
+                0 => {
+                    store.clear_for_file(&first);
+                }
+                1 => store.clear_for_server(&rust),
+                _ => store.clear_server(ServerKind::Python),
+            }
+            check(&store);
+            store.clear_for_server(&rust);
+            store.clear_for_server(&python);
+            check(&store);
+            assert_eq!(store.estimated_memory().estimated_bytes, Some(0));
+        }
     }
 
     #[test]
@@ -1554,6 +1733,11 @@ mod tests {
 
             store.debug_assert_index_consistent();
             assert!(store.len() <= 7);
+            assert_eq!(
+                store.estimated_memory(),
+                store.recounted_memory(),
+                "step {step}"
+            );
         }
 
         assert!(operation_counts.into_iter().all(|count| count > 0));

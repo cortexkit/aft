@@ -977,6 +977,7 @@ impl SearchIndexSnapshot {
             } else {
                 unindexed.insert(id);
             }
+            crate::run_tool_call::progress::report();
         }
         Self {
             base: None,
@@ -4458,6 +4459,7 @@ impl SearchIndexSnapshot {
         let mut entries = self
             .files
             .iter()
+            .inspect(|_| crate::run_tool_call::progress::report())
             .filter(|file| !file.path.as_os_str().is_empty())
             .filter_map(|file| {
                 let root = containing_root(&file.path)?;
@@ -11449,6 +11451,51 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn call_keepalive_indexed_projection_and_glob_report_completed_rows() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant, SystemTime};
+        let root = tempfile::tempdir().unwrap();
+        let rows = ["a.rs", "b.rs", "c.rs"].map(|name| {
+            let path = root.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            (
+                super::FileEntry {
+                    path,
+                    size: 0,
+                    modified: SystemTime::UNIX_EPOCH,
+                    content_hash: blake3::hash(b""),
+                },
+                None,
+            )
+        });
+        let clock = Arc::new(AtomicU64::new(0));
+        let sent = Arc::new(AtomicU64::new(0));
+        let origin = Instant::now();
+        let token = crate::executor::JobCancellation::new();
+        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+            {
+                let clock = clock.clone();
+                move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))
+            },
+            {
+                let sent = sent.clone();
+                move |_| {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+        ));
+        let _token = crate::executor::install_job_cancellation(token);
+        let snapshot = super::SearchIndexSnapshot::from_verified_rows(root.path(), 1024, rows);
+        assert_eq!(sent.load(Ordering::SeqCst), 3);
+        let (files, has_files, visited) = snapshot.glob_profiled("*.rs", root.path(), false);
+        assert!(has_files);
+        assert_eq!((files.len(), visited), (3, 3));
+        assert_eq!(sent.load(Ordering::SeqCst), 6);
+    }
+
     fn lexical_views_paused_legacy_publication(turn_views_on: bool) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
