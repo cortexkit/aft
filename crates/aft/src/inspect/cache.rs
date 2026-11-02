@@ -3998,7 +3998,7 @@ pub(crate) mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 42);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 43);
     }
 
     #[test]
