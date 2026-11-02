@@ -13,18 +13,8 @@ use std::path::Path;
 use tempfile::tempdir;
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
-    crate::test_helpers::project::ensure_project(root).unwrap();
-    let resp = aft.send(
-        &serde_json::json!({
-            "id": "configure", "command": "configure", "harness": "opencode", "project_root": root,
-            "config": crate::test_helpers::project_detection_user_config(crate::test_helpers::project::admitted_config(
-                serde_json::json!({})
-            ))
-        })
-        .to_string(),
-    );
+    let resp = aft.configure_project(root);
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
-    aft.wait_for_folder_admission();
 }
 
 fn path_text_ends_with(path: &str, suffix: &str) -> bool {
@@ -145,10 +135,7 @@ fn callgraph_configure_sets_project_root() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(Path::new(&root));
 
     assert_eq!(
         resp["success"], true,
@@ -200,10 +187,7 @@ fn callgraph_cross_file_tree() {
     let root = fixtures.display().to_string();
 
     // Configure first
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(Path::new(&root));
     assert_eq!(resp["success"], true);
 
     // Get call tree for main
@@ -292,10 +276,7 @@ fn callgraph_depth_limit_truncates() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     // Depth 1: main → processData (no deeper)
     let resp = aft.send(&format!(
@@ -353,10 +334,7 @@ fn callgraph_unknown_symbol_error() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"call_tree","file":{},"symbol":"nonexistent"}}"#,
@@ -380,10 +358,7 @@ fn callgraph_aliased_import_resolution() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"call_tree","file":{},"symbol":"runCheck","depth":3}}"#,
@@ -442,10 +417,7 @@ fn callgraph_callers_cross_file() {
     let root = fixtures.display().to_string();
 
     // Configure first
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(Path::new(&root));
     assert_eq!(resp["success"], true);
 
     // Get callers of validate in helpers.ts
@@ -502,10 +474,7 @@ fn callgraph_callers_empty_result() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     // main is an entry point — nothing calls it
     let resp = aft.send(&format!(
@@ -531,10 +500,7 @@ fn callgraph_callers_recursive() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     // checkFormat is called by validate (same file), validate called by processData (utils.ts)
     // With depth 2, we should see transitive callers
@@ -607,11 +573,7 @@ export function runWorkspaceImport(): string {
     .unwrap();
 
     let mut aft = AftProcess::spawn();
-    let root_display = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_display)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -747,11 +709,7 @@ export function registerPiReadingTools(): string {
     .unwrap();
 
     let mut aft = AftProcess::spawn();
-    let root_display = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_display)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -845,11 +803,7 @@ export function runWorkspaceImport(): string {
     .unwrap();
 
     let mut aft = AftProcess::spawn();
-    let root_display = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_display)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -938,11 +892,7 @@ test("calls target", () => {
     .unwrap();
 
     let mut aft = AftProcess::spawn();
-    let root_display = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_display)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -1276,11 +1226,7 @@ export function render(): unknown {
     .unwrap();
 
     let mut aft = AftProcess::spawn();
-    let root_display = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_display)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(
         resp["success"], true,
         "configure should succeed: {:?}",
@@ -2061,10 +2007,7 @@ fn callgraph_trace_to_symbol_not_found() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_to","file":{},"symbol":"nonexistent"}}"#,
@@ -2112,10 +2055,7 @@ fn callgraph_trace_to_single_path() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_to","file":{},"symbol":"checkFormat","depth":10}}"#,
@@ -2171,10 +2111,7 @@ fn callgraph_trace_to_multi_path() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_to","file":{},"symbol":"validate","depth":10}}"#,
@@ -2238,10 +2175,7 @@ fn callgraph_trace_to_no_entry_points() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_to","file":{},"symbol":"main","depth":10}}"#,
@@ -2293,11 +2227,7 @@ fn callgraph_default_import_targets_real_default_export_name() {
     .expect("write helper");
 
     let mut aft = AftProcess::spawn();
-    let root_str = root.display().to_string();
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root_str)
-    ));
+    let resp = aft.configure_project(root);
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
     let resp = aft.send(&format!(
@@ -2347,10 +2277,7 @@ fn callgraph_impact_symbol_not_found() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"impact","file":{},"symbol":"nonexistent"}}"#,
@@ -2380,10 +2307,7 @@ fn callgraph_impact_multi_caller() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"impact","file":{},"symbol":"validate","depth":5}}"#,
@@ -2502,10 +2426,7 @@ fn callgraph_trace_data_symbol_not_found() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_data","file":{},"symbol":"nonexistent","expression":"x"}}"#,
@@ -2535,10 +2456,7 @@ fn callgraph_trace_data_assignment_tracking() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_data","file":{},"symbol":"transformData","expression":"rawInput","depth":5}}"#,
@@ -2604,10 +2522,7 @@ fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let overwritten = trace_data_hops(&mut aft, &root, "2", "overwritten");
     assert!(
@@ -2656,10 +2571,7 @@ fn callgraph_trace_data_cross_file() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_data","file":{},"symbol":"transformData","expression":"rawInput","depth":5}}"#,
@@ -2725,10 +2637,7 @@ fn callgraph_trace_data_approximation() {
     let mut aft = AftProcess::spawn();
     let (_temp, root) = temp_callgraph_fixture();
 
-    aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    aft.configure_project(Path::new(&root));
 
     let resp = aft.send(&format!(
         r#"{{"id":"2","command":"trace_data","file":{},"symbol":"complexFlow","expression":"data","depth":5}}"#,
@@ -2777,10 +2686,7 @@ fn callgraph_navigation_rejects_paths_outside_project_root() {
     .expect("write outside file");
     let outside_path = outside_file.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(Path::new(&root));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
     let requests = [
@@ -2833,10 +2739,7 @@ fn callgraph_ops_return_building_then_ready_async() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let resp = aft.send(&format!(
-        r#"{{"id":"1","command":"configure","harness":"opencode","project_root":{}}}"#,
-        crate::helpers::json_string(&root)
-    ));
+    let resp = aft.configure_project(Path::new(&root));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 
     // Configure eagerly warms the store in the background. The first op must

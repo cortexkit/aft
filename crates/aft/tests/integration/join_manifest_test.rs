@@ -26,7 +26,7 @@ fn regular(key: &str, resolution_input: bool) -> ManifestEntry {
 }
 
 fn fixture() -> (tempfile::TempDir, Manifest, MemoryBlobs) {
-    let root = crate::test_helpers::tempdir();
+    let root = tempfile::tempdir().unwrap();
     let inputs = [
         ("package.json", r#"{"private":true,"workspaces":["packages/*"]}"#, "config"),
         ("tsconfig.json", r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["lib/*"]}}}"#, "config"),

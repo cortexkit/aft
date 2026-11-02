@@ -26,14 +26,15 @@ pub fn settle(ctx: &AppContext) -> serde_json::Value {
 /// deferred index loading can then send an index-enabled configure request and
 /// inspect state before background maintenance releases the index loaders.
 pub fn prepare_project(ctx: &AppContext, root: &std::path::Path, storage: &std::path::Path) {
+    super::project::ensure_project(root).expect("mark test project");
     let request = serde_json::from_value(serde_json::json!({
         "id": "fixture-admission", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage,
         "config": [{"tier": "user", "source": root.join("fixture-admission.jsonc"),
-            "doc": serde_json::json!({
+            "doc": super::project::admitted_config(serde_json::json!({
                 "indexes": {"trigram": false, "semantic": false, "callgraph": false},
                 "views": {"enabled": false}
-            }).to_string()}]
+            })).to_string()}]
     }))
     .unwrap();
     let response = aft::commands::configure::handle_configure(&request, ctx);

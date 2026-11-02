@@ -351,7 +351,7 @@ fn config_doc(views: bool, planes: Planes, embedder: Option<&MockEmbedder>) -> V
 /// so dozens of fixture children do not each queue a view publication that
 /// the trigram tests never read.
 fn child_trigram_doc() -> Value {
-    config_doc(false, TRIGRAM_ONLY, None)
+    crate::test_helpers::project::admitted_config(config_doc(false, TRIGRAM_ONLY, None))
 }
 
 fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
@@ -978,13 +978,18 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     init_repo(&child, &child_files(0));
     init_repo(&other, &child_files(1));
     let configure_request = |root: &Path, views: bool| {
+        let doc = if root.join(".git").exists() {
+            crate::test_helpers::project::admitted_config(config_doc(views, TRIGRAM_ONLY, None))
+        } else {
+            config_doc(views, TRIGRAM_ONLY, None)
+        };
         json!({
             "id": "cfg",
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(views, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(doc),
         })
         .to_string()
     };
@@ -994,6 +999,8 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     for repo in [&child, &other] {
         let configured = aft.send(&configure_request(repo, false));
         assert_eq!(configured["success"], true, "{configured:#}");
+        let folder = aft.wait_for_folder_admission();
+        assert_eq!(folder["classification"], "project", "{folder}");
         let deadline = Instant::now() + DEADLINE;
         while !trigram_artifact(repo, &storage).is_file() {
             assert!(Instant::now() < deadline, "child index never persisted");

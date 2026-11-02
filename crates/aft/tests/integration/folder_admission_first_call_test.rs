@@ -10,12 +10,7 @@ fn timing_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Configure the fixture root with the project intent its case needs.
-///
-/// Folder admission reads the policy from user config alone. Declaring the
-/// fixture's own intent keeps its answer about this folder independent of where
-/// the temporary directory happens to live; the refusing case stays a negative
-/// decision for the folder itself.
+/// Declare known projects, but leave the no-evidence case on automatic detection.
 fn configure(
     root: &Path,
     storage: &Path,
@@ -26,7 +21,7 @@ fn configure(
     let detection = if admitted {
         json!({"mode": "project"})
     } else {
-        json!({"mode": "off"})
+        json!({"mode": "auto"})
     };
     json!({"id":id,"command":"configure","harness":"opencode",
         "project_root":root,"storage_dir":storage,
@@ -61,21 +56,27 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     std::fs::create_dir(&project).unwrap();
     if project_evidence {
         crate::test_helpers::project::mark_project(&project).unwrap();
+        std::fs::write(
+            project.join("main.rs"),
+            "fn caller() { callee(); }\nfn callee() {}\n",
+        )
+        .unwrap();
     }
-    std::fs::write(
-        project.join("main.rs"),
-        "fn caller() { callee(); }\nfn callee() {}\n",
-    )
-    .unwrap();
     let started = dir.path().join("probe-started");
     let release = dir.path().join("probe-release");
     let release_on_drop = ReleaseOnDrop::new(&release);
-    let mut aft = AftProcess::spawn_with_env(&[
+    let mut env = vec![
         ("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref()),
         ("AFT_TEST_ADMISSION_STARTED", started.as_os_str()),
         ("AFT_TEST_ADMISSION_RELEASE", release.as_os_str()),
         ("AFT_TEST_ADMISSION_TRACE", "1".as_ref()),
-    ]);
+    ];
+    if !project_evidence {
+        // This empty root is already outside Git. The sequencing check needs
+        // no external tools, so do not spend its short probe budget starting Git.
+        env.push(("PATH", "".as_ref()));
+    }
+    let mut aft = AftProcess::spawn_with_env(&env);
     // Both frames are queued before configure's post-ACK maintenance can run.
     aft.send_silent(
         &configure(
@@ -121,9 +122,6 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     let tool = response(&mut aft, "first-tool");
     let status = aft.send(r#"{"id":"admitted-status","command":"status"}"#);
     assert_eq!(status["folder"]["state"], "decided", "{status}");
-    // The fixture declares its project intent, and the call reports what that
-    // decision was: the refusal is the tool held for the decision, not evidence
-    // about the fixture folder (the classifier has its own coverage).
     let admitted = full_validation || project_evidence;
     assert_eq!(
         status["folder"]["classification"],
@@ -132,7 +130,7 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     );
     assert_eq!(
         status["folder"]["override_mode"],
-        if admitted { "project" } else { "off" },
+        if admitted { "project" } else { "auto" },
         "{status}"
     );
     let (status, stderr) = aft.stderr_output();
@@ -156,11 +154,8 @@ fn tool_from_same_burst_waits_for_negative_decision_and_gets_approved_refusal() 
     let tool = call_while_probe_is_held(false, false);
     assert_eq!(tool["success"], false, "{tool}");
     assert_eq!(tool["code"], "folder_not_admitted", "{tool}");
-    // The fixture declares not-project intent, so the decision it was held for
-    // is the declared one. Evidence rules for the same bare folder are covered
-    // by the classifier's own tests, which do not depend on where TMPDIR is.
-    assert_eq!(tool["reason"], "user_override", "{tool}");
-    assert_eq!(tool["folder"]["override_mode"], "off", "{tool}");
+    assert_eq!(tool["reason"], "no_project_evidence", "{tool}");
+    assert_eq!(tool["folder"]["override_mode"], "auto", "{tool}");
     assert_eq!(
         tool["message"],
         aft::folder_admission_runtime::OFF_TEXT,

@@ -964,9 +964,24 @@ impl AftProcess {
     }
 
     /// Configure an ordinary tool-behavior fixture, not a folder-admission test.
+    /// Mark the root as a project and explicitly configure project detection.
+    /// Tool tests must not receive a folder refusal just because the automatic
+    /// folder check ran out of time starting Git on a busy runner.
     pub fn configure_project(&mut self, project_root: &std::path::Path) -> serde_json::Value {
         project::ensure_project(project_root).expect("mark test project");
-        self.configure(project_root)
+        let response = self.send(
+            &serde_json::json!({
+                "id": "cfg", "command": "configure", "harness": "opencode",
+                "project_root": project_root,
+                "config": project_detection_user_config(serde_json::json!({})),
+            })
+            .to_string(),
+        );
+        if response["success"] == true {
+            let folder = self.wait_for_folder_admission();
+            assert_eq!(folder["classification"], "project", "{folder}");
+        }
+        response
     }
 
     /// Finish project setup before testing a tool that must not run against
@@ -1421,6 +1436,26 @@ fn child_storage_guard_rejects_non_temporary_roots() {
     let mut command = Command::new("unused");
     command.env("AFT_STORAGE_DIR", "/not-a-temporary-root/cortexkit/aft");
     assert_child_storage_isolated(&command);
+}
+
+#[test]
+fn configure_project_marks_a_bare_root_outside_git() {
+    let root = tempdir();
+    let inherited_git = git_work_tree_of(root.path());
+    eprintln!(
+        "fixture root={} temp={} enclosing_git={inherited_git:?}",
+        root.path().display(),
+        std::env::temp_dir().display()
+    );
+    assert!(inherited_git.is_none(), "{inherited_git:?}");
+    let mut aft = AftProcess::spawn();
+    let configured = aft.configure_project(root.path());
+    assert_eq!(configured["success"], true, "{configured}");
+    assert!(root.path().join("Makefile").is_file());
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["classification"], "project", "{folder}");
+    assert_eq!(folder["override_mode"], "project", "{folder}");
+    assert!(aft.shutdown().success());
 }
 
 fn spawn_stdout_capture_thread(
