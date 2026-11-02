@@ -469,7 +469,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                             name: "m".into(),
                             symbol: format!("{declaration_owner}::m"),
                             has_body: !interface,
-                            shape: "->".into(),
+                            shape: if language == "rust" { "self;->" } else { "->" }.into(),
                             private: false,
                         }];
                         for i in 0..overrides {
@@ -489,7 +489,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                                 name: "m".into(),
                                 symbol: format!("D{i}::m"),
                                 has_body: true,
-                                shape: "->".into(),
+                                shape: if language == "rust" { "self;->" } else { "->" }.into(),
                                 private: false,
                             });
                         }
@@ -551,7 +551,12 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                         name: "m".into(),
                         symbol: format!("Unrelated{i}::m"),
                         has_body: true,
-                        shape: "different-arity".into(),
+                        shape: if language == "rust" {
+                            "self;different-arity"
+                        } else {
+                            "different-arity"
+                        }
+                        .into(),
                         private: true,
                     });
                 }
@@ -620,4 +625,49 @@ fn relative_import_and_open_receiver_dispatch_do_not_rescan_every_file() {
         "{visits} file visits for {} sites in 130 files",
         16 * sites.len()
     );
+}
+
+#[test]
+fn mixed_old_and_new_rust_shapes_do_not_guess_instance_binding() {
+    let mut old = parse("pub struct Old; impl Old { pub fn m(&self) {} }", "rust");
+    for method in &mut old.dispatch.methods {
+        method.shape = method
+            .shape
+            .strip_prefix("self;")
+            .or_else(|| method.shape.strip_prefix("static;"))
+            .unwrap_or(&method.shape)
+            .to_string();
+    }
+    let encoded = super::super::CallgraphBlob::Parse(old).to_bytes().unwrap();
+    let decoded = super::super::CallgraphBlob::from_bytes(&encoded).unwrap();
+    let old = decoded.parse().unwrap();
+    let fresh = parse("use crate::old::Old; pub struct Fresh; impl Fresh { pub fn m(&self) {} } fn caller(old: &Old, fresh: &Fresh) { old.m(); fresh.m(); }", "rust");
+    let mut resolver = Resolver::new(BTreeMap::from([
+        ("old.rs".to_string(), old),
+        ("new.rs".to_string(), &fresh),
+    ]));
+    resolver.type_targets.insert(
+        ("new.rs".into(), "Old".into()),
+        ("old.rs".into(), "Old".into()),
+    );
+    let old_site = fresh
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.receiver.as_deref() == Some("Old"))
+        .unwrap();
+    let fresh_site = fresh
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.receiver.as_deref() == Some("Fresh"))
+        .unwrap();
+    let uncertain = resolver.resolve("new.rs", old_site);
+    assert!(uncertain.targets.is_empty(), "{uncertain:#?}");
+    assert_eq!(uncertain.unresolved, 1);
+    let exact = resolver.resolve("new.rs", fresh_site);
+    assert_eq!(exact.targets.len(), 1, "{exact:#?}");
+    assert!(exact.targets.iter().all(|target| target.file == "new.rs"
+        && target.symbol == "Fresh::m"
+        && target.provenance == "exact"));
 }

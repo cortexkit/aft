@@ -12,6 +12,24 @@ pub(super) struct Declaration {
     pub return_type: Option<String>,
     pub bytes: Range<usize>,
     pub line: u32,
+    pub has_self: bool,
+    pub trait_name: Option<String>,
+}
+
+pub(super) fn has_self_parameter(node: Node<'_>, source: &str) -> bool {
+    node.child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            parameters
+                .named_children(&mut parameters.walk())
+                .any(|parameter| {
+                    parameter.kind() == "self_parameter"
+                        || parameter
+                            .child_by_field_name("pattern")
+                            .is_some_and(|pattern| {
+                                text(pattern, source).trim_start_matches("mut ") == "self"
+                            })
+                })
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -56,16 +74,50 @@ fn names(pattern: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn identity(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
+fn identity(
+    node: Node<'_>,
+    source: &str,
+    types: &HashSet<String>,
+) -> Option<(String, Option<String>)> {
     let name = text(node.child_by_field_name("name")?, source);
     let mut scope = Vec::new();
     let mut owner = None;
     let mut parent = node.parent();
     let mut implementation = false;
+    let mut qualify = false;
     while let Some(ancestor) = parent {
-        if ancestor.kind() == "impl_item" {
+        if ancestor.kind() == "impl_item" && !implementation {
             let ty = text(ancestor.child_by_field_name("type")?, source);
-            owner = Some(ty.to_string());
+            let base = ty.split('<').next().unwrap_or(ty);
+            let local = types.contains(&crate::callgraph::rust_module_qualified_name(
+                ancestor, source, base,
+            ));
+            qualify = local
+                || ancestor
+                    .child_by_field_name("trait")
+                    .is_some_and(|trait_node| {
+                        let name = text(trait_node, source)
+                            .split('<')
+                            .next()
+                            .unwrap_or_default();
+                        types.contains(&crate::callgraph::rust_module_qualified_name(
+                            ancestor, source, name,
+                        ))
+                    });
+            let generic =
+                ancestor
+                    .child_by_field_name("type_parameters")
+                    .is_some_and(|parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .any(|parameter| {
+                                parameter
+                                    .child_by_field_name("name")
+                                    .is_some_and(|name| text(name, source) == ty)
+                            })
+                    });
+            owner = (local && !generic)
+                .then(|| crate::callgraph::rust_module_qualified_name(ancestor, source, ty));
             scope.push(
                 if let Some(trait_node) = ancestor.child_by_field_name("trait") {
                     format!("{} for {ty}", text(trait_node, source))
@@ -74,20 +126,23 @@ fn identity(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
                 },
             );
             implementation = true;
-            break;
+            parent = ancestor.parent();
+            continue;
         }
-        if matches!(ancestor.kind(), "mod_item" | "trait_item") {
+        if ancestor.kind() == "mod_item" && (!implementation || qualify)
+            || ancestor.kind() == "trait_item" && !implementation
+        {
             let name = text(ancestor.child_by_field_name("name")?, source).to_string();
             if ancestor.kind() == "trait_item" {
-                owner = Some(name.clone());
+                owner = Some(crate::callgraph::rust_module_qualified_name(
+                    ancestor, source, &name,
+                ));
             }
             scope.push(name);
         }
         parent = ancestor.parent();
     }
-    if !implementation {
-        scope.reverse();
-    }
+    scope.reverse();
     scope.push(name.to_string());
     Some((scope.join("::"), owner))
 }
@@ -95,6 +150,23 @@ fn identity(node: Node<'_>, source: &str) -> Option<(String, Option<String>)> {
 impl RustBindings {
     pub fn new(source: &str, root: Node<'_>) -> Self {
         let mut result = Self::default();
+        let mut types = HashSet::new();
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            if matches!(
+                node.kind(),
+                "struct_item" | "enum_item" | "trait_item" | "type_item"
+            ) {
+                if let Some(name) = node.child_by_field_name("name") {
+                    types.insert(crate::callgraph::rust_module_qualified_name(
+                        node,
+                        source,
+                        text(name, source),
+                    ));
+                }
+            }
+            pending.extend(node.named_children(&mut node.walk()));
+        }
         let mut stack = vec![(root, None, root.byte_range())];
         while let Some((node, mut callable, mut scope)) = stack.pop() {
             if node.kind() == "struct_item" {
@@ -153,12 +225,36 @@ impl RustBindings {
                         }
                     }
                 }
+                let mut parent = node.parent();
+                while let Some(ancestor) = parent {
+                    if ancestor.kind() == "impl_item" {
+                        if let Some(parameters) = ancestor.child_by_field_name("type_parameters") {
+                            result.generic_functions.insert(node.start_byte());
+                            for parameter in parameters.named_children(&mut parameters.walk()) {
+                                if let Some(name) = parameter.child_by_field_name("name") {
+                                    let key = (node.start_byte(), text(name, source).to_string());
+                                    if result.parameters.insert(key.clone()) {
+                                        if let Some(bounds) =
+                                            parameter.child_by_field_name("bounds")
+                                        {
+                                            result
+                                                .bounds
+                                                .insert(key, text(bounds, source).to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    parent = ancestor.parent();
+                }
             }
             if node.kind() == "block" {
                 scope = node.byte_range();
             }
             if matches!(node.kind(), "function_item" | "function_signature_item") {
-                if let Some((symbol, owner)) = identity(node, source) {
+                if let Some((symbol, owner)) = identity(node, source, &types) {
                     let declaration = Declaration {
                         symbol: symbol.clone(),
                         owner,
@@ -167,6 +263,21 @@ impl RustBindings {
                             .map(|n| text(n, source).to_string()),
                         bytes: node.byte_range(),
                         line: node.start_position().row as u32 + 1,
+                        has_self: has_self_parameter(node, source),
+                        trait_name: {
+                            let mut parent = node.parent();
+                            let mut trait_name = None;
+                            while let Some(ancestor) = parent {
+                                if ancestor.kind() == "impl_item" {
+                                    trait_name = ancestor
+                                        .child_by_field_name("trait")
+                                        .map(|name| text(name, source).to_string());
+                                    break;
+                                }
+                                parent = ancestor.parent();
+                            }
+                            trait_name
+                        },
                     };
                     result.symbols.insert(node.start_byte(), symbol.clone());
                     result
@@ -304,6 +415,13 @@ impl RustBindings {
     pub fn unit_struct(&self, symbol: &str) -> bool {
         self.unit_structs.get(symbol).copied() == Some(true)
     }
+
+    pub fn type_parameter_in(&self, symbol: &str, name: &str) -> bool {
+        self.declaration(symbol).is_some_and(|declaration| {
+            self.parameters
+                .contains(&(declaration.bytes.start, name.to_string()))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -384,5 +502,22 @@ mod tests {
         assert!(index.unit_struct("inner::Unit"));
         assert!(!index.unit_struct("Named"));
         assert!(!index.unit_struct("Tuple"));
+    }
+
+    #[test]
+    fn local_inline_owners_are_qualified_without_moving_imported_types() {
+        let index = index("struct Root; mod local { struct Item; impl Item { fn new() -> Self { Self } } } mod implementation { use super::Root; impl Root { fn new() -> Self { Root } } }");
+        assert_eq!(
+            index
+                .declaration("local::Item::new")
+                .unwrap()
+                .owner
+                .as_deref(),
+            Some("local::Item")
+        );
+        assert_eq!(
+            index.declaration("Root::new").unwrap().owner.as_deref(),
+            None
+        );
     }
 }

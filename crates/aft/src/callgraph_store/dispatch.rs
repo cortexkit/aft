@@ -101,7 +101,7 @@ fn descendants(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
 }
-fn method_shape(node: Node<'_>, source: &str) -> String {
+fn method_shape(node: Node<'_>, source: &str, language: &str) -> String {
     let parameters = field(node, &["parameters"])
         .map(|p| {
             descendants(p)
@@ -115,7 +115,32 @@ fn method_shape(node: Node<'_>, source: &str) -> String {
     let result = field(node, &["result", "return_type"])
         .map(|n| text(n, source).split_whitespace().collect::<String>())
         .unwrap_or_default();
-    format!("{parameters}->{result}")
+    let receiver = if language == "rust" {
+        if super::super::rust_bindings::has_self_parameter(node, source) {
+            "self;"
+        } else {
+            "static;"
+        }
+    } else {
+        ""
+    };
+    format!("{receiver}{parameters}->{result}")
+}
+
+fn rust_receiver_shape(shape: &str) -> Option<bool> {
+    // Older method shapes lack receiver information. A missing prefix means
+    // unknown, not a static method.
+    if shape.starts_with("self;") {
+        Some(true)
+    } else if shape.starts_with("static;") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn associated_reference(full: &str) -> bool {
+    super::super::parse_method_dispatch(full).is_some_and(|(_, _, _, associated)| associated)
 }
 fn type_name(raw: &str) -> String {
     raw.trim()
@@ -419,7 +444,9 @@ pub fn extract(
                 ) {
                     if let Some(owner) = named(container, source) {
                         facts.fields.push(FieldHint {
-                            owner,
+                            owner: crate::callgraph::rust_module_qualified_name(
+                                container, source, &owner,
+                            ),
                             name: text(name, source).to_string(),
                             ty: type_name(text(ty, source)),
                         });
@@ -436,7 +463,13 @@ pub fn extract(
                 if let Some(ty) = field(node, &["return_type"]) {
                     let mut ty = type_name(text(ty, source));
                     if ty == "Self" {
-                        ty = owner(node, source, language).map(|(o, _)| o).unwrap_or(ty);
+                        ty = rust_bindings
+                            .as_ref()
+                            .and_then(|index| index.declaration(&symbol.scoped_name))
+                            .and_then(|declaration| declaration.owner.as_ref())
+                            .map(|owner| type_name(owner))
+                            .or_else(|| owner(node, source, language).map(|(owner, _)| owner))
+                            .unwrap_or(ty);
                     }
                     facts.returns.push(ReturnHint {
                         symbol: symbol.scoped_name.clone(),
@@ -450,9 +483,12 @@ pub fn extract(
         if !TYPES.contains(&node.kind()) {
             continue;
         }
-        let Some(name) = named(*node, source) else {
+        let Some(mut name) = named(*node, source) else {
             continue;
         };
+        if language == "rust" {
+            name = crate::callgraph::rust_module_qualified_name(*node, source, &name);
+        }
         let body = field(*node, &["body", "type"]);
         let interface = node.kind().contains("interface")
             || node.kind() == "trait_item"
@@ -530,16 +566,35 @@ pub fn extract(
         if !["method", "function"].contains(&symbol.kind.as_str()) {
             continue;
         }
-        let Some((owner, trait_name)) = owner(node, source, language) else {
+        let Some((mut owner, mut trait_name)) = owner(node, source, language) else {
             continue;
         };
+        if language == "rust" {
+            if let Some(declared) = rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration(&symbol.scoped_name))
+                .and_then(|declaration| declaration.owner.as_ref())
+            {
+                owner = type_name(declared);
+            }
+            if let Some(name) = &trait_name {
+                let qualified = crate::callgraph::rust_module_qualified_name(node, source, name);
+                if facts
+                    .types
+                    .iter()
+                    .any(|ty| ty.interface && ty.name == qualified)
+                {
+                    trait_name = Some(qualified);
+                }
+            }
+        }
         facts.methods.push(MethodHint {
             owner,
             trait_name,
             name: symbol.name.clone(),
             symbol: symbol.scoped_name.clone(),
             has_body: field(node, &["body"]).is_some(),
-            shape: method_shape(node, source),
+            shape: method_shape(node, source, language),
             private: text(node, source)
                 .split('{')
                 .next()
@@ -566,9 +621,22 @@ pub fn extract(
         {
             continue;
         }
-        let Some((owner, trait_name)) = owner(*node, source, language) else {
+        let Some((mut owner, trait_name)) = owner(*node, source, language) else {
             continue;
         };
+        if language == "rust" {
+            if let Some(declared) = rust_bindings
+                .as_ref()
+                .and_then(|index| {
+                    index
+                        .symbol_at(node.start_byte())
+                        .and_then(|symbol| index.declaration(symbol))
+                })
+                .and_then(|declaration| declaration.owner.as_ref())
+            {
+                owner = type_name(declared);
+            }
+        }
         let Some(name) = named(*node, source) else {
             continue;
         };
@@ -586,7 +654,7 @@ pub fn extract(
                 name,
                 symbol,
                 has_body: field(*node, &["body"]).is_some(),
-                shape: method_shape(*node, source),
+                shape: method_shape(*node, source, language),
                 private: text(*node, source)
                     .split('{')
                     .next()
@@ -608,8 +676,20 @@ pub fn extract(
                 field(*implementation, &["type"]),
                 field(*implementation, &["trait"]),
             ) {
-                let ty = type_name(text(ty, source));
-                let trait_name = type_name(text(trait_node, source));
+                let ty = crate::callgraph::rust_module_qualified_name(
+                    *implementation,
+                    source,
+                    &type_name(text(ty, source)),
+                );
+                let mut trait_name = type_name(text(trait_node, source));
+                let qualified = crate::callgraph::rust_module_qualified_name(
+                    *implementation,
+                    source,
+                    &trait_name,
+                );
+                if type_indices.contains_key(&qualified) {
+                    trait_name = qualified;
+                }
                 if let Some(t) = type_indices.get(&ty).map(|&i| &mut facts.types[i]) {
                     if !t.bases.contains(&trait_name) {
                         t.bases.push(trait_name);
@@ -978,7 +1058,29 @@ fn receiver_type<'tree>(
     super::extraction_work::note(|work| work.receiver_type_calls += 1);
     let value = text(receiver, source);
     let function = enclosing(call, FUNCTIONS)?;
-    let current_owner = owner(function, source, language).map(|(o, _)| o);
+    #[cfg(test)]
+    let unindexed = (language == "rust" && rust_index.is_none()).then(|| {
+        let mut root = call;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        super::extraction_work::note(|work| {
+            work.receiver_function_nodes += descendants(function).len()
+        });
+        RustBindings::new(source, root)
+    });
+    let rust_bindings = rust_index.map(|index| &index.bindings);
+    #[cfg(test)]
+    let rust_bindings = rust_bindings.or(unindexed.as_ref());
+    let current_owner = rust_bindings
+        .and_then(|index| {
+            index
+                .symbol_at(function.start_byte())
+                .and_then(|symbol| index.declaration(symbol))
+        })
+        .and_then(|declaration| declaration.owner.as_ref())
+        .map(|owner| type_name(owner))
+        .or_else(|| owner(function, source, language).map(|(o, _)| o));
     if language == "rust" {
         if receiver.kind() == "call_expression" {
             return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
@@ -1061,21 +1163,7 @@ fn receiver_type<'tree>(
         return None;
     }
     if language == "rust" {
-        #[cfg(test)]
-        let unindexed = rust_index.is_none().then(|| {
-            let mut root = call;
-            while let Some(parent) = root.parent() {
-                root = parent;
-            }
-            super::extraction_work::note(|work| {
-                work.receiver_function_nodes += descendants(function).len()
-            });
-            RustBindings::new(source, root)
-        });
-        let bindings = rust_index.map(|index| &index.bindings);
-        #[cfg(test)]
-        let bindings = bindings.or(unindexed.as_ref());
-        let bindings = bindings?;
+        let bindings = rust_bindings?;
         let binding = bindings.binding(value, call.start_byte())?;
         if let Some(annotation) = &binding.annotation {
             let annotation_name = type_name(annotation);
@@ -1380,6 +1468,7 @@ pub struct Resolver<'a> {
     pub files: BTreeMap<String, &'a ParseBlob>,
     pub import_targets: BTreeMap<(String, String), String>,
     pub type_targets: BTreeMap<(String, String), (String, String)>,
+    associated_sites: HashSet<(String, u32)>,
     /// Every method of every file, grouped by method name and in file order,
     /// built on first use. An open or interface receiver then checks only the
     /// same-named methods instead of rescanning the whole manifest per site.
@@ -1421,15 +1510,38 @@ pub mod dependency {
 }
 impl<'a> Resolver<'a> {
     pub fn new(files: BTreeMap<String, &'a ParseBlob>) -> Self {
+        let associated_sites = files
+            .iter()
+            .filter(|(_, parse)| parse.language == "rust")
+            .flat_map(|(file, parse)| {
+                parse
+                    .refs
+                    .iter()
+                    .filter(|reference| {
+                        reference
+                            .full_ref
+                            .as_deref()
+                            .is_some_and(associated_reference)
+                    })
+                    .map(move |reference| (file.clone(), reference.ordinal))
+            })
+            .collect();
         Self {
             files,
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
+            associated_sites,
             methods_by_name: std::cell::OnceCell::new(),
             dependencies: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
+    }
+    pub fn note_associated_site(&mut self, file: &str, ordinal: u32) {
+        self.associated_sites.insert((file.to_string(), ordinal));
+    }
+    fn associated_site(&self, file: &str, ordinal: u32) -> bool {
+        self.associated_sites.contains(&(file.to_string(), ordinal))
     }
     /// Every key recorded since the previous call.
     pub fn take_dependencies(&self) -> BTreeSet<String> {
@@ -1642,12 +1754,15 @@ impl<'a> Resolver<'a> {
         }
         None
     }
-    fn methods(&self, file: &str, owner: &str, name: &str) -> Vec<Target> {
+    fn methods(&self, file: &str, owner: &str, name: &str, associated: bool) -> Vec<Target> {
         let language = &self.known_file(file).language;
         self.methods_named(name)
             .iter()
             .filter(|(method_file, p, m)| {
                 &p.language == language
+                    && (language != "rust"
+                        || associated
+                        || rust_receiver_shape(&m.shape) != Some(false))
                     && self
                         .project_type(method_file, &m.owner)
                         .is_some_and(|(f, t)| f == file && t.name == owner)
@@ -1665,11 +1780,12 @@ impl<'a> Resolver<'a> {
         ty: &TypeHint,
         name: &str,
         seen: &mut BTreeSet<(String, String)>,
+        associated: bool,
     ) -> Vec<Target> {
         if !seen.insert((file.to_string(), ty.name.clone())) {
             return Vec::new();
         }
-        let direct = self.methods(file, &ty.name, name);
+        let direct = self.methods(file, &ty.name, name, associated);
         if !direct.is_empty() {
             return direct;
         }
@@ -1685,7 +1801,7 @@ impl<'a> Resolver<'a> {
                 if !seen.insert((file.clone(), ty.name.clone())) {
                     continue;
                 }
-                hits.extend(self.methods(&file, &ty.name, name));
+                hits.extend(self.methods(&file, &ty.name, name, associated));
                 next.extend(
                     ty.bases
                         .iter()
@@ -1806,14 +1922,42 @@ impl<'a> Resolver<'a> {
                 ..Resolution::default()
             };
         };
-        let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new());
+        let associated = parse.language == "rust" && self.associated_site(file, site.ordinal);
+        let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new(), associated);
         if parse.language == "rust" {
+            // An older method shape may not distinguish an instance method from
+            // an associated function. Keep it live without an exact edge.
+            if !associated
+                && exact.iter().any(|target| {
+                    self.known_file(&target.file)
+                        .dispatch
+                        .methods
+                        .iter()
+                        .find(|method| method.symbol == target.symbol)
+                        .is_some_and(|method| rust_receiver_shape(&method.shape).is_none())
+                })
+            {
+                return Resolution {
+                    unresolved: 1,
+                    protected: self
+                        .methods_named(member)
+                        .iter()
+                        .filter(|(_, parse, _)| parse.language == "rust")
+                        .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
+                        .collect(),
+                    ..Resolution::default()
+                };
+            }
             let methods = self
                 .known_file(&type_file)
                 .dispatch
                 .methods
                 .iter()
-                .filter(|m| m.owner == ty.name && m.name == *member)
+                .filter(|m| {
+                    m.owner == ty.name
+                        && m.name == *member
+                        && (associated || rust_receiver_shape(&m.shape) != Some(false))
+                })
                 .collect::<Vec<_>>();
             let inherent = methods
                 .iter()
@@ -1840,12 +1984,22 @@ impl<'a> Resolver<'a> {
                         return false;
                     };
                     let trait_name = method.trait_name.as_deref().unwrap_or(&method.owner);
+                    if site
+                        .caller
+                        .as_deref()
+                        .and_then(|name| name.rsplit_once("::"))
+                        .map(|(scope, _)| scope)
+                        == method.symbol.rsplit_once("::").map(|(scope, _)| scope)
+                    {
+                        return true;
+                    }
                     let Some((trait_file, declaration)) =
                         self.project_type(&target.file, trait_name)
                     else {
                         return false;
                     };
-                    self.project_type(file, trait_name).is_some_and(
+                    let caller_name = trait_name.rsplit("::").next().unwrap_or(trait_name);
+                    self.project_type(file, caller_name).is_some_and(
                         |(caller_file, caller_trait)| {
                             caller_file == trait_file && caller_trait.name == declaration.name
                         },
@@ -1864,6 +2018,12 @@ impl<'a> Resolver<'a> {
             for (candidate_file, candidate, method) in self.methods_named(member) {
                 let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
                 if candidate.language != parse.language {
+                    continue;
+                }
+                if parse.language == "rust"
+                    && !associated
+                    && rust_receiver_shape(&method.shape) != Some(true)
+                {
                     continue;
                 }
                 {
@@ -1922,7 +2082,8 @@ impl<'a> Resolver<'a> {
 }
 
 /// Resolution inputs are borrowed immutably for one emission pass. Locations
-/// and caller identities are emitted by the caller, not used to choose targets.
+/// are emitted by the caller. Rust typed lookup also uses the enclosing impl
+/// scope and whether the written call is a scoped path.
 pub struct MemoizedResolver<'r, 'a> {
     resolver: &'r Resolver<'a>,
     resolved: std::cell::RefCell<BTreeMap<ResolutionKey, MemoizedResolution>>,
@@ -1938,6 +2099,8 @@ struct ResolutionKey {
     receiver: Option<String>,
     member: Option<String>,
     dynamic: bool,
+    associated: bool,
+    caller_scope: Option<String>,
 }
 
 impl<'r, 'a> MemoizedResolver<'r, 'a> {
@@ -1961,6 +2124,16 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             receiver: site.receiver.clone(),
             member: site.member.clone(),
             dynamic: site.dynamic,
+            associated: self.resolver.files[file].language == "rust"
+                && self.resolver.associated_site(file, site.ordinal),
+            caller_scope: (self.resolver.files[file].language == "rust" && site.receiver.is_some())
+                .then(|| {
+                    site.caller
+                        .as_deref()
+                        .and_then(|name| name.rsplit_once("::"))
+                        .map(|(scope, _)| scope.to_string())
+                })
+                .flatten(),
         };
         if let Some((resolved, dependencies)) = self.resolved.borrow().get(&key) {
             self.resolver

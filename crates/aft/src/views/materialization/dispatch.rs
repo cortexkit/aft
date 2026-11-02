@@ -662,9 +662,40 @@ pub(super) fn emit_from_decoded(
         }
     }
     stage.finish("resolver_index", format_args!("files={}", parses.len()));
+    let mut ordinary_syntax = HashSet::new();
+    let mut written_references = transaction.prepare_cached(
+        "SELECT ref_id,full_ref FROM refs WHERE caller_file=?1 AND kind IN ('call','construction')",
+    )?;
+    for path in &selected {
+        if rows
+            .get(path)
+            .is_some_and(|row| row.facts.language == "rust")
+        {
+            let references = written_references.query_map([path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for reference in references {
+                let (id, full) = reference?;
+                if let Some(full) = full {
+                    let associated =
+                        crate::callgraph_store::join::dispatch::associated_reference(&full);
+                    if associated {
+                        if let Some(ordinal) = id
+                            .rsplit(':')
+                            .next()
+                            .and_then(|ordinal| ordinal.parse().ok())
+                        {
+                            resolver.note_associated_site(path, ordinal);
+                        }
+                    }
+                    if associated || full.starts_with("self.") {
+                        ordinary_syntax.insert(id);
+                    }
+                }
+            }
+        }
+    }
     let memoized = MemoizedResolver::new(&resolver);
-    let mut written_reference =
-        transaction.prepare_cached("SELECT full_ref FROM refs WHERE ref_id=?1")?;
     let mut sites = Vec::new();
     let mut file_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
     resolver.take_dependencies();
@@ -675,15 +706,14 @@ pub(super) fn emit_from_decoded(
         for site in row.sites.as_deref().unwrap_or_default() {
             let ref_id = format!("view:{path}:{}", site.ordinal);
             let resolution = memoized.resolve(path, site);
-            // A scoped path can name a module function instead of a constructor.
-            // Keep its ordinary binding when no project receiver type is found.
+            // Keep proven self-call and scoped module-function bindings when
+            // dispatch facts do not identify a project receiver type.
             if row.facts.language == "rust"
                 && resolution.external > 0
                 && resolution.targets.is_empty()
                 && scope.ordinary_edge_refs.contains(&ref_id)
             {
-                let full: Option<String> = written_reference.query_row([&ref_id], |r| r.get(0))?;
-                if full.is_some_and(|name| name.contains("::") && !name.contains('.')) {
+                if ordinary_syntax.contains(&ref_id) {
                     continue;
                 }
             }
