@@ -1,1 +1,1 @@
-Nothing changes until the AFT_TOOL_DISPLAY=1 switch is on.
+Groundwork for showing AFT's tool calls in the CortexKit apps; nothing changes for users yet.
