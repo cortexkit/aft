@@ -107,3 +107,48 @@ pub fn admitted_config(mut config: serde_json::Value) -> serde_json::Value {
     config["project_detection"] = serde_json::json!({ "mode": "project" });
     config
 }
+
+/// Keep project detection consistent between direct and parent reads.
+/// Folder decisions are saved with the detection mode used to make them. A
+/// parent using auto for a child opened as project must recheck that child
+/// before reading its indexes. Exact child overrides avoid that extra check
+/// while the parent itself still uses automatic workspace detection.
+pub fn repository_fixture_config(root: &Path, mut config: serde_json::Value) -> serde_json::Value {
+    if root.join(".git").exists() {
+        return admitted_config(config);
+    }
+    let overrides = std::fs::read_dir(root)
+        .expect("list fixture repositories")
+        .map(|entry| entry.expect("read fixture repository").path())
+        .filter(|path| path.join(".git").exists())
+        .map(|path| serde_json::json!({"path": path, "mode": "project"}))
+        .collect::<Vec<_>>();
+    config["project_detection"] = serde_json::json!({"mode": "auto", "overrides": overrides});
+    config
+}
+
+#[test]
+fn repository_fixture_policy_matches_direct_and_parent_child_reads() {
+    let parent = tempfile::tempdir().unwrap();
+    let child = parent.path().join("child");
+    let nested = child.join("src");
+    std::fs::create_dir_all(child.join(".git")).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    let config = repository_fixture_config(parent.path(), serde_json::json!({}));
+    let policy: aft::folder_admission::ProjectDetectionConfig =
+        serde_json::from_value(config["project_detection"].clone()).unwrap();
+    assert_eq!(
+        policy.mode_for_root(parent.path()),
+        aft::folder_admission::DetectionMode::Auto
+    );
+    assert_eq!(
+        policy.mode_for_root(&child),
+        aft::folder_admission::DetectionMode::Project
+    );
+    assert_eq!(
+        policy.mode_for_root(&nested),
+        aft::folder_admission::DetectionMode::Auto
+    );
+    let direct = repository_fixture_config(&child, serde_json::json!({}));
+    assert_eq!(direct["project_detection"]["mode"], "project");
+}

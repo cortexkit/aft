@@ -351,7 +351,7 @@ fn config_doc(views: bool, planes: Planes, embedder: Option<&MockEmbedder>) -> V
 /// so dozens of fixture children do not each queue a view publication that
 /// the trigram tests never read.
 fn child_trigram_doc() -> Value {
-    crate::test_helpers::project::admitted_config(config_doc(false, TRIGRAM_ONLY, None))
+    config_doc(false, TRIGRAM_ONLY, None)
 }
 
 fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
@@ -369,7 +369,7 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(root, doc)),
         })),
         &ctx,
     );
@@ -978,18 +978,14 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     init_repo(&child, &child_files(0));
     init_repo(&other, &child_files(1));
     let configure_request = |root: &Path, views: bool| {
-        let doc = if root.join(".git").exists() {
-            crate::test_helpers::project::admitted_config(config_doc(views, TRIGRAM_ONLY, None))
-        } else {
-            config_doc(views, TRIGRAM_ONLY, None)
-        };
+        let doc = config_doc(views, TRIGRAM_ONLY, None);
         json!({
             "id": "cfg",
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(doc),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(root, doc)),
         })
         .to_string()
     };
@@ -1656,7 +1652,7 @@ fn slow_discovery_never_delays_the_bind() {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, TRIGRAM_ONLY, None))),
     }));
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
@@ -1737,7 +1733,7 @@ fn standalone_view_open_never_blocks_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None))),
     }).to_string())["success"], true);
     let deadline = Instant::now() + Duration::from_secs(15);
     while !started_file.exists() {
@@ -1825,7 +1821,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
+        "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder)))),
     }).to_string())["success"], true);
     let mut grace_max = 0;
     let mut load_max = 0;
@@ -1932,7 +1928,7 @@ fn parent_folder_survives_a_real_process_restart() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(crate::test_helpers::project::repository_fixture_config(&root, config_doc(true, TRIGRAM_ONLY, None))),
         })
         .to_string()
     };
