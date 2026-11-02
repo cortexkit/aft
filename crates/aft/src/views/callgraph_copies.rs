@@ -697,6 +697,7 @@ mod tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         );
+        ctx.set_canonical_cache_root(f.worker.clone());
         let reader = ctx
             .callgraph_view_reader()
             .expect("views route")
