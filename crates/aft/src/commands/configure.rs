@@ -13202,10 +13202,12 @@ mod tests {
         let request = configure_semantic_views(&root, storage.path(), &server.base_url);
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
+        let query = |ctx: &AppContext| {
+            ctx.checkout_semantic_runtime()
+                .map(|runtime| runtime.search(&[1.0, 0.0, 0.0], 1_000, &|_| true))
+        };
         let complete = |ctx: &AppContext| {
-            let answer = ctx
-                .checkout_semantic_runtime()
-                .map(|runtime| runtime.search(&[1.0, 0.0, 0.0], 1_000, &|_| true));
+            let answer = query(ctx);
             let complete = answer
                 .as_ref()
                 .is_some_and(|answer| answer.as_ref().is_ok_and(|answer| answer.complete()));
@@ -13218,8 +13220,17 @@ mod tests {
             }
             complete
         };
-        fills.wait_until_settled(Duration::from_secs(60)).unwrap();
-        assert!(complete(&ctx), "the semantic view never filled");
+        let settled = fills.wait_until_settled(Duration::from_secs(60)).unwrap();
+        let initial = query(&ctx);
+        assert!(
+            initial
+                .as_ref()
+                .is_some_and(|answer| answer.as_ref().is_ok_and(|answer| answer.complete())),
+            "the semantic view never filled; at settlement={settled:?}; at query: lane={}; retry_pending={}; non_probe_inputs={}; answer={initial:?}",
+            ctx.checkout_semantic().describe(),
+            ctx.checkout_semantic().retry_pending_for_test(),
+            server.non_probe_input_count(),
+        );
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
 
