@@ -96,6 +96,7 @@ fn held_file_completion_excludes_held_time_and_aggregates_actual_changes() {
         "modified",
     );
     f.capture.lock().unwrap().began = Some(Instant::now() - Duration::from_millis(12));
+    handler_ready(Some(&f.key), true);
     reply(&f.key, false, false, None);
     let writes = publications();
     assert_eq!(
@@ -768,7 +769,7 @@ fn handler_duration_is_frozen_before_reply_queueing() {
     let f = fixture("edit", "display-handler-duration");
     let _active = enter(Some(&f.key));
     f.capture.lock().unwrap().began = Some(Instant::now() - Duration::from_millis(12));
-    handler_ready(Some(&f.key));
+    handler_ready(Some(&f.key), true);
     let processing = f.capture.lock().unwrap().processing_ms;
     assert!(processing >= 12);
     assert!(f.capture.lock().unwrap().began.is_none());
@@ -790,4 +791,25 @@ fn error_records_keep_valid_reason_codes_without_copying_error_text() {
             .unwrap()
             .contains("private error text"));
     }
+}
+
+#[test]
+fn file_facts_are_frozen_on_the_executor_before_the_reply_is_queued() {
+    let f = fixture("edit", "display-frozen-files");
+    let _active = enter(Some(&f.key));
+    let path = f._dir.path().join("a.txt");
+    std::fs::write(&path, "new\n").unwrap();
+    file(
+        path.to_str().unwrap(),
+        None,
+        Some("old\n"),
+        Some("new\n"),
+        "modified",
+    );
+    handler_ready(Some(&f.key), true);
+    f.capture.lock().unwrap().files.clear();
+    reply(&f.key, false, false, None);
+    let writes = publications();
+    assert_eq!(writes[0].body["fileCount"], 1);
+    assert_eq!(writes[0].body["path"], "a.txt");
 }

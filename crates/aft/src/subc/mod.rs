@@ -10583,7 +10583,7 @@ impl PlainToolRun {
                                 &result.response,
                             );
                             let response = result.response;
-                            rich_ui::display::handler_ready(ledger_key.as_ref());
+                            rich_ui::display::handler_ready(ledger_key.as_ref(), response.success);
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
                                 phase_trace: phase_trace

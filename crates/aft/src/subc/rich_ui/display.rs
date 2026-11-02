@@ -42,6 +42,7 @@ pub(crate) struct Capture {
     record_sent: bool,
     finished: bool,
     files: Vec<FileChange>,
+    file_snapshot: Option<(Value, Option<Value>)>,
     masker: Option<crate::log_redact::SecretValues>,
     bash: Option<(Value, Value)>,
     deferred: bool,
@@ -162,6 +163,7 @@ pub(in crate::subc) fn register(
                 record_sent: false,
                 finished: false,
                 files: Vec::new(),
+                file_snapshot: None,
                 masker: None,
                 bash: None,
                 deferred: false,
@@ -528,7 +530,16 @@ pub(crate) fn reply(
                 )
             })
     } else {
-        file_bodies(&capture, !error)
+        capture.file_snapshot.clone().unwrap_or_else(|| {
+            if capture.files.is_empty() {
+                file_bodies(&capture, !error)
+            } else {
+                (
+                    json!({"outcome": if error { "error" } else { "success" }}),
+                    None,
+                )
+            }
+        })
     };
     if capture.tool == "bash" && capture.deferred {
         if completion {
@@ -931,6 +942,7 @@ pub(crate) fn bash_terminal(
             record_sent: true,
             finished: false,
             files: Vec::new(),
+            file_snapshot: None,
             masker: None,
             bash: Some(bodies),
             deferred: true,
@@ -985,7 +997,7 @@ pub(crate) fn person_answered(ledger_key: &crate::db::call_ledger::Key) {
     }
 }
 
-pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>) {
+pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>, success: bool) {
     let capture =
         ledger_key.and_then(|ledger_key| CALLS.lock().ok()?.get(&key(ledger_key)).cloned());
     if let Some(capture) = capture {
@@ -994,6 +1006,9 @@ pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>) {
                 capture.processing_ms = capture
                     .processing_ms
                     .saturating_add(began.elapsed().as_millis() as u64);
+            }
+            if capture.tool != "bash" {
+                capture.file_snapshot = Some(file_bodies(&capture, success));
             }
         }
     }
