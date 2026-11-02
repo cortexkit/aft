@@ -1,5 +1,520 @@
 [
   {
+    "table": "access_asks",
+    "schema_statement": "sql-f8f2c391e3a2d263d478",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "args_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "call_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "elicitation_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "selector",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "request",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pending",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "approved",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "holder",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_grants",
+    "schema_statement": "sql-04cf18e76f4438ee4747",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 5,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "mode",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_launch_params",
+    "schema_statement": "sql-04cf18e76f4438ee4747",
+    "columns": [
+      {
+        "column": "project_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "principal",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 5,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 6,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 7,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "preset",
+        "baseline_type": "TEXT",
+        "primary_key_position": 8,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "params",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_materialized",
+    "schema_statement": "sql-04cf18e76f4438ee4747",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_modes",
+    "schema_statement": "sql-bff153a4a70e36a80fb6",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "mode",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_scope_agents",
+    "schema_statement": "sql-bff153a4a70e36a80fb6",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "agent_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "access_scopes",
+    "schema_statement": "sql-04cf18e76f4438ee4747",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "parent_owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "parent",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "parent_epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "config",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ended",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "accounting",
+    "schema_statement": "sql-e88528ffe77bcd7b6a07",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "measured_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "watermark",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "alert_disappearance_records",
+    "schema_statement": "sql-d2ce675199aad29f2735",
+    "columns": [
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "dispatch_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "producer_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "identity_fingerprint",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "lifecycle_episode_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "observation_ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "agent_visible_response_ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "alert_rendered_records",
+    "schema_statement": "sql-d2ce675199aad29f2735",
+    "columns": [
+      {
+        "column": "block_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "dispatch_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "producer_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "response_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "identity_fingerprint",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "severity",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "code",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "wording_form",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "representation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "agent_visible_response_ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "lifecycle_episode_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "asks",
+    "schema_statement": "sql-7641a849c5ae6c2e13f1",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "message",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "backend_file_state",
     "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
@@ -43,8 +558,625 @@
     "graph_data": true
   },
   {
+    "table": "backups",
+    "schema_statement": "sql-a7e7e8c21d913655f68e",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "backup_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "op_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "order_blob",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "path_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "backup_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "description",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "is_tombstone",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "base_builds",
+    "schema_statement": "sql-16607ceb034c71280764",
+    "columns": [
+      {
+        "column": "base_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_token",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "attempt",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "heartbeat_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "base_refs",
+    "schema_statement": "sql-16607ceb034c71280764",
+    "columns": [
+      {
+        "column": "worker_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "base_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "nonce",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "membership_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "worker_generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "updated_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "base_sweeps",
+    "schema_statement": "sql-16607ceb034c71280764",
+    "columns": [
+      {
+        "column": "base_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "unreferenced_sweeps",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "bash_pattern_watches",
+    "schema_statement": "sql-0439aa3363dd344d5cfb",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "watch_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pattern_kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pattern",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "once",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "stdout_offset",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "stderr_offset",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pty_offset",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scanning",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pending_match",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "match_text",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "match_offset",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "match_context",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "bash_tasks",
+    "schema_statement": "sql-a7e7e8c21d913655f68e",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "command",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "cwd",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "status",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "exit_code",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "pgid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "started_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "completed_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "stdout_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "stderr_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "compressed",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "timeout_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "completion_delivered",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "output_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "metadata",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "bash_view_records",
+    "schema_statement": "sql-adaccad920e09367826d",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "record",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "row_template_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "page_template_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "bash_watch_delivery_acks",
+    "schema_statement": "sql-81086fae6dc05f746cd1",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "watch_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "acknowledged_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "eviction_epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "evicted_through",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "bash_watch_delivery_gaps",
+    "schema_statement": "sql-81086fae6dc05f746cd1",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "watch_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "batch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "batches",
+    "schema_statement": "sql-10bca80d90c7cc021c25",
+    "columns": [
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "blob_liveness",
+    "schema_statement": "sql-3f53184070c81797323d",
+    "columns": [
+      {
+        "column": "blob_id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ref_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "blob_payloads",
-    "schema_statement": "sql-fdddb9c1e7c5d1f46c43",
+    "schema_statement": "sql-1a2f68e913bf1358d76f",
     "columns": [
       {
         "column": "full_key",
@@ -68,6 +1200,31 @@
         "column": "payload_schema",
         "baseline_type": "INTEGER",
         "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ref_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "blob_quarantine",
+    "schema_statement": "sql-0c0528f90b35f1073f6e",
+    "columns": [
+      {
+        "column": "full_key",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
         "encoding": "unchanged"
       }
     ],
@@ -93,8 +1250,548 @@
     "graph_data": false
   },
   {
+    "table": "blob_removals",
+    "schema_statement": "sql-9a0ab30cc751d3d504c2",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "identity",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "removed",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "breaker_attempts",
+    "schema_statement": "sql-2993c12a73ea7eb6c00c",
+    "columns": [
+      {
+        "column": "root_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "domain",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "corpus_fingerprint",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "attempt_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "start_committed_extracted_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "death_charged",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "breaker_records",
+    "schema_statement": "sql-2993c12a73ea7eb6c00c",
+    "columns": [
+      {
+        "column": "root_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "domain",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "corpus_fingerprint",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "configuration_version",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "zero_credit_deaths",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "credited_deaths",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "in_build_burn_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "suspended_reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "suspended_since_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "suspended_until_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "call_ledger",
+    "schema_statement": "sql-bd2ae33de649e82356d1",
+    "columns": [
+      {
+        "column": "carrier",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "call_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "custodian",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "withdraw_answer",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "frame_type",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "frame_body",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "outcome",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "event_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "settled_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "seq",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "acked",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "late_entry",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "recovered",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "call_ledger_ack",
+    "schema_statement": "sql-bd2ae33de649e82356d1",
+    "columns": [
+      {
+        "column": "custodian",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "through_seq",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_seq",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "call_ledger_updates",
+    "schema_statement": "sql-d8a8fa5b432a41e85de1",
+    "columns": [
+      {
+        "column": "carrier",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "call_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "approval_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "custodian",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "seq",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "event_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "settled_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "entry",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "changed_view_paths",
     "schema_statement": "sql-75e60e55c351ce15f41a",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "cold_fallback_marker",
+    "schema_statement": "sql-c20c094deb3072fe252a",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "compression_event_rollups",
+    "schema_statement": "sql-ad2a96aa0c8aa45fbbc2",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_is_null",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "events",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "original_tokens",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "compressed_tokens",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "compression_events",
+    "schema_statement": "sql-a7e7e8c21d913655f68e",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "tool",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "command",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "compressor",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "original_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "compressed_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "original_tokens",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "compressed_tokens",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "compression_retention_cursor",
+    "schema_statement": "sql-ad2a96aa0c8aa45fbbc2",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "event_id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "data",
+    "schema_statement": "sql-7d6f5513459e0d7d65b2",
+    "columns": [
+      {
+        "column": "payload",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "dependency_seed_paths",
+    "schema_statement": "sql-746751c5aefd30b96823",
     "columns": [
       {
         "column": "path",
@@ -130,6 +1827,19 @@
       {
         "column": "published_at",
         "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "destination",
+    "schema_statement": "sql-3df9c8f3996d86cedbd0",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
         "primary_key_position": 0,
         "encoding": "unchanged"
       }
@@ -190,6 +1900,19 @@
       }
     ],
     "graph_data": true
+  },
+  {
+    "table": "dispatch_writes",
+    "schema_statement": "sql-dff2eeeeef556901b12d",
+    "columns": [
+      {
+        "column": "file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
   },
   {
     "table": "edges",
@@ -451,13 +2174,789 @@
     "graph_data": true
   },
   {
+    "table": "fixture",
+    "schema_statement": "sql-591d127b56057ae16138",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "format_meta",
+    "schema_statement": "sql-bad393bfb195da074e90",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "format_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "layout_tag",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_text",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "free_fixture",
+    "schema_statement": "sql-4e17f712e02c43ec117c",
+    "columns": [
+      {
+        "column": "data",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_authorities",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "incarnation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "minting_run",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "task_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "record_json",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "record_digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ticket_digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "phase",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_initialization",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "initialized",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_legacy_dispatch",
+    "schema_statement": "sql-c98bb1c80b06c68b4cc0",
+    "columns": [
+      {
+        "column": "request_nonce",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "incarnation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "forwarding_run",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "enqueued_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_policy_versions",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "artifact_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "version",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "envelope",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_policy_watermarks",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "artifact_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "version",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_requests",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "request_nonce",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "incarnation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload_digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "expect_json",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "prepared_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_scope_ends",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "evidence_json",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "recorded_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "gh_speech_task_revocations",
+    "schema_statement": "sql-7f04c8ed6df8d1540d18",
+    "columns": [
+      {
+        "column": "incarnation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "recorded_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "github_read_cache",
+    "schema_statement": "sql-4b650fe17d47590c635e",
+    "columns": [
+      {
+        "column": "resource_kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "repository",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "resource_number",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "authentication_identity_hash",
+        "baseline_type": "BLOB",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "canonical_text",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "fetched_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "updated_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "growing",
+    "schema_statement": "sql-ca3581809ca5c5ba1a40",
+    "columns": [
+      {
+        "column": "payload",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "harness_state",
+    "schema_statement": "sql-a7e7e8c21d913655f68e",
+    "columns": [
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "updated_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "host_state",
+    "schema_statement": "sql-a7e7e8c21d913655f68e",
+    "columns": [
+      {
+        "column": "key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "updated_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "imports",
+    "schema_statement": "sql-a5973405385b73148660",
+    "columns": [
+      {
+        "column": "legacy_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "artifact",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "producer",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "plane",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "attempt",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_token",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "source_hash",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "source_len",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "staged_hash",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "imported",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "skipped",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "updated_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "completed_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "installs",
+    "schema_statement": "sql-c84693ad7611d01e8295",
+    "columns": [
+      {
+        "column": "n",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "ledger_meta",
+    "schema_statement": "sql-9da1d8236a3501829f32",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "format_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "lock_fixture",
+    "schema_statement": "sql-882ec120d2e4bb2bae99",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "lock_probe",
+    "schema_statement": "sql-b356c840324375ec2691",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "macos_permission_cards",
+    "schema_statement": "sql-bff153a4a70e36a80fb6",
+    "columns": [
+      {
+        "column": "folder",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "program",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "call_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "selector",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "elicitation_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "maintenance_outcomes",
+    "schema_statement": "sql-fa0297bf066d297daaa9",
+    "columns": [
+      {
+        "column": "operation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "outcome",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "manager_task",
+    "schema_statement": "sql-4cbfffb6cd72687b9c90",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "manifest_entries",
+    "schema_statement": "sql-499f9acec6f678e55156",
+    "columns": [
+      {
+        "column": "rel_path",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "entry_json",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "manifest_metadata",
+    "schema_statement": "sql-499f9acec6f678e55156",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "path_identity_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "marker",
+    "schema_statement": "sql-fd44d8a64202a6ea16c1",
+    "columns": [
+      {
+        "column": "v",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "members",
-    "schema_statement": "sql-61c528a7a3bbc43d0e4f",
+    "schema_statement": "sql-e88528ffe77bcd7b6a07",
     "columns": [
       {
         "column": "scope",
         "baseline_type": "TEXT",
         "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
         "encoding": "unchanged"
       },
       {
@@ -507,7 +3006,7 @@
   },
   {
     "table": "meta",
-    "schema_statement": "sql-37e2df171cd413132dc9",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "k",
@@ -523,6 +3022,81 @@
       }
     ],
     "graph_data": true
+  },
+  {
+    "table": "migration_derived",
+    "schema_statement": "sql-1a4aaf77db47766e418f",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "next_changed_dependencies",
+    "schema_statement": "sql-08974afa02820ddfa1e4",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "dep_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "next_view_node_positions",
+    "schema_statement": "sql-d3fece47f5b78e49c909",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "start_line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "start_col",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "end_line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "end_col",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "range_ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
   },
   {
     "table": "nodes",
@@ -634,6 +3208,208 @@
     "graph_data": true
   },
   {
+    "table": "oid_aliases",
+    "schema_statement": "sql-fa5847a4a3f0e16c2148",
+    "columns": [
+      {
+        "column": "git_oid",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "blake3",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "pad",
+    "schema_statement": "sql-6cca368324ec8a60f00e",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "path_skips",
+    "schema_statement": "sql-fa0297bf066d297daaa9",
+    "columns": [
+      {
+        "column": "rel_path",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "since_generation",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "path_status",
+    "schema_statement": "sql-d66ff30feec5fb6b1ba2",
+    "columns": [
+      {
+        "column": "rel_path",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "since_generation",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "path_status_marks",
+    "schema_statement": "sql-fa0297bf066d297daaa9",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "payload",
+    "schema_statement": "sql-6ec8d102da628ce1e21f",
+    "columns": [
+      {
+        "column": "data",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "payload_deletions",
+    "schema_statement": "sql-86fbb6b371b0da65e700",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "count",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "payload_totals",
+    "schema_statement": "sql-65e2a2513c468506ff65",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "row_count",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "payloads",
+    "schema_statement": "sql-521f3d006759aee672f9",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "planted",
+    "schema_statement": "sql-03a7be301494150daf56",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "pointer",
     "schema_statement": "sql-93071b07d9de551f25f6",
     "columns": [
@@ -645,6 +3421,83 @@
       },
       {
         "column": "generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "precious",
+    "schema_statement": "sql-d39cf7fec4e4a8aee448",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "private_test",
+    "schema_statement": "sql-f2a8fe59928b92027f67",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "probe",
+    "schema_statement": "sql-5341f3ddd4f2c9850df5",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "probe_refs",
+    "schema_statement": "sql-3eba6609d4b5899ed5fc",
+    "columns": [
+      {
+        "column": "full_key",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ref_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "projection_delta_spill",
+    "schema_statement": "sql-6652ad4c480c842d66ac",
+    "columns": [
+      {
+        "column": "revision",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
         "encoding": "unchanged"
@@ -756,6 +3609,32 @@
       {
         "column": "registered_at_ms",
         "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "reclaim_fixture",
+    "schema_statement": "sql-9a667b636e796f2bcc1b",
+    "columns": [
+      {
+        "column": "data",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "refresh_wal_test_payload",
+    "schema_statement": "sql-013efec94852cdd275d7",
+    "columns": [
+      {
+        "column": "data",
+        "baseline_type": "BLOB",
         "primary_key_position": 0,
         "encoding": "unchanged"
       }
@@ -921,6 +3800,122 @@
     "graph_data": false
   },
   {
+    "table": "remote_exec_policies",
+    "schema_statement": "sql-a477db83414a5a6e2466",
+    "columns": [
+      {
+        "column": "project_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "principal",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "preset",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "params",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_used",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "reservations",
+    "schema_statement": "sql-e88528ffe77bcd7b6a07",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reserved_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "charge_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "completed_seq",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "resolution_config_fields",
     "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
@@ -938,6 +3933,246 @@
       }
     ],
     "graph_data": true
+  },
+  {
+    "table": "retained",
+    "schema_statement": "sql-b0f008b2bcc6c9cdd63b",
+    "columns": [
+      {
+        "column": "v",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "retry",
+    "schema_statement": "sql-d4c88a55b54cd76536a9",
+    "columns": [
+      {
+        "column": "v",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "reuse_sentinel",
+    "schema_statement": "sql-667f1183cea66289298f",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "rich_ui_cursor_key",
+    "schema_statement": "sql-adaccad920e09367826d",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "key",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "rich_ui_session_presets",
+    "schema_statement": "sql-adaccad920e09367826d",
+    "columns": [
+      {
+        "column": "project_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "harness",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "session",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "principal",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner",
+        "baseline_type": "TEXT",
+        "primary_key_position": 5,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 6,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "TEXT",
+        "primary_key_position": 7,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "preset",
+        "baseline_type": "TEXT",
+        "primary_key_position": 8,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "recorded_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "rich_ui_templates",
+    "schema_statement": "sql-adaccad920e09367826d",
+    "columns": [
+      {
+        "column": "digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "bytes",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "s4_dispatch_writes",
+    "schema_statement": "sql-334f08d539ff96a79241",
+    "columns": [
+      {
+        "column": "file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "schema_version",
+    "schema_statement": "sql-027b882fb3e083d59218",
+    "columns": [
+      {
+        "column": "version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "segments",
+    "schema_statement": "sql-d463594849c937c624de",
+    "columns": [
+      {
+        "column": "segment_id",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "byte_len",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ref_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "created_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "selected_view_paths",
+    "schema_statement": "sql-f2203855120710beb0ff",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "sentinel",
+    "schema_statement": "sql-c2185c8a8fa248c5290e",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "source",
+    "schema_statement": "sql-7f44f3d12817856c7a42",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
   },
   {
     "table": "staging_file_inventory",
@@ -959,6 +4194,25 @@
     "graph_data": true
   },
   {
+    "table": "staging_meta",
+    "schema_statement": "sql-10bca80d90c7cc021c25",
+    "columns": [
+      {
+        "column": "key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "value",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "staging_ref_context",
     "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
@@ -978,6 +4232,68 @@
     "graph_data": true
   },
   {
+    "table": "standing_root_freshness",
+    "schema_statement": "sql-083e61c2b6d1aa7910ed",
+    "columns": [
+      {
+        "column": "literal_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "index_kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "needs_strict_verify",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "strict_verified_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "standing_roots",
+    "schema_statement": "sql-083e61c2b6d1aa7910ed",
+    "columns": [
+      {
+        "column": "literal_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "resolved_target",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "resolved_git_toplevel",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scoped_relative_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "stat_evidence",
     "schema_statement": "sql-6349b40b074531911d6c",
     "columns": [
@@ -990,6 +4306,119 @@
       {
         "column": "record",
         "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "state",
+    "schema_statement": "sql-3e80b68b452d86fe2154",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "store_meta",
+    "schema_statement": "sql-d463594849c937c624de",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "plane",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "gc_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "strict_rebuild",
+    "schema_statement": "sql-16607ceb034c71280764",
+    "columns": [
+      {
+        "column": "worker_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "worker_generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "recorded_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "sweep_ambiguity",
+    "schema_statement": "sql-76d2ba61721716ae0709",
+    "columns": [
+      {
+        "column": "temp_identity",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "ambiguous_since_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "sweep_cursor",
+    "schema_statement": "sql-76d2ba61721716ae0709",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_identity",
+        "baseline_type": "TEXT",
         "primary_key_position": 0,
         "encoding": "unchanged"
       }
@@ -1053,6 +4482,242 @@
     "graph_data": false
   },
   {
+    "table": "sweep_state",
+    "schema_statement": "sql-16607ceb034c71280764",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "gc_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "lease_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "lease_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reconcile_cursor",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "dangling_base_edges",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "live_base_cap_hits",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "symbols",
+    "schema_statement": "sql-654163f974362d6a7e64",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "t",
+    "schema_statement": "sql-e3b862e92ef8868075a3",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "tasks",
+    "schema_statement": "sql-525cdf6c227dff99b6ae",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "tier2_aggregates",
+    "schema_statement": "sql-c4fbd46711f8f133a4af",
+    "columns": [
+      {
+        "column": "category",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "contribution_set_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "aggregate",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generated_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "tier2_contributions",
+    "schema_statement": "sql-c4fbd46711f8f133a4af",
+    "columns": [
+      {
+        "column": "category",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_mtime_ns",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_size",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "contribution",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generated_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "tier2_meta",
+    "schema_statement": "sql-a452ed24dab981161739",
+    "columns": [
+      {
+        "column": "category",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "project_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_full_run",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "trace_probe",
+    "schema_statement": "sql-fdab186a379b9d2d903e",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
     "table": "type_ref_names",
     "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
@@ -1064,6 +4729,32 @@
       }
     ],
     "graph_data": true
+  },
+  {
+    "table": "unexpected",
+    "schema_statement": "sql-916f8113c780b492b22d",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "unrelated",
+    "schema_statement": "sql-7641a849c5ae6c2e13f1",
+    "columns": [
+      {
+        "column": "secret",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
   },
   {
     "table": "usage_record",
@@ -1083,6 +4774,19 @@
       },
       {
         "column": "measured_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "value",
+    "schema_statement": "sql-2f3193577c880f72fa4e",
+    "columns": [
+      {
+        "column": "n",
         "baseline_type": "INTEGER",
         "primary_key_position": 0,
         "encoding": "unchanged"
@@ -1327,6 +5031,61 @@
     "graph_data": true
   },
   {
+    "table": "view_tokens",
+    "schema_statement": "sql-28bbb7567fedbc6c32f8",
+    "columns": [
+      {
+        "column": "nonce",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "expected_tree",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "minted_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "expires_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "bound_root",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "bound_gitdir",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "consumed_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
     "table": "view_unknown_live",
     "schema_statement": "sql-43692bd2c5ba3c5511a9",
     "columns": [
@@ -1387,5 +5146,154 @@
       }
     ],
     "graph_data": true
+  },
+  {
+    "table": "write_ledger_meta",
+    "schema_statement": "sql-2e9c42663daa1f814ba2",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "started_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "write_ledger_minutes",
+    "schema_statement": "sql-2e9c42663daa1f814ba2",
+    "columns": [
+      {
+        "column": "minute_ts",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "domain",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "logical_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "physical_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "write_ledger_process_minutes",
+    "schema_statement": "sql-2e9c42663daa1f814ba2",
+    "columns": [
+      {
+        "column": "minute_ts",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "logical_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "physical_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "write_ledger_unmeasurable_minutes",
+    "schema_statement": "sql-80f7a4c7b11db4f46537",
+    "columns": [
+      {
+        "column": "minute_ts",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "seam",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "reason",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "estimate_basis",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "observations",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "estimated_physical_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "estimate_available",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "writes",
+    "schema_statement": "sql-ffbe23e44441bd953929",
+    "columns": [
+      {
+        "column": "value",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
   }
 ]

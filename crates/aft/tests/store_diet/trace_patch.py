@@ -61,7 +61,11 @@ def main():
             relative = str(path.relative_to(ROOT))
             chunks.extend(difflib.unified_diff(before.splitlines(True), after.splitlines(True), 'a/' + relative, 'b/' + relative))
             if count:
-                sites.append({'path': relative, 'raw_open_calls': count})
+                calls = []
+                for match in re.finditer(r'\b(?:rusqlite::)?Connection::open(?:_with_flags_and_vfs|_with_flags|_in_memory)?\(', before):
+                    functions = list(re.finditer(r'\bfn\s+(\w+)\s*(?:<[^{}]*>)?\s*\(', before[:match.start()]))
+                    calls.append({'line': before.count('\n', 0, match.start()) + 1, 'helper': functions[-1][1] if functions else '<module>'})
+                sites.append({'path': relative, 'raw_open_calls': count, 'helpers': calls})
     relative = 'crates/aft/src/db/store_diet_trace.rs'
     chunks.extend(difflib.unified_diff([], HELPER.splitlines(True), '/dev/null', 'b/' + relative))
     (HERE / 'baseline-trace.patch').write_text(''.join(chunks))

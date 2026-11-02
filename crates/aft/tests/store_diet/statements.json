@@ -1693,6 +1693,10 @@
         "sql": "INSERT OR IGNORE INTO view_sessions\n            (project_root,harness,session,principal,owner,scope_ref,preset,epoch,params{extra_column})\n            SELECT project_root,harness,session,principal,owner,scope_ref,preset,?1,params{extra_column}\n            FROM view_sessions WHERE rowid=?2"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "INSERT OR IGNORE INTO view_tokens\n            (project_root,harness,session,principal,owner,scope_ref,preset,epoch,params{extra_column})\n            SELECT project_root,harness,session,principal,owner,scope_ref,preset,?1,params{extra_column}\n            FROM view_tokens WHERE rowid=?2"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "INSERT OR IGNORE INTO view_unknown_live\n            (project_root,harness,session,principal,owner,scope_ref,preset,epoch,params{extra_column})\n            SELECT project_root,harness,session,principal,owner,scope_ref,preset,?1,params{extra_column}\n            FROM view_unknown_live WHERE rowid=?2"
       },
@@ -2456,6 +2460,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT rowid,epoch FROM view_sessions WHERE {identity}\n            AND (length(epoch)<length(?8) OR (length(epoch)=length(?8) AND epoch<?8))\n            ORDER BY length(epoch) DESC,epoch DESC LIMIT 1"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT rowid,epoch FROM view_tokens WHERE {identity}\n            AND (length(epoch)<length(?8) OR (length(epoch)=length(?8) AND epoch<?8))\n            ORDER BY length(epoch) DESC,epoch DESC LIMIT 1"
       },
       {
         "variant": "view_unknown_live/0",
@@ -3328,32 +3336,12 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state/0",
-        "sql": "SELECT backend,workspace_root,file_path,content_hash,status,updated_at FROM backend_file_state WHERE backend = ?1"
-      },
-      {
-        "variant": "dispatch_hints/0",
-        "sql": "SELECT id,method_name,caller_node,file,line,byte_start,byte_end,provenance FROM dispatch_hints WHERE id = ?1"
-      },
-      {
         "variant": "edges/0",
         "sql": "SELECT edge_id,ref_id,source_node,target_node,target_file,target_symbol,kind,line,provenance FROM edges WHERE edge_id = ?1"
       },
       {
-        "variant": "emitted_view_rows/0",
-        "sql": "SELECT table_name,row_key FROM emitted_view_rows WHERE table_name = ?1"
-      },
-      {
-        "variant": "file_dependencies/0",
-        "sql": "SELECT file_path,dep_file FROM file_dependencies WHERE file_path = ?1"
-      },
-      {
         "variant": "files/0",
-        "sql": "SELECT path,content_hash,mtime_ns,size,lang,is_dead_code_root,is_public_api,surface_fingerprint,indexed_at,source_identity FROM files WHERE path = ?1"
-      },
-      {
-        "variant": "meta/0",
-        "sql": "SELECT k,v FROM meta WHERE k = ?1"
+        "sql": "SELECT path,content_hash,mtime_ns,size,lang,is_dead_code_root,is_public_api,surface_fingerprint,indexed_at FROM files WHERE path = ?1"
       },
       {
         "variant": "nodes/0",
@@ -3361,63 +3349,7 @@
       },
       {
         "variant": "refs/0",
-        "sql": "SELECT ref_id,caller_node,caller_file,kind,short_name,callee_last_segment,full_ref,module_path,import_kind,local_name,requested_name,namespace_alias,wildcard,line,byte_start,byte_end,status,target_node,target_file,target_symbol,provenance FROM refs WHERE ref_id = ?1"
-      },
-      {
-        "variant": "resolution_config_fields/0",
-        "sql": "SELECT path,fields FROM resolution_config_fields WHERE path = ?1"
-      },
-      {
-        "variant": "staging_file_inventory/0",
-        "sql": "SELECT path,size FROM staging_file_inventory WHERE path = ?1"
-      },
-      {
-        "variant": "staging_ref_context/0",
-        "sql": "SELECT ref_id,caller_symbol FROM staging_ref_context WHERE ref_id = ?1"
-      },
-      {
-        "variant": "type_ref_names/0",
-        "sql": "SELECT name FROM type_ref_names WHERE name = ?1"
-      },
-      {
-        "variant": "view_bindings/0",
-        "sql": "SELECT file_path,payload FROM view_bindings WHERE file_path = ?1"
-      },
-      {
-        "variant": "view_dispatch_dependencies/0",
-        "sql": "SELECT file_path,dependency FROM view_dispatch_dependencies WHERE file_path = ?1"
-      },
-      {
-        "variant": "view_dispatch_files/0",
-        "sql": "SELECT file_path,facts_digest,sites_digest,facts,type_target_trace,sites FROM view_dispatch_files WHERE file_path = ?1"
-      },
-      {
-        "variant": "view_dispatch_sites/0",
-        "sql": "SELECT caller_file,ordinal,language,unresolved_receiver_sites,dynamic_member_sites,external FROM view_dispatch_sites WHERE caller_file = ?1"
-      },
-      {
-        "variant": "view_file_surfaces/0",
-        "sql": "SELECT file_path,payload FROM view_file_surfaces WHERE file_path = ?1"
-      },
-      {
-        "variant": "view_module_digest_inputs/0",
-        "sql": "SELECT input,digest FROM view_module_digest_inputs WHERE input = ?1"
-      },
-      {
-        "variant": "view_module_path_targets/0",
-        "sql": "SELECT target,source,declared,present,indirect FROM view_module_path_targets WHERE target = ?1"
-      },
-      {
-        "variant": "view_sessions/0",
-        "sql": "SELECT session_id,scope,owner_pid,owner_start,opened_at_ms FROM view_sessions WHERE session_id = ?1"
-      },
-      {
-        "variant": "view_unknown_live/0",
-        "sql": "SELECT caller_file,ordinal,target_file,target_symbol FROM view_unknown_live WHERE caller_file = ?1"
-      },
-      {
-        "variant": "view_usage/0",
-        "sql": "SELECT scope,bytes,held,measured_at_ms FROM view_usage WHERE scope = ?1"
+        "sql": "SELECT ref_id,caller_node,caller_file,kind,short_name,full_ref,module_path,import_kind,local_name,requested_name,namespace_alias,wildcard,line,byte_start,byte_end,status,target_node,target_file,target_symbol,provenance,callee_last_segment FROM refs WHERE ref_id = ?1"
       }
     ]
   },
@@ -4130,96 +4062,12 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state/0",
-        "sql": "SELECT file_path FROM backend_file_state WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "dispatch_hints/0",
-        "sql": "SELECT file_path FROM dispatch_hints WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "edges/0",
-        "sql": "SELECT file_path FROM edges WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "emitted_view_rows/0",
-        "sql": "SELECT file_path FROM emitted_view_rows WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "file_dependencies/0",
-        "sql": "SELECT file_path FROM file_dependencies WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "files/0",
-        "sql": "SELECT file_path FROM files WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "meta/0",
-        "sql": "SELECT file_path FROM meta WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "nodes/0",
-        "sql": "SELECT file_path FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "refs/0",
-        "sql": "SELECT file_path FROM refs WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "resolution_config_fields/0",
-        "sql": "SELECT file_path FROM resolution_config_fields WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "staging_file_inventory/0",
-        "sql": "SELECT file_path FROM staging_file_inventory WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "staging_ref_context/0",
-        "sql": "SELECT file_path FROM staging_ref_context WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "type_ref_names/0",
-        "sql": "SELECT file_path FROM type_ref_names WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
         "variant": "view_bindings/0",
         "sql": "SELECT file_path FROM view_bindings WHERE file_path IN (SELECT path FROM changed_view_paths)"
       },
       {
-        "variant": "view_dispatch_dependencies/0",
-        "sql": "SELECT file_path FROM view_dispatch_dependencies WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_dispatch_files/0",
-        "sql": "SELECT file_path FROM view_dispatch_files WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_dispatch_sites/0",
-        "sql": "SELECT file_path FROM view_dispatch_sites WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
         "variant": "view_file_surfaces/0",
         "sql": "SELECT file_path FROM view_file_surfaces WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_module_digest_inputs/0",
-        "sql": "SELECT file_path FROM view_module_digest_inputs WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_module_path_targets/0",
-        "sql": "SELECT file_path FROM view_module_path_targets WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_sessions/0",
-        "sql": "SELECT file_path FROM view_sessions WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_unknown_live/0",
-        "sql": "SELECT file_path FROM view_unknown_live WHERE file_path IN (SELECT path FROM changed_view_paths)"
-      },
-      {
-        "variant": "view_usage/0",
-        "sql": "SELECT file_path FROM view_usage WHERE file_path IN (SELECT path FROM changed_view_paths)"
       }
     ]
   },
@@ -6975,6 +6823,10 @@
         "sql": "DELETE FROM view_sessions WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "DELETE FROM view_tokens WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "DELETE FROM view_unknown_live WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"
       },
@@ -7414,6 +7266,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT count(*) FROM view_sessions WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT count(*) FROM view_tokens WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"
       },
       {
         "variant": "view_unknown_live/0",
@@ -9355,6 +9211,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "DELETE FROM view_sessions WHERE project_key = ?1"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "DELETE FROM view_tokens WHERE project_key = ?1"
       },
       {
         "variant": "view_unknown_live/0",
@@ -11707,6 +11567,10 @@
         "sql": "PRAGMA table_info(view_sessions)"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "PRAGMA table_info(view_tokens)"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "PRAGMA table_info(view_unknown_live)"
       },
@@ -12918,6 +12782,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT rowid,params FROM view_sessions WHERE {identity} AND epoch=?8"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT rowid,params FROM view_tokens WHERE {identity} AND epoch=?8"
       },
       {
         "variant": "view_unknown_live/0",
@@ -14245,32 +14113,12 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state/0",
-        "sql": "INSERT OR REPLACE INTO backend_file_state (backend,workspace_root,file_path,content_hash,status,updated_at) VALUES (?1,?2,?3,?4,?5,?6)"
-      },
-      {
-        "variant": "dispatch_hints/0",
-        "sql": "INSERT OR REPLACE INTO dispatch_hints (id,method_name,caller_node,file,line,byte_start,byte_end,provenance) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-      },
-      {
         "variant": "edges/0",
         "sql": "INSERT OR REPLACE INTO edges (edge_id,ref_id,source_node,target_node,target_file,target_symbol,kind,line,provenance) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
       },
       {
-        "variant": "emitted_view_rows/0",
-        "sql": "INSERT OR REPLACE INTO emitted_view_rows (table_name,row_key) VALUES (?1,?2)"
-      },
-      {
-        "variant": "file_dependencies/0",
-        "sql": "INSERT OR REPLACE INTO file_dependencies (file_path,dep_file) VALUES (?1,?2)"
-      },
-      {
         "variant": "files/0",
-        "sql": "INSERT OR REPLACE INTO files (path,content_hash,mtime_ns,size,lang,is_dead_code_root,is_public_api,surface_fingerprint,indexed_at,source_identity) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
-      },
-      {
-        "variant": "meta/0",
-        "sql": "INSERT OR REPLACE INTO meta (k,v) VALUES (?1,?2)"
+        "sql": "INSERT OR REPLACE INTO files (path,content_hash,mtime_ns,size,lang,is_dead_code_root,is_public_api,surface_fingerprint,indexed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
       },
       {
         "variant": "nodes/0",
@@ -14278,63 +14126,7 @@
       },
       {
         "variant": "refs/0",
-        "sql": "INSERT OR REPLACE INTO refs (ref_id,caller_node,caller_file,kind,short_name,callee_last_segment,full_ref,module_path,import_kind,local_name,requested_name,namespace_alias,wildcard,line,byte_start,byte_end,status,target_node,target_file,target_symbol,provenance) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)"
-      },
-      {
-        "variant": "resolution_config_fields/0",
-        "sql": "INSERT OR REPLACE INTO resolution_config_fields (path,fields) VALUES (?1,?2)"
-      },
-      {
-        "variant": "staging_file_inventory/0",
-        "sql": "INSERT OR REPLACE INTO staging_file_inventory (path,size) VALUES (?1,?2)"
-      },
-      {
-        "variant": "staging_ref_context/0",
-        "sql": "INSERT OR REPLACE INTO staging_ref_context (ref_id,caller_symbol) VALUES (?1,?2)"
-      },
-      {
-        "variant": "type_ref_names/0",
-        "sql": "INSERT OR REPLACE INTO type_ref_names (name) VALUES (?1)"
-      },
-      {
-        "variant": "view_bindings/0",
-        "sql": "INSERT OR REPLACE INTO view_bindings (file_path,payload) VALUES (?1,?2)"
-      },
-      {
-        "variant": "view_dispatch_dependencies/0",
-        "sql": "INSERT OR REPLACE INTO view_dispatch_dependencies (file_path,dependency) VALUES (?1,?2)"
-      },
-      {
-        "variant": "view_dispatch_files/0",
-        "sql": "INSERT OR REPLACE INTO view_dispatch_files (file_path,facts_digest,sites_digest,facts,type_target_trace,sites) VALUES (?1,?2,?3,?4,?5,?6)"
-      },
-      {
-        "variant": "view_dispatch_sites/0",
-        "sql": "INSERT OR REPLACE INTO view_dispatch_sites (caller_file,ordinal,language,unresolved_receiver_sites,dynamic_member_sites,external) VALUES (?1,?2,?3,?4,?5,?6)"
-      },
-      {
-        "variant": "view_file_surfaces/0",
-        "sql": "INSERT OR REPLACE INTO view_file_surfaces (file_path,payload) VALUES (?1,?2)"
-      },
-      {
-        "variant": "view_module_digest_inputs/0",
-        "sql": "INSERT OR REPLACE INTO view_module_digest_inputs (input,digest) VALUES (?1,?2)"
-      },
-      {
-        "variant": "view_module_path_targets/0",
-        "sql": "INSERT OR REPLACE INTO view_module_path_targets (target,source,declared,present,indirect) VALUES (?1,?2,?3,?4,?5)"
-      },
-      {
-        "variant": "view_sessions/0",
-        "sql": "INSERT OR REPLACE INTO view_sessions (session_id,scope,owner_pid,owner_start,opened_at_ms) VALUES (?1,?2,?3,?4,?5)"
-      },
-      {
-        "variant": "view_unknown_live/0",
-        "sql": "INSERT OR REPLACE INTO view_unknown_live (caller_file,ordinal,target_file,target_symbol) VALUES (?1,?2,?3,?4)"
-      },
-      {
-        "variant": "view_usage/0",
-        "sql": "INSERT OR REPLACE INTO view_usage (scope,bytes,held,measured_at_ms) VALUES (?1,?2,?3,?4)"
+        "sql": "INSERT OR REPLACE INTO refs (ref_id,caller_node,caller_file,kind,short_name,full_ref,module_path,import_kind,local_name,requested_name,namespace_alias,wildcard,line,byte_start,byte_end,status,target_node,target_file,target_symbol,provenance,callee_last_segment) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)"
       }
     ]
   },
@@ -15229,6 +15021,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "PRAGMA index_list(view_sessions)"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "PRAGMA index_list(view_tokens)"
       },
       {
         "variant": "view_unknown_live/0",
@@ -21744,6 +21540,10 @@
         "sql": "SELECT COUNT(*) FROM view_sessions"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "SELECT COUNT(*) FROM view_tokens"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "SELECT COUNT(*) FROM view_unknown_live"
       },
@@ -22217,6 +22017,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT session_id,scope,owner_pid,owner_start,opened_at_ms FROM view_sessions ORDER BY session_id,scope,owner_pid,owner_start,opened_at_ms"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT nonce,root,expected_tree,minted_ms,expires_ms,bound_root,bound_gitdir,consumed_ms FROM view_tokens ORDER BY nonce,root,expected_tree,minted_ms,expires_ms,bound_root,bound_gitdir,consumed_ms"
       },
       {
         "variant": "view_unknown_live/0",
@@ -24134,6 +23938,10 @@
         "sql": "SELECT DISTINCT {column} FROM view_sessions WHERE {column} IS NOT NULL AND {column} <> ''"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> ''"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> ''"
       },
@@ -25056,6 +24864,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT COUNT(*) FROM view_sessions WHERE epoch='2'"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT COUNT(*) FROM view_tokens WHERE epoch='2'"
       },
       {
         "variant": "view_unknown_live/0",
@@ -29408,6 +29220,10 @@
         "sql": "DELETE FROM view_sessions"
       },
       {
+        "variant": "view_tokens/0",
+        "sql": "DELETE FROM view_tokens"
+      },
+      {
         "variant": "view_unknown_live/0",
         "sql": "DELETE FROM view_unknown_live"
       },
@@ -30131,22 +29947,6 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state-update-1/0",
-        "sql": "UPDATE OR REPLACE backend_file_state SET workspace_root=?2 WHERE backend=?1"
-      },
-      {
-        "variant": "backend_file_state-update-5/0",
-        "sql": "UPDATE OR REPLACE backend_file_state SET workspace_root=?2,file_path=?3,content_hash=?4,status=?5,updated_at=?6 WHERE backend=?1"
-      },
-      {
-        "variant": "dispatch_hints-update-1/0",
-        "sql": "UPDATE OR REPLACE dispatch_hints SET method_name=?2 WHERE id=?1"
-      },
-      {
-        "variant": "dispatch_hints-update-7/0",
-        "sql": "UPDATE OR REPLACE dispatch_hints SET method_name=?2,caller_node=?3,file=?4,line=?5,byte_start=?6,byte_end=?7,provenance=?8 WHERE id=?1"
-      },
-      {
         "variant": "edges-update-1/0",
         "sql": "UPDATE OR REPLACE edges SET ref_id=?2 WHERE edge_id=?1"
       },
@@ -30155,36 +29955,12 @@
         "sql": "UPDATE OR REPLACE edges SET ref_id=?2,source_node=?3,target_node=?4,target_file=?5,target_symbol=?6,kind=?7,line=?8,provenance=?9 WHERE edge_id=?1"
       },
       {
-        "variant": "emitted_view_rows-update-1/0",
-        "sql": "UPDATE OR REPLACE emitted_view_rows SET row_key=?2 WHERE table_name=?1"
-      },
-      {
-        "variant": "emitted_view_rows-update-1/0",
-        "sql": "UPDATE OR REPLACE emitted_view_rows SET row_key=?2 WHERE table_name=?1"
-      },
-      {
-        "variant": "file_dependencies-update-1/0",
-        "sql": "UPDATE OR REPLACE file_dependencies SET dep_file=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "file_dependencies-update-1/0",
-        "sql": "UPDATE OR REPLACE file_dependencies SET dep_file=?2 WHERE file_path=?1"
-      },
-      {
         "variant": "files-update-1/0",
         "sql": "UPDATE OR REPLACE files SET content_hash=?2 WHERE path=?1"
       },
       {
-        "variant": "files-update-9/0",
-        "sql": "UPDATE OR REPLACE files SET content_hash=?2,mtime_ns=?3,size=?4,lang=?5,is_dead_code_root=?6,is_public_api=?7,surface_fingerprint=?8,indexed_at=?9,source_identity=?10 WHERE path=?1"
-      },
-      {
-        "variant": "meta-update-1/0",
-        "sql": "UPDATE OR REPLACE meta SET v=?2 WHERE k=?1"
-      },
-      {
-        "variant": "meta-update-1/0",
-        "sql": "UPDATE OR REPLACE meta SET v=?2 WHERE k=?1"
+        "variant": "files-update-8/0",
+        "sql": "UPDATE OR REPLACE files SET content_hash=?2,mtime_ns=?3,size=?4,lang=?5,is_dead_code_root=?6,is_public_api=?7,surface_fingerprint=?8,indexed_at=?9 WHERE path=?1"
       },
       {
         "variant": "nodes-update-1/0",
@@ -30200,111 +29976,7 @@
       },
       {
         "variant": "refs-update-20/0",
-        "sql": "UPDATE OR REPLACE refs SET caller_node=?2,caller_file=?3,kind=?4,short_name=?5,callee_last_segment=?6,full_ref=?7,module_path=?8,import_kind=?9,local_name=?10,requested_name=?11,namespace_alias=?12,wildcard=?13,line=?14,byte_start=?15,byte_end=?16,status=?17,target_node=?18,target_file=?19,target_symbol=?20,provenance=?21 WHERE ref_id=?1"
-      },
-      {
-        "variant": "resolution_config_fields-update-1/0",
-        "sql": "UPDATE OR REPLACE resolution_config_fields SET fields=?2 WHERE path=?1"
-      },
-      {
-        "variant": "resolution_config_fields-update-1/0",
-        "sql": "UPDATE OR REPLACE resolution_config_fields SET fields=?2 WHERE path=?1"
-      },
-      {
-        "variant": "staging_file_inventory-update-1/0",
-        "sql": "UPDATE OR REPLACE staging_file_inventory SET size=?2 WHERE path=?1"
-      },
-      {
-        "variant": "staging_file_inventory-update-1/0",
-        "sql": "UPDATE OR REPLACE staging_file_inventory SET size=?2 WHERE path=?1"
-      },
-      {
-        "variant": "staging_ref_context-update-1/0",
-        "sql": "UPDATE OR REPLACE staging_ref_context SET caller_symbol=?2 WHERE ref_id=?1"
-      },
-      {
-        "variant": "staging_ref_context-update-1/0",
-        "sql": "UPDATE OR REPLACE staging_ref_context SET caller_symbol=?2 WHERE ref_id=?1"
-      },
-      {
-        "variant": "view_bindings-update-1/0",
-        "sql": "UPDATE OR REPLACE view_bindings SET payload=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_bindings-update-1/0",
-        "sql": "UPDATE OR REPLACE view_bindings SET payload=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_dispatch_dependencies-update-1/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_dependencies SET dependency=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_dispatch_dependencies-update-1/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_dependencies SET dependency=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_dispatch_files-update-1/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_files SET facts_digest=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_dispatch_files-update-5/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_files SET facts_digest=?2,sites_digest=?3,facts=?4,type_target_trace=?5,sites=?6 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_dispatch_sites-update-1/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_sites SET ordinal=?2 WHERE caller_file=?1"
-      },
-      {
-        "variant": "view_dispatch_sites-update-5/0",
-        "sql": "UPDATE OR REPLACE view_dispatch_sites SET ordinal=?2,language=?3,unresolved_receiver_sites=?4,dynamic_member_sites=?5,external=?6 WHERE caller_file=?1"
-      },
-      {
-        "variant": "view_file_surfaces-update-1/0",
-        "sql": "UPDATE OR REPLACE view_file_surfaces SET payload=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_file_surfaces-update-1/0",
-        "sql": "UPDATE OR REPLACE view_file_surfaces SET payload=?2 WHERE file_path=?1"
-      },
-      {
-        "variant": "view_module_digest_inputs-update-1/0",
-        "sql": "UPDATE OR REPLACE view_module_digest_inputs SET digest=?2 WHERE input=?1"
-      },
-      {
-        "variant": "view_module_digest_inputs-update-1/0",
-        "sql": "UPDATE OR REPLACE view_module_digest_inputs SET digest=?2 WHERE input=?1"
-      },
-      {
-        "variant": "view_module_path_targets-update-1/0",
-        "sql": "UPDATE OR REPLACE view_module_path_targets SET source=?2 WHERE target=?1"
-      },
-      {
-        "variant": "view_module_path_targets-update-4/0",
-        "sql": "UPDATE OR REPLACE view_module_path_targets SET source=?2,declared=?3,present=?4,indirect=?5 WHERE target=?1"
-      },
-      {
-        "variant": "view_sessions-update-1/0",
-        "sql": "UPDATE OR REPLACE view_sessions SET scope=?2 WHERE session_id=?1"
-      },
-      {
-        "variant": "view_sessions-update-4/0",
-        "sql": "UPDATE OR REPLACE view_sessions SET scope=?2,owner_pid=?3,owner_start=?4,opened_at_ms=?5 WHERE session_id=?1"
-      },
-      {
-        "variant": "view_unknown_live-update-1/0",
-        "sql": "UPDATE OR REPLACE view_unknown_live SET ordinal=?2 WHERE caller_file=?1"
-      },
-      {
-        "variant": "view_unknown_live-update-3/0",
-        "sql": "UPDATE OR REPLACE view_unknown_live SET ordinal=?2,target_file=?3,target_symbol=?4 WHERE caller_file=?1"
-      },
-      {
-        "variant": "view_usage-update-1/0",
-        "sql": "UPDATE OR REPLACE view_usage SET bytes=?2 WHERE scope=?1"
-      },
-      {
-        "variant": "view_usage-update-3/0",
-        "sql": "UPDATE OR REPLACE view_usage SET bytes=?2,held=?3,measured_at_ms=?4 WHERE scope=?1"
+        "sql": "UPDATE OR REPLACE refs SET caller_node=?2,caller_file=?3,kind=?4,short_name=?5,full_ref=?6,module_path=?7,import_kind=?8,local_name=?9,requested_name=?10,namespace_alias=?11,wildcard=?12,line=?13,byte_start=?14,byte_end=?15,status=?16,target_node=?17,target_file=?18,target_symbol=?19,provenance=?20,callee_last_segment=?21 WHERE ref_id=?1"
       }
     ]
   },
@@ -30508,6 +30180,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT {columns} FROM view_sessions"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT {columns} FROM view_tokens"
       },
       {
         "variant": "view_unknown_live/0",
@@ -30977,6 +30653,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "SELECT * FROM \"view_sessions\" LIMIT 0"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "SELECT * FROM \"view_tokens\" LIMIT 0"
       },
       {
         "variant": "view_unknown_live/0",
@@ -32981,6 +32661,10 @@
       {
         "variant": "view_sessions/0",
         "sql": "UPDATE view_sessions SET project_key = ?1"
+      },
+      {
+        "variant": "view_tokens/0",
+        "sql": "UPDATE view_tokens SET project_key = ?1"
       },
       {
         "variant": "view_unknown_live/0",

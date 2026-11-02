@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import queue
+import sqlite3
 import subprocess
 import threading
 
@@ -34,15 +35,15 @@ def manifest(symbols):
     for symbol in sample(symbols, 500):
         path, name = symbol.split('\0', 1)
         for op in ['callers', 'call_tree', 'impact']:
-            requests.append({'command': op, 'file': path, 'symbol': name})
-        requests.append({'command': 'zoom', 'file': path, 'symbol': name})
-        requests.append({'command': 'search', 'query': name})
+            requests.append({'command': op, 'file': path, 'symbol': name, 'include_tests': True})
+        requests.append({'command': 'zoom', 'file': path, 'symbol': name, 'callgraph': True})
+        requests.append({'command': 'semantic_search', 'query': name, 'include_tests': True})
     chosen = sample(symbols, 100)
     for i, symbol in enumerate(chosen):
         path, name = symbol.split('\0', 1)
         other_path, other = chosen[(i + 1) % len(chosen)].split('\0', 1)
         requests.append({'command': 'trace_to', 'file': path, 'symbol': name})
-        requests.append({'command': 'trace_to_symbol', 'file': path, 'symbol': name, 'toSymbol': other, 'toPath': other_path})
+        requests.append({'command': 'trace_to_symbol', 'file': path, 'symbol': name, 'toSymbol': other, 'toFile': other_path})
         requests.append({'command': 'trace_data', 'file': path, 'symbol': name, 'expression': 'value'})
     for section in ['dead_code', 'unused_exports', 'cycles']:
         requests.append({'command': 'inspect', 'sections': [section]})
@@ -83,7 +84,8 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
                         assert line is not None, f'binary exited before reply to {request["id"]}'
                         value = json.loads(line)
                         if value.get('id') == request['id']:
-                            assert value.get('success', True), f'request failed: {line!r}'
+                            if request is configure:
+                                assert value.get('success'), f'configure failed: {line!r}'
                             if request is not configure:
                                 (output / (request['id'] + '.reply')).write_bytes(line)
                             break
@@ -112,12 +114,29 @@ def compare(left, right):
     print(f'{len(names)} raw-byte replies match; no normalisation')
 
 
+def row_counts(database):
+    """Read a finished database through SQLite, never a raw database descriptor."""
+    tables = json.loads((HERE / 'table_encoding.json').read_text())
+    connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        result = {table['table']: connection.execute(f'SELECT count(*) FROM {table["table"]}').fetchone()[0]
+                  if table['table'] in present else None for table in tables if table['graph_data']}
+        result['refs_unresolved'] = connection.execute("SELECT count(*) FROM refs WHERE status='unresolved'").fetchone()[0]
+        return result
+    finally:
+        connection.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     make = sub.add_parser('manifest')
     make.add_argument('symbols', type=pathlib.Path, help='JSON array of path + NUL + symbol strings')
     make.add_argument('output', type=pathlib.Path)
+    fixture = sub.add_parser('fixture-manifest')
+    fixture.add_argument('seeded', type=pathlib.Path)
+    fixture.add_argument('output', type=pathlib.Path)
     run = sub.add_parser('capture')
     for arg in ['binary', 'root', 'cache', 'manifest', 'output']:
         run.add_argument(arg, type=pathlib.Path)
@@ -126,13 +145,21 @@ def main():
     diff = sub.add_parser('compare')
     diff.add_argument('baseline', type=pathlib.Path)
     diff.add_argument('candidate', type=pathlib.Path)
+    counts = sub.add_parser('counts')
+    counts.add_argument('database', type=pathlib.Path)
+    counts.add_argument('output', type=pathlib.Path)
     args = parser.parse_args()
     if args.command == 'manifest':
         dump(args.output, manifest(json.loads(args.symbols.read_text())))
+    elif args.command == 'fixture-manifest':
+        symbols = [row['file'] + '\0' + row['symbol'] for row in json.loads(args.seeded.read_text()) if 'to_file' not in row]
+        dump(args.output, manifest(symbols))
     elif args.command == 'capture':
         capture(args.binary, args.root, args.cache, json.loads(args.manifest.read_text()), args.output, args.timeout, args.views)
-    else:
+    elif args.command == 'compare':
         compare(args.baseline, args.candidate)
+    else:
+        dump(args.output, row_counts(args.database))
 
 
 if __name__ == '__main__':

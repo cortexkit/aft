@@ -3,6 +3,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 import inventory
 import parity
@@ -36,6 +37,25 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
     def test_plan_guard_does_not_silently_accept_unavailable_plan(self):
         with self.assertRaises(AssertionError):
             inventory.compare_plans({'q': []}, {'q': {'error': 'no such table'}})
+
+    def test_trace_coverage_preserves_fixed_literals_and_requires_reasons(self):
+        scratch = inventory.ROOT / 'target/scratch'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            root = pathlib.Path(temporary)
+            trace = root / 'trace.jsonl'
+            trace.write_text(json.dumps("SELECT * FROM refs WHERE status='resolved' AND caller_file='main.ts'") + '\n')
+            rows = [{'id': state, 'variants': [{'variant': 'one', 'sql': f"SELECT * FROM refs WHERE status='{state}' AND caller_file=?1"}]} for state in ['resolved', 'unresolved']]
+            exemptions = root / 'trace_exemptions.json'
+            exemptions.write_text('{}')
+            with mock.patch.object(inventory, 'HERE', root):
+                with self.assertRaisesRegex(SystemExit, 'unresolved:one'):
+                    inventory.coverage(rows, [trace])
+                exemptions.write_text(json.dumps({'unresolved:one': 'This manifest has no unresolved-reference query.'}))
+                inventory.coverage(rows, [trace])
+                exemptions.write_text(json.dumps({'unresolved:one': ''}))
+                with self.assertRaisesRegex(AssertionError, 'empty trace exemption'):
+                    inventory.coverage(rows, [trace])
 
     def test_sampling_is_seeded_bounded_and_input_order_independent(self):
         symbols = [f'file{i}.rs\0f{i}' for i in range(600)]

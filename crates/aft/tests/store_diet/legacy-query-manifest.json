@@ -1,0 +1,2168 @@
+[
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "include_tests": true,
+    "id": "parity-00000"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "include_tests": true,
+    "id": "parity-00001"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "include_tests": true,
+    "id": "parity-00002"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "callgraph": true,
+    "id": "parity-00003"
+  },
+  {
+    "command": "semantic_search",
+    "query": "overwritten",
+    "include_tests": true,
+    "id": "parity-00004"
+  },
+  {
+    "command": "callers",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "include_tests": true,
+    "id": "parity-00005"
+  },
+  {
+    "command": "call_tree",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "include_tests": true,
+    "id": "parity-00006"
+  },
+  {
+    "command": "impact",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "include_tests": true,
+    "id": "parity-00007"
+  },
+  {
+    "command": "zoom",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "callgraph": true,
+    "id": "parity-00008"
+  },
+  {
+    "command": "semantic_search",
+    "query": "validate",
+    "include_tests": true,
+    "id": "parity-00009"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00010"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00011"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00012"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00013"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00014"
+  },
+  {
+    "command": "callers",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "include_tests": true,
+    "id": "parity-00015"
+  },
+  {
+    "command": "call_tree",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "include_tests": true,
+    "id": "parity-00016"
+  },
+  {
+    "command": "impact",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "include_tests": true,
+    "id": "parity-00017"
+  },
+  {
+    "command": "zoom",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "callgraph": true,
+    "id": "parity-00018"
+  },
+  {
+    "command": "semantic_search",
+    "query": "checkFormat",
+    "include_tests": true,
+    "id": "parity-00019"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "include_tests": true,
+    "id": "parity-00020"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "include_tests": true,
+    "id": "parity-00021"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "include_tests": true,
+    "id": "parity-00022"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "callgraph": true,
+    "id": "parity-00023"
+  },
+  {
+    "command": "semantic_search",
+    "query": "usedBeforeOverwrite",
+    "include_tests": true,
+    "id": "parity-00024"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "include_tests": true,
+    "id": "parity-00025"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "include_tests": true,
+    "id": "parity-00026"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "include_tests": true,
+    "id": "parity-00027"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "callgraph": true,
+    "id": "parity-00028"
+  },
+  {
+    "command": "semantic_search",
+    "query": "via_super",
+    "include_tests": true,
+    "id": "parity-00029"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "include_tests": true,
+    "id": "parity-00030"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "include_tests": true,
+    "id": "parity-00031"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "include_tests": true,
+    "id": "parity-00032"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "callgraph": true,
+    "id": "parity-00033"
+  },
+  {
+    "command": "semantic_search",
+    "query": "complexFlow",
+    "include_tests": true,
+    "id": "parity-00034"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "include_tests": true,
+    "id": "parity-00035"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "include_tests": true,
+    "id": "parity-00036"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "include_tests": true,
+    "id": "parity-00037"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "callgraph": true,
+    "id": "parity-00038"
+  },
+  {
+    "command": "semantic_search",
+    "query": "tests::calls_lib_target",
+    "include_tests": true,
+    "id": "parity-00039"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "include_tests": true,
+    "id": "parity-00040"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "include_tests": true,
+    "id": "parity-00041"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "include_tests": true,
+    "id": "parity-00042"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "callgraph": true,
+    "id": "parity-00043"
+  },
+  {
+    "command": "semantic_search",
+    "query": "augmented",
+    "include_tests": true,
+    "id": "parity-00044"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "include_tests": true,
+    "id": "parity-00045"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "include_tests": true,
+    "id": "parity-00046"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "include_tests": true,
+    "id": "parity-00047"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "callgraph": true,
+    "id": "parity-00048"
+  },
+  {
+    "command": "semantic_search",
+    "query": "bench_target",
+    "include_tests": true,
+    "id": "parity-00049"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "include_tests": true,
+    "id": "parity-00050"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "include_tests": true,
+    "id": "parity-00051"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "include_tests": true,
+    "id": "parity-00052"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "callgraph": true,
+    "id": "parity-00053"
+  },
+  {
+    "command": "semantic_search",
+    "query": "conditionallyOverwritten",
+    "include_tests": true,
+    "id": "parity-00054"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00055"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00056"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00057"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00058"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00059"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "include_tests": true,
+    "id": "parity-00060"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "include_tests": true,
+    "id": "parity-00061"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "include_tests": true,
+    "id": "parity-00062"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "callgraph": true,
+    "id": "parity-00063"
+  },
+  {
+    "command": "semantic_search",
+    "query": "lib_target",
+    "include_tests": true,
+    "id": "parity-00064"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "include_tests": true,
+    "id": "parity-00065"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "include_tests": true,
+    "id": "parity-00066"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "include_tests": true,
+    "id": "parity-00067"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "callgraph": true,
+    "id": "parity-00068"
+  },
+  {
+    "command": "semantic_search",
+    "query": "integration_caller",
+    "include_tests": true,
+    "id": "parity-00069"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "include_tests": true,
+    "id": "parity-00070"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "include_tests": true,
+    "id": "parity-00071"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "include_tests": true,
+    "id": "parity-00072"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "callgraph": true,
+    "id": "parity-00073"
+  },
+  {
+    "command": "semantic_search",
+    "query": "sink",
+    "include_tests": true,
+    "id": "parity-00074"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "include_tests": true,
+    "id": "parity-00075"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "include_tests": true,
+    "id": "parity-00076"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "include_tests": true,
+    "id": "parity-00077"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "callgraph": true,
+    "id": "parity-00078"
+  },
+  {
+    "command": "semantic_search",
+    "query": "nested_target",
+    "include_tests": true,
+    "id": "parity-00079"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00080"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00081"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00082"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00083"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00084"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00085"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00086"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00087"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00088"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00089"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00090"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00091"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00092"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00093"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00094"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00095"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00096"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00097"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00098"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00099"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "include_tests": true,
+    "id": "parity-00100"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "include_tests": true,
+    "id": "parity-00101"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "include_tests": true,
+    "id": "parity-00102"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "callgraph": true,
+    "id": "parity-00103"
+  },
+  {
+    "command": "semantic_search",
+    "query": "integration_target",
+    "include_tests": true,
+    "id": "parity-00104"
+  },
+  {
+    "command": "callers",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "include_tests": true,
+    "id": "parity-00105"
+  },
+  {
+    "command": "call_tree",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "include_tests": true,
+    "id": "parity-00106"
+  },
+  {
+    "command": "impact",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "include_tests": true,
+    "id": "parity-00107"
+  },
+  {
+    "command": "zoom",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "callgraph": true,
+    "id": "parity-00108"
+  },
+  {
+    "command": "semantic_search",
+    "query": "testValidation",
+    "include_tests": true,
+    "id": "parity-00109"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "include_tests": true,
+    "id": "parity-00110"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "include_tests": true,
+    "id": "parity-00111"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "include_tests": true,
+    "id": "parity-00112"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "callgraph": true,
+    "id": "parity-00113"
+  },
+  {
+    "command": "semantic_search",
+    "query": "custom_target",
+    "include_tests": true,
+    "id": "parity-00114"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "include_tests": true,
+    "id": "parity-00115"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "include_tests": true,
+    "id": "parity-00116"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "include_tests": true,
+    "id": "parity-00117"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "callgraph": true,
+    "id": "parity-00118"
+  },
+  {
+    "command": "semantic_search",
+    "query": "transformData",
+    "include_tests": true,
+    "id": "parity-00119"
+  },
+  {
+    "command": "callers",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "include_tests": true,
+    "id": "parity-00120"
+  },
+  {
+    "command": "call_tree",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "include_tests": true,
+    "id": "parity-00121"
+  },
+  {
+    "command": "impact",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "include_tests": true,
+    "id": "parity-00122"
+  },
+  {
+    "command": "zoom",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "callgraph": true,
+    "id": "parity-00123"
+  },
+  {
+    "command": "semantic_search",
+    "query": "processData",
+    "include_tests": true,
+    "id": "parity-00124"
+  },
+  {
+    "command": "callers",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "include_tests": true,
+    "id": "parity-00125"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "include_tests": true,
+    "id": "parity-00126"
+  },
+  {
+    "command": "impact",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "include_tests": true,
+    "id": "parity-00127"
+  },
+  {
+    "command": "zoom",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "callgraph": true,
+    "id": "parity-00128"
+  },
+  {
+    "command": "semantic_search",
+    "query": "derived",
+    "include_tests": true,
+    "id": "parity-00129"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "include_tests": true,
+    "id": "parity-00130"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "include_tests": true,
+    "id": "parity-00131"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "include_tests": true,
+    "id": "parity-00132"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "callgraph": true,
+    "id": "parity-00133"
+  },
+  {
+    "command": "semantic_search",
+    "query": "must_not_cross_bin_boundary",
+    "include_tests": true,
+    "id": "parity-00134"
+  },
+  {
+    "command": "callers",
+    "file": "main.ts",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00135"
+  },
+  {
+    "command": "call_tree",
+    "file": "main.ts",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00136"
+  },
+  {
+    "command": "impact",
+    "file": "main.ts",
+    "symbol": "main",
+    "include_tests": true,
+    "id": "parity-00137"
+  },
+  {
+    "command": "zoom",
+    "file": "main.ts",
+    "symbol": "main",
+    "callgraph": true,
+    "id": "parity-00138"
+  },
+  {
+    "command": "semantic_search",
+    "query": "main",
+    "include_tests": true,
+    "id": "parity-00139"
+  },
+  {
+    "command": "callers",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "include_tests": true,
+    "id": "parity-00140"
+  },
+  {
+    "command": "call_tree",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "include_tests": true,
+    "id": "parity-00141"
+  },
+  {
+    "command": "impact",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "include_tests": true,
+    "id": "parity-00142"
+  },
+  {
+    "command": "zoom",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "callgraph": true,
+    "id": "parity-00143"
+  },
+  {
+    "command": "semantic_search",
+    "query": "runCheck",
+    "include_tests": true,
+    "id": "parity-00144"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "include_tests": true,
+    "id": "parity-00145"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "include_tests": true,
+    "id": "parity-00146"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "include_tests": true,
+    "id": "parity-00147"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "callgraph": true,
+    "id": "parity-00148"
+  },
+  {
+    "command": "semantic_search",
+    "query": "via_crate",
+    "include_tests": true,
+    "id": "parity-00149"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "include_tests": true,
+    "id": "parity-00150"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "include_tests": true,
+    "id": "parity-00151"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "include_tests": true,
+    "id": "parity-00152"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "callgraph": true,
+    "id": "parity-00153"
+  },
+  {
+    "command": "semantic_search",
+    "query": "first",
+    "include_tests": true,
+    "id": "parity-00154"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00155"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00156"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00157"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "callgraph": true,
+    "id": "parity-00158"
+  },
+  {
+    "command": "semantic_search",
+    "query": "error_reason",
+    "include_tests": true,
+    "id": "parity-00159"
+  },
+  {
+    "command": "callers",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "include_tests": true,
+    "id": "parity-00160"
+  },
+  {
+    "command": "call_tree",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "include_tests": true,
+    "id": "parity-00161"
+  },
+  {
+    "command": "impact",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "include_tests": true,
+    "id": "parity-00162"
+  },
+  {
+    "command": "zoom",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "callgraph": true,
+    "id": "parity-00163"
+  },
+  {
+    "command": "semantic_search",
+    "query": "processInput",
+    "include_tests": true,
+    "id": "parity-00164"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00165"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00166"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "include_tests": true,
+    "id": "parity-00167"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "callgraph": true,
+    "id": "parity-00168"
+  },
+  {
+    "command": "semantic_search",
+    "query": "error_reason",
+    "include_tests": true,
+    "id": "parity-00169"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "include_tests": true,
+    "id": "parity-00170"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "include_tests": true,
+    "id": "parity-00171"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "include_tests": true,
+    "id": "parity-00172"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "callgraph": true,
+    "id": "parity-00173"
+  },
+  {
+    "command": "semantic_search",
+    "query": "example_target",
+    "include_tests": true,
+    "id": "parity-00174"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "include_tests": true,
+    "id": "parity-00175"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "include_tests": true,
+    "id": "parity-00176"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "include_tests": true,
+    "id": "parity-00177"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "callgraph": true,
+    "id": "parity-00178"
+  },
+  {
+    "command": "semantic_search",
+    "query": "second",
+    "include_tests": true,
+    "id": "parity-00179"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "include_tests": true,
+    "id": "parity-00180"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "include_tests": true,
+    "id": "parity-00181"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "include_tests": true,
+    "id": "parity-00182"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "callgraph": true,
+    "id": "parity-00183"
+  },
+  {
+    "command": "semantic_search",
+    "query": "local",
+    "include_tests": true,
+    "id": "parity-00184"
+  },
+  {
+    "command": "callers",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "include_tests": true,
+    "id": "parity-00185"
+  },
+  {
+    "command": "call_tree",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "include_tests": true,
+    "id": "parity-00186"
+  },
+  {
+    "command": "impact",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "include_tests": true,
+    "id": "parity-00187"
+  },
+  {
+    "command": "zoom",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "callgraph": true,
+    "id": "parity-00188"
+  },
+  {
+    "command": "semantic_search",
+    "query": "run",
+    "include_tests": true,
+    "id": "parity-00189"
+  },
+  {
+    "command": "callers",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "include_tests": true,
+    "id": "parity-00190"
+  },
+  {
+    "command": "call_tree",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "include_tests": true,
+    "id": "parity-00191"
+  },
+  {
+    "command": "impact",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "include_tests": true,
+    "id": "parity-00192"
+  },
+  {
+    "command": "zoom",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "callgraph": true,
+    "id": "parity-00193"
+  },
+  {
+    "command": "semantic_search",
+    "query": "handleRequest",
+    "include_tests": true,
+    "id": "parity-00194"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "id": "parity-00195"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "toSymbol": "validate",
+    "toFile": "helpers.ts",
+    "id": "parity-00196"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "overwritten",
+    "expression": "value",
+    "id": "parity-00197"
+  },
+  {
+    "command": "trace_to",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "id": "parity-00198"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/benches/perf.rs",
+    "id": "parity-00199"
+  },
+  {
+    "command": "trace_data",
+    "file": "helpers.ts",
+    "symbol": "validate",
+    "expression": "value",
+    "id": "parity-00200"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "id": "parity-00201"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "toSymbol": "checkFormat",
+    "toFile": "helpers.ts",
+    "id": "parity-00202"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/benches/perf.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00203"
+  },
+  {
+    "command": "trace_to",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "id": "parity-00204"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "toSymbol": "usedBeforeOverwrite",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00205"
+  },
+  {
+    "command": "trace_data",
+    "file": "helpers.ts",
+    "symbol": "checkFormat",
+    "expression": "value",
+    "id": "parity-00206"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "id": "parity-00207"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "toSymbol": "via_super",
+    "toFile": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "id": "parity-00208"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "usedBeforeOverwrite",
+    "expression": "value",
+    "id": "parity-00209"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "id": "parity-00210"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "toSymbol": "complexFlow",
+    "toFile": "data_flow.ts",
+    "id": "parity-00211"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_super",
+    "expression": "value",
+    "id": "parity-00212"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "id": "parity-00213"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "toSymbol": "tests::calls_lib_target",
+    "toFile": "rust_bin_targets/src/lib.rs",
+    "id": "parity-00214"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow.ts",
+    "symbol": "complexFlow",
+    "expression": "value",
+    "id": "parity-00215"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "id": "parity-00216"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "toSymbol": "augmented",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00217"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "tests::calls_lib_target",
+    "expression": "value",
+    "id": "parity-00218"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "id": "parity-00219"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "toSymbol": "bench_target",
+    "toFile": "rust_bin_targets/benches/bench_support.rs",
+    "id": "parity-00220"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "augmented",
+    "expression": "value",
+    "id": "parity-00221"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "id": "parity-00222"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "toSymbol": "conditionallyOverwritten",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00223"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/benches/bench_support.rs",
+    "symbol": "bench_target",
+    "expression": "value",
+    "id": "parity-00224"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "id": "parity-00225"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/examples/demo.rs",
+    "id": "parity-00226"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "conditionallyOverwritten",
+    "expression": "value",
+    "id": "parity-00227"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "id": "parity-00228"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "toSymbol": "lib_target",
+    "toFile": "rust_bin_targets/src/lib.rs",
+    "id": "parity-00229"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/examples/demo.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00230"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "id": "parity-00231"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "toSymbol": "integration_caller",
+    "toFile": "rust_bin_targets/tests/standalone.rs",
+    "id": "parity-00232"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/lib.rs",
+    "symbol": "lib_target",
+    "expression": "value",
+    "id": "parity-00233"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "id": "parity-00234"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "toSymbol": "sink",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00235"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/tests/standalone.rs",
+    "symbol": "integration_caller",
+    "expression": "value",
+    "id": "parity-00236"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "id": "parity-00237"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "toSymbol": "nested_target",
+    "toFile": "rust_bin_targets/src/bin/other/nested.rs",
+    "id": "parity-00238"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "sink",
+    "expression": "value",
+    "id": "parity-00239"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "id": "parity-00240"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/src/bin/other/main.rs",
+    "id": "parity-00241"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/other/nested.rs",
+    "symbol": "nested_target",
+    "expression": "value",
+    "id": "parity-00242"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "id": "parity-00243"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/tools/custom.rs",
+    "id": "parity-00244"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/other/main.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00245"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "id": "parity-00246"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/src/main.rs",
+    "id": "parity-00247"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/tools/custom.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00248"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "id": "parity-00249"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "toSymbol": "main",
+    "toFile": "rust_bin_targets/src/bin/tool.rs",
+    "id": "parity-00250"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/main.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00251"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "id": "parity-00252"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "toSymbol": "integration_target",
+    "toFile": "rust_bin_targets/tests/test_support.rs",
+    "id": "parity-00253"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/tool.rs",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00254"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "id": "parity-00255"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "toSymbol": "testValidation",
+    "toFile": "test_helpers.ts",
+    "id": "parity-00256"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/tests/test_support.rs",
+    "symbol": "integration_target",
+    "expression": "value",
+    "id": "parity-00257"
+  },
+  {
+    "command": "trace_to",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "id": "parity-00258"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "toSymbol": "custom_target",
+    "toFile": "rust_bin_targets/tools/custom_support.rs",
+    "id": "parity-00259"
+  },
+  {
+    "command": "trace_data",
+    "file": "test_helpers.ts",
+    "symbol": "testValidation",
+    "expression": "value",
+    "id": "parity-00260"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "id": "parity-00261"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "toSymbol": "transformData",
+    "toFile": "data_flow.ts",
+    "id": "parity-00262"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/tools/custom_support.rs",
+    "symbol": "custom_target",
+    "expression": "value",
+    "id": "parity-00263"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "id": "parity-00264"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "toSymbol": "processData",
+    "toFile": "utils.ts",
+    "id": "parity-00265"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow.ts",
+    "symbol": "transformData",
+    "expression": "value",
+    "id": "parity-00266"
+  },
+  {
+    "command": "trace_to",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "id": "parity-00267"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "toSymbol": "derived",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00268"
+  },
+  {
+    "command": "trace_data",
+    "file": "utils.ts",
+    "symbol": "processData",
+    "expression": "value",
+    "id": "parity-00269"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "id": "parity-00270"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "toSymbol": "must_not_cross_bin_boundary",
+    "toFile": "rust_bin_targets/src/binx/caller.rs",
+    "id": "parity-00271"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_flow_kills.ts",
+    "symbol": "derived",
+    "expression": "value",
+    "id": "parity-00272"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "id": "parity-00273"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "toSymbol": "main",
+    "toFile": "main.ts",
+    "id": "parity-00274"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/binx/caller.rs",
+    "symbol": "must_not_cross_bin_boundary",
+    "expression": "value",
+    "id": "parity-00275"
+  },
+  {
+    "command": "trace_to",
+    "file": "main.ts",
+    "symbol": "main",
+    "id": "parity-00276"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "main.ts",
+    "symbol": "main",
+    "toSymbol": "runCheck",
+    "toFile": "aliased.ts",
+    "id": "parity-00277"
+  },
+  {
+    "command": "trace_data",
+    "file": "main.ts",
+    "symbol": "main",
+    "expression": "value",
+    "id": "parity-00278"
+  },
+  {
+    "command": "trace_to",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "id": "parity-00279"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "toSymbol": "via_crate",
+    "toFile": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "id": "parity-00280"
+  },
+  {
+    "command": "trace_data",
+    "file": "aliased.ts",
+    "symbol": "runCheck",
+    "expression": "value",
+    "id": "parity-00281"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "id": "parity-00282"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "toSymbol": "first",
+    "toFile": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "id": "parity-00283"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "via_crate",
+    "expression": "value",
+    "id": "parity-00284"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "id": "parity-00285"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "toSymbol": "error_reason",
+    "toFile": "rust_bin_targets/src/route_client.rs",
+    "id": "parity-00286"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "first",
+    "expression": "value",
+    "id": "parity-00287"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "id": "parity-00288"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "toSymbol": "processInput",
+    "toFile": "data_processor.ts",
+    "id": "parity-00289"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "value",
+    "id": "parity-00290"
+  },
+  {
+    "command": "trace_to",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "id": "parity-00291"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "toSymbol": "error_reason",
+    "toFile": "rust_bin_targets/src/bin/support/route_client.rs",
+    "id": "parity-00292"
+  },
+  {
+    "command": "trace_data",
+    "file": "data_processor.ts",
+    "symbol": "processInput",
+    "expression": "value",
+    "id": "parity-00293"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "id": "parity-00294"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "toSymbol": "example_target",
+    "toFile": "rust_bin_targets/examples/demo_support.rs",
+    "id": "parity-00295"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "error_reason",
+    "expression": "value",
+    "id": "parity-00296"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "id": "parity-00297"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "toSymbol": "second",
+    "toFile": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "id": "parity-00298"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/examples/demo_support.rs",
+    "symbol": "example_target",
+    "expression": "value",
+    "id": "parity-00299"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "id": "parity-00300"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "toSymbol": "local",
+    "toFile": "rust_bin_targets/src/bin/support/route_client.rs",
+    "id": "parity-00301"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/admin_client.rs",
+    "symbol": "second",
+    "expression": "value",
+    "id": "parity-00302"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "id": "parity-00303"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "toSymbol": "run",
+    "toFile": "rust_bin_targets/src/bin/support/mod.rs",
+    "id": "parity-00304"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/route_client.rs",
+    "symbol": "local",
+    "expression": "value",
+    "id": "parity-00305"
+  },
+  {
+    "command": "trace_to",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "id": "parity-00306"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "toSymbol": "handleRequest",
+    "toFile": "service.ts",
+    "id": "parity-00307"
+  },
+  {
+    "command": "trace_data",
+    "file": "rust_bin_targets/src/bin/support/mod.rs",
+    "symbol": "run",
+    "expression": "value",
+    "id": "parity-00308"
+  },
+  {
+    "command": "trace_to",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "id": "parity-00309"
+  },
+  {
+    "command": "trace_to_symbol",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "toSymbol": "overwritten",
+    "toFile": "data_flow_kills.ts",
+    "id": "parity-00310"
+  },
+  {
+    "command": "trace_data",
+    "file": "service.ts",
+    "symbol": "handleRequest",
+    "expression": "value",
+    "id": "parity-00311"
+  },
+  {
+    "command": "inspect",
+    "sections": [
+      "dead_code"
+    ],
+    "id": "parity-00312"
+  },
+  {
+    "command": "inspect",
+    "sections": [
+      "unused_exports"
+    ],
+    "id": "parity-00313"
+  },
+  {
+    "command": "inspect",
+    "sections": [
+      "cycles"
+    ],
+    "id": "parity-00314"
+  }
+]

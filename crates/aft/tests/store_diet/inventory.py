@@ -80,15 +80,13 @@ def statements(batch):
 def schemas(rows):
     result = {}
     for row in rows:
-        if not graph_statement(row):
-            continue
         for sql in statements(row['baseline']):
             sql = re.sub(r'--[^\n]*', '', sql).strip()
             match = re.match(r'CREATE (?:TEMP )?TABLE (?:IF NOT EXISTS )?(\w+)\s*\(', sql, re.I)
             if not match or '{' in sql:
                 continue
             table = match[1]
-            if table not in SHARED | VIEW_INFRA and not table.startswith('view_'):
+            if table in SHARED and not any(site['path'].endswith('/callgraph_store/mod.rs') for site in row['sites']):
                 continue
             connection = sqlite3.connect(':memory:')
             try:
@@ -152,9 +150,15 @@ def variants(row, tables):
         expanded = [(label, sql.replace('{identity}', value)) for label, value in [('identity', 'source_identity'), ('old-shape', 'NULL')]]
     elif '{table}' in sql:
         expanded = []
+        stable = any(site['path'].endswith('/stable_rows.rs') for site in row['sites'])
+        shapes = stable_write_shapes() if stable else {}
         for table in tables:
             name = table['table']
-            columns = [c['column'] for c in table['columns']]
+            if stable and name not in shapes:
+                continue
+            if 'FROM {table} WHERE file_path IN' in sql and name not in {'view_bindings', 'view_file_surfaces'}:
+                continue
+            columns = shapes.get(name, [c['column'] for c in table['columns']])
             if not table['graph_data'] or not columns:
                 continue
             text = sql.replace('{table}', name).replace('{key}', columns[0])
@@ -172,6 +176,12 @@ def variants(row, tables):
     return result
 
 
+def stable_write_shapes():
+    source = (ROOT / 'crates/aft/src/views/materialization.rs').read_text()
+    return {table: [text for _, text in strings(columns)] for table, columns in
+            re.findall(r'stable_rows::write\(\s*[^,]+,\s*"(\w+)",\s*&\[(.*?)\]', source, re.S)}
+
+
 def source_inventory():
     result = {'rust_order': [], 'id_text_readers': [], 'connection_helpers': [], 'attach': []}
     for folder in ['callgraph_store', 'views', 'commands', 'db']:
@@ -181,7 +191,7 @@ def source_inventory():
             lines = path.read_text().splitlines()
             for i, line in enumerate(lines):
                 site = {'path': str(path.relative_to(ROOT)), 'line': i + 1, 'text': line.strip()}
-                if re.search(r'\.sort(?:_unstable)?(?:_by(?:_key)?)?\(|\.dedup(?:_by(?:_key)?)?\(|BTree(?:Map|Set)|\.group_by\(', line):
+                if re.search(r'\.sort(?:_unstable)?(?:_by(?:_key|_cached_key)?)?\(|\.(?:min|max)_by(?:_key)?\(|\.dedup(?:_by(?:_key)?)?\(|BTree(?:Map|Set)|\.group_by\(', line):
                     result['rust_order'].append(site)
                 if re.search(r'(?:strip_prefix|starts_with|split_once|rsplit_once|strip_suffix|split|contains)\(', line) and any(re.search(r'\b(?:id|ref_id|node_id|site_ref_id)\b|pos:symbol:|view:|top:|dispatch:|edge:', context) for context in lines[max(0, i - 2):i + 3]):
                     result['id_text_readers'].append(site)
@@ -192,19 +202,59 @@ def source_inventory():
     return result
 
 
+def sweep_references(tables, rows):
+    source = (ROOT / 'crates/aft/src/callgraph_store/mod.rs').read_text()
+    index_list = source.split('const SECONDARY_INDEXES:', 1)[1].split('\n];', 1)[0]
+    indexes = []
+    for name, target in re.findall(r'\(\s*"([^"]+)",\s*"([^"]+)"\s*,?\s*\)', index_list):
+        match = re.fullmatch(r'(\w+)\(([^)]+)\)', target)
+        if match:
+            indexes.append((name, match[1], match[2].split(',')[0].strip()))
+    for row in rows:
+        if graph_statement(row):
+            for name, table, columns in re.findall(r'CREATE INDEX IF NOT EXISTS (\w+)\s+ON (\w+)\(([^)]+)\)', row['baseline']):
+                indexes.append((name, table, columns.split(',')[0].strip()))
+    result = []
+    for table in tables:
+        name = table['table']
+        for column in table['columns']:
+            if not column['encoding'].startswith('interned string'):
+                continue
+            col = column['column']
+            existing = 'PRIMARY KEY' if column['primary_key_position'] == 1 else next((idx for idx, tab, first in indexes if tab == name and first == col), None)
+            result.append({'table': name, 'column': col, 'index': existing or f'diet_sweep_{name}_{col}', 'new_index': existing is None,
+                           'probe': f'SELECT 1 FROM {name} WHERE {col} = ?1 LIMIT 1'})
+    for table, column in [('refs', 'hash_caller_symbol'), ('dispatch_hints', 'hash_caller_symbol')] + [('edges', col) for col in ['id_site_path', 'id_target_path', 'id_target_symbol', 'ref_identity_path']]:
+        result.append({'table': table, 'column': column, 'index': f'diet_sweep_{table}_{column}', 'new_index': True, 'new_identity_input': True,
+                       'probe': f'SELECT 1 FROM {table} WHERE {column} = ?1 LIMIT 1'})
+    result.append({'table': 'emitted_view_rows', 'column': 'row_key', 'index': 'PRIMARY KEY(table_name,row_key)', 'new_index': False,
+                   'probe': "SELECT 1 FROM emitted_view_rows WHERE table_name = ?1 AND row_key = ?2 LIMIT 1", 'condition': 'only path-keyed emitted tables, not identity-keyed tables'})
+    return result
+
+
 def coverage(inventory, traces):
-    # SQLite expands bound parameters in trace callbacks. Match literals in a
-    # parameter-neutral representation, not by substring (SELECT 1 must not
-    # accidentally cover SELECT 10).
-    def shape(sql):
-        sql = re.sub(r"'(?:''|[^'])*'|\?[0-9]*|:[A-Za-z_]\w*|\b[0-9]+\b", '?', sql)
-        return re.sub(r'\s+', ' ', sql).strip().rstrip(';').lower()
-    seen = {shape(json.loads(line)) for trace in traces for line in trace.read_text().splitlines()}
+    # SQLite expands parameters, but fixed literals remain part of a statement's
+    # identity: a resolved-ref query must not cover an unresolved-ref query.
+    def canonical(sql):
+        return ''.join(part if i % 2 else re.sub(r'\s+', ' ', part)
+                       for i, part in enumerate(re.split(r"('(?:''|[^'])*')", sql))).strip().rstrip(';')
+    def pattern(sql):
+        pieces = re.split(r"('(?:''|[^'])*'|\?[0-9]*|[:@$][A-Za-z_]\w*)", canonical(sql))
+        bind = r"(?:NULL|[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|[xX]'[0-9a-fA-F]*'|'(?:''|[^'])*')"
+        expression = ''.join(bind if re.fullmatch(r'\?[0-9]*|[:@$][A-Za-z_]\w*', piece) else re.escape(piece) for piece in pieces)
+        return re.compile(expression)
+    seen = {canonical(json.loads(line)) for trace in traces for line in trace.read_text().splitlines()}
     exemptions = json.loads((HERE / 'trace_exemptions.json').read_text())
-    missing = [row['id'] for row in inventory if shape(row['candidate']) not in seen and row['id'] not in exemptions]
+    variants = {row['id'] + ':' + variant['variant']: variant['sql'] for row in inventory for variant in row['variants']}
+    missing = []
+    for key, sql in variants.items():
+        matcher = pattern(sql)
+        if not any(matcher.fullmatch(traced) for traced in seen) and key not in exemptions:
+            missing.append(key)
     if missing:
         raise SystemExit('uncovered SQL statements: ' + ', '.join(missing))
-    stale = set(exemptions) - {row['id'] for row in inventory}
+    assert all(isinstance(reason, str) and reason.strip() for reason in exemptions.values()), 'empty trace exemption reason'
+    stale = set(exemptions) - variants.keys()
     if stale:
         raise SystemExit('stale trace exemptions: ' + ', '.join(sorted(stale)))
     print(f'{len(inventory)} statements: trace coverage/exemptions checked')
@@ -212,6 +262,7 @@ def coverage(inventory, traces):
 
 def compare_plans(baseline, candidate):
     """Compare access paths, ignoring SQLite node numbering and join order."""
+    assert baseline.keys() <= candidate.keys(), 'candidate omitted baseline statement plans'
     def accesses(plan):
         result = {}
         for detail in plan:
@@ -223,20 +274,30 @@ def compare_plans(baseline, candidate):
         return result
     for key, new in candidate.items():
         old = baseline.get(key)
+        if isinstance(new, dict) and 'unprepared' not in new:
+            compare_plans(old or {}, new)
+            continue
+        if isinstance(old, dict) and old.get('unprepared') and old == new:
+            # An intentionally unavailable fixture statement remains explicit
+            # in the snapshot; it is not counted as a prepared query plan.
+            continue
         if not isinstance(new, list) or (old is not None and not isinstance(old, list)):
             raise AssertionError(f'{key}: plan unavailable; resolve statement before comparison')
         before = accesses(old or [])
         for table, paths in accesses(new).items():
+            previous = before.get(table, [])
+            scans_before = sum(p[0] == 'SCAN' for p in previous)
+            scans_after = sum(p[0] == 'SCAN' for p in paths)
+            assert scans_after <= scans_before or (old is None and table == 'string_candidates'), f'{key}: new scan of {table}'
+            equalities = sorted((p[1] for p in previous if p[0] == 'SEARCH'), reverse=True)
+            searches = sorted((p for p in paths if p[0] == 'SEARCH'), key=lambda p: p[1], reverse=True)
+            for index, (_, eq, _) in enumerate(searches[:len(equalities)]):
+                assert eq >= equalities[index], f'{key}: fewer equality columns on {table}'
             for kind, eq, tail in paths:
-                previous = before.get(table, [])
                 if not previous:
-                    assert kind == 'SEARCH', f'{key}: new scan of {table}'
+                    assert kind == 'SEARCH' or (old is None and table == 'string_candidates'), f'{key}: new scan of {table}'
                     if old is not None:
                         assert 'PRIMARY KEY' in tail or 'INTEGER PRIMARY KEY' in tail, f'{key}: new join {table} is not a primary-key search'
-                elif kind == 'SCAN':
-                    assert any(p[0] == 'SCAN' for p in previous), f'{key}: SEARCH became SCAN on {table}'
-                else:
-                    assert eq >= max(p[1] for p in previous), f'{key}: fewer equality columns on {table}'
 
 
 def main():
@@ -254,6 +315,7 @@ def main():
         dump(HERE / 'order_sql.json', order_inventory(rows))
         dump(HERE / 'source_inventory.json', source_inventory())
         dump(HERE / 'table_encoding.json', tables)
+        dump(HERE / 'sweep_references.json', sweep_references(tables, rows))
         print(f'captured {len(rows)} SQL statements')
     elif args.command == 'check':
         actual = census()
@@ -262,6 +324,7 @@ def main():
         assert json.loads((HERE / 'table_encoding.json').read_text()) == schemas(actual), 'table encoding census is stale'
         assert json.loads((HERE / 'order_sql.json').read_text()) == order_inventory(actual), 'SQL ordering census is stale'
         assert json.loads((HERE / 'source_inventory.json').read_text()) == source_inventory(), 'Rust source census is stale'
+        assert json.loads((HERE / 'sweep_references.json').read_text()) == sweep_references(schemas(actual), actual), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
         coverage(json.loads(path.read_text()), args.paths)

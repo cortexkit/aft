@@ -407,8 +407,18 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/extraction_tests.rs",
+      "line": 124,
+      "text": ".min_by_key(|(i, n)| (n.1 - n.0, *i))"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/extraction_tests.rs",
       "line": 191,
       "text": "paths.sort();"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/extraction_tests.rs",
+      "line": 195,
+      "text": ".max_by_key(|p| std::fs::metadata(p).unwrap().len());"
     },
     {
       "path": "crates/aft/src/callgraph_store/extraction_tests.rs",
@@ -1017,6 +1027,11 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 3598,
+      "text": ".min_by_key(|(_, waiting)| waiting.next_recheck)"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 4187,
       "text": "received_paths: BTreeSet<PathBuf>,"
     },
@@ -1432,6 +1447,11 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 17492,
+      "text": ".max_by_key(|(prefix, _)| prefix.len())"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 17522,
       "text": "files.sort();"
     },
@@ -1654,6 +1674,11 @@
       "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 20520,
       "text": "caller_files: Option<&BTreeSet<String>>,"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 20674,
+      "text": ".max_by_key(|(index, _, _)| *index)?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
@@ -2149,6 +2174,11 @@
       "path": "crates/aft/src/callgraph_store/payload_parity_tests.rs",
       "line": 261,
       "text": "let mut files = BTreeMap::<&str, BTreeMap<&str, Vec<usize>>>::new();"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/payload_parity_tests.rs",
+      "line": 274,
+      "text": ".map(|indices| *indices.iter().min_by_key(|i| rank(i)).unwrap())"
     },
     {
       "path": "crates/aft/src/callgraph_store/payload_parity_tests.rs",
@@ -2654,6 +2684,11 @@
       "path": "crates/aft/src/views/callgraph.rs",
       "line": 1629,
       "text": "_: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,"
+    },
+    {
+      "path": "crates/aft/src/views/callgraph_copies.rs",
+      "line": 140,
+      "text": ".min_by(|a, b| (a.registered_at_ms, &a.scope).cmp(&(b.registered_at_ms, &b.scope)))"
     },
     {
       "path": "crates/aft/src/views/derived_index.rs",
@@ -3294,6 +3329,11 @@
       "path": "crates/aft/src/views/manifest_incremental.rs",
       "line": 570,
       "text": "static CACHES: OnceLock<Mutex<BTreeMap<PathBuf, RootCache>>> = OnceLock::new();"
+    },
+    {
+      "path": "crates/aft/src/views/manifest_incremental.rs",
+      "line": 743,
+      "text": ".min_by_key(|(_, cache)| cache.last_used)"
     },
     {
       "path": "crates/aft/src/views/manifest_incremental.rs",
@@ -4212,6 +4252,11 @@
     },
     {
       "path": "crates/aft/src/views/parent/engine.rs",
+      "line": 189,
+      "text": ".max_by(|(left_index, left), (right_index, right)| {"
+    },
+    {
+      "path": "crates/aft/src/views/parent/engine.rs",
       "line": 490,
       "text": "semantic_statuses.sort();"
     },
@@ -4294,6 +4339,11 @@
       "path": "crates/aft/src/views/parent.rs",
       "line": 928,
       "text": "pending: Mutex::new(BTreeSet::new()),"
+    },
+    {
+      "path": "crates/aft/src/views/parent.rs",
+      "line": 1188,
+      "text": ".max_by_key(|child| child.root.components().count())"
     },
     {
       "path": "crates/aft/src/views/parity_harness.rs",
@@ -5187,6 +5237,11 @@
     },
     {
       "path": "crates/aft/src/commands/callgraph_borrowed.rs",
+      "line": 1015,
+      "text": ".max_by_key(|symbol| {"
+    },
+    {
+      "path": "crates/aft/src/commands/callgraph_borrowed.rs",
       "line": 1183,
       "text": "groups.sort_by(|left, right| left[\"file\"].as_str().cmp(&right[\"file\"].as_str()));"
     },
@@ -5559,6 +5614,11 @@
       "path": "crates/aft/src/commands/zoom.rs",
       "line": 679,
       "text": "let mut files = BTreeSet::new();"
+    },
+    {
+      "path": "crates/aft/src/commands/zoom.rs",
+      "line": 1165,
+      "text": ".min_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/commands/zoom.rs",

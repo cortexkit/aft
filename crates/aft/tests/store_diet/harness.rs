@@ -234,15 +234,32 @@ fn plans(store: &CallGraphStore) -> Value {
         serde_json::from_slice(&fs::read(Path::new(ASSETS).join("statements.json")).unwrap())
             .unwrap();
     let conn = store.conn.lock().unwrap();
+    // Other databases and transaction-local tables do not live in a finished
+    // graph fixture. Keep their schemas on a separate in-memory connection.
+    // Actual graph plans always use the real fixture's schema first.
+    let auxiliary = Connection::open_in_memory().unwrap();
+    let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
+    for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+        let _ = auxiliary.execute_batch(&sql.unwrap());
+    }
+    for _ in 0..2 {
+        for row in &rows {
+            for variant in row["variants"].as_array().unwrap() {
+                let sql = variant["sql"].as_str().unwrap();
+                let upper = sql.trim_start().to_ascii_uppercase();
+                if upper.starts_with("CREATE TABLE")
+                    || upper.starts_with("CREATE TEMP TABLE")
+                    || upper.starts_with("CREATE INDEX")
+                    || upper.starts_with("CREATE UNIQUE INDEX")
+                    || (upper.starts_with("ALTER TABLE") && upper.contains(" ADD COLUMN "))
+                {
+                    let _ = auxiliary.execute_batch(sql);
+                }
+            }
+        }
+    }
     let mut result = serde_json::Map::new();
     for row in rows {
-        let graph = row["sites"].as_array().unwrap().iter().any(|site| {
-            let path = site["path"].as_str().unwrap();
-            path.contains("/callgraph_store/") || path.contains("/views/")
-        });
-        if !graph {
-            continue;
-        }
         for variant in row["variants"].as_array().unwrap() {
             let key = format!(
                 "{}:{}",
@@ -251,15 +268,16 @@ fn plans(store: &CallGraphStore) -> Value {
             );
             let sql = variant["sql"].as_str().unwrap();
             let sql = sql.strip_prefix("EXPLAIN QUERY PLAN ").unwrap_or(sql);
-            let plan = (|| -> rusqlite::Result<Vec<String>> {
-                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let explain = |connection: &Connection| -> rusqlite::Result<Vec<String>> {
+                let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
                 let count = statement.parameter_count();
                 let rows = statement.query_map(
                     params_from_iter(vec![rusqlite::types::Value::Null; count]),
                     |row| row.get::<_, String>(3),
                 )?;
                 rows.collect()
-            })();
+            };
+            let plan = explain(&conn).or_else(|_| explain(&auxiliary));
             result.insert(
                 key,
                 match plan {
