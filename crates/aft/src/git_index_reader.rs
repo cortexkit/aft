@@ -706,6 +706,14 @@ impl GitQueries {
     }
 
     fn run(&self, args: &[&str], input: Vec<u8>) -> io::Result<Output> {
+        #[cfg(test)]
+        let index_before = crate::views::verification::gitdir(&self.root)
+            .ok()
+            .map(|dir| dir.join("index"))
+            .map(|path| {
+                let stat = crate::views::verification::NativeStat::strict_read(&path);
+                (path, stat.ok())
+            });
         let mut command = Command::new("git");
         command
             .current_dir(&self.root)
@@ -714,7 +722,15 @@ impl GitQueries {
             .env("LC_ALL", "C");
         #[cfg(test)]
         crate::test_env::apply_hermetic_git_env(&mut command);
-        pump(&mut command, input, self.timeout, &self.spawned).map_err(|error| {
+        let result = pump(&mut command, input, self.timeout, &self.spawned);
+        #[cfg(test)]
+        if let Some((path, before)) = index_before {
+            let after = crate::views::verification::NativeStat::strict_read(&path).ok();
+            if before != after || result.is_err() {
+                eprintln!("Git query {args:?} at {:?}: {result:?}; index {path:?}: old={before:?}; new={after:?}", self.root);
+            }
+        }
+        result.map_err(|error| {
             crate::views::io::at(
                 &format!("running git {} in", args.join(" ")),
                 &self.root,
@@ -744,6 +760,8 @@ fn pump(
         .stderr(Stdio::piped())
         .spawn()?;
     spawned.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    eprintln!("metadata child pid={} cwd={:?} args={:?}", child.id(), command.get_current_dir(), command.get_args().collect::<Vec<_>>());
     crate::views::io::WORK
         .git_subprocesses
         .fetch_add(1, Ordering::Relaxed);

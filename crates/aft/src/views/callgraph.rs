@@ -2137,6 +2137,17 @@ mod tests {
         setup_git(&linked, &["add", "-A"]);
         setup_git(&linked, &["commit", "-q", "-m", "next"]);
 
+        for root in [&main, &linked] {
+            for name in ["a.ts", "b.ts", "package.json", "notes.md"] {
+                std::fs::File::open(root.join(name))
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+                    ))
+                    .unwrap();
+            }
+        }
+
         let producers = super::super::manifest_v2::Producers {
             trigram: crate::blob_store::v2::TrigramPolicy {
                 max_file_size: 1 << 20,
