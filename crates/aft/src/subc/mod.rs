@@ -18782,6 +18782,7 @@ mod tests {
             params: json!({
                 "project_root": dir.path(), "storage_dir": storage.path(), "harness": "runner",
                 "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
+                    "project_detection": {"mode": "workspace"},
                     "views": {"enabled": true},
                     "indexes": {"trigram": false, "semantic": false, "callgraph": false}
                 }).to_string()}],
@@ -18789,13 +18790,10 @@ mod tests {
         };
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
-        crate::test_admission::settle(&ctx);
+        let folder = crate::test_admission::settle(&ctx);
+        assert_eq!(folder["classification"], "workspace", "{folder}");
         let parent = crate::views::parent::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
-        assert_eq!(
-            crate::folder_admission_runtime::snapshot(&ctx).unwrap()["classification"],
-            "workspace"
-        );
         wait_for_watcher_count(&ctx, 1);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
         let plan = counters
