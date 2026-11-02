@@ -250,8 +250,16 @@ fn lexical_rebind_stopped_or_restarted_subscription_cannot_reuse_verification() 
 fn lexical_rebind_pending_write_refuses_reuse_until_it_is_reconciled() {
     fixture(|f| {
         f.bind();
+        // Active-write accounting belongs to the root's intent registration;
+        // the lexical driver also receives the before/after notifications.
+        let cut = f.ctx.lexical_source_for_test().acquire().unwrap();
+        let delta = Arc::new(std::sync::Mutex::new(
+            super::super::snapshot::LiveDelta::new(cut.generation().clone()),
+        ));
+        super::super::intent::register(&f.root, &delta);
         let path = f.root.join("a.rs");
         let write = super::super::intent::record_paths([path.as_path()]);
+        assert!(super::super::intent::active(&f.root));
         fs::write(f.root.join("a.rs"), "fn written_needle() {}\n").unwrap();
         f.ctx.mark_subc_unbound();
         f.ctx.mark_subc_bound();
@@ -266,6 +274,9 @@ fn lexical_rebind_pending_write_refuses_reuse_until_it_is_reconciled() {
             "{error}"
         );
         drop(write);
+        assert!(!super::super::intent::active(&f.root));
+        assert!(f.ctx.lexical_source_for_test().steady_revision().is_none());
+        super::super::first_load::rebind_tests::take_measurements();
         f.ctx.view_load_retry_due_for_test();
         let result = f.rebind();
         assert_eq!(f.matches(&result, "written_needle"), 1);
