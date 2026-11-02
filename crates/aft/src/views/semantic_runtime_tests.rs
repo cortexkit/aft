@@ -4289,11 +4289,19 @@ fn permanent_fill_failure_preserves_reason_without_retry() {
             });
         })
     };
-    let event = observer.next();
+    let settled = observer
+        .wait_until_settled(Duration::from_secs(60))
+        .unwrap()
+        .expect("settlement records the lane state");
     let armed = lock(&slot.retry).is_some();
     slot.clear();
     worker.join().unwrap();
-    assert_eq!(event, "settled");
+    assert!(settled.contains("state=settled"), "{settled}");
+    assert!(
+        settled.contains("unavailable: embedding dimension mismatch"),
+        "{settled}"
+    );
+    assert!(settled.contains("retry_pending=false"), "{settled}");
     assert!(!armed, "dimension mismatch armed a retry");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(

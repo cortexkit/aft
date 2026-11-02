@@ -1348,6 +1348,11 @@ impl CheckoutSemanticSlot {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_pending_for_test(&self) -> bool {
+        lock(&self.retry).is_some()
+    }
+
     fn request_retry_at(&self, now: Instant) -> bool {
         let mut retry = lock(&self.retry);
         let Some(retry) = retry.as_mut() else {
@@ -1954,7 +1959,8 @@ impl FillObserver {
             .state
     }
 
-    pub(crate) fn wait_until_settled(&self, timeout: Duration) -> Result<(), String> {
+    /// Returns the settlement diagnostics supplied by the worker, if any.
+    pub(crate) fn wait_until_settled(&self, timeout: Duration) -> Result<Option<String>, String> {
         let deadline = Instant::now() + timeout;
         let mut retries = Vec::new();
         loop {
@@ -1971,7 +1977,7 @@ impl FillObserver {
                 ));
             }
             match event.state {
-                "settled" => return Ok(()),
+                "settled" => return Ok(event.reason),
                 "retry" => {
                     eprintln!(
                         "semantic fill retry for {}: {:?}",
@@ -2234,7 +2240,18 @@ fn serve_fills_with_status<F>(
                     set_status(slot, epoch, status, value);
                 }
                 #[cfg(test)]
-                observe_fill(&schedule.root, "settled");
+                {
+                    // Settlement can also mean a terminal failure. Capture the
+                    // slot description and retry state before a later wake changes either.
+                    let diagnostic = slot.upgrade().map(|slot| {
+                        format!(
+                            "state=settled worker_epoch={epoch}; lane={}; retry_pending={}",
+                            slot.describe(),
+                            slot.retry_pending_for_test(),
+                        )
+                    });
+                    observe_fill_with_reason(&schedule.root, "settled", diagnostic.as_deref());
+                }
                 backoff = schedule.retry_initial;
                 retry_after = None;
             }
