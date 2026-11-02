@@ -3715,6 +3715,11 @@ fn build_health_diagnostic_rollup_from_actors(
     }
 
     let busy_roots = candidates.iter().filter(|candidate| candidate.busy).count();
+    let disk_reserve_detail = candidates
+        .iter()
+        .flat_map(|candidate| candidate.health.view_storage_reserve.values())
+        .next()
+        .map(|reserve| reserve.message.clone());
     let warming_roots = candidates
         .iter()
         .filter(|candidate| !candidate.busy && !candidate.fully_ready)
@@ -3910,21 +3915,12 @@ fn build_health_diagnostic_rollup_from_actors(
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     rollup_mark!(timer, "lifecycle OS probes");
     shared_app.publish_lifecycle_census(lifecycle.clone());
-    let detail = if busy_roots > 0 {
-        Some(format!(
-            "{busy_roots} root actor(s) could not be snapshotted without contention"
-        ))
-    } else if standing_refusals > 0 {
-        Some(format!(
-            "{standing_refusals} standing root(s) refused current resolved-path identity"
-        ))
-    } else if warming_roots > 0 {
-        Some(format!(
-            "{warming_roots} root(s) warming background indexes (serving normally)"
-        ))
-    } else {
-        None
-    };
+    let (status, detail) = root_health_rollup_state(
+        busy_roots,
+        standing_refusals,
+        warming_roots,
+        disk_reserve_detail,
+    );
 
     let storage_retention = lifecycle_contexts
         .iter()
@@ -4013,11 +4009,7 @@ fn build_health_diagnostic_rollup_from_actors(
             (None, None) => unreachable!("a census is measured whenever none is reused"),
         };
     HealthDiagnosticRollup {
-        status: if busy_roots > 0 || standing_refusals > 0 {
-            HealthStatus::Degraded
-        } else {
-            HealthStatus::Ok
-        },
+        status,
         detail,
         generated_at_ms: None,
         generation: 0,
@@ -4029,6 +4021,37 @@ fn build_health_diagnostic_rollup_from_actors(
         #[cfg(test)]
         tick,
     }
+}
+
+fn root_health_rollup_state(
+    busy_roots: usize,
+    standing_refusals: usize,
+    warming_roots: usize,
+    disk_reserve_detail: Option<String>,
+) -> (HealthStatus, Option<String>) {
+    let status = if busy_roots > 0 || standing_refusals > 0 || disk_reserve_detail.is_some() {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Ok
+    };
+    let detail = if busy_roots > 0 {
+        Some(format!(
+            "{busy_roots} root actor(s) could not be snapshotted without contention"
+        ))
+    } else if standing_refusals > 0 {
+        Some(format!(
+            "{standing_refusals} standing root(s) refused current resolved-path identity"
+        ))
+    } else if disk_reserve_detail.is_some() {
+        disk_reserve_detail
+    } else if warming_roots > 0 {
+        Some(format!(
+            "{warming_roots} root(s) warming background indexes (serving normally)"
+        ))
+    } else {
+        None
+    };
+    (status, detail)
 }
 
 fn render_cold_build_limiter_census(
@@ -4961,6 +4984,15 @@ mod tests {
         assert_eq!(
             root["view_storage_reserve"]["trigram"]["message"],
             reserve.message
+        );
+        let (status, detail) = root_health_rollup_state(0, 0, 1, Some(reserve.message.clone()));
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(detail, Some(reserve.message));
+        let (status, detail) = root_health_rollup_state(0, 0, 1, None);
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(
+            detail.as_deref(),
+            Some("1 root(s) warming background indexes (serving normally)")
         );
     }
 
