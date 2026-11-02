@@ -330,7 +330,8 @@ fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
     publish(&checkout, &storage);
     git(&checkout, &["restore", "index.ts"]);
     let ctx = configure(&checkout, &storage, true);
-    let response = query(&ctx, &checkout, "callers", "ownerCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query(&ctx, &checkout, "callers", "ownerCaller"));
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(
@@ -361,7 +362,8 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
     assert!(ctx.shared_artifacts_read_only());
     assert!(!ctx.callgraph_writer());
     assert!(!ctx.ram_overlay_active());
-    let response = query(&ctx, &checkout, "callers", "workerCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query(&ctx, &checkout, "callers", "workerCaller"));
     assert!(
         response.success,
         "worktree-only source must publish without an owner writer: {response:?}"
@@ -612,7 +614,8 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
             "{operation}: {response:?}"
         );
     }
-    let response = query_file(&ctx, &unindexed, "callers", "newCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query_file(&ctx, &unindexed, "callers", "newCaller"));
     assert!(response.success, "{response:?}");
     let response = callgraph_when_ready("callers", || {
         aft::commands::callers::handle_callers(

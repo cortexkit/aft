@@ -19821,7 +19821,7 @@ mod callgraph_store_for_ops_tests {
         let root = ctx.callgraph_project_root().unwrap();
         ctx.set_canonical_cache_root(root.clone());
         assert!(matches!(
-            ctx.callgraph_store_for_ops(),
+            ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
             CallgraphStoreAccess::Ready(_)
         ));
         ctx.callgraph_view.lock().take();
@@ -19864,7 +19864,7 @@ mod callgraph_store_for_ops_tests {
         drop(blocker);
         ctx.view_load_retry_due_for_test();
         assert!(matches!(
-            ctx.callgraph_store_for_ops(),
+            ctx.with_ready_callgraph_for_test(|| ctx.callgraph_store_for_ops()),
             CallgraphStoreAccess::Ready(_)
         ));
         let ready = ctx.callgraph_view_read_diagnostics();

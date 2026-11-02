@@ -12936,9 +12936,11 @@ mod tests {
             lsp_hints: None,
             params: json!({"file": root.join("tracked.rs"), "symbol": "dirty"}),
         };
-        let response = crate::commands::callers::handle_callers(&request, &ctx);
-        // The checkout view verifies the working tree for the query itself, so
-        // the dirty source answers at once, without waiting for publication.
+        let response = ctx.with_ready_callgraph_for_test(|| {
+            crate::commands::callers::handle_callers(&request, &ctx)
+        });
+        // Fixture acquisition verifies the working tree rather than serving
+        // the stale configure-publication snapshot.
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["total_callers"], 1);
     }
@@ -14750,7 +14752,7 @@ mod tests {
             // Stopping the writer alone does not bypass the pending timer.
             assert!(!request().success);
             ctx.view_load_retry_due_for_test();
-            let recovered = request();
+            let recovered = ctx.with_ready_callgraph_for_test(request);
             assert!(recovered.success, "{:?}", recovered.data);
             assert!(ctx.try_health_snapshot(&root).view_load_failures.is_empty());
         }
@@ -15954,7 +15956,7 @@ mod tests {
             assert!(health.view_load_failure_last.is_none());
             source.verified.store(true, Ordering::SeqCst);
             ctx.view_load_retry_due_for_test();
-            let answer = callers();
+            let answer = ctx.with_ready_callgraph_for_test(callers);
             assert!(answer.success, "{:?}", answer.data);
             assert!(answer.data.to_string().contains("caller"), "{:?}", answer.data);
             assert_eq!(source.attempts.load(Ordering::SeqCst), attempts + 1);
@@ -16176,7 +16178,7 @@ mod tests {
                 ctx,
             )
         };
-        let answer = callers(&ctx);
+        let answer = ctx.with_ready_callgraph_for_test(|| callers(&ctx));
         assert!(answer.success, "{:?}", answer.data);
         assert!(ctx.callgraph_view_route_count() > 0);
 
@@ -16196,7 +16198,7 @@ mod tests {
             true,
         );
         let _ = crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true);
-        let answer = callers(&ctx);
+        let answer = ctx.with_ready_callgraph_for_test(|| callers(&ctx));
         assert!(answer.success, "{:?}", answer.data);
         assert_eq!(legacy_views_on_writes(&storage), Vec::<String>::new());
         assert_eq!(ctx.view_publication_attempts_for_test(), 0);
@@ -16329,7 +16331,7 @@ mod tests {
             )
         };
         assert!(grep().success);
-        assert!(callers().success);
+        assert!(ctx.with_ready_callgraph_for_test(callers).success);
         assert!(ctx.lexical_view_is_ready() && ctx.callgraph_view_is_ready());
 
         evict(&ctx);
@@ -16341,7 +16343,7 @@ mod tests {
         let answer = grep();
         assert!(answer.success, "{:?}", answer.data);
         assert_eq!(answer.data["index_status"], "Ready", "{:?}", answer.data);
-        let answer = callers();
+        let answer = ctx.with_ready_callgraph_for_test(callers);
         assert!(answer.success, "{:?}", answer.data);
         assert_eq!(
             (
