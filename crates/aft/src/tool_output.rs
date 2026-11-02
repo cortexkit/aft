@@ -702,7 +702,7 @@ fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: 
                 };
                 let start = cursor + offset;
                 cursor = start + rendered.len();
-                start + rendered.find('\n').unwrap_or(rendered.len()) < visible.len()
+                start + rendered.find('\n').unwrap_or(rendered.len()) <= visible.len()
             })
             .count();
     }
