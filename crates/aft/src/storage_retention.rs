@@ -6148,12 +6148,13 @@ pub(crate) fn evict_least_recent_v3_member(
 /// Give a write refused for insufficient free device space a bounded chance
 /// to free its family's unused databases. The reservation lock stays held through the
 /// caller's subsequent space check; no registry barrier is held on entry.
+/// Returns whether any database was removed, so an unsuccessful walk can be throttled.
 pub(crate) fn reclaim_v3_admission_family(
     storage: &Path,
     family: &str,
     lock: &crate::blob_store::v3::ReservationLock,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     #[cfg(test)]
     test_hook(storage, "v3-pressure-reclaim-started");
     if !crate::blob_store::v3::family_dir(storage, family)
@@ -6161,11 +6162,12 @@ pub(crate) fn reclaim_v3_admission_family(
         .join("members.sqlite")
         .try_exists()?
     {
-        return Ok(());
+        return Ok(false);
     }
     let mut registry =
         crate::blob_store::v3::RegistryWriter::open_for_barrier(storage, family, lock)
             .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut reclaimed = false;
     for _ in 0..64 {
         if Instant::now() >= deadline
             || evict_least_recent_v3_member(
@@ -6181,6 +6183,7 @@ pub(crate) fn reclaim_v3_admission_family(
         {
             break;
         }
+        reclaimed = true;
         #[cfg(test)]
         test_hook(storage, "v3-pressure-reclaimed");
     }
@@ -6190,7 +6193,7 @@ pub(crate) fn reclaim_v3_admission_family(
     registry
         .covering_measurement_until(deadline)
         .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+    Ok(reclaimed)
 }
 
 fn report_v3_idle_unknown(

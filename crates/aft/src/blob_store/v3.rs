@@ -1114,10 +1114,37 @@ fn preflight_floor(storage: &Path, request: u64) -> Result<()> {
     check_space(storage, request, live)
 }
 
+const FLOOR_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn floor_reclaim_cooldown(storage: &Path, family: &str) -> Arc<Mutex<Option<Instant>>> {
+    type Cooldown = Arc<Mutex<Option<Instant>>>;
+    type Key = (PathBuf, String);
+    static COOLDOWNS: std::sync::OnceLock<Mutex<std::collections::HashMap<Key, Cooldown>>> =
+        std::sync::OnceLock::new();
+    let storage = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
+    COOLDOWNS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((storage, family.to_owned()))
+        .or_default()
+        .clone()
+}
+
 fn with_floor_reclaim<T>(
     storage: &Path,
     family: &str,
     lock: Option<&ReservationLock>,
+    admission: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    with_floor_reclaim_using_clock(storage, family, lock, Instant::now, admission)
+}
+
+fn with_floor_reclaim_using_clock<T>(
+    storage: &Path,
+    family: &str,
+    lock: Option<&ReservationLock>,
+    now: impl Fn() -> Instant,
     mut admission: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     match admission() {
@@ -1133,6 +1160,19 @@ fn with_floor_reclaim<T>(
     {
         return Err(Error::Refused("device_free_space_floor"));
     }
+    let cooldown = floor_reclaim_cooldown(storage, family);
+    // Do not queue agent-facing requests behind another reclaim's I/O, or
+    // repeat an unproductive walk more than once per minute for this family.
+    let mut retry_at = match cooldown.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err(Error::Refused("device_free_space_floor"));
+        }
+    };
+    if retry_at.is_some_and(|retry_at| now() < retry_at) {
+        return Err(Error::Refused("device_free_space_floor"));
+    }
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let owned_lock;
     let lock = match lock {
@@ -1140,15 +1180,23 @@ fn with_floor_reclaim<T>(
         None => {
             owned_lock = match ReservationLock::acquire_until(storage, deadline) {
                 Ok(lock) => lock,
-                Err(_) => return Err(Error::Refused("device_free_space_floor")),
+                Err(_) => {
+                    *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN);
+                    return Err(Error::Refused("device_free_space_floor"));
+                }
             };
             &owned_lock
         }
     };
-    if let Err(error) =
-        crate::storage_retention::reclaim_v3_admission_family(storage, family, lock, deadline)
-    {
-        crate::slog_warn!("views admission reclaim failed family={family}: {error}");
+    match crate::storage_retention::reclaim_v3_admission_family(storage, family, lock, deadline) {
+        Ok(true) => *retry_at = None,
+        Ok(false) => *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN),
+        Err(error) => {
+            // The same cooldown suppresses both another walk and another
+            // warning until the family is eligible for a new reclaim attempt.
+            *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN);
+            crate::slog_warn!("views admission reclaim failed family={family}: {error}");
+        }
     }
     admission()
 }
