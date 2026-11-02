@@ -59,6 +59,9 @@ fn metadata_persistence_running_task(storage: &Path, registry: &BgTaskRegistry) 
         .unwrap();
     let task = registry.task(&paths.task_id).unwrap();
     task.lock_state().unwrap().child_exit_observed = true;
+    // Completion delivery also saves a rendered output preview. Suppress that
+    // separate write so these fixtures count only terminal-state persistence.
+    *task.terminal_notification_routed.lock().unwrap() = true;
     task
 }
 
