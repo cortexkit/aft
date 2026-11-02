@@ -2160,7 +2160,7 @@ const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command chan
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
 
 #[cfg(unix)]
-const RUNON_EDITS_CHECKOUT_MESSAGE: &str = "runon refused: this command writes <path>, and a build-server job runs on a throwaway copy, so the edit would be lost. Edit in a local call, then runon only the build or test.";
+const RUNON_EDITS_CHECKOUT_MESSAGE: &str = "runon refused: this command writes <path>, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.";
 
 #[cfg(unix)]
 fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {

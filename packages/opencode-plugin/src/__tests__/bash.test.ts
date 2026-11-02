@@ -302,7 +302,7 @@ describe("OpenCode bash adapter", () => {
       expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
       expect(bash.description).toContain("including chains and pipes");
       expect(bash.description).toContain(
-        "A runon job runs on a copy of this checkout that is reset before the next job; only output, the exit code and return_paths files come back. Edit, generate and format files locally first.",
+        "A runon job's file changes are not copied back; only output, the exit code and return_paths files return. Edit locally first; name a file in return_paths to regenerate it remotely.",
       );
       expect(bash.description).toContain(
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs this machine's own operating system or hardware (its sandbox, code signing, service manager, permission prompts or GUI frameworks)",

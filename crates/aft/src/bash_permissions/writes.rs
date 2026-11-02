@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
-use super::scan::{command_parts, walk_shell_commands};
+use super::scan::walk_shell_commands;
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -387,12 +387,17 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
     }
     let mut paths = Vec::new();
     redirected(source, wrapper, &mut paths);
-    let parts = command_parts(source, node);
+    let mut cursor = node.walk();
+    let parts: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| !child.kind().contains("redirect") && child.kind() != "variable_assignment")
+        .map(|child| child.utf8_text(source.as_bytes()).unwrap_or("").to_string())
+        .collect();
     // Keep unknown operands in position so they cannot turn an input into a
     // destination; the sentinel is discarded by literal() before resolution.
     let words: Vec<_> = parts
         .iter()
-        .map(|part| literal(&part.text).unwrap_or_else(|| "$unknown".into()))
+        .map(|part| literal(part).unwrap_or_else(|| "$unknown".into()))
         .collect();
     let Some(head) = words
         .first()
@@ -468,10 +473,7 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
                 a == "--in-place"
                     || a.starts_with("--in-place=")
                     || a.starts_with("-i")
-                    || (head != "sed"
-                        && a.starts_with('-')
-                        && !a.starts_with("--")
-                        && a.contains('i'))
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
             }) =>
         {
             let mut files = operands(args, &["-e", "-pe", "-ne", "--expression", "-f", "--file"]);
@@ -560,9 +562,9 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
             // Interpreter source is not a shell path, so keep its quotes.
             let code = parts
                 .windows(2)
-                .find(|pair| pair[0].text == flag)
+                .find(|pair| pair[0] == flag)
                 .map(|pair| {
-                    let raw = pair[1].text.as_str();
+                    let raw = pair[1].as_str();
                     if raw.len() >= 2
                         && (raw.starts_with('\'') && raw.ends_with('\'')
                             || raw.starts_with('"') && raw.ends_with('"'))

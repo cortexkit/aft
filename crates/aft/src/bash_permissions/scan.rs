@@ -27,8 +27,8 @@ const READ_ONLY_FILE_COMMANDS: &[&str] = &["cat"];
 type ReadExemption<'a> = &'a dyn Fn(&Path) -> bool;
 
 #[derive(Debug, Clone)]
-pub(super) struct Part {
-    pub(super) text: String,
+struct Part {
+    text: String,
 }
 
 pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
@@ -1025,7 +1025,7 @@ pub(super) fn walk_shell_commands(
     targets.directories
 }
 
-pub(super) fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
+fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
     let mut out = Vec::new();
 
     let mut cursor = node.walk();

@@ -12278,6 +12278,8 @@ fn runon_write_shapes_respect_snapshot_membership() {
             .contains("sub/file.rs")
     );
     assert!(runon_write_refusal("cargo fmt", &request).is_some());
+    assert!(runon_write_refusal("cp $SOURCE tracked.rs", &request).is_some());
+    assert!(runon_write_refusal("cp input $DESTINATION", &request).is_none());
     assert!(runon_write_refusal(
         "git apply <<'EOF'\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1 +1 @@\n-a\n+b\nEOF",
         &request
@@ -12299,7 +12301,7 @@ fn runon_write_shapes_respect_snapshot_membership() {
             "{command}"
         );
     }
-    let expected = format!("runon refused: this command writes {} (and 1 more), and a build-server job runs on a throwaway copy, so the edit would be lost. Edit in a local call, then runon only the build or test.", root.join("tracked.rs").display());
+    let expected = format!("runon refused: this command writes {} (and 1 more), and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.", root.join("tracked.rs").display());
     assert_eq!(
         runon_write_refusal("tee tracked.rs new.rs", &request).unwrap(),
         expected
@@ -12347,7 +12349,7 @@ async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     assert_eq!(done.child_pid, None);
     let refusal = refusal_response(done);
     assert_eq!(refusal.data["code"], "runon_edits_checkout");
-    let expected = format!("runon refused: this command writes {}, and a build-server job runs on a throwaway copy, so the edit would be lost. Edit in a local call, then runon only the build or test.", dir.path().canonicalize().unwrap().join("source.rs").display());
+    let expected = format!("runon refused: this command writes {}, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.", dir.path().canonicalize().unwrap().join("source.rs").display());
     assert_eq!(refusal.data["message"], expected);
     let task = ctx.bash_background().task(task_id).unwrap();
     let state = task.state.lock().unwrap();
