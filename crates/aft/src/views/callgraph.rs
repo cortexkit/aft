@@ -1025,9 +1025,15 @@ impl CallgraphView {
                 .name("callgraph-view-acquire".into())
                 .spawn(move || {
                     let result = source.acquire_with_revision();
+                    #[cfg(test)]
+                    let finished = if result.is_ok() {
+                        "callgraph-reader-acquired"
+                    } else {
+                        "callgraph-acquisition-failed"
+                    };
                     let _ = tx.send(result);
                     #[cfg(test)]
-                    crate::storage_retention::test_hook(&root, "callgraph-reader-acquired");
+                    crate::storage_retention::test_hook(&root, finished);
                 })
                 .map_err(|error| CallgraphViewError::from(error.to_string()))?;
             #[cfg(test)]
@@ -1560,9 +1566,29 @@ mod tests {
         )
         .unwrap();
         graph.record_change(&added);
+        let (failed_tx, failed_rx) = crossbeam_channel::bounded(1);
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "callgraph-acquisition-failed" {
+                    failed_tx.send(()).unwrap();
+                }
+            }),
+        );
         let error = match graph.reader() {
             Ok(_) => panic!("a pinned WAL reader should prevent the truncating checkpoint"),
             Err(error) => error,
+        };
+        // The request can time out before SQLite's longer checkpoint wait.
+        // Keep the blocker until the worker finishes, then require the reader
+        // to preserve the checkpoint's original busy cause on the next read.
+        let error = if error.building {
+            failed_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            graph.reader().unwrap_err()
+        } else {
+            error
         };
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_STORE_BUSY), "{error}");
