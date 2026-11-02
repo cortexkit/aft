@@ -997,16 +997,20 @@ fn command_parts(source: &str, node: Node<'_>) -> Vec<Part> {
             continue;
         }
 
-        if matches!(
-            child.kind(),
-            "command_name"
-                | "command_name_expr"
-                | "word"
-                | "string"
-                | "raw_string"
-                | "concatenation"
-                | "number"
-        ) {
+        // Keep expansion operands even when their values are unknown. Dropping
+        // `$DEST` would turn `cd $DEST` into bare `cd` and invent HOME as its cwd.
+        if is_dynamic_node(child)
+            || matches!(
+                child.kind(),
+                "command_name"
+                    | "command_name_expr"
+                    | "word"
+                    | "string"
+                    | "raw_string"
+                    | "concatenation"
+                    | "number"
+            )
+        {
             out.push(Part {
                 text: node_text(source, child).to_string(),
             });
@@ -1668,6 +1672,8 @@ mod tests {
         let cwd = dir.path().canonicalize().unwrap();
         for prefix in [
             "cd \"$X\"",
+            "cd $X",
+            "cd ${X}",
             "pushd \"$X\"",
             "cd -",
             "pushd +1",
@@ -2585,6 +2591,104 @@ mod tests {
             &mut stack,
         );
         assert_eq!(scan_cwd, None, "cd - goes to an unknown directory");
+    }
+
+    #[test]
+    fn home_directory_changes_preserve_complete_operands() {
+        let project = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        let cases = [
+            ("cd ~/sub/dir || exit 1; cp rel/a rel/b", "sub/dir"),
+            ("cd ~/x && cp rel/a rel/b", "x"),
+            ("cd ~ && cp rel/a rel/b", ""),
+            (r#"cd "$HOME/x"; cp rel/a rel/b"#, "x"),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (command, suffix) in cases {
+            let tree = parse_tree(command).unwrap();
+            let mut nodes = Vec::new();
+            collect_commands(tree.root_node(), &mut nodes);
+            let parts = command_parts(command, nodes[0]);
+            let mut cwd = Some(project.path().to_path_buf());
+            track_cwd_change("cd", &parts, Some(&home), &mut cwd, &mut Vec::new());
+            actual.push((command, cwd));
+            expected.push((command, Some(resolve_existing(&home.join(suffix)))));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn home_directory_change_guards_preserve_known_targets() {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        for (command, suffix) in [
+            ("cd ~/sub/dir || exit 1; cp rel/a rel/b", "sub/dir"),
+            ("cd ~/x && cp rel/a rel/b", "x"),
+            ("cd ~ && cp rel/a rel/b", ""),
+        ] {
+            let asks = scan_with_project_root(command, &home.join(suffix), cwd.path());
+            assert!(
+                asks.iter().all(|ask| ask.reason.is_none()),
+                "{command}: {asks:?}"
+            );
+            assert!(
+                asks.iter()
+                    .all(|ask| ask.kind != PermissionKind::ExternalDirectory),
+                "{command}: {asks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_directory_changes_never_fall_back_to_home() {
+        let project = tempfile::tempdir().unwrap();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for command in [
+            "W=~/x/y; cd $W || exit 1; cp rel/a rel/b",
+            r#"W=~/x/y; cd "$W" || exit 1; cp rel/a rel/b"#,
+            "W=~/x/y; cd ${W} || exit 1; cp rel/a rel/b",
+        ] {
+            let asks = scan_with_project_root(command, project.path(), project.path());
+            let unknown = asks
+                .iter()
+                .any(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON));
+            let targets: Vec<_> = asks
+                .iter()
+                .flat_map(|ask| ask.targets.iter().map(|target| target.path.clone()))
+                .collect();
+            actual.push((command, unknown, targets));
+            expected.push((command, true, Vec::<PathBuf>::new()));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn variable_directory_change_in_worktree_command_keeps_paths_unknown() {
+        let project = tempfile::tempdir().unwrap();
+        let command = concat!(
+            "cd ~/Work/Projects/CortexKit/aft || exit 1; ",
+            "W=~/Work/Projects/CortexKit-scratch/aft-drop-stale-lock; ",
+            "[ -d $W ] && git worktree remove --force $W; ",
+            "git worktree add -q -b land/drop-stale-plugin-lockfile $W origin/main ",
+            "&& cd $W || exit 1; git rm -q packages/opencode-plugin/bun.lock; ",
+            "cp benchmarks/aft-search/slice-descriptors/a.json ",
+            "benchmarks/aft-search/slice-descriptors/b.json"
+        );
+        assert_unknown_cwd_ask(command, project.path());
+        let asks = scan_with_project_root(command, project.path(), project.path());
+        assert!(
+            asks.iter()
+                .all(|ask| ask.kind != PermissionKind::ExternalDirectory),
+            "{asks:?}"
+        );
+    }
+
+    #[test]
+    fn variable_directory_change_cannot_inherit_home_project_exemption() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set for shell tests"));
+        assert_unknown_cwd_ask("W=/usr; cd $W || exit 1; cp rel/a rel/b", &home);
     }
 
     #[test]
