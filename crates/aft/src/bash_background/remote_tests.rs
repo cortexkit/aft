@@ -7333,6 +7333,14 @@ fn git_fixture(root: &Path) {
     hermetic_git(root, &["init", "--quiet"]);
     hermetic_git(root, &["config", "user.name", "AFT Test"]);
     hermetic_git(root, &["config", "user.email", "aft-test@example.invalid"]);
+    // Execution sentinels are disposable output, not source edits. Keep them
+    // ignored so the checkout-write preflight does not mask the executor or cd
+    // refusal that each test is meant to exercise.
+    std::fs::write(
+        root.join(".git/info/exclude"),
+        "must-not-run-locally\nmust-not-run\nlocal-spawn-proof\n",
+    )
+    .unwrap();
     std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
     hermetic_git(root, &["add", "tracked.txt"]);
     hermetic_git(root, &["commit", "--quiet", "-m", "fixture"]);
@@ -12382,7 +12390,11 @@ async fn runon_write_check_never_refuses_without_runon() {
     .await;
     assert!(done.remote_refusal.is_none(), "{done:?}");
     assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
-    assert_eq!(exec_runs(&daemon).len(), 1);
+    assert!(exec_runs(&daemon).is_empty());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("source.rs")).unwrap(),
+        "source"
+    );
 }
 
 #[test]

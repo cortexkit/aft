@@ -511,7 +511,11 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
             let check = args
                 .iter()
                 .any(|a| matches!(a.as_str(), "--check" | "--check-only"));
+            let unknown = node
+                .utf8_text(source.as_bytes())
+                .is_ok_and(|text| text.contains(['$', '`']));
             let writes = !check
+                && !unknown
                 && match head {
                     "cargo" => args.first().is_some_and(|a| a == "fmt"),
                     "rustfmt" | "black" => true,
