@@ -89,12 +89,22 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
         assert_eq!(folder["observed"]["entries"], 0, "{folder}");
         for _ in 0..2 {
             let refused = admission::refusal(&ctx, "incomplete", "fixture").unwrap();
-            assert_eq!(refused.data["message"], admission::OFF_TEXT);
+            assert_eq!(refused.data["message"], admission::INCOMPLETE_TEXT);
         }
+        assert!(std::fs::read_dir(storage.path().join("folder-admission"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true));
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut maintenance = crate::runtime_drain::StandaloneConfigureMaintenance::default();
         loop {
-            crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+            if maintenance.has_pending(&ctx) {
+                assert!(
+                    ctx.configure_tail_has_work(),
+                    "the daemon must also see the due retry"
+                );
+                maintenance.drain_one(&ctx);
+            }
             let folder = admission::snapshot(&ctx).unwrap();
             if folder["state"] == "decided" && folder["classification"] == "project" {
                 break;
@@ -135,6 +145,67 @@ fn scratch(root: &Path) {
 #[test]
 fn folder_admission_off_notice_is_pinned_byte_for_byte() {
     assert_eq!(admission::OFF_TEXT, "Indexing is off: this folder does not look like a project. grep and glob still work, with limits. To index it, set project_detection in your AFT user config.");
+}
+
+#[test]
+fn folder_admission_incomplete_notice_is_pinned_byte_for_byte() {
+    // This test pins the notice byte for byte (approved by Ufuk).
+    assert_eq!(admission::INCOMPLETE_TEXT, "Indexing is paused: AFT could not check this folder in time and will check again shortly. grep and glob still work, with limits.");
+}
+
+#[test]
+fn folder_admission_definite_refusal_announces_once_per_session() {
+    // A definite refusal uses the full notice once per session, then its code.
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(storage.path());
+    assert!(super::handle_configure(&request("configure", json!({
+        "project_root": root.path(), "storage_dir": storage.path(), "harness": "opencode",
+        "config": [{"tier": "user", "source": "off fixture", "doc": json!({
+            "project_detection": {"mode": "off"},
+            "indexes": {"trigram": false, "semantic": false, "callgraph": false}, "views": {"enabled": false}
+        }).to_string()}]
+    })), &ctx).success);
+    settle(&ctx);
+    let first = admission::refusal(&ctx, "first", "same-session").unwrap();
+    assert_eq!(
+        crate::subc_format::format_response("search", &first, false),
+        admission::OFF_TEXT
+    );
+    let later = admission::refusal(&ctx, "later", "same-session").unwrap();
+    assert_eq!(
+        crate::subc_format::format_response("search", &later, false),
+        "folder_not_admitted: user_override"
+    );
+}
+
+#[test]
+fn folder_admission_project_override_skips_a_held_probe_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(storage.path());
+    let (started, _release) = admission::gate_probe_for_test(&ctx);
+    let ack = super::handle_configure(
+        &request(
+            "configure",
+            json!({
+                "project_root": root.path(), "storage_dir": storage.path(), "harness": "opencode",
+                "config": [{"tier": "user", "source": "declared project", "doc": json!({
+                    "project_detection": {"mode": "project"},
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": false}, "views": {"enabled": false}
+                }).to_string()}]
+            }),
+        ),
+        &ctx,
+    );
+    assert!(ack.success, "{}", ack.data);
+    settle(&ctx);
+    assert_eq!(
+        admission::snapshot(&ctx).unwrap()["classification"],
+        "project"
+    );
+    assert_eq!(admission::probe_counts_for_test(&ctx), (0, 0));
+    assert!(started.try_recv().is_err());
 }
 
 #[test]
@@ -208,12 +279,13 @@ fn folder_admission_timeout_is_incomplete_in_health_and_can_reconnect() {
         std::thread::sleep(Duration::from_millis(2));
     }
     let health = serde_json::to_value(ctx.try_health_snapshot(root.path())).unwrap();
-    assert_eq!(health["folder"]["classification"], "not_project");
+    assert_eq!(health["folder"]["classification"], Value::Null);
+    assert_eq!(health["folder"]["state"], "pending");
     assert_eq!(health["folder"]["reason"], "evidence_budget_exhausted");
     assert_eq!(health["folder"]["coverage"]["complete"], false);
     assert_eq!(health["folder"]["coverage"]["count_kind"], "lower_bound");
     let refusal = admission::refusal(&ctx, "timed-out", "session").unwrap();
-    assert_eq!(refusal.data["message"], admission::OFF_TEXT);
+    assert_eq!(refusal.data["message"], admission::INCOMPLETE_TEXT);
     release.send(()).unwrap();
     assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
     settle(&ctx);
@@ -323,12 +395,17 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         assert!(!ctx.watcher_runtime_active());
         settle(&ctx);
         let folder = admission::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], "not_project");
+        assert_eq!(folder["classification"], Value::Null);
         assert_eq!(folder["reason"], "evidence_budget_exhausted");
-        assert_eq!(folder["state"], "decided");
+        assert_eq!(folder["state"], "pending");
         assert_eq!(folder["coverage"]["complete"], false);
         assert!(folder["observed"]["entries"].as_u64().unwrap() <= 4096);
-        assert_eq!(folder["message"], admission::OFF_TEXT);
+        let incomplete_message = if folder["coverage"]["stop"] == "time" {
+            admission::INCOMPLETE_TEXT
+        } else {
+            "folder_not_admitted: evidence_budget_exhausted"
+        };
+        assert_eq!(folder["message"], incomplete_message);
         assert_eq!(admission::probe_counts_for_test(&ctx), (1, 0));
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(ctx.semantic_index().read().unwrap().is_none());
@@ -336,8 +413,8 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         assert!(!ctx.heavy_root_work_allowed());
         assert!(!ctx.watcher_runtime_active());
         let health = serde_json::to_value(ctx.try_health_snapshot(root.path())).unwrap();
-        assert_eq!(health["folder"]["classification"], "not_project");
-        assert_eq!(health["folder"]["message"], admission::OFF_TEXT);
+        assert_eq!(health["folder"]["classification"], Value::Null);
+        assert_eq!(health["folder"]["message"], incomplete_message);
         assert_eq!(health["search_index"]["status"], "disabled");
         assert_eq!(health["semantic_index"]["status"], "disabled");
 
@@ -352,7 +429,7 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         );
         assert!(!search.success);
         assert_eq!(search.data["code"], "folder_not_admitted");
-        assert_eq!(search.data["message"], admission::OFF_TEXT);
+        assert_eq!(search.data["message"], incomplete_message);
         let again = crate::commands::semantic_search::handle_semantic_search(
             &request("semantic_search", json!({"query": "off_root_file"})),
             &ctx,
@@ -369,10 +446,10 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         let restarted = context(storage.path());
         assert!(configure(root.path(), storage.path(), &restarted, true, false).success);
         settle(&restarted);
-        assert_eq!(admission::probe_counts_for_test(&restarted), (0, 1));
+        assert_eq!(admission::probe_counts_for_test(&restarted), (1, 0));
         assert_eq!(
             admission::snapshot(&restarted).unwrap()["classification"],
-            "not_project"
+            Value::Null
         );
         assert!(restarted.search_index().read().unwrap().is_none());
         assert!(!restarted.watcher_runtime_active());
@@ -622,9 +699,47 @@ fn git(root: &Path, args: &[&str]) {
 
 #[test]
 fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
+    workspace_views_with_ready_children(false);
+}
+
+#[test]
+fn folder_admission_workspace_views_retry_a_busy_child_identity() {
+    workspace_views_with_ready_children(true);
+}
+
+fn wait_for_child_index(ctx: &Arc<AppContext>, root: &Path, storage: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        crate::runtime_drain::drain_deferred_configure_maintenance(ctx);
+        crate::runtime_drain::drain_search_index_events(ctx);
+        let persisted = ctx.cached_artifact_cache_key(root).is_some_and(|key| {
+            crate::search_index::resolve_cache_dir_with_key(&key, Some(storage))
+                .join("cache.bin")
+                .is_file()
+        });
+        if persisted
+            && ctx
+                .search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|index| index.ready)
+        {
+            assert!(crate::root_identity::read(root, storage).unwrap().is_some());
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline,
+            "child never settled and published its index: folder={:?}, identity={:?}, degraded={:?}",
+            admission::snapshot(ctx), ctx.cached_artifact_cache_key(root), ctx.degraded_reasons());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn workspace_views_with_ready_children(busy_child: bool) {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     isolated(root.path(), || {
+        let mut children = Vec::new();
         for (name, symbol) in [
             ("alpha", "workspace_alpha_marker"),
             ("beta", "workspace_beta_marker"),
@@ -646,13 +761,75 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
                     "fixture",
                 ],
             );
-            let key = crate::search_index::artifact_cache_key(&child);
-            let cache = crate::search_index::resolve_cache_dir_with_key(&key, Some(storage.path()));
-            let mut index = crate::search_index::SearchIndex::build(&child);
-            assert!(index.write_to_disk(
-                &cache,
-                crate::search_index::current_git_head(&child).as_deref()
-            ));
+            let lock = (busy_child && name == "alpha").then(|| {
+                // A manually written cache does not establish a settled identity.
+                let key = crate::search_index::artifact_cache_key(&child);
+                let cache =
+                    crate::search_index::resolve_cache_dir_with_key(&key, Some(storage.path()));
+                let mut index = crate::search_index::SearchIndex::build(&child);
+                assert!(index.write_to_disk(
+                    &cache,
+                    crate::search_index::current_git_head(&child).as_deref()
+                ));
+                assert!(crate::root_identity::read(&child, storage.path())
+                    .unwrap()
+                    .is_none());
+                let lock = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+                lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+                    .unwrap();
+                let error =
+                    crate::search_index::artifact_cache_key_read_only(&child, storage.path())
+                        .expect_err(
+                            "an unbound child must not guess an identity while pins are unreadable",
+                        );
+                assert!(error.contains("aft.db was busy at bind"), "{error}");
+                eprintln!("parent child resolver before readiness: {error}");
+                lock
+            });
+            let child_ctx = context(storage.path());
+            let configured = super::handle_configure(
+                &request(
+                    "configure",
+                    json!({
+                        "project_root": child, "storage_dir": storage.path(), "harness": "opencode",
+                        "config": [{"tier": "user", "source": "child fixture", "doc": crate::test_project::repository_fixture_config(&child, json!({
+                            "indexes": {"trigram": true, "semantic": false, "callgraph": false}, "views": {"enabled": false}
+                        })).to_string()}]
+                    }),
+                ),
+                &child_ctx,
+            );
+            assert!(configured.success, "{}", configured.data);
+            if let Some(lock) = lock {
+                settle(&child_ctx);
+                assert!(child_ctx
+                    .degraded_reasons()
+                    .iter()
+                    .any(|reason| reason.contains("aft.db was busy at bind")));
+                assert!(child_ctx.cached_artifact_cache_key(&child).is_none());
+                eprintln!(
+                    "busy child before retry: {:?}",
+                    child_ctx.degraded_reasons()
+                );
+                lock.execute_batch("ROLLBACK").unwrap();
+                drop(lock);
+            }
+            // A derived Git key is not a child bind. Drive the same identity
+            // retry as the runtime before the parent reads the child's artifact.
+            wait_for_child_index(&child_ctx, &child, storage.path());
+            if busy_child && name == "alpha" {
+                assert_eq!(
+                    crate::search_index::artifact_cache_key_read_only(&child, storage.path())
+                        .unwrap(),
+                    child_ctx.cached_artifact_cache_key(&child).unwrap()
+                );
+                eprintln!(
+                    "busy child after retry: key={:?} degraded={:?}",
+                    child_ctx.cached_artifact_cache_key(&child),
+                    child_ctx.degraded_reasons()
+                );
+            }
+            children.push(child_ctx);
         }
         let ctx = context(storage.path());
         let ack = super::handle_configure(
@@ -660,15 +837,28 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
                 "configure",
                 json!({
                     "project_root": root.path(), "storage_dir": storage.path(), "harness": "opencode",
-                    "config": [{"tier": "user", "source": "workspace fixture", "doc": json!({
+                    "config": [{"tier": "user", "source": "workspace fixture", "doc": crate::test_project::repository_fixture_config(root.path(), json!({
                         "indexes": {"trigram": true, "semantic": false, "callgraph": false}, "views": {"enabled": true}
-                    }).to_string()}]
+                    })).to_string()}]
                 }),
             ),
             &ctx,
         );
         assert!(ack.success, "{}", ack.data);
-        settle(&ctx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let session = loop {
+            crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+            if let Some(session) = crate::views::parent::session_for_root(root.path()) {
+                break session;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent never settled: folder={:?} degraded={:?}",
+                admission::snapshot(&ctx),
+                ctx.degraded_reasons()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert_eq!(
             admission::snapshot(&ctx).unwrap()["classification"],
             "workspace"
@@ -681,7 +871,6 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
             ctx.watcher_runtime_active(),
             !super::file_watcher_disabled_for_test()
         );
-        let session = crate::views::parent::session_for_root(root.path()).unwrap();
         assert!(session.wait_rounds(1, Duration::from_secs(30)));
         let grep = crate::commands::grep::handle_grep(
             &request("grep", json!({"pattern": "workspace_alpha_marker"})),

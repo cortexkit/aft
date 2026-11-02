@@ -10,23 +10,12 @@ fn timing_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Declare known projects, but leave the no-evidence case on automatic detection.
-fn configure(
-    root: &Path,
-    storage: &Path,
-    id: &str,
-    full_validation: bool,
-    admitted: bool,
-) -> Value {
-    let detection = if admitted {
-        json!({"mode": "project"})
-    } else {
-        json!({"mode": "auto"})
-    };
+/// Probe real marker/empty-folder evidence; explicit project intent needs no worker.
+fn configure(root: &Path, storage: &Path, id: &str, full_validation: bool) -> Value {
     json!({"id":id,"command":"configure","harness":"opencode",
         "project_root":root,"storage_dir":storage,
         "config":user_config(json!({"views":{"enabled":false},
-            "project_detection": detection,
+            "project_detection": {"mode": "auto"},
             "validate_on_edit": if full_validation { "full" } else { "off" },
             "indexes":{"trigram":false,"semantic":false,"callgraph":false}}))})
 }
@@ -65,17 +54,14 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     let started = dir.path().join("probe-started");
     let release = dir.path().join("probe-release");
     let release_on_drop = ReleaseOnDrop::new(&release);
-    let mut env = vec![
+    // The held probes need only a root marker or an empty folder, not Git.
+    let env = [
+        ("PATH", "".as_ref()),
         ("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref()),
         ("AFT_TEST_ADMISSION_STARTED", started.as_os_str()),
         ("AFT_TEST_ADMISSION_RELEASE", release.as_os_str()),
         ("AFT_TEST_ADMISSION_TRACE", "1".as_ref()),
     ];
-    if !project_evidence {
-        // This empty root is already outside Git. The sequencing check needs
-        // no external tools, so do not spend its short probe budget starting Git.
-        env.push(("PATH", "".as_ref()));
-    }
     let mut aft = AftProcess::spawn_with_env(&env);
     // Both frames are queued before configure's post-ACK maintenance can run.
     aft.send_silent(
@@ -84,7 +70,6 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
             &dir.path().join("storage"),
             "bind",
             full_validation,
-            project_evidence,
         )
         .to_string(),
     );
@@ -128,11 +113,7 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
         if admitted { "project" } else { "not_project" },
         "{status}"
     );
-    assert_eq!(
-        status["folder"]["override_mode"],
-        if admitted { "project" } else { "auto" },
-        "{status}"
-    );
+    assert_eq!(status["folder"]["override_mode"], "auto", "{status}");
     let (status, stderr) = aft.stderr_output();
     if tool["success"] != true {
         eprintln!("{stderr}");
@@ -181,7 +162,7 @@ fn bash_queued_with_configure_keeps_foreground_orchestration() {
     let storage = crate::test_helpers::tempdir();
     let mut aft =
         AftProcess::spawn_with_env(&[("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref())]);
-    let mut bind = configure(project.path(), storage.path(), "bash-bind", false, true);
+    let mut bind = configure(project.path(), storage.path(), "bash-bind", false);
     bind["config"] = crate::test_helpers::project_detection_user_config(json!({
         "bash": {"background": true},
         "indexes": {"trigram": false, "semantic": false, "callgraph": false}
@@ -222,8 +203,9 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref()),
         ("AFT_TEST_ADMISSION_DELAY_FILE", delay.as_os_str()),
+        ("PATH", "".as_ref()),
     ]);
-    aft.send_silent(&configure(&project, &storage, "slow-bind", false, true).to_string());
+    aft.send_silent(&configure(&project, &storage, "slow-bind", false).to_string());
     aft.send_silent(&search("slow-tool").to_string());
     assert_eq!(response(&mut aft, "slow-bind")["success"], true);
     let refused = response(&mut aft, "slow-tool");
@@ -231,9 +213,15 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     assert_eq!(refused["reason"], "evidence_budget_exhausted", "{refused}");
     assert_eq!(
         refused["message"],
-        aft::folder_admission_runtime::OFF_TEXT,
+        aft::folder_admission_runtime::INCOMPLETE_TEXT,
         "{refused}"
     );
+    assert_eq!(
+        refused["folder"]["classification"],
+        Value::Null,
+        "{refused}"
+    );
+    assert_eq!(refused["folder"]["state"], "pending", "{refused}");
     assert_eq!(refused["folder"]["coverage"]["complete"], false);
     let repeated = aft.send(&search("slow-tool-again").to_string());
     assert_eq!(
@@ -242,7 +230,7 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     );
     assert_eq!(
         repeated["message"],
-        aft::folder_admission_runtime::OFF_TEXT,
+        aft::folder_admission_runtime::INCOMPLETE_TEXT,
         "{repeated}"
     );
     let status = aft.send(r#"{"id":"health-after-timeout","command":"status"}"#);
@@ -252,7 +240,7 @@ fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     );
     assert_eq!(status["folder"]["coverage"]["complete"], false);
     std::fs::write(&delay, "0").unwrap();
-    aft.send_silent(&configure(&project, &storage, "fast-bind", false, true).to_string());
+    aft.send_silent(&configure(&project, &storage, "fast-bind", false).to_string());
     aft.send_silent(&search("fast-tool").to_string());
     assert_eq!(response(&mut aft, "fast-bind")["success"], true);
     let tool = response(&mut aft, "fast-tool");

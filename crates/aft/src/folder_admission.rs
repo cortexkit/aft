@@ -140,6 +140,9 @@ pub enum FolderClassification {
     Project,
     Workspace,
     NotProject,
+    /// No determination was possible; pending snapshots already use JSON null.
+    #[serde(untagged)]
+    Undetermined,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +240,17 @@ pub struct FolderAdmission {
     pub outside_paths: Vec<PathBuf>,
 }
 
+impl FolderAdmission {
+    pub(crate) fn is_determined(&self) -> bool {
+        self.classification != FolderClassification::Undetermined
+            && !(self.classification == FolderClassification::NotProject
+                && matches!(
+                    self.reason,
+                    AdmissionReason::EvidenceBudgetExhausted | AdmissionReason::ProbeIoError
+                ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedCount {
     pub count: usize,
@@ -253,7 +267,7 @@ pub(crate) fn exhausted(
     FolderAdmission {
         policy_version: POLICY_VERSION,
         canonical_root: Some(root.to_path_buf()),
-        classification: FolderClassification::NotProject,
+        classification: FolderClassification::Undetermined,
         reason: AdmissionReason::EvidenceBudgetExhausted,
         observed: Observed::default(),
         coverage: ProbeCoverage {
@@ -280,6 +294,21 @@ pub(crate) fn exhausted(
         git_controls: Vec::new(),
         outside_paths: Vec::new(),
     }
+}
+
+/// Project and Off are user decisions, not requests for an evidence probe.
+pub(crate) fn override_decision(root: &Path, mode: DetectionMode) -> Option<FolderAdmission> {
+    let classification = match mode {
+        DetectionMode::Project => FolderClassification::Project,
+        DetectionMode::Off => FolderClassification::NotProject,
+        DetectionMode::Auto | DetectionMode::Workspace => return None,
+    };
+    let mut decision = exhausted(root, mode, ProbeBudgets::default());
+    decision.classification = classification;
+    decision.reason = AdmissionReason::UserOverride;
+    decision.coverage.stop = ProbeStop::UserOverride;
+    decision.coverage.elapsed_ms = 0;
+    Some(decision)
 }
 
 struct Probe {
@@ -406,7 +435,7 @@ fn probe_with_read_dir(
                 .as_ref()
                 .ok()
                 .map(|identity| identity.as_path().to_path_buf()),
-            classification: FolderClassification::NotProject,
+            classification: FolderClassification::Undetermined,
             reason: AdmissionReason::NoProjectEvidence,
             observed: Observed::default(),
             coverage: ProbeCoverage {
@@ -452,7 +481,10 @@ fn probe_with_read_dir(
         return probe.finish();
     }
     probe.result.override_mode = policy.mode_for_root(&root);
-    if probe.result.override_mode != DetectionMode::Off && probe.time_left() {
+    if let Some(decision) = override_decision(&root, probe.result.override_mode) {
+        return decision;
+    }
+    if probe.time_left() {
         if read_dir(&root).is_err() {
             probe.result.observed.errors += 1;
             probe.result.reason = AdmissionReason::ProbeIoError;
@@ -467,18 +499,6 @@ fn probe_with_read_dir(
         probe.result.reason = AdmissionReason::UserOverride;
         return probe.finish();
     }
-    if probe.result.override_mode != DetectionMode::Auto {
-        probe.result.classification = match probe.result.override_mode {
-            DetectionMode::Project => FolderClassification::Project,
-            DetectionMode::Workspace => FolderClassification::Workspace,
-            DetectionMode::Off => FolderClassification::NotProject,
-            DetectionMode::Auto => unreachable!(),
-        };
-        probe.result.reason = AdmissionReason::UserOverride;
-        probe.result.coverage.stop = ProbeStop::UserOverride;
-        return probe.finish();
-    }
-
     // Three immediate personal directories (such as Desktop, Downloads and
     // Documents) identify a mixed personal container. Fixed-name checks keep
     // that pattern and root manifests independent of directory listing order.
@@ -493,6 +513,7 @@ fn probe_with_read_dir(
         return probe.finish();
     }
     if probe.result.observed.personal_groups >= 3 {
+        probe.result.classification = FolderClassification::NotProject;
         probe.result.reason = AdmissionReason::MixedPersonalTree;
         probe.result.coverage.stop = ProbeStop::StrongEvidence;
         return probe.finish();
@@ -552,6 +573,8 @@ fn probe_with_read_dir(
         {
             probe.result.classification = FolderClassification::Project;
             probe.result.reason = AdmissionReason::SmallSourceTree;
+        } else {
+            probe.result.classification = FolderClassification::NotProject;
         }
     } else {
         probe.result.reason = AdmissionReason::EvidenceBudgetExhausted;
@@ -1166,7 +1189,7 @@ mod tests {
             },
         );
         assert!(!result.coverage.root_listing_complete);
-        assert_eq!(result.classification, FolderClassification::NotProject);
+        assert_eq!(result.classification, FolderClassification::Undetermined);
         assert_eq!(result.observed.child_projects, 2);
     }
 
@@ -1196,7 +1219,7 @@ mod tests {
             },
         );
         assert_eq!(calls.get(), 1);
-        assert_eq!(result.classification, FolderClassification::NotProject);
+        assert_eq!(result.classification, FolderClassification::Undetermined);
         assert_eq!(result.reason, AdmissionReason::ProbeIoError);
         assert_eq!(result.coverage.stop, ProbeStop::IoError);
         assert_eq!(result.observed.errors, 1);
@@ -1377,13 +1400,13 @@ mod tests {
             }
         }
         let result = classify(root.path());
-        assert_eq!(result.classification, FolderClassification::NotProject);
+        assert_eq!(result.classification, FolderClassification::Undetermined);
         assert_eq!(result.reason, AdmissionReason::EvidenceBudgetExhausted);
         assert!(result.observed.entries <= 4096);
         assert!(!result.coverage.complete);
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["coverage"]["entry_budget"], 4096);
-        assert_eq!(wire["classification"], "not_project");
+        assert_eq!(wire["classification"], serde_json::Value::Null);
     }
 
     #[test]
