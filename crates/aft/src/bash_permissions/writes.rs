@@ -136,8 +136,27 @@ fn heredoc(source: &str, node: Node<'_>) -> Option<String> {
         return Some(node.utf8_text(source.as_bytes()).ok()?.to_string());
     }
     let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find_map(|child| heredoc(source, child))
+    let body = node
+        .named_children(&mut cursor)
+        .find_map(|child| heredoc(source, child));
+    body
+}
+
+fn patch_redirect(source: &str, node: Node<'_>) -> Option<String> {
+    if node.kind() == "file_redirect" {
+        let mut cursor = node.walk();
+        if node.children(&mut cursor).any(|child| child.kind() == "<") {
+            return node
+                .child_by_field_name("destination")
+                .and_then(|child| literal(child.utf8_text(source.as_bytes()).ok()?));
+        }
+        return None;
+    }
+    let mut cursor = node.walk();
+    let path = node
+        .named_children(&mut cursor)
+        .find_map(|child| patch_redirect(source, child));
+    path
 }
 
 fn patch_paths(text: &str, strip: usize) -> Vec<String> {
@@ -206,7 +225,11 @@ fn patch_input(
                 .find(|pair| matches!(pair[0].as_str(), "-i" | "--input"))
                 .map(|pair| pair[1].as_str())
         };
-        if let Some(path) = input.and_then(|p| resolve(p, cwd)) {
+        let redirected = patch_redirect(source, node);
+        if let Some(path) = input
+            .or(redirected.as_deref())
+            .and_then(|p| resolve(p, cwd))
+        {
             if std::fs::metadata(&path).is_ok_and(|m| m.len() <= 1024 * 1024) {
                 text = std::fs::read_to_string(path).ok();
             }
@@ -411,11 +434,34 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
                         .find_map(|a| a.strip_prefix("--target-directory="))
                 });
             let operands = operands(args, &["-m", "-o", "-g", "-t", "--target-directory"]);
-            target_dir
-                .or_else(|| (operands.len() >= 2).then(|| *operands.last().unwrap()))
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            let destination =
+                target_dir.or_else(|| (operands.len() >= 2).then(|| *operands.last().unwrap()));
+            if let Some(destination) = destination {
+                if resolve(destination, cwd).is_some_and(|p| p.is_dir()) {
+                    let source_count = if target_dir.is_some() {
+                        operands.len()
+                    } else {
+                        operands.len() - 1
+                    };
+                    operands[..source_count]
+                        .iter()
+                        .filter_map(|source| {
+                            let source = literal(source)?;
+                            let name = Path::new(&source).file_name()?;
+                            Some(
+                                Path::new(destination)
+                                    .join(name)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    vec![destination.to_owned()]
+                }
+            } else {
+                Vec::new()
+            }
         }
         Some(Shape::InPlace)
             if args.iter().any(|a| {
@@ -428,7 +474,7 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
                         && a.contains('i'))
             }) =>
         {
-            let mut files = operands(args, &["-e", "--expression", "-f", "--file"]);
+            let mut files = operands(args, &["-e", "-pe", "-ne", "--expression", "-f", "--file"]);
             if head == "sed" && files.first() == Some(&"") {
                 files.remove(0);
             }

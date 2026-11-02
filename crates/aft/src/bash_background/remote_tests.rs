@@ -12222,6 +12222,7 @@ fn runon_write_shapes_respect_snapshot_membership() {
         "install input PATH",
         "ln input PATH",
         "rm PATH",
+        "rm -rf PATH",
         "unlink PATH",
         "truncate -s 0 PATH",
         "touch PATH",
@@ -12269,6 +12270,11 @@ fn runon_write_shapes_respect_snapshot_membership() {
             .contains("sub/file.rs")
     );
     assert!(runon_write_refusal("cargo fmt", &request).is_some());
+    assert!(runon_write_refusal(
+        "git apply <<'EOF'\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1 +1 @@\n-a\n+b\nEOF",
+        &request
+    )
+    .is_some());
     for command in [
         "cargo fmt --check",
         "cargo fmt -- --check",
@@ -12277,6 +12283,8 @@ fn runon_write_shapes_respect_snapshot_membership() {
         "rustfmt --check tracked.rs",
         "cat tracked.rs",
         "python3 -c 'open(\"tracked.rs\", \"r\").read()'",
+        "python3 -c 'print(\"open(\\\"tracked.rs\\\", \\\"w\\\")\")'",
+        "python3 -c 'open(path, \"w\").write(\"source\")'",
     ] {
         assert!(
             runon_write_refusal(command, &request).is_none(),
