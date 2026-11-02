@@ -10220,6 +10220,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let changed = scoped_diagnostics_inspect(&ctx, "saved-changed", "src");
+    println!("real restart: changed: {changed:#}");
     assert!(
         !changed["text"]
             .as_str()
@@ -10230,6 +10231,10 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     assert!(reported_check_still_running(&changed), "{changed:#}");
     let errors = loop {
         let response = scoped_diagnostics_inspect(&ctx, "saved-errors-warm", "src");
+        println!(
+            "real restart: warm errors {}: {}",
+            response["summary"]["diagnostics"], response["text"]
+        );
         if response["summary"]["diagnostics"]["errors"]
             .as_u64()
             .is_some_and(|n| n > 0)
