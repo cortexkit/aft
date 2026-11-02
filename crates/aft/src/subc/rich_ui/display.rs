@@ -365,8 +365,10 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
                 };
                 entry["diff"] = json!(masker.redact(&diff));
             } else {
-                // A missing per-agent matcher must not turn arbitrary file
-                // content into a persisted detail with only generic redaction.
+                // Diffs are masked with the secret values this agent has
+                // resolved (`capture.masker`). Without that list, generic
+                // credential patterns could miss a secret pasted into the
+                // file, so the diff is left out and only counts are kept.
                 entry["diffOmitted"] = json!(true);
             }
         }

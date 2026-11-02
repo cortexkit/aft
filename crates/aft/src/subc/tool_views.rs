@@ -1,4 +1,7 @@
-//! Permanent views keyed by literal served pins, not by today's catalog.
+//! View templates answered through `tool.views`, keyed by the exact schema pin
+//! (the hash of one tool definition) each was served for. Once served, a pin
+//! stays here even after the catalog moves to a newer definition, so a
+//! transcript's older calls can still be drawn.
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 

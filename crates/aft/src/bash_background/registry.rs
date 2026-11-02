@@ -3381,8 +3381,11 @@ impl BgTaskRegistry {
         );
     }
 
-    /// The original handler chose its reply; polling/status calls never enter
-    /// this hook and cannot take ownership of that call's display identity.
+    /// Records which task this `bash` call's reply started, so the call's
+    /// display completion can be written when the task ends. Only the handler
+    /// that produced the call's own reply calls this; later `bash_status` or
+    /// `bash_watch` calls for the same task don't, so they can't attach the
+    /// task to their own call's display records.
     pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
         if !crate::subc::rich_ui::display::enabled() {
             return;

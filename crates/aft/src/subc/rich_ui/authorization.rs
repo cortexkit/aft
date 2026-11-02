@@ -1,5 +1,7 @@
-//! Admission helpers for app-server reads made on behalf of a daemon-stamped
-//! scope. Reading another session requires its authenticated policy route.
+//! Checks for reads the Occipital display server (`reserved:occipital`) makes
+//! for an app. The daemon stamps each such route with the session scope it
+//! acts for, and a read is admitted only against that stamped session;
+//! reading any other session needs that session's own authenticated route.
 use subc_protocol::ErrorBody;
 
 pub(crate) const OCCIPITAL_PRINCIPAL: &str = "reserved:occipital";
