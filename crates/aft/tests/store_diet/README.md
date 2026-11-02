@@ -175,3 +175,12 @@ exercise red cases (SEARCH to SCAN, fewer equality columns, new unindexed join,
 unavailable plan), and byte-comparison tests change row order to prove it is
 not ignored. The source census is a conservative static aid, not a Rust parser:
 new dynamic SQL constructors still require an explicit reviewed expansion.
+
+The small six-operation wire golden uses `--config wire-policy.json` (inspection
+background work disabled). This is an input policy, not reply normalization:
+otherwise asynchronous health counts may first become available between two
+calls and append a new `[AFT ...]` status note only to the slower replay. The
+trace replay exposed that baseline timing dependency. No status note is stripped
+or masked. The full inspect/search/zoom manifest must use inspection enabled;
+its baseline-versus-baseline replay remains the authority for any additional
+settling policy before a candidate is tested.
