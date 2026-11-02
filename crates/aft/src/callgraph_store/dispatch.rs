@@ -40,6 +40,7 @@ pub(crate) fn typescript_objects_from_data(
     if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
         return None;
     }
+    let mut profile = crate::views::materialization::profile::StageTimer::new("typescript_facts");
     let mut refs = Vec::new();
     for (caller, calls) in &data.calls_by_symbol {
         for call in calls.iter().filter(|call| {
@@ -83,16 +84,30 @@ pub(crate) fn typescript_objects_from_data(
         python_bindings: Vec::new(),
         refs,
     };
+    profile.finish(
+        "inputs",
+        format_args!("nodes={} refs={}", nodes.len(), parse.refs.len()),
+    );
     let objects = typescript::Objects::new(nodes, source, &parse);
+    profile.finish("index", format_args!("nodes={}", nodes.len()));
     let mut facts = DispatchFacts::default();
     objects.extract(&mut facts);
     facts.methods.extend_from_slice(objects.methods());
+    profile.finish(
+        "facts",
+        format_args!(
+            "methods={} types={}",
+            facts.methods.len(),
+            facts.types.len()
+        ),
+    );
     let call_kinds = crate::calls::call_node_kinds(lang);
     let calls = nodes
         .iter()
         .filter(|node| call_kinds.contains(&node.kind()))
         .map(|node| ((node.start_byte(), node.end_byte()), *node))
         .collect::<HashMap<_, _>>();
+    profile.finish("calls", format_args!("calls={}", calls.len()));
     for reference in &parse.refs {
         let Some(&call) = calls.get(&(reference.byte_start, reference.byte_end)) else {
             continue;
@@ -129,8 +144,10 @@ pub(crate) fn typescript_objects_from_data(
         });
     }
     if facts.methods.is_empty() && facts.sites.is_empty() && facts.returns.is_empty() {
+        profile.finish("sites", format_args!("sites=0"));
         return None;
     }
+    profile.finish("sites", format_args!("sites={}", facts.sites.len()));
     let site_ordinals = facts
         .sites
         .iter()

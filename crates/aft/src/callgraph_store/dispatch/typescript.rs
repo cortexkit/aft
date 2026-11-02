@@ -189,6 +189,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         source: &'source str,
         parse: &ParseBlob,
     ) -> Self {
+        let mut profile =
+            crate::views::materialization::profile::StageTimer::new("typescript_index");
         let mut result = Self {
             nodes,
             source,
@@ -216,6 +218,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 .collect(),
         };
         result.index_nodes();
+        profile.finish("scope", format_args!("nodes={}", nodes.len()));
         let mut symbols = HashMap::new();
         let mut members = HashMap::new();
         for symbol in parse
@@ -284,6 +287,14 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             .filter(|node| node.kind() == "object" && result.needed_objects.contains(&node.id()))
             .map(|node| object_identity(*node))
             .collect::<HashSet<_>>();
+        profile.finish(
+            "declarations",
+            format_args!(
+                "objects={} methods={}",
+                result.needed_objects.len(),
+                result.object_methods.len()
+            ),
+        );
         result.returns.retain(|_, ty| owners.contains(ty));
         result
     }
