@@ -324,7 +324,7 @@ fn handle_embedding_request(mut stream: std::net::TcpStream, delay: Duration) {
         .expect("write embedding response");
 }
 
-fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+pub(super) fn storm_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => {
             if let Some(delay) = configure_sleep_delay(&req) {
@@ -1102,17 +1102,6 @@ fn subc_storm_detach_rebind_replays_completion_and_preserves_bash_task() {
         "subc_storm_detach_rebind_replays_completion_and_preserves_bash_task",
         Duration::from_secs(45),
         drive_detach_rebind_daemon,
-        |_, _, _| {},
-        storm_dispatch,
-    );
-}
-
-#[test]
-fn tool_output_cap_read_after_last_route_close_and_rebind() {
-    subc_bridge_test::run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
-        "tool_output_cap_read_after_last_route_close_and_rebind",
-        Duration::from_secs(45),
-        drive_tool_output_cap_rebind_daemon,
         |_, _, _| {},
         storm_dispatch,
     );
@@ -1919,73 +1908,6 @@ async fn drive_detach_rebind_daemon(input: FakeDaemonInput) {
     send_goodbye_and_wait(&tx).await;
 }
 
-async fn drive_tool_output_cap_rebind_daemon(input: FakeDaemonInput) {
-    let session = subc_bridge_test::open_fake_daemon_session(input).await;
-    let root = session.root1.clone();
-    let mut lifecycle_events = session
-        .lifecycle_events
-        .expect("route lifecycle probe installed");
-    let (tx, mut rx) = start_io(session.stream);
-    const SESSION: &str = "output-cap-rebind-session";
-    send_bind(
-        &tx,
-        1,
-        4000,
-        &root,
-        SESSION,
-        storm_project_config(false, false, false, 0),
-    );
-    expect_ack_or_watchdog(&mut rx, 4000).await;
-    send_tool(
-        &tx,
-        1,
-        4001,
-        "subc_storm_egress_payload",
-        json!({"payload_bytes":65_536}),
-    );
-    let cut = expect_tool_response_or_watchdog(&mut rx, 4001).await;
-    let text = cut["text"].as_str().expect("rendered cut text");
-    assert!(text.len() <= 51_200);
-    let path = text
-        .rsplit_once("; full result saved to ")
-        .unwrap()
-        .1
-        .strip_suffix("; read it with read and a line range]")
-        .unwrap()
-        .to_owned();
-    send_route_goodbye(&tx, 1, 4002);
-    expect_lifecycle_event(
-        &mut lifecycle_events,
-        SubcLifecycleEvent::RouteDetached {
-            route_channel: 1,
-            route_epoch: 1,
-            session_id: SESSION.into(),
-        },
-    )
-    .await;
-    send_bind(
-        &tx,
-        2,
-        4003,
-        &root,
-        SESSION,
-        storm_project_config(false, false, false, 0),
-    );
-    expect_ack_or_watchdog(&mut rx, 4003).await;
-    send_tool(
-        &tx,
-        2,
-        4004,
-        "read",
-        json!({"path":path,"startLine":1,"endLine":1}),
-    );
-    let read = expect_tool_response_or_watchdog(&mut rx, 4004).await;
-    assert!(read["byte_size"].as_u64().unwrap() > 51_200, "{read:?}");
-    assert_eq!(read["lines_read"], 1);
-    assert!(read["content"].as_str().unwrap().contains("payload"));
-    send_goodbye_and_wait(&tx).await;
-}
-
 async fn drive_epoch_rebind_rejection_daemon(input: FakeDaemonInput) {
     let session = subc_bridge_test::open_fake_daemon_session(input).await;
     let (tx, mut rx) = start_io(session.stream);
@@ -2388,7 +2310,7 @@ fn artifact_storm_config(storage_dir: &Path) -> Value {
     })
 }
 
-fn storm_project_config(
+pub(super) fn storm_project_config(
     search: bool,
     semantic: bool,
     changed: bool,
@@ -2470,7 +2392,7 @@ fn send_interactive_tool(
     }
 }
 
-fn start_io(
+pub(super) fn start_io(
     stream: tokio::net::TcpStream,
 ) -> (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
@@ -2499,7 +2421,7 @@ fn start_io(
     (out_tx, in_rx)
 }
 
-fn send_bind(
+pub(super) fn send_bind(
     tx: &mpsc::UnboundedSender<Frame>,
     channel: u16,
     corr: u64,
@@ -2695,7 +2617,7 @@ fn send_control<T: serde::Serialize>(tx: &mpsc::UnboundedSender<Frame>, corr: u6
     .expect("send control frame");
 }
 
-fn send_tool(
+pub(super) fn send_tool(
     tx: &mpsc::UnboundedSender<Frame>,
     channel: u16,
     corr: u64,
@@ -2728,7 +2650,7 @@ fn send_tool_epoch(
     .expect("send tool frame");
 }
 
-fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64) {
+pub(super) fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64) {
     tx.send(
         Frame::build(
             FrameType::Goodbye,
@@ -2743,7 +2665,7 @@ fn send_route_goodbye(tx: &mpsc::UnboundedSender<Frame>, channel: u16, corr: u64
     .expect("send route goodbye");
 }
 
-async fn send_goodbye_and_wait(tx: &mpsc::UnboundedSender<Frame>) {
+pub(super) async fn send_goodbye_and_wait(tx: &mpsc::UnboundedSender<Frame>) {
     send_goodbye(tx);
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
@@ -3184,7 +3106,7 @@ fn assert_bind_stats(latencies: &[Duration]) {
     );
 }
 
-async fn expect_lifecycle_event(
+pub(super) async fn expect_lifecycle_event(
     events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
     expected: SubcLifecycleEvent,
 ) {
@@ -3195,7 +3117,7 @@ async fn expect_lifecycle_event(
     assert_eq!(actual, expected, "unexpected detach/rebind lifecycle event");
 }
 
-async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
+pub(super) async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
     loop {
         let frame = rx.recv().await.expect("EOF waiting for RouteBindAck");
         if is_ack(&frame, corr) {
@@ -3204,7 +3126,7 @@ async fn expect_ack_or_watchdog(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u
     }
 }
 
-async fn expect_tool_response_or_watchdog(
+pub(super) async fn expect_tool_response_or_watchdog(
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     corr: u64,
 ) -> Value {
