@@ -64,11 +64,29 @@ fn live_base_cap_reclaims_unreferenced_bases_then_admits() {
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     capped_bases(storage.path());
+    let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _hook = crate::storage_retention::observe_test_hook(
+        storage.path(),
+        std::sync::Arc::new({
+            let storage = storage.path().to_path_buf();
+            let concurrent = concurrent.clone();
+            move |step| {
+                if step == "v3-pressure-reclaim-started" {
+                    assert!(matches!(
+                        claim_base(&storage, FAMILY, &scope(201), None).unwrap(),
+                        ClaimOutcome::Reclaiming
+                    ));
+                    concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }),
+    );
     assert!(matches!(
         claim_base(storage.path(), FAMILY, &scope(200), None).unwrap(),
         ClaimOutcome::Claimed(_)
     ));
     assert!(registered_bases(storage.path()).is_empty());
+    assert_eq!(concurrent.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -122,6 +140,12 @@ fn live_base_cap_second_claim_within_cooldown_does_not_walk() {
     ));
     assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(registered_bases(storage.path()), scopes);
+    let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+    assert!(matches!(
+        v3::publish(storage.path(), FAMILY, 1, None, |_| Ok(())),
+        Err(v3::Error::Refused("device_free_space_floor"))
+    ));
+    assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -158,7 +182,7 @@ fn two_claimants_of_one_base_produce_exactly_one_build() {
                     ClaimOutcome::Claimed(_claim) => {
                         builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    ClaimOutcome::Busy { .. } => {}
+                    ClaimOutcome::Busy { .. } | ClaimOutcome::Reclaiming => {}
                     other => panic!("{other:?}"),
                 },
             );
@@ -249,6 +273,10 @@ fn the_live_base_cap_counts_claims_and_registered_bases_and_records_hits() {
         Ok(())
     })
     .unwrap();
+    let _pins: Vec<_> = registered_bases(storage.path())
+        .iter()
+        .map(|scope| crate::pins::LivePin::create_v3(storage.path(), FAMILY, scope).unwrap())
+        .collect();
     // One claimed-but-unregistered base fills the cap.
     assert!(matches!(
         claim_base(storage.path(), FAMILY, &scope(5), None).unwrap(),
@@ -271,7 +299,7 @@ fn the_live_base_cap_counts_claims_and_registered_bases_and_records_hits() {
     assert_eq!(hits, 1);
     assert!(matches!(
         plan_binder(storage.path(), FAMILY, &scope(6), std::time::Duration::ZERO),
-        BinderPlan::Strict("live_base_cap")
+        BinderPlan::Wait { .. }
     ));
 }
 

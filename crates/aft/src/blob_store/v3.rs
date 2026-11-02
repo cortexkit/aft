@@ -1116,7 +1116,7 @@ fn preflight_floor(storage: &Path, request: u64) -> Result<()> {
 
 const FLOOR_RECLAIM_COOLDOWN: Duration = Duration::from_secs(60);
 
-fn floor_reclaim_cooldown(storage: &Path, family: &str) -> Arc<Mutex<Option<Instant>>> {
+pub(crate) fn floor_reclaim_cooldown(storage: &Path, family: &str) -> Arc<Mutex<Option<Instant>>> {
     type Cooldown = Arc<Mutex<Option<Instant>>>;
     type Key = (PathBuf, String);
     static COOLDOWNS: std::sync::OnceLock<Mutex<std::collections::HashMap<Key, Cooldown>>> =
@@ -1170,8 +1170,40 @@ fn with_floor_reclaim_using_clock<T>(
             return Err(Error::Refused("device_free_space_floor"));
         }
     };
+    reclaim_admission_family_using_clock(storage, family, lock, &mut retry_at, now, |_| admission())
+        .unwrap_or(Err(Error::Refused("device_free_space_floor")))
+}
+
+/// Runs one bounded family reclaim, then retries admission under the reservation
+/// lock. The caller holds the shared floor/cap cooldown through both operations.
+/// A throttled attempt leaves admission's original result unchanged.
+pub(crate) fn reclaim_admission_family<T>(
+    storage: &Path,
+    family: &str,
+    lock: &ReservationLock,
+    retry_at: &mut Option<Instant>,
+    admission: impl FnOnce(&ReservationLock) -> T,
+) -> Option<T> {
+    reclaim_admission_family_using_clock(
+        storage,
+        family,
+        Some(lock),
+        retry_at,
+        Instant::now,
+        admission,
+    )
+}
+
+fn reclaim_admission_family_using_clock<T>(
+    storage: &Path,
+    family: &str,
+    lock: Option<&ReservationLock>,
+    retry_at: &mut Option<Instant>,
+    now: impl Fn() -> Instant,
+    admission: impl FnOnce(&ReservationLock) -> T,
+) -> Option<T> {
     if retry_at.is_some_and(|retry_at| now() < retry_at) {
-        return Err(Error::Refused("device_free_space_floor"));
+        return None;
     }
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let owned_lock;
@@ -1182,7 +1214,7 @@ fn with_floor_reclaim_using_clock<T>(
                 Ok(lock) => lock,
                 Err(_) => {
                     *retry_at = Some(now() + FLOOR_RECLAIM_COOLDOWN);
-                    return Err(Error::Refused("device_free_space_floor"));
+                    return None;
                 }
             };
             &owned_lock
@@ -1198,7 +1230,7 @@ fn with_floor_reclaim_using_clock<T>(
             crate::slog_warn!("views admission reclaim failed family={family}: {error}");
         }
     }
-    admission()
+    Some(admission(lock))
 }
 fn recover_ledgers(storage: &Path, lock: &ReservationLock) -> Result<()> {
     lock.verify(storage)?;

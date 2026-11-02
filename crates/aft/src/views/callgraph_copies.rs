@@ -78,18 +78,9 @@ pub(crate) fn admit(
     if members.iter().any(|member| member.scope == own) {
         return Ok(Admission::Own);
     }
-    let main_scope = super::callgraph::view_scope(&main);
     // While the main checkout has no call graph, the oldest checkout that has
     // one stands in for it, so borrowers still have a graph to read.
-    let Some(target) = members
-        .iter()
-        .find(|member| member.scope == main_scope)
-        .or_else(|| {
-            members
-                .iter()
-                .min_by(|a, b| (a.registered_at_ms, &a.scope).cmp(&(b.registered_at_ms, &b.scope)))
-        })
-    else {
+    let Some(target) = borrow_target(&members, &main) else {
         return Ok(Admission::Own);
     };
     let target_root = target.root.clone().unwrap_or_else(|| main.clone());
@@ -136,6 +127,41 @@ pub(crate) fn admit(
             Ok(borrow)
         }
     }
+}
+
+fn borrow_target<'a>(members: &'a [Member], main: &Path) -> Option<&'a Member> {
+    let main_scope = super::callgraph::view_scope(main);
+    members
+        .iter()
+        .find(|member| member.scope == main_scope)
+        .or_else(|| {
+            members
+                .iter()
+                .min_by(|a, b| (a.registered_at_ms, &a.scope).cmp(&(b.registered_at_ms, &b.scope)))
+        })
+}
+
+/// Capacity can block a new base even for a checkout already registered as a
+/// view. Select the same borrow target as copy saturation without readmitting
+/// that checkout merely because its member row exists.
+pub(crate) fn borrow_at_base_cap(
+    storage: &Path,
+    family: &str,
+    policy: crate::blob_store::v2::TrigramPolicy,
+    root: &Path,
+) -> Result<Admission, String> {
+    let main = super::read::main_checkout_root(root).unwrap_or_else(|| root.to_path_buf());
+    let members = active_members(storage, family)?;
+    let Some(target) = borrow_target(&members, &main) else {
+        return Ok(Admission::Own);
+    };
+    if needs_producer_rebuild(storage, family, policy, &target.scope) {
+        return Ok(Admission::Own);
+    }
+    Ok(Admission::Borrow {
+        root: target.root.clone().unwrap_or(main),
+        scope: target.scope.clone(),
+    })
 }
 
 /// Counts and evicts idle databases under the same storage lock.
