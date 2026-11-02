@@ -141,6 +141,98 @@ fn go_typed_edges(store: &CallGraphStore) -> Vec<(String, String, String)> {
         .unwrap()
 }
 
+fn go_method_answers(conn: &Connection) -> Vec<(String, String, String, String, u32)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.caller_file, src.scoped_name, e.target_file, e.target_symbol, r.line
+        FROM edges e JOIN refs r ON r.ref_id=e.ref_id JOIN nodes src ON src.id=e.source_node
+        WHERE e.kind='call' AND e.target_symbol LIKE '%::%' ORDER BY 1,2,3,4,5",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn go_view_answers(
+    fixture: &Fixture,
+    package_known: bool,
+) -> Vec<(String, String, String, String, u32)> {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    let temp = tempfile::tempdir_in(fixture.temp.path()).unwrap();
+    let blobs_path = temp.path().join("blobs.sqlite");
+    let blobs = Connection::open(&blobs_path).unwrap();
+    blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
+    let mut entries = Vec::new();
+    for path in source_files(&fixture.root) {
+        let source = fs::read_to_string(&path).unwrap();
+        let blob =
+            join::CallgraphBlob::extract(&source, "go", crate::views::callgraph::PRODUCER).unwrap();
+        let mut value = serde_json::to_value(&blob).unwrap();
+        if !package_known {
+            value["dispatch"]
+                .as_object_mut()
+                .unwrap()
+                .remove("go_package");
+        }
+        let blob: join::CallgraphBlob = serde_json::from_value(value).unwrap();
+        let payload = blob.to_bytes().unwrap();
+        let key = blake3::hash(&payload);
+        blobs
+            .execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    key.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        entries.push((
+            RelPath::new(relative_path(&fixture.root, &path).into_bytes()).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(key.to_hex().to_string()),
+                },
+                resolution_input: false,
+            },
+        ));
+    }
+    let manifest = Manifest::new(entries).unwrap();
+    let database = temp.path().join("view.sqlite");
+    crate::views::materialization::materialize_manifest_view_database(
+        &database,
+        &blobs_path,
+        &manifest,
+    )
+    .unwrap();
+    go_method_answers(&Connection::open(database).unwrap())
+}
+
+fn assert_go_concrete_view_parity(fixture: &Fixture, has_interface: bool) {
+    let legacy = go_method_answers(&fixture.store.conn.lock().unwrap());
+    let mut viewed = go_view_answers(fixture, true);
+    // A known interface receiver deliberately retains declaration/implementation
+    // fan-out in views; the retiring store only resolves concrete receivers.
+    let interface = viewed
+        .iter()
+        .filter(|e| e.1 == "contract")
+        .map(|e| e.3.as_str())
+        .collect::<BTreeSet<_>>();
+    if has_interface {
+        assert_eq!(interface, BTreeSet::from(["I::run", "T::run"]));
+    } else {
+        assert!(interface.is_empty());
+    }
+    viewed.retain(|e| e.1 != "contract");
+    assert_eq!(legacy, viewed);
+}
+
 #[test]
 fn go_concrete_method_receivers_bind_across_test_package_files() {
     let fixture = Fixture::from_files(&[
@@ -165,6 +257,7 @@ fn go_concrete_method_receivers_bind_across_test_package_files() {
             ),
         ]
     );
+    assert_go_concrete_view_parity(&fixture, false);
 }
 
 #[test]
@@ -184,6 +277,7 @@ fn go_concrete_factory_return_and_local_declarations_bind_exactly() {
             4
         ]
     );
+    assert_go_concrete_view_parity(&fixture, false);
     let changed = edit(
         &fixture.root,
         "caller_test.go",
@@ -216,6 +310,7 @@ fn go_concrete_factory_return_and_local_declarations_bind_exactly() {
             ),
         ]
     );
+    assert_go_concrete_view_parity(&fixture, false);
 }
 
 #[test]
@@ -226,6 +321,21 @@ fn go_concrete_binding_refuses_shadows_interfaces_and_nonlocal_packages() {
         ("external_test.go", "package p_test\nfunc outsider(x *T) { x.run() }\n"),
     ]);
     assert!(go_typed_edges(&fixture.store).is_empty());
+    assert_go_concrete_view_parity(&fixture, true);
+}
+
+#[test]
+fn go_concrete_missing_package_fact_is_unknown_in_views() {
+    let fixture = Fixture::from_files(&[
+        (
+            "types.go",
+            "package p\ntype T struct{}\nfunc (x *T) run() {}\n",
+        ),
+        ("caller.go", "package p\nfunc (x *T) caller() { x.run() }\n"),
+    ]);
+    assert_go_concrete_view_parity(&fixture, false);
+    assert_eq!(go_typed_edges(&fixture.store).len(), 1);
+    assert!(go_view_answers(&fixture, false).is_empty());
 }
 
 /// A cold-built fixture store that edit shapes are applied to.

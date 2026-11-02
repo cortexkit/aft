@@ -1,4 +1,4 @@
-//! Concrete Go receiver bindings for the source-backed SQLite dispatch pass.
+//! Indexed Go receiver evidence shared by fact extraction and SQLite dispatch.
 use super::*;
 use tree_sitter::Node;
 
@@ -6,14 +6,24 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
-fn nodes(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut result = Vec::new();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        result.push(node);
-        push_named_children(node, &mut stack);
-    }
-    result
+#[derive(Default)]
+pub(super) struct SourceIndex {
+    pub(super) package: Option<String>,
+    calls: HashMap<(usize, usize), Option<String>>,
+    calls_by_line: HashMap<u32, HashMap<(String, String), Option<String>>>,
+    methods: HashSet<(String, String)>,
+}
+
+struct Binding {
+    scope: Option<(usize, usize)>,
+    end: usize,
+    local: bool,
+    ty: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 fn nominal_type(node: Node<'_>, source: &str) -> Option<String> {
@@ -26,16 +36,11 @@ fn nominal_type(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn package(parsed: &ParsedDispatchSource) -> Option<String> {
-    let root = parsed.tree.root_node();
+fn package(root: Node<'_>, source: &str) -> Option<String> {
     let clause = root
         .named_children(&mut root.walk())
         .find(|n| n.kind() == "package_clause")?;
-    Some(text(clause.named_child(0)?, &parsed.source).to_string())
-}
-
-fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
-    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+    Some(text(clause.named_child(0)?, source).to_string())
 }
 
 fn scope(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -86,9 +91,9 @@ fn binding_names(node: Node<'_>, source: &str) -> Vec<String> {
 
 fn initializer_type(
     mut node: Node<'_>,
-    function: Node<'_>,
-    root: Node<'_>,
     source: &str,
+    bound_names: &HashSet<String>,
+    factories: &HashMap<String, Option<String>>,
 ) -> Option<String> {
     while matches!(node.kind(), "parenthesized_expression" | "unary_expression") {
         if node.kind() == "unary_expression"
@@ -114,78 +119,186 @@ fn initializer_type(
     let name = text(callee, source);
     // A local function value must not borrow the return type of a homonymous
     // package function. Only a uniquely declared, unshadowed function is evidence.
-    if nodes(function).iter().any(|n| {
-        binding_names(*n, source)
-            .iter()
-            .any(|binding| binding == name)
-    }) {
+    if bound_names.contains(name) {
         return None;
     }
-    let mut cursor = root.walk();
-    let mut functions = root.named_children(&mut cursor).filter(|n| {
-        n.kind() == "function_declaration"
-            && n.child_by_field_name("name").map(|n| text(n, source)) == Some(name)
-    });
-    let declared = functions.next()?;
-    if functions.next().is_some() || declared.child_by_field_name("type_parameters").is_some() {
-        return None;
-    }
-    nominal_type(declared.child_by_field_name("result")?, source)
+    factories.get(name).cloned().flatten()
 }
 
-fn receiver_type(call: Node<'_>, parsed: &ParsedDispatchSource, receiver: &str) -> Option<String> {
-    let source = &parsed.source;
-    let mut function = call.parent()?;
-    while !matches!(
-        function.kind(),
-        "function_declaration" | "method_declaration"
-    ) {
-        function = function.parent()?;
-    }
-    let all = nodes(function);
-    // Refuse shadowed bindings rather than choosing a declaration by spelling.
-    // This also makes captures with a redeclared closure parameter conservative.
-    let mut bindings = all.iter().copied().filter(|n| {
-        binding_names(*n, source)
-            .iter()
-            .any(|name| name == receiver)
-    });
-    let declaration = bindings.next()?;
-    if bindings.next().is_some()
-        || declaration.kind() == "variadic_parameter_declaration"
-        || !contains(scope(declaration)?, call)
-    {
-        return None;
-    }
-    let ty = if let Some(ty) = declaration.child_by_field_name("type") {
-        nominal_type(ty, source)?
-    } else {
-        if declaration.end_byte() > call.start_byte() {
-            return None;
+impl SourceIndex {
+    pub(super) fn new(root: Node<'_>, source: &str) -> Self {
+        let mut index = Self {
+            package: package(root, source),
+            ..Self::default()
+        };
+        let mut factories = HashMap::new();
+        let mut functions = HashMap::<usize, Vec<Node<'_>>>::new();
+        let mut stack = vec![(root, None)];
+        // Walk each source once. Function literals stay in their enclosing
+        // declaration so captured names and closure-parameter shadows agree.
+        while let Some((node, function)) = stack.pop() {
+            #[cfg(test)]
+            WORK.with(|work| {
+                let (n, f, b) = work.get();
+                work.set((n + 1, f, b));
+            });
+            let function = if matches!(node.kind(), "function_declaration" | "method_declaration") {
+                Some(node.start_byte())
+            } else {
+                function
+            };
+            if let Some(function) = function {
+                functions.entry(function).or_default().push(node);
+            }
+            if node.kind() == "function_declaration" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let ty = node
+                        .child_by_field_name("result")
+                        .filter(|_| node.child_by_field_name("type_parameters").is_none())
+                        .and_then(|n| nominal_type(n, source));
+                    factories
+                        .entry(text(name, source).to_string())
+                        .and_modify(|old| *old = None)
+                        .or_insert(ty);
+                }
+            }
+            if node.kind() == "method_declaration" {
+                if let (Some(name), Some(ty)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("receiver")
+                        .and_then(|n| n.named_child(0))
+                        .and_then(|n| n.child_by_field_name("type"))
+                        .and_then(|n| nominal_type(n, source)),
+                ) {
+                    index.methods.insert((ty, text(name, source).to_string()));
+                }
+            }
+            stack.extend(
+                node.named_children(&mut node.walk())
+                    .map(|child| (child, function)),
+            );
         }
-        let names = binding_names(declaration, source);
-        let value = declaration
-            .child_by_field_name("right")
-            .or_else(|| declaration.child_by_field_name("value"))?;
-        let values = value.named_children(&mut value.walk()).collect::<Vec<_>>();
-        if names.len() != values.len() {
-            return None;
+        for all in functions.values() {
+            #[cfg(test)]
+            WORK.with(|work| {
+                let (n, f, b) = work.get();
+                work.set((n, f + 1, b));
+            });
+            let mut declarations = HashMap::<String, Option<Node<'_>>>::new();
+            let mut type_shadows = HashSet::new();
+            for &node in all {
+                for name in binding_names(node, source) {
+                    declarations
+                        .entry(name)
+                        .and_modify(|old| *old = None)
+                        .or_insert(Some(node));
+                }
+                if matches!(
+                    node.kind(),
+                    "type_spec" | "type_alias" | "type_parameter_declaration"
+                ) {
+                    type_shadows.extend(
+                        node.children_by_field_name("name", &mut node.walk())
+                            .map(|n| text(n, source).to_string()),
+                    );
+                }
+            }
+            let bound_names = declarations.keys().cloned().collect::<HashSet<_>>();
+            let mut bindings = HashMap::new();
+            for (name, declaration) in declarations {
+                #[cfg(test)]
+                WORK.with(|work| {
+                    let (n, f, b) = work.get();
+                    work.set((n, f, b + 1));
+                });
+                let Some(declaration) = declaration else {
+                    continue;
+                };
+                if declaration.kind() == "variadic_parameter_declaration" {
+                    continue;
+                }
+                let ty = declaration
+                    .child_by_field_name("type")
+                    .and_then(|n| nominal_type(n, source))
+                    .or_else(|| {
+                        if declaration.child_by_field_name("type").is_some() {
+                            return None;
+                        }
+                        let names = binding_names(declaration, source);
+                        let value = declaration
+                            .child_by_field_name("right")
+                            .or_else(|| declaration.child_by_field_name("value"))?;
+                        let values = value.named_children(&mut value.walk()).collect::<Vec<_>>();
+                        if names.len() != values.len() {
+                            return None;
+                        }
+                        initializer_type(
+                            values[names.iter().position(|n| n == &name)?],
+                            source,
+                            &bound_names,
+                            &factories,
+                        )
+                    })
+                    .filter(|ty| !type_shadows.contains(ty));
+                bindings.insert(
+                    name,
+                    Binding {
+                        scope: scope(declaration).map(|n| (n.start_byte(), n.end_byte())),
+                        end: declaration.end_byte(),
+                        local: !matches!(
+                            declaration.kind(),
+                            "parameter_declaration" | "variadic_parameter_declaration"
+                        ),
+                        ty,
+                    },
+                );
+            }
+            for &call in all.iter().filter(|n| n.kind() == "call_expression") {
+                let Some(callee) = call
+                    .child_by_field_name("function")
+                    .filter(|n| n.kind() == "selector_expression")
+                else {
+                    continue;
+                };
+                let (Some(receiver), Some(member)) = (
+                    callee.child_by_field_name("operand"),
+                    callee.child_by_field_name("field"),
+                ) else {
+                    continue;
+                };
+                if receiver.kind() != "identifier" {
+                    continue;
+                }
+                let receiver = text(receiver, source).to_string();
+                let ty = bindings.get(&receiver).and_then(|b| {
+                    let (start, end) = b.scope?;
+                    (start <= call.start_byte()
+                        && call.end_byte() <= end
+                        && (!b.local || b.end <= call.start_byte()))
+                    .then(|| b.ty.clone())
+                    .flatten()
+                });
+                let span = (call.start_byte(), call.end_byte());
+                index.calls.insert(span, ty.clone());
+                index
+                    .calls_by_line
+                    .entry(call.start_position().row as u32 + 1)
+                    .or_default()
+                    .entry((receiver, text(member, source).to_string()))
+                    .and_modify(|old| {
+                        if *old != ty {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(ty);
+            }
         }
-        let position = names.iter().position(|name| name == receiver)?;
-        initializer_type(values[position], function, parsed.tree.root_node(), source)?
-    };
-    // Local types and type parameters can shadow the package's nominal type.
-    if all.iter().any(|n| {
-        matches!(
-            n.kind(),
-            "type_spec" | "type_alias" | "type_parameter_declaration"
-        ) && n
-            .children_by_field_name("name", &mut n.walk())
-            .any(|n| text(n, source) == ty)
-    }) {
-        return None;
+        index
     }
-    Some(ty)
+
+    pub(super) fn receiver(&self, start: usize, end: usize) -> Option<&str> {
+        self.calls.get(&(start, end))?.as_deref()
+    }
 }
 
 /// Select a uniquely declared method in the receiver's own Go package.
@@ -199,32 +312,17 @@ pub(super) fn resolve(
         return None;
     }
     let parsed = parsed_dispatch_source(project_root, reference, LangId::Go, source_cache)?;
-    let package = package(parsed)?;
-    let mut types = BTreeSet::new();
-    for call in nodes(parsed.tree.root_node()).into_iter().filter(|n| {
-        n.kind() == "call_expression" && n.start_position().row as u32 + 1 == reference.line
-    }) {
-        let Some(callee) = call.child_by_field_name("function") else {
-            continue;
-        };
-        if callee.kind() != "selector_expression"
-            || callee
-                .child_by_field_name("operand")
-                .map(|n| text(n, &parsed.source))
-                != Some(reference.receiver_expression.as_str())
-            || callee
-                .child_by_field_name("field")
-                .map(|n| text(n, &parsed.source))
-                != Some(reference.method_name.as_str())
-        {
-            continue;
-        }
-        types.insert(receiver_type(call, parsed, &reference.receiver_expression));
-    }
-    if types.len() != 1 {
-        return None;
-    }
-    let ty = types.into_iter().next()??;
+    let index = parsed.go_index.as_ref()?;
+    let package = index.package.as_ref()?.clone();
+    let ty = index
+        .calls_by_line
+        .get(&reference.line)?
+        .get(&(
+            reference.receiver_expression.clone(),
+            reference.method_name.clone(),
+        ))?
+        .as_ref()?
+        .clone();
     let scoped = format!("{ty}::{}", reference.method_name);
     let directory = Path::new(&reference.caller_file).parent();
     let mut found = Vec::new();
@@ -243,25 +341,17 @@ pub(super) fn resolve(
         ) else {
             continue;
         };
-        if self::package(parsed).as_deref() != Some(&package) {
+        let Some(index) = parsed.go_index.as_ref() else {
+            continue;
+        };
+        if index.package.as_ref() != Some(&package) {
             continue;
         }
         // A real receiver declaration proves a concrete method. An interface's
         // compatible method set is not a reverse link to this concrete type.
-        let declared = nodes(parsed.tree.root_node()).into_iter().any(|node| {
-            node.kind() == "method_declaration"
-                && node
-                    .child_by_field_name("name")
-                    .map(|n| text(n, &parsed.source))
-                    == Some(reference.method_name.as_str())
-                && node
-                    .child_by_field_name("receiver")
-                    .and_then(|n| n.named_child(0))
-                    .and_then(|n| n.child_by_field_name("type"))
-                    .and_then(|n| nominal_type(n, &parsed.source))
-                    .as_deref()
-                    == Some(&ty)
-        });
+        let declared = index
+            .methods
+            .contains(&(ty.clone(), reference.method_name.clone()));
         if declared {
             found.push(candidate.clone());
         }
@@ -270,5 +360,47 @@ pub(super) fn resolve(
         found.pop()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_concrete_index_work_is_linear_and_lookups_do_not_walk_source() {
+        let mut visits = Vec::new();
+        for count in [40, 160] {
+            let source = format!("package p\ntype T struct{{}}\nfunc (x *T) run() {{}}\nfunc factory() *T {{ return &T{{}} }}\nfunc caller() {{\n x := factory()\n{}\n}}\n", "x.run()\n".repeat(count));
+            let tree =
+                parse_source_with_cached_parser(Path::new("indexed.go"), &source, LangId::Go)
+                    .unwrap();
+            WORK.with(|work| work.set((0, 0, 0)));
+            let index = SourceIndex::new(tree.root_node(), &source);
+            let work = WORK.with(|work| work.get());
+            assert_eq!(work.1, 3, "analyze each function once, not once per call");
+            assert_eq!(work.2, 2, "receiver and local bindings are analyzed once");
+            assert_eq!(index.calls.len(), count);
+            for (&(start, end), ty) in &index.calls {
+                assert_eq!(ty.as_deref(), Some("T"));
+                assert_eq!(index.receiver(start, end), Some("T"));
+            }
+            for calls in index.calls_by_line.values() {
+                assert_eq!(
+                    calls.get(&("x".into(), "run".into())).unwrap().as_deref(),
+                    Some("T")
+                );
+            }
+            assert_eq!(
+                WORK.with(|work| work.get()),
+                work,
+                "lookups must not walk the source or function"
+            );
+            visits.push(work.0);
+        }
+        assert!(
+            visits[1] < visits[0] * 5,
+            "four times as many calls must have linear indexing work: {visits:?}"
+        );
     }
 }

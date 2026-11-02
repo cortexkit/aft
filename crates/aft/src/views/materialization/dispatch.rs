@@ -83,6 +83,8 @@ struct ImportFact {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct FileFacts {
     language: String,
+    #[serde(default)]
+    go_package: Option<String>,
     types: Vec<TypeHint>,
     methods: Vec<MethodHint>,
     fields: Vec<FieldHint>,
@@ -99,6 +101,7 @@ impl FileFacts {
     fn new(parse: &ParseBlob) -> Self {
         Self {
             language: parse.language.clone(),
+            go_package: parse.dispatch.go_package.clone(),
             types: parse.dispatch.types.clone(),
             methods: parse.dispatch.methods.clone(),
             fields: parse.dispatch.fields.clone(),
@@ -125,6 +128,7 @@ impl FileFacts {
         ParseBlob {
             entry_point_symbols: Vec::new(),
             dispatch: DispatchFacts {
+                go_package: self.go_package.clone(),
                 types: self.types.clone(),
                 methods: self.methods.clone(),
                 sites: Vec::new(),

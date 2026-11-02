@@ -20750,6 +20750,7 @@ fn load_name_match_candidates(
 struct ParsedDispatchSource {
     source: String,
     tree: tree_sitter::Tree,
+    go_index: Option<go_dispatch::SourceIndex>,
 }
 
 type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
@@ -20812,7 +20813,13 @@ fn parse_dispatch_source(
     let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
     let tree =
         parse_source_with_cached_parser(&project_root.join(caller_file), &source, lang).ok()?;
-    Some(ParsedDispatchSource { source, tree })
+    let go_index =
+        (lang == LangId::Go).then(|| go_dispatch::SourceIndex::new(tree.root_node(), &source));
+    Some(ParsedDispatchSource {
+        source,
+        tree,
+        go_index,
+    })
 }
 
 fn parsed_dispatch_source<'a>(

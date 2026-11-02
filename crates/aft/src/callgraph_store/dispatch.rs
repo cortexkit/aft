@@ -11,6 +11,10 @@ use crate::parser::LangId;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
+    /// The package clause distinguishes co-located external test packages.
+    /// Older facts omit it; absence must not authorize a concrete binding.
+    #[serde(default)]
+    pub go_package: Option<String>,
     pub types: Vec<TypeHint>,
     pub methods: Vec<MethodHint>,
     pub sites: Vec<SiteHint>,
@@ -361,6 +365,7 @@ pub fn extract(
     #[cfg(test)]
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
     let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
+    let go_index = (language == "go").then(|| super::go_dispatch::SourceIndex::new(root, source));
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
@@ -386,6 +391,7 @@ pub fn extract(
             .or_insert(node);
     }
     let mut facts = DispatchFacts::default();
+    facts.go_package = go_index.as_ref().and_then(|index| index.package.clone());
     if language == "rust" {
         for node in &all {
             if node.kind() == "field_declaration" {
@@ -421,6 +427,9 @@ pub fn extract(
     }
     for node in &all {
         if !TYPES.contains(&node.kind()) {
+            continue;
+        }
+        if language == "go" && enclosing(*node, FUNCTIONS).is_some() {
             continue;
         }
         let Some(name) = named(*node, source) else {
@@ -661,21 +670,32 @@ pub fn extract(
             }
             continue;
         }
-        if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source))) {
+        if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source)))
+            && go_index
+                .as_ref()
+                .and_then(|index| index.receiver(call.start_byte(), call.end_byte()))
+                .is_none()
+        {
             // A namespace-qualified function is a static import binding, not an
             // unknown object receiver. Preserve the ordinary manifest resolver.
             continue;
         }
-        let receiver = receiver_node.and_then(|receiver| {
-            receiver_type(
-                receiver,
-                call,
-                source,
-                language,
-                &facts,
-                receiver_index.as_ref(),
-            )
-        });
+        let receiver = if let Some(index) = &go_index {
+            index
+                .receiver(call.start_byte(), call.end_byte())
+                .map(str::to_string)
+        } else {
+            receiver_node.and_then(|receiver| {
+                receiver_type(
+                    receiver,
+                    call,
+                    source,
+                    language,
+                    &facts,
+                    receiver_index.as_ref(),
+                )
+            })
+        };
         facts.sites.push(SiteHint {
             ordinal: reference.ordinal,
             caller: enclosing(call, FUNCTIONS)
@@ -1264,7 +1284,7 @@ pub struct Resolver<'a> {
 
 /// Keys naming what one resolution read. A resolution reads nothing else, so
 /// it is unchanged while every key it recorded names unchanged inputs:
-/// - [`dependency::file`]: one file's resolver facts (language, types,
+/// - [`dependency::file`]: one file's resolver facts (language, Go package, types,
 ///   methods, fields, returns, imports, default export, and its import and
 ///   receiver type targets), or that the path has no facts;
 /// - [`dependency::method`]: which files of the manifest declare a method of
@@ -1379,6 +1399,9 @@ impl<'a> Resolver<'a> {
             return self.project_type_at_depth(target_file, &returned.ty, depth + 1);
         }
         let parse = self.file(file)?;
+        if parse.language == "go" && parse.dispatch.go_package.is_none() {
+            return None;
+        }
         if let Some(t) = parse.dispatch.types.iter().find(|t| t.name == name) {
             return Some((file.to_string(), t));
         }
@@ -1401,7 +1424,11 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .filter(|(f, p)| {
                     self.note_file_visit();
-                    p.language == parse.language && std::path::Path::new(f).parent() == directory
+                    p.language == parse.language
+                        && std::path::Path::new(f).parent() == directory
+                        && (parse.language != "go"
+                            || (p.dispatch.go_package == parse.dispatch.go_package
+                                && (file.ends_with("_test.go") || !f.ends_with("_test.go"))))
                 })
                 .flat_map(|(f, p)| {
                     p.dispatch
@@ -1486,6 +1513,9 @@ impl<'a> Resolver<'a> {
                 };
                 self.note_file_visit();
                 if candidate.language != parse.language {
+                    continue;
+                }
+                if parse.language == "go" && candidate.dispatch.go_package.is_none() {
                     continue;
                 }
                 if let Some(t) = candidate
@@ -1591,6 +1621,14 @@ impl<'a> Resolver<'a> {
                     .map(move |m| (file.clone(), m.symbol.clone()))
             })
             .collect();
+        if language == "go" {
+            return Resolution {
+                unresolved: usize::from(!protected.is_empty()),
+                external: usize::from(protected.is_empty()),
+                protected,
+                ..Resolution::default()
+            };
+        }
         let targets = protected
             .iter()
             .filter(|(file, symbol)| {
@@ -1656,6 +1694,9 @@ impl<'a> Resolver<'a> {
         let Some(member) = &site.member else {
             return Resolution::default();
         };
+        if parse.language == "go" && parse.dispatch.go_package.is_none() {
+            return self.unknown("go", member);
+        }
         let Some(receiver) = &site.receiver else {
             return self.unknown(&parse.language, member);
         };
@@ -1694,7 +1735,14 @@ impl<'a> Resolver<'a> {
         if parse.language == "go" && exact.len() > 1 {
             return self.unknown(&parse.language, member);
         }
-        let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
+        let mut targets = exact
+            .into_iter()
+            .filter(|target| {
+                parse.language != "go"
+                    || file.ends_with("_test.go")
+                    || !target.file.ends_with("_test.go")
+            })
+            .collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate, method) in self.methods_named(member) {
                 let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
