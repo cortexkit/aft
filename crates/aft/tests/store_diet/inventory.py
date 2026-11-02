@@ -17,7 +17,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 # Consume comments and character literals as well as strings, so commented-out
 # queries and SQL-looking text in comments never become executable statements.
 TOKEN = re.compile(r'//[^\n]*|/\*.*?\*/|r(?P<hash>\#*)"(?P<raw>.*?)"(?P=hash)|"(?P<cooked>(?:\\.|[^"\\])*)"|\'(?:\\.|[^\'\\\n])\'', re.S)
-SQL = re.compile(r'^\s*(?:SELECT\s|INSERT\s+(?:OR\s+\w+\s+)?INTO\s|UPDATE\s+(?:OR\s+\w+\s+)?[\w{][\w{}.:]*\s+SET\s|DELETE\s+FROM\s|(?:CREATE|DROP|ALTER)\s+(?:UNIQUE\s+|TEMP\s+|VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\s|PRAGMA\s|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\s*\(|REPLACE\s+INTO\s|EXPLAIN\s|ATTACH\s+DATABASE\s|DETACH\s|BEGIN(?:\s+(?:IMMEDIATE|TRANSACTION|EXCLUSIVE)|;|$)|COMMIT(?:;|$)|ROLLBACK(?:;|$)|ANALYZE(?:;|$)|VACUUM(?:;|$)|REINDEX\s)', re.I)
+SQL = re.compile(r'^\s*(?:SELECT\s|INSERT\s+(?:OR\s+\w+\s+)?INTO\s|UPDATE\s+(?:OR\s+\w+\s+)?[\w{][\w{}.:]*\s+SET\s|DELETE\s+FROM\s|(?:CREATE|DROP|ALTER)\s+(?:UNIQUE\s+|TEMP\s+|VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\s|PRAGMA\s|WITH\s+(?:RECURSIVE\s+)?\w+\s*(?:\([^)]*\)\s*)?AS\s*\(|REPLACE\s+INTO\s|EXPLAIN\s|ATTACH\s+DATABASE\s|DETACH\s+DATABASE\s|BEGIN(?:\s+(?:IMMEDIATE|TRANSACTION|EXCLUSIVE)|;|$)|COMMIT(?:;|$)|ROLLBACK(?:;|$)|ANALYZE(?:;|$)|VACUUM(?:;|$)|REINDEX\s)', re.I)
 
 
 def strings(text):
@@ -36,11 +36,11 @@ def census():
     for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
         text = path.read_text()
         for pos, sql in strings(text):
-            if not SQL.match(sql):
+            if not SQL.match(re.sub(r'^\s*(?:--[^\n]*\n|/\*.*?\*/)\s*', '', sql, flags=re.S)):
                 continue
-            # Whitespace inside a literal is retained in text. Only the census
-            # identity ignores indentation, to survive rustfmt-only changes.
-            key = hashlib.sha256(re.sub(r'\s+', ' ', sql).strip().encode()).hexdigest()[:20]
+            # Keep whitespace inside SQL string literals significant. The text
+            # itself is the stable identity; source lines are only citations.
+            key = hashlib.sha256(sql.encode()).hexdigest()[:20]
             item = found.setdefault(key, {'id': 'sql-' + key, 'baseline': sql, 'candidate': sql, 'sites': []})
             item['sites'].append({'path': str(path.relative_to(ROOT)), 'line': text.count('\n', 0, pos) + 1})
     return sorted(found.values(), key=lambda row: row['id'])
@@ -54,11 +54,11 @@ def graph_statement(row):
     return any('/callgraph_store/' in s['path'] or '/views/' in s['path'] for s in row['sites'])
 
 
-VOCAB = {'kind', 'status', 'import_kind', 'provenance', 'lang', 'backend'}
+VOCAB = {'kind', 'status', 'import_kind', 'provenance', 'lang', 'language', 'backend'}
 STRINGS = {'path', 'file_path', 'dep_file', 'caller_file', 'target_file', 'file', 'name', 'scoped_name',
            'signature', 'short_name', 'callee_last_segment', 'full_ref', 'module_path', 'local_name',
            'requested_name', 'namespace_alias', 'method_name', 'workspace_root', 'caller_symbol',
-           'source_file', 'symbol', 'target', 'source', 'target_path', 'source_path'}
+           'source_file', 'symbol', 'target_symbol', 'target', 'source', 'target_path', 'source_path', 'declared', 'dependency', 'input'}
 IDENTITIES = {'id', 'ref_id', 'edge_id', 'caller_node', 'source_node', 'target_node'}
 SHARED = {'files', 'nodes', 'refs', 'edges', 'dispatch_hints', 'file_dependencies', 'type_ref_names',
           'resolution_config_fields', 'backend_file_state', 'meta', 'staging_file_inventory', 'staging_ref_context'}
@@ -112,8 +112,12 @@ def schemas(rows):
                     encoding = 'content-derived 64-bit identity; retain full constructor inputs (identities.md)'
                 elif graph and column == 'payload' and table in {'view_bindings', 'view_file_surfaces', 'view_dispatch_files'}:
                     encoding = 'compressed bytes of identical JSON'
+                elif table == 'view_dispatch_files' and column in {'facts', 'sites', 'type_target_trace'}:
+                    encoding = 'compressed bytes of identical JSON'
                 elif graph and column in STRINGS:
                     encoding = 'interned string id; decode text for comparisons and output'
+                if table == 'emitted_view_rows' and column == 'row_key':
+                    encoding = 'typed stable-row primary key selected by table_name; preserve former text mapping (identities.md)'
                 result[table]['columns'].append({'column': column, 'baseline_type': kind, 'primary_key_position': primary, 'encoding': encoding})
     return sorted(result.values(), key=lambda row: row['table'])
 
@@ -129,6 +133,42 @@ def order_inventory(rows):
                        'legacy_replacement': 'decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid',
                        'views_replacement': 'same, except reconstruct complete former view/dispatch id text before ordering',
                        'selection': 'Preserve every preceding tie key; only the first salted identity key permits within-group reorder.'})
+    return result
+
+
+def variants(row, tables):
+    sql = row['baseline']
+    expanded = [('literal', sql)]
+    if '{requested_values}' in sql:
+        expanded = [(f'batch-{n}', sql.replace('{requested_values}', ', '.join(['(?, ?)'] * n))) for n in [1, 499]]
+    elif '{placeholders}' in sql and '{table}' not in sql:
+        expanded = [(f'batch-{n}', sql.replace('{placeholders}', ', '.join(['?'] * n))) for n in [1, 999]]
+    elif '{distinct}' in sql:
+        expanded = [(label, sql.replace('{distinct}', value)) for label, value in [('all', ''), ('distinct', 'DISTINCT ')]]
+    elif '{filter}' in sql:
+        alias = 'n.' if 'FROM nodes n' in sql else ''
+        expanded = [(label, sql.replace('{filter}', value)) for label, value in [('all', ''), ('non-test', f' AND COALESCE({alias}is_test, 0) = 0')]]
+    elif '{identity}' in sql and 'FROM files' in sql:
+        expanded = [(label, sql.replace('{identity}', value)) for label, value in [('identity', 'source_identity'), ('old-shape', 'NULL')]]
+    elif '{table}' in sql:
+        expanded = []
+        for table in tables:
+            name = table['table']
+            columns = [c['column'] for c in table['columns']]
+            if not table['graph_data'] or not columns:
+                continue
+            text = sql.replace('{table}', name).replace('{key}', columns[0])
+            if '{assignments}' in text:
+                for changed in [columns[1:2], columns[1:]]:
+                    if changed:
+                        expanded.append((f'{name}-update-{len(changed)}', text.replace('{assignments}', ','.join(f'{c}=?{i+2}' for i, c in enumerate(changed)))))
+            else:
+                text = text.replace('{placeholders}', ','.join(f'?{i+1}' for i in range(len(columns)))).replace('{}', ','.join(columns))
+                expanded.append((name, text))
+    result = []
+    for label, text in expanded:
+        for i, part in enumerate(statements(text)):
+            result.append({'variant': f'{label}/{i}', 'sql': part})
     return result
 
 
@@ -159,7 +199,7 @@ def coverage(inventory, traces):
     def shape(sql):
         sql = re.sub(r"'(?:''|[^'])*'|\?[0-9]*|:[A-Za-z_]\w*|\b[0-9]+\b", '?', sql)
         return re.sub(r'\s+', ' ', sql).strip().rstrip(';').lower()
-    seen = {shape(line) for trace in traces for line in trace.read_text().splitlines()}
+    seen = {shape(json.loads(line)) for trace in traces for line in trace.read_text().splitlines()}
     exemptions = json.loads((HERE / 'trace_exemptions.json').read_text())
     missing = [row['id'] for row in inventory if shape(row['candidate']) not in seen and row['id'] not in exemptions]
     if missing:
@@ -207,15 +247,21 @@ def main():
     path = HERE / 'statements.json'
     if args.command == 'capture':
         rows = census()
+        tables = schemas(rows)
+        for row in rows:
+            row['variants'] = variants(row, tables)
         dump(path, rows)
         dump(HERE / 'order_sql.json', order_inventory(rows))
         dump(HERE / 'source_inventory.json', source_inventory())
-        dump(HERE / 'table_encoding.json', schemas(rows))
+        dump(HERE / 'table_encoding.json', tables)
         print(f'captured {len(rows)} SQL statements')
     elif args.command == 'check':
         actual = census()
         expected = json.loads(path.read_text())
         assert [(r['id'], r['baseline']) for r in actual] == [(r['id'], r['candidate']) for r in expected], 'SQL census changed; review and update statements.json'
+        assert json.loads((HERE / 'table_encoding.json').read_text()) == schemas(actual), 'table encoding census is stale'
+        assert json.loads((HERE / 'order_sql.json').read_text()) == order_inventory(actual), 'SQL ordering census is stale'
+        assert json.loads((HERE / 'source_inventory.json').read_text()) == source_inventory(), 'Rust source census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
         coverage(json.loads(path.read_text()), args.paths)

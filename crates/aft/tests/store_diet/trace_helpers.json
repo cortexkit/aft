@@ -1,0 +1,314 @@
+[
+  {
+    "path": "crates/aft/src/access_policy_task_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/access_policy_tests.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/bash_background/viewed_task.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/blob_store/mod.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/blob_store/reclaim.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/blob_store/v2/read_tests.rs",
+    "raw_open_calls": 6
+  },
+  {
+    "path": "crates/aft/src/blob_store/v2/sizing_tests.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/copy_tests.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/initialization.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/layout_tests.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/read_audit.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/replay.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/tests.rs",
+    "raw_open_calls": 7
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/build_breaker.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/build_breaker_audit_tests.rs",
+    "raw_open_calls": 9
+  },
+  {
+    "path": "crates/aft/src/cache_location_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/dead_code_projection.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/mod.rs",
+    "raw_open_calls": 26
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/perf_tests.rs",
+    "raw_open_calls": 6
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/refresh_wal/tests.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/commands/configure.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/commands/inspect.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/commands/storage_floor_tests.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/context.rs",
+    "raw_open_calls": 8
+  },
+  {
+    "path": "crates/aft/src/db/call_ledger.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/db/file_identity.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/db/lifecycle.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/db/mod.rs",
+    "raw_open_calls": 22
+  },
+  {
+    "path": "crates/aft/src/db/remote_exec.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/db/rich_ui.rs",
+    "raw_open_calls": 8
+  },
+  {
+    "path": "crates/aft/src/db/wal_credit_probe.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/disk_write_hunt.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/gc/family_read_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/gc/mod.rs",
+    "raw_open_calls": 9
+  },
+  {
+    "path": "crates/aft/src/inspect/cache.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/inspect/manager.rs",
+    "raw_open_calls": 11
+  },
+  {
+    "path": "crates/aft/src/legacy_partitions.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/migration/per_checkout_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/migration/v3_ledger_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/path_status/health.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/path_status/mod.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/production_storage.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/readonly_artifacts.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/storage_retention.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/subc/consent_security_audit_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/subc/mod.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/subc/remote_policy_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/subc/rich_ui/chunks/tests.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/views/assembly.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/views/closure_connection_tests.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/views/cold_fallback_tests.rs",
+    "raw_open_calls": 13
+  },
+  {
+    "path": "crates/aft/src/views/donor.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/eviction.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/views/first_load.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/views/generation.rs",
+    "raw_open_calls": 7
+  },
+  {
+    "path": "crates/aft/src/views/lazy_read_benchmark.rs",
+    "raw_open_calls": 2
+  },
+  {
+    "path": "crates/aft/src/views/manifest_incremental.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/views/manifest_publication_bench.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/materialization/cold_bench.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/materialization/dirty_pages.rs",
+    "raw_open_calls": 10
+  },
+  {
+    "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
+    "raw_open_calls": 9
+  },
+  {
+    "path": "crates/aft/src/views/materialization/fact_tests.rs",
+    "raw_open_calls": 13
+  },
+  {
+    "path": "crates/aft/src/views/materialization/module_digest_tests.rs",
+    "raw_open_calls": 6
+  },
+  {
+    "path": "crates/aft/src/views/materialization/parity.rs",
+    "raw_open_calls": 7
+  },
+  {
+    "path": "crates/aft/src/views/materialization/tests.rs",
+    "raw_open_calls": 50
+  },
+  {
+    "path": "crates/aft/src/views/materialization/update_bench.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/views/mod.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/semantic.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/views/semantic_fill_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/semantic_read_tests.rs",
+    "raw_open_calls": 4
+  },
+  {
+    "path": "crates/aft/src/views/semantic_runtime_tests.rs",
+    "raw_open_calls": 1
+  },
+  {
+    "path": "crates/aft/src/views/tree_base_tests.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/views/verification.rs",
+    "raw_open_calls": 5
+  },
+  {
+    "path": "crates/aft/src/views/worker_seed_tests.rs",
+    "raw_open_calls": 3
+  },
+  {
+    "path": "crates/aft/src/views/write_accounting.rs",
+    "raw_open_calls": 2
+  }
+]

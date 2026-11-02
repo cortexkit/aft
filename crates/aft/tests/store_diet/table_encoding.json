@@ -1,7 +1,7 @@
 [
   {
     "table": "backend_file_state",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "backend",
@@ -75,7 +75,7 @@
   },
   {
     "table": "blob_receipts",
-    "schema_statement": "sql-070cf069300e73d631d3",
+    "schema_statement": "sql-1e4898597ce336c3afe1",
     "columns": [
       {
         "column": "path",
@@ -94,7 +94,7 @@
   },
   {
     "table": "changed_view_paths",
-    "schema_statement": "sql-2e4911bc99a51f786206",
+    "schema_statement": "sql-75e60e55c351ce15f41a",
     "columns": [
       {
         "column": "path",
@@ -107,7 +107,7 @@
   },
   {
     "table": "derived_outputs",
-    "schema_statement": "sql-87e6e5f019237c9671e5",
+    "schema_statement": "sql-b5645deee10d3a183536",
     "columns": [
       {
         "column": "scope",
@@ -138,7 +138,7 @@
   },
   {
     "table": "dispatch_hints",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "id",
@@ -193,7 +193,7 @@
   },
   {
     "table": "edges",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "edge_id",
@@ -229,7 +229,7 @@
         "column": "target_symbol",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       },
       {
         "column": "kind",
@@ -254,7 +254,7 @@
   },
   {
     "table": "emitted_view_rows",
-    "schema_statement": "sql-2e4911bc99a51f786206",
+    "schema_statement": "sql-75e60e55c351ce15f41a",
     "columns": [
       {
         "column": "table_name",
@@ -266,14 +266,14 @@
         "column": "row_key",
         "baseline_type": "TEXT",
         "primary_key_position": 2,
-        "encoding": "unchanged"
+        "encoding": "typed stable-row primary key selected by table_name; preserve former text mapping (identities.md)"
       }
     ],
     "graph_data": true
   },
   {
     "table": "evidence_meta",
-    "schema_statement": "sql-911518fa35a03c6bdb4e",
+    "schema_statement": "sql-6349b40b074531911d6c",
     "columns": [
       {
         "column": "singleton",
@@ -316,7 +316,7 @@
   },
   {
     "table": "family_free_usage",
-    "schema_statement": "sql-8d7e6a167b52a5aeeb52",
+    "schema_statement": "sql-d14e450b68ff89deaa18",
     "columns": [
       {
         "column": "singleton",
@@ -341,7 +341,7 @@
   },
   {
     "table": "family_usage",
-    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "schema_statement": "sql-9294402bd6eb8c1e61c1",
     "columns": [
       {
         "column": "singleton",
@@ -366,7 +366,7 @@
   },
   {
     "table": "file_dependencies",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "file_path",
@@ -385,7 +385,7 @@
   },
   {
     "table": "files",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "path",
@@ -452,7 +452,7 @@
   },
   {
     "table": "members",
-    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "schema_statement": "sql-61c528a7a3bbc43d0e4f",
     "columns": [
       {
         "column": "scope",
@@ -507,7 +507,7 @@
   },
   {
     "table": "meta",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-37e2df171cd413132dc9",
     "columns": [
       {
         "column": "k",
@@ -526,7 +526,7 @@
   },
   {
     "table": "nodes",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "id",
@@ -635,7 +635,7 @@
   },
   {
     "table": "pointer",
-    "schema_statement": "sql-ea3f88cecf2c089accee",
+    "schema_statement": "sql-93071b07d9de551f25f6",
     "columns": [
       {
         "column": "singleton",
@@ -654,7 +654,7 @@
   },
   {
     "table": "proof_meta",
-    "schema_statement": "sql-070cf069300e73d631d3",
+    "schema_statement": "sql-1e4898597ce336c3afe1",
     "columns": [
       {
         "column": "singleton",
@@ -727,7 +727,7 @@
   },
   {
     "table": "readers",
-    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "schema_statement": "sql-61c528a7a3bbc43d0e4f",
     "columns": [
       {
         "column": "reader_id",
@@ -764,7 +764,7 @@
   },
   {
     "table": "refs",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "ref_id",
@@ -884,7 +884,7 @@
         "column": "target_symbol",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       },
       {
         "column": "provenance",
@@ -897,7 +897,7 @@
   },
   {
     "table": "registry_meta",
-    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "schema_statement": "sql-61c528a7a3bbc43d0e4f",
     "columns": [
       {
         "column": "singleton",
@@ -922,7 +922,7 @@
   },
   {
     "table": "resolution_config_fields",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "path",
@@ -941,7 +941,7 @@
   },
   {
     "table": "staging_file_inventory",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "path",
@@ -960,7 +960,7 @@
   },
   {
     "table": "staging_ref_context",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "ref_id",
@@ -979,7 +979,7 @@
   },
   {
     "table": "stat_evidence",
-    "schema_statement": "sql-911518fa35a03c6bdb4e",
+    "schema_statement": "sql-6349b40b074531911d6c",
     "columns": [
       {
         "column": "path",
@@ -998,7 +998,7 @@
   },
   {
     "table": "sweep_lease",
-    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "schema_statement": "sql-61c528a7a3bbc43d0e4f",
     "columns": [
       {
         "column": "singleton",
@@ -1054,7 +1054,7 @@
   },
   {
     "table": "type_ref_names",
-    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "schema_statement": "sql-813f3fdad24b503f1e09",
     "columns": [
       {
         "column": "name",
@@ -1067,7 +1067,7 @@
   },
   {
     "table": "usage_record",
-    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "schema_statement": "sql-9294402bd6eb8c1e61c1",
     "columns": [
       {
         "column": "singleton",
@@ -1092,7 +1092,7 @@
   },
   {
     "table": "view_bindings",
-    "schema_statement": "sql-e19e7ddd1e58688991b5",
+    "schema_statement": "sql-9d2906e26d011429e81c",
     "columns": [
       {
         "column": "file_path",
@@ -1111,7 +1111,7 @@
   },
   {
     "table": "view_dispatch_dependencies",
-    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "schema_statement": "sql-43692bd2c5ba3c5511a9",
     "columns": [
       {
         "column": "file_path",
@@ -1123,14 +1123,14 @@
         "column": "dependency",
         "baseline_type": "TEXT",
         "primary_key_position": 2,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       }
     ],
     "graph_data": true
   },
   {
     "table": "view_dispatch_files",
-    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "schema_statement": "sql-43692bd2c5ba3c5511a9",
     "columns": [
       {
         "column": "file_path",
@@ -1154,26 +1154,26 @@
         "column": "facts",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "compressed bytes of identical JSON"
       },
       {
         "column": "type_target_trace",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "compressed bytes of identical JSON"
       },
       {
         "column": "sites",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "compressed bytes of identical JSON"
       }
     ],
     "graph_data": true
   },
   {
     "table": "view_dispatch_sites",
-    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "schema_statement": "sql-43692bd2c5ba3c5511a9",
     "columns": [
       {
         "column": "caller_file",
@@ -1191,7 +1191,7 @@
         "column": "language",
         "baseline_type": "TEXT",
         "primary_key_position": 0,
-        "encoding": "unchanged"
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
       },
       {
         "column": "unresolved_receiver_sites",
@@ -1216,7 +1216,7 @@
   },
   {
     "table": "view_file_surfaces",
-    "schema_statement": "sql-e19e7ddd1e58688991b5",
+    "schema_statement": "sql-9d2906e26d011429e81c",
     "columns": [
       {
         "column": "file_path",
@@ -1235,13 +1235,13 @@
   },
   {
     "table": "view_module_digest_inputs",
-    "schema_statement": "sql-6dbf4fa20c677743072f",
+    "schema_statement": "sql-09bc45c9d57282fdd417",
     "columns": [
       {
         "column": "input",
         "baseline_type": "TEXT",
         "primary_key_position": 1,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       },
       {
         "column": "digest",
@@ -1254,7 +1254,7 @@
   },
   {
     "table": "view_module_path_targets",
-    "schema_statement": "sql-6dbf4fa20c677743072f",
+    "schema_statement": "sql-09bc45c9d57282fdd417",
     "columns": [
       {
         "column": "target",
@@ -1272,7 +1272,7 @@
         "column": "declared",
         "baseline_type": "TEXT",
         "primary_key_position": 3,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       },
       {
         "column": "present",
@@ -1291,7 +1291,7 @@
   },
   {
     "table": "view_sessions",
-    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "schema_statement": "sql-9294402bd6eb8c1e61c1",
     "columns": [
       {
         "column": "session_id",
@@ -1328,7 +1328,7 @@
   },
   {
     "table": "view_unknown_live",
-    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "schema_statement": "sql-43692bd2c5ba3c5511a9",
     "columns": [
       {
         "column": "caller_file",
@@ -1352,14 +1352,14 @@
         "column": "target_symbol",
         "baseline_type": "TEXT",
         "primary_key_position": 4,
-        "encoding": "unchanged"
+        "encoding": "interned string id; decode text for comparisons and output"
       }
     ],
     "graph_data": true
   },
   {
     "table": "view_usage",
-    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "schema_statement": "sql-9294402bd6eb8c1e61c1",
     "columns": [
       {
         "column": "scope",

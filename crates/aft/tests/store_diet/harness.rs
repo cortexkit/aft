@@ -3,6 +3,7 @@ use super::*;
 use crate::commands::callgraph_store_adapter as adapter;
 use crate::parser::SymbolCache;
 use serde_json::{json, Value};
+use std::fs;
 use std::sync::RwLock;
 
 const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/store_diet");
@@ -22,11 +23,20 @@ fn golden(name: &str, bytes: &[u8]) {
 }
 
 fn fixture_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = walkdir::WalkDir::new(root)
+    fn walk(root: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), files);
+            } else if entry.file_type().unwrap().is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(root, &mut paths);
+    let mut files = paths
         .into_iter()
-        .map(|entry| entry.unwrap())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
         .filter(|path| {
             matches!(
                 path.extension().and_then(|s| s.to_str()),
@@ -128,6 +138,10 @@ fn store_diet_legacy_golden() {
         "legacy-counts.json",
         &serde_json::to_vec_pretty(&counts(&store)).unwrap(),
     );
+    golden(
+        "legacy-seeded.json",
+        &serde_json::to_vec_pretty(&seeded_replies(&store, &root)).unwrap(),
+    );
 }
 
 fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
@@ -209,4 +223,122 @@ fn store_diet_views_golden() {
         "views-counts.json",
         &serde_json::to_vec_pretty(&counts(&store)).unwrap(),
     );
+    golden(
+        "views-seeded.json",
+        &serde_json::to_vec_pretty(&seeded_replies(&store, &root)).unwrap(),
+    );
+}
+
+fn plans(store: &CallGraphStore) -> Value {
+    let rows: Vec<Value> =
+        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("statements.json")).unwrap())
+            .unwrap();
+    let conn = store.conn.lock().unwrap();
+    let mut result = serde_json::Map::new();
+    for row in rows {
+        let graph = row["sites"].as_array().unwrap().iter().any(|site| {
+            let path = site["path"].as_str().unwrap();
+            path.contains("/callgraph_store/") || path.contains("/views/")
+        });
+        if !graph {
+            continue;
+        }
+        for variant in row["variants"].as_array().unwrap() {
+            let key = format!(
+                "{}:{}",
+                row["id"].as_str().unwrap(),
+                variant["variant"].as_str().unwrap()
+            );
+            let sql = variant["sql"].as_str().unwrap();
+            let sql = sql.strip_prefix("EXPLAIN QUERY PLAN ").unwrap_or(sql);
+            let plan = (|| -> rusqlite::Result<Vec<String>> {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let count = statement.parameter_count();
+                let rows = statement.query_map(
+                    params_from_iter(vec![rusqlite::types::Value::Null; count]),
+                    |row| row.get::<_, String>(3),
+                )?;
+                rows.collect()
+            })();
+            result.insert(
+                key,
+                match plan {
+                    Ok(plan) => json!(plan),
+                    Err(error) => json!({"unprepared": error.to_string()}),
+                },
+            );
+        }
+    }
+    Value::Object(result)
+}
+
+#[test]
+fn store_diet_baseline_plans() {
+    let (temp, root, files) = fixture();
+    let legacy = CallGraphStore::open(temp.path().join("legacy"), root.clone()).unwrap();
+    legacy.cold_build(&files).unwrap();
+    let views = view_store(temp.path(), &root, &files);
+    let actual = json!({"legacy": plans(&legacy), "views": plans(&views)});
+    golden(
+        "baseline-plans.json",
+        &serde_json::to_vec_pretty(&actual).unwrap(),
+    );
+}
+
+fn sample_queries(store: &CallGraphStore) -> Vec<(String, String)> {
+    let conn = store.conn.lock().unwrap();
+    let mut statement = conn
+        .prepare("SELECT file_path, scoped_name FROM nodes WHERE scoped_name <> '<top-level>'")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    let mut symbols = rows
+        .collect::<rusqlite::Result<BTreeSet<_>>>()
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>();
+    symbols.sort_by_cached_key(|(file, symbol)| {
+        blake3::hash(format!("callgraph-store-diet-v1\0{file}\0{symbol}").as_bytes())
+            .as_bytes()
+            .to_owned()
+    });
+    symbols
+}
+
+fn answer<T: serde::Serialize>(result: std::result::Result<T, impl std::fmt::Display>) -> Value {
+    match result {
+        Ok(value) => serde_json::to_value(value).unwrap(),
+        Err(error) => json!({"error": error.to_string()}),
+    }
+}
+
+fn seeded_replies(store: &CallGraphStore, root: &Path) -> Value {
+    let symbols = sample_queries(store);
+    assert!(!symbols.is_empty());
+    let mut results = Vec::new();
+    for (file, symbol) in &symbols[..symbols.len().min(500)] {
+        let path = root.join(file);
+        results.push(json!({
+            "file": file, "symbol": symbol,
+            "callers": answer(adapter::callers_result(store, &path, symbol, 4, true)),
+            "call_tree": answer(adapter::call_tree_result(store, &path, symbol, 4, true)),
+            "impact": answer(adapter::impact_result(store, &path, symbol, 4, true)),
+        }));
+    }
+    for i in 0..symbols.len().min(100) {
+        let (file, symbol) = &symbols[i];
+        let (to_file, to_symbol) = &symbols[(i + 1) % symbols.len()];
+        let path = root.join(file);
+        let cache = Arc::new(RwLock::new(SymbolCache::new()));
+        results.push(json!({
+            "file": file, "symbol": symbol, "to_file": to_file, "to_symbol": to_symbol,
+            "trace_to": answer(adapter::trace_to_result(store, &path, symbol, 4, true)),
+            "trace_to_symbol": answer(adapter::trace_to_symbol_result(store, &path, symbol, to_symbol, Some(&root.join(to_file)), 4, true)),
+            "trace_data": answer(adapter::trace_data_result(store, &path, symbol, "value", 4, cache)),
+        }));
+    }
+    json!(results)
 }
