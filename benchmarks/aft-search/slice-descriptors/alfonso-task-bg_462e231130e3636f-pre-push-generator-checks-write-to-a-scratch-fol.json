@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["prepush-generated-scratch"],
+  "note": "Generator checks compare scratch outputs without changing tracked fixtures; no search ranking behavior changes."
+}
