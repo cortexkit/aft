@@ -74,6 +74,13 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         with self.assertRaisesRegex(AssertionError, 'metadata type changed'):
             parity.normalise_metadata(b'{"search_ms": []}', ['search_ms'])
 
+    def test_transient_graph_admission_is_not_recorded_as_a_query_answer(self):
+        request = {'command': 'callers'}
+        self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'unavailable', 'reason': 'identity_provisional'}}}))
+        self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'building'}}}))
+        self.assertFalse(parity.pending_reply(request, {'success': True, 'complete': False, 'unresolved_call_sites': 1}))
+        self.assertFalse(parity.pending_reply(request, {'success': False, 'code': 'symbol_not_found'}))
+
     def test_parity_rejects_changed_reply_bytes_and_empty_capture(self):
         # Keep scratch beneath the checkout.
         scratch = inventory.ROOT / 'target/scratch'

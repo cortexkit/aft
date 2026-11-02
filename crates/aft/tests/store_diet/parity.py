@@ -52,6 +52,13 @@ def manifest(symbols):
     return [dict(request, id=f'parity-{i:05}') for i, request in enumerate(requests)]
 
 
+def pending_reply(request, reply):
+    if request['command'] == 'inspect' and reply.get('inspect_terminal') not in {None, 'fresh'}:
+        return True
+    graph = (reply.get('index') or {}).get('callgraph') or {}
+    return graph.get('reason') == 'identity_provisional' or graph.get('status') in {'building', 'refreshing'}
+
+
 def capture(binary, root, cache, requests, output, timeout, views=False):
     assert not cache.exists(), f'cold capture requires a fresh cache: {cache}'
     cache.mkdir(parents=True)
@@ -91,8 +98,8 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
                             if request is configure:
                                 assert value.get('success'), f'configure failed: {line!r}'
                             if request is not configure:
-                                if request['command'] == 'inspect' and value.get('inspect_terminal') not in {None, 'fresh'}:
-                                    assert time.monotonic() < deadline, f'inspect never became fresh: {line!r}'
+                                if pending_reply(request, value):
+                                    assert time.monotonic() < deadline, f'query never became ready: {line!r}'
                                     time.sleep(0.1)
                                     process.stdin.write(json.dumps(request, separators=(',', ':')).encode() + b'\n')
                                     process.stdin.flush()

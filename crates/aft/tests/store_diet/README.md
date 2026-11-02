@@ -78,6 +78,18 @@ reporting analysis in progress or a search timing difference will fail replay:
 settle the baseline workload and establish any permitted metadata whitelist
 with baseline-versus-baseline evidence before using a candidate.
 
+The runner waits for inspect to report `fresh` before recording its query reply,
+and retries while the runtime is still assigning the project's stable repository
+identity or building its graph. If the only
+remaining differences are top-level `search_ms` or `tier2_last_run` metadata,
+`prove-normalisation BASE_CAPTURE REPLAY_CAPTURE PROOF.json` checks that both
+captures used the same baseline executable, proves all other bytes equal, and
+writes the observed whitelist. Commit that proof and whitelist before recording
+a candidate. Pass `--normalisation PROOF.json` to subsequent comparisons. The
+normaliser replaces only the selected top-level numeric value spans: nested row
+fields, whitespace, order, counts, notes and provenance remain byte-identical.
+No other field is admitted by the tool.
+
 For the committed fixture sample:
 
 ```
