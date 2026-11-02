@@ -16615,6 +16615,49 @@ fn collect_reexport_refs_with_line_index(
     facts: &FactPaths<'_>,
     line_index: &LineIndex,
 ) -> ReexportRefs {
+    if abs_path.extension().and_then(|ext| ext.to_str()) == Some("py") {
+        let Ok(tree) = parse_source_with_cached_parser(abs_path, source, LangId::Python) else {
+            return ReexportRefs {
+                raw_refs: Vec::new(),
+                surface_parts: Vec::new(),
+            };
+        };
+        let exports = callgraph::python::extract(source, tree.root_node()).reexports;
+        let mut raw_refs = build_import_refs(
+            project_root,
+            abs_path,
+            rel_path,
+            &exports,
+            line_index,
+            memo,
+            facts,
+        );
+        let mut surface_parts = Vec::new();
+        for raw in &mut raw_refs {
+            let names = raw
+                .local_name
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .zip(raw.requested_name.as_deref().unwrap_or_default().split(','))
+                .map(|(local, source)| format!("{source} as {local}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = format!("export {{ {names} }}");
+            raw.ref_id = ref_id(&["python_reexport", &raw.ref_id]);
+            raw.kind = "reexport".to_string();
+            raw.import_kind = Some("reexport".to_string());
+            raw.full_ref = Some(statement.clone());
+            surface_parts.push(format!(
+                "reexport\t{}\t{statement}",
+                raw.module_path.as_deref().unwrap_or_default()
+            ));
+        }
+        return ReexportRefs {
+            raw_refs,
+            surface_parts,
+        };
+    }
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut search_start = 0usize;
@@ -17146,9 +17189,15 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         Some(LangId::Go) => {
             resolve_go_target(index, &caller_file, full_ref, short_name, caller_data)
         }
-        Some(LangId::Python) => {
-            resolve_python_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
-        }
+        Some(LangId::Python) => resolve_python_target(
+            index,
+            &caller_file,
+            full_ref,
+            short_name,
+            caller_data,
+            &raw,
+            &mut dependencies,
+        ),
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
         }
@@ -17565,6 +17614,7 @@ fn resolve_python_target<I: ResolverIndex>(
     short_name: &str,
     caller_data: &FileCallData,
     raw: &RawRef,
+    dependencies: &mut BTreeSet<String>,
 ) -> Option<(String, String, String)> {
     if let Ok(binding_index) = caller_data
         .python_bindings
@@ -17574,19 +17624,55 @@ fn resolve_python_target<I: ResolverIndex>(
     {
         let binding = &caller_data.python_bindings[binding_index];
         let (module, symbol) = binding.target.as_ref()?;
-        let target_file = index.module_target(caller_file, module)?;
-        // An import names one module, never every same-named symbol in the project.
-        let node = index.node_for_symbol(&target_file, symbol)?;
-        // Bare-name lookup also finds methods; `from mod import f` requires
-        // the module-level function, not a class's same-named method.
-        if node != node_id(&target_file, "function", symbol) {
-            return None;
-        }
-        return index
-            .node_is_callable(&target_file, &node)
-            .then(|| ("resolved".to_string(), target_file, symbol.clone()));
+        let target_file = if module.is_empty() {
+            caller_file.to_string()
+        } else {
+            index.module_target(caller_file, module)?
+        };
+        let (file, symbol) = resolve_python_symbol(index, &target_file, symbol, dependencies)?;
+        return Some(("resolved".to_string(), file, symbol));
     }
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
+}
+
+fn resolve_python_symbol<I: ResolverIndex>(
+    index: &I,
+    file: &str,
+    symbol: &str,
+    dependencies: &mut BTreeSet<String>,
+) -> Option<(String, String)> {
+    let mut file = file.to_string();
+    let mut symbol = symbol.to_string();
+    let mut visited = HashSet::new();
+    loop {
+        dependencies.insert(file.clone());
+        if !visited.insert((file.clone(), symbol.clone())) {
+            return None;
+        }
+        if let Some(node) = index.node_for_symbol(&file, &symbol) {
+            // A bare import must not accidentally select a class method with the same name.
+            if node == node_id(&file, "function", &symbol) && index.node_is_callable(&file, &node) {
+                return Some((file, symbol));
+            }
+            if node == node_id(&file, "class", &symbol) {
+                let initializer = format!("{symbol}::__init__");
+                let init_node = index.node_for_symbol(&file, &initializer)?;
+                return (init_node == node_id(&file, "method", &initializer)
+                    && index.node_is_callable(&file, &init_node))
+                .then_some((file, initializer));
+            }
+        }
+        let mut targets = BTreeSet::new();
+        for export in index.reexports_for(&file) {
+            if let (Some(source), Some(target)) = (export.named.get(&symbol), export.target_file) {
+                targets.insert((target, source.clone()));
+            }
+        }
+        if targets.len() != 1 {
+            return None;
+        }
+        (file, symbol) = targets.into_iter().next()?;
+    }
 }
 
 fn resolve_js_ts_target<I: ResolverIndex>(

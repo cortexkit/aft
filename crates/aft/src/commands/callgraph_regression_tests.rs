@@ -173,6 +173,97 @@ fn callgraph_python_import_forms_and_unrelated_names() {
 }
 
 #[test]
+fn callgraph_python_reexport_chains_are_lexical_and_refreshable() {
+    let (_temp, store) = fixture(&[
+        ("pkg/source.py", "def target():\n    pass\n\ndef replacement():\n    pass\n"),
+        ("pkg/middle.py", "from .source import target as forwarded\n"),
+        ("pkg/__init__.py", "from .middle import forwarded as public\n"),
+        ("calls.py", "from pkg import public as renamed\nimport pkg as namespace\ndef named():\n    renamed()\ndef qualified():\n    namespace.public()\ndef shadow(renamed):\n    renamed()\n"),
+        ("hidden.py", "def setup():\n    from pkg.source import target as public\n"),
+        ("shadowed.py", "from pkg.source import target as public\npublic = unknown\n"),
+        ("ambiguous.py", "if condition:\n    from pkg.source import target as public\nelse:\n    from pkg.source import replacement as public\n"),
+        ("cycle_a.py", "from cycle_b import public\n"),
+        ("cycle_b.py", "from cycle_a import public\n"),
+        ("negative.py", "from hidden import public as hidden\nfrom shadowed import public as shadowed\nfrom ambiguous import public as ambiguous\nfrom cycle_a import public as cyclic\ndef rejected():\n    hidden()\n    shadowed()\n    ambiguous()\n    cyclic()\n"),
+    ]);
+    let sites = store
+        .direct_callers_of(Path::new("pkg/source.py"), "target")
+        .unwrap();
+    let mut names = sites
+        .iter()
+        .map(|site| site.caller.symbol.as_str())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["named", "qualified"]);
+    assert!(sites.iter().all(|site| !site.approximate()));
+    let middle = store.project_root().join("pkg/middle.py");
+    std::fs::write(&middle, "from .source import replacement as forwarded\n").unwrap();
+    store.refresh_files(&[middle]).unwrap();
+    assert!(store
+        .direct_callers_of(Path::new("pkg/source.py"), "target")
+        .unwrap()
+        .is_empty());
+    let sites = store
+        .direct_callers_of(Path::new("pkg/source.py"), "replacement")
+        .unwrap();
+    assert_eq!(sites.len(), 2);
+    assert!(sites.iter().all(|site| !site.approximate()));
+}
+
+#[test]
+fn callgraph_python_definition_headers_use_defining_scope() {
+    let (_temp, store) = fixture(&[
+        ("mod.py", "def factory():\n    pass\n"),
+        ("calls.py", "from mod import factory\ndef outer():\n    @factory()\n    def inner(factory=factory(), annotation: factory() = None) -> factory():\n        factory()\n    return inner\n\nclass Container:\n    from mod import factory as local_factory\n    def method(self, local_factory=local_factory()):\n        local_factory()\n"),
+    ]);
+    let sites = store
+        .direct_callers_of(Path::new("mod.py"), "factory")
+        .unwrap();
+    let mut owners = sites
+        .iter()
+        .map(|site| (site.line, site.caller.symbol.as_str()))
+        .collect::<Vec<_>>();
+    owners.sort();
+    assert_eq!(
+        owners,
+        [
+            (3, "outer"),
+            (4, "outer"),
+            (4, "outer"),
+            (4, "outer"),
+            (11, "Container")
+        ]
+    );
+    assert!(sites.iter().all(|site| !site.approximate()));
+}
+
+#[test]
+fn callgraph_python_constructors_follow_class_bindings_not_names() {
+    let (_temp, store) = fixture(&[
+        ("pkg/source.py", "class Widget:\n    def __init__(self):\n        pass\n\nclass WithoutInit:\n    pass\n"),
+        ("pkg/__init__.py", "from .source import Widget as Public\n"),
+        ("calls.py", "from pkg import Public as Renamed\nimport pkg.source as module\nclass Local:\n    def __init__(self):\n        pass\ndef construct():\n    Local()\n    Renamed()\n    module.Widget()\ndef shadow(Renamed):\n    Renamed()\n"),
+        ("unrelated.py", "class Renamed:\n    def __init__(self):\n        pass\n"),
+    ]);
+    let sites = store
+        .direct_callers_of(Path::new("pkg/source.py"), "Widget::__init__")
+        .unwrap();
+    assert_eq!(sites.len(), 2);
+    assert!(sites
+        .iter()
+        .all(|site| site.caller.symbol == "construct" && !site.approximate()));
+    let local = store
+        .direct_callers_of(Path::new("calls.py"), "Local::__init__")
+        .unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].caller.symbol, "construct");
+    assert!(store
+        .direct_callers_of(Path::new("unrelated.py"), "Renamed::__init__")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn callgraph_nonzero_callers_disclose_only_matching_unresolved_names() {
     let (_temp, store) = fixture(&[
         (

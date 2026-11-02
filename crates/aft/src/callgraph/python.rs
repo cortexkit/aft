@@ -2,7 +2,7 @@
 
 use crate::imports::{self, ImportBlock, ImportForm, ImportStatement};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// A selected import for one call. An absent target means a local binding
@@ -21,13 +21,15 @@ enum Binding {
         symbol: Option<String>,
         prefix: String,
     },
-    LocalDefinition,
+    LocalDefinition(String),
     Shadowed,
 }
 
 struct Scope {
     parent: Option<usize>,
     class: bool,
+    owner: String,
+    classes: Vec<String>,
     names: HashMap<String, Binding>,
 }
 
@@ -35,18 +37,29 @@ struct Extractor<'a> {
     source: &'a str,
     scopes: Vec<Scope>,
     imports: Vec<ImportStatement>,
+    module_imports: HashSet<(usize, usize)>,
     calls: Vec<(Node<'a>, usize)>,
 }
 
-pub(super) fn extract(source: &str, root: Node<'_>) -> (ImportBlock, Vec<CallBinding>) {
+pub(super) struct Extraction {
+    pub imports: ImportBlock,
+    pub bindings: Vec<CallBinding>,
+    pub owners: HashMap<usize, String>,
+    pub reexports: Vec<ImportStatement>,
+}
+
+pub(super) fn extract(source: &str, root: Node<'_>) -> Extraction {
     let mut extractor = Extractor {
         source,
         scopes: vec![Scope {
             parent: None,
             class: false,
+            owner: super::TOP_LEVEL_SYMBOL.to_string(),
+            classes: Vec::new(),
             names: HashMap::new(),
         }],
         imports: Vec::new(),
+        module_imports: HashSet::new(),
         calls: Vec::new(),
     };
     extractor.visit(root, 0);
@@ -65,10 +78,10 @@ pub(super) fn extract(source: &str, root: Node<'_>) -> (ImportBlock, Vec<CallBin
                 return None;
             }
             let binding = extractor.lookup(*scope, parts[0])?;
-            if *binding == Binding::LocalDefinition {
-                return None;
-            }
             let target = match binding {
+                Binding::LocalDefinition(symbol) if parts.len() == 1 => {
+                    Some((String::new(), symbol.clone()))
+                }
                 Binding::Imported {
                     module,
                     symbol: Some(symbol),
@@ -93,13 +106,49 @@ pub(super) fn extract(source: &str, root: Node<'_>) -> (ImportBlock, Vec<CallBin
         })
         .collect();
     bindings.sort_by_key(|binding| (binding.byte_start, binding.byte_end));
-    (
-        ImportBlock {
+    let mut reexports = Vec::new();
+    for import in &extractor.imports {
+        if !extractor
+            .module_imports
+            .contains(&(import.byte_range.start, import.byte_range.end))
+        {
+            continue;
+        }
+        let ImportForm::Python {
+            from_import: true,
+            named,
+        } = &import.form
+        else {
+            continue;
+        };
+        let named = named.iter().filter(|specifier| {
+            let local = imports::specifier_local_name(specifier);
+            matches!(extractor.scopes[0].names.get(local), Some(Binding::Imported { module, symbol: Some(symbol), .. })
+                if module == &import.module_path && symbol == imports::specifier_imported_name(specifier))
+        }).cloned().collect::<Vec<_>>();
+        if !named.is_empty() {
+            let mut exported = import.clone();
+            exported.names = named.clone();
+            exported.form = ImportForm::Python {
+                from_import: true,
+                named,
+            };
+            reexports.push(exported);
+        }
+    }
+    Extraction {
+        imports: ImportBlock {
             imports: extractor.imports,
             byte_range: None,
         },
         bindings,
-    )
+        owners: extractor
+            .calls
+            .iter()
+            .map(|(call, scope)| (call.start_byte(), extractor.scopes[*scope].owner.clone()))
+            .collect(),
+        reexports,
+    }
 }
 
 impl<'a> Extractor<'a> {
@@ -130,25 +179,40 @@ impl<'a> Extractor<'a> {
         None
     }
 
-    fn visit(&mut self, node: Node<'a>, mut scope: usize) {
+    fn visit(&mut self, node: Node<'a>, scope: usize) {
         if matches!(
             node.kind(),
             "function_definition" | "class_definition" | "lambda"
         ) {
             if let Some(name) = node.child_by_field_name("name") {
+                let mut path = self.scopes[scope].classes.clone();
+                path.push(self.source[name.byte_range()].to_string());
                 self.bind(
                     scope,
                     &self.source[name.byte_range()],
-                    Binding::LocalDefinition,
+                    Binding::LocalDefinition(path.join("::")),
                 );
             }
             let id = self.scopes.len();
+            let mut classes = self.scopes[scope].classes.clone();
+            let owner = if let Some(name) = node.child_by_field_name("name") {
+                let name = &self.source[name.byte_range()];
+                let mut path = classes.clone();
+                path.push(name.to_string());
+                if node.kind() == "class_definition" {
+                    classes.push(name.to_string());
+                }
+                path.join("::")
+            } else {
+                self.scopes[scope].owner.clone()
+            };
             self.scopes.push(Scope {
                 parent: Some(scope),
                 class: node.kind() == "class_definition",
+                owner,
+                classes,
                 names: HashMap::new(),
             });
-            scope = id;
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 for parameter in parameters.named_children(&mut parameters.walk()) {
                     let name = if parameter.kind() == "identifier" {
@@ -159,10 +223,17 @@ impl<'a> Extractor<'a> {
                             .or_else(|| parameter.named_child(0))
                     };
                     if let Some(name) = name.filter(|n| n.kind() == "identifier") {
-                        self.bind(scope, &self.source[name.byte_range()], Binding::Shadowed);
+                        self.bind(id, &self.source[name.byte_range()], Binding::Shadowed);
                     }
                 }
             }
+            // Defaults, annotations, bases and decorators execute where the
+            // declaration is defined; only its body sees the new local scope.
+            let body = node.child_by_field_name("body");
+            for child in node.named_children(&mut node.walk()) {
+                self.visit(child, if Some(child) == body { id } else { scope });
+            }
+            return;
         }
         if let Some(import) = imports::parse_py_import_node(self.source, &node) {
             self.import(scope, import);
@@ -201,6 +272,10 @@ impl<'a> Extractor<'a> {
     }
 
     fn import(&mut self, scope: usize, import: ImportStatement) {
+        if scope == 0 {
+            self.module_imports
+                .insert((import.byte_range.start, import.byte_range.end));
+        }
         let ImportForm::Python { from_import, named } = &import.form else {
             return;
         };

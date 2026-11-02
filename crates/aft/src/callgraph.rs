@@ -1736,8 +1736,9 @@ pub(crate) fn build_file_data_from_tree(
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
     // Parse imports
-    let (import_block, python_bindings) = if lang == LangId::Python {
-        python::extract(source, tree.root_node())
+    let python = (lang == LangId::Python).then(|| python::extract(source, tree.root_node()));
+    let (import_block, python_bindings) = if let Some(python) = &python {
+        (python.imports.clone(), python.bindings.clone())
     } else {
         (imports::parse_imports(&source, &tree, lang), Vec::new())
     };
@@ -1760,6 +1761,21 @@ pub(crate) fn build_file_data_from_tree(
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
     };
+    if let Some(python) = &python {
+        let mut owned = HashMap::<String, Vec<CallSite>>::new();
+        let mut seen = HashSet::new();
+        for site in calls_by_symbol.into_values().flatten() {
+            if seen.insert((site.byte_start, site.byte_end)) {
+                if let Some(owner) = python.owners.get(&site.byte_start) {
+                    owned.entry(owner.clone()).or_default().push(site);
+                }
+            }
+        }
+        for sites in owned.values_mut() {
+            sites.sort_by_key(|site| (site.byte_start, site.byte_end));
+        }
+        calls_by_symbol = owned;
+    }
     let mut value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
     } else if lang == LangId::Go {
