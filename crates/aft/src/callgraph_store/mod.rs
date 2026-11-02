@@ -17929,10 +17929,15 @@ fn rust_unique_file_level_function<I: ResolverIndex>(
     if full_ref.contains("::") || !callgraph::is_bare_callee(full_ref, short_name) {
         return None;
     }
-    // The only symbol with this unqualified name must be the file-level one
-    // itself; with a same-named nested item the call could mean either.
-    let symbol = index.local_symbol(caller_file, caller_data, short_name)?;
-    let is_file_level_function = symbol == short_name
+    // Another free function can shadow a bare call; associated functions
+    // cannot. Keep trait members behind their declaring trait or type.
+    let symbol = short_name.to_string();
+    let is_file_level_function = index.node_for_symbol(caller_file, short_name).is_some()
+        && !caller_data.symbol_metadata.iter().any(|(name, meta)| {
+            name != short_name
+                && last_name_segment(name) == short_name
+                && meta.kind == SymbolKind::Function
+        })
         && caller_data
             .symbol_metadata
             .get(short_name)
@@ -20936,13 +20941,36 @@ fn rust_bound_dispatch_candidate(
             start,
         )?;
         let callee = initializer.child_by_field_name("function")?;
-        let (file, symbol, signature, declaration_line): (String, String, String, usize) = tx.query_row(
-            "SELECT r.target_file, r.target_symbol, n.signature, n.start_line FROM refs r JOIN nodes n ON n.id=r.target_node
+        let (file, symbol, end_line, end_col): (String, String, usize, usize) = tx.query_row(
+            "SELECT r.target_file, r.target_symbol, n.end_line, n.end_col FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
             params![reference.caller_file, initializer.start_byte(), initializer.end_byte(), node_text(callee, &parsed.source)],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).optional().ok().flatten()?;
-        let return_type = signature.split_once("->")?.1.trim();
+        let parsed = parsed_dispatch_source_for_file(
+            project_root,
+            &file,
+            "rust",
+            LangId::Rust,
+            source_cache,
+        )?;
+        let mut declaration = parsed.tree.root_node().descendant_for_point_range(
+            tree_sitter::Point::new(end_line, end_col.checked_sub(1)?),
+            tree_sitter::Point::new(end_line, end_col.checked_sub(1)?),
+        )?;
+        while declaration.kind() != "function_item" {
+            declaration = declaration.parent()?;
+        }
+        if declaration.end_position() != tree_sitter::Point::new(end_line, end_col) {
+            return None;
+        }
+        let declaration_byte = declaration.start_byte();
+        let declaration_line = declaration.start_position().row;
+        let return_type = node_text(
+            declaration.child_by_field_name("return_type")?,
+            &parsed.source,
+        )
+        .to_string();
         if return_type == "Self" {
             let (owner, _) = symbol.rsplit_once("::")?;
             let owner = owner.split_once(" for ").map_or(owner, |(_, ty)| ty);
@@ -20962,20 +20990,8 @@ fn rust_bound_dispatch_candidate(
             let mut declaration_raw = raw.clone();
             declaration_raw.caller_file = file.clone();
             declaration_raw.caller_symbol = Some(symbol.clone());
-            let parsed = parsed_dispatch_source_for_file(
-                project_root,
-                &file,
-                "rust",
-                LangId::Rust,
-                source_cache,
-            )?;
             declaration_raw.line = declaration_line as u32 + 1;
-            declaration_raw.byte_start = parsed
-                .source
-                .split_inclusive('\n')
-                .take(declaration_line)
-                .map(str::len)
-                .sum();
+            declaration_raw.byte_start = declaration_byte;
             declaration_raw.byte_end = declaration_raw.byte_start;
             let binding =
                 rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
@@ -34265,6 +34281,11 @@ impl Other { pub fn qualified(self) -> Self { self } }
             "Manager::run",
         );
         let conn = Connection::open(store.sqlite_path()).expect("reader");
+        let typed: i64 = conn.query_row("SELECT COUNT(*) FROM edges WHERE target_symbol IN ('Symbol::qualified', 'Analyzer for Generic::analyze', 'Analyzer::analyze') AND provenance='type_match'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            typed, 3,
+            "receiver returns must produce binding-backed edges"
+        );
         let wrong: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM edges WHERE target_symbol='Other::qualified'",
