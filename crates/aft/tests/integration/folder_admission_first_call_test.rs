@@ -38,11 +38,24 @@ fn response(aft: &mut AftProcess, id: &str) -> Value {
 // are serialized instead of competing for that budget with each other.
 fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Value {
     let _timing = timing_guard();
-    let dir = tempfile::tempdir().unwrap();
-    let project = dir.path().join("project");
+    let dir = crate::test_helpers::tempdir();
+    // The refusing fixture must prove the negative classification: a parent
+    // holding its own Git metadata keeps an enclosing checkout from supplying
+    // project evidence for the root inside it.
+    let root_parent = dir.path().join("root");
+    std::fs::create_dir(&root_parent).unwrap();
+    let project = root_parent.join("project");
     std::fs::create_dir(&project).unwrap();
     if project_evidence {
         crate::test_helpers::project::mark_project(&project).unwrap();
+    } else {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root_parent)
+            .args(["init", "-q", "--template="])
+            .status()
+            .expect("git init for the refusing fixture parent");
+        assert!(status.success(), "git init failed for the refusing fixture");
     }
     std::fs::write(
         project.join("main.rs"),
@@ -82,7 +95,10 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
         !dir.path().join("storage/retention/roots").exists(),
         "an admission-pending bind must not record a provisional artifact identity"
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // A fixture that refuses must observe the decision itself: a check that
+    // ended on its evidence budget answers evidence_budget_exhausted instead,
+    // which is a different (incomplete) classification.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !started.exists() {
         assert!(Instant::now() < deadline, "admission probe did not start");
         if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(1)) {
@@ -97,10 +113,20 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     }
     drop(release_on_drop);
     let tool = response(&mut aft, "first-tool");
+    let status = aft.send(r#"{"id":"admitted-status","command":"status"}"#);
+    assert_eq!(status["folder"]["state"], "decided", "{status}");
     if full_validation {
-        let status = aft.send(r#"{"id":"admitted-status","command":"status"}"#);
-        assert_eq!(status["folder"]["state"], "decided", "{status}");
         assert_eq!(status["folder"]["classification"], "project", "{status}");
+    } else {
+        assert_eq!(
+            status["folder"]["classification"], "not_project",
+            "{status}"
+        );
+        assert_eq!(
+            status["folder"]["reason"], "no_project_evidence",
+            "{status}"
+        );
+        assert_eq!(status["folder"]["coverage"]["complete"], true, "{status}");
     }
     let (status, stderr) = aft.stderr_output();
     if tool["success"] != true {
@@ -145,8 +171,8 @@ fn full_validation_call_does_not_starve_its_admission_replay() {
 
 #[test]
 fn bash_queued_with_configure_keeps_foreground_orchestration() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft =
         AftProcess::spawn_with_env(&[("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref())]);
     let mut bind = configure(project.path(), storage.path(), "bash-bind", false);
@@ -179,7 +205,7 @@ fn bash_queued_with_configure_keeps_foreground_orchestration() {
 #[test]
 fn timed_out_admission_is_incomplete_and_next_connect_rechecks() {
     let _timing = timing_guard();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let project = dir.path().join("project");
     std::fs::create_dir(&project).unwrap();
     crate::test_helpers::project::mark_project(&project).unwrap();

@@ -10,7 +10,7 @@ use crate::helpers::{fixture_path, AftProcess};
 /// Returns `(TempDir, root_path)`.
 fn setup_extract_fixture() -> (tempfile::TempDir, String) {
     let fixtures = fixture_path("extract_function");
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
 
     for entry in std::fs::read_dir(&fixtures).expect("read fixtures dir") {
         let entry = entry.expect("read entry");
@@ -136,7 +136,7 @@ fn extract_function_with_return_value() {
 /// pass `a` into the extracted helper.
 #[test]
 fn extract_function_plain_const_keeps_enclosing_function_scope() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("plain_const.ts");
     std::fs::write(
         &file,
@@ -174,7 +174,7 @@ fn extract_function_plain_const_keeps_enclosing_function_scope() {
 /// preserve relative nesting inside the extracted range.
 #[test]
 fn extract_function_preserves_nested_body_indentation() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("nested_indent.ts");
     std::fs::write(
         &file,
@@ -207,7 +207,7 @@ fn extract_function_preserves_nested_body_indentation() {
 /// shape instead of always rewriting to `const`.
 #[test]
 fn extract_function_preserves_let_return_binding() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("let_return.ts");
     std::fs::write(
         &file,
@@ -241,7 +241,7 @@ fn extract_function_preserves_let_return_binding() {
 
 #[test]
 fn extract_function_preserves_every_const_live_out_binding() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("multi_output.ts");
     std::fs::write(
         &file,

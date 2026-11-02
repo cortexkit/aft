@@ -151,7 +151,7 @@ fn semantic_lock_path(root: &Path, project_key: &str) -> PathBuf {
 
 #[test]
 fn search_lock_acquires_when_uncontended() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let cache_dir = search_cache_dir(dir.path());
     let lock_path = cache_dir.join("cache.lock");
 
@@ -163,7 +163,7 @@ fn search_lock_acquires_when_uncontended() {
 
 #[test]
 fn search_lock_serializes_concurrent_callers() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let cache_dir = Arc::new(search_cache_dir(dir.path()));
     let lock_path = cache_dir.join("cache.lock");
 
@@ -177,7 +177,7 @@ fn search_lock_serializes_concurrent_callers() {
 
 #[test]
 fn search_lock_reclaims_dead_owner() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let cache_dir = search_cache_dir(dir.path());
     let lock_path = cache_dir.join("cache.lock");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
@@ -190,7 +190,7 @@ fn search_lock_reclaims_dead_owner() {
 
 #[test]
 fn search_lock_blocks_cross_host() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let cache_dir = search_cache_dir(dir.path());
     let lock_path = cache_dir.join("cache.lock");
     write_synthetic_lock(&lock_path, cross_host_metadata());
@@ -207,7 +207,7 @@ fn search_lock_blocks_cross_host() {
 
 #[test]
 fn symbol_lock_acquires_when_uncontended() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = symbol_lock_path(storage.path(), "project");
 
     let guard = SymbolCacheLock::acquire(storage.path(), "project", storage.path())
@@ -219,7 +219,7 @@ fn symbol_lock_acquires_when_uncontended() {
 
 #[test]
 fn symbol_lock_serializes_concurrent_callers() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let root = Arc::new(storage.path().to_path_buf());
     let lock_path = symbol_lock_path(&root, "project");
 
@@ -233,7 +233,7 @@ fn symbol_lock_serializes_concurrent_callers() {
 
 #[test]
 fn symbol_lock_reclaims_dead_owner() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = symbol_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
 
@@ -246,7 +246,7 @@ fn symbol_lock_reclaims_dead_owner() {
 
 #[test]
 fn symbol_lock_blocks_cross_host() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = symbol_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, cross_host_metadata());
 
@@ -262,7 +262,7 @@ fn symbol_lock_blocks_cross_host() {
 
 #[test]
 fn semantic_lock_acquires_when_uncontended() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = semantic_lock_path(storage.path(), "project");
 
     let guard = SemanticIndexLock::acquire(storage.path(), "project", storage.path())
@@ -274,7 +274,7 @@ fn semantic_lock_acquires_when_uncontended() {
 
 #[test]
 fn semantic_lock_serializes_concurrent_callers() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let root = Arc::new(storage.path().to_path_buf());
     let lock_path = semantic_lock_path(&root, "project");
 
@@ -288,7 +288,7 @@ fn semantic_lock_serializes_concurrent_callers() {
 
 #[test]
 fn semantic_lock_reclaims_dead_owner() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = semantic_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, dead_owner_metadata());
 
@@ -301,7 +301,7 @@ fn semantic_lock_reclaims_dead_owner() {
 
 #[test]
 fn semantic_lock_blocks_cross_host() {
-    let storage = tempfile::tempdir().expect("create temp dir");
+    let storage = crate::test_helpers::tempdir();
     let lock_path = semantic_lock_path(storage.path(), "project");
     write_synthetic_lock(&lock_path, cross_host_metadata());
 

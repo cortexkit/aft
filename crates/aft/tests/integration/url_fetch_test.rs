@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 
 struct MockServer {
     addr: SocketAddr,
@@ -128,8 +127,8 @@ fn translated_outline(
 
 #[test]
 fn outline_url_array_fetches_each_html_target_like_a_single_url() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(2, |path, stream| {
         let body = match path.as_str() {
             "/docs/first.html" => {
@@ -170,8 +169,8 @@ fn outline_url_array_fetches_each_html_target_like_a_single_url() {
 
 #[test]
 fn outline_url_array_can_mix_a_json_url_and_a_local_file() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let file = project.path().join("module.ts");
     fs::write(&file, "export function localFunction() {}\n").unwrap();
     let server = spawn_mock_server(1, |path, stream| {
@@ -206,8 +205,8 @@ fn outline_url_array_can_mix_a_json_url_and_a_local_file() {
 
 #[test]
 fn outline_url_array_skips_unfetchable_url_with_its_fetch_reason() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let file = project.path().join("kept.ts");
     fs::write(&file, "export function kept() {}\n").unwrap();
     let server = spawn_mock_server(2, |path, stream| {
@@ -245,8 +244,8 @@ fn outline_url_array_skips_unfetchable_url_with_its_fetch_reason() {
 
 #[test]
 fn translated_zoom_http_path_fetches_local_heading() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |path, stream| {
         assert_eq!(path, "/docs/extension-authoring");
         write_response(
@@ -279,8 +278,8 @@ fn translated_zoom_http_path_fetches_local_heading() {
 
 #[test]
 fn translated_zoom_http_targets_fetch_local_heading() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     fs::write(
         project.path().join("http_client.rs"),
         "pub fn client() {}\n",
@@ -383,8 +382,8 @@ const DOCUSAURUS_HTML: &str = r##"<!doctype html>
 
 #[test]
 fn private_ip_blocked_at_fetch_time() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configure_with_storage(project.path(), storage.path());
 
     let resp = aft.send(
@@ -410,8 +409,8 @@ fn private_ip_blocked_at_fetch_time() {
 
 #[test]
 fn cache_hit_revalidates_ssrf() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "text/markdown", b"# Cached\n");
     });
@@ -451,8 +450,8 @@ fn cache_hit_revalidates_ssrf() {
 
 #[test]
 fn body_read_stall_aborts_within_timeout() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write!(
             stream,
@@ -498,7 +497,7 @@ fn body_read_stall_aborts_within_timeout() {
 
 #[test]
 fn redirect_revalidates_each_hop() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, move |_path, stream| {
         write!(
             stream,
@@ -532,7 +531,7 @@ fn redirect_revalidates_each_hop() {
 
 #[test]
 fn github_blob_url_fetches_from_raw_content_path() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let requested_path = Arc::new(Mutex::new(None));
     let requested_path_for_handler = Arc::clone(&requested_path);
     let server = spawn_mock_server(1, move |path, stream| {
@@ -566,8 +565,8 @@ fn github_blob_url_fetches_from_raw_content_path() {
 
 #[test]
 fn unsupported_content_type_rejected() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "application/pdf", b"%PDF");
     });
@@ -592,8 +591,8 @@ fn unsupported_content_type_rejected() {
 
 #[test]
 fn html_url_is_converted_to_markdown_before_cache_and_zoom_heading_is_clean() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(
             stream,
@@ -707,8 +706,8 @@ fn html_url_is_converted_to_markdown_before_cache_and_zoom_heading_is_clean() {
 
 #[test]
 fn url_outline_and_zoom_outputs_hide_cache_paths() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(
             stream,
@@ -817,8 +816,8 @@ const RUSTDOC_HTML: &str = r##"<!doctype html>
 
 #[test]
 fn html_url_rustdoc_headings_are_clean_without_chrome() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(2, |_path, stream| {
         write_response(
             stream,
@@ -907,8 +906,8 @@ fn html_url_split_code_block_outline_and_zoom_agree() {
     // Trimmed copy of the Chrome DevTools auto-connect page, whose <pre> closes
     // </code> in the middle of a JSON string.
     const FIXTURE: &str = include_str!("../fixtures/url_html/chrome_auto_connect.html");
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(2, |_path, stream| {
         write_response(
             stream,
@@ -1013,7 +1012,7 @@ fn html_url_split_code_block_outline_and_zoom_agree() {
 
 #[test]
 fn markdown_url_cache_content_is_unchanged() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let body = b"# Native Markdown\n\n```rs\nfn main() {}\n```\n";
     let server = spawn_mock_server(1, move |_path, stream| {
         write_response(stream, "200 OK", "text/markdown; charset=utf-8", body);
@@ -1043,8 +1042,8 @@ fn markdown_url_cache_content_is_unchanged() {
 
 #[test]
 fn json_outline_works() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(
             stream,
@@ -1092,8 +1091,8 @@ fn json_outline_works() {
 
 #[test]
 fn body_size_cap() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         let body = format!("# Large\n{}", "x".repeat(11 * 1024 * 1024));
         write!(
@@ -1145,8 +1144,8 @@ fn oversized_json_server() -> MockServer {
 
 #[test]
 fn url_json_download_and_miss_are_bounded() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = oversized_json_server();
     let url = server.url("/large.json");
     let mut aft = configure_with_storage(project.path(), storage.path());
@@ -1198,8 +1197,8 @@ fn url_json_download_and_miss_are_bounded() {
 
 #[test]
 fn url_json_top_level_value_is_capped() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = oversized_json_server();
     let mut aft = configure_with_storage(project.path(), storage.path());
     let resp = aft.send(
@@ -1250,7 +1249,7 @@ fn reply_ceiling_cuts_fake_tool_and_warns() {
 #[test]
 fn reply_ceiling_finalization_bounds_late_text() {
     crate::test_helpers::init_test_logger();
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
         aft::config::Config {
@@ -1293,8 +1292,8 @@ fn reply_ceiling_finalization_bounds_late_text() {
 
 #[test]
 fn url_markdown_rendering_and_heading_misses_are_bounded() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut body = format!("# Large\n{}\n", "界".repeat(100_000));
     for i in 0..1000 {
         body.push_str(&format!("## Heading {i} {}\nbody\n", "label".repeat(20)));
@@ -1331,8 +1330,8 @@ fn url_markdown_rendering_and_heading_misses_are_bounded() {
 
 #[test]
 fn url_plain_text_does_not_dump_body_on_heading_miss() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(
             stream,
@@ -1357,8 +1356,8 @@ fn url_plain_text_does_not_dump_body_on_heading_miss() {
 
 #[test]
 fn url_unknown_download_size_and_split_utf8_are_disclosed() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         let body = format!("{{\"tree\":\"{}\"}}", "界".repeat(4 * 1024 * 1024));
         write!(
@@ -1388,7 +1387,7 @@ fn url_unknown_download_size_and_split_utf8_are_disclosed() {
 
 #[test]
 fn cache_writes_atomically() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "application/json", br#"{"atomic":true}"#);
     });
@@ -1450,8 +1449,8 @@ fn ipv4_mapped_ipv6_ssrf_blocked() {
         assert!(is_private_ip_for_test(parsed), "{ip} should be private");
     }
 
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configure_with_storage(project.path(), storage.path());
     for host in ["[::ffff:127.0.0.1]", "[::1]", "[fe80::1]", "[fc00::1]"] {
         let resp = aft.send(
@@ -1509,7 +1508,7 @@ fn rfc6598_and_rfc2544_ranges_blocked() {
 
 #[test]
 fn concurrent_fetches_do_not_collide() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(2, |_path, stream| {
         write_response(stream, "200 OK", "application/json", br#"{"same":true}"#);
     });
@@ -1582,7 +1581,7 @@ fn transient_connect_failure_retries_then_succeeds() {
         }
     });
     let url = server.url("/doc.md");
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
 
     let start = Instant::now();
     let result = fetch_url_to_cache(
@@ -1626,7 +1625,7 @@ fn http_error_status_is_not_retried() {
         write_response(stream, "404 Not Found", "text/plain", b"nope\n");
     });
     let url = server.url("/missing.md");
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
 
     let result = fetch_url_to_cache(
         &url,
@@ -1650,8 +1649,8 @@ fn http_error_status_is_not_retried() {
 
 #[test]
 fn mjs_url_served_as_javascript_cached_and_outlined_as_js() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let body = br#"export function greet() { return "hi"; }
 export class Agent { run() {} }
 "#;
@@ -1693,8 +1692,8 @@ export class Agent { run() {} }
 
 #[test]
 fn rs_url_served_as_plain_text_cached_as_rust() {
-    let project = TempDir::new().unwrap();
-    let storage = TempDir::new().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let body = b"pub fn alpha() {}\npub struct Beta;\n";
     let server = spawn_mock_server(1, move |_path, stream| {
         write_response(stream, "200 OK", "text/plain", body);
@@ -1730,7 +1729,7 @@ fn rs_url_served_as_plain_text_cached_as_rust() {
 
 #[test]
 fn extensionless_javascript_url_falls_back_to_js_extension() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(
             stream,
@@ -1757,7 +1756,7 @@ fn extensionless_javascript_url_falls_back_to_js_extension() {
 
 #[test]
 fn extensionless_plain_text_still_cached_as_markdown() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "text/plain", b"# Hello\n");
     });
@@ -1779,7 +1778,7 @@ fn extensionless_plain_text_still_cached_as_markdown() {
 
 #[test]
 fn stale_wrong_extension_cache_entry_is_refetched() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let body = b"pub fn fresh() {}\n";
     let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fetch_count_handler = Arc::clone(&fetch_count);
@@ -1831,7 +1830,7 @@ fn stale_wrong_extension_cache_entry_is_refetched() {
 
 #[test]
 fn nul_bytes_in_source_body_rejected_as_binary() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "text/plain", b"pub fn x() {}\0");
     });
@@ -1853,7 +1852,7 @@ fn nul_bytes_in_source_body_rejected_as_binary() {
 
 #[test]
 fn url_with_query_resolves_ts_extension() {
-    let storage = TempDir::new().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let server = spawn_mock_server(1, |_path, stream| {
         write_response(stream, "200 OK", "text/plain", b"export const x = 1;\n");
     });
@@ -1885,8 +1884,8 @@ fn translated_zoom_extensionless_urls_preserve_comma_headings() {
             "<h1>Alpha, beta</h1><p>First section.</p><h1>Gamma, delta</h1><p>Second section.</p>",
         ),
     ] {
-        let project = TempDir::new().unwrap();
-        let storage = TempDir::new().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
         let server = spawn_mock_server(1, move |_path, stream| {
             write_response(stream, "200 OK", content_type, body.as_bytes());
         });

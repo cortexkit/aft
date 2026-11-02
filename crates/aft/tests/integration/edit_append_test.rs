@@ -50,7 +50,7 @@ fn tool_call(
 
 #[test]
 fn append_creates_file_when_missing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("created.txt");
 
     let mut aft = AftProcess::spawn();
@@ -69,7 +69,7 @@ fn append_creates_file_when_missing() {
 
 #[test]
 fn append_appends_to_existing_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("existing.txt");
     fs::write(&target, "line1\n").unwrap();
 
@@ -89,7 +89,7 @@ fn append_appends_to_existing_file() {
 
 #[test]
 fn append_reports_invalid_syntax() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("broken.ts");
     fs::write(&target, "export function broken() {\n").unwrap();
 
@@ -108,7 +108,7 @@ fn append_reports_invalid_syntax() {
 
 #[test]
 fn append_creates_parent_directories() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("newdir/subdir/file.txt");
 
     let mut aft = AftProcess::spawn();
@@ -127,7 +127,7 @@ fn append_creates_parent_directories() {
 
 #[test]
 fn append_tool_reports_nested_markdown_creation_and_identical_write() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join(
         ".cortexkit/internal-docs/investigations/new-investigation/permission-routing-correction.md",
     );
@@ -170,7 +170,7 @@ fn append_tool_reports_nested_markdown_creation_and_identical_write() {
 
 #[test]
 fn append_tool_reports_markdown_creation_with_existing_parent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("new.md");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, dir.path());
@@ -190,7 +190,7 @@ fn append_tool_reports_markdown_creation_with_existing_parent() {
 
 #[test]
 fn append_tool_reports_existing_markdown_append() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("existing.md");
     fs::write(&target, "# Existing\n").unwrap();
     let mut aft = AftProcess::spawn();
@@ -214,7 +214,7 @@ fn append_tool_reports_existing_markdown_append() {
 
 #[test]
 fn append_tool_undo_removes_created_markdown() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("nested/undo/created.md");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, dir.path());
@@ -242,7 +242,7 @@ fn append_tool_undo_removes_created_markdown() {
 
 #[test]
 fn append_tool_write_and_batch_creation_contracts() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("nested/write/created.md");
     let missing = dir.path().join("nested/batch/missing.md");
     let mut aft = AftProcess::spawn();
@@ -284,7 +284,7 @@ fn append_tool_write_and_batch_creation_contracts() {
 #[test]
 #[cfg(unix)]
 fn append_tool_reports_written_bytes_when_post_format_read_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     fs::write(root.join("biome.json"), "{}\n").unwrap();
     let bin = root.join("node_modules/.bin");
@@ -357,7 +357,7 @@ rm "$file"
 
 #[test]
 fn append_with_create_dirs_false_rejects_missing_parent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("newdir/subdir/file.txt");
 
     let mut aft = AftProcess::spawn();
@@ -378,7 +378,7 @@ fn append_with_create_dirs_false_rejects_missing_parent() {
 #[test]
 #[allow(non_snake_case)]
 fn append_rejects_missing_appendContent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("missing-content.txt");
 
     let mut aft = AftProcess::spawn();
@@ -406,7 +406,7 @@ fn append_rejects_missing_appendContent() {
 
 #[test]
 fn append_rejects_path_outside_project_root_when_restricted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     fs::create_dir_all(&root).unwrap();
     let outside = dir.path().join("outside.txt");
@@ -427,7 +427,7 @@ fn append_rejects_path_outside_project_root_when_restricted() {
 
 #[test]
 fn append_creates_backup_for_existing_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("backup.txt");
     fs::write(&target, "before\n").unwrap();
 
@@ -458,7 +458,7 @@ fn append_creates_backup_for_existing_file() {
 
 #[test]
 fn append_includes_diff_when_requested() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("diff.txt");
     fs::write(&target, "line1\n").unwrap();
 
@@ -497,7 +497,7 @@ fn append_includes_diff_when_requested() {
 #[test]
 fn append_include_diff_content_returns_full_before_after() {
     // The UI/plugin path opts into full content with `include_diff_content`.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("diff-content.txt");
     fs::write(&target, "line1\n").unwrap();
 
@@ -526,7 +526,7 @@ fn append_diff_omitted_when_not_requested() {
     // Inverse case: ensure that omitting include_diff still keeps the
     // response shape lean. Some plugins parse `diff` defensively, so
     // missing-vs-empty matters for response-size tests.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("no-diff.txt");
 
     let mut aft = AftProcess::spawn();
@@ -547,7 +547,7 @@ fn append_diff_omitted_when_not_requested() {
 
 #[test]
 fn append_accepts_snake_case_param() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("snake-case.txt");
 
     let mut aft = AftProcess::spawn();

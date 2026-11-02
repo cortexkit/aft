@@ -306,8 +306,8 @@ fn seed_delta_fixture(root: &Path, count: usize) -> Vec<PathBuf> {
 
 #[test]
 fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
-    let project = tempfile::tempdir().expect("create delta project");
-    let storage = tempfile::tempdir().expect("create delta storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 130);
     let mut live = build_delta_index(project.path(), &files);
 
@@ -365,8 +365,8 @@ fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
 
 #[test]
 fn semantic_dirty_frame_matches_structural_diff_exactly() {
-    let project = tempfile::tempdir().expect("create dirty parity project");
-    let storage = tempfile::tempdir().expect("create dirty parity storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let mut live = build_delta_index(project.path(), &files);
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
@@ -388,8 +388,8 @@ fn semantic_dirty_frame_matches_structural_diff_exactly() {
 
 #[test]
 fn semantic_segment_tombstone_masks_deleted_file() {
-    let project = tempfile::tempdir().expect("create tombstone project");
-    let storage = tempfile::tempdir().expect("create tombstone storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let deleted = files[3].clone();
     let mut live = build_delta_index(project.path(), &files);
@@ -410,8 +410,8 @@ fn semantic_segment_tombstone_masks_deleted_file() {
 
 #[test]
 fn semantic_segments_apply_in_refresh_order() {
-    let project = tempfile::tempdir().expect("create ordered segment project");
-    let storage = tempfile::tempdir().expect("create ordered segment storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let changed = files[0].clone();
     let mut live = build_delta_index(project.path(), &files);
@@ -449,8 +449,8 @@ fn semantic_segments_apply_in_refresh_order() {
 
 #[test]
 fn semantic_compaction_folds_superseded_chunks_once() {
-    let project = tempfile::tempdir().expect("create compaction project");
-    let storage = tempfile::tempdir().expect("create compaction storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let changed = files[0].clone();
     let mut live = build_delta_index(project.path(), &files);
@@ -491,8 +491,8 @@ fn semantic_compaction_folds_superseded_chunks_once() {
 
 #[test]
 fn semantic_compaction_starts_after_sixty_four_segments() {
-    let project = tempfile::tempdir().expect("create bounded compaction project");
-    let storage = tempfile::tempdir().expect("create bounded compaction storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 1_000);
     let changed = files[0].clone();
     let mut live = build_delta_index(project.path(), &files);
@@ -591,8 +591,8 @@ fn semantic_segment_sigkill_child() {
 fn semantic_segment_sigkill_preserves_previous_state_and_retry_recovers() {
     use std::os::unix::process::ExitStatusExt;
 
-    let project = tempfile::tempdir().expect("create SIGKILL project");
-    let storage = tempfile::tempdir().expect("create SIGKILL storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let changed = files[0].clone();
     let mut original = build_delta_index(project.path(), &files);
@@ -686,8 +686,8 @@ fn semantic_compaction_swap_child() {
 #[cfg(unix)]
 #[test]
 fn semantic_reader_open_during_compaction_sees_complete_generation() {
-    let project = tempfile::tempdir().expect("create reader project");
-    let storage = tempfile::tempdir().expect("create reader storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let changed = files[0].clone();
     let mut live = build_delta_index(project.path(), &files);
@@ -734,8 +734,8 @@ fn semantic_reader_open_during_compaction_sees_complete_generation() {
 #[cfg(unix)]
 #[test]
 fn semantic_append_waits_for_paused_compaction_and_lands() {
-    let project = tempfile::tempdir().expect("create contention project");
-    let storage = tempfile::tempdir().expect("create contention storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let files = seed_delta_fixture(project.path(), 20);
     let first = files[0].clone();
     let second = files[1].clone();
@@ -819,8 +819,8 @@ fn build_v1_index_bytes(file: &Path) -> Vec<u8> {
 
 #[test]
 fn write_and_read_roundtrip_preserves_semantic_entries() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (index, source_file) = build_test_index(project.path());
 
     index.write_to_disk(storage.path(), "roundtrip-project");
@@ -850,7 +850,7 @@ fn write_and_read_roundtrip_preserves_semantic_entries() {
 
 #[test]
 fn read_from_nonexistent_path_returns_none() {
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
 
     let restored = SemanticIndex::read_from_disk(
         storage.path(),
@@ -867,7 +867,7 @@ fn read_from_nonexistent_path_returns_none() {
 fn read_from_corrupt_file_returns_none_and_logs_warning() {
     init_test_logger();
 
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let semantic_dir = storage.path().join("semantic").join("corrupt-project");
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
     let semantic_file = semantic_dir.join("semantic.bin");
@@ -899,7 +899,7 @@ fn read_from_corrupt_file_returns_none_and_logs_warning() {
 fn semantic_cache_inconsistent_lengths_rebuilds() {
     init_test_logger();
 
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let semantic_dir = storage.path().join("semantic").join("drift-project");
     fs::create_dir_all(&semantic_dir).expect("create semantic dir");
     let semantic_file = semantic_dir.join("semantic.bin");
@@ -943,8 +943,8 @@ fn semantic_cache_inconsistent_lengths_rebuilds() {
 fn mismatched_load_preserves_cache_until_replacement_is_written() {
     init_test_logger();
 
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (mut index, _source_file) = build_test_index(project.path());
     let project_key = "mismatch-project";
     let semantic_file = storage
@@ -1022,8 +1022,8 @@ fn mismatched_load_preserves_cache_until_replacement_is_written() {
 
 #[test]
 fn read_only_mismatch_returns_none_without_touching_shared_cache() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (mut index, _source_file) = build_test_index(project.path());
     let project_key = "readonly-mismatch-project";
     let semantic_file = storage
@@ -1067,7 +1067,7 @@ fn read_only_mismatch_returns_none_without_touching_shared_cache() {
 
 #[test]
 fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let old_file = project.path().join("src/old.rs");
     let new_file = project.path().join("src/new.rs");
     fs::create_dir_all(old_file.parent().expect("source parent")).expect("create src dir");
@@ -1139,8 +1139,8 @@ fn live_refresh_retries_deferred_new_file_after_deletion_frees_capacity() {
 
 #[test]
 fn stale_file_detected_after_deletion() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (index, source_file) = build_test_index(project.path());
 
     index.write_to_disk(storage.path(), "stale-project");
@@ -1159,8 +1159,8 @@ fn stale_file_detected_after_deletion() {
 
 #[test]
 fn semantic_stale_check_detects_same_mtime_same_size_content_change() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     fs::create_dir_all(source_file.parent().expect("source parent")).expect("create src dir");
     fs::write(
@@ -1257,7 +1257,7 @@ fn semantic_stale_check_detects_same_mtime_same_size_content_change() {
 
 #[test]
 fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let legacy_file = storage.path().join("src/lib.rs");
     fs::create_dir_all(legacy_file.parent().expect("legacy parent")).expect("create src dir");
     fs::write(&legacy_file, "pub fn legacy_symbol() {}\n").expect("write legacy source file");
@@ -1311,8 +1311,8 @@ fn read_from_disk_rebuilds_v1_cache_when_fingerprint_is_expected() {
 /// staleness check survives it.
 #[test]
 fn write_roundtrip_preserves_subsecond_mtime_precision() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (index, source_file) = build_test_index(project.path());
 
     // Sanity: the live file must actually have subsecond mtime for this
@@ -1364,8 +1364,8 @@ fn write_roundtrip_preserves_subsecond_mtime_precision() {
 /// writer replaces them.
 #[test]
 fn read_from_disk_rebuilds_v2_cache_for_v4_snippets() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let (index, source_file) = build_test_index(project.path());
 
     // Construct a V2 blob by hand (matches pre-v0.15.2 serialisation).
@@ -1478,7 +1478,7 @@ fn from_bytes_rejects_corrupt_v3_cache_payloads() {
 
     // Case 1: nanos >= 1e9 → reject with a specific message.
     let bad_nanos = build_v3_with_mtime(0, 2_000_000_000);
-    let root = tempfile::tempdir().expect("semantic cache root");
+    let root = crate::test_helpers::tempdir();
     let err = SemanticIndex::from_bytes(&bad_nanos, root.path())
         .expect_err("V3 with nanos >= 1e9 must be rejected");
     assert!(

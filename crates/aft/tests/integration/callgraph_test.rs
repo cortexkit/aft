@@ -2276,7 +2276,7 @@ fn callgraph_trace_to_no_entry_points() {
 
 #[test]
 fn callgraph_default_import_targets_real_default_export_name() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path();
     let main = root.join("main.ts");
     let helper = root.join("helper.ts");
@@ -2764,7 +2764,7 @@ fn callgraph_navigation_rejects_paths_outside_project_root() {
     let fixtures = fixture_path("callgraph");
     let root = fixtures.display().to_string();
 
-    let outside = tempfile::tempdir().expect("create outside temp dir");
+    let outside = crate::test_helpers::tempdir();
     let outside_file = outside.path().join("outside.ts");
     fs::write(
         &outside_file,

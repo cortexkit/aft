@@ -10,7 +10,7 @@ use aft::inspect::oxc_engine::{
 };
 
 fn fixture_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     let paths = files
@@ -144,7 +144,7 @@ fn oxc_engine_facts_cache_is_source_type_aware() {
 fn oxc_engine_skips_symlinked_inputs_outside_project_root() {
     use std::os::unix::fs::symlink;
 
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(root.join("src")).expect("create project src");
     let inside = write_file(&root, "src/inside.ts", "export const inside = 1;\n");
@@ -1851,7 +1851,7 @@ fn oxc_engine_warm_facts_cache_resolves_3k_file_corpus_under_perf_gate() {
     const EXPECTED_CORPUS_HASH: &str =
         "466bda6471cd346a9d41a55d47548733fc0054f2e02699f390cd5306927bbf7f";
 
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(root.join("src")).expect("create src");
     let mut paths = Vec::with_capacity(FILE_COUNT);

@@ -37,8 +37,8 @@ struct QueryFixture {
 }
 
 fn query_fixture(with_graph: bool) -> QueryFixture {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let root = crate::test_helpers::tempdir();
     let root_path = std::fs::canonicalize(root.path()).unwrap();
     let source = b"function target() { return 1; }\nexport function caller() { return target(); }\ncaller();\n";
     std::fs::write(root_path.join("fixture.ts"), source).unwrap();
@@ -387,8 +387,8 @@ impl QueryState for Driver {
 
 #[test]
 fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let root = crate::test_helpers::tempdir();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-test").unwrap();
     let access = ViewAccess::Owner(
         registry
@@ -448,8 +448,8 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
 
 #[test]
 fn store_clone_pins_old_blobs_after_swap_and_gc() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let root = crate::test_helpers::tempdir();
     let registry = FamilyRegistry::open(storage.path(), "callgraph-pin-test").unwrap();
     let view = registry
         .register_view_with_storage(registry.storage(), "scope-pin", root.path())

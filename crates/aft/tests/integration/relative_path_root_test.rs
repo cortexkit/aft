@@ -12,8 +12,8 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn relative_write_read_and_delete_touch_only_the_project_root() {
-    let project = tempfile::tempdir().expect("project dir");
-    let cwd = tempfile::tempdir().expect("daemon cwd");
+    let project = crate::test_helpers::tempdir();
+    let cwd = crate::test_helpers::tempdir();
     std::fs::write(project.path().join("decoy.txt"), "project decoy").unwrap();
     std::fs::write(cwd.path().join("decoy.txt"), "cwd decoy").unwrap();
 

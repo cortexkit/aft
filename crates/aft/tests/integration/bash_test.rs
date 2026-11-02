@@ -88,7 +88,7 @@ fn wait_for_terminal_status(aft: &mut AftProcess, task_id: &str) -> serde_json::
 #[cfg(unix)]
 #[test]
 fn bash_inherits_login_shell_enriched_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let home = dir.path().join("home");
     let custom_bin = home.join(".custom/bin");
     let cargo_bin = home.join(".cargo/bin");
@@ -166,7 +166,7 @@ eval "$2"
 #[cfg(unix)]
 #[test]
 fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("storage");
     std::fs::create_dir_all(&project).unwrap();
@@ -248,7 +248,7 @@ fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
 #[cfg(unix)]
 #[test]
 fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let project = dir.path().join("project");
     let storage = dir.path().join("storage");
     let upstream = dir.path().join("upstream");
@@ -352,7 +352,7 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn sandboxed_head_shell_without_a_ticket_keeps_gh_passthrough() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let base = dir.path().canonicalize().unwrap();
     let project = base.join("project");
     let storage = base.join("storage");
@@ -588,7 +588,7 @@ fn bash_rejects_blocked_env_vars() {
 #[test]
 fn bash_rejects_invalid_pty_dimensions() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let configure = aft.send(
         &serde_json::json!({
             "id": "cfg-bg",
@@ -667,7 +667,7 @@ fn bash_rejects_invalid_pty_dimensions() {
 #[test]
 fn bash_piped_runner_exit_status_is_not_hidden() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     write_executable_shim(
@@ -732,8 +732,8 @@ fn bash_piped_runner_exit_status_is_not_hidden() {
 #[cfg(target_os = "linux")]
 #[test]
 fn non_pty_foreground_and_deferred_bash_children_get_isolated_sessions() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configure = aft.send(
         &serde_json::json!({
@@ -851,8 +851,8 @@ fn interactive_zsh_terminal_probe_child() {
         return;
     }
     let zsh = which::which("zsh").expect("parent skips this probe when zsh is unavailable");
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let configure = aft.send(
         &serde_json::json!({
@@ -909,7 +909,7 @@ fn interactive_zsh_terminal_probe_child() {
 #[test]
 fn bash_timeout_terminates_shell_process_group_grandchild() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let pid_file = dir.path().join("sleep.pid");
     let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
 
@@ -988,8 +988,8 @@ fn assert_changed_files_completion_with_git_budget(
     exhausted: bool,
     memory_stop: bool,
 ) {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     for args in [
         vec!["init", "-q"],
         vec!["config", "user.email", "test@example.invalid"],
@@ -1025,6 +1025,8 @@ fn assert_changed_files_completion_with_git_budget(
             std::ffi::OsStr::new("1"),
         ),
     ]);
+    // The changed-files watcher belongs to a project's background indexing.
+    crate::test_helpers::project::mark_project(project.path()).unwrap();
     let mut bash_config = serde_json::json!({"changed_files": "diff", "rewrite": false});
     if memory_stop {
         bash_config["memory_limit_mib"] = serde_json::json!(64);
@@ -1035,6 +1037,8 @@ fn assert_changed_files_completion_with_git_budget(
         "config": user_config(serde_json::json!({"bash": bash_config, "sandbox": {"profile": {"head": "off"}}}))
     }).to_string());
     assert_eq!(configured["success"], true, "{configured}");
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["classification"], "project", "{folder}");
     // Establish native service readiness before testing command-exit delivery.
     // The separate saturation regression deliberately starts without warming up.
     let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1202,8 +1206,8 @@ fn assert_changed_file_image(report: &serde_json::Value, name: &str, exhausted: 
 #[cfg(unix)]
 #[test]
 fn bash_changed_files_flush_timeout_reports_incomplete() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
         (

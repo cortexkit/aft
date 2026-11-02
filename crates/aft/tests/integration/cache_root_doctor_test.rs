@@ -122,7 +122,7 @@ struct StorageLockChild {
 
 impl StorageLockChild {
     fn spawn(storage: &Path, home: &Path) -> Self {
-        let signals = tempfile::tempdir().unwrap();
+        let signals = crate::test_helpers::tempdir();
         let mut command = fixture_command("cache_root_storage_lock_child");
         command
             .env("AFT_TEST_CACHE_STORAGE_LOCK_CHILD", storage)
@@ -210,7 +210,7 @@ fn cache_root_delayed_child() {
 
 #[test]
 fn cache_root_doctor_child_waits_have_named_deadlines() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let mut child = BoundedChild::spawn(
         &mut fixture_command("cache_root_delayed_child"),
         "delayed exit fixture",
@@ -240,7 +240,7 @@ fn cache_root_doctor_child_waits_have_named_deadlines() {
 #[test]
 fn cache_root_doctor_process_scan_timeout_is_reported() {
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     fs::create_dir(temp.path().join("storage")).unwrap();
     let bin = temp.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -295,7 +295,7 @@ fn tree(root: &Path) -> Vec<PathBuf> {
 #[cfg(unix)]
 #[test]
 fn cache_root_doctor_fresh_install_without_storage_succeeds_and_creates_nothing() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     // No daemon is listed, so a scan (if one ran) could not refuse.
@@ -328,7 +328,7 @@ fn cache_root_doctor_fresh_install_without_storage_succeeds_and_creates_nothing(
 #[cfg(unix)]
 #[test]
 fn cache_root_doctor_prelease_process_snapshot_refuses_cleanup() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let storage = temp.path().join("storage");
     let precious = canary(&storage, "index/keep");
     let path = process_snapshot_fixture(
@@ -439,7 +439,7 @@ fn native_doctor_fixes_only_marked_roots_and_old_cache_cleanup_is_explicit() {
 #[test]
 #[ignore = "real-volume scenario supervised by the cache-root doctor test"]
 fn cache_root_doctor_body_child() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     #[cfg(unix)]
     let process_path = process_snapshot_fixture(temp.path(), "");
     // First enrollment requires a real second filesystem, chosen by the

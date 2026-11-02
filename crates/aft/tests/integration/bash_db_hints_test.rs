@@ -62,7 +62,7 @@ fn uncollected_completion(aft: &mut AftProcess, storage: &std::path::Path, task:
 #[test]
 fn db_hints_foreground_trailer_independent_of_compression_and_switch() {
     for enabled in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn();
         configure(&mut aft, &dir, enabled);
         for compressed in [true, false] {
@@ -91,7 +91,7 @@ fn db_hints_foreground_trailer_independent_of_compression_and_switch() {
 #[test]
 fn db_hints_production_shapes_cd_uri_and_var_assignment() {
     for enabled in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn();
         configure(&mut aft, &dir, enabled);
         let dir_str = dir.path().to_string_lossy().to_string();
@@ -143,7 +143,7 @@ fn db_hints_production_shapes_cd_uri_and_var_assignment() {
 
 #[test]
 fn db_hints_background_completion_keeps_trailer_after_preview_cap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &dir, true);
     let launched = aft.send(
@@ -175,7 +175,7 @@ fn db_hints_background_completion_keeps_trailer_after_preview_cap() {
 
 #[test]
 fn db_hints_terminal_pty_status_and_completion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &dir, true);
     let launched = aft.send(

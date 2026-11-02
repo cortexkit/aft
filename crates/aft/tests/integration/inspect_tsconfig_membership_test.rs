@@ -11,7 +11,7 @@ use aft::protocol::RawRequest;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)

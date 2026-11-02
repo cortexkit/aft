@@ -223,7 +223,7 @@ impl SubcBridgeTestRoots {
     fn new() -> Self {
         let root1 = crate::test_helpers::project::project_tempdir();
         let root2 = crate::test_helpers::project::project_tempdir();
-        let failed_root = tempfile::tempdir().expect("failed root tempdir");
+        let failed_root = crate::test_helpers::tempdir();
         let push_burst_root = crate::test_helpers::project::project_tempdir();
         let slow_root = crate::test_helpers::project::project_tempdir();
         let callgraph_root = crate::test_helpers::project::project_tempdir();
@@ -243,8 +243,8 @@ impl SubcBridgeTestRoots {
             "pub fn caller() { callee(); }\npub fn callee() {}\n",
         )
         .expect("callgraph source file");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
 
         Self {
             root1,
@@ -380,7 +380,7 @@ fn remove_test_env(key: &'static str) -> EnvVarGuard {
 
 #[test]
 fn storage_override_holds_shared_process_settings_guard() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     {
         let _setting = set_test_env("AFT_STORAGE_DIR", storage.path().to_str().unwrap());
         assert!(
@@ -1981,8 +1981,8 @@ where
     let _serial = bridge_test_serial_guard();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let _env_lock_owner = BridgeRunnerEnvLockOwner::claim();
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_dir = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
     let user_config_path = storage.path().join("user-aft.jsonc");
 
@@ -2998,7 +2998,7 @@ fn subc_bridge_deleted_root_reclaim_ends_streams_while_database_initializes() {
             let _ = std::fs::remove_file(&self.resume);
         }
     }
-    let gate_dir = tempfile::tempdir().unwrap();
+    let gate_dir = crate::test_helpers::tempdir();
     let gates = DatabaseGates {
         open: gate_dir.path().join("database-open"),
         resume: gate_dir.path().join("database-resume"),
@@ -3220,9 +3220,9 @@ fn subc_bridge_first_party_bash_permission_required_stays_in_band() {
 
 #[test]
 fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -4039,7 +4039,7 @@ fn slow_shell_startup_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
@@ -4074,7 +4074,7 @@ fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
@@ -4105,7 +4105,7 @@ fn slow_started_promotion_dispatch(req: RawRequest, ctx: &AppContext) -> Respons
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
-    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let probe = crate::test_helpers::tempdir();
     let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive",
@@ -4170,9 +4170,9 @@ fn malformed_fed_bind_production_dispatch(req: RawRequest, ctx: &AppContext) -> 
 fn subc_rejects_forwarded_configure_tool_call_in_production() {
     S1_ATTACKER_CONFIG_REACHED_DISPATCH.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -4380,9 +4380,9 @@ async fn drive_s1_rejection_daemon(
 /// the retry and subsequent route bind must still work normally.
 #[test]
 fn subc_registers_not_ready_and_noop_warmer_flips_ready_without_live_roots_query() {
-    let root = tempfile::tempdir().expect("root tempdir");
-    let storage = tempfile::tempdir().expect("storage tempdir");
-    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let root = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let conn_dir = crate::test_helpers::tempdir();
     let conn_path = conn_dir.path().join("subc-connection.json");
 
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
@@ -10658,7 +10658,7 @@ async fn reclaim_bound_test_root_with_database_gates(
     database_gates: Option<(&std::path::Path, &std::path::Path)>,
 ) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
     let mut session = open_fake_daemon_session(input).await;
-    let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let root_dir = crate::test_helpers::tempdir();
     let root = root_dir.path();
     let root_id = ProjectRootId::from_path(root).expect("reclaimed root id");
     for channel in [121, 122, 123] {
@@ -10889,7 +10889,7 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
     // bound is one no code path will ever close, not a slow one.
     const TERMINAL_BOUND: Duration = Duration::from_secs(4);
 
-    let reclaimed_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let reclaimed_dir = crate::test_helpers::tempdir();
     let reclaimed_root = reclaimed_dir.path().to_path_buf();
     let reclaimed_root_id = ProjectRootId::from_path(&reclaimed_root).expect("reclaimed root id");
 

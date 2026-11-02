@@ -9,7 +9,7 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
 
     // Copy fixture to temp dir so we don't mutate the original
     let fixture = fixture_path("ambiguous.ts");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("ambiguous.ts");
     std::fs::copy(&fixture, &target).unwrap();
 

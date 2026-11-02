@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::helpers::{user_config, AftProcess};
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let response = aft.send(
         &json!({
             "id": "cfg-drain-bg",

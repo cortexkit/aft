@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::helpers::AftProcess;
 
 fn inspect_cycles(files: &[(&str, &str)]) -> Value {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = crate::test_helpers::tempdir();
     let project = temp.path().join("project");
     let storage = temp.path().join("storage");
     fs::create_dir_all(&project).expect("create project");

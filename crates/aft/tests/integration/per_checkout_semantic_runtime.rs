@@ -264,7 +264,7 @@ struct Repository {
 }
 
 fn repository() -> Repository {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let main = base.join("main");
     std::fs::create_dir_all(&main).unwrap();
@@ -472,7 +472,7 @@ fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
     let repo = repository();
     write(&repo.main, "src/watchdog.rs",
         "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n");
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
     let runtime = ctx.checkout_semantic_runtime().unwrap();
@@ -568,7 +568,7 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let chunks = unique_chunks(&repo.main);
     assert!(chunks > 0);
 
@@ -616,7 +616,7 @@ fn views_on_semantic_member_stores_no_call_graph_database() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = Arc::new(
         AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -776,7 +776,7 @@ fn two_process_single_flight(commit_main: bool, commit_linked: bool) {
     let gate = Arc::new(EmbeddingGate::default());
     let server = MockEmbedder::with_gate(Some(Arc::clone(&gate)));
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let chunks = unique_chunks(&repo.main);
     {
         let warm = configure(&repo.main, storage.path(), &server, true);
@@ -959,7 +959,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let chunks = unique_chunks(&repo.main);
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
@@ -996,7 +996,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
         "the new model must embed every chunk once, reusing nothing of the old one"
     );
 
-    let legacy_storage = tempfile::tempdir().unwrap();
+    let legacy_storage = crate::test_helpers::tempdir();
     let legacy = Arc::new(
         AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -1036,7 +1036,7 @@ fn views_on_back_to_back_configures_leave_one_worker() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let chunks = unique_chunks(&repo.main);
     let ctx = Arc::new(
         AppContext::new(
@@ -1081,8 +1081,8 @@ fn views_on_search_ranks_like_views_off_on_the_same_content() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let legacy_storage = tempfile::tempdir().unwrap();
-    let views_storage = tempfile::tempdir().unwrap();
+    let legacy_storage = crate::test_helpers::tempdir();
+    let views_storage = crate::test_helpers::tempdir();
 
     let legacy = configure(&repo.main, legacy_storage.path(), &server, false);
     wait_legacy_ready(&legacy);
@@ -1168,7 +1168,7 @@ fn views_on_aft_and_outside_edits_reach_the_fill() {
     unsafe { std::env::set_var("AFT_SEMANTIC_QUIET_WINDOW_MS", "50") };
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
 
@@ -1309,7 +1309,7 @@ fn views_on_search_after_idle_eviction_reports_the_lane_reloading() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = configure(&repo.main, storage.path(), &server, true);
     wait_views_filled(&ctx);
     evict_until_lane_released(&ctx);
@@ -1353,7 +1353,7 @@ fn views_off_search_after_idle_eviction_reports_the_index_reloading() {
     let _settings = crate::test_helpers::without_storage_override();
     let server = MockEmbedder::start();
     let repo = repository();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let ctx = configure(&repo.main, storage.path(), &server, false);
     wait_legacy_ready(&ctx);
     evict_once_idle(&ctx);

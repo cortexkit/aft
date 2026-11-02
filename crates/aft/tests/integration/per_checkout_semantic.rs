@@ -297,9 +297,9 @@ fn semantic_parity_with_cold_rebuild_across_edit_schedules() {
     for schedule in
         parity_harness::standard_schedules("src/base.rs", base.as_bytes(), "src/ignored.rs")
     {
-        let storage = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
+        let root = crate::test_helpers::tempdir();
+        let scratch = crate::test_helpers::tempdir();
         tree(root.path(), 3);
         write(root.path(), "src/base.rs", base);
         write(root.path(), "src/ignored.rs", "pub fn hidden_item() {}\n");
@@ -420,9 +420,9 @@ fn semantic_parity_with_cold_rebuild_across_edit_schedules() {
 #[test]
 fn embed_counts_views_and_sessions_share_identical_content() {
     const FILES: usize = 40;
-    let storage = tempfile::tempdir().unwrap();
-    let first = tempfile::tempdir().unwrap();
-    let second = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let first = crate::test_helpers::tempdir();
+    let second = crate::test_helpers::tempdir();
     tree(first.path(), FILES);
     tree(second.path(), FILES);
     let (_, chunks) = cold(first.path(), "model-a", "load");
@@ -473,7 +473,7 @@ fn embed_counts_views_and_sessions_share_identical_content() {
     );
 
     // A view of an older branch: 30 modules as on main, 10 changed, 5 extra.
-    let older = tempfile::tempdir().unwrap();
+    let older = crate::test_helpers::tempdir();
     tree(older.path(), FILES);
     for index in 0..10 {
         write(
@@ -568,9 +568,9 @@ fn embed_counts_views_and_sessions_share_identical_content() {
 /// key, the other waits for it. The model sees each chunk once.
 #[test]
 fn concurrent_fills_of_two_views_make_one_model_call_per_chunk() {
-    let storage = tempfile::tempdir().unwrap();
-    let first = tempfile::tempdir().unwrap();
-    let second = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let first = crate::test_helpers::tempdir();
+    let second = crate::test_helpers::tempdir();
     tree(first.path(), 12);
     tree(second.path(), 12);
     let (_, chunks) = cold(first.path(), "model-a", "load");
@@ -689,8 +689,8 @@ fn texts_of(storage: &Path, label: &str) -> usize {
 /// another model then scores none of those vectors.
 #[test]
 fn semantic_real_restart_reuses_embeddings_across_sessions() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let root = crate::test_helpers::tempdir();
     tree(root.path(), 6);
     let (cold_rows, chunks) = cold(root.path(), "model-a", "load path");
     assert!(spawn(storage.path(), root.path(), "fill", "one")
@@ -740,8 +740,8 @@ fn semantic_real_restart_reuses_embeddings_across_sessions() {
 #[cfg(unix)]
 #[test]
 fn semantic_forced_kill_during_fill_keeps_pending_and_stored_work() {
-    let storage = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let root = crate::test_helpers::tempdir();
     tree(root.path(), 4);
     let mut child = spawn(storage.path(), root.path(), "park", "killed");
     let started = std::time::Instant::now();

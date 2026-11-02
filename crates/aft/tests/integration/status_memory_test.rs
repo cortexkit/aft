@@ -20,8 +20,8 @@ fn status_request() -> RawRequest {
 
 #[test]
 fn status_memory_attributes_every_registered_root_and_exposes_residual() {
-    let first = tempfile::tempdir().expect("first root");
-    let second = tempfile::tempdir().expect("second root");
+    let first = crate::test_helpers::tempdir();
+    let second = crate::test_helpers::tempdir();
     let first_root = std::fs::canonicalize(first.path()).expect("canonical first root");
     let second_root = std::fs::canonicalize(second.path()).expect("canonical second root");
     let app = App::default_shared();

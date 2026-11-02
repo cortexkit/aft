@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use super::helpers::{user_config, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
@@ -299,7 +299,7 @@ fn grep_legitimate_single_path_with_space_is_not_split() {
 #[test]
 fn grep_multi_path_rejects_outside_fragment_when_restricted() {
     let project = setup_project(&[("a/one.ts", "const value = 'needle';\n")]);
-    let outside = tempfile::tempdir().expect("outside temp dir");
+    let outside = crate::test_helpers::tempdir();
     fs::write(
         outside.path().join("outside.ts"),
         "const value = 'needle';\n",

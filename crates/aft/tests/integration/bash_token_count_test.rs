@@ -73,7 +73,7 @@ fn wait_for_completed_frame(aft: &mut AftProcess, task_id: &str) -> Value {
 }
 
 fn run_background_command(command: &str) -> Value {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure_background(&mut aft, project.path());
     let task_id = spawn_background(&mut aft, command, None);
@@ -170,7 +170,7 @@ fn bash_completed_frame_compressed_tokens_reflect_compression() {
         return;
     }
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let mut command = Command::new("git");
     assert!(
         crate::test_helpers::apply_hermetic_git_env(command.current_dir(project.path()))

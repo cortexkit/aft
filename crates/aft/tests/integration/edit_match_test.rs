@@ -27,7 +27,7 @@ fn configure_with_backup_disabled(aft: &mut AftProcess, root: &std::path::Path) 
 
 #[test]
 fn edit_match_glob_rolls_back_prior_files_when_later_write_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let a = root.join("a.ts");
     let b = root.join("b.ts");
@@ -72,7 +72,7 @@ fn edit_match_glob_rolls_back_when_any_file_becomes_syntax_invalid() {
     // `syntax_valid: false` and left edits applied, which silently broke
     // the project. The new contract: agent gets a clear `syntax_invalid`
     // error and the working tree is unchanged.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let a = root.join("a.ts");
     let b = root.join("b.ts");
@@ -129,7 +129,7 @@ fn edit_match_glob_succeeds_when_all_files_remain_syntax_valid() {
     // syntax-valid, the batch commits normally and per-file results report
     // syntax_valid: true. This guards against an over-eager rollback that
     // would block legitimate batch edits.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let a = root.join("a.ts");
     let b = root.join("b.ts");
@@ -162,7 +162,7 @@ fn edit_match_glob_succeeds_when_all_files_remain_syntax_valid() {
 
 #[test]
 fn edit_match_omits_syntax_valid_when_language_unsupported() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("notes.unusual_extension");
     fs::write(&file, "hello old world\n").unwrap();
 
@@ -196,7 +196,7 @@ fn edit_match_omits_syntax_valid_when_language_unsupported() {
 // verbatim used to merge the last replaced line with the following line.
 #[test]
 fn edit_match_table_fuzzy_preserves_padding_but_exact_removes_requested_pipe() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("table.md");
     fs::write(&file, "  | For  a task | b |  \n  | For  a task | b |  \n").unwrap();
     let mut aft = AftProcess::spawn();
@@ -237,7 +237,7 @@ fn edit_match_table_fuzzy_preserves_padding_but_exact_removes_requested_pipe() {
 
 #[test]
 fn edit_match_fuzzy_preserves_trailing_newline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("greet.js");
     // Trailing spaces after two lines force the rstrip fuzzy pass (pass 2),
     // since the clean `match` below won't match byte-for-byte.
@@ -278,7 +278,7 @@ fn edit_match_fuzzy_preserves_trailing_newline() {
 
 #[test]
 fn edit_match_replace_all_rejects_overlapping_fuzzy_matches() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("over.js");
     // Trailing spaces defeat the exact (pass 1) matcher and force the fuzzy
     // line pass, which steps line-by-line. A 2-line needle over three identical
@@ -319,7 +319,7 @@ fn edit_match_replace_all_rejects_overlapping_fuzzy_matches() {
 
 #[test]
 fn edit_match_reflow_replaces_formatter_split() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("split.js");
     let original =
         "function demo() {\n  const value = alpha +\n    beta +\n    gamma;\n  return value;\n}\n";
@@ -347,7 +347,7 @@ fn edit_match_reflow_replaces_formatter_split() {
 
 #[test]
 fn edit_match_reflow_replaces_formatter_join() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("join.js");
     let original = "function demo() {\n  const value = alpha + beta + gamma;\n}\n";
     fs::write(&file, original).unwrap();
@@ -374,7 +374,7 @@ fn edit_match_reflow_replaces_formatter_join() {
 
 #[test]
 fn edit_match_reflow_ambiguous_does_not_edit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("ambiguous.js");
     let original =
         "const value = alpha +\n  beta +\n  gamma;\n\nconst value = alpha +\n  beta +\n  gamma;\n";
@@ -409,7 +409,7 @@ fn edit_match_reflow_ambiguous_does_not_edit() {
 
 #[test]
 fn edit_match_near_miss_reports_candidate_and_divergence() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("near_miss_detail.js");
     let original =
         "fn calculate() {\n    let first = 1;\n    let actual = 2;\n    let last = 3;\n}\n";
@@ -440,7 +440,7 @@ fn edit_match_near_miss_reports_candidate_and_divergence() {
 
 #[test]
 fn edit_match_diagnostics_flow_through_tool_call_ndjson() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let near_file = dir.path().join("tool_call_near.rs");
     let ambiguous_file = dir.path().join("tool_call_ambiguous.rs");
     fs::write(
@@ -501,7 +501,7 @@ fn edit_match_diagnostics_flow_through_tool_call_ndjson() {
 
 #[test]
 fn edit_match_reflow_near_miss_does_not_edit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("near_miss.js");
     let original = "const value = alpha +\n  beta +\n  gamma;\n";
     fs::write(&file, original).unwrap();

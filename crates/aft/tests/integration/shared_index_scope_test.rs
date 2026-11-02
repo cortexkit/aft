@@ -45,7 +45,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().expect("fixture dir");
+    let dir = crate::test_helpers::tempdir();
     // Git refuses Windows verbatim (`\\?\`) paths, which bare
     // `fs::canonicalize` returns there, so use the product's normalized form.
     let base = canonicalize_like_product(dir.path());

@@ -36,7 +36,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let project_dir = crate::test_helpers::project::project_tempdir();
-        let storage_dir = tempfile::tempdir().expect("storage dir");
+        let storage_dir = crate::test_helpers::tempdir();
         fs::write(
             project_dir.path().join("lib.rs"),
             "pub fn greet() -> &'static str { \"hi\" }\npub fn main() { greet(); }\n",

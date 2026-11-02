@@ -76,7 +76,7 @@ struct EditRun {
 /// `validate_on_edit: "syntax"` (the issue's setting), and return the reply
 /// and the file content afterwards.
 fn run_edit(shape: Shape, name: &str, before: &str, old: &str, new: &str) -> EditRun {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = fs::canonicalize(dir.path()).unwrap();
     let file = root.join(name);
     fs::write(&file, before).unwrap();

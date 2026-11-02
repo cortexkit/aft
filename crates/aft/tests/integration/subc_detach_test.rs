@@ -44,11 +44,11 @@ fn background_bash_survives_restart(database_open_delay_ms: Option<u64>) {
         .expect("test runtime");
 
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
 
         let listener = write_connection_file(conn_dir.path()).await;
@@ -141,11 +141,11 @@ fn subc_foreground_drain_preserves_route_harness_across_restart() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let conn_dir = tempfile::tempdir().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        let data_home = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -235,10 +235,10 @@ fn subc_undo_and_background_task_survive_restart_after_mixed_harness_binds() {
         // the compile-time CARGO_TARGET_TMPDIR path has not been created.
         std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let conn_dir = tempfile::tempdir().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        let data_home = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -326,11 +326,11 @@ fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let conn_dir = tempfile::tempdir().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        let data_home = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -436,7 +436,7 @@ fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
 #[test]
 fn standalone_and_index_take_storage_lease_before_cache_access() {
     for index in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_helpers::tempdir();
         let storage = temp.path().join("storage");
         std::fs::create_dir_all(storage.join("retention")).unwrap();
         let lock = std::fs::OpenOptions::new()
@@ -473,10 +473,10 @@ fn subc_process_storage_lease_covers_configure_loop_and_exit_tail() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let project = tempfile::tempdir().unwrap();
-        let config = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let conn = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let config = crate::test_helpers::tempdir();
+        let data = crate::test_helpers::tempdir();
+        let conn = crate::test_helpers::tempdir();
         let storage = data.path().join("cortexkit/aft");
         std::fs::create_dir_all(storage.join("retention")).unwrap();
         std::fs::create_dir_all(config.path().join("cortexkit")).unwrap();
@@ -558,11 +558,11 @@ fn subc_bare_eof_exits_nonzero_and_goodbye_exits_zero() {
         .expect("test runtime");
 
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -614,12 +614,12 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
         .expect("test runtime");
 
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
-        let logs = tempfile::tempdir().expect("module stderr tempdir");
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
+        let logs = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
@@ -750,20 +750,20 @@ fn drain_with_live_lsp_servers_and_writer(
         .expect("test runtime");
     runtime.block_on(async {
         let projects = (0..server_count)
-            .map(|_| tempfile::tempdir().unwrap())
+            .map(|_| crate::test_helpers::tempdir())
             .collect::<Vec<_>>();
-        let storage = tempfile::tempdir().unwrap();
-        let conn_dir = tempfile::tempdir().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        let data_home = tempfile::tempdir().unwrap();
-        let pids = tempfile::tempdir().unwrap();
-        let logs = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
+        let pids = crate::test_helpers::tempdir();
+        let logs = crate::test_helpers::tempdir();
         let stderr_path = logs.path().join("module.stderr");
         let phase_events_path = logs.path().join("exit-phase-events.log");
         let config_dir = config_home.path().join("cortexkit");
         std::fs::create_dir_all(&config_dir).unwrap();
         let fake = crate::test_helpers::fake_lsp::fake_server_binary();
-        let bin_dir = tempfile::tempdir().unwrap();
+        let bin_dir = crate::test_helpers::tempdir();
         let wrapper = bin_dir.path().join("rust-analyzer");
         let source = format!(
             "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}' \"$@\"\n",
@@ -1325,7 +1325,7 @@ fn module_startup_diagnostics(child: &mut Child, stderr_path: &Path) -> String {
 
 #[test]
 fn subc_startup_failure_diagnostics_include_exit_status_and_stderr() {
-    let logs = tempfile::tempdir().unwrap();
+    let logs = crate::test_helpers::tempdir();
     let stderr_path = logs.path().join("child.stderr");
     let mut child = Command::new("sh")
         .args(["-c", "echo startup-diagnostic-marker >&2; exit 7"])
@@ -1692,12 +1692,12 @@ fn scope_project_case_034(
         .build()
         .unwrap();
     runtime.block_on(async {
-        let project = tempfile::tempdir().unwrap();
-        let decoy = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let conn_dir = tempfile::tempdir().unwrap();
-        let config_home = tempfile::tempdir().unwrap();
-        let data_home = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let decoy = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         std::fs::write(project.path().join("marker.txt"), "scope_project_034_marker\n").unwrap();
         std::fs::write(decoy.path().join("marker.txt"), "wrong_legacy_project\n").unwrap();

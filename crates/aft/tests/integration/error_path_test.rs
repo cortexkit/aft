@@ -65,7 +65,7 @@ fn set_read_only(path: &Path, read_only: bool) {
 #[test]
 fn write_fails_when_parent_directory_is_missing_and_create_dirs_is_false() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("missing").join("nested").join("new.txt");
 
     let req = serde_json::json!({
@@ -94,7 +94,7 @@ fn write_fails_when_parent_directory_is_missing_and_create_dirs_is_false() {
 #[test]
 fn write_rejects_paths_outside_the_configured_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
@@ -137,7 +137,7 @@ fn write_rejects_paths_outside_the_configured_project_root() {
 #[test]
 fn write_fails_for_read_only_files() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("readonly.txt");
     fs::write(&target, "before").unwrap();
     set_read_only(&target, true);
@@ -163,7 +163,7 @@ fn write_fails_for_read_only_files() {
 #[test]
 fn edit_match_rejects_empty_match_strings() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("sample.txt");
     fs::write(&target, "hello world\n").unwrap();
 
@@ -189,7 +189,7 @@ fn edit_match_rejects_empty_match_strings() {
 #[test]
 fn edit_match_returns_file_not_found_for_missing_files() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("missing.txt");
 
     let req = serde_json::json!({
@@ -214,7 +214,7 @@ fn edit_match_returns_file_not_found_for_missing_files() {
 #[test]
 fn edit_match_rejects_occurrences_that_are_out_of_range() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("occurrence.txt");
     fs::write(&target, "hello world\n").unwrap();
 
@@ -241,7 +241,7 @@ fn edit_match_rejects_occurrences_that_are_out_of_range() {
 #[test]
 fn delete_file_returns_file_not_found_for_missing_files() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let target = dir.path().join("missing.txt");
 
     let req = serde_json::json!({
@@ -264,7 +264,7 @@ fn delete_file_returns_file_not_found_for_missing_files() {
 #[test]
 fn delete_file_rejects_paths_outside_the_configured_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();

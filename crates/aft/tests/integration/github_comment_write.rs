@@ -77,7 +77,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(github: serde_json::Value) -> Self {
-        let root = tempfile::tempdir().expect("create GitHub write fixture");
+        let root = crate::test_helpers::tempdir();
         let github = if github.get("enabled").is_some() {
             // Write the resolved `github.read`, `github.write` and `github.shim`
             // values instead of the retired `github.enabled`, so the child reads

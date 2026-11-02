@@ -20,7 +20,7 @@ use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
@@ -115,7 +115,7 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 fn linked_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     let worktree_root = temp_dir.path().join("linked-worktree");
     let storage_dir = temp_dir.path().join("storage");

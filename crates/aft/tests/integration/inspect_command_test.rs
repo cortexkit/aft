@@ -27,7 +27,7 @@ use aft::protocol::RawRequest;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project root");
     (temp_dir, root)
@@ -3019,7 +3019,7 @@ fn inspect_tool_call_refuses_space_separated_scope_as_one_missing_path() {
 #[test]
 fn inspect_tool_call_distinguishes_outside_root_from_missing_scope() {
     let (_temp_dir, root) = fixture_project();
-    let outside = tempfile::tempdir().expect("outside project tempdir");
+    let outside = crate::test_helpers::tempdir();
     let ctx = configured_restricted_context(&root);
 
     let outside_response = inspect_tool_call(
@@ -4571,7 +4571,7 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
         .status()
         .unwrap()
         .success());
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let trace = storage.path().join("cargo-runs");
     let wrapper = storage.path().join("cargo-wrapper");
     let source = format!(
@@ -4699,7 +4699,7 @@ fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
         .status()
         .unwrap()
         .success());
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let wrapper = storage.path().join("cargo-wrapper");
     let pid_file = storage.path().join("check-pid");
     let source = format!(
@@ -5306,7 +5306,7 @@ fn python_progress_fixture_with_timeout(
     mode: Option<&str>,
     timeout_ms: u64,
 ) -> (tempfile::TempDir, AppContext) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     std::fs::write(
         root.join("pyproject.toml"),
@@ -8877,7 +8877,7 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
 
 #[test]
 fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     let storage_dir = root.join(".aft-test-storage");
     fs::create_dir_all(&root).expect("create project root");
@@ -9907,7 +9907,7 @@ fn wait_for_completed_rust_check(
 #[test]
 fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
     crate::helpers::disable_in_process_file_watcher();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("checkout");
     let storage = temp.path().join("storage");
     write_file(
@@ -10024,7 +10024,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     ) {
         return;
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("checkout");
     let storage = temp.path().join("storage");
     write_file(
@@ -10177,7 +10177,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
 
 fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
     crate::helpers::disable_in_process_file_watcher();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let storage = temp.path().join("storage");
     let records = || {
         fs::read_dir(storage.join("rust-completed-checks"))

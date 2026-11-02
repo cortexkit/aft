@@ -105,8 +105,8 @@ fn host_state_value(storage: &Path, key: &str) -> Option<String> {
 
 #[test]
 fn db_set_state_writes_to_db() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = set_state(&mut aft, "foo", "bar");
@@ -121,8 +121,8 @@ fn db_set_state_writes_to_db() {
 
 #[test]
 fn db_get_state_reads_from_db() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     assert_eq!(set_state(&mut aft, "foo", "bar")["success"], true);
@@ -135,8 +135,8 @@ fn db_get_state_reads_from_db() {
 
 #[test]
 fn db_get_state_missing_returns_null() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = get_state(&mut aft, "missing_key");
@@ -148,8 +148,8 @@ fn db_get_state_missing_returns_null() {
 
 #[test]
 fn db_set_state_dual_writes_known_keys_to_legacy_file() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = set_state(&mut aft, "last_announced_version", "0.27.0");
@@ -162,8 +162,8 @@ fn db_set_state_dual_writes_known_keys_to_legacy_file() {
 
 #[test]
 fn db_set_state_unknown_key_no_legacy_file() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = set_state(&mut aft, "random_test_key", "test_value");
@@ -179,8 +179,8 @@ fn db_set_state_unknown_key_no_legacy_file() {
 
 #[test]
 fn db_get_state_fallback_to_legacy_file() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     fs::create_dir_all(storage.path().join("opencode")).unwrap();
     fs::write(
         storage.path().join("opencode/last_announced_version"),
@@ -198,8 +198,8 @@ fn db_get_state_fallback_to_legacy_file() {
 
 #[test]
 fn db_get_state_repairs_root_scoped_notification_file() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     fs::write(storage.path().join("last_announced_version"), "0.26.5").unwrap();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
@@ -217,8 +217,8 @@ fn db_get_state_repairs_root_scoped_notification_file() {
 
 #[test]
 fn db_set_state_atomic_legacy_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = set_state(&mut aft, "last_announced_version", "0.27.0");
@@ -236,8 +236,8 @@ fn db_set_state_atomic_legacy_write() {
 
 #[test]
 fn db_get_state_harness_isolation() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut opencode = configured_aft(project.path(), storage.path(), "opencode");
     assert_eq!(set_state(&mut opencode, "foo", "bar")["success"], true);
     assert!(opencode.shutdown().success());
@@ -252,8 +252,8 @@ fn db_get_state_harness_isolation() {
 
 #[test]
 fn db_set_host_state_writes_to_db_and_legacy_file() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
 
     let response = set_host_state(&mut aft, "trusted_filter_projects", "[\"X\"]");
@@ -275,9 +275,9 @@ fn db_set_host_state_writes_to_db_and_legacy_file() {
 
 #[test]
 fn db_set_host_state_concurrent_insert() {
-    let project_a = tempfile::tempdir().unwrap();
-    let project_b = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project_a = crate::test_helpers::tempdir();
+    let project_b = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut aft_a = configured_aft(project_a.path(), storage.path(), "opencode");
     let mut aft_b = configured_aft(project_b.path(), storage.path(), "pi");
     let barrier = Arc::new(Barrier::new(2));
@@ -310,8 +310,8 @@ fn db_set_host_state_concurrent_insert() {
 
 #[test]
 fn db_get_host_state_no_harness_scoping() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut opencode = configured_aft(project.path(), storage.path(), "opencode");
     assert_eq!(
         set_host_state(&mut opencode, "alpha", "shared")["success"],
@@ -333,8 +333,8 @@ fn db_get_host_state_no_harness_scoping() {
 #[cfg(unix)]
 #[test]
 fn db_set_state_legacy_write_failure_does_not_fail_db_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let harness_dir = storage.path().join("opencode");
     fs::create_dir_all(&harness_dir).unwrap();
     let original_perms = fs::metadata(&harness_dir).unwrap().permissions();
@@ -363,8 +363,8 @@ fn journal_lock(storage: &Path) -> rusqlite::Connection {
 
 #[test]
 fn deferred_database_open_retries_journal_lock_until_release() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let lock = journal_lock(storage.path());
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
     let release = std::thread::spawn(move || {
@@ -379,8 +379,8 @@ fn deferred_database_open_retries_journal_lock_until_release() {
 
 #[test]
 fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let lock = journal_lock(storage.path());
     let mut aft = configured_aft(project.path(), storage.path(), "opencode");
     let start = std::time::Instant::now();
@@ -417,8 +417,8 @@ fn saved_root_identities(storage: &Path) -> Vec<Value> {
 #[cfg(unix)]
 #[test]
 fn locked_database_legacy_path_pin_binds_without_saving_then_honours_the_pin() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let root = fs::canonicalize(project.path()).unwrap();
     // A repository with a commit: without the pin, a bind chooses its Git
     // identity, so honouring the path pin is observable.
@@ -494,8 +494,8 @@ struct ProvisionalFixture {
 
 #[cfg(unix)]
 fn provisional_fixture(path_pin: bool) -> ProvisionalFixture {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let root = fs::canonicalize(project.path()).unwrap();
     fs::write(
         root.join("marker.rs"),
@@ -606,8 +606,8 @@ fn assert_no_artifact_state(storage: &Path) {
 #[test]
 fn unreadable_git_bind_serves_tools_without_saving_an_identity_and_retries() {
     let project = crate::test_helpers::project::project_tempdir();
-    let storage = tempfile::tempdir().unwrap();
-    let tools = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
+    let tools = crate::test_helpers::tempdir();
     let root = fs::canonicalize(project.path()).unwrap();
     let source = root.join("marker.rs");
     fs::write(&source, "pub fn unreadable_git_marker() {}\n").unwrap();
@@ -897,8 +897,8 @@ fn provisional_identity_search_answers_through_the_unindexed_fallback() {
 fn standalone_database_retry_does_not_block_read_only_requests() {
     use std::time::{Duration, Instant};
 
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let path = project.path().join("readable.txt");
     fs::write(&path, "available during database contention\n").unwrap();
     let lock = journal_lock(storage.path());

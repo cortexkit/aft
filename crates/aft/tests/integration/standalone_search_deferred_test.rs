@@ -72,9 +72,9 @@ fn read_response(aft: &mut AftProcess, request_id: &str, timeout: Duration) -> (
 
 #[test]
 fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps() {
-    let project = tempfile::tempdir().expect("create queued-ping project");
-    let storage = tempfile::tempdir().expect("create shared storage fixture");
-    let transient_root = tempfile::tempdir().expect("create transient cache root");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let transient_root = crate::test_helpers::tempdir();
     let stale_entries = seed_stale_storage_entries(storage.path(), transient_root.path(), 200);
     let sweep_release = storage.path().join("sweep-release");
     let sweep_started = storage.path().join("sweep-started");
@@ -136,8 +136,8 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
 fn standalone_configure_replays_completed_task_before_queued_completion_drain() {
     const SESSION: &str = "standalone-replay-session";
 
-    let project = tempfile::tempdir().expect("create replay project");
-    let storage = tempfile::tempdir().expect("create replay storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let configure = |id: &str| {
         json!({
             "id": id,
@@ -238,9 +238,9 @@ fn standalone_configure_replays_completed_task_before_queued_completion_drain() 
 
 #[test]
 fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
-    let project = tempfile::tempdir().expect("create detached-sweep project");
-    let storage = tempfile::tempdir().expect("create shared storage fixture");
-    let transient_root = tempfile::tempdir().expect("create transient cache root");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
+    let transient_root = crate::test_helpers::tempdir();
     let sweep_signal = project.path().join("sweep-started");
     let sweep_release = project.path().join("sweep-release");
     seed_stale_storage_entries(storage.path(), transient_root.path(), 1);
@@ -415,7 +415,7 @@ fn start_embedding_server() -> (
 
 #[test]
 fn standalone_tool_call_read_finishes_before_slow_inspect() {
-    let temp_dir = tempfile::tempdir().expect("create standalone inspect fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     let src = project.join("src");
     let storage = temp_dir.path().join("storage");
@@ -686,7 +686,7 @@ fn assert_read_answers_during_inspect_lsp_work(
 /// waited for all of it.
 #[test]
 fn standalone_read_answers_while_inspect_walks_for_language_servers() {
-    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     fs::create_dir_all(project.join("src")).expect("create project");
     fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
@@ -725,7 +725,7 @@ fn fake_lsp_server_path() -> PathBuf {
 /// read sent while an inspect started a server waited for the handshake.
 #[test]
 fn standalone_read_answers_while_inspect_initializes_a_language_server() {
-    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     fs::create_dir_all(&project).expect("create project");
     crate::test_helpers::project::mark_project(&project).unwrap();
@@ -800,7 +800,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
 /// or language-server request sent meanwhile waited for the answer.
 #[test]
 fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
-    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     fs::create_dir_all(project.join("src")).expect("create project");
     fs::write(
@@ -854,7 +854,7 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
     let project = crate::test_helpers::project::project_tempdir();
-    let storage = tempfile::tempdir().expect("create standalone storage");
+    let storage = crate::test_helpers::tempdir();
     let (base_url, query_started, release_query, embedding_server) = start_embedding_server();
     let mut aft = AftProcess::spawn();
 
@@ -989,7 +989,7 @@ fn standalone_edit_then_queued_grep_is_fresh_without_watcher_delivery() {
 #[cfg(unix)]
 fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
     let project = crate::test_helpers::project::project_tempdir();
-    let storage = tempfile::tempdir().expect("create freshness storage");
+    let storage = crate::test_helpers::tempdir();
     let target = project.path().join("source.ts");
     fs::write(&target, "export const value = 'old_watcher_token';\n")
         .expect("write freshness fixture");
@@ -1157,7 +1157,7 @@ fn mutation_freshness_fixture_with_content(
     content: &str,
 ) -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
     let project = crate::test_helpers::project::project_tempdir();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     fs::create_dir(project.path().join("src")).unwrap();
     fs::write(project.path().join("src/source.ts"), content).unwrap();
     let mut aft = AftProcess::spawn_with_env(&[
@@ -1387,7 +1387,7 @@ fn warming_rust_inspect_response(
     diagnostics_timeout_ms: u64,
     mut rust_env: Value,
 ) -> (Value, Duration) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let project = temp.path().join("project");
     fs::create_dir_all(project.join("crates")).unwrap();
     let root_marker = if cargo_owned {
@@ -1554,7 +1554,7 @@ fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
     // lasts about 15 s for an analyzer that never settles; a check started
     // only after it would have about 7.5 s. The cargo below spends 9 s before
     // checking anything, so only a check that ran during the wait can finish.
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let real_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let slow_cargo = temp.path().join("slow-cargo");
     crate::test_helpers::executable_cache::write_executable(
@@ -1581,7 +1581,7 @@ fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
 /// the ten-second bound on every search below.
 #[test]
 fn standalone_search_on_ready_index_answers_without_waiting_for_the_pending_poll() {
-    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     let storage = temp_dir.path().join("storage");
     fs::create_dir_all(project.join("src")).expect("create project");

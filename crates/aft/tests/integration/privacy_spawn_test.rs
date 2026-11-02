@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
 #[test]
 fn disclaimed_foreground_background_and_pty_preserve_attribution_io_and_exit_with_seatbelt() {
     let project = macos_native_fixture_project();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     attribution_probe(project.path());
     let mut aft = AftProcess::spawn();
     for sandbox in [false, true] {
@@ -271,7 +271,7 @@ fn await_group_exit(group: i32, deadline: Instant) -> Result<(), String> {
 #[test]
 fn disclaimed_timeout_kills_foreground_background_and_pty_groups_with_seatbelt() {
     let project = macos_native_fixture_project();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     attribution_probe(project.path());
     let mut aft = AftProcess::spawn_with_env(&[("RUST_LOG", std::ffi::OsStr::new("aft=debug"))]);
     let only_sandboxed_foreground =

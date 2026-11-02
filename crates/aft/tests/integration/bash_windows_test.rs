@@ -176,7 +176,7 @@ fn windows_bash_blocks_path_env_case_insensitively() {
 #[test]
 #[cfg(target_os = "windows")]
 fn windows_cmd_background_wrapper_allows_bang_in_path() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = crate::test_helpers::tempdir();
     let project = parent.path().join("project!bang");
     std::fs::create_dir_all(&project).unwrap();
     let storage = parent.path().join("storage!bang");

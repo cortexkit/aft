@@ -266,7 +266,7 @@ mod unix {
             return;
         }
         install();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let path = dir.path().join("trace.sqlite");
         let connection = rusqlite::Connection::open(&path).unwrap();
         let shm = std::fs::File::create(dir.path().join("trace.sqlite-shm")).unwrap();
@@ -300,7 +300,7 @@ mod unix {
     #[test]
     fn sqlite_extra_shm_close_loses_dms_lock_and_faults() {
         use std::os::unix::process::ExitStatusExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let output = lock_probe_command("extra-close", &dir.path().join("probe.sqlite"))
             .output()
             .unwrap();
@@ -314,7 +314,7 @@ mod unix {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sqlite_without_extra_close_keeps_dms_lock_and_mapping() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let output = lock_probe_command("control", &dir.path().join("probe.sqlite"))
             .output()
             .unwrap();
@@ -329,7 +329,7 @@ mod unix {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sqlite_credit_hook_keeps_dms_read_lock() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let output = lock_probe_command("tracked", &dir.path().join("probe.sqlite"))
             .output()
             .unwrap();
@@ -352,7 +352,7 @@ mod unix {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sqlite_connection_close_keeps_a_sibling_connections_dms_lock() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let output = lock_probe_command("tracked-close", &dir.path().join("probe.sqlite"))
             .output()
             .unwrap();

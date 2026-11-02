@@ -150,7 +150,7 @@ fn assert_no_sensitive_material(rendered: &str) {
 
 #[test]
 fn first_party_opencode_pi_and_runner_binds_remain_permitted() {
-    let fixture = tempfile::tempdir().expect("create first-party fixture root");
+    let fixture = crate::test_helpers::tempdir();
     let bin_dir = fixture.path().join("bin");
     let call_log = fixture.path().join("gh-calls.log");
     write_success_gh(&bin_dir);
@@ -158,7 +158,7 @@ fn first_party_opencode_pi_and_runner_binds_remain_permitted() {
     let path = path_with(&bin_dir);
 
     for harness in ["opencode", "pi", "runner"] {
-        let project = tempfile::tempdir().expect("create first-party project");
+        let project = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn_with_env(&[
             ("PATH", path.as_os_str()),
             ("AFT_GH_READ_CALL_LOG", call_log.as_os_str()),
@@ -297,7 +297,7 @@ fn spawn_proxy_probe() -> (String, mpsc::Receiver<bool>, thread::JoinHandle<()>)
 }
 
 fn run_isolated_restriction_probe(case: &str) {
-    let fixture = tempfile::tempdir().expect("create restriction fixture root");
+    let fixture = crate::test_helpers::tempdir();
     let project = fixture.path().join("project");
     let bin_dir = fixture.path().join("bin");
     let gh_log = fixture.path().join("gh-calls.log");
@@ -360,11 +360,11 @@ fn untrusted_mcp_and_forced_restrict_binds_refuse_before_gh_image_or_filesystem_
 
 #[test]
 fn github_cli_failures_are_actionable_redacted_and_missing_cli_is_immediate() {
-    let fixture = tempfile::tempdir().expect("create gh failure fixture root");
+    let fixture = crate::test_helpers::tempdir();
     let bin_dir = fixture.path().join("bin");
     write_failure_gh(&bin_dir);
     let path = path_with(&bin_dir);
-    let project = tempfile::tempdir().expect("create failing gh project");
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     configure_gh_read(&mut aft, project.path(), "runner");
 
@@ -396,8 +396,8 @@ fn github_cli_failures_are_actionable_redacted_and_missing_cli_is_immediate() {
     }
     assert!(aft.shutdown().success());
 
-    let missing_bin = tempfile::tempdir().expect("create empty PATH directory");
-    let missing_project = tempfile::tempdir().expect("create missing-cli project");
+    let missing_bin = crate::test_helpers::tempdir();
+    let missing_project = crate::test_helpers::tempdir();
     let mut missing = AftProcess::spawn_with_env(&[("PATH", missing_bin.path().as_os_str())]);
     configure_gh_read(&mut missing, missing_project.path(), "runner");
     let started = Instant::now();
@@ -517,7 +517,7 @@ fn cache_miss_repeat_read_and_image_download_paths_use_deferred_responses() {
     // Fetch-always contract: every read is a live fetch through the deferred
     // machinery; the cache exists only as a fetch-failure fallback, so repeat
     // reads fetch again rather than serving TTL-fresh or stale-refresh copies.
-    let storage = tempfile::tempdir().expect("create deferred-path cache storage");
+    let storage = crate::test_helpers::tempdir();
     let (refresh_started_tx, _refresh_started_rx) = mpsc::sync_channel(1);
     let fetcher = Arc::new(InstrumentedFetcher::new(refresh_started_tx));
     let downloader = Arc::new(FixtureImageDownloader(AtomicUsize::new(0)));
@@ -586,7 +586,7 @@ impl GithubFetcher for StaticFetcher {
 
 #[test]
 fn render_attachment_and_cache_data_do_not_expose_raw_authentication_identity() {
-    let storage = tempfile::tempdir().expect("create credential-isolation cache storage");
+    let storage = crate::test_helpers::tempdir();
     let database = storage.path().join("aft.db");
     let engine = GithubReadEngine::new(
         sqlite_cache_store(&database),
@@ -632,7 +632,7 @@ fn render_attachment_and_cache_data_do_not_expose_raw_authentication_identity() 
 #[test]
 
 fn slow_github_fetch_does_not_block_sibling_status_or_ordinary_read_on_standalone() {
-    let fixture = tempfile::tempdir().expect("create slow-gh fixture root");
+    let fixture = crate::test_helpers::tempdir();
     let bin_dir = fixture.path().join("bin");
     let slow_started = fixture.path().join("slow-gh-started");
     let slow_release = fixture.path().join("slow-gh-release");

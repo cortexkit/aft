@@ -96,7 +96,7 @@ fn simple_echo_requires_bash_permission() {
     // OpenCode's built-in bash tool always asks for echo.
     // See packages/opencode/src/tool/bash.ts (which only excludes the
     // CWD set: cd / push-location / set-location).
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -123,7 +123,7 @@ fn simple_echo_requires_bash_permission() {
 
 #[test]
 fn system_temp_path_does_not_require_external_directory() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -151,7 +151,7 @@ fn system_temp_path_does_not_require_external_directory() {
 #[cfg(unix)]
 #[test]
 fn etc_hosts_still_requires_external_directory() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -173,7 +173,7 @@ fn etc_hosts_still_requires_external_directory() {
 
 #[test]
 fn bash_permission_scan_collects_redirect_target() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -214,7 +214,7 @@ fn bash_permission_scan_collects_redirect_target() {
 
 #[test]
 fn bash_permission_scan_collects_cd_redirect_target() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -239,7 +239,7 @@ fn dynamic_file_args_do_not_emit_external_directory_wildcard() {
     // Issue #135: a dynamic file arg (`rm "$DEST/file"`) is unresolvable. We
     // match native OpenCode (which skips dynamic path args) and emit NO
     // external_directory ask — the bash approval still gates the command.
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -261,7 +261,7 @@ fn dynamic_file_args_do_not_emit_external_directory_wildcard() {
 
 #[test]
 fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let outside = non_system_temp_dir("aft-relative-redirect-");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
@@ -305,7 +305,7 @@ fn relative_redirect_permission_grant_matches_absolute_cwd_pattern() {
 
 #[test]
 fn bash_permission_scan_handles_source() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -375,7 +375,7 @@ fn symlink_path_resolving_outside_project_requires_permission() {
 
 #[test]
 fn chained_cd_then_rm_uses_subcommand_directory() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -396,7 +396,7 @@ fn chained_cd_then_rm_uses_subcommand_directory() {
 
 #[test]
 fn git_status_returns_bash_ask_with_stable_prefix() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -422,7 +422,7 @@ fn git_status_returns_bash_ask_with_stable_prefix() {
 
 #[test]
 fn pipe_returns_asks_for_each_subcommand() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -447,7 +447,7 @@ fn pipe_returns_asks_for_each_subcommand() {
 
 #[test]
 fn granted_permission_allows_git_status_short() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -473,7 +473,7 @@ fn granted_permission_allows_git_status_short() {
 
 #[test]
 fn background_command_requires_permission_before_spawn() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -504,7 +504,7 @@ fn background_command_requires_permission_before_spawn() {
 /// asserts they all produce at least one ask. Failures are real bypasses.
 #[test]
 fn no_command_shape_produces_zero_asks() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -588,7 +588,7 @@ fn no_command_shape_produces_zero_asks() {
 
 #[test]
 fn malformed_bash_requires_full_permission_prompt() {
-    let root = TempDir::new().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root);
 
@@ -826,7 +826,7 @@ mod session_owned_artifacts {
 #[test]
 fn native_tool_call_bash_runs_once_approved() {
     for harness in ["opencode", "pi"] {
-        let root = TempDir::new().unwrap();
+        let root = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn();
         let configured = aft.send(
             &serde_json::to_string(&json!({

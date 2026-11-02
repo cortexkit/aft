@@ -74,7 +74,7 @@ fn formats_flag_reports_every_store_this_build_reads() {
 
 #[test]
 fn a_floor_equal_to_the_card_stages() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     write_floor(root.path(), card_formats()["stores"].clone());
     let output = check(&card(), root.path());
     assert!(
@@ -86,7 +86,7 @@ fn a_floor_equal_to_the_card_stages() {
 
 #[test]
 fn a_floor_written_by_this_build_at_startup_stages() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     // The baseline configure writes when it first opens a storage root.
     let baseline = PersistedStore::ALL
         .into_iter()
@@ -99,7 +99,7 @@ fn a_floor_written_by_this_build_at_startup_stages() {
 
 #[test]
 fn a_floor_above_the_card_refuses_staging_and_names_the_store() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut stores = card_formats()["stores"].clone();
     let above = PersistedStore::SemanticIndex.supported() + 1;
     stores["semantic"] = json!(above);
@@ -113,7 +113,7 @@ fn a_floor_above_the_card_refuses_staging_and_names_the_store() {
 
 #[test]
 fn a_floor_naming_a_store_the_card_does_not_know_refuses_staging() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let mut stores = card_formats()["stores"].clone();
     stores["store_from_a_newer_build"] = json!(1);
     write_floor(root.path(), stores);
@@ -124,7 +124,7 @@ fn a_floor_naming_a_store_the_card_does_not_know_refuses_staging() {
 
 #[test]
 fn a_newer_floor_schema_refuses_staging() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     fs::write(
         root.path().join("reader-floor.json"),
         serde_json::to_vec(&json!({ "floor_schema": 2, "stores": {} })).unwrap(),
@@ -137,7 +137,7 @@ fn a_newer_floor_schema_refuses_staging() {
 
 #[test]
 fn a_card_that_cannot_report_its_formats_is_refused() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     write_floor(root.path(), card_formats()["stores"].clone());
     // A build from before the floor scheme has no --formats flag.
     let old_card = root.path().join("old-card");
@@ -153,7 +153,7 @@ fn a_card_that_cannot_report_its_formats_is_refused() {
 
 #[test]
 fn a_root_without_a_floor_stages() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let output = check(&card(), root.path());
     assert!(output.status.success(), "{}", stderr(&output));
 }

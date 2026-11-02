@@ -153,7 +153,7 @@ fn git_project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static
 #[test]
 fn artifact_cache_key_uses_sorted_roots_for_grafted_history() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    let dir = tempfile::tempdir().expect("create grafted-history temp dir");
+    let dir = crate::test_helpers::tempdir();
     let repo = dir.path().join("grafted-repo");
     fs::create_dir_all(&repo).expect("create grafted repo");
     init_git(&repo);
@@ -223,7 +223,7 @@ fn git_head(root: &Path) -> String {
 }
 
 fn clone_checkout(root: &Path) -> (tempfile::TempDir, std::path::PathBuf) {
-    let temp = tempfile::tempdir().expect("create clone dir");
+    let temp = crate::test_helpers::tempdir();
     let clone_root = temp.path().join("clone");
     let mut command = std::process::Command::new("git");
     let status = crate::test_helpers::apply_hermetic_git_env(&mut command)
@@ -350,7 +350,7 @@ fn openai_context_with_storage(
 }
 
 fn project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static str) {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -412,7 +412,7 @@ fn install_ready_semantic_lane(ctx: &AppContext, project_root: &Path) {
 fn project_with_repeated_needle_files(
     file_count: usize,
 ) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let src_dir = project.path().join("src");
     std::fs::create_dir_all(&src_dir).expect("create source dir");
 
@@ -674,7 +674,7 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
 fn natural_language_query_refuses_when_no_lane_is_ready_and_semantic_disabled() {
     // With no ready index lane aft_search refuses with each lane's status;
     // it no longer answers with a degraded filesystem-walk grep.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -697,7 +697,7 @@ fn natural_language_query_refuses_when_no_lane_is_ready_and_semantic_disabled() 
 fn no_ready_lane_refuses_instead_of_a_capped_degraded_grep() {
     // With no ready index lane aft_search refuses with each lane's status;
     // it no longer answers with a degraded filesystem-walk grep.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let ctx = test_context(project.path());
     ctx.update_config(|config| config.indexes.semantic = false);
     let response = response_value(handle_semantic_search(
@@ -712,7 +712,7 @@ fn no_ready_lane_refuses_instead_of_a_capped_degraded_grep() {
 fn natural_language_query_refuses_while_the_semantic_lane_builds() {
     // With no ready index lane aft_search refuses with each lane's status;
     // it no longer answers with a degraded filesystem-walk grep.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -740,7 +740,7 @@ fn natural_language_query_refuses_while_the_semantic_lane_builds() {
 
 #[test]
 fn blank_queries_are_rejected_before_routing() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let ctx = test_context(project.path());
 
     for query in ["", "  "] {
@@ -753,7 +753,7 @@ fn blank_queries_are_rejected_before_routing() {
 
 #[test]
 fn external_missing_path_returns_path_not_found() {
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let missing = session_project.path().join("does-not-exist");
     let ctx = test_context(session_project.path());
 
@@ -776,8 +776,8 @@ fn external_missing_path_returns_path_not_found() {
 fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
-    let session_project = tempfile::tempdir().expect("session project");
-    let storage = tempfile::tempdir().expect("storage");
+    let session_project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
     // This test covers the generic scan, so the query has two words. A query
@@ -961,9 +961,9 @@ fn restricted_paths_keep_same_root_local_and_refuse_external_root() {
 #[test]
 fn external_plain_folder_returns_unindexed_scan_hits_without_indexing() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let (external_project, _, _) = project_with_needle();
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
     for query in ["needle_symbol", "fn needle_symbol"] {
@@ -991,7 +991,7 @@ fn external_plain_folder_returns_unindexed_scan_hits_without_indexing() {
 #[test]
 fn external_plain_folder_honours_gitignore_and_aftignore() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let (external_project, _, _) = project_with_needle();
     for (directory, ignore_name, ignored) in [
         ("", ".gitignore", "git_hidden.rs"),
@@ -1026,7 +1026,7 @@ fn external_plain_folder_honours_gitignore_and_aftignore() {
 
 #[test]
 fn external_plain_folder_respects_configured_and_force_restriction() {
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let (external_project, _, _) = project_with_needle();
     let ctx = test_context(session_project.path());
     for configured in [true, false] {
@@ -1043,7 +1043,7 @@ fn external_plain_folder_respects_configured_and_force_restriction() {
 
 #[test]
 fn external_volume_root_is_refused_with_grep_hint() {
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let ctx = test_context(session_project.path());
     // Use filesystem root rather than ambient HOME so this public search response
     // stays stable when tests isolate HOME or the host home is a Git checkout.
@@ -1069,7 +1069,7 @@ fn external_volume_root_is_refused_with_grep_hint() {
 fn external_ignore_rule_mismatch_keeps_drift_in_metadata_only() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (owner_project, _owner_source, _source) = git_project_with_needle();
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     let owner_only_ignore = owner_project.path().join(".foo/.gitignore");
     std::fs::create_dir_all(owner_only_ignore.parent().expect("ignore parent"))
         .expect("create ignore dir");
@@ -1077,7 +1077,7 @@ fn external_ignore_rule_mismatch_keeps_drift_in_metadata_only() {
     persist_search_index(owner_project.path(), storage.path());
 
     let (_clone, sibling_root) = clone_checkout(owner_project.path());
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
     let response = response_value(handle_semantic_search(
@@ -1112,7 +1112,7 @@ fn external_ignore_rule_mismatch_keeps_drift_in_metadata_only() {
 fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external_project.path(), storage.path());
     let (base_url, handle) = start_mock_embedding_server();
     persist_matching_semantic_index(
@@ -1126,7 +1126,7 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
         "// updated after index build\npub fn needle_symbol() -> bool { false }\npub fn exported() {}\n",
     )
     .expect("mutate external source");
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let ctx = openai_context_with_storage(session_project.path(), storage.path(), base_url);
     let response = response_value(handle_semantic_search(
         &request_with_path(
@@ -1172,8 +1172,8 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
 fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, external_source, _source) = git_project_with_needle();
-    let session_project = tempfile::tempdir().expect("session project");
-    let storage = tempfile::tempdir().expect("storage");
+    let session_project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external_project.path(), storage.path());
     persist_mismatched_semantic_index(external_project.path(), &external_source, storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
@@ -1225,8 +1225,8 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
 fn external_path_obeys_force_restrict_guard() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, _external_source, _source) = git_project_with_needle();
-    let session_project = tempfile::tempdir().expect("session project");
-    let storage = tempfile::tempdir().expect("storage");
+    let session_project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external_project.path(), storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
     let request = request_with_path("needle_symbol", Some("literal"), external_project.path());
@@ -1276,7 +1276,7 @@ fn hybrid_disabled_semantic_uses_lexical_only_fallback() {
 
 #[test]
 fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let target = project.path().join("src/tool/browser.rs");
     let partial = project.path().join("src/tool/other.rs");
     std::fs::create_dir_all(target.parent().expect("source parent")).expect("create source dir");
@@ -1314,7 +1314,7 @@ fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
 /// source file that emits it.
 fn project_with_phrase_in_source_and_data() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>)
 {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source = project.path().join("src/configure.rs");
     let data = project.path().join("benchmarks/census_episodes.json");
     std::fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
@@ -1351,7 +1351,7 @@ fn ranked_files(response: &Value) -> Vec<String> {
 /// hyphenated queries were verified as literals, both of those ranked above
 /// the file holding the string and were labelled `[exact]`.
 fn project_with_hyphenated_literal() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let files = [
         (
             "src/server.rs",
@@ -1445,9 +1445,9 @@ fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_ex
     let (external_project, _entries) = project_with_hyphenated_literal();
     init_git(external_project.path());
     commit_all(external_project.path());
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external_project.path(), storage.path());
-    let session_project = tempfile::tempdir().expect("session project");
+    let session_project = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
     let response = response_value(handle_semantic_search(
@@ -1468,7 +1468,7 @@ fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_ex
 fn project_with_files(
     files: &[(&str, &str)],
 ) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     // The canonical root (macOS temp dirs sit behind a /var symlink) so the
     // indexed paths match the root the reply strips from displayed paths.
     let root = std::fs::canonicalize(project.path()).expect("canonical project dir");
@@ -2036,7 +2036,7 @@ fn grep_results_report_regex_or_literal_source() {
 
 #[test]
 fn standalone_grep_keeps_generated_artifacts_in_mtime_order() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source = project.path().join("Source/Session.swift");
     let html = project.path().join("docs/index.html");
     let json = project.path().join("docs/search.json");
@@ -2091,7 +2091,7 @@ fn standalone_grep_keeps_generated_artifacts_in_mtime_order() {
 
 #[test]
 fn standalone_grep_uses_display_path_tiebreak_for_equal_mtimes() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let src = project.path().join("src");
     std::fs::create_dir_all(&src).expect("create source dir");
     let zeta = src.join("zeta.txt");
@@ -2145,7 +2145,7 @@ fn standalone_grep_uses_display_path_tiebreak_for_equal_mtimes() {
 
 #[test]
 fn literal_grep_filters_test_support_files_unless_requested() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     let fixture_file = project.path().join("fixtures/schema.sql");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -2211,7 +2211,7 @@ fn literal_grep_filters_test_support_files_unless_requested() {
 fn no_ready_lane_refuses_instead_of_a_degraded_grep_with_test_files() {
     // With no ready index lane aft_search refuses with each lane's status;
     // it no longer answers with a degraded filesystem-walk grep.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     std::fs::create_dir_all(project.path().join("fixtures")).expect("create fixture dir");
     std::fs::write(
         project.path().join("fixtures/notes.txt"),
@@ -2447,7 +2447,7 @@ fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
 
 #[test]
 fn excluded_test_results_do_not_starve_default_semantic_search() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let tests_dir = project.path().join("tests");
     std::fs::create_dir_all(&tests_dir).expect("create tests dir");
 
@@ -2585,7 +2585,7 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_with_semantic() {
 
 #[test]
 fn auto_bare_quantifier_queries_route_to_regex_grep() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -2614,7 +2614,7 @@ fn auto_bare_quantifier_queries_route_to_regex_grep() {
 
 #[test]
 fn auto_short_identifier_tokens_use_literal_scan() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -2745,7 +2745,7 @@ fn literal_query_preserves_unmatched_quotes() {
     // Mixed quotes (`"foo'` / `'foo"`) are not a balanced outer pair — leave
     // them alone. Asymmetric stripping would be more confusing than the
     // matched-pair convention.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
         .expect("create source dir");
@@ -2774,7 +2774,7 @@ fn literal_query_preserves_unmatched_quotes() {
 fn quote_strip_does_not_produce_empty_query() {
     // `""` should be rejected as empty after stripping, not silently routed
     // into a wildcard search.
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let ctx = test_context(project.path());
 
     for query in ["\"\"", "''"] {
@@ -2817,7 +2817,7 @@ fn quote_strip_only_removes_one_pair() {
 
 #[test]
 fn live_engine_pipeline_ranks_and_pages_with_provenance() {
-    let project = tempfile::tempdir().expect("create project dir");
+    let project = crate::test_helpers::tempdir();
     let exact = project.path().join("src/z_exact.rs");
     let lexical = project.path().join("src/a_lexical.rs");
     let log = project.path().join("src/logging.rs");
@@ -2931,7 +2931,7 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
     const QUERY: &str = "settle refuses \"merged_ref is not integrated\": how is integration checked (against which ref: main, the campaign integration_ref, or the caller directory HEAD)";
 
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
-    let external = tempfile::tempdir().expect("external project");
+    let external = crate::test_helpers::tempdir();
     init_git(external.path());
     let src = external.path().join("crates/prefrontal-core-module/src");
     fs::create_dir_all(&src).expect("create external source tree");
@@ -2987,9 +2987,9 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
         &in_root_ctx,
     ));
 
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external.path(), storage.path());
-    let session = tempfile::tempdir().expect("session project");
+    let session = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session.path(), storage.path());
     let raw_response =
         handle_semantic_search(&request_with_path(QUERY, None, external.path()), &ctx);
@@ -3078,7 +3078,7 @@ const EXTERNAL_IDENTIFIER_SOURCES: [(&str, &str); 6] = [
 /// source files hold a placeholder instead, so an index built now predates
 /// the identifier.
 fn external_identifier_project(with_identifier: bool) -> tempfile::TempDir {
-    let project = tempfile::tempdir().expect("external project");
+    let project = crate::test_helpers::tempdir();
     let root = project.path();
     write_external_identifier_sources(root, with_identifier);
     fs::write(
@@ -3174,8 +3174,8 @@ fn assert_every_source_use_first_and_no_dump(response: &Value) {
 fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let external = external_identifier_project(true);
-    let session = tempfile::tempdir().expect("session project");
-    let storage = tempfile::tempdir().expect("storage");
+    let session = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session.path(), storage.path());
 
     let response = response_value(handle_semantic_search(
@@ -3219,13 +3219,13 @@ fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
 fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no_dump() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let external = external_identifier_project(false);
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external.path(), storage.path());
     // The identifier arrives after the project's own index was written, as it
     // does when nobody has opened a session in that project since.
     std::thread::sleep(Duration::from_millis(20));
     write_external_identifier_sources(external.path(), true);
-    let session = tempfile::tempdir().expect("session project");
+    let session = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session.path(), storage.path());
 
     let response = response_value(handle_semantic_search(
@@ -3267,7 +3267,7 @@ fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no
 fn external_prose_query_finds_a_file_added_after_the_saved_index() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (external_project, _source_file, _source) = git_project_with_needle();
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(external_project.path(), storage.path());
     let added = external_project.path().join("src/quokkalith.rs");
     fs::write(
@@ -3275,7 +3275,7 @@ fn external_prose_query_finds_a_file_added_after_the_saved_index() {
         "// Assemble the zephyrine quokkalith from its parts.\npub fn assemble_zephyrine_quokkalith() {}\n",
     )
     .expect("write file added after the index was saved");
-    let session = tempfile::tempdir().expect("session project");
+    let session = crate::test_helpers::tempdir();
     let ctx = test_context_with_storage(session.path(), storage.path());
 
     let response = response_value(handle_semantic_search(
@@ -3531,7 +3531,7 @@ fn issue_826_lane_footer_agrees_with_a_degraded_answer() {
 fn issue_826_trigram_footer_agrees_with_a_scan_answer() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (project, _source_file, _source) = git_project_with_needle();
-    let storage = tempfile::tempdir().expect("storage");
+    let storage = crate::test_helpers::tempdir();
     persist_search_index(project.path(), storage.path());
     let (base_url, handle) = start_mock_embedding_error_server();
     let ctx = openai_context_with_storage(project.path(), storage.path(), base_url);

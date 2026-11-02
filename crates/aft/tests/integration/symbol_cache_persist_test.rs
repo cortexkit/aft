@@ -47,8 +47,8 @@ fn build_symbol_cache(project: &tempfile::TempDir, source: &std::path::Path) -> 
 
 #[test]
 fn cold_start_populates_and_persists_symbol_cache() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let source = write_source(&project, "pub fn cold_start() -> bool { true }\n");
     let cache = build_symbol_cache(&project, &source);
 
@@ -60,8 +60,8 @@ fn cold_start_populates_and_persists_symbol_cache() {
 
 #[test]
 fn warm_restart_loads_entries_into_fresh_symbol_cache() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let source = write_source(&project, "pub fn warm_restart() -> bool { true }\n");
     let cache = build_symbol_cache(&project, &source);
     let metadata = fs::metadata(&source).expect("stat source");
@@ -82,8 +82,8 @@ fn warm_restart_loads_entries_into_fresh_symbol_cache() {
 
 #[test]
 fn mtime_invalidation_drops_changed_entry() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let source = write_source(&project, "pub fn mtime_change() -> bool { true }\n");
     let cache = build_symbol_cache(&project, &source);
 
@@ -100,8 +100,8 @@ fn mtime_invalidation_drops_changed_entry() {
 
 #[test]
 fn size_invalidation_drops_changed_entry() {
-    let project = tempfile::tempdir().expect("create project dir");
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let source = write_source(&project, "pub fn size_change() -> bool { true }\n");
     let cache = build_symbol_cache(&project, &source);
 
@@ -122,7 +122,7 @@ fn size_invalidation_drops_changed_entry() {
 
 #[test]
 fn corrupt_file_recovery_returns_none_without_panicking() {
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let path = cache_file(&storage, "corrupt-project");
     fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
     fs::write(&path, b"garbage").expect("write corrupt cache");
@@ -132,7 +132,7 @@ fn corrupt_file_recovery_returns_none_without_panicking() {
 
 #[test]
 fn wrong_version_returns_none_without_panicking() {
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let path = cache_file(&storage, "version-project");
     fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
     let mut bytes = Vec::new();

@@ -358,14 +358,14 @@ fn canonical_line_range(text: &str, start_line: usize, end_line: usize) -> Strin
 
 #[test]
 fn fixture_selected_markdown_is_byte_identical_across_all_transport_harnesses() {
-    let fixture_root = tempfile::tempdir().expect("create fixture gh root");
+    let fixture_root = crate::test_helpers::tempdir();
     let bin_dir = fixture_root.path().join("bin");
     let call_log = fixture_root.path().join("gh-calls.log");
     write_fake_gh(&bin_dir);
     fs::write(&call_log, "").expect("create fixture gh call log");
 
-    let project = tempfile::tempdir().expect("create configured project");
-    let storage = tempfile::tempdir().expect("create shared cache storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let canonical = fixture_markdown("pr.expected.md");
     let selected_lines = (3, 27);
     let expected_selected = canonical_line_range(&canonical, selected_lines.0, selected_lines.1);
@@ -426,14 +426,14 @@ fn fixture_selected_markdown_is_byte_identical_across_all_transport_harnesses() 
 
 #[test]
 fn start_line_and_offset_select_from_the_completed_canonical_render() {
-    let fixture_root = tempfile::tempdir().expect("create selector fixture root");
+    let fixture_root = crate::test_helpers::tempdir();
     let bin_dir = fixture_root.path().join("bin");
     let call_log = fixture_root.path().join("gh-calls.log");
     write_fake_gh(&bin_dir);
     fs::write(&call_log, "").expect("create selector fixture gh call log");
 
-    let project = tempfile::tempdir().expect("create selector project");
-    let storage = tempfile::tempdir().expect("create selector storage");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let canonical = fixture_markdown("issue.expected.md");
     let selected_lines = (3, 4);
     let expected_selected = canonical_line_range(&canonical, selected_lines.0, selected_lines.1);
@@ -673,7 +673,7 @@ fn cortexkit_e2e_live_issue_matches_across_ndjson_subc_and_pi() {
         .expect("AFT_GH_READ_LIVE_PROJECT_ROOT must name the cortexkit-e2e project root");
     assert!(project.is_absolute(), "live project root must be absolute");
 
-    let storage = tempfile::tempdir().expect("create shared live-fire cache");
+    let storage = crate::test_helpers::tempdir();
     let ndjson = live_read(
         TransportHarness::Ndjson,
         &project,

@@ -66,7 +66,7 @@ export function calculate(input: number) {
 }
 
 fn build_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project");
     fs::create_dir_all(&root).expect("create project");
     let source = duplicate_source();
@@ -219,7 +219,7 @@ fn aggregate_contains_symbol(
 
 #[test]
 fn blocking_dead_code_builds_a_cold_callgraph_snapshot() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("blocking-dead-code");
     fs::create_dir_all(&root).expect("create project");
     write_file(&root, "package.json", r#"{"main":"src/main.ts"}"#);
@@ -307,7 +307,7 @@ export function privateHelper() { return 0; }
     ];
 
     for case in cases {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = crate::test_helpers::tempdir();
         let root = temp_dir
             .path()
             .join(format!("framework-route-{}", case.name));
@@ -482,7 +482,7 @@ export function deadSibling() { return 0; }
     ];
 
     for case in cases {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let temp_dir = crate::test_helpers::tempdir();
         let root = temp_dir
             .path()
             .join(format!("nestjs-decorator-{}", case.name));
@@ -625,7 +625,7 @@ fn assert_reexport_context(item: &Value, file: &str, exported_name: &str) {
 
 #[test]
 fn inspect_unused_exports_oxc_reexport_alias_reports_canonical_once_with_context() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("unused-reexport-context");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -662,7 +662,7 @@ fn inspect_unused_exports_oxc_reexport_alias_reports_canonical_once_with_context
 
 #[test]
 fn inspect_unused_exports_splits_test_only_references_from_headline() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("unused-test-only-tier");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -788,7 +788,7 @@ fn inspect_tier2_reuse_skips_fresh_files_and_rescans_stale_file() {
 
 #[test]
 fn inspect_cycles_reports_import_sccs_once_and_excludes_type_only_edges() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-cycles");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -882,7 +882,7 @@ fn inspect_cycles_reports_import_sccs_once_and_excludes_type_only_edges() {
 
 #[test]
 fn inspect_cycles_incremental_rescans_only_changed_file() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-cycles-incremental");
     fs::create_dir_all(&root).expect("create project");
     let changed_file = write_file(
@@ -928,7 +928,7 @@ fn inspect_cycles_incremental_rescans_only_changed_file() {
 
 #[test]
 fn inspect_tier2_reuse_rescans_mtime_advancing_same_size_change_and_matches_cold() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-mtime-advancing");
     fs::create_dir_all(&root).expect("create project");
     let source = write_file(&root, "src/export.ts", "export function one() {}\n");
@@ -976,7 +976,7 @@ fn inspect_tier2_reuse_rescans_mtime_advancing_same_size_change_and_matches_cold
 
 #[test]
 fn inspect_tier2_reuse_treats_mtime_preserving_same_size_change_as_fresh_until_ceiling() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-mtime-preserving");
     fs::create_dir_all(&root).expect("create project");
     let source = write_file(&root, "src/export.ts", "export function one() {}\n");
@@ -1051,7 +1051,7 @@ where
     S: FnOnce(&Path),
     E: FnOnce(&Path),
 {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join(format!("project-{name}"));
     fs::create_dir_all(&root).expect("create project");
     setup(&root);
@@ -1093,7 +1093,7 @@ where
 
 #[test]
 fn inspect_unused_exports_quick_reuse_invalidates_node_modules_tsconfig_change() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir
         .path()
         .join("project-quick-reuse-node-modules-tsconfig");
@@ -1189,7 +1189,7 @@ console.log(x);
 
 #[test]
 fn inspect_unused_exports_tracks_external_package_tsconfig_extends_change() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let repo = temp_dir.path().join("repo");
     let root = repo.join("pkg");
     fs::create_dir_all(&root).expect("create project");
@@ -1294,7 +1294,7 @@ console.log(x);
 
 #[test]
 fn inspect_unused_exports_tracks_external_package_tsconfig_package_json_field_change() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let repo = temp_dir.path().join("repo");
     let root = repo.join("pkg");
     fs::create_dir_all(&root).expect("create project");
@@ -1404,7 +1404,7 @@ console.log(x);
 
 #[test]
 fn inspect_unused_exports_hash_tracks_package_json_tsconfig_dependencies() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let repo = temp_dir.path().join("repo");
     let root = repo.join("pkg");
     fs::create_dir_all(&root).expect("create project");
@@ -1479,7 +1479,7 @@ fn assert_dead_code_incremental_matches_cold<S, E>(
     S: FnOnce(&Path),
     E: FnOnce(&Path),
 {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join(format!("dead-code-project-{name}"));
     fs::create_dir_all(&root).expect("create project");
     setup(&root);
@@ -1978,7 +1978,7 @@ export function privateHelper() { return 0; }
 
 #[test]
 fn inspect_dead_code_twice_cold_is_deterministic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("dead-code-twice-cold");
     fs::create_dir_all(&root).expect("create project");
     write_file(root.as_path(), "package.json", r#"{"main":"src/main.ts"}"#);
@@ -2024,7 +2024,7 @@ fn inspect_dead_code_twice_cold_is_deterministic() {
 
 #[test]
 fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("dead-code-rust-macro-twice-cold");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -2081,7 +2081,7 @@ fn inspect_dead_code_rust_macro_token_refs_twice_cold_is_deterministic() {
 
 #[test]
 fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("dead-code-route-twice-cold");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -2131,7 +2131,7 @@ fn inspect_dead_code_framework_routes_twice_cold_is_deterministic() {
 
 #[test]
 fn inspect_dead_code_nestjs_decorators_twice_cold_is_deterministic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("dead-code-nestjs-twice-cold");
     fs::create_dir_all(&root).expect("create project");
     write_file(
@@ -2665,7 +2665,7 @@ fn inspect_unused_exports_oxc_read_error_surfaces_after_cached_rollup() {
         );
     }
 
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-unreadable-unused-exports");
     fs::create_dir_all(&root).expect("create project");
     write_file(&root, "package.json", r#"{}"#);
@@ -2728,7 +2728,7 @@ fn inspect_unused_exports_oxc_read_error_surfaces_after_cached_rollup() {
 
 #[test]
 fn inspect_unused_exports_twice_cold_is_deterministic() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let temp_dir = crate::test_helpers::tempdir();
     let root = temp_dir.path().join("project-twice-cold");
     fs::create_dir_all(&root).expect("create project");
     write_file(

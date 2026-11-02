@@ -12,7 +12,7 @@ fn semantic_store(storage: &Path) -> BlobStore {
 
 #[test]
 fn plane_store_uses_the_family_layout_and_required_pragmas() {
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let semantic = semantic_store(storage.path());
     let callgraph = BlobStore::open(storage.path(), "family-a", BlobPlane::Callgraph)
         .expect("open callgraph blob store");
@@ -39,7 +39,7 @@ fn plane_store_uses_the_family_layout_and_required_pragmas() {
 
 #[test]
 fn immutable_puts_are_idempotent_and_payloads_round_trip() {
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let mut store = semantic_store(storage.path());
     let key = SemanticKey::for_current(b"source", b"src/lib.rs", "model-a").full_key();
 
@@ -67,7 +67,7 @@ fn immutable_puts_are_idempotent_and_payloads_round_trip() {
 
 #[test]
 fn payload_integrity_mismatches_are_cache_misses() {
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let mut store = semantic_store(storage.path());
     let key = SemanticKey::for_current(b"source", b"src/lib.rs", "model-a").full_key();
     store.put(&key, b"payload").expect("insert payload");
@@ -100,7 +100,7 @@ fn semantic_keys_include_paths_but_callgraph_keys_reuse_equal_content() {
     assert_eq!(callgraph_a, callgraph_b);
     assert_ne!(callgraph_a, config);
 
-    let storage = tempfile::tempdir().expect("create temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let mut semantic_store = semantic_store(storage.path());
     assert!(matches!(
         semantic_store.put(&callgraph_a, b"wrong plane"),

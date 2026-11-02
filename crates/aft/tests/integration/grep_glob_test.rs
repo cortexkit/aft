@@ -48,6 +48,7 @@ fn configure(aft: &mut AftProcess, root: &Path) {
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+    aft.wait_for_folder_admission();
 }
 
 fn configure_with_index(aft: &mut AftProcess, root: &Path) {
@@ -1681,7 +1682,7 @@ fn explicit_ignored_and_symlinked_dirs_are_searched_indexed() {
 #[cfg(unix)]
 #[test]
 fn explicit_symlink_escaping_root_is_refused_when_restricted() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside-store/pkg");
     fs::create_dir_all(root.join("node_modules")).expect("create project");

@@ -135,7 +135,7 @@ fn hashline_bash_payload(data: &Value) -> Vec<u8> {
 
 #[test]
 fn tail_from_line_and_existing_head_tail_forms_match_native_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = fs::canonicalize(dir.path()).unwrap();
     let file = root.join("lines.txt");
     fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
@@ -178,7 +178,7 @@ fn tail_from_line_and_existing_head_tail_forms_match_native_bytes() {
 
 #[test]
 fn rewrites_grep_and_rejects_pipes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn Needle() {}\n").unwrap();
     filetime::set_file_mtime(
@@ -206,7 +206,7 @@ fn rewrites_grep_and_rejects_pipes() {
 
 #[test]
 fn grep_with_non_edge_anchor_declines_to_native() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("env.txt");
     fs::write(&file, "$HOME\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -216,7 +216,7 @@ fn grep_with_non_edge_anchor_declines_to_native() {
 
 #[test]
 fn grep_footer_steers_to_aft_search_when_registered() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn needle() {}\n").unwrap();
     filetime::set_file_mtime(
@@ -248,7 +248,7 @@ fn grep_footer_steers_to_aft_search_when_registered() {
 
 #[test]
 fn grep_rewrite_rejects_oversized_regex_programs() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("notes.txt"), "needle\n").unwrap();
     let ctx = context(dir.path(), true);
     let pattern = "(a?){500000}";
@@ -258,7 +258,7 @@ fn grep_rewrite_rejects_oversized_regex_programs() {
 
 #[test]
 fn rewrites_rg_and_rejects_chains() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("notes.txt"), "alpha beta\n").unwrap();
     filetime::set_file_mtime(
         dir.path(),
@@ -279,7 +279,7 @@ fn rewrites_rg_and_rejects_chains() {
 
 #[test]
 fn rewrites_find_and_rejects_other_flags() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -291,7 +291,7 @@ fn rewrites_find_and_rejects_other_flags() {
 
 #[test]
 fn find_declines_ignored_files_directories_and_skipped_roots() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let initialized = Command::new("/usr/bin/git")
         .args(["init", "-q"])
         .current_dir(dir.path())
@@ -340,7 +340,7 @@ fn find_declines_ignored_files_directories_and_skipped_roots() {
 
 #[test]
 fn find_files_only_unignored_tree_matches_native_sorted_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let initialized = Command::new("/usr/bin/git")
         .args(["init", "-q"])
         .current_dir(dir.path())
@@ -388,7 +388,7 @@ fn find_files_only_unignored_tree_matches_native_sorted_bytes() {
 
 #[test]
 fn rewrites_cat_read_and_rejects_multiple_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
     fs::write(dir.path().join("b.txt"), "world\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -408,8 +408,8 @@ fn rewrites_cat_read_and_rejects_multiple_files() {
 /// tool; nothing either session sent changes the other's text.
 #[test]
 fn standalone_rewrite_footer_names_each_sessions_own_command_tool() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     fs::write(project.path().join("a.txt"), "hello\n").unwrap();
     let mut aft = AftProcess::spawn();
     let configured = aft.send(
@@ -488,7 +488,7 @@ fn standalone_rewrite_footer_names_each_sessions_own_command_tool() {
 
 #[test]
 fn rewrites_cat_append_and_echo_append() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let ctx = context(dir.path(), true);
 
     let notes = dir.path().join("notes.txt");
@@ -515,7 +515,7 @@ fn rewrite_append_uses_original_session_for_backups() {
         .prefix("case-")
         .tempdir_in(parent)
         .unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let file = dir.path().join("notes.txt");
     fs::write(&file, "before\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -545,7 +545,7 @@ fn rewrite_append_uses_original_session_for_backups() {
 
 #[test]
 fn rewrites_sed_range_and_rejects_other_forms() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("lines.txt"), "one\ntwo\nthree\n").unwrap();
     let ctx = context(dir.path(), true);
 
@@ -561,7 +561,7 @@ fn rewrites_sed_range_and_rejects_other_forms() {
 
 #[test]
 fn rewrites_ls_directory_and_rejects_unknown_flags() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -579,8 +579,8 @@ fn rewrites_ls_directory_and_rejects_unknown_flags() {
 
 #[test]
 fn binary_rewrite_matches_bash_for_double_quoted_backslashes() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let preserved_path = project.path().join(r"read\q.txt");
     let stripped_path = project.path().join("readq.txt");
     fs::write(&preserved_path, "PRESERVED_READ_TARGET\n").unwrap();
@@ -734,8 +734,8 @@ fn binary_rewrite_matches_bash_for_double_quoted_backslashes() {
 
 #[test]
 fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let tree = project.path().join("tree");
     fs::create_dir(&tree).unwrap();
     fs::write(tree.join("visible.txt"), "visible\n").unwrap();
@@ -839,7 +839,7 @@ fn binary_ls_rewrite_preserves_hidden_visibility_and_direct_read_default() {
 ///     `read FILE` would dump contents).
 #[test]
 fn rejects_ls_with_l_flag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn lib() {}\n").unwrap();
     fs::write(dir.path().join("README.md"), "# project\n").unwrap();
@@ -877,7 +877,7 @@ fn rejects_ls_with_l_flag() {
 /// rewrite must check the path's file type and fall through for files.
 #[test]
 fn rejects_ls_on_regular_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("README.md"), "# project\n").unwrap();
     let ctx = context(dir.path(), true);
 
@@ -896,7 +896,7 @@ fn rejects_ls_on_regular_file() {
 /// by rewriting a guaranteed-failing call into a different failure shape.
 #[test]
 fn rejects_ls_on_missing_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let ctx = context(dir.path(), true);
 
     assert!(
@@ -911,7 +911,7 @@ fn rejects_ls_on_missing_path() {
 
 #[test]
 fn respects_experimental_flag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
     let ctx = context(dir.path(), false);
 
@@ -927,8 +927,8 @@ fn respects_experimental_flag() {
 fn rewrite_target_failure_logs_decline_before_fallthrough() {
     init_test_logger_with_level(log::LevelFilter::Debug);
 
-    let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let outside = crate::test_helpers::tempdir();
     let outside_path = outside.path().join("outside.txt");
     fs::write(&outside_path, "secret\n").unwrap();
     let ctx = context(dir.path(), true);
@@ -954,7 +954,7 @@ fn rewrite_target_failure_logs_decline_before_fallthrough() {
 fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
     init_test_logger_with_level(log::LevelFilter::Debug);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let path = dir.path().join("oversized.txt");
     fs::write(&path, vec![b'x'; 50 * 1024 + 1]).unwrap();
     let ctx = context(dir.path(), true);
@@ -985,8 +985,8 @@ fn rewrite_shape_decline_log_names_predicate_and_resolved_candidate() {
 fn routine_out_of_root_cat_decline_is_not_a_warning() {
     init_test_logger();
 
-    let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let outside = crate::test_helpers::tempdir();
     let outside_path = outside.path().join("opencode").join("tool-output.txt");
     fs::create_dir_all(outside_path.parent().unwrap()).unwrap();
     fs::write(&outside_path, "hello\n").unwrap();
@@ -1005,8 +1005,8 @@ fn routine_out_of_root_cat_decline_is_not_a_warning() {
 
 #[test]
 fn rewrite_target_failure_falls_through_to_bash() {
-    let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let outside = crate::test_helpers::tempdir();
     fs::write(outside.path().join("outside.txt"), "secret\n").unwrap();
     let ctx = context(dir.path(), true);
 
@@ -1070,7 +1070,7 @@ fn parser_handles_quotes_escapes_heredocs_and_rejects_expansion() {
 
 #[test]
 fn edit_append_op_appends_creates_and_reports_invalid_paths() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let ctx = context(dir.path(), false);
     let existing = dir.path().join("existing.txt");
     fs::write(&existing, "before\n").unwrap();

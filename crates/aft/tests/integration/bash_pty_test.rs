@@ -105,8 +105,8 @@ fn wait_for_completion(registry: &BgTaskRegistry, task_id: &str) -> BgCompletion
 #[cfg(unix)]
 #[test]
 fn pty_spawn_echo_exit() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn_pty(
@@ -138,8 +138,8 @@ fn pty_spawn_echo_exit() {
 
 #[test]
 fn pty_replay_marks_killed_when_running_no_marker() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     base_task(
         storage.path(),
         project.path(),
@@ -171,8 +171,8 @@ fn pty_replay_marks_killed_when_running_no_marker() {
 
 #[test]
 fn pty_replay_keeps_terminal_when_already_terminal() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let mut task = base_task(
         storage.path(),
         project.path(),
@@ -209,8 +209,8 @@ fn pty_replay_keeps_terminal_when_already_terminal() {
 
 #[test]
 fn pty_replay_uses_exit_marker_when_present() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     base_task(
         storage.path(),
         project.path(),
@@ -232,8 +232,8 @@ fn pty_replay_uses_exit_marker_when_present() {
 
 #[test]
 fn pty_replay_accepts_schema_version_2_as_piped() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = task_paths(storage.path(), SESSION, "bash-0000000000000204").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(
@@ -276,8 +276,8 @@ fn pty_replay_accepts_schema_version_2_as_piped() {
 #[cfg(unix)]
 #[test]
 fn pipes_unaffected_by_pty_changes() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -305,8 +305,8 @@ fn pipes_unaffected_by_pty_changes() {
 #[cfg(unix)]
 #[test]
 fn pty_waiter_writes_code_marker_on_natural_exit() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn_pty(
@@ -339,8 +339,8 @@ fn pty_waiter_writes_code_marker_on_natural_exit() {
 #[cfg(unix)]
 #[test]
 fn pty_reader_drains_before_completion_fires() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn_pty(
@@ -382,8 +382,8 @@ fn pty_completion_coordinator_fires_only_when_both_done() {
 #[cfg(unix)]
 #[test]
 fn pty_watchdog_wake_channel_triggers_immediate_completion() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let wake_ready = project.path().join("wake-ready");
     // Declare after both TempDirs: Rust drops locals in reverse declaration order,
     // so this guard writes the sentinel before either TempDir removes its directory.
@@ -422,7 +422,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
 
 #[test]
 fn pty_task_bundle_files_includes_pty_spill() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let paths = task_paths(storage.path(), SESSION, "bash-0000000000000205").unwrap();
     let files = task_bundle_files(&paths);
     assert!(files.iter().any(|path| path == &paths.pty));
@@ -430,8 +430,8 @@ fn pty_task_bundle_files_includes_pty_spill() {
 
 #[test]
 fn pty_v2_task_rehydrates_then_upgrades_to_current_schema_on_next_persist() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let paths = task_paths(storage.path(), SESSION, "bash-0000000000000206").unwrap();
     fs::create_dir_all(&paths.dir).unwrap();
     fs::write(
@@ -520,8 +520,8 @@ fn read_pty_until(path: &std::path::Path, needle: &str, timeout: Duration) -> St
 #[cfg(unix)]
 #[test]
 fn pty_write_to_cat() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
         aft::config::Config {
@@ -560,8 +560,8 @@ fn pty_write_to_cat() {
 #[cfg(unix)]
 #[test]
 fn pty_interactive_shell_keeps_terminal_stdin() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
         aft::config::Config {
@@ -598,8 +598,8 @@ fn pty_interactive_shell_keeps_terminal_stdin() {
 #[cfg(windows)]
 #[test]
 fn windows_piped_stdin_remains_eof_without_bootstrap_gate() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry.spawn(aft::sandbox_spawn::SpawnPlan::Unsandboxed, "if ([Console]::OpenStandardInput().ReadByte() -ne -1) { exit 42 }; [Console]::Write('stdin-eof')", SESSION.into(), project.path().to_path_buf(), Default::default(), aft::bash_background::HardKill::After(Duration::from_secs(30)), None, storage.path().to_path_buf(), 10, true, false, Some(project.path().to_path_buf())).unwrap();
     let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
@@ -612,8 +612,8 @@ fn windows_piped_stdin_remains_eof_without_bootstrap_gate() {
 #[cfg(windows)]
 #[test]
 fn pty_write_to_cmd_dir() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -650,8 +650,8 @@ fn pty_write_python_repl_round_trip() {
         eprintln!("skipping: python not found");
         return;
     };
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -680,8 +680,8 @@ fn pty_write_python_repl_round_trip() {
 
 #[test]
 fn pty_write_non_pty_task() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = registry
         .spawn(
@@ -709,8 +709,8 @@ fn pty_write_non_pty_task() {
 
 #[test]
 fn pty_write_exited_task() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -734,7 +734,7 @@ fn pty_write_too_large() {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::RawRequest;
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config {
@@ -764,7 +764,7 @@ fn pty_true_implies_background() {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::RawRequest;
 
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config {
@@ -849,8 +849,8 @@ fn pty_status_accepts_output_modes() {
 #[cfg(unix)]
 #[test]
 fn pty_kill_terminates_sighup_ignoring_cat() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -879,8 +879,8 @@ fn pty_kill_terminates_sighup_ignoring_cat() {
 #[cfg(windows)]
 #[test]
 fn pty_kill_terminates_pwsh_infinite_loop() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -897,8 +897,8 @@ fn pty_kill_terminates_pwsh_infinite_loop() {
 #[cfg(windows)]
 #[test]
 fn pty_kill_terminates_pwsh_infinite_loop_within_bounded_time() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -926,8 +926,8 @@ fn pty_kill_terminates_pwsh_infinite_loop_within_bounded_time() {
 )]
 #[test]
 fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -950,8 +950,8 @@ fn pty_waiter_writes_killed_marker_on_kill_via_killer_kill() {
 )]
 #[test]
 fn pty_kill_with_clones_outstanding_still_terminates() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -972,8 +972,8 @@ fn pty_kill_with_clones_outstanding_still_terminates() {
 
 #[test]
 fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -995,8 +995,8 @@ fn pty_timeout_kill_finalizes_as_timed_out_not_killed() {
 )]
 #[test]
 fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -1021,8 +1021,8 @@ fn pty_status_snapshot_skips_preview_and_uses_pty_path() {
 )]
 #[test]
 fn pty_completion_preview_is_empty() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -1045,8 +1045,8 @@ fn pty_completion_preview_is_empty() {
 )]
 #[test]
 fn pty_completion_token_counts_returns_skipped_sentinel() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,
@@ -1070,8 +1070,8 @@ fn pty_completion_token_counts_returns_skipped_sentinel() {
 )]
 #[test]
 fn pty_parallel_smoke_10_tasks() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let mut task_ids = Vec::new();
     for index in 0..10 {
@@ -1094,8 +1094,8 @@ fn pty_parallel_smoke_10_tasks() {
 #[cfg(windows)]
 #[test]
 fn pty_windows_wrapper_script_runs_utf8_command() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let registry = registry();
     let task_id = spawn_pty_task(
         &registry,

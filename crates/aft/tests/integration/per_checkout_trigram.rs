@@ -136,7 +136,7 @@ impl PlaneOracle for Oracle<'_> {
     }
 }
 fn parity(root: &Path, delta: &LiveDelta, index: &GenerationIndex, literal: &str) {
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
     parity_harness::check_parity(
         &Oracle {
             delta,
@@ -155,7 +155,7 @@ fn parity(root: &Path, delta: &LiveDelta, index: &GenerationIndex, literal: &str
 fn trigram_parity_edit_and_switch_schedules() {
     for schedule in parity_harness::standard_schedules("base.txt", b"base needle\n", "ignored.txt")
     {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_helpers::tempdir();
         write(root.path(), "base.txt", b"base needle\n");
         write(root.path(), ".aftignore", b"ignored.txt\n");
         let files: &[(&str, &[u8])] = &[
@@ -216,7 +216,7 @@ fn trigram_parity_edit_and_switch_schedules() {
 
 #[test]
 fn trigram_pending_intent_scans_before_pruning() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     write(root.path(), "a.txt", b"old\n");
     let mut delta = LiveDelta::new(generation(files, "a"));
@@ -241,7 +241,7 @@ fn trigram_pending_intent_scans_before_pruning() {
 
 #[test]
 fn trigram_overlay_supersedes_before_posting_pruning() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let base: &[(&str, &[u8])] = &[("old.txt", b"old\n"), ("gone.txt", b"needle\n")];
     let next: &[(&str, &[u8])] = &[("old.txt", b"needle\n"), ("renamed.txt", b"needle\n")];
     for (path, bytes) in next {
@@ -261,7 +261,7 @@ fn trigram_overlay_supersedes_before_posting_pruning() {
 
 #[test]
 fn trigram_membership_filters_before_presence_guard() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"needle\n"), ("ignored.txt", b"needle\n")];
     for (path, bytes) in files {
         write(root.path(), path, bytes);
@@ -278,7 +278,7 @@ fn trigram_membership_filters_before_presence_guard() {
 
 #[test]
 fn trigram_overflow_hashes_preserved_stat_bytes() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     write(root.path(), "a.txt", b"old\n");
     let mut delta = LiveDelta::new(generation(files, "a"));
@@ -314,7 +314,7 @@ fn trigram_overflow_hashes_preserved_stat_bytes() {
 
 #[test]
 fn trigram_healthy_event_hashes_and_reconciles_ignore() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     write(root.path(), "a.txt", b"old\n");
     let mut delta = LiveDelta::new(generation(files, "a"));
@@ -339,7 +339,7 @@ fn trigram_healthy_event_hashes_and_reconciles_ignore() {
 
 #[test]
 fn trigram_direct_scan_reports_named_read_gap() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"needle\n")];
     let delta = LiveDelta::new(generation(files, "a"));
     let plane = index(segment(files), &delta, files);
@@ -351,7 +351,7 @@ fn trigram_direct_scan_reports_named_read_gap() {
 #[test]
 fn trigram_import_mutator_records_intent_without_watcher() {
     use aft::{config::Config, context::AppContext, language::StubProvider, protocol::RawRequest};
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let root = fs::canonicalize(root.path()).unwrap();
     let files: &[(&str, &[u8])] = &[("a.ts", b"const x = 1;\n")];
     write(&root, "a.ts", files[0].1);
@@ -386,7 +386,7 @@ fn trigram_import_mutator_records_intent_without_watcher() {
 
 #[test]
 fn trigram_inflight_reconcile_cannot_clear_intent() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     write(root.path(), "a.txt", files[0].1);
     let delta = Arc::new(Mutex::new(LiveDelta::new(generation(files, "a"))));
@@ -625,7 +625,7 @@ fn trigram_real_restart_and_kill_strict_reconcile() {
         Some(DurabilityStep::SegmentFileSynced),
         Some(DurabilityStep::PointerCas),
     ] {
-        let storage = tempfile::tempdir().unwrap();
+        let storage = crate::test_helpers::tempdir();
         let root = storage.path().join("checkout");
         fs::create_dir_all(&root).unwrap();
         write(&root, "a.txt", b"new\n");
@@ -681,7 +681,7 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
     use aft::blob_store::v2::FamilyPlane;
     use aft::views::contracts::ViewAccess;
     use aft::views::trigram::{Opener, Publisher, TrigramDriver};
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let root = storage.path().join("checkout");
     fs::create_dir_all(&root).unwrap();
     write(&root, "a.txt", b"old\n");
@@ -746,7 +746,7 @@ fn trigram_driver_rejects_obsolete_install_and_reports_actual_gaps() {
 #[test]
 fn trigram_write_success_and_validation_rollback_without_watcher() {
     use aft::{config::Config, context::AppContext, language::StubProvider, protocol::RawRequest};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_helpers::tempdir();
     let root = fs::canonicalize(directory.path()).unwrap();
     let files: &[(&str, &[u8])] = &[("a.ts", b"const old = 1;\n")];
     write(&root, "a.ts", files[0].1);
@@ -793,7 +793,7 @@ fn trigram_write_success_and_validation_rollback_without_watcher() {
 
 #[test]
 fn trigram_partial_io_error_keeps_written_bytes_visible() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = crate::test_helpers::tempdir();
     let files: &[(&str, &[u8])] = &[("a.txt", b"old\n")];
     write(directory.path(), "a.txt", files[0].1);
     let delta = Arc::new(Mutex::new(LiveDelta::new(generation(files, "a"))));
@@ -825,7 +825,7 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
     use aft::blob_store::v2::FamilyPlane;
     use aft::views::contracts::{PlaneAdapter, ViewAccess};
     use aft::views::trigram::{materialize, TrigramAdapter};
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let root = storage.path().join("checkout");
     fs::create_dir_all(&root).unwrap();
     write(&root, "a.txt", b"old\n");
@@ -902,7 +902,7 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
 fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
     use aft::pins::work_counters::key_file_work;
     use aft::views::trigram::materialize;
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let root = storage.path().join("checkout");
     fs::create_dir_all(&root).unwrap();
     let contents: Vec<(String, Vec<u8>)> = (0..200)

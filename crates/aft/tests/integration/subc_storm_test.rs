@@ -1721,7 +1721,7 @@ async fn drive_heavy_init_saturation_daemon(input: FakeDaemonInput) {
         "HeavyInit storm must leave a worker free for a bind"
     );
 
-    let fresh_root = tempfile::tempdir().expect("fresh bind root");
+    let fresh_root = crate::test_helpers::tempdir();
     corr += 1;
     send_bind(
         &tx,
@@ -2046,7 +2046,7 @@ fn build_route_specs(scale: &StormScale, roots: &[PathBuf]) -> Vec<RouteSpec> {
 }
 
 fn create_parent_and_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let fixture = tempfile::tempdir().expect("worktree storm fixture");
+    let fixture = crate::test_helpers::tempdir();
     let parent_root = fixture.path().join("parent");
     let worktree_root = fixture.path().join("linked-worktree");
     std::fs::create_dir_all(parent_root.join("src")).expect("parent source dir");
@@ -2077,7 +2077,7 @@ fn create_storm_roots(count: usize) -> (Vec<tempfile::TempDir>, Vec<PathBuf>) {
     let mut dirs = Vec::new();
     let mut paths = Vec::new();
     for index in 0..count {
-        let dir = tempfile::tempdir().expect("storm root tempdir");
+        let dir = crate::test_helpers::tempdir();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).expect("storm src dir");
         std::fs::write(
@@ -2972,7 +2972,7 @@ fn strip_verbatim(path: &str) -> String {
 }
 
 fn readiness_fixture() -> (Vec<tempfile::TempDir>, Vec<PathBuf>, HealthReport, Value) {
-    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let dirs: Vec<_> = (0..2).map(|_| crate::test_helpers::tempdir()).collect();
     let roots: Vec<_> = dirs.iter().map(|dir| dir.path().to_path_buf()).collect();
     let report = HealthReport {
         status: HealthStatus::Ok,

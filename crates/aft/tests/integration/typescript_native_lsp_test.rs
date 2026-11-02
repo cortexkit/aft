@@ -181,7 +181,7 @@ fn runtime_notes(aft: &mut AftProcess, file: &Path) -> Vec<String> {
 fn typescript_server_temp_directories_are_isolated() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let parent = temp.path().canonicalize().unwrap();
     let bin = parent.join("bin");
     let server = bin.join("typescript-language-server");
@@ -220,7 +220,7 @@ fn typescript_5_inspect_resolves_module_created_by_aft_write() {
     ) else {
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap();
     typescript_package(&root, &ts5);
     write(
@@ -276,7 +276,7 @@ fn typescript_5_inspect_outside_project_root_uses_external_workspace() {
     ) else {
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let parent = temp.path().canonicalize().unwrap();
     let root = parent.join("configured");
     fs::create_dir_all(&root).unwrap();
@@ -335,7 +335,7 @@ fn typescript_7_project_is_served_by_the_native_language_server() {
     ) else {
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap().join("app");
     typescript_package(&root, &ts7);
     let broken = root.join("src").join("broken.ts");
@@ -448,7 +448,7 @@ fn mixed_typescript_5_and_7_packages_get_separate_servers() {
     let (Some(ts7), Some(ts5)) = (installed(TS7_ENV, test), installed(TS5_ENV, test)) else {
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap().join("monorepo");
     write(&root.join("package.json"), r#"{"private":true}"#);
     let source =
@@ -567,7 +567,7 @@ fn sentinel(path: &Path, marker: &Path) {
 /// wrapper `node_modules/.bin/tsc` is started.
 #[test]
 fn typescript_7_without_its_platform_package_is_a_named_gap_and_spawns_nothing() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap().join("app");
     write(&root.join("package.json"), r#"{"private":true}"#);
     write(&root.join("tsconfig.json"), "{}");
@@ -628,7 +628,7 @@ fn typescript_7_without_its_platform_package_is_a_named_gap_and_spawns_nothing()
 /// identify itself as typescript-go after initialize is stopped and named.
 #[test]
 fn native_binary_that_is_not_typescript_go_is_rejected() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap().join("app");
     write(&root.join("package.json"), r#"{"private":true}"#);
     write(&root.join("tsconfig.json"), "{}");
@@ -699,7 +699,7 @@ fn unscoped_typescript_5_inspect_keeps_the_empty_working_set_contract() {
     ) else {
         return;
     };
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().canonicalize().unwrap().join("app");
     typescript_package(&root, &ts5);
     write(

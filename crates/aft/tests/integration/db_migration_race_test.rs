@@ -199,7 +199,7 @@ fn schema_sql(conn: &Connection) -> Vec<Option<String>> {
 
 #[test]
 fn migration_fast_path_avoids_writes_and_v8_runs_one_step_per_missing_version() {
-    let current_storage = tempfile::tempdir().expect("current temporary storage");
+    let current_storage = crate::test_helpers::tempdir();
     let current_database = current_storage.path().join("aft.db");
     drop(aft::db::open(&current_database).expect("create current database"));
     let mut current = Connection::open(&current_database).expect("open current connection");
@@ -212,7 +212,7 @@ fn migration_fast_path_avoids_writes_and_v8_runs_one_step_per_missing_version() 
     assert_eq!(MIGRATION_WRITE_TRANSACTIONS.load(Ordering::SeqCst), 0);
     current.trace(None);
 
-    let v8_storage = tempfile::tempdir().expect("v8 temporary storage");
+    let v8_storage = crate::test_helpers::tempdir();
     let v8_database = v8_storage.path().join("aft.db");
     create_v8_database(&v8_database);
     let mut v8 = Connection::open(&v8_database).expect("open v8 connection");
@@ -233,7 +233,7 @@ fn migration_fast_path_avoids_writes_and_v8_runs_one_step_per_missing_version() 
 
 #[test]
 fn stale_planned_migrations_cannot_regress_the_schema_or_wedge_open() {
-    let storage = tempfile::tempdir().expect("temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let database = storage.path().join("aft.db");
     create_v8_database(&database);
 
@@ -288,7 +288,7 @@ fn stale_planned_migrations_cannot_regress_the_schema_or_wedge_open() {
 
 #[test]
 fn open_repairs_reported_version_nine_wedge_with_v10_objects_intact() {
-    let storage = tempfile::tempdir().expect("temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let database = storage.path().join("aft.db");
     let conn = aft::db::open(&database).expect("create v10 database");
     conn.execute_batch(REPLAY_V9_AND_RECORD_9)
@@ -305,7 +305,7 @@ fn open_repairs_reported_version_nine_wedge_with_v10_objects_intact() {
 
 #[test]
 fn eight_concurrent_v8_openers_converge_on_the_fresh_v10_schema() {
-    let storage = tempfile::tempdir().expect("temporary storage");
+    let storage = crate::test_helpers::tempdir();
     let database = storage.path().join("aft.db");
     create_v8_database(&database);
 
@@ -344,7 +344,7 @@ fn eight_concurrent_v8_openers_converge_on_the_fresh_v10_schema() {
     let migrated = Connection::open(&database).expect("open concurrently migrated database");
     assert_eq!(schema_version(&migrated), aft::db::CURRENT_SCHEMA_VERSION);
 
-    let fresh_storage = tempfile::tempdir().expect("fresh comparison storage");
+    let fresh_storage = crate::test_helpers::tempdir();
     let fresh = aft::db::open(&fresh_storage.path().join("aft.db"))
         .expect("create fresh v10 comparison database");
     assert_eq!(schema_sql(&migrated), schema_sql(&fresh));

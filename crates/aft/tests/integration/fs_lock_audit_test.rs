@@ -57,7 +57,7 @@ fn write_synthetic_lock(path: &Path, metadata: &SyntheticLockMetadata) {
 
 #[test]
 fn live_same_host_pid_with_stale_heartbeat_is_not_reclaimed() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let lock_path = dir.path().join("audit.lock");
     let stale_at = now_ms().saturating_sub(STALE_HEARTBEAT_MS + 60_000);
     let metadata = SyntheticLockMetadata {
@@ -80,7 +80,7 @@ fn live_same_host_pid_with_stale_heartbeat_is_not_reclaimed() {
 
 #[test]
 fn stale_cross_host_lock_is_reclaimed_after_extended_heartbeat_timeout() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let lock_path = dir.path().join("audit.lock");
     let stale_at = now_ms().saturating_sub(STALE_HEARTBEAT_MS.saturating_mul(5) + 1_000);
     let metadata = SyntheticLockMetadata {

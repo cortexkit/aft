@@ -76,7 +76,7 @@ fn temp_copy(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let src = fixture_path(fixture_name);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let (stem, ext) = fixture_name.rsplit_once('.').unwrap_or((fixture_name, ""));
@@ -239,7 +239,7 @@ fn add_import_ts_relative_group() {
 #[test]
 fn add_import_ts_allows_parent_relative_module() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("parent_relative.ts");
     fs::write(&file, "export const x = 1;\n").unwrap();
 
@@ -270,7 +270,7 @@ fn add_import_ts_allows_parent_relative_module() {
 #[test]
 fn add_import_c_allows_parent_relative_include() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("relative_include.c");
     fs::write(&file, "int main(void) { return 0; }\n").unwrap();
 
@@ -301,7 +301,7 @@ fn add_import_c_allows_parent_relative_include() {
 #[test]
 fn add_import_solidity_allows_parent_relative_import() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("RelativeImport.sol");
     fs::write(
         &file,
@@ -336,7 +336,7 @@ fn add_import_solidity_allows_parent_relative_import() {
 #[test]
 fn add_import_solidity_dedupes_single_quoted_path() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("SingleQuotedImport.sol");
     let original = "pragma solidity ^0.8.0;\nimport './X.sol';\ncontract C {}\n";
     fs::write(&file, original).unwrap();
@@ -365,7 +365,7 @@ fn add_import_solidity_dedupes_single_quoted_path() {
 #[test]
 fn add_import_lua_dedup_only_recognizes_pure_require_declarations() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let pure_file = dir.path().join("pure.lua");
     let pure_original = "local pure = require(\"module\")\n";
@@ -415,7 +415,7 @@ fn add_import_lua_dedup_only_recognizes_pure_require_declarations() {
 #[test]
 fn add_import_c_rejects_absolute_modules() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("unsafe_include.c");
     let original = "int main(void) { return 0; }\n";
     fs::write(&file, original).unwrap();
@@ -446,7 +446,7 @@ fn add_import_c_rejects_absolute_modules() {
 #[test]
 fn add_import_java_and_php_reject_filesystem_modules() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let java_file = dir.path().join("Unsafe.java");
     let java_original = "package demo;\n\nclass Unsafe {}\n";
@@ -602,7 +602,7 @@ fn add_import_empty_file() {
     static EMPTY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = EMPTY_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("empty_{}.ts", n));
     fs::write(&file, "").unwrap();
@@ -662,7 +662,7 @@ fn add_import_unsupported_language_returns_error() {
     static UNSUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = UNSUP_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("test_{}.txt", n));
     fs::write(&file, "hello world").unwrap();
@@ -1205,7 +1205,7 @@ fn remove_import_preserves_default_when_named_removed() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "remove_default_named_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -1241,7 +1241,7 @@ fn remove_import_preserves_default_when_named_removed() {
 #[test]
 fn remove_import_solidity_matches_single_quoted_path() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("RemoveSingleQuotedImport.sol");
     fs::write(
         &file,
@@ -1273,7 +1273,7 @@ fn remove_import_solidity_matches_single_quoted_path() {
 #[test]
 fn remove_import_lua_ignores_mixed_rhs_but_removes_pure_require() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let mixed_file = dir.path().join("mixed.lua");
     let mixed_original = "local victim = require(\"victim\"), keep()\nprint(\"after\")\n";
@@ -1323,7 +1323,7 @@ fn remove_import_lua_ignores_mixed_rhs_but_removes_pure_require() {
 #[test]
 fn java_static_member_add_then_remove_round_trip() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("StaticRoundTrip.java");
     let original = "package com.example;\n\nimport java.util.List;\n\nclass C {}\n";
     fs::write(&file, original).unwrap();
@@ -1369,7 +1369,7 @@ fn java_static_member_add_then_remove_round_trip() {
 #[test]
 fn java_remove_module_removes_static_members_and_exact_import() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("RemoveStaticType.java");
     fs::write(
         &file,
@@ -1401,7 +1401,7 @@ fn java_remove_module_removes_static_members_and_exact_import() {
 #[test]
 fn java_remove_static_member_keeps_sibling_and_wildcard() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("RemoveOneStaticMember.java");
     fs::write(
         &file,
@@ -1437,7 +1437,7 @@ fn java_remove_static_member_keeps_sibling_and_wildcard() {
 #[test]
 fn organize_imports_without_imports_reports_no_op() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("no_imports.ts");
     let original = "export const x = 1;\n";
     fs::write(&file, original).unwrap();
@@ -1457,7 +1457,7 @@ fn organize_imports_without_imports_reports_no_op() {
 #[test]
 fn organize_imports_rejects_multi_namespace_php_without_mutating() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("multi_namespace.php");
     let original = r#"<?php
 
@@ -1505,7 +1505,7 @@ fn organize_imports_ts_regroups_and_sorts() {
     static ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_ts_{}.ts", n));
 
@@ -1564,7 +1564,7 @@ fn organize_imports_preserves_side_effect_order() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "organize_side_effects_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -1606,7 +1606,7 @@ fn organize_imports_preserves_c_and_cpp_textual_include_order() {
     let mut aft = AftProcess::spawn();
 
     for (extension, request_id) in [("c", "org-c-order"), ("cpp", "org-cpp-order")] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         fs::write(dir.path().join("setup.h"), "#define FEATURE_READY 1\n").unwrap();
         fs::write(
             dir.path().join("reader.h"),
@@ -1635,7 +1635,7 @@ fn organize_imports_preserves_c_and_cpp_textual_include_order() {
 #[test]
 fn organize_imports_python_still_sorts_and_deduplicates() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("sorting_control.py");
     fs::write(
         &file,
@@ -1660,7 +1660,7 @@ fn organize_imports_python_still_sorts_and_deduplicates() {
 #[test]
 fn organize_imports_ruby_preserves_reexecuting_loads_but_deduplicates_requires() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let load_file = dir.path().join("repeated_load.rb");
     fs::write(
@@ -1707,7 +1707,7 @@ fn organize_imports_ruby_preserves_reexecuting_loads_but_deduplicates_requires()
 #[test]
 fn organize_imports_perl_preserves_reexecuting_use_and_no_but_deduplicates_require() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     let use_file = dir.path().join("repeated_use.pl");
     fs::write(&use_file, "use Probe;\nuse Probe;\n\nprint 'done';\n").unwrap();
@@ -1767,7 +1767,7 @@ fn organize_imports_preserves_inter_import_comments() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "organize_comment_gap_{}.ts",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -1791,7 +1791,7 @@ fn add_remove_import_refuse_csharp_and_php_multi_region_imports() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
 
     let cs_file = dir.path().join(format!("multi_region_{n}.cs"));
@@ -1864,7 +1864,7 @@ fn php_grouped_use_refuses_memberwise_add_and_remove() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "php_grouped_use_{}.php",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -1903,7 +1903,7 @@ fn php_grouped_use_refuses_memberwise_add_and_remove() {
 #[test]
 fn php_remove_comma_separated_use_rewrites_physical_declaration() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let cases = [
         (
             "first",
@@ -1962,7 +1962,7 @@ fn php_remove_comma_separated_use_rewrites_physical_declaration() {
 #[test]
 fn php_add_deduplicates_comma_separated_sibling_and_organize_preserves_it() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("php_multi_dedup.php");
     let original = "<?php\nuse App\\First, App\\Keep;\n\nclass C { public Keep $keep; }\n";
     fs::write(&file, original).unwrap();
@@ -1998,7 +1998,7 @@ fn organize_imports_go_grouped_block_refuses_internal_comments() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "organize_go_grouped_comments_{}.go",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -2032,7 +2032,7 @@ fn organize_imports_go_grouped_block_parses() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join(format!(
         "organize_go_grouped_{}.go",
         COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -2069,7 +2069,7 @@ fn organize_imports_ts_deduplicates() {
     static DEDUP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = DEDUP_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_dedup_{}.ts", n));
 
@@ -2127,7 +2127,7 @@ fn organize_imports_py_isort_grouping() {
     static PY_ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = PY_ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_py_{}.py", n));
 
@@ -2194,7 +2194,7 @@ fn organize_imports_rs_merges_common_prefix() {
     static RS_ORG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = RS_ORG_COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_rs_{}.rs", n));
 
@@ -2264,7 +2264,7 @@ fn organize_imports_rs_preserves_nested_use_tree() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_rs_nested_{}.rs", n));
 
@@ -2314,7 +2314,7 @@ fn main() {}
 #[test]
 fn organize_imports_rs_refuses_to_detach_outer_attribute() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("organize_rs_attribute.rs");
     let original = "\
 #[cfg(unix)]
@@ -2347,7 +2347,7 @@ fn organize_imports_rs_preserves_pub_use_and_private_use_pair() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("organize_rs_pub_private_{}.rs", n));
 
@@ -2397,7 +2397,7 @@ fn organize_imports_ts_preserves_named_aliases() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("alias_ts_{}.ts", n));
 
@@ -2433,7 +2433,7 @@ fn organize_imports_ts_preserves_per_name_type_prefix() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("typeprefix_ts_{}.ts", n));
 
@@ -2480,7 +2480,7 @@ fn organize_imports_ts_aliased_and_bare_are_not_duplicates() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("alias_dedup_ts_{}.ts", n));
 
@@ -2520,7 +2520,7 @@ fn organize_imports_ts_preserves_namespace_and_side_effect_imports() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir
         .path()
@@ -2559,7 +2559,7 @@ fn organize_imports_ts_preserves_side_effect_and_namespace_imports_reverse_order
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir
         .path()
@@ -2598,7 +2598,7 @@ fn organize_imports_ts_dedupes_identical_namespace_imports() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("namespace_dedup_ts_{}.ts", n));
 
@@ -2632,7 +2632,7 @@ fn organize_imports_ts_keeps_distinct_namespace_aliases() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("namespace_aliases_ts_{}.ts", n));
 
@@ -2670,7 +2670,7 @@ fn organize_imports_ts_sorts_named_specifiers_by_imported_name() {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let file = dir.path().join(format!("specifier_sort_ts_{}.ts", n));
 
@@ -2698,7 +2698,7 @@ fn organize_imports_ts_sorts_named_specifiers_by_imported_name() {
 
 #[test]
 fn generate_ts_namespace_import_line_round_trips_namespace_only() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("namespace.ts");
     fs::write(&file, "import * as ns from './mod';\n").expect("write import file");
     let (_, _, block) = parse_file_imports(&file, LangId::TypeScript).expect("parse imports");
@@ -2718,7 +2718,7 @@ fn generate_ts_namespace_import_line_round_trips_namespace_only() {
 
 #[test]
 fn generate_ts_namespace_import_line_round_trips_default_and_namespace() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("default_namespace.ts");
     fs::write(&file, "import Foo, * as ns from './mod';\n").expect("write import file");
     let (_, _, block) = parse_file_imports(&file, LangId::TypeScript).expect("parse imports");
@@ -2742,7 +2742,7 @@ fn generate_ts_namespace_import_line_round_trips_default_and_namespace() {
 fn add_import_merges_into_existing_same_module_named_import() {
     let mut aft = AftProcess::spawn();
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("lib.mjs");
     let file = dir.path().join("merge.mjs");
     fs::write(
@@ -2829,7 +2829,7 @@ fn send_scala_add_import(
 
 fn assert_scala2_add_is_noop(input: &str, module: &str, names: &[&str], modifiers: &[&str]) {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("dedup.scala");
     fs::write(&file, input).unwrap();
 
@@ -2881,7 +2881,7 @@ fn add_import_scala2_dedupes_renamed_import() {
 #[test]
 fn add_import_scala2_new_wildcard_uses_existing_dialect() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("new.scala");
     let input = "import a.b._\n\nobject Main {}\n";
     fs::write(&file, input).unwrap();
@@ -2910,7 +2910,7 @@ fn add_import_scala2_new_wildcard_uses_existing_dialect() {
 #[test]
 fn organize_imports_preserves_es_attributes_and_ordinary_organization() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("attributes.mjs");
     fs::write(
         &file,
@@ -2950,7 +2950,7 @@ import { alpha, zebra } from 'ordinary';\n",
 #[test]
 fn add_and_partial_remove_preserve_es_import_attributes() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("config.json");
     fs::write(&module, "{\"ok\":true}\n").unwrap();
     aft.send(&format!(
@@ -3038,7 +3038,7 @@ fn add_and_partial_remove_preserve_es_import_attributes() {
 #[test]
 fn add_import_rejects_non_default_json_named_export_without_mutation_or_backup() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("config.json");
     fs::write(&module, "{\"ok\":true}\n").unwrap();
     aft.send(&format!(
@@ -3121,7 +3121,7 @@ fn add_import_rejects_non_default_json_named_export_without_mutation_or_backup()
 #[test]
 fn add_import_rejects_fresh_json_named_import_without_mutation_or_backup() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("config.json");
     fs::write(&module, "{\"ok\":true}\n").unwrap();
     aft.send(&format!(
@@ -3182,7 +3182,7 @@ fn add_import_rejects_fresh_json_named_import_without_mutation_or_backup() {
 #[test]
 fn add_import_rejects_json_namespace_binding_without_mutation_or_backup() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("config.json");
     let file = dir.path().join("namespace-json.mjs");
     fs::write(&module, "{\"ok\":true}\n").unwrap();
@@ -3214,7 +3214,7 @@ fn add_import_rejects_json_namespace_binding_without_mutation_or_backup() {
 #[test]
 fn add_import_allows_json_default_import_add_and_dedup() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let module = dir.path().join("config.json");
     let file = dir.path().join("default-json.mjs");
     fs::write(&module, "{\"ok\":true}\n").unwrap();
@@ -3278,7 +3278,7 @@ fn add_import_allows_json_default_import_add_and_dedup() {
 #[test]
 fn add_import_allows_named_export_for_non_json_attributed_module() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("webassembly-attribute.mjs");
     fs::write(
         &file,
@@ -3329,7 +3329,7 @@ fn assert_rust_library_compiles(file: &Path) {
 
 #[test]
 fn rust_use_list_add_remove_organize_compiles() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("lib.rs");
     let source = "use a::{x, y};\n\nmod a { pub fn x() {} pub fn y() {} pub fn z() {} }\npub fn f() { x(); y(); }\n";
     fs::write(&file, source).unwrap();
@@ -3392,7 +3392,7 @@ fn rust_use_list_complex_entries_roundtrip() {
         ("pub use a::{x as y, z};", "a", vec!["x as y", "z"]),
         ("use {a, b};", "", vec!["a", "b"]),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join("lib.rs");
         fs::write(&file, declaration).unwrap();
         let (_, _, block) = parse_file_imports(&file, LangId::Rust).unwrap();
@@ -3434,7 +3434,7 @@ fn rust_complex_use_lists_survive_edits_and_compile() {
             "use std::fmt::{self, Display};",
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join("lib.rs");
         let definitions = "pub mod a { pub fn x() {} pub fn e() {} pub fn z() {} pub mod b { pub fn c() {} pub fn d() {} } }\n";
         let source = format!("{declaration}\n\n{definitions}");
@@ -3472,7 +3472,7 @@ fn es_import_commands_preserve_quotes() {
         ("js", "import { z, a } from \"z\";\nimport { b } from 'b';\n"),
         ("vue", "<script setup lang=\"ts\">\nimport { z, a } from \"z\";\nimport { b } from 'b';\n</script>\n"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("quotes.{extension}"));
         fs::write(&file, source).unwrap();
         let mut aft = AftProcess::spawn();
@@ -3506,7 +3506,7 @@ fn es_import_commands_preserve_missing_semicolons() {
         ("js", "import { A, B } from './types.js'\nimport { z } from 'z'\n\nexport const x = 1\n"),
         ("vue", "<script setup lang=\"ts\">\nimport type { A, B } from './types.ts'\nimport { z } from 'z'\n</script>\n"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("nosemi.{extension}"));
         fs::write(&file, source).unwrap();
         let types = if extension == "js" { "./types.js" } else { "./types.ts" };
@@ -3550,7 +3550,7 @@ fn es_import_commands_keep_semicolons() {
         ("js", "import { A, B } from './types.ts';\nimport { z } from 'z';\n\nexport const x = 1;\n"),
         ("vue", "<script setup lang=\"ts\">\nimport type { A, B } from './types.ts';\nimport { z } from 'z';\n</script>\n"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("semi.{extension}"));
         fs::write(&file, source).unwrap();
         let mut aft = AftProcess::spawn();
@@ -3582,7 +3582,7 @@ fn es_import_commands_keep_semicolons() {
 /// file's majority.
 #[test]
 fn es_import_rewrites_keep_each_statements_terminator() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("mixed.ts");
     fs::write(
         &file,
@@ -3646,7 +3646,7 @@ fn es_import_rewrites_keep_each_statements_terminator() {
 /// `javascript.formatter.semicolons` setting.
 #[test]
 fn es_add_import_follows_biome_semicolons_without_existing_imports() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().canonicalize().unwrap();
     fs::write(
         root.join("biome.json"),
@@ -3716,7 +3716,7 @@ fn remove_named_specifier_preserves_existing_list_layout() {
             "use std::fs::{\n    read_dir,\n    remove_file,\n};\n",
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("layout.{extension}"));
         fs::write(&file, source).unwrap();
         let response = aft.send(
@@ -3741,7 +3741,7 @@ fn remove_named_specifier_preserves_existing_list_layout() {
         ("py", "from pkg import (only)\n", "pkg"),
         ("rs", "pub use pkg::{only};\n", "pkg"),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("only-one.{extension}"));
         fs::write(&file, source).unwrap();
         let response = aft.send(
@@ -3796,7 +3796,7 @@ fn add_named_specifier_preserves_existing_multiline_layout() {
             "use pkg::{\n    alpha,\n    beta,\n    gamma,\n};\n",
         ),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("add-layout.{extension}"));
         fs::write(&file, source).unwrap();
         let response = send_add_import(
@@ -3845,7 +3845,7 @@ fn es_script(extension: &str, script: &str) -> String {
 #[test]
 fn add_import_es_inline_type_dedup_reports_partial_add() {
     for extension in ["ts", "tsx", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("inline.{extension}"));
         let module = "@cortexkit/anthropic-auth-core";
         let source = es_script(extension, "import {\n  Zap, // keep authored order\n  Api,\n  type LogTestRecord,\n} from \"@cortexkit/anthropic-auth-core\";\n");
@@ -3878,7 +3878,7 @@ fn add_import_es_inline_type_dedup_reports_partial_add() {
 #[test]
 fn add_import_es_all_names_present_is_byte_identical() {
     for extension in ["ts", "tsx", "js", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("present.{extension}"));
         let source = es_script(
             extension,
@@ -3903,7 +3903,7 @@ fn add_import_es_all_names_present_is_byte_identical() {
 #[test]
 fn add_import_es_alias_dedup_uses_local_binding() {
     for extension in ["ts", "tsx", "js", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("aliases.{extension}"));
         let source = es_script(extension, "import { X as Y, Z } from 'pkg';\n");
         fs::write(&file, &source).unwrap();
@@ -3935,7 +3935,7 @@ fn add_import_es_alias_dedup_uses_local_binding() {
 #[test]
 fn add_import_es_type_statement_dedup_and_in_place_extension() {
     for extension in ["ts", "tsx", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("types.{extension}"));
         let source = es_script(extension, "import { Value } from 'pkg'\nimport type {\n  Zed, // preserve order and comment\n  A as LocalA,\n} from 'pkg'\n");
         fs::write(&file, &source).unwrap();
@@ -3969,7 +3969,7 @@ fn add_import_es_type_statement_dedup_and_in_place_extension() {
 #[test]
 fn add_import_es_prefers_type_statement_over_inline_type() {
     for extension in ["ts", "tsx", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("prefer.{extension}"));
         let source = es_script(
             extension,
@@ -3991,7 +3991,7 @@ fn add_import_es_prefers_type_statement_over_inline_type() {
 #[test]
 fn add_import_es_inline_type_present_and_plain_value_fallback() {
     for extension in ["ts", "tsx", "vue"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let file = dir.path().join(format!("fallback.{extension}"));
         let mut aft = AftProcess::spawn();
         let source = es_script(

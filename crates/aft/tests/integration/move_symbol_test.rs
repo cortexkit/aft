@@ -11,7 +11,7 @@ use serde_json::json;
 /// including the `features/` subdirectory.  Returns `(TempDir, root_path)`.
 fn setup_move_fixture() -> (tempfile::TempDir, String) {
     let fixtures = fixture_path("move_symbol");
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
 
     // Copy top-level fixture files
     for entry in std::fs::read_dir(&fixtures).expect("read fixtures dir") {
@@ -85,7 +85,7 @@ fn full_validation_case(
     fail: bool,
     checker: ValidationChecker,
 ) -> (tempfile::TempDir, serde_json::Value) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(
         &root.join("tsconfig.json"),
@@ -382,7 +382,7 @@ fn setup_namespace_move_case(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = tmp.path().join("source.ts");
     let destination = tmp.path().join("dest.ts");
     let consumer = tmp.path().join("consumer.ts");
@@ -409,7 +409,7 @@ fn request_namespace_move(
 }
 
 fn assert_move_symbol_unsupported(ext: &str, source: &str, dest: &str) {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let src = tmp.path().join(format!("source.{ext}"));
     let dst = tmp.path().join(format!("dest.{ext}"));
     write_file(&src, source);
@@ -446,7 +446,7 @@ fn move_symbol_rejects_go_source() {
 
 #[test]
 fn move_symbol_rewrites_barrel_named_reexport() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let src_dir = tmp.path().join("src");
     let foo = src_dir.join("foo.ts");
@@ -479,7 +479,7 @@ fn move_symbol_rewrites_barrel_named_reexport() {
 /// must be left untouched while the real `src/` consumer is rewritten.
 #[test]
 fn move_symbol_skips_build_artifacts_and_gitignored_files() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let foo = tmp.path().join("src/foo.ts");
     let bar = tmp.path().join("src/bar.ts");
@@ -542,7 +542,7 @@ fn move_symbol_skips_build_artifacts_and_gitignored_files() {
 /// rejects it. The move must FAIL and the source must still define the symbol.
 #[test]
 fn move_symbol_rolled_back_dest_does_not_lose_symbol() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let src = tmp.path().join("src.ts");
     let dest = tmp.path().join("dest.js");
@@ -587,7 +587,7 @@ fn move_symbol_rolled_back_dest_does_not_lose_symbol() {
 /// import after the move.
 #[test]
 fn move_symbol_rewrites_consumers_in_hidden_dirs() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let foo = tmp.path().join("src/foo.ts");
     let bar = tmp.path().join("src/bar.ts");
@@ -758,7 +758,7 @@ fn move_symbol_configured_without_store_still_rewrites_ts_consumers() {
 
 #[test]
 fn move_symbol_large_project_has_no_legacy_file_cap() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
 
     write_file(
@@ -977,7 +977,7 @@ export const result = moved();\n"
 
 #[test]
 fn move_symbol_rewrites_namespace_members_in_js_and_tsx_consumers() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = tmp.path().join("source.ts");
     let destination = tmp.path().join("dest.ts");
     let javascript_consumer = tmp.path().join("consumer.js");
@@ -1171,7 +1171,7 @@ fn move_symbol_rejects_namespace_reexport_before_writing() {
 
 #[test]
 fn move_symbol_rewrites_source_file_when_remaining_code_uses_moved_symbol() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("helpers.ts");
@@ -1238,7 +1238,7 @@ export function useHelper(): string {
 
 #[test]
 fn move_symbol_does_not_reimport_shadowed_source_references() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("dest.ts");
@@ -1312,7 +1312,7 @@ export const value = logger();
 
 #[test]
 fn move_symbol_reimports_unshadowed_source_references() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("dest.ts");
@@ -1357,7 +1357,7 @@ export function useLogger(): string {
 
 #[test]
 fn move_symbol_does_not_reimport_object_keys_or_member_access() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("dest.ts");
@@ -1402,7 +1402,7 @@ export function read(obj: { logger: number }): number {
 
 #[test]
 fn move_symbol_preserves_default_import_shape_and_alias() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let old = tmp.path().join("old.ts");
     let dest = tmp.path().join("new_home.ts");
@@ -1623,7 +1623,7 @@ fn move_symbol_operation_undo_restores_source_destination_and_consumers() {
 
 #[test]
 fn move_symbol_undo_removes_new_destination_file() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let root = tmp.path().display().to_string();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("new_dest.ts");
@@ -1707,7 +1707,7 @@ fn move_symbol_symbol_not_found() {
 
 #[test]
 fn move_symbol_ambiguous_symbol_is_error_response() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = tmp.path().join("source.ts");
     let dest = tmp.path().join("dest.ts");
     std::fs::write(
@@ -1806,7 +1806,7 @@ fn move_symbol_file_not_found() {
 /// the `export` keyword and trailing whitespace.
 #[test]
 fn move_symbol_does_not_leak_export_keyword() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let source = tmp.path().join("sample.ts");
     let dest = tmp.path().join("helper.ts");
 
@@ -1875,7 +1875,7 @@ fn move_symbol_does_not_leak_export_keyword() {
 /// original function to the new extracted one.
 #[test]
 fn extract_function_preserves_enclosing_export_keyword() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("sample.ts");
 
     std::fs::write(

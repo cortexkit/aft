@@ -138,11 +138,11 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
         .expect("test runtime");
 
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let storage = tempfile::tempdir().expect("storage tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path(), storage.path());
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");

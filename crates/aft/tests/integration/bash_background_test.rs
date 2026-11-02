@@ -35,7 +35,7 @@ fn wait_until_process_exits(pid: i32) -> bool {
 }
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_background_at_root(
         aft,
         &dir,
@@ -48,7 +48,7 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
 
 #[cfg(unix)]
 fn configure_background_with_env(aft: &mut AftProcess, env: Value) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_background_at_root(
         aft,
         &dir,
@@ -75,8 +75,8 @@ fn configure_background_at_root(aft: &mut AftProcess, dir: &tempfile::TempDir, c
 }
 
 fn configure_restricted_background(aft: &mut AftProcess) -> (tempfile::TempDir, tempfile::TempDir) {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let response = aft.send(
         &json!({
             "id": "cfg-restricted-bg",
@@ -748,8 +748,8 @@ fn restricted_read_allows_only_current_session_bash_artifacts() {
 fn assert_background_artifact_search_access(command: &str) {
     for restricted in [false, true] {
         let mut aft = AftProcess::spawn();
-        let project = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
+        let project = crate::test_helpers::tempdir();
+        let storage = crate::test_helpers::tempdir();
         let configured = aft.send(
             &json!({
                 "id": "artifact-search-config",
@@ -1122,8 +1122,8 @@ fn project_bash_env_applies_only_after_trust_and_is_disclosed_once() {
     // The configured project root is the directory bash commands run in, so it
     // is also the root the trust list is keyed by. Storage is separate so the
     // trust file it writes is easy to find.
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let storage_path = storage.path().to_path_buf();
     let project_tier = serde_json::json!({
         "tier": "project",
@@ -1565,7 +1565,7 @@ fn background_output_spills_to_disk() {
 #[test]
 fn background_feature_flag_disabled_rejects_spawn() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     // Explicitly disable background via a config tier. configure now ALWAYS
     // resolves (a tier-less configure applies the recommended-surface defaults,
     // which ENABLE background) — so to test the "background disabled rejects

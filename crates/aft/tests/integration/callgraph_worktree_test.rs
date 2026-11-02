@@ -40,6 +40,25 @@ fn commit(root: &Path) {
     );
 }
 
+/// Give the fixture's own checkout a commit.
+///
+/// Several tests in this module configure a linked checkout and then check the
+/// legacy writer refusal, without running the classifier that admission runs
+/// for real. A checkout whose HEAD names no commit would be treated by other
+/// tests as a repository Git cannot describe, so the fixture never leaves one.
+fn commit_index(root: &Path) {
+    if std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        return;
+    }
+    commit(root);
+}
+
 fn source(caller: &str) -> String {
     format!(
         "export function target(value: number) {{ return value; }}\n\
@@ -47,12 +66,17 @@ fn source(caller: &str) -> String {
     )
 }
 
-fn linked_checkout(parent: &Path) -> PathBuf {
+fn linked_checkout(parent: &Path, complete_history: bool) -> PathBuf {
     let owner = parent.join("owner");
     std::fs::create_dir_all(&owner).unwrap();
     git(&owner, &["init", "-q"]);
     std::fs::write(owner.join("index.ts"), source("ownerCaller")).unwrap();
     commit(&owner);
+    if !complete_history {
+        let awaiting_commit = parent.join("awaiting-commit");
+        std::fs::create_dir_all(&awaiting_commit).unwrap();
+        git(&awaiting_commit, &["init", "-q"]);
+    }
     let checkout = parent.join("checkout");
     git(
         &owner,
@@ -64,7 +88,12 @@ fn linked_checkout(parent: &Path) -> PathBuf {
             checkout.to_str().unwrap(),
         ],
     );
-    std::fs::canonicalize(checkout).unwrap()
+    let checkout = std::fs::canonicalize(checkout).unwrap();
+    if complete_history {
+        // A new linked worktree names no commit until its own index is written.
+        commit_index(&checkout);
+    }
+    checkout
 }
 
 fn request(value: Value) -> RawRequest {
@@ -141,7 +170,7 @@ fn family_writes_in_child(name: &str, expects_legacy_denial: bool) -> bool {
     }
     // A separate process isolates both the logger and every default storage
     // location, without changing the environment of parallel tests.
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -191,7 +220,7 @@ fn views_worktree_family_writes_publish_without_legacy_denial() {
         return;
     }
     let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
-    let checkout = linked_checkout(&fixture);
+    let checkout = linked_checkout(&fixture, false);
     let storage = fixture.join("storage");
     let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, true);
     assert!(!owner.shared_artifacts_read_only());
@@ -244,7 +273,7 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
         return;
     }
     let fixture = PathBuf::from(std::env::var_os("AFT_TEST_FAMILY_WRITES_ROOT").unwrap());
-    let checkout = linked_checkout(&fixture);
+    let checkout = linked_checkout(&fixture, false);
     let storage = fixture.join("storage");
     let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, false);
     assert!(!owner.shared_artifacts_read_only());
@@ -274,7 +303,7 @@ const OPERATIONS: [&str; 6] = [
 
 #[test]
 fn callgraph_restart_reconciles_source_dirtied_before_configure() {
-    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::test_helpers::tempdir();
     let root = fixture.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "-q"]);
@@ -324,8 +353,8 @@ fn callgraph_restart_reconciles_source_dirtied_before_configure() {
 
 #[test]
 fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join("index.ts"), source("dirtyCaller")).unwrap();
     publish(&checkout, &storage);
@@ -346,8 +375,8 @@ fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
 
 #[test]
 fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let storage = fixture.path().join("storage");
     let worker_source = source("workerCaller");
     std::fs::write(checkout.join("index.ts"), &worker_source).unwrap();
@@ -409,8 +438,8 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
 
 #[test]
 fn callgraph_worktree_new_markdown_does_not_wait_for_unrelated_planes() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let owner = fixture.path().join("owner");
     let storage = fixture.path().join("storage");
     publish(&owner, &storage);
@@ -510,8 +539,8 @@ fn query_file(ctx: &AppContext, file: &Path, operation: &str, caller: &str) -> R
 
 #[test]
 fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join(".gitignore"), ".cortexkit/\n").unwrap();
     commit(&checkout);
@@ -592,8 +621,8 @@ fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
 
 #[test]
 fn callgraph_unindexed_path_differs_from_missing_symbol() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let storage = fixture.path().join("storage");
     let empty = checkout.join("empty.ts");
     std::fs::write(&empty, "// An indexed file with no symbols.\n").unwrap();
@@ -651,8 +680,8 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
 
 #[test]
 fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let owner = fixture.path().join("owner");
     let storage = fixture.path().join("storage");
     // The main checkout has published only shared blobs and its own view, not
@@ -704,8 +733,8 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
 #[test]
 fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
     for views in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
-        let checkout = linked_checkout(fixture.path());
+        let fixture = crate::test_helpers::tempdir();
+        let checkout = linked_checkout(fixture.path(), true);
         let storage = fixture.path().join("storage");
         // Only the linked checkout is configured: no owner route or store has
         // ever existed, including when views are enabled.
@@ -750,8 +779,8 @@ fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
 
 #[test]
 fn callgraph_worktree_own_view_serves_all_operations_without_owner_store() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
+    let fixture = crate::test_helpers::tempdir();
+    let checkout = linked_checkout(fixture.path(), true);
     let storage = fixture.path().join("storage");
     std::fs::write(checkout.join("index.ts"), source("checkoutCaller")).unwrap();
     commit(&checkout);

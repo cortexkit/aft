@@ -88,7 +88,7 @@ fn ensure_symlink(result: std::io::Result<()>, test_name: &str) -> bool {
 #[test]
 fn write_blocks_parent_dir_traversal_outside_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
@@ -116,7 +116,7 @@ fn write_blocks_parent_dir_traversal_outside_project_root() {
 #[test]
 fn read_blocks_absolute_path_outside_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside.txt");
     fs::create_dir_all(&root).unwrap();
@@ -142,7 +142,7 @@ fn read_blocks_absolute_path_outside_project_root() {
 #[test]
 fn write_blocks_symlink_traversal_outside_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
@@ -177,7 +177,7 @@ fn write_blocks_symlink_traversal_outside_project_root() {
 #[test]
 fn write_blocks_broken_symlink_escape_from_project_root() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("escape-target");
     fs::create_dir_all(&root).unwrap();
@@ -210,7 +210,7 @@ fn write_blocks_broken_symlink_escape_from_project_root() {
 #[cfg(any(unix, windows))]
 #[test]
 fn validate_path_rejects_broken_absolute_symlink_escape() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside").join("foo");
     fs::create_dir_all(&root).unwrap();
@@ -229,7 +229,7 @@ fn validate_path_rejects_broken_absolute_symlink_escape() {
 #[cfg(any(unix, windows))]
 #[test]
 fn validate_path_rejects_broken_relative_symlink_escape() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     fs::create_dir_all(&root).unwrap();
     if !ensure_symlink(
@@ -246,7 +246,7 @@ fn validate_path_rejects_broken_relative_symlink_escape() {
 #[cfg(any(unix, windows))]
 #[test]
 fn validate_path_rejects_broken_symlink_chain_escape() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let outside = dir.path().join("outside");
     fs::create_dir_all(&root).unwrap();
@@ -270,7 +270,7 @@ fn validate_path_rejects_broken_symlink_chain_escape() {
 
 #[test]
 fn write_resolves_relative_dotdot_path_within_project_root() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     fs::create_dir_all(root.join("nested")).unwrap();
 
@@ -297,7 +297,7 @@ fn write_resolves_relative_dotdot_path_within_project_root() {
 #[test]
 fn validate_path_resolves_relative_paths_against_project_root_not_process_cwd() {
     let cwd = std::env::current_dir().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     let file = root.join("src").join("main.rs");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -314,7 +314,7 @@ fn validate_path_resolves_relative_paths_against_project_root_not_process_cwd() 
 
 #[test]
 fn validate_path_returns_canonical_path_that_write_uses() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path().join("project");
     fs::create_dir_all(root.join("nested")).unwrap();
 

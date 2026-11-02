@@ -63,6 +63,83 @@ thread_local! {
         .prefix("aft-test-scratch-")
         .tempdir()
         .expect("create per-test scratch dir");
+    static TEMP_FOR_FIXTURES: () = prepare_fixture_temp_directory();
+}
+
+/// Create a temporary fixture directory that carries no project evidence.
+///
+/// Folder admission treats any directory inside a Git work tree as a project.
+/// A build server runs its jobs with a temp directory inside the checkout it
+/// builds, so a bare `tempfile::tempdir()` there silently inherits that
+/// checkout's evidence and is admitted, while the same fixture is refused on
+/// CI runners whose temp directory lies outside every repository. Fixtures
+/// therefore create their roots through this function instead: it proves the
+/// process temp directory sits outside any work tree, or relocates it once
+/// (`TMPDIR`/`TEMP`/`TMP`) to an equivalent that does, and fails with the
+/// reason when the environment supports neither. The check runs once per test
+/// binary the first time a fixture is created.
+pub fn tempdir() -> tempfile::TempDir {
+    TEMP_FOR_FIXTURES.with(|_| ());
+    tempfile::tempdir().expect("create test project directory")
+}
+
+fn prepare_fixture_temp_directory() {
+    let inherited = std::env::temp_dir();
+    if temp_outside_git_work_tree(&inherited) {
+        return;
+    }
+    // A caller may isolate fixtures from an enclosing checkout by naming a Git
+    // ceiling directory (the admission tests do). Probe from inside a real
+    // temporary directory so the caller's ceiling applies to it too.
+    let probe = tempfile::Builder::new()
+        .prefix("aft-temp-check-")
+        .tempdir()
+        .expect("create temp check directory");
+    if git_work_tree_of(probe.path()).is_none() {
+        return;
+    }
+    drop(probe);
+    let relocated = inherited.join("aft-fixture-tmp");
+    if !temp_outside_git_work_tree(&relocated) {
+        panic!(
+            "the test temp directory {} is inside a Git work tree, and so is {}; folder \
+             admission would treat every bare fixture as a project. Point TMPDIR outside any \
+             repository",
+            inherited.display(),
+            relocated.display()
+        );
+    }
+    std::env::set_var("TMPDIR", &relocated);
+    std::env::set_var("TEMP", &relocated);
+    std::env::set_var("TMP", &relocated);
+}
+
+fn temp_outside_git_work_tree(directory: &Path) -> bool {
+    match std::fs::create_dir_all(directory) {
+        Ok(()) => {}
+        Err(error) => panic!(
+            "create test temp directory {}: {error}",
+            directory.display()
+        ),
+    }
+    git_work_tree_of(directory).is_none()
+}
+
+/// The work tree Git reports for `path`, or `None` when it is outside one.
+/// Git's own limits are inherited, including a caller's ceiling directories.
+fn git_work_tree_of(path: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!top.is_empty()).then(|| PathBuf::from(top))
 }
 
 /// A scratch directory private to the calling test's thread.
@@ -910,6 +987,15 @@ impl AftProcess {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The configure acknowledgement precedes the folder decision. Fixtures
+    /// that assert a non-project root must settle the decision and prove the
+    /// root really carries no project evidence before they use it.
+    pub fn wait_for_unadmitted_folder(&mut self) -> serde_json::Value {
+        let folder = self.wait_for_folder_admission();
+        assert_eq!(folder["classification"], "not_project", "{folder}");
+        folder
     }
 
     /// Send a configure command with `format_on_edit: true`.

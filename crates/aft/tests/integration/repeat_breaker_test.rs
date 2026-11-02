@@ -265,7 +265,7 @@ fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
     // request from a delegated worker: inside the `tool_call` envelope, and at
     // the top level of a raw `bash` request (whose own arguments are nested
     // under `params`).
-    let project = tempfile::tempdir().expect("worker repeat project");
+    let project = crate::test_helpers::tempdir();
     std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
         .expect("write repeat fixture");
     let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
@@ -982,7 +982,7 @@ fn repeat_breaker_discards_occurrences_beyond_the_record_cap() {
 
 #[test]
 fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
-    let project = tempfile::tempdir().expect("repeat breaker NDJSON project");
+    let project = crate::test_helpers::tempdir();
     std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
         .expect("write repeat fixture");
     let mut aft = AftProcess::spawn();
@@ -1043,7 +1043,7 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
 
 #[test]
 fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
-    let project = tempfile::tempdir().expect("rewritten bash repeat project");
+    let project = crate::test_helpers::tempdir();
     write_rewritten_grep_fixture(project.path());
     let mut aft = AftProcess::spawn();
     let configured = aft.send(
@@ -1182,7 +1182,7 @@ fn repeat_breaker_never_steers_previewed_mutations() {
     // Hoisted mutations send a preview and then the apply for one model call.
     // Neither half is polling, even after three identical applied writes span
     // the breaker's time threshold.
-    let project = tempfile::tempdir().expect("preview repeat project");
+    let project = crate::test_helpers::tempdir();
     let target = project.path().join("notes.txt");
     let mut aft = AftProcess::spawn();
     aft.configure_project(project.path());

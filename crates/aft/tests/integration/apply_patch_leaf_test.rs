@@ -78,7 +78,7 @@ fn preview(aft: &mut AftProcess, id: &str, patch_text: &str) -> Value {
 
 #[test]
 fn apply_patch_full_multifile_and_single_undo_reverts_all() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "update.txt", "alpha\nold\nomega\n");
     write_file(root, "delete.txt", "remove me\n");
@@ -137,7 +137,7 @@ fn apply_patch_full_multifile_and_single_undo_reverts_all() {
 
 #[test]
 fn apply_patch_crlf_envelope_preserves_only_content_carriage_returns() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "existing.txt", "alpha\nold\rinside\nomega\n");
     let mut aft = configured_aft(root);
@@ -186,7 +186,7 @@ fn apply_patch_crlf_envelope_preserves_only_content_carriage_returns() {
 
 #[test]
 fn apply_patch_update_uses_reflow_fuzzy_hunk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(
         root,
@@ -216,7 +216,7 @@ fn apply_patch_update_uses_reflow_fuzzy_hunk() {
 
 #[test]
 fn apply_patch_preserves_dominant_line_endings_and_preview_parity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let replacement = root.join("replacement.txt");
     fs::write(&replacement, b"alpha\r\nold\r\nomega\r\n").unwrap();
@@ -314,7 +314,7 @@ fn apply_patch_preserves_dominant_line_endings_and_preview_parity() {
 
 #[test]
 fn apply_patch_move_happy_path_and_undo_restores_source() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "source.txt", "before\nkeep\n");
     let mut aft = configured_aft(root);
@@ -357,7 +357,7 @@ fn apply_patch_move_happy_path_and_undo_restores_source() {
 #[cfg(unix)]
 #[test]
 fn restricted_apply_patch_rejects_symlink_delete_without_touching_target() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = write_file(root, "target.txt", "target contents\n");
     let link = root.join("target-link.txt");
@@ -390,7 +390,7 @@ fn restricted_apply_patch_rejects_symlink_delete_without_touching_target() {
 #[cfg(unix)]
 #[test]
 fn restricted_apply_patch_move_removes_symlink_entry_without_touching_target() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let target = write_file(root, "target.txt", "target contents\n");
     let source = root.join("before-link.txt");
@@ -427,7 +427,7 @@ fn restricted_apply_patch_move_removes_symlink_entry_without_touching_target() {
 #[cfg(unix)]
 #[test]
 fn restricted_apply_patch_symlink_delete_rejection_rolls_back_prior_hunks() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let good = write_file(root, "good.txt", "before\n");
     let target = write_file(root, "target.txt", "target contents\n");
@@ -460,7 +460,7 @@ fn restricted_apply_patch_symlink_delete_rejection_rolls_back_prior_hunks() {
 
 #[test]
 fn apply_patch_same_path_move_is_an_in_place_update_and_undoable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "source.txt", "before\nkeep\n");
     let mut aft = configured_aft(root);
@@ -498,7 +498,7 @@ fn apply_patch_same_path_move_is_an_in_place_update_and_undoable() {
 
 #[test]
 fn apply_patch_same_path_move_alias_is_an_in_place_update() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "source.txt", "before\n");
     let mut aft = configured_aft(root);
@@ -527,7 +527,7 @@ fn apply_patch_same_path_move_alias_is_an_in_place_update() {
 
 #[test]
 fn apply_patch_same_path_move_preview_is_an_in_place_diff() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "source.txt", "before\nkeep\n");
     let mut aft = configured_aft(root);
@@ -559,7 +559,7 @@ fn apply_patch_same_path_move_preview_is_an_in_place_diff() {
 
 #[test]
 fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "one.txt", "old\n");
     write_file(
@@ -611,7 +611,7 @@ fn apply_patch_partial_keeps_successful_hunks_and_reports_failure() {
 
 #[test]
 fn apply_patch_total_failure_returns_error_envelope_without_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     let original = "preamble\nfn target() {\n  let first = 1;\n  let actual = 2;\n  return first;\n}\ntrailer\n";
     write_file(root, "target.txt", original);
@@ -658,7 +658,7 @@ fn apply_patch_total_failure_returns_error_envelope_without_writes() {
 
 #[test]
 fn apply_patch_preview_reports_diff_and_leaves_disk_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "existing.txt", "old\n");
     let mut aft = configured_aft(root);
@@ -707,7 +707,7 @@ fn apply_patch_preview_reports_diff_and_leaves_disk_unchanged() {
 
 #[test]
 fn apply_patch_add_existing_fails_and_syntax_rollback_does_not_poison_undo() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let root = dir.path();
     write_file(root, "exists.txt", "already\n");
     write_file(root, "good.ts", "const good = 1;\n");

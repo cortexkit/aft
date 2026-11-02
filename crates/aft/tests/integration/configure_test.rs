@@ -34,6 +34,9 @@ fn configure_with_search_index_and_storage(aft: &mut AftProcess, root: &Path, st
         configure["success"], true,
         "configure should succeed: {configure:?}"
     );
+    // The configure acknowledgement precedes the folder decision; grep reports
+    // its index status only once that decision is applied.
+    aft.wait_for_folder_admission();
 }
 
 fn grep_marker(aft: &mut AftProcess, pattern: &str) -> Value {
@@ -92,7 +95,7 @@ fn warning_with_kind<'a>(
 
 #[test]
 fn configure_accepts_tier_validate_on_edit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
 
     let configure = aft.send(
@@ -124,8 +127,8 @@ fn configure_accepts_tier_validate_on_edit() {
 
 #[test]
 fn configure_cold_reuse_rebuilds_search_index_when_ignore_rules_change() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/secret.rs"),
@@ -162,7 +165,7 @@ fn configure_cold_reuse_rebuilds_search_index_when_ignore_rules_change() {
 
 #[test]
 fn configure_warnings_frame_after_main_response() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
     let path = empty_path();
     let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
@@ -238,7 +241,7 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
 #[cfg(unix)]
 #[test]
 fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
     std::fs::write(dir.path().join("ruff.toml"), "line-length = 88\n").unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
@@ -294,7 +297,7 @@ fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
 
 #[test]
 fn configure_skips_formatter_warnings_when_format_on_edit_disabled() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
     std::fs::write(dir.path().join("biome.json"), "{}\n").unwrap();
 
@@ -372,7 +375,7 @@ fn configure_warns_for_missing_explicit_tsgo_checker() {
 
 #[test]
 fn configure_only_warns_for_languages_present() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
     std::fs::write(dir.path().join("pyrightconfig.json"), "{}\n").unwrap();
 
@@ -461,7 +464,7 @@ fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
 
 #[test]
 fn configure_finds_pyright_in_nested_workspace_virtualenv() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let backend = dir.path().join("backend");
     std::fs::create_dir_all(backend.join("app")).unwrap();
     std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
@@ -514,7 +517,7 @@ fn configure_finds_pyright_in_nested_workspace_virtualenv() {
 
 #[test]
 fn configure_deduplicates_nested_python_builtin_override() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let backend = dir.path().join("backend");
     std::fs::create_dir_all(backend.join("app")).unwrap();
     std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
@@ -572,7 +575,7 @@ fn configure_deduplicates_nested_python_builtin_override() {
 
 #[test]
 fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("Program.cs"), "class Program {}\n").unwrap();
 
     let path = empty_path();
@@ -720,7 +723,7 @@ fn configure_skips_builtin_lsp_warnings_when_auto_install_disabled() {
     // server walk in `detect_missing_lsp_binaries`. The result should be ZERO
     // `lsp_binary_missing` warnings for the built-in. (Explicit `lsp.servers`
     // entries are unaffected — see `configure_warns_for_custom_lsp_*`.)
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
 
     let path = empty_path();
@@ -802,7 +805,7 @@ fn configure_warnings_wait_consumes_pending_frame_before_reading_stdout() {
 
 #[test]
 fn configure_suppresses_missing_lsp_warning_for_inflight_install() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
 
     let path = empty_path();
@@ -841,7 +844,7 @@ fn configure_suppresses_missing_lsp_warning_for_inflight_install() {
 
 #[test]
 fn configure_accepts_custom_lsp_servers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
 
     let configure = aft.send(
@@ -889,7 +892,7 @@ fn configure_accepts_custom_lsp_servers() {
 /// was silently dropped when these were required.
 #[test]
 fn configure_accepts_partial_builtin_lsp_override() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
 
     let configure = aft.send(
@@ -930,7 +933,7 @@ fn configure_accepts_partial_builtin_lsp_override() {
 /// on this passing.
 #[test]
 fn configure_accepts_lsp_paths_extra() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let existing_bin = dir.path().join("lsp-cache").join("typescript").join(".bin");
     let pending_bin = dir.path().join("lsp-cache").join("clangd").join("bin");
     std::fs::create_dir_all(&existing_bin).unwrap();
@@ -961,7 +964,7 @@ fn configure_accepts_lsp_paths_extra() {
 
 #[test]
 fn configure_rejects_existing_file_lsp_paths_extra() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("not-a-directory");
     std::fs::write(&file, "not a directory").unwrap();
     let mut aft = AftProcess::spawn();
@@ -994,7 +997,7 @@ fn configure_rejects_existing_file_lsp_paths_extra() {
 /// resolver would then fail late and in confusing ways.
 #[test]
 fn configure_rejects_malformed_lsp_paths_extra() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
 
     // Non-array → invalid_request.
     let mut aft = AftProcess::spawn();
@@ -1053,7 +1056,7 @@ fn configure_rejects_malformed_lsp_paths_extra() {
 /// not depend on the walk completing.
 #[test]
 fn configure_answers_before_the_language_server_applicability_walk() {
-    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let temp_dir = crate::test_helpers::tempdir();
     let project = temp_dir.path().join("project");
     fs::create_dir_all(project.join("src")).expect("create project");
     fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");

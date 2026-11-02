@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 #[test]
 fn checkpoint_restore_preserves_permissions_and_symlinks_through_protocol() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("mode.txt");
     let target = dir.path().join("target.txt");
     let link = dir.path().join("link.txt");

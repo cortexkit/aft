@@ -5,7 +5,7 @@ use aft::db::github_read_cache::{
 use aft::db::TrackedConnection as Connection;
 
 fn fixture_db() -> (tempfile::TempDir, Connection) {
-    let dir = tempfile::tempdir().expect("create temporary storage");
+    let dir = crate::test_helpers::tempdir();
     let conn = aft::db::open(&dir.path().join("aft.db")).expect("open aft database");
     (dir, conn)
 }

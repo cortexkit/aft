@@ -70,7 +70,7 @@ fn assert_jsonl_parseable(path: &Path) {
 
 #[test]
 fn migrate_empty_source_succeeds_as_noop() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("missing-legacy");
     let to = temp.path().join("new");
     let log = temp.path().join("logs/migration.jsonl");
@@ -83,7 +83,7 @@ fn migrate_empty_source_succeeds_as_noop() {
 
 #[test]
 fn migrate_happy_path_copies_all_subtrees() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     let log = temp.path().join("logs/migration.jsonl");
@@ -116,7 +116,7 @@ fn migrate_happy_path_copies_all_subtrees() {
 
 #[test]
 fn migrate_idempotent_when_both_markers_exist() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     let log = temp.path().join("migration.jsonl");
@@ -130,7 +130,7 @@ fn migrate_idempotent_when_both_markers_exist() {
 
 #[test]
 fn migrate_resumes_when_only_source_marker_exists() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     let log = temp.path().join("migration.jsonl");
@@ -148,7 +148,7 @@ fn migrate_resumes_when_only_source_marker_exists() {
 
 #[test]
 fn migrate_preflight_fails_when_insufficient_disk() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     write(&from.join("bash-tasks/session-a/bash-1.json"), "1234567890");
@@ -166,7 +166,7 @@ fn migrate_preflight_fails_when_insufficient_disk() {
 
 #[test]
 fn migrate_lock_contention_returns_code_3() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("missing");
     let to = temp.path().join("new");
     fs::create_dir_all(to.join(".aft")).unwrap();
@@ -188,7 +188,7 @@ fn migrate_lock_contention_returns_code_3() {
 fn migrate_partial_failure_leaves_staging_dirs() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     write(&from.join("bash-tasks/session-a/bash-1.json"), "{}");
@@ -234,7 +234,7 @@ fn migrate_partial_failure_leaves_staging_dirs() {
 fn migrate_writes_markers_only_on_full_success() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     write(&from.join("backups/session-a/path-a/meta.json"), "secret");
@@ -260,7 +260,7 @@ fn migrate_writes_markers_only_on_full_success() {
 
 #[test]
 fn migrate_logs_to_file_not_stderr() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     let log = temp.path().join("logs/migration.jsonl");
@@ -293,7 +293,7 @@ fn migrate_logs_to_file_not_stderr() {
 
 #[test]
 fn status_mode_reports_migrated_when_marker_present() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let to = temp.path().join("new");
     let marker = to.join("opencode/.migrated_from_legacy");
     write(
@@ -331,7 +331,7 @@ fn status_mode_reports_migrated_when_marker_present() {
 
 #[test]
 fn status_mode_reports_not_migrated_when_marker_absent() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let to = temp.path().join("new");
 
     let output = Command::new(aft_binary())
@@ -358,7 +358,7 @@ fn status_mode_reports_not_migrated_when_marker_absent() {
 
 #[test]
 fn status_mode_reports_source_marker_only_partial_state() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     let source_marker = from.join(".migrated_to_cortexkit");
@@ -395,7 +395,7 @@ fn status_mode_reports_source_marker_only_partial_state() {
 
 #[test]
 fn status_mode_does_not_acquire_lock() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let to = temp.path().join("new");
     fs::create_dir_all(to.join(".aft")).unwrap();
     let _guard = aft::fs_lock::acquire(&to.join(".aft/migration.lock")).unwrap();
@@ -430,7 +430,7 @@ fn status_mode_does_not_require_from_or_log() {
 
 #[test]
 fn migrate_filter_merge_skips_existing_child() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     write(&from.join("filters/projectA/source.toml"), "source");
@@ -453,7 +453,7 @@ fn migrate_filter_merge_skips_existing_child() {
 
 #[test]
 fn migrate_trust_file_merges_host_global() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let from = temp.path().join("legacy");
     let to = temp.path().join("new");
     write(&from.join("trusted-filter-projects.json"), r#"["Y","Z"]"#);

@@ -13,8 +13,8 @@ const SESSION_ID: &str = "powershell-refusal-session";
 fn powershell_shell_without_pwsh_is_refused_with_the_fix() {
     // An empty PATH guarantees `pwsh` cannot resolve on any host, including CI
     // machines that do have PowerShell installed.
-    let empty_path = tempfile::tempdir().expect("empty PATH dir");
-    let project = tempfile::tempdir().expect("powershell temp project");
+    let empty_path = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[("PATH", empty_path.path().as_os_str())]);
     configure_project(&mut aft, project.path(), "cfg-no-pwsh");
     for (label, name, arguments) in [

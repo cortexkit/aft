@@ -27,8 +27,8 @@ fn state_of(conn: &rusqlite::Connection, call_key: &str) -> State {
 
 #[test]
 fn standalone_configure_leaves_a_running_module_s_unsettled_calls_alone() {
-    let project = tempfile::tempdir().expect("project dir");
-    let storage = tempfile::tempdir().expect("storage dir");
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let db_path = storage.path().join("aft.db");
 
     // Stand in for a module that is still running these calls: this test

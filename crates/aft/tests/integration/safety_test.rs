@@ -114,7 +114,7 @@ fn test_checkpoint_create_restore_cycle() {
 
 #[test]
 fn checkpoint_restore_honors_one_file_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file_a = dir.path().join("a.txt");
     let file_b = dir.path().join("b.txt");
     let file_c = dir.path().join("c.txt");
@@ -157,7 +157,7 @@ fn checkpoint_restore_honors_one_file_scope() {
 
 #[test]
 fn checkpoint_restore_rejects_a_scope_path_absent_from_checkpoint_atomically() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file_a = dir.path().join("a.txt");
     let file_b = dir.path().join("b.txt");
     let absent = dir.path().join("not-checkpointed.txt");
@@ -201,7 +201,7 @@ fn checkpoint_restore_rejects_a_scope_path_absent_from_checkpoint_atomically() {
 
 #[test]
 fn checkpoint_restore_without_scope_restores_every_checkpoint_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let files = [
         dir.path().join("a.txt"),
         dir.path().join("b.txt"),
@@ -248,7 +248,7 @@ fn checkpoint_restore_without_scope_restores_every_checkpoint_file() {
 
 #[test]
 fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
-    let project = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
     let root = project.path();
     let draft_relative = std::path::Path::new(".cortexkit/alfonso/drafts/spec.md");
     let draft = root.join(draft_relative);
@@ -294,7 +294,7 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
         "fixture draft must be untracked"
     );
 
-    let storage = tempfile::tempdir().unwrap();
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     configure_unrestricted_with_storage(
         &mut aft,
@@ -392,8 +392,8 @@ fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
 
 #[test]
 fn checkpoint_restart_hydrates_durable_checkpoint_and_explains_empty_session() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = crate::test_helpers::tempdir();
+    let storage = crate::test_helpers::tempdir();
     let root = project.path();
     let file = root.join("checkpoint-target.txt");
     fs::write(&file, "original\n").unwrap();
@@ -1455,8 +1455,8 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
 fn temp_tree_without_backups_deletes_links_empty_dirs_and_sockets() {
     use std::os::unix::net::UnixListener;
 
-    let scratch = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
+    let outside = crate::test_helpers::tempdir();
     let tree = scratch.path().join("tree");
     fs::create_dir_all(tree.join("empty")).unwrap();
     fs::write(tree.join("file.txt"), "content").unwrap();
@@ -1494,7 +1494,7 @@ fn temp_tree_without_backups_deletes_links_empty_dirs_and_sockets() {
 #[cfg(unix)]
 #[test]
 fn temp_symlink_without_backups_is_deleted_without_touching_its_target() {
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
     let target = scratch.path().join("target.txt");
     let link = scratch.path().join("link.txt");
     fs::write(&target, "target").unwrap();
@@ -1523,7 +1523,7 @@ fn temp_symlink_without_backups_is_deleted_without_touching_its_target() {
 /// tree under a system temp directory copies nothing, so it has no budget.
 #[test]
 fn temp_tree_without_backups_is_not_limited_by_the_backup_budget() {
-    let scratch = tempfile::tempdir().unwrap();
+    let scratch = crate::test_helpers::tempdir();
     let tree = scratch.path().join("node_modules");
     for index in 0..2_100 {
         let package = tree.join(format!("pkg-{:03}", index / 50));
@@ -2009,7 +2009,7 @@ fn checkpoint_paths_reports_restore_targets_without_mutating() {
 #[cfg(unix)]
 #[test]
 fn restricted_checkpoint_creation_preserves_in_root_final_symlink() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     let outside = container.path().join("outside.txt");
     fs::create_dir_all(&root).unwrap();
@@ -2082,7 +2082,7 @@ fn restricted_checkpoint_creation_preserves_in_root_final_symlink() {
 #[cfg(unix)]
 #[test]
 fn restricted_checkpoint_creation_rejects_symlinked_parent_escape() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     let outside = container.path().join("outside");
     fs::create_dir_all(&root).unwrap();
@@ -2116,7 +2116,7 @@ fn restricted_checkpoint_creation_rejects_symlinked_parent_escape() {
 
 #[test]
 fn checkpoint_regular_file_keys_and_restores_identically_when_restricted() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     fs::create_dir_all(&root).unwrap();
     let root = fs::canonicalize(root).unwrap();
@@ -2169,7 +2169,7 @@ fn checkpoint_regular_file_keys_and_restores_identically_when_restricted() {
 #[cfg(unix)]
 #[test]
 fn restricted_checkpoint_creation_preserves_external_target_symlink() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     let outside = container.path().join("external.txt");
     fs::create_dir_all(&root).unwrap();
@@ -2267,7 +2267,7 @@ fn restricted_checkpoint_restore_replaces_in_root_symlink_without_changing_its_t
 #[cfg(unix)]
 #[test]
 fn force_restricted_checkpoint_restore_replaces_external_target_symlink() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     let outside = tempfile::NamedTempFile::new().unwrap();
     fs::write(outside.path(), "outside-unchanged").unwrap();
     let file = root.path().join("a.txt");
@@ -2363,7 +2363,7 @@ fn restricted_checkpoint_restore_replaces_dangling_symlink() {
 
 #[test]
 fn restricted_checkpoint_restore_rejects_stored_lexical_path_outside_root() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     let outside = container.path().join("outside.txt");
     fs::create_dir_all(&root).unwrap();
@@ -2595,7 +2595,7 @@ fn relative_path_undo_preview_and_history_see_same_stack_as_absolute() {
 
 #[test]
 fn relative_path_escaping_root_still_fails_validation() {
-    let container = tempfile::tempdir().unwrap();
+    let container = crate::test_helpers::tempdir();
     let root = container.path().join("project");
     fs::create_dir_all(&root).unwrap();
     let outside = container.path().join("outside.txt");
@@ -2620,7 +2620,7 @@ fn relative_path_escaping_root_still_fails_validation() {
 
 #[test]
 fn temp_path_mutations_report_missing_undo_and_increment_status_counter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let deleted = dir.path().join("deleted.txt");
     let written = dir.path().join("written.txt");
     let edited = dir.path().join("edited.txt");

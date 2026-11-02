@@ -102,12 +102,12 @@ fn wait_for_search_index_ready(aft: &mut AftProcess, timeout: Duration) -> Value
 #[test]
 fn unchanged_head_warm_configure_reuses_verified_cache_without_rebuild_thread() {
     let project = setup_project(&[("src/lib.rs", "pub fn needle() -> usize { 1 }\n")]);
-    let marker_dir = tempfile::tempdir().expect("create marker dir");
+    let marker_dir = crate::test_helpers::tempdir();
     let marker = marker_dir.path().join("rebuild-spawned");
     // Both processes must share one cache dir: the harness default mints a
     // fresh AFT_CACHE_DIR per spawn, which would leave the restarted process
     // with no disk cache to warm-load.
-    let shared_cache = tempfile::tempdir().expect("create shared cache dir");
+    let shared_cache = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_TEST_SEARCH_REBUILD_THREAD_MARKER", marker.as_os_str()),
         ("AFT_CACHE_DIR", shared_cache.path().as_os_str()),

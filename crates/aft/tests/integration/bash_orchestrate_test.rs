@@ -94,7 +94,7 @@ fn wait_for_bash_completed_frame(aft: &mut AftProcess, task_id: &str) -> serde_j
 #[test]
 fn orchestrated_fast_foreground_returns_single_terminal_response() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, HANG_CATCH.as_millis() as u64);
 
     let response = aft.send(&bash_request(
@@ -118,7 +118,7 @@ fn orchestrated_fast_foreground_returns_single_terminal_response() {
 #[test]
 fn orchestrated_non_zero_exit_appends_exit_code_marker() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, HANG_CATCH.as_millis() as u64);
 
     let response = aft.send(&bash_request(
@@ -142,7 +142,7 @@ fn orchestrated_non_zero_exit_appends_exit_code_marker() {
 #[test]
 fn orchestrated_foreground_promotes_after_wait_window() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, PROMOTION_WAIT_MS);
     let child_started = dir.path().join("promotion-child-started");
     let child_release = dir.path().join("promotion-child-release");
@@ -212,7 +212,7 @@ fn orchestrated_foreground_promotes_after_wait_window() {
 #[test]
 fn promoted_pipeline_reports_the_failed_middle_stage() {
     let mut aft = spawn_with_wait(SHORT_WAIT_MS);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, PROMOTION_WAIT_MS);
 
     let response = aft.send_with_timeout(
@@ -393,7 +393,7 @@ fn orchestrated_wait_rejects_background_and_pty() {
 #[test]
 fn orchestrated_background_returns_formatted_launch_immediately() {
     let mut aft = spawn_with_wait(SHORT_WAIT_MS);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, 600);
 
     let response = aft.send(&bash_request(
@@ -464,7 +464,7 @@ fn bash_gate_off_still_returns_spawn_response() {
 #[test]
 fn pending_orchestrated_bash_does_not_starve_push_frames() {
     let mut aft = spawn_with_wait("5000");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let child_started = dir.path().join("pending-bash-started");
     let child_release = dir.path().join("pending-bash-release");
     // Declare after the TempDir so a panic releases the gated child before
@@ -543,7 +543,7 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
 #[test]
 fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response() {
     let mut aft = AftProcess::spawn();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     configure_bash_background(&mut aft, &dir, 5_000);
     let pid_file = dir.path().join("foreground.pid");
     let release_file = dir.path().join("foreground.release");

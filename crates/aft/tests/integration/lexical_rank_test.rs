@@ -13,7 +13,7 @@ fn write_file(root: &Path, relative: &str, content: &str) -> std::path::PathBuf 
 
 #[test]
 fn zero_posting_trigrams_do_not_collapse_candidate_union() {
-    let project = tempfile::tempdir().expect("create project");
+    let project = crate::test_helpers::tempdir();
     let path = write_file(project.path(), "src/lib.rs", "alpha_token");
     let mut index = SearchIndex::new();
     index.index_file(&path, b"alpha_token");
@@ -27,7 +27,7 @@ fn zero_posting_trigrams_do_not_collapse_candidate_union() {
 
 #[test]
 fn three_or_more_trigrams_use_rarest_three_and_cap_at_200() {
-    let project = tempfile::tempdir().expect("create project");
+    let project = crate::test_helpers::tempdir();
     let mut index = SearchIndex::new();
     for i in 0..250 {
         let path = write_file(project.path(), &format!("src/file{i}.rs"), "abcdefghij");
@@ -42,7 +42,7 @@ fn three_or_more_trigrams_use_rarest_three_and_cap_at_200() {
 
 #[test]
 fn one_or_two_trigrams_use_all_remaining_and_cap_at_500() {
-    let project = tempfile::tempdir().expect("create project");
+    let project = crate::test_helpers::tempdir();
     let mut index = SearchIndex::new();
     for i in 0..550 {
         let path = write_file(project.path(), &format!("src/file{i}.rs"), "abc");
@@ -57,7 +57,7 @@ fn one_or_two_trigrams_use_all_remaining_and_cap_at_500() {
 
 #[test]
 fn candidate_filter_excludes_non_semantic_file_extensions() {
-    let project = tempfile::tempdir().expect("create project");
+    let project = crate::test_helpers::tempdir();
     let rust_path = write_file(project.path(), "src/lib.rs", "uniqueIdentifier");
     let readme_path = write_file(project.path(), "README.md", "uniqueIdentifier");
     let mut index = SearchIndex::new();

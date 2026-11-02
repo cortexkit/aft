@@ -79,7 +79,7 @@ fn status(aft: &mut AftProcess) -> serde_json::Value {
 
 #[test]
 fn configure_never_runs_the_launcher_git_without_developer_tools() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let launcher_dir = temp.path().join("usr-bin");
     let log = launcher_stub(&launcher_dir);
     let project = temp.path().join("project");
@@ -113,7 +113,7 @@ fn configure_never_runs_the_launcher_git_without_developer_tools() {
 
 #[test]
 fn a_real_git_earlier_on_path_is_still_used() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let launcher_dir = temp.path().join("usr-bin");
     let launcher_log = launcher_stub(&launcher_dir);
     let homebrew = temp.path().join("homebrew-bin");

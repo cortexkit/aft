@@ -2,7 +2,6 @@ use super::helpers::AftProcess;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 fn write_file(root: &Path, relative: &str, content: &str) -> PathBuf {
     let path = root.join(relative);
@@ -19,7 +18,7 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn outline_arrow_consts_keep_declarator_ranges() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let source = "/** Format reset. */\nexport const formatReset = () => 1;\nfunction outer() {\n  /** Nested reset. */\n  const nestedReset = () => 2;\n}\n";
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
@@ -97,7 +96,7 @@ fn outline_directory_and_array_match_real_structure_golden() {
 
 #[test]
 fn outline_single_file_lists_test_names_and_every_product_member() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let product = write_file(
         dir.path(),
         "product.rs",
@@ -267,7 +266,7 @@ fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[test]
 fn outline_single_file_returns_tree_text_with_signatures_and_variables() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "single.ts",
@@ -465,7 +464,7 @@ export function testBeta(): void {}
 
 #[test]
 fn outline_multi_file_returns_relative_tree_text_without_signatures_for_multiple_languages() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let ts = write_file(
         dir.path(),
         "src/service.ts",
@@ -546,7 +545,7 @@ fn outline_multi_file_returns_relative_tree_text_without_signatures_for_multiple
 
 #[test]
 fn outline_multi_file_batches_nested_paths_when_directory_mode_is_not_in_protocol() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let top = write_file(dir.path(), "src/a.ts", "export function alpha() {}\n");
     let nested = write_file(dir.path(), "src/nested/b.ts", "export function beta() {}\n");
 
@@ -592,7 +591,7 @@ fn outline_multi_file_batches_nested_paths_when_directory_mode_is_not_in_protoco
 
 #[test]
 fn outline_multi_file_truncates_when_output_exceeds_30kb() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut files = Vec::new();
 
     for file_idx in 0..24 {
@@ -636,7 +635,7 @@ fn outline_multi_file_truncates_when_output_exceeds_30kb() {
 
 #[test]
 fn outline_and_zoom_resolve_typescript_callable_members() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "issue-329.ts",
@@ -748,7 +747,7 @@ fn outline_existing_large_interface_is_a_nested_member_menu() {
 
 #[test]
 fn zoom_symbol_lookup_returns_content_and_call_graph_annotations() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "calls.ts",
@@ -942,7 +941,7 @@ function runUnderBackgroundLease() {}
 
 #[test]
 fn zoom_large_container_returns_member_signature_menu() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "large.ts", &large_ts_class_source());
 
     let mut aft = AftProcess::spawn();
@@ -978,7 +977,7 @@ fn zoom_large_container_returns_member_signature_menu() {
 
 #[test]
 fn zoom_large_interface_returns_member_signature_menu() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "large-interface.ts",
@@ -1010,7 +1009,7 @@ fn zoom_large_interface_returns_member_signature_menu() {
 
 #[test]
 fn zoom_small_container_returns_whole_body() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "small.ts",
@@ -1047,7 +1046,7 @@ fn zoom_small_container_returns_whole_body() {
 
 #[test]
 fn zoom_leaf_qualified_method_returns_full_body_even_when_large() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "large.ts", &large_ts_class_source());
 
     let mut aft = AftProcess::spawn();
@@ -1076,7 +1075,7 @@ fn zoom_leaf_qualified_method_returns_full_body_even_when_large() {
 
 #[test]
 fn zoom_ambiguous_bare_name_returns_candidate_signatures() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "ambiguous.ts",
@@ -1144,7 +1143,7 @@ class Second {
 
 #[test]
 fn zoom_rust_type_counts_impl_method_spans_for_menu() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut source = String::from(
         r#"pub struct Widget {
     value: i32,
@@ -1221,7 +1220,7 @@ declare_handlers! {
 
 pub fn outside_macros() {}
 "#;
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "runtime.rs", source);
 
     let mut aft = AftProcess::spawn();
@@ -1278,7 +1277,7 @@ pub fn outside_macros() {}
 
 #[test]
 fn zoom_symbol_not_found_returns_error() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "missing.ts",
@@ -1305,7 +1304,7 @@ fn zoom_symbol_not_found_returns_error() {
 
 #[test]
 fn zoom_follows_reexport_chains_to_the_resolved_symbol_source() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let config = write_file(
         dir.path(),
         "config.ts",
@@ -1369,7 +1368,7 @@ fn zoom_follows_reexport_chains_to_the_resolved_symbol_source() {
 
 #[test]
 fn zoom_whitespace_separated_symbol_string_resolves_multiple_code_symbols() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "calls.ts",
@@ -1431,7 +1430,7 @@ function orchestrate(): number {
 
 #[test]
 fn zoom_whitespace_separated_symbol_reports_per_symbol_not_found() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "calls.ts",
@@ -1469,7 +1468,7 @@ fn zoom_whitespace_separated_symbol_reports_per_symbol_not_found() {
 
 #[test]
 fn zoom_markdown_heading_with_spaces_not_split() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "readme.md",
@@ -1501,7 +1500,7 @@ fn zoom_markdown_heading_with_spaces_not_split() {
 
 #[test]
 fn zoom_html_heading_with_spaces_not_split() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "page.html",
@@ -1533,7 +1532,7 @@ fn zoom_html_heading_with_spaces_not_split() {
 
 #[test]
 fn zoom_symbol_not_found_with_close_matches() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "search.ts",
@@ -1578,7 +1577,7 @@ function compute_total() {}
 
 #[test]
 fn zoom_symbol_not_found_without_close_matches() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "search.ts",
@@ -1648,7 +1647,7 @@ const NESTED_JSON: &str = r#"{
 
 #[test]
 fn zoom_json_nested_object_path() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1677,7 +1676,7 @@ fn zoom_json_nested_object_path() {
 
 #[test]
 fn zoom_json_array_index() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1706,7 +1705,7 @@ fn zoom_json_array_index() {
 
 #[test]
 fn zoom_json_chained_array_index() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1737,7 +1736,7 @@ fn zoom_json_chained_array_index() {
 fn zoom_json_literal_dotted_key_wins_over_path() {
     // The fixture has a literal key "plain.dotted" with no corresponding
     // nested path. Literal-first means the literal key wins outright.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1767,7 +1766,7 @@ fn zoom_json_literal_dotted_key_wins_over_path() {
 fn zoom_json_equal_node_literal_and_path_is_not_ambiguous() {
     // A query that resolves to the same node both as a literal key and as a
     // path must not be reported as ambiguous.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1794,7 +1793,7 @@ fn zoom_json_equal_node_literal_and_path_is_not_ambiguous() {
 fn zoom_json_different_node_literal_and_path_is_ambiguous() {
     // A query that resolves to DIFFERENT nodes as a literal key and as a path
     // must return ambiguous_match with both candidates.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1822,7 +1821,7 @@ fn zoom_json_different_node_literal_and_path_is_ambiguous() {
 
 #[test]
 fn zoom_json_miss_reports_deepest_prefix_and_failing_segment() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1859,7 +1858,7 @@ fn zoom_json_miss_reports_deepest_prefix_and_failing_segment() {
 
 #[test]
 fn zoom_json_multi_symbol_paths_work() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1891,7 +1890,7 @@ fn zoom_json_multi_symbol_paths_work() {
 
 #[test]
 fn zoom_json_targets_form_works_with_paths() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(dir.path(), "nested.json", NESTED_JSON);
 
     let mut aft = AftProcess::spawn();
@@ -1926,7 +1925,7 @@ fn zoom_json_targets_form_works_with_paths() {
 fn zoom_non_json_dotted_query_keeps_existing_behavior() {
     // Negative control: a dotted query on a .ts file must still resolve via the
     // existing symbol logic (qualified name), and its miss message is unchanged.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_file(
         dir.path(),
         "search.ts",

@@ -151,7 +151,7 @@ fn read_whole(aft: &mut AftProcess, id: &str, file: &Path, hashline: bool) -> St
 /// `git checkout --`, and read again at once. The second read must show the
 /// restored line, not the edit that no longer exists on disk.
 fn assert_read_sees_git_checkout_restore(linked_worktree: bool, hashline: bool) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let (root, file) = committed_fixture(dir.path(), linked_worktree);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root, hashline);
@@ -230,7 +230,7 @@ fn hashline_read_after_git_checkout_restore_in_linked_worktree_returns_restored_
 /// modification time back, so a cache keyed on (path, size, mtime) could not
 /// tell the two versions apart.
 fn assert_read_sees_same_size_same_mtime_rewrite(hashline: bool) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let (root, file) = committed_fixture(dir.path(), false);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root, hashline);
@@ -285,7 +285,7 @@ fn hashline_read_after_same_size_same_mtime_rewrite_returns_new_bytes() {
 /// write can ever arrive. The read must still see the new bytes.
 #[test]
 fn read_after_external_write_without_watcher_event_returns_new_bytes() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::test_helpers::tempdir();
     let (root, file) = committed_fixture(dir.path(), false);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, &root, false);

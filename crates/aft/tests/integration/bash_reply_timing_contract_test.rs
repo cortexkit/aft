@@ -69,7 +69,7 @@ const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
 fn omitted_bash_timeout_resolves_to_thirty_minute_hard_cap() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let mut aft = AftProcess::spawn();
     configure(&mut aft, dir.path(), &storage);
@@ -146,7 +146,7 @@ fn subc_block_to_completion_answers_timed_out_within_timeout_plus_margin() {
 }
 
 fn assert_standalone_held_call_times_out(flag: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let pidfile = dir.path().join("grandchild.pid");
     let mut aft = AftProcess::spawn();
@@ -265,7 +265,7 @@ const MARKER_SLACK: Duration = Duration::from_millis(750);
 
 #[test]
 fn foreground_without_wait_is_killed_at_its_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn();
@@ -295,7 +295,7 @@ fn foreground_without_wait_is_killed_at_its_timeout() {
 
 #[test]
 fn promoted_foreground_is_killed_at_its_timeout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn_with_env(&[(
@@ -423,7 +423,7 @@ fn subc_pty_is_killed_at_its_timeout() {
 /// Launches a `background: true` or `pty: true` task with a timeout, then
 /// polls its status until the timeout kill lands.
 fn assert_standalone_launched_task_is_capped(flag: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let storage = dir.path().join("storage");
     let files = CappedFiles::new(dir.path());
     let mut aft = AftProcess::spawn();
@@ -1026,10 +1026,10 @@ where
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let conn_dir = tempfile::tempdir().expect("connection tempdir");
-        let config_home = tempfile::tempdir().expect("config home tempdir");
-        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let project = crate::test_helpers::tempdir();
+        let conn_dir = crate::test_helpers::tempdir();
+        let config_home = crate::test_helpers::tempdir();
+        let data_home = crate::test_helpers::tempdir();
         write_user_config(config_home.path());
 
         let listener = write_connection_file(conn_dir.path()).await;

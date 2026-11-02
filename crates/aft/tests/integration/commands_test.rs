@@ -16,7 +16,7 @@ fn write_temp_file(root: &Path, relative: &str, content: &str) -> PathBuf {
 
 #[test]
 fn read_allows_explicit_ranges_from_large_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let path = dir.path().join("large.txt");
     let mut content = String::from("first\nsecond\nthird\n");
     content.push_str(&"x".repeat(51 * 1024 * 1024));
@@ -51,7 +51,7 @@ fn read_allows_explicit_ranges_from_large_files() {
 
 #[test]
 fn read_range_stops_after_one_line_lookahead() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let path = dir.path().join("invalid-after-lookahead.txt");
     let mut bytes = (1..=11)
         .map(|n| format!("line {n}\n"))
@@ -89,7 +89,7 @@ fn read_range_stops_after_one_line_lookahead() {
 
 #[test]
 fn read_range_reports_partial_and_omits_unknown_total_lines() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let path = dir.path().join("hundred.txt");
     let content = (1..=100)
         .map(|n| format!("line {n}"))
@@ -129,7 +129,7 @@ fn read_range_reports_partial_and_omits_unknown_total_lines() {
 
 #[test]
 fn read_directory_truncation_reports_partial() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     for i in 0..1001 {
         fs::write(dir.path().join(format!("entry-{i:04}.txt")), "x").expect("write entry");
     }
@@ -469,7 +469,7 @@ fn test_zoom_success_with_annotations() {
 
 #[test]
 fn test_read_range_after_binary_sample_rewind() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("sample.txt");
     let mut content = "a".repeat(4096);
     content.push_str("\nline-two\nline-three\n");
@@ -496,7 +496,7 @@ fn test_read_range_after_binary_sample_rewind() {
 
 #[test]
 fn test_read_binary_detection_after_single_open_refactor() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("binary.bin");
     std::fs::write(&file, [b'a', b'b', 0, b'c']).expect("write binary");
 
@@ -524,7 +524,7 @@ fn test_read_binary_detection_after_single_open_refactor() {
 
 #[test]
 fn test_read_rejects_files_larger_than_50mb() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("large.txt");
     let handle = File::create(&file).expect("create large file");
     handle
@@ -557,7 +557,7 @@ fn test_read_refuses_inverted_line_range() {
     // clamp that fixed the panic then returned an empty SUCCESS, which a
     // reader cannot tell apart from "those lines are blank". It must now be
     // refused by name, and the process must stay alive.
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("sample.txt");
     std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").expect("write sample");
 
@@ -594,7 +594,7 @@ fn test_read_refuses_inverted_line_range() {
 fn test_read_refuses_start_past_end_of_non_empty_file() {
     // A window that starts after the last line selects nothing; it must be
     // refused by name instead of returning an empty success.
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     let file = temp_dir.path().join("sample.txt");
     std::fs::write(&file, "one\ntwo\nthree\n").expect("write sample");
     let empty = temp_dir.path().join("empty.txt");
@@ -643,7 +643,7 @@ fn test_read_refuses_start_past_end_of_non_empty_file() {
 
 #[test]
 fn test_read_directory_caps_entries_at_one_thousand() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let temp_dir = crate::test_helpers::tempdir();
     for index in 0..1005 {
         std::fs::write(temp_dir.path().join(format!("entry_{index:04}.txt")), "x")
             .expect("write directory entry");
@@ -701,7 +701,7 @@ fn test_zoom_symbol_not_found() {
 
 #[test]
 fn test_zoom_code_symbol_lookup_keeps_hash_prefix_exact() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = write_temp_file(
         dir.path(),
         "lib.rs",
@@ -794,7 +794,7 @@ fn test_zoom_empty_annotations_arrays() {
 
 #[test]
 fn test_zoom_supports_c_symbols() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let file = write_temp_file(
         dir.path(),
         "src/sample.c",
@@ -821,7 +821,7 @@ fn test_zoom_supports_c_symbols() {
 
 #[test]
 fn test_zoom_supports_cpp_symbols() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let file = write_temp_file(
         dir.path(),
         "src/sample.cpp",
@@ -848,7 +848,7 @@ fn test_zoom_supports_cpp_symbols() {
 
 #[test]
 fn test_zoom_supports_zig_symbols() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let file = write_temp_file(
         dir.path(),
         "src/sample.zig",
@@ -875,7 +875,7 @@ fn test_zoom_supports_zig_symbols() {
 
 #[test]
 fn test_zoom_supports_csharp_symbols() {
-    let dir = tempfile::tempdir().expect("create temp dir");
+    let dir = crate::test_helpers::tempdir();
     let file = write_temp_file(
         dir.path(),
         "src/Sample.cs",
@@ -902,7 +902,7 @@ fn test_zoom_supports_csharp_symbols() {
 
 #[test]
 fn read_directory_pages_through_protocol() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     for n in 0..2620 {
         fs::write(dir.path().join(format!("entry-{n:04}")), "").unwrap();
     }

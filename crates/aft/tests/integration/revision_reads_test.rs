@@ -61,7 +61,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// `feature` branch with its own version, and an uncommitted working-tree
 /// change, so every revision's content differs from the working file.
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let base = canonical_git_path(dir.path());
     let repo = base.join("repo");
     fs::create_dir_all(repo.join("src")).unwrap();

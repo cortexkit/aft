@@ -196,6 +196,10 @@ fn init_repo(root: &Path, files: &[(&str, String)]) {
         write(root, path, text);
     }
     commit_all(root, "initial");
+    // A folder check treats a repository as a project only once its Git
+    // metadata is complete; commands the fixture just started may still be
+    // writing it.
+    git(root, &["rev-parse", "--verify", "HEAD"]);
 }
 
 fn request(value: Value) -> RawRequest {
@@ -425,7 +429,7 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
 
 #[test]
 fn runtime_drains_retry_child_trigram_after_busy_identity() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("alpha");
     let storage = base.join("storage");
@@ -604,7 +608,7 @@ struct Folder {
 }
 
 fn folder(count: usize) -> Folder {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -694,6 +698,29 @@ fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSes
     session
 }
 
+/// The parent folder of a fixture's repositories is only a workspace while it
+/// carries no project evidence of its own. Prove that before the fixture binds
+/// it, so an added root manifest cannot silently turn it into a project.
+fn assert_container(folder: &Folder) {
+    for marker in [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Makefile",
+        "Gemfile",
+    ] {
+        assert!(
+            !folder.root.join(marker).exists(),
+            "the parent folder must not carry {marker}"
+        );
+    }
+    assert!(
+        !folder.root.join(".git").exists(),
+        "the parent folder must not be a repository"
+    );
+}
+
 /// 32 repositories: the merged grep and glob answers equal the union of each
 /// child's own answers with the child's folder as path prefix; repeated
 /// queries load nothing; unchanged children are never reported stale; and the
@@ -703,6 +730,7 @@ fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSes
 fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     fast_refresh();
     let folder = folder(32);
+    assert_container(&folder);
     let mut expected_grep = BTreeSet::new();
     let mut expected_glob = BTreeSet::new();
     let mut child_median = 0.0;
@@ -969,7 +997,7 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
 /// event-driven, routed to the child that owns the path.
 #[test]
 fn parent_watcher_routes_child_edits_to_the_owning_child() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -977,6 +1005,12 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     let other = root.join("other");
     init_repo(&child, &child_files(0));
     init_repo(&other, &child_files(1));
+    for marker in ["Cargo.toml", "package.json", "Makefile", ".git"] {
+        assert!(
+            !root.join(marker).exists(),
+            "the parent folder must not carry {marker}"
+        );
+    }
     let configure_request = |root: &Path, views: bool| {
         json!({
             "id": "cfg",
@@ -1064,7 +1098,7 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
 #[test]
 fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
     fast_refresh();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1310,7 +1344,7 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     watchdog.enter("fixture setup");
     fast_refresh();
     let embedder = MockEmbedder::start();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1576,7 +1610,7 @@ fn precomputed_query_vector_ranks_byte_identically(ctx: &AppContext, query: &str
 #[test]
 fn over_cap_parent_names_skipped_and_unindexed_children() {
     fast_refresh();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1627,7 +1661,7 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
 #[test]
 fn slow_discovery_never_delays_the_bind() {
     fast_refresh();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1707,7 +1741,7 @@ fn slow_discovery_never_delays_the_bind() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn standalone_view_open_never_blocks_requests() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("repo");
     let storage = base.join("storage");
@@ -1787,7 +1821,7 @@ fn standalone_view_open_never_blocks_requests() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn standalone_semantic_grace_and_load_never_block_requests() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("repo");
     let storage = base.join("storage");
@@ -1885,7 +1919,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
 /// behaviour and no parent session starts.
 #[test]
 fn views_off_folder_is_not_a_parent_session() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1906,7 +1940,7 @@ fn views_off_folder_is_not_a_parent_session() {
 /// process writes a legacy trigram artifact for the child.
 #[test]
 fn parent_folder_survives_a_real_process_restart() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");

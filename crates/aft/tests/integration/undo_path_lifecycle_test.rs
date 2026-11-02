@@ -103,7 +103,7 @@ fn assert_two_files(entries: &[Value], newer: usize) {
 
 #[test]
 fn aft_delete_then_recreate_labels_previous_file_and_undo_walks_the_timeline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
     first_file_with_history(&mut aft, &file);
@@ -150,7 +150,7 @@ fn aft_delete_then_recreate_labels_previous_file_and_undo_walks_the_timeline() {
 
 #[test]
 fn rm_then_recreate_labels_previous_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
     first_file_with_history(&mut aft, &file);
@@ -182,7 +182,7 @@ fn rm_then_recreate_labels_previous_file() {
 
 #[test]
 fn aft_move_into_vacated_path_labels_previous_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let other = dir.path().join("b.txt");
     let mut aft = AftProcess::spawn();
@@ -253,7 +253,7 @@ fn external_change_checkpoint(reply: &Value, checkpoint_field: &Value, warning: 
 
 #[test]
 fn rename_over_file_undo_saves_the_new_file_as_checkpoint_and_keeps_walking_back() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let file = rename_over_file_with_history(&mut aft, dir.path());
 
@@ -308,7 +308,7 @@ fn rename_over_file_undo_saves_the_new_file_as_checkpoint_and_keeps_walking_back
 
 #[test]
 fn rename_over_file_operation_undo_saves_the_new_file_and_keeps_walking_back() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
     let file = rename_over_file_with_history(&mut aft, dir.path());
 
@@ -350,7 +350,7 @@ fn rename_over_file_operation_undo_saves_the_new_file_and_keeps_walking_back() {
 #[cfg(unix)]
 #[test]
 fn recursive_delete_undo_saves_a_file_recreated_outside_aft_before_restoring_the_tree() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let tree = dir.path().join("tree");
     fs::create_dir_all(tree.join("empty")).unwrap();
     let file = tree.join("a.txt");
@@ -418,7 +418,7 @@ fn editor_atomic_save(file: &Path, content: &str) {
 
 #[test]
 fn editor_atomic_save_with_unchanged_content_undoes_normally() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
     first_file_with_history(&mut aft, &file);
@@ -434,7 +434,7 @@ fn editor_atomic_save_with_unchanged_content_undoes_normally() {
 
 #[test]
 fn editor_atomic_save_with_new_content_is_saved_before_undo() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
     first_file_with_history(&mut aft, &file);
@@ -456,7 +456,7 @@ fn editor_atomic_save_with_new_content_is_saved_before_undo() {
 
 #[test]
 fn undoing_aft_own_edits_reports_no_external_change() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let file = dir.path().join("a.txt");
     let mut aft = AftProcess::spawn();
     first_file_with_history(&mut aft, &file);
@@ -480,7 +480,7 @@ fn undoing_aft_own_edits_reports_no_external_change() {
 #[test]
 fn repeated_undo_past_an_external_change_reaches_the_oldest_state() {
     for operation_undo in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_helpers::tempdir();
         let mut aft = AftProcess::spawn();
         let file = rename_over_file_with_history(&mut aft, dir.path());
 

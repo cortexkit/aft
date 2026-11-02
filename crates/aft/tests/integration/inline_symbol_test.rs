@@ -10,7 +10,7 @@ use crate::helpers::{fixture_path, AftProcess};
 /// Returns `(TempDir, root_path)`.
 fn setup_inline_fixture() -> (tempfile::TempDir, String) {
     let fixtures = fixture_path("inline_symbol");
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
 
     for entry in std::fs::read_dir(&fixtures).expect("read fixtures dir") {
         let entry = entry.expect("read entry");
@@ -48,7 +48,7 @@ fn configure(aft: &mut AftProcess, root: &str) {
 /// `function_declaration` and returned a `symbol_not_found` error.
 #[test]
 fn inline_symbol_exported_function() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("exported.ts");
     std::fs::write(
         &file,
@@ -256,7 +256,7 @@ fn inline_symbol_python_keeps_crlf_line_endings() {
 /// inlined into a call site that is itself nested.
 #[test]
 fn inline_symbol_python_nested_body_keeps_relative_indentation() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("nested.py");
     std::fs::write(
         &file,
@@ -294,7 +294,7 @@ fn inline_in_fresh_file(
     symbol: &str,
     line: u32,
 ) -> (serde_json::Value, String) {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join(name);
     std::fs::write(&file, source).expect("write test file");
     let root = tmp.path().display().to_string();
@@ -445,7 +445,7 @@ fn inline_symbol_scope_conflict() {
 /// 2-space-indented line became 4-space-indented).
 #[test]
 fn inline_symbol_preserves_call_site_indent() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("indent.ts");
     std::fs::write(
         &file,
@@ -484,7 +484,7 @@ fn inline_symbol_preserves_call_site_indent() {
 /// stay untouched.
 #[test]
 fn inline_symbol_does_not_substitute_shadowed_arrow_parameter() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("shadowed_arrow.ts");
     std::fs::write(
         &file,
@@ -522,7 +522,7 @@ fn inline_symbol_does_not_substitute_shadowed_arrow_parameter() {
 /// rejecting it as call_not_found.
 #[test]
 fn inline_symbol_matches_multiline_call_starting_on_target_line() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("multiline.ts");
     std::fs::write(
         &file,
@@ -560,7 +560,7 @@ fn inline_symbol_matches_multiline_call_starting_on_target_line() {
 
 #[test]
 fn inline_symbol_preserves_nested_multiline_indentation() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("nested_indent.ts");
     std::fs::write(
         &file,
@@ -603,7 +603,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_standalone_return_expression_becomes_expression_statement() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("standalone_return.ts");
     std::fs::write(
         &file,
@@ -641,7 +641,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_maps_destructured_default_and_rest_parameters() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("params.ts");
     std::fs::write(
         &file,
@@ -694,7 +694,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_refuses_destructuring_from_non_variable_argument() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("params_mismatch.ts");
     std::fs::write(
         &file,
@@ -727,7 +727,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_parenthesizes_binary_argument_to_preserve_precedence() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("precedence.ts");
     std::fs::write(
         &file,
@@ -764,7 +764,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_wraps_ts_precedence_sensitive_arguments() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("sensitive_arguments.ts");
     std::fs::write(
         &file,
@@ -824,7 +824,7 @@ export async function main(flag: boolean) {
 
 #[test]
 fn inline_symbol_keeps_atomic_arguments_bare() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("atomic_arguments.ts");
     std::fs::write(
         &file,
@@ -889,7 +889,7 @@ export function main(value: number) {
 
 #[test]
 fn inline_symbol_wraps_every_use_of_non_atomic_argument() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("multiple_uses.ts");
     std::fs::write(
         &file,
@@ -922,7 +922,7 @@ export function main() {
 
 #[test]
 fn inline_symbol_wraps_python_conditional_argument() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("conditional.py");
     std::fs::write(
         &file,
@@ -953,7 +953,7 @@ result = twice(1 if flag else 2)
 
 #[test]
 fn inline_symbol_rejects_qualified_call_with_same_named_free_function() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("qualified_collision.ts");
     let original = "function helper(x: number): number {\n  return x + 1;\n}\n\nconst obj = { helper(x: number) { return x * 2; } };\nconst result = obj.helper(3);\n";
     std::fs::write(&file, original).expect("write fixture");
@@ -995,7 +995,7 @@ fn inline_symbol_rejects_qualified_call_with_same_named_free_function() {
 
 #[test]
 fn inline_symbol_bare_call_selects_free_function_despite_same_named_method() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("bare_collision.ts");
     std::fs::write(
         &file,
@@ -1027,7 +1027,7 @@ fn inline_symbol_bare_call_selects_free_function_despite_same_named_method() {
 
 #[test]
 fn inline_symbol_rejects_python_attribute_call_with_same_named_function() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("qualified_collision.py");
     let original = "def helper(x):\n    return x + 1\n\nclass Obj:\n    def helper(self, x):\n        return x * 2\n\nobj = Obj()\nresult = obj.helper(3)\n";
     std::fs::write(&file, original).expect("write fixture");
@@ -1069,7 +1069,7 @@ fn inline_symbol_rejects_python_attribute_call_with_same_named_function() {
 
 #[test]
 fn inline_symbol_preserves_unambiguous_method_inlining() {
-    let tmp = tempfile::tempdir().expect("temp dir");
+    let tmp = crate::test_helpers::tempdir();
     let file = tmp.path().join("method_only.ts");
     std::fs::write(
         &file,

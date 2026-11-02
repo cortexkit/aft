@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_helpers::tempdir();
     let response = aft.send(
         &json!({
             "id": "cfg-watch-bg",
@@ -674,8 +674,8 @@ fn watch_and_status_survive_another_harness_configuring_the_root() {
 /// never-existing ID as not found.
 #[test]
 fn bash_status_reports_running_task_after_its_row_is_erased() {
-    let cache = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
+    let cache = crate::test_helpers::tempdir();
+    let project = crate::test_helpers::tempdir();
     let storage_dir = project.path().join("task-storage");
     fs::create_dir_all(&storage_dir).unwrap();
     let mut aft = AftProcess::spawn_with_env(&[("AFT_CACHE_DIR", cache.path().as_os_str())]);

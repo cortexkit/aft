@@ -99,7 +99,7 @@ fn compatible_same_root_snapshot_publishes_a_view_without_reembedding() {
 }
 
 fn assert_compatible_snapshot_imports(version: u8) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("root");
     let source = root.join("src/lib.rs");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -150,7 +150,7 @@ fn assert_compatible_snapshot_imports(version: u8) {
 
 #[test]
 fn v8_refused_files_are_skipped_not_published_as_fully_covered() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("root");
     fs::create_dir_all(root.join("src")).unwrap();
     let source = b"pub fn entry() {}\n";
@@ -196,7 +196,7 @@ fn v8_refused_files_are_skipped_not_published_as_fully_covered() {
 
 #[test]
 fn absolute_rows_are_relativized_per_row_and_external_rows_do_not_abort_import() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("root");
     let source = root.join("src/in_root.rs");
     fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -242,7 +242,7 @@ fn absolute_rows_are_relativized_per_row_and_external_rows_do_not_abort_import()
 fn absolute_non_utf8_legacy_path_keeps_its_exact_relative_bytes() {
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = fs::canonicalize(temp.path().join("root")).unwrap_or_else(|_| {
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
@@ -275,7 +275,7 @@ fn absolute_non_utf8_legacy_path_keeps_its_exact_relative_bytes() {
 
 #[test]
 fn unstamped_snapshot_requests_one_rebuild_instead_of_failing_the_migration() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("root");
     fs::create_dir_all(&root).unwrap();
     let storage = temp.path().join("storage");
@@ -302,7 +302,7 @@ fn unstamped_snapshot_requests_one_rebuild_instead_of_failing_the_migration() {
 
 #[test]
 fn staged_callgraph_rebuild_runs_once_then_rebinds_the_ready_store() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_helpers::tempdir();
     let root = temp.path().join("root");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub fn entry() {}\n").unwrap();

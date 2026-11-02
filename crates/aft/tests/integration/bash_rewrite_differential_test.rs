@@ -99,8 +99,8 @@ fn utility_available(row: &CorpusRow) -> bool {
 }
 
 fn run_row(row: &CorpusRow) -> Result<(), String> {
-    let oracle_root = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let aft_root = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let oracle_root = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
+    let aft_root = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
     let oracle_home = oracle_root.path().join("home");
     let aft_home = aft_root.path().join("home");
     fs::create_dir_all(&oracle_home).map_err(|error| error.to_string())?;
@@ -115,7 +115,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
 
     let oracle = run_oracle(row, oracle_root.path(), &oracle_home)?;
     let route_file = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-    let storage = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let storage = crate::test_helpers::tempdir().map_err(|error| error.to_string())?;
     let mut aft = AftProcess::spawn_with_env(&[
         ("PATH", OsStr::new(CONTROLLED_PATH)),
         ("LC_ALL", OsStr::new("C")),
@@ -327,7 +327,7 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
     use aft::parser::TreeSitterProvider;
     use aft::sandbox_spawn::AuthenticatedPrincipal;
 
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_helpers::tempdir();
     fs::write(root.path().join("note.txt"), "note\n").unwrap();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),

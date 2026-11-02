@@ -304,7 +304,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_helpers::tempdir();
         let base = std::fs::canonicalize(temp.path()).unwrap();
         let home = base.join("host");
         let project = base.join("project");

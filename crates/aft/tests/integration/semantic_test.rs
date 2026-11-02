@@ -136,7 +136,7 @@ fn semantic_search_refuses_before_any_index_lane_is_ready() {
 #[test]
 fn semantic_search_with_both_index_lanes_off_refuses_with_no_search_lanes_enabled() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let mut aft = AftProcess::spawn();
 
     let configure = configure_semantic(&mut aft, project.path(), storage.path(), false);
@@ -176,7 +176,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
             "pub fn normalize_user_id(input: &str) -> String {\n    input.trim().to_lowercase()\n}\n",
         ),
     ]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
     let project_key = artifact_cache_key(project.path());
     let semantic_file = storage
         .path()
@@ -235,7 +235,7 @@ fn semantic_index_persists_across_configure_build_search_roundtrip() {
 #[test]
 fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
 
     for base_url in &[
         "http://127.0.0.1:11434", // Ollama default
@@ -274,7 +274,7 @@ fn configure_accepts_loopback_base_url_for_self_hosted_backends() {
 #[test]
 fn configure_accepts_user_private_base_url() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() {}\n")]);
-    let storage = tempfile::tempdir().expect("create storage dir");
+    let storage = crate::test_helpers::tempdir();
 
     for base_url in &[
         "http://192.168.1.50:8080",
