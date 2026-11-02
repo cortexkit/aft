@@ -2068,7 +2068,9 @@ mod tests {
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
             }
             assert!(
-                !ctx.harness_dir().join("tool-results").exists(),
+                !crate::bash_background::task_storage_dir(&ctx)
+                    .join("tool-results")
+                    .exists(),
                 "an identical task capture must not be copied"
             );
         });

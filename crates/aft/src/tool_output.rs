@@ -15,6 +15,17 @@ pub const TEXT_LIMIT: usize = 50 * 1024;
 pub const SAVED_FILE_LIMIT: usize = 64 * 1024 * 1024;
 pub const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
 
+fn harness_root(ctx: &AppContext) -> PathBuf {
+    let routed = crate::bash_background::task_storage_dir(ctx);
+    if routed == ctx.storage_dir() {
+        ctx.harness_opt()
+            .map(|h| routed.join(h.storage_segment()))
+            .unwrap_or(routed)
+    } else {
+        routed
+    }
+}
+
 struct Artifact {
     session: String,
     file: Mutex<File>,
@@ -50,7 +61,7 @@ impl OutputScope {
         let harness_root = harness
             .and_then(|h| h.parse::<crate::harness::Harness>().ok())
             .map(|h| storage.join(h.storage_segment()))
-            .unwrap_or_else(|| crate::bash_background::task_storage_dir(ctx));
+            .unwrap_or_else(|| harness_root(ctx));
         Self {
             directory: harness_root
                 .join("tool-results")
@@ -82,7 +93,7 @@ impl OutputScope {
 
 impl OutputFiles {
     fn session_dir(ctx: &AppContext, session: &str) -> PathBuf {
-        crate::bash_background::task_storage_dir(ctx)
+        harness_root(ctx)
             .join("tool-results")
             .join(crate::backup::hash_session(session))
     }
