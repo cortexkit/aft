@@ -475,6 +475,8 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 /// each directory entry is read, and a walk that reaches it returns `None`:
 /// its partial sum is never a total. `path` is a family directory.
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
+    #[cfg(test)]
+    let _profile = work_profile::span("namespace_walk");
     walk_allocated(path, deadline, Level::Family)
 }
 
@@ -910,6 +912,8 @@ fn pragma(c: &Connection, path: &Path, kind: Kind, name: &'static str, value: i6
 thread_local! { static BAD_PRAGMA: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 
 fn open_db(path: &Path, kind: Kind, create: bool, readonly: bool) -> Result<IdentityConnection> {
+    #[cfg(test)]
+    let _profile = work_profile::span("connection_open");
     let flags = if readonly {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } else if create {

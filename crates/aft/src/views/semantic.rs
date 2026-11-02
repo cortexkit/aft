@@ -5939,6 +5939,45 @@ mod v3_store_tests {
     use super::*;
 
     #[test]
+    fn measurement_v3_semantic_fill_multiview_store() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let storage = tempfile::tempdir().unwrap();
+        let family = "00112233445566ff";
+        let route = super::super::snapshot::V3Route {
+            storage: storage.path().to_path_buf(),
+            family: family.into(),
+            scope: "worker".into(),
+        };
+        let store = SemanticStore::V3(route.clone(), std::sync::OnceLock::new());
+        store
+            .put_or_touch(&FamilyKey::new(FamilyPlane::Semantic, [0; 32]), b"seed")
+            .unwrap();
+        for view in 0..8 {
+            let dir =
+                crate::blob_store::v3::view_dir(storage.path(), family, &format!("member-{view}"))
+                    .unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in 0..256 {
+                std::fs::write(dir.join(format!("{file}.bin")), [7u8; 4096]).unwrap();
+            }
+        }
+        drop(store);
+        for pass in 0..2 {
+            let store = SemanticStore::V3(route.clone(), std::sync::OnceLock::new());
+            crate::blob_store::v3::work_profile::take();
+            let started = Instant::now();
+            // Reuse the same keys on the second pass to keep the namespace unchanged.
+            for batch in 1..=4 {
+                let key = FamilyKey::new(FamilyPlane::Semantic, [batch; 32]);
+                store.put_or_touch(&key, b"run").unwrap();
+                assert_eq!(store.get(&key).unwrap(), Some(b"run".to_vec()));
+                assert!(store.touch(&[key]).unwrap().missing.is_empty());
+            }
+            eprintln!("FILL_MEASUREMENT pass={pass} views=8 files=2048 batches=4 wall_ms={:.3} profile={:?}", started.elapsed().as_secs_f64() * 1000.0, crate::blob_store::v3::work_profile::take());
+        }
+    }
+
+    #[test]
     fn v3_semantic_touch_skips_current_rows_and_publishes_after_epoch_advance() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let storage = tempfile::tempdir().unwrap();

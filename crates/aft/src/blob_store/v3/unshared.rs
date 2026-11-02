@@ -19,6 +19,8 @@ use std::path::Path;
 /// the filesystem can report them, otherwise `allocated`, its `stat` charge.
 /// Never more than `allocated`.
 pub(super) fn charge(path: &Path, allocated: u64) -> u64 {
+    #[cfg(test)]
+    let _profile = super::work_profile::span("private_size_measurement");
     private_bytes(path).map_or(allocated, |bytes| bytes.min(allocated))
 }
 
@@ -28,6 +30,8 @@ pub(super) fn charge(path: &Path, allocated: u64) -> u64 {
 /// volumes) or the call fails.
 #[cfg(target_os = "macos")]
 fn private_bytes(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    let _profile = super::work_profile::span("getattrlist_call");
     use std::os::unix::ffi::OsStrExt;
 
     // Attributes come back packed at 4-byte alignment after the length word:
