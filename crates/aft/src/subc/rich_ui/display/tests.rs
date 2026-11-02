@@ -66,13 +66,17 @@ fn task() -> PersistedTask {
         false,
     )
 }
-fn terminal(f: &Fixture, display: &TaskDisplay, status: BgTaskStatus, exit: Option<i64>) {
+fn terminal(f: &Fixture, display: &mut TaskDisplay, status: BgTaskStatus, exit: Option<i64>) {
     let mut metadata = task();
     metadata.status = status;
     metadata.exit_code = exit;
     metadata.group_kill_sent = metadata.status == BgTaskStatus::Killed;
     let bodies = bash_bodies(&metadata, Some(3), Some(("ok\n".into(), "".into())));
-    bash_terminal(display, bodies, "bash-demo1", Some(2400));
+    let snapshot = display.clone();
+    if display.reply_produced && display.deferred {
+        display.attempted = true;
+    }
+    bash_terminal(&snapshot, bodies, "bash-demo1", Some(2400));
     let capture = f.capture.lock().unwrap();
     assert!(capture.terminal || capture.finished);
 }
@@ -124,7 +128,7 @@ fn held_bash_foreground_completes_once_after_the_reply_is_produced() {
     held(&f);
     let _active = enter(Some(&f.key));
     let mut display = current_task().unwrap();
-    terminal(&f, &display, BgTaskStatus::Completed, Some(0));
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
     assert_eq!(
         publications().len(),
         1,
@@ -165,8 +169,8 @@ fn held_background_case(name: &str, status: BgTaskStatus, exit: Option<i64>, rea
         1,
         "releasing a hold into background work is not a completion"
     );
-    terminal(&f, &display, status.clone(), exit);
-    terminal(&f, &display, status, exit);
+    terminal(&f, &mut display, status.clone(), exit);
+    terminal(&f, &mut display, status, exit);
     let writes = publications();
     let completed: Vec<_> = writes
         .iter()
@@ -226,8 +230,8 @@ fn held_background_unknown_fate_writes_no_completion_or_terminal_detail() {
     running.status = BgTaskStatus::Running;
     bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
     reply(&f.key, false, false, None);
-    terminal(&f, &display, BgTaskStatus::FateUnknown, None);
-    terminal(&f, &display, BgTaskStatus::FateUnknown, None);
+    terminal(&f, &mut display, BgTaskStatus::FateUnknown, None);
+    terminal(&f, &mut display, BgTaskStatus::FateUnknown, None);
     let writes = publications();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].kind, DisplayKind::Record);
@@ -540,8 +544,10 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
                 json!({"patch_text":format!("*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch", path.display())})
             }
         };
-        let request: RawRequest =
-            serde_json::from_value(json!({"id":"native","command":tool,"params":params})).unwrap();
+        let mut request = params;
+        request["id"] = json!("native");
+        request["command"] = json!(tool);
+        let request: RawRequest = serde_json::from_value(request).unwrap();
         let _active = enter(Some(&f.key));
         let response = match tool {
             "write" => crate::commands::write::handle_write(&request, &ctx),
@@ -706,7 +712,7 @@ fn running_hold_without_a_person_wait_omits_held_ms() {
     running.status = BgTaskStatus::Running;
     bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
     reply(&f.key, true, false, Some("running"));
-    terminal(&f, &display, BgTaskStatus::Completed, Some(0));
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
     let writes = publications();
     let completed = writes
         .iter()
@@ -734,4 +740,38 @@ fn killed_without_a_confirmed_provider_stop_has_no_completion() {
         Some(10),
     );
     assert_eq!(publications().len(), 1);
+}
+
+#[test]
+fn person_wait_ends_at_approval_before_the_executor_queue() {
+    let f = fixture("edit", "display-person-wait");
+    held(&f);
+    person_answered(&f.key);
+    let person_ms = f.capture.lock().unwrap().held_ms.unwrap();
+    assert!(person_ms >= 2000);
+    assert!(f.capture.lock().unwrap().held_at.is_none());
+    let _active = enter(Some(&f.key));
+    assert_eq!(f.capture.lock().unwrap().held_ms, Some(person_ms));
+    reply(&f.key, true, false, Some("consent"));
+    f.capture.lock().unwrap().held_at = Some(Instant::now() - Duration::from_secs(1));
+    person_answered(&f.key);
+    assert!(f.capture.lock().unwrap().held_ms.unwrap() >= person_ms + 1000);
+    assert_eq!(
+        publications().len(),
+        1,
+        "additional person waits must not replace the record"
+    );
+}
+
+#[test]
+fn handler_duration_is_frozen_before_reply_queueing() {
+    let f = fixture("edit", "display-handler-duration");
+    let _active = enter(Some(&f.key));
+    f.capture.lock().unwrap().began = Some(Instant::now() - Duration::from_millis(12));
+    handler_ready(Some(&f.key));
+    let processing = f.capture.lock().unwrap().processing_ms;
+    assert!(processing >= 12);
+    assert!(f.capture.lock().unwrap().began.is_none());
+    reply(&f.key, false, false, None);
+    assert_eq!(publications()[0].body["durationMs"], processing);
 }

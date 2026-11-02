@@ -100,37 +100,6 @@ pub(crate) fn terminal_task_metadata_for_test(
     metadata
 }
 
-/// A `bash_tasks` row mirroring `metadata`, for read-only app-server calls and persistence tests.
-#[cfg(test)]
-pub(crate) fn task_row_for_test(
-    metadata: &crate::bash_background::persistence::PersistedTask,
-    harness: &str,
-    status: &str,
-    completed_at: Option<i64>,
-    completion_delivered: bool,
-) -> super::bash_tasks::BashTaskRow {
-    super::bash_tasks::BashTaskRow {
-        harness: harness.into(),
-        session_id: metadata.session_id.clone(),
-        task_id: metadata.task_id.clone(),
-        project_key: "project".into(),
-        command: metadata.command.clone(),
-        cwd: "/work".into(),
-        status: status.into(),
-        exit_code: metadata.exit_code,
-        pid: None,
-        pgid: None,
-        started_at: metadata.started_at as i64,
-        completed_at,
-        stdout_path: None,
-        stderr_path: None,
-        compressed: false,
-        timeout_ms: None,
-        completion_delivered,
-        output_bytes: None,
-        metadata: serde_json::to_string(metadata).unwrap(),
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;

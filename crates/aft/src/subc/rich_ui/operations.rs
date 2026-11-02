@@ -3,7 +3,6 @@
 
 use serde_json::{json, Map, Value};
 
-pub(crate) const RICH_UI_PROVIDER_VERSION: &str = "1.0";
 pub(crate) const GENERIC_MESSAGE: &str = "The requested read could not be completed.";
 pub(crate) const FIXED_MESSAGES: &[(&str, &str)] = &[
     (

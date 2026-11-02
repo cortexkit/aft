@@ -77,7 +77,7 @@ fn enabled() -> bool {
     SENDER.get().is_some()
 }
 
-pub(crate) fn register(
+pub(in crate::subc) fn register(
     ledger_key: &crate::db::call_ledger::Key,
     route: &crate::subc::RouteIdentity,
     call: &subc_protocol::tool_call::ToolCallRequest,
@@ -185,9 +185,7 @@ pub(crate) fn enter(key_value: Option<&crate::db::call_ledger::Key>) -> Guard {
     if let Some(capture) = &capture {
         if let Ok(mut capture) = capture.lock() {
             capture.began.get_or_insert_with(Instant::now);
-            if let Some(held_at) = capture.held_at.take() {
-                capture.held_ms = Some(held_at.elapsed().as_millis() as u64);
-            }
+            end_person_wait(&mut capture);
         }
     }
     Guard(ACTIVE.with(|slot| slot.replace(capture)))
@@ -505,18 +503,18 @@ pub(crate) fn reply(
             capture.record_sent = true;
             capture.processing_ms = duration;
             capture.began = None;
-            if !running {
-                capture.held_at = Some(Instant::now());
-            }
+        }
+        if !running && capture.held_at.is_none() {
+            capture.processing_ms = duration;
+            capture.began = None;
+            capture.held_at = Some(Instant::now());
         }
         if capture.deferred && capture.terminal {
             emit_bash_completion(&mut capture);
         }
         return;
     }
-    if let Some(held_at) = capture.held_at.take() {
-        capture.held_ms = Some(held_at.elapsed().as_millis() as u64);
-    }
+    end_person_wait(&mut capture);
     let completion = capture.record_sent;
     let (mut body, detail) = if capture.tool == "bash" {
         capture
@@ -844,9 +842,7 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferr
         return;
     };
     capture.began.get_or_insert_with(Instant::now);
-    if let Some(held_at) = capture.held_at.take() {
-        capture.held_ms = Some(held_at.elapsed().as_millis() as u64);
-    }
+    end_person_wait(&mut capture);
     if capture.bash.is_none() || !capture.terminal {
         capture.bash = Some(body);
     }
@@ -854,6 +850,11 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferr
     display.reply_produced = true;
     display.deferred = deferred;
     display.held_ms = capture.held_ms;
+    if let Some(began) = capture.began.take() {
+        capture.processing_ms = capture
+            .processing_ms
+            .saturating_add(began.elapsed().as_millis() as u64);
+    }
 }
 
 fn emit_bash_completion(capture: &mut Capture) {
@@ -956,3 +957,40 @@ fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> 
 #[cfg(test)]
 #[path = "display/tests.rs"]
 mod tests;
+
+fn end_person_wait(capture: &mut Capture) {
+    if let Some(held_at) = capture.held_at.take() {
+        capture.held_ms = Some(
+            capture
+                .held_ms
+                .unwrap_or(0)
+                .saturating_add(held_at.elapsed().as_millis() as u64),
+        );
+    }
+}
+
+pub(crate) fn person_answered(ledger_key: &crate::db::call_ledger::Key) {
+    let capture = CALLS
+        .lock()
+        .ok()
+        .and_then(|calls| calls.get(&key(ledger_key)).cloned());
+    if let Some(capture) = capture {
+        if let Ok(mut capture) = capture.lock() {
+            end_person_wait(&mut capture);
+        }
+    }
+}
+
+pub(crate) fn handler_ready(ledger_key: Option<&crate::db::call_ledger::Key>) {
+    let capture =
+        ledger_key.and_then(|ledger_key| CALLS.lock().ok()?.get(&key(ledger_key)).cloned());
+    if let Some(capture) = capture {
+        if let Ok(mut capture) = capture.lock() {
+            if let Some(began) = capture.began.take() {
+                capture.processing_ms = capture
+                    .processing_ms
+                    .saturating_add(began.elapsed().as_millis() as u64);
+            }
+        }
+    }
+}

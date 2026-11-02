@@ -2610,6 +2610,8 @@ impl LedgerEdge {
                 *request
             })
             .collect();
+        super::rich_ui::display::person_answered(key);
+        super::rich_ui::display::reply(key, false, true, Some("cancelled"));
         for (route, corr) in requests {
             match subc_protocol::Frame::build(
                 subc_protocol::FrameType::Cancel,
@@ -2883,6 +2885,7 @@ impl LedgerEdge {
             };
             (call.root.clone(), call.key.clone())
         };
+        super::rich_ui::display::person_answered(&key);
         // Ignore duplicate allow replies while the first database update runs.
         // A duplicate's failed transition must not consume the permission entry
         // before the first update can release its authorized reply.

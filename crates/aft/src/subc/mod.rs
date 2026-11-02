@@ -10401,6 +10401,11 @@ impl PlainToolRun {
         mut phase_trace: PhaseTrace,
         done: oneshot::Sender<ToolCallCompletion>,
     ) -> crate::executor::ExecutorJob {
+        if self.approved_io_window.is_some() {
+            if let Some(key) = &self.ledger_key {
+                rich_ui::display::person_answered(key);
+            }
+        }
         let run_spec = self.clone();
         let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
@@ -10578,6 +10583,7 @@ impl PlainToolRun {
                                 &result.response,
                             );
                             let response = result.response;
+                            rich_ui::display::handler_ready(ledger_key.as_ref());
                             let _ = done.send(ToolCallCompletion {
                                 text: result.text,
                                 phase_trace: phase_trace
