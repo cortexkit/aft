@@ -24975,6 +24975,12 @@ mod tests {
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
         assert_eq!(folder["classification"], "not_project", "{folder}");
         assert_eq!(folder["state"], "decided", "{folder}");
+        assert_eq!(folder["coverage"]["stop"], "strong_evidence", "{folder}");
+        assert_eq!(folder["observed"]["entries"], 0, "{folder}");
+        assert_eq!(
+            crate::folder_admission_runtime::probe_counts_for_test(&ctx),
+            (0, 0)
+        );
         assert!(ctx
             .degraded_reasons()
             .contains(&"folder_not_admitted".into()));

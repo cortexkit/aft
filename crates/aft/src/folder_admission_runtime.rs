@@ -279,9 +279,10 @@ fn timeout_cache(
 }
 
 fn override_cache(root: &Path, mode: crate::folder_admission::DetectionMode) -> Option<Cache> {
-    let decision = crate::folder_admission::override_decision(root, mode)?;
+    let decision = crate::folder_admission::boundary_decision(root, mode)
+        .or_else(|| crate::folder_admission::override_decision(root, mode))?;
     // User intent replaces evidence collection, not root-path validation.
-    if !root.is_dir() {
+    if !decision.is_structural_refusal() && !root.is_dir() {
         return None;
     }
     Some(Cache {
@@ -368,6 +369,12 @@ fn valid(cache: &Cache, config: &Config, root: &Path) -> bool {
 
 fn intent_valid(cache: &Cache, config: &Config, root: &Path) -> bool {
     if !cache.decision.is_determined() {
+        return false;
+    }
+    let structural = crate::path_identity::project_root_is_volume_root(root);
+    if (structural == Some(true) && !cache.decision.is_structural_refusal())
+        || (cache.decision.is_structural_refusal() && structural != Some(true))
+    {
         return false;
     }
     if cache.decision.classification == FolderClassification::Project
@@ -619,6 +626,15 @@ pub(crate) fn admit_borrowed(
     storage: &Path,
     detection: &crate::folder_admission::ProjectDetectionConfig,
 ) -> Result<(), String> {
+    if let Some(decision) =
+        crate::folder_admission::boundary_decision(root, detection.mode_for_root(root))
+    {
+        return Err(serde_json::to_value(decision.reason)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned());
+    }
     let config = Config {
         storage_dir: Some(storage.to_path_buf()),
         project_detection: detection.clone(),
@@ -984,6 +1000,17 @@ pub(crate) fn prepare(
         }
         binding.decision.clone()?
     };
+    if matches!(
+        cache.decision.classification,
+        FolderClassification::Project | FolderClassification::Workspace
+    ) && crate::folder_admission::boundary_decision(
+        root,
+        config.project_detection.mode_for_root(root),
+    )
+    .is_some()
+    {
+        return None;
+    }
     if !cache.decision.is_determined() || cache.stamps.is_empty() {
         return None;
     }
@@ -1584,6 +1611,9 @@ pub(crate) fn ensure_metadata_watch(ctx: &AppContext) {
     let Some((root, decision)) = input else {
         return;
     };
+    if decision.is_structural_refusal() {
+        return;
+    }
     // Watch only known directories, never recursively discover watch targets.
     let dirty = Arc::clone(&state.dirty);
     if let Ok(mut watcher) =
@@ -1900,6 +1930,54 @@ pub(crate) fn artifacts_admitted(ctx: &AppContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structural_roots_outrank_overrides_cached_projects_and_borrowing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let root = crate::path_identity::project_root_volume(&canonical, None).unwrap();
+        for mode in [
+            crate::folder_admission::DetectionMode::Auto,
+            crate::folder_admission::DetectionMode::Project,
+            crate::folder_admission::DetectionMode::Workspace,
+            crate::folder_admission::DetectionMode::Off,
+        ] {
+            let cache = override_cache(&root, mode).unwrap();
+            assert!(cache.decision.is_structural_refusal());
+            assert!(cache.decision.is_determined());
+            assert_eq!(cache.decision.observed.entries, 0);
+        }
+        let config = Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            project_detection: crate::folder_admission::ProjectDetectionConfig {
+                mode: crate::folder_admission::DetectionMode::Project,
+                overrides: vec![],
+            },
+            ..Config::default()
+        };
+        let refused = override_cache(&root, config.project_detection.mode).unwrap();
+        let mut stale = refused.clone();
+        stale.decision.classification = FolderClassification::Project;
+        stale.decision.reason = crate::folder_admission::AdmissionReason::UserOverride;
+        stale.decision.coverage.stop = crate::folder_admission::ProbeStop::UserOverride;
+        assert!(!intent_valid(&stale, &config, &root));
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        install_bound_cache(&ctx, config.clone(), root.clone(), stale);
+        assert!(prepare(&ctx, &root, &config, false, true).is_none());
+        assert_eq!(
+            admit_borrowed(&root, storage.path(), &config.project_detection).unwrap_err(),
+            "no_project_evidence"
+        );
+        assert!(standalone(&root, &config).unwrap().is_structural_refusal());
+        install_bound_cache(&ctx, config, root, refused);
+        ensure_metadata_watch(&ctx);
+        assert!(ctx.folder_admission().watcher.lock().is_none());
+        assert_eq!(probe_counts_for_test(&ctx), (0, 0));
+    }
 
     #[test]
     fn explicit_decisions_still_require_a_directory() {

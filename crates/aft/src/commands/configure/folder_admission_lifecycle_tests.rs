@@ -142,6 +142,30 @@ fn scratch(root: &Path) {
     }
 }
 
+fn assert_bounded_export_decision(folder: &Value) -> bool {
+    let entries = folder["observed"]["entries"].as_u64().unwrap();
+    let budget = folder["coverage"]["entry_budget"].as_u64().unwrap();
+    let stop = folder["coverage"]["stop"].as_str().unwrap();
+    let incomplete = (matches!(stop, "time" | "io_error") && (budget == 0 || entries < budget))
+        || (entries == 0 && folder["coverage"]["root_listing_complete"] != true);
+    assert_eq!(
+        folder["classification"],
+        if incomplete {
+            Value::Null
+        } else {
+            json!("not_project")
+        },
+        "{folder}"
+    );
+    assert_eq!(
+        folder["state"],
+        if incomplete { "pending" } else { "decided" },
+        "{folder}"
+    );
+    assert_eq!(folder["reason"], "evidence_budget_exhausted", "{folder}");
+    !incomplete
+}
+
 #[test]
 fn folder_admission_off_notice_is_pinned_byte_for_byte() {
     assert_eq!(admission::OFF_TEXT, "Indexing is off: this folder does not look like a project. grep and glob still work, with limits. To index it, set project_detection in your AFT user config.");
@@ -395,12 +419,12 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         assert!(!ctx.watcher_runtime_active());
         settle(&ctx);
         let folder = admission::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], Value::Null);
-        assert_eq!(folder["reason"], "evidence_budget_exhausted");
-        assert_eq!(folder["state"], "pending");
+        let determined = assert_bounded_export_decision(&folder);
         assert_eq!(folder["coverage"]["complete"], false);
         assert!(folder["observed"]["entries"].as_u64().unwrap() <= 4096);
-        let incomplete_message = if folder["coverage"]["stop"] == "time" {
+        let incomplete_message = if determined {
+            admission::OFF_TEXT
+        } else if folder["coverage"]["stop"] == "time" {
             admission::INCOMPLETE_TEXT
         } else {
             "folder_not_admitted: evidence_budget_exhausted"
@@ -418,7 +442,7 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         assert!(!ctx.heavy_root_work_allowed());
         assert!(!ctx.watcher_runtime_active());
         let health = serde_json::to_value(ctx.try_health_snapshot(root.path())).unwrap();
-        assert_eq!(health["folder"]["classification"], Value::Null);
+        assert_eq!(health["folder"]["classification"], folder["classification"]);
         assert_eq!(health["folder"]["message"], incomplete_message);
         assert_eq!(health["search_index"]["status"], "disabled");
         assert_eq!(health["semantic_index"]["status"], "disabled");
@@ -452,12 +476,17 @@ fn folder_admission_configure_and_restart_never_load_old_indexes() {
         assert!(configure(root.path(), storage.path(), &restarted, true, false).success);
         settle(&restarted);
         let (attempts, cache_hits) = admission::probe_counts_for_test(&restarted);
-        assert!(attempts >= 1, "restart did not make a fresh observation");
-        assert_eq!(cache_hits, 0, "restart reused an incomplete observation");
-        assert_eq!(
-            admission::snapshot(&restarted).unwrap()["classification"],
-            Value::Null
-        );
+        let restarted_folder = admission::snapshot(&restarted).unwrap();
+        let restarted_determined = assert_bounded_export_decision(&restarted_folder);
+        if cache_hits > 0 {
+            assert_eq!((attempts, cache_hits), (0, 1));
+            assert!(
+                restarted_determined,
+                "restart reused an incomplete observation"
+            );
+        } else {
+            assert!(attempts >= 1, "restart did not make a fresh observation");
+        }
         assert!(restarted.search_index().read().unwrap().is_none());
         assert!(!restarted.watcher_runtime_active());
         assert_eq!(
@@ -484,9 +513,10 @@ fn folder_admission_grep_glob_count_rejected_names_before_filtering() {
         assert!(configure(root.path(), storage.path(), &ctx, true, false).success);
         settle(&ctx);
         let folder = admission::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], Value::Null, "{folder}");
-        assert_eq!(folder["state"], "pending", "{folder}");
-        let expected_notice = if folder["coverage"]["stop"] == "time" {
+        let determined = assert_bounded_export_decision(&folder);
+        let expected_notice = if determined {
+            admission::OFF_TEXT
+        } else if folder["coverage"]["stop"] == "time" {
             admission::INCOMPLETE_TEXT
         } else {
             "folder_not_admitted: evidence_budget_exhausted"
@@ -954,8 +984,7 @@ fn folder_admission_only_user_config_can_force_an_export_to_index() {
             .any(|key| key["key"] == "project_detection"));
         settle(&ctx);
         let folder = admission::snapshot(&ctx).unwrap();
-        assert_eq!(folder["classification"], Value::Null, "{folder}");
-        assert_eq!(folder["state"], "pending", "{folder}");
+        assert_bounded_export_decision(&folder);
         assert_eq!(folder["override_mode"], "auto", "{folder}");
         assert!(!ctx.heavy_root_work_allowed());
         let mut user = base;

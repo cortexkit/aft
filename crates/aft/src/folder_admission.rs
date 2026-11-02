@@ -241,13 +241,30 @@ pub struct FolderAdmission {
 }
 
 impl FolderAdmission {
+    // Reaching an entry/width/depth limit finishes a bounded policy check.
+    // Time or I/O interruption before the entry quota is spent does not.
+    fn bounded_examination_complete(&self) -> bool {
+        let spent =
+            self.coverage.entry_budget > 0 && self.observed.entries >= self.coverage.entry_budget;
+        let interrupted = matches!(self.coverage.stop, ProbeStop::Time | ProbeStop::IoError)
+            || self.reason == AdmissionReason::ProbeIoError;
+        self.observed.entries > 0 && (spent || !interrupted)
+    }
+
     pub(crate) fn is_determined(&self) -> bool {
         self.classification != FolderClassification::Undetermined
             && !(self.classification == FolderClassification::NotProject
                 && matches!(
                     self.reason,
                     AdmissionReason::EvidenceBudgetExhausted | AdmissionReason::ProbeIoError
-                ))
+                )
+                && !self.bounded_examination_complete())
+    }
+
+    pub(crate) fn is_structural_refusal(&self) -> bool {
+        self.classification == FolderClassification::NotProject
+            && self.reason == AdmissionReason::NoProjectEvidence
+            && self.coverage.stop == ProbeStop::StrongEvidence
     }
 }
 
@@ -311,6 +328,26 @@ pub(crate) fn override_decision(root: &Path, mode: DetectionMode) -> Option<Fold
     Some(decision)
 }
 
+/// Root identity is a safety boundary, independent of project evidence or policy overrides.
+pub(crate) fn boundary_decision(root: &Path, mode: DetectionMode) -> Option<FolderAdmission> {
+    let broad = crate::path_identity::project_root_is_volume_root(root);
+    if broad == Some(false) {
+        return None;
+    }
+    let mut decision = exhausted(root, mode, ProbeBudgets::default());
+    decision.coverage.elapsed_ms = 0;
+    if broad == Some(true) {
+        decision.classification = FolderClassification::NotProject;
+        decision.reason = AdmissionReason::NoProjectEvidence;
+        decision.coverage.stop = ProbeStop::StrongEvidence;
+    } else {
+        decision.reason = AdmissionReason::ProbeIoError;
+        decision.coverage.stop = ProbeStop::IoError;
+        decision.observed.errors = 1;
+    }
+    Some(decision)
+}
+
 struct Probe {
     result: FolderAdmission,
     start: Instant,
@@ -367,6 +404,15 @@ impl Probe {
         };
         coverage.elapsed_ms = millis(self.start.elapsed());
         self.result.observed.child_projects = self.child_groups.len();
+        if self.result.classification == FolderClassification::Undetermined
+            && matches!(
+                self.result.reason,
+                AdmissionReason::EvidenceBudgetExhausted | AdmissionReason::ProbeIoError
+            )
+            && self.result.bounded_examination_complete()
+        {
+            self.result.classification = FolderClassification::NotProject;
+        }
         self.result.observed.root_markers.sort();
         self.result.observed.root_markers.dedup();
         self.result.child_roots.sort();
@@ -481,6 +527,9 @@ fn probe_with_read_dir(
         return probe.finish();
     }
     probe.result.override_mode = policy.mode_for_root(&root);
+    if let Some(decision) = boundary_decision(&root, probe.result.override_mode) {
+        return decision;
+    }
     if let Some(decision) = override_decision(&root, probe.result.override_mode) {
         return decision;
     }
@@ -1148,11 +1197,20 @@ mod tests {
                 ..ProbeBudgets::default()
             },
         ] {
-            let result = probe(root.path(), &ProjectDetectionConfig::default(), budgets);
+            let result = crate::developer_tools::with_git_usable_for_test(false, || {
+                probe(root.path(), &ProjectDetectionConfig::default(), budgets)
+            });
             assert_eq!(result.reason, AdmissionReason::EvidenceBudgetExhausted);
             assert!(!result.coverage.complete);
             assert!(result.observed.entries <= budgets.entries);
             assert!(result.observed.entries <= budgets.per_directory + 1);
+            if budgets.time.is_zero() {
+                assert_eq!(result.classification, FolderClassification::Undetermined);
+                assert_eq!(result.observed.entries, 0);
+            } else {
+                assert_eq!(result.classification, FolderClassification::NotProject);
+                assert!(result.is_determined());
+            }
         }
         let tree = tempfile::tempdir().unwrap();
         let child = tree.path().join("child");
@@ -1192,7 +1250,7 @@ mod tests {
             },
         );
         assert!(!result.coverage.root_listing_complete);
-        assert_eq!(result.classification, FolderClassification::Undetermined);
+        assert_eq!(result.classification, FolderClassification::NotProject);
         assert_eq!(result.observed.child_projects, 2);
     }
 
@@ -1299,6 +1357,57 @@ mod tests {
             serde_json::to_value(result).unwrap()["classification"],
             serde_json::Value::Null
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_is_refused_without_listing_even_with_an_override() {
+        for mode in [
+            DetectionMode::Auto,
+            DetectionMode::Project,
+            DetectionMode::Workspace,
+            DetectionMode::Off,
+        ] {
+            let result = probe_with_read_dir(
+                Path::new("/"),
+                &ProjectDetectionConfig {
+                    mode,
+                    overrides: vec![],
+                },
+                ProbeBudgets {
+                    time: Duration::ZERO,
+                    ..ProbeBudgets::default()
+                },
+                |_| panic!("structural roots must not enumerate evidence"),
+            );
+            assert_eq!(result.classification, FolderClassification::NotProject);
+            assert!(result.is_structural_refusal());
+            assert!(result.is_determined());
+            assert_eq!(result.observed.entries, 0);
+        }
+    }
+
+    #[test]
+    fn full_entry_budget_is_a_decision_but_early_time_and_io_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        for stop in [ProbeStop::Time, ProbeStop::IoError] {
+            let mut result = exhausted(
+                root.path(),
+                DetectionMode::Auto,
+                ProbeBudgets {
+                    entries: 3,
+                    ..ProbeBudgets::default()
+                },
+            );
+            result.classification = FolderClassification::NotProject;
+            result.coverage.stop = stop;
+            result.observed.entries = 3;
+            assert!(result.is_determined());
+            result.observed.entries = 2;
+            assert!(!result.is_determined());
+            result.observed.entries = 0;
+            assert!(!result.is_determined());
+        }
     }
 
     #[cfg(unix)]
@@ -1416,13 +1525,13 @@ mod tests {
             }
         }
         let result = classify(root.path());
-        assert_eq!(result.classification, FolderClassification::Undetermined);
+        assert_eq!(result.classification, FolderClassification::NotProject);
         assert_eq!(result.reason, AdmissionReason::EvidenceBudgetExhausted);
         assert!(result.observed.entries <= 4096);
         assert!(!result.coverage.complete);
         let wire = serde_json::to_value(result).unwrap();
         assert_eq!(wire["coverage"]["entry_budget"], 4096);
-        assert_eq!(wire["classification"], serde_json::Value::Null);
+        assert_eq!(wire["classification"], "not_project");
     }
 
     #[test]

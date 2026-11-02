@@ -148,6 +148,26 @@ pub(crate) fn project_root_volume(canonical_root: &Path, home: Option<&Path>) ->
     }
 }
 
+/// Decide whether a canonical directory is a filesystem or volume anchor.
+/// HOME, ordinary home ancestors, and a volume's children are not rejected by
+/// this rule. None means the filesystem identity could not establish the answer.
+pub(crate) fn project_root_is_volume_root(canonical_root: &Path) -> Option<bool> {
+    if !canonical_root.is_absolute() {
+        return None;
+    }
+    if canonical_root.parent().is_none() {
+        return Some(true);
+    }
+    let volume = project_root_volume(canonical_root, None)?;
+    let root = crate::access_policy::policy_path(canonical_root);
+    let volume = crate::access_policy::policy_path(&volume);
+    if root == volume {
+        return Some(true);
+    }
+    // Only protect the volume identity, not HOME or root-level directories.
+    protected_directory_alias(&root, &volume, &volume)
+}
+
 /// Testable core of [`project_root_volume`]: `read` supplies the raw bytes of
 /// `/proc/self/mountinfo` and `volume_of` runs the device walk for a path.
 #[cfg(target_os = "linux")]
@@ -434,6 +454,41 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_project_directories_are_not_volume_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert_eq!(super::project_root_is_volume_root(&root), Some(false));
+        let volume = super::project_root_volume(&root, None).unwrap();
+        assert_eq!(super::project_root_is_volume_root(&volume), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_is_a_structural_volume_root() {
+        assert_eq!(
+            super::project_root_is_volume_root(std::path::Path::new("/")),
+            Some(true)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_and_share_roots_are_structural_volume_roots() {
+        for root in [
+            r"C:\",
+            r"\\?\C:\",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert_eq!(
+                super::project_root_is_volume_root(std::path::Path::new(root)),
+                Some(true),
+                "{root}"
+            );
+        }
+    }
+
     #[test]
     fn project_root_volume_children_are_not_permission_scopes() {
         let volume = tempfile::tempdir().unwrap();
