@@ -1207,6 +1207,8 @@ mod tests {
         "write_ledger_process_minutes",
         "write_ledger_meta",
         "write_ledger_unmeasurable_minutes",
+        "bash_view_records",
+        "rich_ui_templates",
         "rich_ui_cursor_key",
         "rich_ui_session_presets",
     ];

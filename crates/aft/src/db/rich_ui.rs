@@ -7,7 +7,20 @@ pub use super::remote_exec::PolicyKey as PresetKey;
 
 pub const SCHEMA_VERSION: u32 = 20;
 
+// Historical migration SQL is immutable. The legacy display tables remain
+// for rollback compatibility, not as a storage backend for current views.
 pub(crate) const MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS bash_view_records (
+  harness TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  record TEXT NOT NULL,
+  row_template_digest TEXT NOT NULL, page_template_digest TEXT NOT NULL,
+  PRIMARY KEY (harness, session_id, task_id),
+  FOREIGN KEY (harness, session_id, task_id)
+    REFERENCES bash_tasks(harness, session_id, task_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS rich_ui_templates (
+  digest TEXT NOT NULL PRIMARY KEY, bytes BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rich_ui_cursor_key (
   id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
   key BLOB NOT NULL CHECK (length(key) = 32)
@@ -106,7 +119,12 @@ mod tests {
     use rusqlite::Connection;
 
     fn assert_tables(conn: &Connection) {
-        for table in ["rich_ui_cursor_key", "rich_ui_session_presets"] {
+        for table in [
+            "bash_view_records",
+            "rich_ui_templates",
+            "rich_ui_cursor_key",
+            "rich_ui_session_presets",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -119,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_ui_migration_fresh_database_has_carrier_tables() {
+    fn rich_ui_migration_fresh_database_has_four_tables() {
         let mut conn = Connection::open_in_memory().unwrap();
         super::super::run_migrations(&mut conn).unwrap();
         assert_tables(&conn);
