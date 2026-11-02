@@ -1769,6 +1769,9 @@ mod tests {
         }
         let _stop = StopTask(ctx.bash_background().clone(), task.into());
         let mut watch = request(task, SESSION);
+        let worker = principal(project.path());
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _wake = wake.install();
         watch.params["deadline_ms"] = json!(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1777,7 +1780,21 @@ mod tests {
                 + 800
         );
         let started = Instant::now();
-        let response = watch_with_wait_deadline(ctx, watch, Duration::from_secs(2)).await;
+        // Dispatch on the test thread so Tokio blocking-pool startup is not
+        // charged to the client's window. Still include the entire watch,
+        // final snapshot, reply rendering, and completion notification.
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            match with_authenticated_principal(worker, || handle_deferred(&watch, Arc::clone(&ctx)))
+            {
+                DispatchOutcome::Immediate(response) => response,
+                DispatchOutcome::Deferred(mut pending) => {
+                    wake.notified().await;
+                    (pending.poll)(&ctx).expect("response queued before completion wake")
+                }
+            }
+        })
+        .await
+        .expect("worker watch must answer before the test deadline, not its 30-minute window");
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_millis(700),

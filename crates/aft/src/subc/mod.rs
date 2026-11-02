@@ -22003,7 +22003,21 @@ mod tests {
                 );
                 let cached_after_pass = ctx.cached_artifact_cache_key(&canonical_root);
 
-                crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                // The standing pass may still be writing aft.db. A busy probe
+                // reschedules the retry, so drive its zero-delay attempts until
+                // the retry disarms, as the module loop does on later ticks.
+                let retry_deadline = Instant::now() + Duration::from_secs(10);
+                while ctx.provisional_identity_retry().is_armed() {
+                    crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+                    assert!(
+                        Instant::now() < retry_deadline,
+                        "identity retry did not finish: {:?}",
+                        ctx.degraded_reasons()
+                    );
+                    if ctx.provisional_identity_retry().is_armed() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 assert!(
                     ctx.artifact_identity_provisional_reason().is_none(),
                     "{:?}",
