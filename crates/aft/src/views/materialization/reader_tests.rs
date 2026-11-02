@@ -57,6 +57,50 @@ pub(crate) fn assert_query_parity(
     let (actual, expected) = (open(actual), open(expected));
     for &(file, symbol) in queries {
         let file = Path::new(file);
+        macro_rules! compare_answer {
+            ($operation:ident) => {
+                assert_eq!(
+                    serde_json::to_vec(
+                        &crate::commands::callgraph_store_adapter::$operation(
+                            &actual, file, symbol, 3, true
+                        )
+                        .unwrap()
+                    )
+                    .unwrap(),
+                    serde_json::to_vec(
+                        &crate::commands::callgraph_store_adapter::$operation(
+                            &expected, file, symbol, 3, true
+                        )
+                        .unwrap()
+                    )
+                    .unwrap(),
+                    "{} {file:?} {symbol}",
+                    stringify!($operation)
+                );
+            };
+        }
+        compare_answer!(callers_result);
+        compare_answer!(impact_result);
+        compare_answer!(call_tree_result);
+        let sources = [(file.to_str().unwrap().to_string(), symbol.to_string())];
+        assert_eq!(
+            format!("{:?}", actual.outgoing_calls_for_symbols(&sources).unwrap()).as_bytes(),
+            format!(
+                "{:?}",
+                expected.outgoing_calls_for_symbols(&sources).unwrap()
+            )
+            .as_bytes(),
+            "batched callees {file:?} {symbol}"
+        );
+        assert_eq!(
+            format!("{:?}", actual.direct_callers_for_symbols(&sources).unwrap()).as_bytes(),
+            format!(
+                "{:?}",
+                expected.direct_callers_for_symbols(&sources).unwrap()
+            )
+            .as_bytes(),
+            "batched callers {file:?} {symbol}"
+        );
         assert_eq!(
             format!("{:?}", actual.callers_of(file, symbol, 3).unwrap()).as_bytes(),
             format!("{:?}", expected.callers_of(file, symbol, 3).unwrap()).as_bytes(),
@@ -299,4 +343,44 @@ fn blob_reader_patch_all_supported_language_fixtures_match_full() {
         assert!(!queries.is_empty(), "{language} must exercise queries");
         assert_query_parity(&patched, &cold, f.dir.path(), &queries);
     }
+}
+
+#[test]
+fn graph_answers_ignore_edge_insertion_order_at_tied_positions() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let corpus = DifferentialCorpus::new(7);
+    let manifest = manifest(
+        &connection,
+        &corpus
+            .files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+    let forward = f.dir.path().join("derived-forward.sqlite");
+    let reverse = f.dir.path().join("derived-reverse.sqlite");
+    materialize_from_blob_reader(&forward, &manifest, &reader).unwrap();
+    {
+        let connection = Connection::open(&forward).unwrap();
+        let inserted = connection.execute("INSERT INTO edges SELECT edge_id || ':alternate', ref_id, source_node, target_node, target_file, target_symbol, kind, line, 'exact' FROM edges WHERE provenance='dispatch'", []).unwrap();
+        assert!(inserted > 0, "incoming ties must differ in provenance");
+    }
+    crate::views::generation::clone_derived_for_test(&forward, &reverse).unwrap();
+    {
+        let connection = Connection::open(&reverse).unwrap();
+        connection.execute_batch("CREATE TEMP TABLE reversed_edges AS SELECT * FROM edges; DELETE FROM edges; INSERT INTO edges SELECT * FROM reversed_edges ORDER BY edge_id DESC; DROP TABLE reversed_edges").unwrap();
+    }
+    parity::assert_logical_parity(&forward, &reverse);
+    assert_query_parity(
+        &reverse,
+        &forward,
+        f.dir.path(),
+        &[
+            ("draw.ts", "draw"),
+            ("shapes.ts", "Square::area"),
+            ("src/shapes.rs", "Tile::width"),
+        ],
+    );
 }

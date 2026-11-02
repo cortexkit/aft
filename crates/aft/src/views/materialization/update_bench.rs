@@ -142,20 +142,29 @@ fn bench_repository_incremental_update() {
     let publish = |revision: &str| -> Manifest {
         git(&checkout, &["checkout", "--quiet", "--force", revision]);
         let started = Instant::now();
-        let report =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: storage.clone(),
-                project_root: checkout.clone(),
-                family: "update-bench".into(),
-                scope: "update-bench".into(),
-                desired_head: revision.into(),
-                changed_paths: BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
+        let request = crate::views::assembly::AssemblyRequest {
+            storage: storage.clone(),
+            project_root: checkout.clone(),
+            family: "update-bench".into(),
+            scope: "update-bench".into(),
+            desired_head: revision.into(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        let report = if std::env::var_os("AFT_UPDATE_BENCH_READER").is_some() {
+            // Measure the graph patch below, not during manifest publication too.
+            let mut prepared =
+                crate::views::assembly::prepare_checkout_deferring(&request, true, &mut |_| Ok(()))
+                    .unwrap();
+            let report = prepared.commit().unwrap();
+            prepared.settle_status();
+            report
+        } else {
+            crate::views::assembly::publish_checkout(&request).unwrap()
+        };
         println!(
             "published {revision} in {:.1} s",
             started.elapsed().as_secs_f64()
@@ -433,6 +442,12 @@ fn bench_repository_incremental_update() {
     } else {
         &[false]
     };
+    let mut expected_by_manifest = BTreeMap::new();
+    for (manifest, database) in [(&old, &old_db), (&new, &new_db)] {
+        if let Some(database) = database {
+            expected_by_manifest.insert(fingerprint(manifest).unwrap(), database.clone());
+        }
+    }
     for (case, base, target, synced, full_resolution) in
         targets.iter().flat_map(|(label, base, target)| {
             variants.iter().flat_map(move |synced| {
@@ -564,8 +579,10 @@ fn bench_repository_incremental_update() {
         }
         drop(incremental_keeper);
         if parity {
-            let expected = cold(&format!("target-{label}"), target);
-            parity::assert_logical_parity(&db, &expected);
+            let expected = expected_by_manifest
+                .entry(fingerprint(target).unwrap())
+                .or_insert_with(|| cold(&format!("target-{case}"), target));
+            parity::assert_logical_parity(&db, expected);
             if v3_reader.is_some() {
                 let materialization_path = if case == "rename-rust" {
                     "crates/aft/src/views/materialization_renamed.rs"
@@ -574,7 +591,7 @@ fn bench_repository_incremental_update() {
                 };
                 tests::reader_tests::assert_query_parity(
                     &db,
-                    &expected,
+                    expected,
                     &checkout,
                     &[
                         (materialization_path, "apply_manifest_diff"),
@@ -587,9 +604,6 @@ fn bench_repository_incremental_update() {
                 );
             }
             println!("update bench parity label={label} equal=true");
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", expected.display()));
-            }
         }
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
