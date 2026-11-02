@@ -3334,16 +3334,16 @@
  #[cfg(test)]
 --- a/crates/aft/tests/store_diet/harness.rs
 +++ b/crates/aft/tests/store_diet/harness.rs
-@@ -147,7 +147,7 @@
- fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
+@@ -158,7 +158,7 @@
+ ) -> TestViewBuild {
      use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
      let blobs = temp.join("blobs.sqlite");
 -    let connection = Connection::open(&blobs).unwrap();
 +    let connection = crate::db::store_diet_trace::open(&blobs).unwrap();
      connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
      let mut entries = Vec::new();
-     for file in files {
-@@ -237,7 +237,7 @@
+     let mut shapes = BTreeMap::<String, usize>::new();
+@@ -322,7 +322,7 @@
      // Other databases and transaction-local tables do not live in a finished
      // graph fixture. Keep their schemas on a separate in-memory connection.
      // Actual graph plans always use the real fixture's schema first.
@@ -3352,6 +3352,15 @@
      let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
      for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
          let _ = auxiliary.execute_batch(&sql.unwrap());
+@@ -840,7 +840,7 @@
+     drop(reader);
+     let base = Manifest::new(built.entries.clone()).unwrap();
+     let mut entries = built.entries;
+-    let connection = Connection::open(&built.blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&built.blobs).unwrap();
+     for (path, entry) in &mut entries {
+         if path.as_bytes() != b"a.ts" {
+             continue;
 --- /dev/null
 +++ b/crates/aft/src/db/store_diet_trace.rs
 @@ -0,0 +1,35 @@

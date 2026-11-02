@@ -48,7 +48,7 @@ four-line cfg(test) module registration there:
 
 ```
 git apply crates/aft/tests/store_diet/baseline-trace.patch
-AFT_STORE_DIET_SQL_TRACE="$PWD/trace.jsonl" cargo test -p agent-file-tools --lib store_diet
+AFT_STORE_DIET_SQL_TRACE="$PWD/trace.jsonl" cargo test -p agent-file-tools --lib -- store_diet
 python3 crates/aft/tests/store_diet/inventory.py coverage trace.jsonl
 ```
 
@@ -60,3 +60,12 @@ fails on an untraced, unexempted variant, on an empty exemption reason, or on a
 stale exemption. Exemptions name the unavailable workload/branch rather than
 pretending a statement was traced. Goldens remain read-only in traced replay,
 so a changed reply cannot be hidden by recording it again.
+
+To review gaps, pass `--report UNCOVERED.json` to `coverage`, then run
+`inventory.py draft-exemptions UNCOVERED.json DRAFT.json`. The draft groups
+test-only, template-boundary and absent owner workloads with source locations.
+Review those owner branches before accepting a draft as trace_exemptions.json;
+an unresolved template remains an expansion gap, not a prepared-plan guarantee.
+Coverage rejects exemptions for statements that are now traced as well as stale
+ids and empty reasons. This prevents an old blanket exemption from hiding a
+newly exercised statement.

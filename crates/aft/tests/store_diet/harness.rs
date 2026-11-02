@@ -11,6 +11,14 @@ const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/store_diet");
 fn golden(name: &str, bytes: &[u8]) {
     let path = Path::new(ASSETS).join(name);
     if std::env::var_os("AFT_STORE_DIET_RECORD").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        // A format change must compare against the old oracle, not bless its
+        // own answers by accidentally inheriting the recording switch.
+        assert_eq!(SCHEMA_VERSION, 3, "baseline recording requires schema 3");
+        assert_eq!(
+            crate::views::materialization::MATERIALIZATION_VERSION,
+            "12",
+            "baseline recording requires materialization 12"
+        );
         fs::write(path, bytes).unwrap();
     } else {
         assert_eq!(
@@ -23,47 +31,29 @@ fn golden(name: &str, bytes: &[u8]) {
 }
 
 fn fixture_files(root: &Path) -> Vec<PathBuf> {
-    fn walk(root: &Path, files: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(root).unwrap() {
+    fn walk(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
             let entry = entry.unwrap();
+            let path = entry.path();
             if entry.file_type().unwrap().is_dir() {
-                walk(&entry.path(), files);
+                walk(root, &path, files);
             } else if entry.file_type().unwrap().is_file() {
-                files.push(entry.path());
+                let relative = relative_path(root, &path);
+                if crate::parser::detect_language(&path).is_some()
+                    || crate::views::assembly::is_resolution_input(relative.as_bytes())
+                {
+                    files.push(path);
+                }
             }
         }
     }
-    let mut paths = Vec::new();
-    walk(root, &mut paths);
-    let mut files = paths
-        .into_iter()
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some(
-                    "ts" | "tsx"
-                        | "js"
-                        | "jsx"
-                        | "rs"
-                        | "py"
-                        | "go"
-                        | "java"
-                        | "cs"
-                        | "php"
-                        | "rb"
-                        | "c"
-                        | "cpp"
-                        | "swift"
-                        | "kt"
-                )
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    walk(root, root, &mut files);
     files.sort();
     files
 }
 
-fn replies(store: &CallGraphStore, root: &Path) -> Value {
+fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
     let file = root.join("main.ts");
     let target = root.join("helpers.ts");
     let cache = Arc::new(RwLock::new(SymbolCache::new()));
@@ -140,32 +130,113 @@ fn store_diet_legacy_golden() {
     );
     golden(
         "legacy-seeded.json",
-        &serde_json::to_vec_pretty(&seeded_replies(&store, &root)).unwrap(),
+        &serde_json::to_vec_pretty(&seeded_replies(&store, &store, &root)).unwrap(),
     );
 }
 
 fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
+    view_store_with_shapes(temp, root, files).0
+}
+
+fn view_store_with_shapes(temp: &Path, root: &Path, files: &[PathBuf]) -> (CallGraphStore, Value) {
+    let built = view_store_custom(temp, root, files, |_, _| {});
+    (built.store, built.shapes)
+}
+
+struct TestViewBuild {
+    store: CallGraphStore,
+    shapes: Value,
+    entries: Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
+    blobs: PathBuf,
+}
+
+fn view_store_custom(
+    temp: &Path,
+    root: &Path,
+    files: &[PathBuf],
+    mutate: impl Fn(&str, &mut join::CallgraphBlob),
+) -> TestViewBuild {
     use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
     let blobs = temp.join("blobs.sqlite");
     let connection = Connection::open(&blobs).unwrap();
     connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
     let mut entries = Vec::new();
+    let mut shapes = BTreeMap::<String, usize>::new();
     for file in files {
-        let language = match file.extension().and_then(|s| s.to_str()).unwrap() {
-            "rs" => "rust",
-            "py" => "python",
-            "go" => "go",
-            "java" => "java",
-            "cs" => "csharp",
-            "js" => "javascript",
-            _ => "typescript",
-        };
         let source = fs::read_to_string(file).unwrap();
-        let payload =
+        let relative = relative_path(root, file);
+        if !crate::views::callgraph::applies_to_relative(relative.as_bytes()) {
+            continue;
+        }
+        let resolution_input = crate::views::assembly::is_resolution_input(relative.as_bytes());
+        let mut blob = if resolution_input {
+            join::CallgraphBlob::config(
+                source.as_bytes().to_vec(),
+                crate::views::callgraph::PRODUCER,
+            )
+        } else {
+            let language =
+                lang_label(crate::parser::detect_language_from_source(file, &source).unwrap());
             join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
                 .unwrap()
-                .to_bytes()
-                .unwrap();
+        };
+        mutate(&relative, &mut blob);
+        let payload = blob.to_bytes().unwrap();
+        if let Some(parsed) = blob.parse() {
+            let resolver =
+                join::dispatch::Resolver::new(BTreeMap::from([(relative.clone(), parsed)]));
+            for site in &parsed.dispatch.sites {
+                let key = format!(
+                    "site:receiver={};member={};caller={};dynamic={};blob_ref={}",
+                    site.receiver.is_some(),
+                    site.member.is_some(),
+                    site.caller.is_some(),
+                    site.dynamic,
+                    parsed
+                        .refs
+                        .iter()
+                        .any(|reference| reference.ordinal as u64 == site.ordinal as u64)
+                );
+                *shapes.entry(key).or_default() += 1;
+                let targets = resolver.resolve(&relative, site).targets;
+                let mut provenance = BTreeMap::<(String, String), Vec<String>>::new();
+                for target in targets {
+                    provenance
+                        .entry((target.file.to_string(), target.symbol.to_string()))
+                        .or_default()
+                        .push(target.provenance.to_string());
+                }
+                for order in provenance.values() {
+                    if order.len() > 1 {
+                        *shapes
+                            .entry(format!(
+                                "target:duplicate_provenance=true;order={}",
+                                order.join(",")
+                            ))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            for ty in &parsed.dispatch.types {
+                *shapes
+                    .entry(format!(
+                        "type:interface={};closed={}",
+                        ty.interface, ty.closed
+                    ))
+                    .or_default() += 1;
+            }
+            for method in &parsed.dispatch.methods {
+                *shapes
+                    .entry(format!(
+                        "method:trait={};body={};private={};shape={}",
+                        method.trait_name.is_some(),
+                        method.has_body,
+                        method.private,
+                        method.shape
+                    ))
+                    .or_default() += 1;
+            }
+        }
         let key = blake3::hash(&payload);
         connection
             .execute(
@@ -178,19 +249,19 @@ fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
             )
             .unwrap();
         entries.push((
-            RelPath::new(relative_path(root, file).as_bytes()).unwrap(),
+            RelPath::new(relative.as_bytes()).unwrap(),
             ManifestEntry::Regular {
                 mode: 0o100644,
                 planes: RegularPlanes {
                     callgraph: Some(key.to_hex().to_string()),
                     semantic: None,
                 },
-                resolution_input: false,
+                resolution_input,
             },
         ));
     }
     drop(connection);
-    let manifest = Manifest::new(entries).unwrap();
+    let manifest = Manifest::new(entries.clone()).unwrap();
     let database = temp.join("derived.sqlite");
     crate::views::materialization::materialize_manifest_view_database(&database, &blobs, &manifest)
         .unwrap();
@@ -208,24 +279,38 @@ fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
     );
     store.manifest_view = true;
     store.database_ready.store(true, AtomicOrdering::Release);
-    store
+    TestViewBuild {
+        store,
+        shapes: json!(shapes),
+        entries,
+        blobs,
+    }
+}
+
+fn readonly_view(inner: CallGraphStore) -> ReadonlyCallGraphStore {
+    ReadonlyCallGraphStore {
+        inner,
+        _view_pin: None,
+        _generation_pin: None,
+        health_stale_census: Mutex::new(None),
+    }
 }
 
 #[test]
 fn store_diet_views_golden() {
     let (temp, root, files) = fixture();
-    let store = view_store(temp.path(), &root, &files);
+    let store = readonly_view(view_store(temp.path(), &root, &files));
     golden(
         "views-replies.json",
         &serde_json::to_vec_pretty(&replies(&store, &root)).unwrap(),
     );
     golden(
         "views-counts.json",
-        &serde_json::to_vec_pretty(&counts(&store)).unwrap(),
+        &serde_json::to_vec_pretty(&counts(&store.inner)).unwrap(),
     );
     golden(
         "views-seeded.json",
-        &serde_json::to_vec_pretty(&seeded_replies(&store, &root)).unwrap(),
+        &serde_json::to_vec_pretty(&seeded_replies(&store.inner, &store, &root)).unwrap(),
     );
 }
 
@@ -350,30 +435,495 @@ fn answer<T: serde::Serialize>(result: std::result::Result<T, impl std::fmt::Dis
     }
 }
 
-fn seeded_replies(store: &CallGraphStore, root: &Path) -> Value {
+fn seeded_replies(store: &CallGraphStore, reader: &impl CallGraphRead, root: &Path) -> Value {
     let symbols = sample_queries(store);
-    assert!(!symbols.is_empty());
+    if symbols.is_empty() {
+        return json!([]);
+    }
     let mut results = Vec::new();
     for (file, symbol) in &symbols[..symbols.len().min(500)] {
         let path = root.join(file);
         results.push(json!({
             "file": file, "symbol": symbol,
-            "callers": answer(adapter::callers_result(store, &path, symbol, 4, true)),
-            "call_tree": answer(adapter::call_tree_result(store, &path, symbol, 4, true)),
-            "impact": answer(adapter::impact_result(store, &path, symbol, 4, true)),
+            "callers": answer(adapter::callers_result(reader, &path, symbol, 4, true)),
+            "call_tree": answer(adapter::call_tree_result(reader, &path, symbol, 4, true)),
+            "impact": answer(adapter::impact_result(reader, &path, symbol, 4, true)),
         }));
     }
-    for i in 0..symbols.len().min(100) {
-        let (file, symbol) = &symbols[i];
-        let (to_file, to_symbol) = &symbols[(i + 1) % symbols.len()];
+    let count = symbols.len() as u128;
+    let total = count * count;
+    let seed = blake3::hash(b"callgraph-store-diet-v1\0pairs");
+    let start = u128::from_le_bytes(seed.as_bytes()[..16].try_into().unwrap()) % total;
+    for i in 0..total.min(100) {
+        let index = (start + i * (count + 1)) % total;
+        let (file, symbol) = &symbols[(index / count) as usize];
+        let (to_file, to_symbol) = &symbols[(index % count) as usize];
         let path = root.join(file);
         let cache = Arc::new(RwLock::new(SymbolCache::new()));
         results.push(json!({
             "file": file, "symbol": symbol, "to_file": to_file, "to_symbol": to_symbol,
-            "trace_to": answer(adapter::trace_to_result(store, &path, symbol, 4, true)),
-            "trace_to_symbol": answer(adapter::trace_to_symbol_result(store, &path, symbol, to_symbol, Some(&root.join(to_file)), 4, true)),
-            "trace_data": answer(adapter::trace_data_result(store, &path, symbol, "value", 4, cache)),
+            "trace_to": answer(adapter::trace_to_result(reader, &path, symbol, 4, true)),
+            "trace_to_symbol": answer(adapter::trace_to_symbol_result(reader, &path, symbol, to_symbol, Some(&root.join(to_file)), 4, true)),
+            "trace_data": answer(adapter::trace_data_result(reader, &path, symbol, "value", 4, cache)),
         }));
     }
     json!(results)
+}
+
+fn stored_values(store: &CallGraphStore) -> Value {
+    // These are logical text values. Integer codecs must decode them before
+    // comparison rather than changing the baseline vocabulary oracle.
+    let conn = store.conn.lock().unwrap();
+    let mut result = serde_json::Map::new();
+    for (table, columns) in [
+        ("files", vec!["lang"]),
+        ("nodes", vec!["kind", "provenance"]),
+        ("refs", vec!["kind", "status", "import_kind", "provenance"]),
+        ("edges", vec!["kind", "provenance"]),
+        ("dispatch_hints", vec!["provenance"]),
+        ("backend_file_state", vec!["backend", "status"]),
+        ("view_dispatch_sites", vec!["language"]),
+    ] {
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !present {
+            continue;
+        }
+        for column in columns {
+            let mut statement = conn.prepare(&format!("SELECT {column}, count(*) FROM {table} WHERE {column} IS NOT NULL GROUP BY {column}")).unwrap();
+            let values = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+                .unwrap();
+            result.insert(format!("{table}.{column}"), json!(values));
+        }
+    }
+    for (table, column) in [("nodes", "id"), ("refs", "ref_id"), ("edges", "edge_id")] {
+        let mut statement = conn
+            .prepare(&format!("SELECT {column} FROM {table}"))
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        let mut forms = BTreeMap::<String, usize>::new();
+        for id in ids {
+            let id = id.unwrap();
+            let form = [
+                "view:symbol:pos:symbol:",
+                "view:symbol:top:",
+                "pos:symbol:",
+                "top:",
+                "edge:view:",
+                "dispatch:",
+                "view:",
+            ]
+            .into_iter()
+            .find(|prefix| id.starts_with(prefix))
+            .unwrap_or("digest");
+            *forms.entry(form.to_string()).or_default() += 1;
+        }
+        result.insert(format!("{table}.id_form"), json!(forms));
+    }
+    let mut statement = conn.prepare("SELECT kind, provenance, caller_node IS NOT NULL, full_ref IS NOT NULL, module_path IS NOT NULL, import_kind IS NOT NULL, wildcard, target_node IS NOT NULL, target_file IS NOT NULL, target_symbol IS NOT NULL FROM refs WHERE status='unresolved'").unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            let flags = (2..10)
+                .map(|i| row.get::<_, i64>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(format!(
+                "{}:{}:{flags:?}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })
+        .unwrap();
+    let mut forms = BTreeMap::<String, usize>::new();
+    for form in rows {
+        *forms.entry(form.unwrap()).or_default() += 1;
+    }
+    result.insert("refs.unresolved_form".into(), json!(forms));
+    let orphan_edges: i64 = conn.query_row("SELECT count(*) FROM edges e LEFT JOIN refs r ON r.ref_id=e.ref_id WHERE r.ref_id IS NULL", [], |row| row.get(0)).unwrap();
+    result.insert("edges.without_ref_row".into(), json!(orphan_edges));
+    Value::Object(result)
+}
+
+fn corpus_cases() -> Vec<Value> {
+    serde_json::from_slice(&fs::read(Path::new(ASSETS).join("corpus_manifest.json")).unwrap())
+        .unwrap()
+}
+
+#[test]
+fn store_diet_language_corpus_legacy() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut results = serde_json::Map::new();
+    for case in corpus_cases() {
+        let name = case["name"].as_str().unwrap();
+        let root = Path::new(ASSETS)
+            .join("corpus")
+            .join(name)
+            .canonicalize()
+            .unwrap();
+        let files = fixture_files(&root);
+        let store = CallGraphStore::open(temp.path().join(name), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        results.insert(name.to_string(), json!({"counts": counts(&store), "values": stored_values(&store), "queries": seeded_replies(&store, &store, &root)}));
+    }
+    golden(
+        "corpus-legacy.json",
+        &serde_json::to_vec_pretty(&results).unwrap(),
+    );
+}
+
+#[test]
+fn store_diet_language_corpus_views() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut results = serde_json::Map::new();
+    for case in corpus_cases() {
+        let name = case["name"].as_str().unwrap();
+        let root = Path::new(ASSETS)
+            .join("corpus")
+            .join(name)
+            .canonicalize()
+            .unwrap();
+        let files = fixture_files(&root);
+        let directory = temp.path().join(name);
+        fs::create_dir_all(&directory).unwrap();
+        let (inner, shapes) = view_store_with_shapes(&directory, &root, &files);
+        let store = readonly_view(inner);
+        results.insert(name.to_string(), json!({"counts": counts(&store.inner), "values": stored_values(&store.inner), "dispatch_shapes": shapes, "queries": seeded_replies(&store.inner, &store, &root)}));
+    }
+    golden(
+        "corpus-views.json",
+        &serde_json::to_vec_pretty(&results).unwrap(),
+    );
+}
+
+static VALUE_PROBE_TRACE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[test]
+fn store_diet_transient_and_backend_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let good = root.join("good.rs");
+    let bad = root.join("bad.rs");
+    fs::write(&good, "fn f() {}\nfn g() { f(); }\n").unwrap();
+    // A single invalid UTF-8 byte is the smallest input that exercises the
+    // undecodable backend state; valid language programs cannot produce it.
+    fs::write(&bad, [0xff]).unwrap();
+    let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
+    VALUE_PROBE_TRACE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clear();
+    store.conn.lock().unwrap().trace(Some(|sql| {
+        VALUE_PROBE_TRACE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push(sql.to_owned())
+    }));
+    store.cold_build(&[good.clone(), bad]).unwrap();
+    let insert = regex::Regex::new(r"(?is)^\s*INSERT(?: OR \w+)? INTO refs\s*\(").unwrap();
+    let staged = VALUE_PROBE_TRACE
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|sql| insert.is_match(sql) && sql.contains("'staged'"));
+    assert!(
+        staged,
+        "the cold pipeline must actually write its staged ref status"
+    );
+    let before = stored_values(&store);
+    store.mark_files_stale(&[good]).unwrap();
+    let after = stored_values(&store);
+    golden(
+        "lifecycle-values.json",
+        &serde_json::to_vec_pretty(
+            &json!({"after_cold": before, "after_stale_mark": after, "staged_ref_write": staged}),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn store_diet_sqlite_implicit_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Path::new(ASSETS)
+        .join("corpus/smoke-typescript")
+        .canonicalize()
+        .unwrap();
+    let file = root.join("a.ts");
+    let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+    store.cold_build(std::slice::from_ref(&file)).unwrap();
+    let nodes = HashMap::from([
+        ("f".to_string(), node_id("a.ts", "function", "f")),
+        ("g".to_string(), node_id("a.ts", "function", "g")),
+    ]);
+    // Two valid identities deliberately share a stored site span. Bare GROUP
+    // BY columns must keep SQLite's baseline representative, not an id sort.
+    let calls = ["f", "g"]
+        .into_iter()
+        .zip(["left.run", "right.run"])
+        .map(|(caller, full)| {
+            (
+                caller.to_string(),
+                vec![callgraph::CallSite {
+                    kind: callgraph::CallSiteKind::Call,
+                    callee_name: "run".into(),
+                    full_callee: full.into(),
+                    line: 1,
+                    byte_start: 7,
+                    byte_end: 10,
+                }],
+            )
+        })
+        .collect();
+    let refs = build_callable_refs("a.ts", &calls, &nodes, &BTreeSet::new(), "call");
+    let mut grouped = Vec::new();
+    for order in [[1usize, 0], [0, 1]] {
+        {
+            let mut connection = store.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction.execute("DELETE FROM edges", []).unwrap();
+            transaction.execute("DELETE FROM refs", []).unwrap();
+            for index in order {
+                insert_resolved_ref(
+                    &transaction,
+                    &ResolvedRef {
+                        raw: refs[index].clone(),
+                        status: "unresolved".into(),
+                        target_node: None,
+                        target_file: None,
+                        target_symbol: None,
+                        dependencies: BTreeSet::new(),
+                        edge: None,
+                    },
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let sites = store
+            .unresolved_method_sites_named("run", LangId::TypeScript)
+            .unwrap();
+        grouped.push(json!({"write_order": order, "sites": sites.into_iter().map(|site| json!({"file": site.file, "caller": site.caller_symbol, "line": site.line, "test": site.is_test})).collect::<Vec<_>>()}));
+    }
+    let mut extract = build_file_extract(&root, &file).unwrap();
+    let original = extract
+        .nodes
+        .iter()
+        .find(|node| node.scoped_name == "f")
+        .unwrap()
+        .clone();
+    let mut overload = original.clone();
+    overload.kind = "class".into();
+    overload.id = node_id("a.ts", &overload.kind, &overload.scoped_name);
+    overload.range_ordinal += 100;
+    overload.range.end_col += 1;
+    overload.is_type_like = true;
+    let mut ties = Vec::new();
+    for class_first in [true, false] {
+        extract.nodes.retain(|node| node.scoped_name != "f");
+        let pair = if class_first {
+            vec![overload.clone(), original.clone()]
+        } else {
+            vec![original.clone(), overload.clone()]
+        };
+        extract.nodes.extend(pair);
+        let mut connection = store.conn.lock().unwrap();
+        {
+            let transaction = connection.transaction().unwrap();
+            transaction.execute("DELETE FROM edges", []).unwrap();
+            transaction.execute("DELETE FROM refs", []).unwrap();
+            transaction.execute("DELETE FROM nodes", []).unwrap();
+            let mut statements = ColdBuildInsertStatements::new(&transaction).unwrap();
+            insert_file_graph_rows_prepared(&mut statements, &extract).unwrap();
+            drop(statements);
+            transaction.commit().unwrap();
+        }
+        let candidates = nodes_for_file_matching_symbol(&connection, "a.ts", "f").unwrap();
+        let selected =
+            crate::views::materialization::dispatch::store_diet_node_kind(&connection, "a.ts", "f")
+                .unwrap();
+        ties.push(json!({"class_first": class_first, "dispatch_node_kind": selected, "ambiguity_candidates": candidates.into_iter().map(|node| json!({"id": node.node_id, "kind": node.kind, "name": node.symbol, "line": node.line})).collect::<Vec<_>>()}));
+    }
+    golden(
+        "sqlite-order.json",
+        &serde_json::to_vec_pretty(
+            &json!({"bare_group_representative": grouped, "unordered_node_and_ties": ties}),
+        )
+        .unwrap(),
+    );
+}
+
+fn ordered_dispatch_rows(store: &CallGraphStore) -> Value {
+    let connection = store.conn.lock().unwrap();
+    let mut result = serde_json::Map::new();
+    for (table, columns, count) in [
+        (
+            "refs",
+            "ref_id, kind, status, target_symbol, provenance",
+            5usize,
+        ),
+        ("edges", "edge_id, ref_id, target_symbol, provenance", 4),
+    ] {
+        let mut statement = connection
+            .prepare(&format!("SELECT {columns} FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                (0..count)
+                    .map(|i| row.get::<_, Option<String>>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        result.insert(table.into(), json!(rows));
+    }
+    Value::Object(result)
+}
+
+#[test]
+fn store_diet_duplicate_site_order_and_prefix_paths() {
+    use crate::views::{Manifest, ManifestEntry};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("source");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let source =
+        fs::read(Path::new(ASSETS).join("corpus/receiver-typescript/receiver.ts")).unwrap();
+    for file in ["a.ts", "a.ts.more.ts"] {
+        fs::write(root.join(file), &source).unwrap();
+    }
+    let directory = temp.path().join("view");
+    fs::create_dir_all(&directory).unwrap();
+    let files = fixture_files(&root);
+    // Duplicate ordinals are legal stored facts. The consumer must retain
+    // site-vector order, including when one file forces the whole-view fallback.
+    let built = view_store_custom(&directory, &root, &files, |file, blob| {
+        if file != "a.ts" {
+            return;
+        }
+        let join::CallgraphBlob::Parse(parsed) = blob else {
+            return;
+        };
+        let sites = parsed
+            .dispatch
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site.member.as_deref() == Some("m"))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert!(sites.len() >= 2);
+        parsed.dispatch.sites[sites[1]].ordinal = parsed.dispatch.sites[sites[0]].ordinal;
+        parsed.dispatch.sites[sites[1]].member = Some("f".into());
+    });
+    let database = built.store.sqlite_path().to_path_buf();
+    let reader = readonly_view(built.store);
+    let before = json!({"rows": ordered_dispatch_rows(&reader.inner), "tree": answer(adapter::call_tree_result(&reader, &root.join("a.ts"), "C::f", 4, true))});
+    drop(reader);
+    let base = Manifest::new(built.entries.clone()).unwrap();
+    let mut entries = built.entries;
+    let connection = Connection::open(&built.blobs).unwrap();
+    for (path, entry) in &mut entries {
+        if path.as_bytes() != b"a.ts" {
+            continue;
+        }
+        let ManifestEntry::Regular { planes, .. } = entry else {
+            panic!("regular fixture")
+        };
+        let old = blake3::Hash::from_hex(planes.callgraph.as_ref().unwrap()).unwrap();
+        let payload: Vec<u8> = connection
+            .query_row(
+                "SELECT payload FROM blob_payloads WHERE full_key=?1",
+                [old.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut blob = join::CallgraphBlob::from_bytes(&payload).unwrap();
+        let join::CallgraphBlob::Parse(parsed) = &mut blob else {
+            panic!("parse fixture")
+        };
+        let duplicate = parsed
+            .dispatch
+            .sites
+            .iter()
+            .map(|site| site.ordinal)
+            .find(|ordinal| {
+                parsed
+                    .dispatch
+                    .sites
+                    .iter()
+                    .filter(|site| site.ordinal == *ordinal)
+                    .count()
+                    > 1
+            })
+            .unwrap();
+        let sites = parsed
+            .dispatch
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site.ordinal == duplicate)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        parsed.dispatch.sites.swap(sites[0], sites[1]);
+        let payload = blob.to_bytes().unwrap();
+        let key = blake3::hash(&payload);
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1,?2,?3,1)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    key.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        planes.callgraph = Some(key.to_hex().to_string());
+    }
+    drop(connection);
+    let next = Manifest::new(entries).unwrap();
+    crate::views::materialization::apply_manifest_diff(&database, &base, &next, &built.blobs)
+        .unwrap();
+    let connection = open_readonly_connection(&database).unwrap();
+    let mut inner = CallGraphStore::from_connection(
+        root.clone(),
+        "order-probe".into(),
+        database,
+        directory,
+        false,
+        None,
+        None,
+        None,
+        connection,
+    );
+    inner.manifest_view = true;
+    inner.database_ready.store(true, AtomicOrdering::Release);
+    let reader = readonly_view(inner);
+    let after = json!({"rows": ordered_dispatch_rows(&reader.inner), "tree": answer(adapter::call_tree_result(&reader, &root.join("a.ts"), "C::f", 4, true))});
+    assert_ne!(
+        before, after,
+        "shuffling duplicate sites must change the baseline last writer"
+    );
+    golden(
+        "dispatch-order.json",
+        &serde_json::to_vec_pretty(&json!({"before": before, "after": after})).unwrap(),
+    );
 }

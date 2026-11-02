@@ -1,0 +1,24 @@
+{
+  "source_revision": "998c896b05753dd3a83158e30f97779b89ef28e2",
+  "domains": {
+    "node_kind": {"columns":["nodes.kind"],"values":["function","kernel","class","method","struct","interface","enum","type_alias","variable","heading","file_summary"],"source":"callgraph_store/mod.rs::symbol_kind_label"},
+    "ref_kind": {"columns":["refs.kind"],"values":["call","value_ref","construction","callback_ref","import","module","reexport","export_alias","macro_body_call","macro_mention"],"source":"callgraph_store/mod.rs::build_callable_refs, structural and macro constructors; views/materialization.rs::manifest_ref_kind"},
+    "edge_kind": {"columns":["edges.kind"],"values":["call","value_ref","callback_ref"],"source":"callgraph_store/mod.rs::resolve_ref; views/materialization.rs ordinary edge emission"},
+    "ref_status": {"columns":["refs.status"],"values":["staged","resolved","unresolved"],"source":"callgraph_store/mod.rs::insert_staged_ref_prepared and resolve_ref"},
+    "import_kind": {"columns":["refs.import_kind"],"values":["value","type","side_effect","module","reexport","export_alias"],"source":"callgraph_store/mod.rs::import_kind_label and structural ref constructors"},
+    "provenance": {"columns":["nodes.provenance","refs.provenance","edges.provenance","dispatch_hints.provenance"],"values":["treesitter+resolver","value_ref","name_match","type_match","exact","dispatch"],"source":"callgraph_store/mod.rs provenance constants; callgraph_store/dispatch.rs::Resolver"},
+    "backend": {"columns":["backend_file_state.backend"],"values":["treesitter"],"source":"callgraph_store/mod.rs::BACKEND_TREESITTER"},
+    "backend_status": {"columns":["backend_file_state.status"],"values":["fresh","stale","undecodable"],"source":"callgraph_store/mod.rs successful extraction, stale marking and undecodable extraction writers"},
+    "language": {"columns":["files.lang"],"values":["typescript","tsx","javascript","python","rust","go","c","cpp","cuda","metal","zig","csharp","bash","html","markdown","solidity","scss","vue","json","scala","java","ruby","kotlin","swift","php","lua","perl","yaml","pascal","r","groovy","objc","toml"],"source":"callgraph_store/mod.rs::lang_label"},
+    "node_id_form": {"columns":["nodes.id_form"],"values":["pos:symbol:","top:","view:symbol:pos:symbol:","view:symbol:top:"],"source":"callgraph_store/mod.rs::node_id and view_node_id"},
+    "ref_id_form": {"columns":["refs.id_form"],"values":["digest","view:"],"source":"callgraph_store/mod.rs::ref_id; views/materialization.rs ref emission"},
+    "edge_id_form": {"columns":["edges.id_form"],"values":["digest","edge:view:","dispatch:"],"source":"callgraph_store/mod.rs edge constructors; views/materialization/dispatch.rs"}
+  },
+  "dispatch_shape_values": ["receiver=true","receiver=false","member=true","member=false","caller=true","caller=false","dynamic=true","dynamic=false","blob_ref=true","blob_ref=false","interface=true","interface=false","closed=true","closed=false","trait=true","trait=false","body=true","body=false","private=true","private=false"],
+  "notes": [
+    "Domains are producer-written values, not arbitrary poison text inserted by fault tests into unconstrained TEXT columns.",
+    "Provenance is checked across its shared vocabulary; per-column locations and counts are still reported individually.",
+    "Staged refs are transient: the lifecycle probe observes an actual successful cold-build INSERT rather than expecting them in a finished ready database.",
+    "Markdown is a legacy graph input and a negative views-plane control. Languages with no call-node kinds retain structural symbols but make no dispatch-coverage claim."
+  ]
+}

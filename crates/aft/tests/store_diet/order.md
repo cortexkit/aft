@@ -67,3 +67,38 @@ unwind. The inventory records the code actually used to generate the goldens,
 without weakening that existing per-path behavior. The no-limit reached-node
 invariant applies to every traversal; completed-path invariance applies only to
 per-path enumeration, not BFS's selected shortest path or data-flow dedup.
+
+## SQLite-dependent selection contracts
+
+The following are intentionally **not** declared total orders. Replacing their
+keys with integers must preserve the baseline access path and row/write order;
+adding a new id tie-break would change the contract rather than preserve it.
+`sqlite-order.json` and `dispatch-order.json` record both normal and shuffled
+stored-input orders, not merely sets of results.
+
+| Consumer | Undeclared selection | Replacement obligation / probe |
+| --- | --- | --- |
+| `CallGraphStore::unresolved_method_sites_named` (`mod.rs:9861-9881`) | GROUP BY `(caller_file, byte_start, byte_end)` returns bare caller, line and test columns from one input row | Preserve the grouping keys as decoded text/numbers and its baseline index/rowid representative. The probe gives two content-derived ref identities the same span, reverses their write order, and records the actual returned caller. |
+| dispatch writer `node()` (`views/materialization/dispatch.rs:1265-1274`) | `SELECT id ... WHERE file_path=? AND scoped_name=?` has no ORDER BY | Keep rowid/insertion semantics, not numeric-id order. The stored-node probe ties scoped name/start line/start column with distinct valid kind-derived identities, shuffles insertion, and invokes the actual production lookup through a cfg(test) shim. Same-kind overloads are coalesced by current semantic ids; the C# overload corpus separately records that producer behavior. |
+| dispatch edge INSERT OR REPLACE | Same `(file, site ordinal, target file, target symbol)` edge identity can arrive with different provenance. Last target wins; Target's BTreeSet orders provenance text | Preserve Target tuple order including **text** provenance, and preserve replacement rather than ignoring equal-identity writes. The trait-default/dynamic-receiver corpus supplies a target reachable as exact and dispatch. |
+| duplicate dispatch site ordinals | The same per-file ordinal is consumed row by row; the duplicate detection selects a whole-manifest row-by-row fallback | Do not dedup, regroup or sort equal ordinals. The structured-blob probe changes only site order, uses `a.ts` beside `a.ts.more.ts`, and records cold then incremental rows plus real call-tree replies. |
+| `nodes_for_file_matching_symbol` (`mod.rs:11158-11213`) and its ambiguity candidates | Only `(scoped_name, start_line, start_col)` are ordered; later ties remain dependent on access/insertion order | Decode the scoped name and keep tied candidate sequence. The same stored-node probe records production candidate vectors with both insertion orders. Do not silently append an id ordering. |
+
+These probes deliberately include stored-row/blob configurations in addition to
+source programs. They isolate consumer contracts that the current extractor may
+coalesce before writing, while retaining content-derived identity inputs. No
+existing test's output assertion is rewritten to make a new order acceptable.
+
+## Maintenance id keys (also in the text-reader inventory)
+
+- The per-file `ref_id` range `[view:{file}:, view:{file};)` is in
+  `identities.md`'s view-ref range/last-colon reader row and in
+  `source_inventory.json:id_text_readers`. Both complete SQL variants of the
+  dispatch edge reader are materialized in `statements.json`, including its
+  `INDEXED BY idx_edges_ref_id` range variant, not just the SELECT prefix.
+- `dispatch:{file}:{ordinal}:{target_file}:{target_symbol}` is in the constructor
+  table in `identities.md`, with form/target components retained independently of
+  refs-row existence. Its writer/last-provenance behavior is listed above.
+- Recovery of the owning file via stripping `view:` and `rsplit_once(':')` is in
+  the same `identities.md` reader row and the line-level reader census. It must
+  use stored components or identical reconstructed text, never a split integer.

@@ -19,6 +19,18 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertEqual([s for _, s in inventory.strings(source)],
                          ['SELECT 1', "SELECT 'quoted' FROM refs", 'SELECT ref_id FROM refs'])
 
+    def test_sql_owner_metadata_distinguishes_test_modules_and_live_functions(self):
+        text = '#[cfg(test)] mod tests { fn setup() { let s = "SELECT { ignored }"; } } fn live() { let s = "SELECT real"; }'
+        scopes = inventory.rust_scopes(text)
+        path = pathlib.Path('src/mod.rs')
+        self.assertEqual(inventory.owner_at(scopes, text.index('SELECT {'), path), {'owner': 'setup', 'test_only': True})
+        self.assertEqual(inventory.owner_at(scopes, text.index('SELECT real'), path), {'owner': 'live', 'test_only': False})
+
+    def test_cooked_sql_strings_keep_escaped_backslashes_and_decode_rust_unicode(self):
+        decoded = inventory.cooked_string(r"SELECT '\\n', '\u{e9}', '\x41'")
+        self.assertEqual(decoded, "SELECT '\\n', 'é', 'A'")
+        self.assertNotIn('\n', decoded)
+
     def test_sql_census_ignores_agent_prose(self):
         for text in ['with 2 files changed', 'create symlink', 'drop the cache', 'update failed']:
             self.assertIsNone(inventory.SQL.match(text))
@@ -66,9 +78,21 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
                     inventory.coverage(rows, [trace])
                 exemptions.write_text(json.dumps({'unresolved:one': 'This manifest has no unresolved-reference query.'}))
                 inventory.coverage(rows, [trace])
+                exemptions.write_text(json.dumps({'unresolved:one': 'Not queried.', 'resolved:one': 'Already traced.'}))
+                with self.assertRaisesRegex(AssertionError, 'obsolete exemptions'):
+                    inventory.coverage(rows, [trace])
                 exemptions.write_text(json.dumps({'unresolved:one': ''}))
                 with self.assertRaisesRegex(AssertionError, 'empty trace exemption'):
                     inventory.coverage(rows, [trace])
+
+    def test_exemption_drafts_keep_owner_and_do_not_misclassify_json_literals(self):
+        rows = [{'id': 'q', 'sites': [{'path': 'crates/aft/src/db/state.rs', 'line': 8, 'owner': 'save', 'test_only': False}]}]
+        draft = inventory.draft_exemptions([{'id': 'q:literal/0', 'sql': "INSERT INTO state VALUES('{}')"}], rows)
+        self.assertIn('Separate state/ledger', draft['q:literal/0'])
+        self.assertIn('state.rs:8 (save)', draft['q:literal/0'])
+        rows[0]['sites'][0]['test_only'] = True
+        draft = inventory.draft_exemptions([{'id': 'q:literal/0', 'sql': 'SELECT 1'}], rows)
+        self.assertTrue(draft['q:literal/0'].startswith('Test-only'))
 
     def test_sampling_is_seeded_bounded_and_input_order_independent(self):
         symbols = [f'file{i}.rs\0f{i}' for i in range(600)]
@@ -77,6 +101,11 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertEqual(sum(r['command'] == 'callers' for r in requests), 500)
         self.assertEqual(sum(r['command'] == 'trace_to_symbol' for r in requests), 100)
         self.assertEqual(len({r['id'] for r in requests}), len(requests))
+
+    def test_small_corpus_samples_pairs_not_only_neighbouring_symbols(self):
+        self.assertEqual(set(parity.sample_pairs(['a', 'b'])), {('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')})
+        self.assertEqual(parity.sample_pairs(['a', 'b']), parity.sample_pairs(['b', 'a']))
+        self.assertEqual(parity.sample_pairs([]), [])
 
     def test_metadata_normalisation_preserves_nested_rows_and_wire_bytes(self):
         raw = b' { "search_ms": 1.25, "rows": [{"search_ms": 9}], "notes": ["unchanged"] }\n'
@@ -93,6 +122,8 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'building'}}}))
         self.assertFalse(parity.pending_reply(request, {'success': True, 'complete': False, 'unresolved_call_sites': 1}))
         self.assertFalse(parity.pending_reply(request, {'success': False, 'code': 'symbol_not_found'}))
+        self.assertTrue(parity.pending_reply({'command': 'inspect'}, {'success': False, 'code': 'inspect_not_fresh'}))
+        self.assertFalse(parity.pending_reply({'command': 'inspect'}, {'success': True, 'inspect_terminal': 'partial', 'partial_reason': 'unknown diagnostics'}))
 
     def test_capture_trusts_only_its_checkout_and_discards_injected_git_config(self):
         scratch = inventory.ROOT / 'target/scratch'
@@ -106,6 +137,21 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
             parity.trust_selected_checkout(env, nested)
             trusted = root.resolve().as_posix().replace("'", "'\\''")
             self.assertEqual(env, {'GIT_CONFIG_PARAMETERS': f"'safe.directory'='{trusted}'"})
+
+    def test_prepared_borrower_state_requires_an_explicit_cache_mode(self):
+        scratch = inventory.ROOT / 'target/scratch'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            cache = pathlib.Path(temporary) / 'cache'
+            with self.assertRaisesRegex(AssertionError, 'existing owner/base'):
+                parity.prepare_cache(cache, True)
+            parity.prepare_cache(cache, False)
+            marker = cache / 'owner-state'
+            marker.write_text('retained')
+            with self.assertRaisesRegex(AssertionError, 'fresh cache'):
+                parity.prepare_cache(cache, False)
+            parity.prepare_cache(cache, True)
+            self.assertEqual(marker.read_text(), 'retained')
 
     def test_parity_rejects_changed_reply_bytes_and_empty_capture(self):
         # Keep scratch beneath the checkout.

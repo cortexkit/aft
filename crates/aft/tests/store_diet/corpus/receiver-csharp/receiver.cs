@@ -1,0 +1,1 @@
+class C { C field; void m() {} void f(C x) { this.m(); x.m(); C y = new C(); y.m(); field.m(); var z = new C(); z.m(); } }

@@ -1,0 +1,1 @@
+object C { def f(): Unit = {} }

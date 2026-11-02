@@ -1,0 +1,1 @@
+{"id":"wire-trace-symbol","success":true,"path":[{"symbol":"main","file":"main.ts","line":3},{"symbol":"processData","file":"utils.ts","line":3},{"symbol":"validate","file":"helpers.ts","line":1}],"complete":true}

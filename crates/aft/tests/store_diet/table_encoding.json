@@ -3021,7 +3021,7 @@
         "encoding": "unchanged"
       }
     ],
-    "graph_data": true
+    "graph_data": false
   },
   {
     "table": "migration_derived",
@@ -5028,7 +5028,7 @@
         "encoding": "unchanged"
       }
     ],
-    "graph_data": true
+    "graph_data": false
   },
   {
     "table": "view_tokens",
@@ -5145,7 +5145,7 @@
         "encoding": "unchanged"
       }
     ],
-    "graph_data": true
+    "graph_data": false
   },
   {
     "table": "write_ledger_meta",

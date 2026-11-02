@@ -24,11 +24,24 @@ METADATA_FIELDS = {'search_ms', 'tier2_last_run'}
 
 
 def dump(path, value):
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    with path.open('w', encoding='utf-8', newline='\n') as output:
+        output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
 def sample(values, limit):
     return sorted(set(values), key=lambda value: (hashlib.sha256((SEED + '\0' + value).encode()).digest(), value))[:limit]
+
+
+def sample_pairs(values):
+    ordered = sorted(set(values))
+    count = len(ordered)
+    if not count:
+        return []
+    total = count * count
+    start = int.from_bytes(hashlib.sha256((SEED + '\0pairs').encode()).digest(), 'little') % total
+    # count + 1 is coprime to count squared, so these indexes never repeat.
+    indexes = ((start + i * (count + 1)) % total for i in range(min(100, total)))
+    return [(ordered[index // count], ordered[index % count]) for index in indexes]
 
 
 def manifest(symbols):
@@ -40,10 +53,9 @@ def manifest(symbols):
             requests.append({'command': op, 'file': path, 'symbol': name, 'include_tests': True})
         requests.append({'command': 'zoom', 'file': path, 'symbol': name, 'callgraph': True})
         requests.append({'command': 'semantic_search', 'query': name, 'include_tests': True})
-    chosen = sample(symbols, 100)
-    for i, symbol in enumerate(chosen):
+    for symbol, other_symbol in sample_pairs(symbols):
         path, name = symbol.split('\0', 1)
-        other_path, other = chosen[(i + 1) % len(chosen)].split('\0', 1)
+        other_path, other = other_symbol.split('\0', 1)
         requests.append({'command': 'trace_to', 'file': path, 'symbol': name})
         requests.append({'command': 'trace_to_symbol', 'file': path, 'symbol': name, 'toSymbol': other, 'toFile': other_path})
         requests.append({'command': 'trace_data', 'file': path, 'symbol': name, 'expression': 'value'})
@@ -53,7 +65,7 @@ def manifest(symbols):
 
 
 def pending_reply(request, reply):
-    if request['command'] == 'inspect' and reply.get('inspect_terminal') not in {None, 'fresh'}:
+    if request['command'] == 'inspect' and reply.get('code') == 'inspect_not_fresh':
         return True
     graph = (reply.get('index') or {}).get('callgraph') or {}
     return graph.get('reason') == 'identity_provisional' or graph.get('status') in {'building', 'refreshing'}
@@ -73,9 +85,16 @@ def trust_selected_checkout(env, root):
             break
 
 
-def capture(binary, root, cache, requests, output, timeout, views=False):
-    assert not cache.exists(), f'cold capture requires a fresh cache: {cache}'
-    cache.mkdir(parents=True)
+def prepare_cache(cache, prepared):
+    if prepared:
+        assert cache.is_dir(), 'prepared capture requires an existing owner/base cache'
+    else:
+        assert not cache.exists(), f'cold capture requires a fresh cache: {cache}'
+        cache.mkdir(parents=True)
+
+
+def capture(binary, root, cache, requests, output, timeout, views=False, prepared=False, overrides=None, require_borrowed=False):
+    prepare_cache(cache, prepared)
     output.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, AFT_CACHE_DIR=str(cache.resolve()), AFT_STORAGE_DIR=str(cache.resolve()),
                XDG_DATA_HOME=str(cache.resolve() / 'data'), XDG_CONFIG_HOME=str(cache.resolve() / 'config'),
@@ -85,6 +104,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
     trust_selected_checkout(env, root)
     frames = queue.Queue()
     successes = {request['command']: 0 for request in requests}
+    borrowed = 0
     with (output / 'stderr.txt').open('wb') as stderr:
         process = subprocess.Popen([str(binary.resolve())], cwd=root,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=env)
@@ -98,6 +118,12 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
             with (output / 'push.ndjson').open('wb') as pushes:
                 config = {'indexes': {'trigram': True, 'semantic': False, 'callgraph': True},
                           'views': {'enabled': views}, 'worktree': {'ram_overlay': False}}
+                for key, value in (overrides or {}).items():
+                    if isinstance(value, dict) and isinstance(config.get(key), dict):
+                        config[key].update(value)
+                    else:
+                        config[key] = value
+                assert config.get('views', {}).get('enabled') == views, '--config must not override --views'
                 configure = {'id': 'configure-parity', 'command': 'configure', 'harness': 'opencode',
                              'project_root': str(root.resolve()), 'storage_dir': str(cache.resolve()),
                              'config': [{'tier': 'user', 'source': str(cache.resolve() / 'user.jsonc'), 'doc': json.dumps(config)}]}
@@ -121,19 +147,23 @@ def capture(binary, root, cache, requests, output, timeout, views=False):
                                     continue
                                 (output / (request['id'] + '.reply')).write_bytes(line)
                                 successes[request['command']] += int(value.get('success') is True)
+                                borrowed += int(bool(value.get('borrowed_callgraph')))
                             break
                         assert value.get('id') is None, f'unexpected reply: {line!r}'
                         pushes.write(line)
             process.stdin.close()
             assert process.wait(timeout=timeout) == 0, 'binary exited unsuccessfully'
             assert all(successes.values()), f'no successful query for a manifest operation: {successes}'
+            assert not require_borrowed or borrowed > 0, 'capture never served a borrowed_callgraph reply'
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
     dump(output / 'capture.json', {'baseline': BASELINE, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                                   'manifest_sha256': hashlib.sha256(json.dumps(requests, sort_keys=True).encode()).hexdigest(),
-                                  'normalised_fields': [], 'requests': len(requests), 'views': views, 'successful_queries': successes})
+                                  'normalised_fields': [], 'requests': len(requests), 'views': views, 'successful_queries': successes,
+                                  'config_sha256': hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                                  'prepared_cache': prepared, 'required_borrowed': require_borrowed})
 
 
 def normalise_metadata(raw, fields):
@@ -183,14 +213,16 @@ def compare(left, right, fields=()):
         if fields:
             before, after = normalise_metadata(before, fields), normalise_metadata(after, fields)
         assert before == after, f'reply bytes differ: {name}'
-    lmeta = json.loads((left / 'capture.json').read_text())
-    rmeta = json.loads((right / 'capture.json').read_text())
+    lmeta = json.loads((left / 'capture.json').read_text(encoding='utf-8'))
+    rmeta = json.loads((right / 'capture.json').read_text(encoding='utf-8'))
     assert lmeta['manifest_sha256'] == rmeta['manifest_sha256'], 'different query manifests'
+    for field in ['views', 'config_sha256', 'prepared_cache', 'required_borrowed']:
+        assert lmeta.get(field) == rmeta.get(field), f'different capture policy: {field}'
     print(f'{len(names)} raw-byte replies match; normalised metadata: {list(fields)}')
 
 
 def prove_normalisation(left, right, output):
-    lmeta, rmeta = (json.loads((root / 'capture.json').read_text()) for root in [left, right])
+    lmeta, rmeta = (json.loads((root / 'capture.json').read_text(encoding='utf-8')) for root in [left, right])
     assert lmeta['binary_sha256'] == rmeta['binary_sha256'], 'normalisation proof requires the same baseline binary'
     fields = set()
     for path in left.glob('*.reply'):
@@ -205,7 +237,7 @@ def prove_normalisation(left, right, output):
 
 def row_counts(database):
     """Read a finished database through SQLite, never a raw database descriptor."""
-    tables = json.loads((HERE / 'table_encoding.json').read_text())
+    tables = json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8'))
     connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
     try:
         present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -231,6 +263,9 @@ def main():
         run.add_argument(arg, type=pathlib.Path)
     run.add_argument('--timeout', type=int, default=300)
     run.add_argument('--views', action='store_true')
+    run.add_argument('--prepared-cache', action='store_true')
+    run.add_argument('--require-borrowed', action='store_true')
+    run.add_argument('--config', type=pathlib.Path, help='user config overrides, including copy/overlay policy')
     diff = sub.add_parser('compare')
     diff.add_argument('baseline', type=pathlib.Path)
     diff.add_argument('candidate', type=pathlib.Path)
@@ -244,17 +279,19 @@ def main():
     counts.add_argument('output', type=pathlib.Path)
     args = parser.parse_args()
     if args.command == 'manifest':
-        dump(args.output, manifest(json.loads(args.symbols.read_text())))
+        dump(args.output, manifest(json.loads(args.symbols.read_text(encoding='utf-8'))))
     elif args.command == 'fixture-manifest':
-        symbols = [row['file'] + '\0' + row['symbol'] for row in json.loads(args.seeded.read_text()) if 'to_file' not in row]
+        symbols = [row['file'] + '\0' + row['symbol'] for row in json.loads(args.seeded.read_text(encoding='utf-8')) if 'to_file' not in row]
         dump(args.output, manifest(symbols))
     elif args.command == 'capture':
-        capture(args.binary, args.root, args.cache, json.loads(args.manifest.read_text()), args.output, args.timeout, args.views)
+        overrides = json.loads(args.config.read_text(encoding='utf-8')) if args.config else None
+        assert overrides is None or isinstance(overrides, dict), '--config must contain an object'
+        capture(args.binary, args.root, args.cache, json.loads(args.manifest.read_text(encoding='utf-8')), args.output, args.timeout, args.views, args.prepared_cache, overrides, args.require_borrowed)
     elif args.command == 'compare':
         fields = []
         if args.normalisation:
-            proof = json.loads(args.normalisation.read_text())
-            metadata = json.loads((args.baseline / 'capture.json').read_text())
+            proof = json.loads(args.normalisation.read_text(encoding='utf-8'))
+            metadata = json.loads((args.baseline / 'capture.json').read_text(encoding='utf-8'))
             assert proof['baseline_binary_sha256'] == metadata['binary_sha256'] and proof['manifest_sha256'] == metadata['manifest_sha256'], 'normalisation proof is for another baseline/manifest'
             fields = proof['normalised_fields']
         compare(args.baseline, args.candidate, fields)

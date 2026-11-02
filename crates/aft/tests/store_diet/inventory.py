@@ -20,34 +20,101 @@ TOKEN = re.compile(r'//[^\n]*|/\*.*?\*/|r(?P<hash>\#*)"(?P<raw>.*?)"(?P=hash)|"(
 SQL = re.compile(r'^\s*(?:SELECT\s|INSERT\s+(?:OR\s+\w+\s+)?INTO\s|UPDATE\s+(?:OR\s+\w+\s+)?[\w{][\w{}.:]*\s+SET\s|DELETE\s+FROM\s|(?:CREATE|DROP|ALTER)\s+(?:UNIQUE\s+|TEMP\s+|VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\s|PRAGMA\s|WITH\s+(?:RECURSIVE\s+)?\w+\s*(?:\([^)]*\)\s*)?AS\s*\(|REPLACE\s+INTO\s|EXPLAIN\s|ATTACH\s+DATABASE\s|DETACH\s+DATABASE\s|BEGIN(?:\s+(?:IMMEDIATE|TRANSACTION|EXCLUSIVE)|;|$)|COMMIT(?:;|$)|ROLLBACK(?:;|$)|ANALYZE(?:;|$)|VACUUM(?:;|$)|REINDEX\s)', re.I)
 
 
+def cooked_string(value):
+    # Decode in sequence so an escaped backslash followed by n stays literal.
+    result, i = [], 0
+    escapes = {'n': '\n', 'r': '\r', 't': '\t', '0': '\0', '\\': '\\', '"': '"', "'": "'"}
+    while i < len(value):
+        if value[i] != '\\':
+            result.append(value[i])
+            i += 1
+            continue
+        i += 1
+        char = value[i]
+        i += 1
+        if char in '\r\n':
+            while i < len(value) and value[i].isspace():
+                i += 1
+        elif char in escapes:
+            result.append(escapes[char])
+        elif char == 'x':
+            result.append(chr(int(value[i:i + 2], 16)))
+            i += 2
+        elif char == 'u' and value[i] == '{':
+            end = value.index('}', i)
+            result.append(chr(int(value[i + 1:end].replace('_', ''), 16)))
+            i = end + 1
+        else:
+            raise ValueError(f'unsupported Rust string escape: {char!r}')
+    return ''.join(result)
+
+
 def strings(text):
     for match in TOKEN.finditer(text):
         value = match.group('raw')
         if value is None and match.group('cooked') is not None:
-            value = match.group('cooked')
-            value = re.sub(r'\\\r?\n\s*', '', value)
-            value = value.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace('\\"', '"').replace('\\\\', '\\')
+            value = cooked_string(match.group('cooked'))
         if value is not None:
             yield match.start(), value
+
+
+def rust_scopes(text):
+    masked = TOKEN.sub(lambda match: ''.join('\n' if char == '\n' else ' ' for char in match[0]), text)
+    stack, closing = [], {}
+    for i, char in enumerate(masked):
+        if char == '{':
+            stack.append(i)
+        elif char == '}' and stack:
+            closing[stack.pop()] = i
+    scopes = []
+    for match in re.finditer(r'\b(fn|mod)\s+(\w+)[^{;]*\{', masked):
+        body = match.end() - 1
+        if body not in closing:
+            continue
+        boundary = max(masked.rfind(char, 0, match.start()) for char in '{};') + 1
+        attributes = masked[boundary:match.start()]
+        test = bool(re.search(r'#\[\s*test\s*\]|#\[\s*cfg\(\s*(?:all\(\s*)?test\b', attributes))
+        scopes.append((match.start(), closing[body], match[1], match[2], test))
+    return scopes
+
+
+def owner_at(scopes, pos, path):
+    containing = [scope for scope in scopes if scope[0] <= pos <= scope[1]]
+    functions = [scope for scope in containing if scope[2] == 'fn']
+    owner = min(functions, key=lambda scope: scope[1] - scope[0])[3] if functions else '<module>'
+    test = path.name.endswith(('_tests.rs', '_test.rs')) or path.name == 'tests.rs' or '/tests/' in path.as_posix() or any(scope[4] for scope in containing)
+    return {'owner': owner, 'test_only': test}
 
 
 def census():
     found = {}
     for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
-        text = path.read_text()
-        for pos, sql in strings(text):
-            if not SQL.match(re.sub(r'^\s*(?:--[^\n]*\n|/\*.*?\*/)\s*', '', sql, flags=re.S)):
+        text = path.read_text(encoding='utf-8')
+        scopes = rust_scopes(text)
+        literals = list(strings(text))
+        composed = []
+        if path.as_posix().endswith('/views/materialization/dispatch.rs'):
+            for pos, fragment in literals:
+                if not fragment.startswith('{columns} '):
+                    continue
+                owner = owner_at(scopes, pos, path)['owner']
+                heads = [value for head_pos, value in literals if head_pos < pos and 'FROM edges' in value and SQL.match(value) and owner_at(scopes, head_pos, path)['owner'] == owner]
+                assert heads, 'dispatch edge-read SQL prefix is not inventoried'
+                composed.append((pos, fragment.replace('{columns}', heads[-1])))
+        for pos, sql in literals + composed:
+            if not SQL.match(re.sub(r'^\s*(?:(?:--[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*', '', sql, flags=re.S)):
                 continue
             # Keep whitespace inside SQL string literals significant. The text
             # itself is the stable identity; source lines are only citations.
             key = hashlib.sha256(sql.encode()).hexdigest()[:20]
             item = found.setdefault(key, {'id': 'sql-' + key, 'baseline': sql, 'candidate': sql, 'sites': []})
-            item['sites'].append({'path': str(path.relative_to(ROOT)), 'line': text.count('\n', 0, pos) + 1})
+            item['sites'].append({'path': path.relative_to(ROOT).as_posix(), 'line': text.count('\n', 0, pos) + 1, **owner_at(scopes, pos, path)})
     return sorted(found.values(), key=lambda row: row['id'])
 
 
 def dump(path, value):
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    with path.open('w', encoding='utf-8', newline='\n') as output:
+        output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
 def graph_statement(row):
@@ -101,7 +168,8 @@ def schemas(rows):
             if old and len(old['columns']) >= len(columns):
                 continue
             graph = table in SHARED or table.startswith('view_') or table in {'emitted_view_rows'}
-            result[table] = {'table': table, 'schema_statement': row['id'], 'columns': [], 'graph_data': graph}
+            result[table] = {'table': table, 'schema_statement': row['id'], 'columns': [],
+                             'graph_data': graph and table not in {'meta', 'view_sessions', 'view_usage'}}
             for _, column, kind, _, _, primary in columns:
                 encoding = 'unchanged'
                 if graph and column in VOCAB:
@@ -177,7 +245,7 @@ def variants(row, tables):
 
 
 def stable_write_shapes():
-    source = (ROOT / 'crates/aft/src/views/materialization.rs').read_text()
+    source = (ROOT / 'crates/aft/src/views/materialization.rs').read_text(encoding='utf-8')
     return {table: [text for _, text in strings(columns)] for table, columns in
             re.findall(r'stable_rows::write\(\s*[^,]+,\s*"(\w+)",\s*&\[(.*?)\]', source, re.S)}
 
@@ -185,9 +253,9 @@ def stable_write_shapes():
 def source_inventory():
     result = {'rust_order': [], 'id_text_readers': [], 'connection_helpers': [], 'attach': []}
     for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding='utf-8').splitlines()
         for i, line in enumerate(lines):
-            site = {'path': str(path.relative_to(ROOT)), 'line': i + 1, 'text': line.strip()}
+            site = {'path': path.relative_to(ROOT).as_posix(), 'line': i + 1, 'text': line.strip()}
             if re.search(r'\.sort(?:_unstable)?(?:_by(?:_key|_cached_key)?)?\(|\.(?:min|max)_by(?:_key)?\(|\.dedup(?:_by(?:_key)?)?\(|BTree(?:Map|Set)|BinaryHeap|\.group_by\(', line):
                 result['rust_order'].append(site)
             if re.search(r'(?:strip_prefix|starts_with|split_once|rsplit_once|strip_suffix|split|contains)\(', line) and any(re.search(r'\b(?:id|ref_id|node_id|site_ref_id)\b|pos:symbol:|view:|top:|dispatch:|edge:', context) for context in lines[max(0, i - 2):i + 3]):
@@ -201,7 +269,7 @@ def source_inventory():
 
 
 def sweep_references(tables, rows):
-    source = (ROOT / 'crates/aft/src/callgraph_store/mod.rs').read_text()
+    source = (ROOT / 'crates/aft/src/callgraph_store/mod.rs').read_text(encoding='utf-8')
     index_list = source.split('const SECONDARY_INDEXES:', 1)[1].split('\n];', 1)[0]
     indexes = []
     for name, target in re.findall(r'\(\s*"([^"]+)",\s*"([^"]+)"\s*,?\s*\)', index_list):
@@ -241,23 +309,55 @@ def coverage(inventory, traces, report=None):
         bind = r"(?:NULL|[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|[xX]'[0-9a-fA-F]*'|'(?:''|[^'])*')"
         expression = ''.join(bind if re.fullmatch(r'\?[0-9]*|[:@$][A-Za-z_]\w*', piece) else re.escape(piece) for piece in pieces)
         return re.compile(expression)
-    seen = {canonical(json.loads(line)) for trace in traces for line in trace.read_text().splitlines()}
-    exemptions = json.loads((HERE / 'trace_exemptions.json').read_text())
+    seen = {canonical(json.loads(line)) for trace in traces for line in trace.read_text(encoding='utf-8').splitlines()}
+    exemptions = json.loads((HERE / 'trace_exemptions.json').read_text(encoding='utf-8'))
     variants = {row['id'] + ':' + variant['variant']: variant['sql'] for row in inventory for variant in row['variants']}
-    missing = []
+    missing, reached = [], set()
     for key, sql in variants.items():
         matcher = pattern(sql)
-        if not any(matcher.fullmatch(traced) for traced in seen) and key not in exemptions:
+        if any(matcher.fullmatch(traced) for traced in seen):
+            reached.add(key)
+        elif key not in exemptions:
             missing.append(key)
     if report:
         dump(report, [{'id': key, 'sql': variants[key], 'sites': next(row['sites'] for row in inventory if key.startswith(row['id'] + ':'))} for key in missing])
     if missing:
         raise SystemExit('uncovered SQL statements: ' + ', '.join(missing))
     assert all(isinstance(reason, str) and reason.strip() for reason in exemptions.values()), 'empty trace exemption reason'
+    assert not reached.intersection(exemptions), 'traced statements have obsolete exemptions; remove them'
     stale = set(exemptions) - variants.keys()
     if stale:
         raise SystemExit('stale trace exemptions: ' + ', '.join(sorted(stale)))
     print(f'{len(inventory)} statements: trace coverage/exemptions checked')
+
+
+def draft_exemptions(missing, rows):
+    by_id = {row['id']: row for row in rows}
+    result = {}
+    for entry in missing:
+        row = by_id[entry['id'].split(':', 1)[0]]
+        sites = row['sites']
+        site = next((site for site in sites if not site.get('test_only')), sites[0])
+        path, owner = site['path'], site.get('owner', '<module>')
+        location = f'{path}:{site["line"]} ({owner})'
+        if all(site.get('test_only') for site in sites):
+            reason = 'Test-only setup, assertion, benchmark or fault-injection SQL; the focused store_diet filter does not run its owning test.'
+        elif re.search(r'\{(?:[A-Za-z_]\w*|:[^}]*)\}', entry['sql']) or '{}' in re.sub(r"'(?:''|[^'])*'", "''", entry['sql']):
+            reason = 'Static format/template fragment, not an independently emitted runtime SQL statement. Its caller must supply the identifiers, columns or predicate before this text can be traced; retain this explicit expansion gap before changing its encoding.'
+        elif re.search(r':batch-(499|999)/', entry['id']) and graph_statement(row):
+            reason = 'Maximum frontier batch variant; the committed fixture has fewer nodes than this batch boundary, so none of its queries can emit this exact expansion.'
+        elif '/views/materialization/' in path or path.endswith('/views/materialization.rs'):
+            reason = 'Incremental/diff, retained-row, dispatch-data or resolution-input branch not reached by the fixed cold-materialization corpus; no changed manifest or receiver-language scenario invokes this owner branch.'
+        elif '/views/' in path:
+            reason = 'Publication, borrowed/sealed generation, registry/eviction, verification or semantic-plane owner workload is absent from the direct cold graph fixture; its owner is not a graph adapter operation.'
+        elif '/callgraph_store/' in path:
+            reason = 'Alternate refresh/staging-resume, read-only wrapper, backend/dispatch or data-dependent resolver branch absent from the fixed cold-store/query corpus. No edit, resumed generation, borrowed publication or matching receiver/symbol-kind workload reaches this owner branch.'
+        elif '/inspect/' in path or path.endswith('/commands/inspect.rs'):
+            reason = 'Inspect cache/scanner/backend branch not reached by this fixed graph corpus and its selected graph categories; no diagnostics/failure/cache-repair workload invokes this owner branch.'
+        else:
+            reason = 'Separate state/ledger, storage maintenance, migration, blob-version or failure-path owner workload not requested by the graph query manifest; no corresponding administrative or mutation API call is present.'
+        result[entry['id']] = reason + ' Owner: ' + location
+    return result
 
 
 def compare_plans(baseline, candidate):
@@ -317,7 +417,7 @@ def mapped_census(expected, actual):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['capture', 'derive', 'check', 'coverage', 'compare-plans'])
+    parser.add_argument('command', choices=['capture', 'derive', 'check', 'coverage', 'draft-exemptions', 'compare-plans'])
     parser.add_argument('paths', nargs='*', type=pathlib.Path)
     parser.add_argument('--report', type=pathlib.Path)
     args = parser.parse_args()
@@ -334,7 +434,7 @@ def main():
         dump(HERE / 'sweep_references.json', sweep_references(tables, rows))
         print(f'captured {len(rows)} SQL statements')
     elif args.command == 'derive':
-        rows = json.loads(path.read_text())
+        rows = json.loads(path.read_text(encoding='utf-8'))
         mapped = mapped_census(rows, census())
         tables = schemas(mapped)
         for row, current in zip(rows, mapped):
@@ -348,18 +448,23 @@ def main():
         print(f'derived inventories for {len(rows)} stable statement ids')
     elif args.command == 'check':
         actual = census()
-        expected = json.loads(path.read_text())
+        expected = json.loads(path.read_text(encoding='utf-8'))
         mapped = mapped_census(expected, actual)
-        assert json.loads((HERE / 'table_encoding.json').read_text()) == schemas(mapped), 'table encoding census is stale'
-        assert json.loads((HERE / 'order_sql.json').read_text()) == order_inventory(mapped), 'SQL ordering census is stale'
-        assert json.loads((HERE / 'source_inventory.json').read_text()) == source_inventory(), 'Rust source census is stale'
-        assert json.loads((HERE / 'sweep_references.json').read_text()) == sweep_references(schemas(mapped), mapped), 'sweep reference census is stale'
+        assert json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8')) == schemas(mapped), 'table encoding census is stale'
+        assert json.loads((HERE / 'order_sql.json').read_text(encoding='utf-8')) == order_inventory(mapped), 'SQL ordering census is stale'
+        assert json.loads((HERE / 'source_inventory.json').read_text(encoding='utf-8')) == source_inventory(), 'Rust source census is stale'
+        assert json.loads((HERE / 'sweep_references.json').read_text(encoding='utf-8')) == sweep_references(schemas(mapped), mapped), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
-        coverage(json.loads(path.read_text()), args.paths, args.report)
+        coverage(json.loads(path.read_text(encoding='utf-8')), args.paths, args.report)
+    elif args.command == 'draft-exemptions':
+        assert len(args.paths) == 2, 'draft-exemptions UNCOVERED.json OUTPUT.json'
+        result = draft_exemptions(json.loads(args.paths[0].read_text(encoding='utf-8')), json.loads(path.read_text(encoding='utf-8')))
+        dump(args.paths[1], result)
+        print(f'wrote {len(result)} draft exemptions; review owner branches before accepting')
     else:
         assert len(args.paths) == 2, 'compare-plans BASELINE.json CANDIDATE.json'
-        compare_plans(*(json.loads(p.read_text()) for p in args.paths))
+        compare_plans(*(json.loads(p.read_text(encoding='utf-8')) for p in args.paths))
         print('query-plan access paths checked')
 
 

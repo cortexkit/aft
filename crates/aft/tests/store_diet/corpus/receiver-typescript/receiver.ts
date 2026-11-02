@@ -1,0 +1,1 @@
+class C { m() {} f(x: C) { this.m(); x.m(); let y: C; y.m(); const z = new C(); z.m(); let w = new C(); w.m(); } }

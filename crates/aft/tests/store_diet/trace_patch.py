@@ -53,14 +53,14 @@ def main():
     sites = []
     paths = list((ROOT / 'crates/aft/src').rglob('*.rs')) + [HERE / 'harness.rs']
     for path in sorted(paths):
-        before = path.read_text()
+        before = path.read_text(encoding='utf-8')
         # Both tracked connection types ultimately call these raw open seams.
         # Match the complete type name, not IdentityConnection/TrackedConnection.
         after, count = re.subn(r'\b(?:rusqlite::)?Connection::(open(?:_with_flags_and_vfs|_with_flags|_in_memory)?)\(', r'crate::db::store_diet_trace::\1(', before)
         if path == ROOT / 'crates/aft/src/db/mod.rs':
             after += '\npub(crate) mod store_diet_trace;\n'
         if before != after:
-            relative = str(path.relative_to(ROOT))
+            relative = path.relative_to(ROOT).as_posix()
             chunks.extend(difflib.unified_diff(before.splitlines(True), after.splitlines(True), 'a/' + relative, 'b/' + relative))
             if count:
                 calls = []
@@ -70,7 +70,8 @@ def main():
                 sites.append({'path': relative, 'raw_open_calls': count, 'helpers': calls})
     relative = 'crates/aft/src/db/store_diet_trace.rs'
     chunks.extend(difflib.unified_diff([], HELPER.splitlines(True), '/dev/null', 'b/' + relative))
-    (HERE / 'baseline-trace.patch').write_text(''.join(chunks))
+    with (HERE / 'baseline-trace.patch').open('w', encoding='utf-8', newline='\n') as output:
+        output.write(''.join(chunks))
     from inventory import dump
     dump(HERE / 'trace_helpers.json', sites)
     print(f'captured {sum(s["raw_open_calls"] for s in sites)} raw opens in {len(sites)} files')

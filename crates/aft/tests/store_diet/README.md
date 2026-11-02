@@ -23,9 +23,9 @@ There are two complementary runners:
    uses isolated empty caches, and compares complete reply lines as bytes. Its
    seeded manifest includes callers/call_tree/impact (up to 500 symbols), three
    trace operations (up to 100 pairs), zoom/search enrichment and all three
-   graph-backed inspect categories. A checkout configured to borrow a published
-   callgraph from another checkout can be used as the root with `--views` after
-   its owner's base is built and published; borrowing provenance is not normalised.
+   graph-backed inspect categories. Borrowed queries use `--views` with an
+   explicitly prepared owner/base cache as described below; borrowing provenance
+   is not normalised.
 
 The fixture query manifests are generated from the committed seeded fixture
 symbols, not from a candidate's possibly changed node set. The seed and sample
@@ -39,8 +39,8 @@ Copy `tests/store_diet` and the cfg(test) module registration onto the baseline
 revision (test scaffolding only), then run:
 
 ```
-AFT_STORE_DIET_RECORD=1 cargo test -p agent-file-tools --lib store_diet -- --nocapture
-cargo test -p agent-file-tools --lib store_diet
+AFT_STORE_DIET_RECORD=1 cargo test -p agent-file-tools --lib -- store_diet --nocapture
+cargo test -p agent-file-tools --lib -- store_diet
 ```
 
 The first command explicitly records, the second compares. Ordinary test runs
@@ -68,8 +68,16 @@ python3 crates/aft/tests/store_diet/parity.py capture CANDIDATE TREE EMPTY_CANDI
 python3 crates/aft/tests/store_diet/parity.py compare base-replies candidate-replies
 ```
 
-Repeat with `--views` on each capture, and with a prepared borrower root. Cache
-paths must not exist before capture. The tool refuses an empty comparison or a
+Repeat with `--views` on each capture. Ordinary cold-capture cache paths must not
+exist before capture. For borrowing, first build/publish an owner's graph with
+the corresponding executable into each mode's separate cache. Capture its linked
+borrower root with `--prepared-cache --require-borrowed --views --config POLICY.json`.
+The policy file supplies that workload's existing copy/overlay settings; it is
+merged into the default user config without changing `--views`. Prepared mode
+retains the owner state, and require-borrowed fails unless an actual reply has
+`borrowed_callgraph` provenance. A fresh empty cache cannot test borrowing.
+Comparison also checks the mode, policy hash and prepared/borrowed flags.
+The tool refuses an empty comparison or a
 manifest-membership mismatch. Configure replies are admission/setup, not query
 results; they are checked for success but excluded from the measured reply set.
 All query replies, including expected errors, remain byte-for-byte oracles.
@@ -78,9 +86,10 @@ reporting analysis in progress or a search timing difference will fail replay:
 settle the baseline workload and establish any permitted metadata whitelist
 with baseline-versus-baseline evidence before using a candidate.
 
-The runner waits for inspect to report `fresh` before recording its query reply,
-and retries while the runtime is still assigning the project's stable repository
-identity or building its graph. If the only
+The runner retries inspect's transient `inspect_not_fresh` error but preserves
+finalized PARTIAL replies and their incomplete-analysis notes. It also retries
+while the runtime is still assigning the project's stable repository identity
+or building its graph. If the only
 remaining differences are top-level `search_ms` or `tier2_last_run` metadata,
 `prove-normalisation BASE_CAPTURE REPLAY_CAPTURE PROOF.json` checks that both
 captures used the same baseline executable, proves all other bytes equal, and
@@ -105,15 +114,20 @@ python3 crates/aft/tests/store_diet/parity.py counts FINISHED.sqlite counts.json
 ```
 
 Compare those JSON bytes as well as replies. Missing tables are explicit nulls,
-not silently converted to zero. A future unique-pair encoding of
-view_unknown_live needs a reader-proven distinct-pair/site-count comparator
-before changing its current row-count oracle.
+not silently converted to zero. Format/salt metadata and registry session/usage
+rows are not graph facts and are excluded from the graph-row count oracle.
+`view_unknown_live` records unresolved sites and the file/symbol targets those
+sites may call. Collapsing it into unique target pairs first requires proving
+that every reader needs only those pairs and that site-count notes still use
+the summed original site counts. Its comparator must then check both distinct
+pairs and summed site counts before replacing the current row-count oracle.
 
 ## Inventory and plans
 
 - `statements.json`: static SQL literal census across crates/aft/src, including
   test-only and incomplete-format fragments. Stable ids hash exact SQL bytes;
-  source citations are not identities. Baseline/candidate text mappings are
+  source citations are not identities. Lexical owner/test-scope annotations aid
+  review but do not replace Rust's compiler. Baseline/candidate text mappings are
   explicit. Supported batch templates include size 1 and maximum 499 pairs or
   999 node ids. Stable-row writes use their actual caller column arrays.
 - `order_sql.json`, `source_inventory.json`, `order.md`: ordered and unordered

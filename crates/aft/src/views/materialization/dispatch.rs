@@ -1313,3 +1313,22 @@ pub fn counts(connection: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<St
     }
     Ok(result)
 }
+
+#[cfg(test)]
+pub(crate) fn store_diet_node_kind(
+    connection: &Connection,
+    file: &str,
+    symbol: &str,
+) -> Result<Option<String>> {
+    let transaction = connection.unchecked_transaction()?;
+    let selected = node(&transaction, file, symbol)?;
+    let kind = selected
+        .map(|id| {
+            transaction.query_row("SELECT kind FROM nodes WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+        })
+        .transpose()?;
+    transaction.commit()?;
+    Ok(kind)
+}

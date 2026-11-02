@@ -1897,15 +1897,19 @@
   },
   {
     "path": "crates/aft/tests/store_diet/harness.rs",
-    "raw_open_calls": 2,
+    "raw_open_calls": 3,
     "helpers": [
       {
-        "line": 150,
-        "helper": "view_store"
+        "line": 161,
+        "helper": "view_store_custom"
       },
       {
-        "line": 240,
+        "line": 325,
         "helper": "plans"
+      },
+      {
+        "line": 843,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       }
     ]
   }
