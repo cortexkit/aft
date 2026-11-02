@@ -12280,6 +12280,7 @@ fn runon_write_shapes_respect_snapshot_membership() {
     assert!(runon_write_refusal("cargo fmt", &request).is_some());
     assert!(runon_write_refusal("cp $SOURCE tracked.rs", &request).is_some());
     assert!(runon_write_refusal("cp input $DESTINATION", &request).is_none());
+    assert!(runon_write_refusal("black $UNKNOWN tracked.rs", &request).is_some());
     assert!(runon_write_refusal(
         "git apply <<'EOF'\n--- a/tracked.rs\n+++ b/tracked.rs\n@@ -1 +1 @@\n-a\n+b\nEOF",
         &request
@@ -12291,6 +12292,11 @@ fn runon_write_shapes_respect_snapshot_membership() {
         "ruff format --check tracked.rs",
         "black --check tracked.rs",
         "rustfmt --check tracked.rs",
+        "cargo fmt --help",
+        "rustfmt --emit stdout tracked.rs",
+        "black --diff tracked.rs",
+        "black --code 'print(1)'",
+        "ruff format --diff tracked.rs",
         "cat tracked.rs",
         "python3 -c 'open(\"tracked.rs\", \"r\").read()'",
         "python3 -c 'print(\"open(\\\"tracked.rs\\\", \\\"w\\\")\")'",

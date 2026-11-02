@@ -510,14 +510,21 @@ fn command_writes(source: &str, node: Node<'_>, cwd: Option<&Path>) -> Vec<PathB
             _ => Vec::new(),
         },
         Some(Shape::Formatter) => {
-            let check = args
-                .iter()
-                .any(|a| matches!(a.as_str(), "--check" | "--check-only"));
+            let check = args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--check" | "--check-only" | "--help" | "-h" | "--version" | "--diff"
+                )
+            }) || args.iter().any(|a| a == "--emit=stdout")
+                || args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--emit" && pair[1] == "stdout")
+                || head == "black" && args.iter().any(|a| matches!(a.as_str(), "--code" | "-c"));
             let unknown = node
                 .utf8_text(source.as_bytes())
                 .is_ok_and(|text| text.contains(['$', '`']));
             let writes = !check
-                && !unknown
+                && !(head == "cargo" && unknown)
                 && match head {
                     "cargo" => args.first().is_some_and(|a| a == "fmt"),
                     "rustfmt" | "black" => true,
