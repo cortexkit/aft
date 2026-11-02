@@ -499,6 +499,23 @@ fn request_deadline(at: Option<Instant>) -> Option<Instant> {
         .chain(CURRENT.with(|budget| budget.borrow().as_ref().map(|b| b.deadline)))
         .min()
 }
+
+/// Check a synchronous mutation loop without dispatching another I/O helper.
+/// Record the same timeout as a bounded filesystem call so response formatting
+/// returns the existing read_deadline_exceeded reply.
+pub(crate) fn check_request_deadline(path: &Path, now: Instant) -> io::Result<()> {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    if request_deadline(None).is_some_and(|deadline| now >= deadline) {
+        return Err(failure(
+            path,
+            "read_deadline_exceeded",
+            "filesystem deadline elapsed before this call started",
+        ));
+    }
+    Ok(())
+}
 fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
     let message = format!("{code}: {}: {reason}", path.display());
     if let Some(budget) = current() {
