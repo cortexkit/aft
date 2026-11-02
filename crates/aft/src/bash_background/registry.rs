@@ -3365,6 +3365,9 @@ impl BgTaskRegistry {
     /// The original handler chose its reply; polling/status calls never enter
     /// this hook and cannot take ownership of that call's display identity.
     pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
+        if !crate::subc::rich_ui::display::enabled() {
+            return;
+        }
         let Some(task_id) = response.get("task_id").and_then(serde_json::Value::as_str) else {
             return;
         };

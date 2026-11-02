@@ -539,7 +539,7 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
         }
         let params = match tool {
             "write" => json!({"file":path,"content":"new\n"}),
-            "edit" => json!({"file":path,"match":"old","replace":"new"}),
+            "edit" => json!({"file":path,"match":"old","replacement":"new"}),
             _ => {
                 json!({"patch_text":format!("*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch", path.display())})
             }
@@ -774,4 +774,20 @@ fn handler_duration_is_frozen_before_reply_queueing() {
     assert!(f.capture.lock().unwrap().began.is_none());
     reply(&f.key, false, false, None);
     assert_eq!(publications()[0].body["durationMs"], processing);
+}
+
+#[test]
+fn error_records_keep_valid_reason_codes_without_copying_error_text() {
+    for (name, reason, expected) in [
+        ("display-error-code", "syntax_error", "syntax_error"),
+        ("display-error-text", "private error text", "failed"),
+    ] {
+        let f = fixture("edit", name);
+        reply(&f.key, false, true, Some(reason));
+        let writes = publications();
+        assert_eq!(writes[0].body["reason"], expected);
+        assert!(!serde_json::to_string(&writes[0].body)
+            .unwrap()
+            .contains("private error text"));
+    }
 }

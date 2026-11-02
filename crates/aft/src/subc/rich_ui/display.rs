@@ -69,7 +69,7 @@ struct Publication {
 }
 #[cfg(test)]
 thread_local! { static TEST_SINK: RefCell<Option<Vec<Publication>>> = const { RefCell::new(None) }; }
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     #[cfg(test)]
     if TEST_SINK.with(|sink| sink.borrow().is_some()) {
         return true;
@@ -561,8 +561,12 @@ pub(crate) fn reply(
             Some("consent" | "bash_denied_untrusted" | "bash_denied")
         ) {
             "consent"
+        } else if let Some(code) =
+            reason.filter(|code| cortexkit_role_tool_display::schema::validate_code(code))
+        {
+            code
         } else {
-            "permission_denied"
+            "failed"
         });
     }
     emit(

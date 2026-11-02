@@ -1188,8 +1188,6 @@ fn observe_completed_bash_result(
     format_context: &crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
-    ctx.bash_background()
-        .capture_display_reply(&result.response.data);
     // Only the reply selected for delivery records the call in the repeat breaker.
     // Hash its bare command output, then restore the status bar and warning text
     // that the executor already appended, so changing counts do not change the hash.
