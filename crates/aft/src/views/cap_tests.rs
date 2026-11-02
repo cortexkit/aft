@@ -84,7 +84,7 @@ impl HeldFamily {
             ..Default::default()
         };
         let main_ctx = AppContext::new(
-            Box::new(crate::language::TreeSitterProvider::new()),
+            Box::new(crate::parser::TreeSitterProvider::new()),
             config.clone(),
         );
         main_ctx.set_canonical_cache_root(main.clone());
@@ -120,7 +120,7 @@ impl HeldFamily {
         )
         .unwrap();
         let worker = AppContext::new(
-            Box::new(crate::language::TreeSitterProvider::new()),
+            Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
                 ..config
