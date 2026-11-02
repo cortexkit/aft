@@ -349,6 +349,7 @@ impl CallgraphBlob {
             &crate::callgraph::ModuleResolutionMemo::default(),
             &paths,
             &line_index,
+            Some(root),
         )
         .raw_refs;
         structural.extend(
@@ -1302,6 +1303,9 @@ impl ParseBlob {
         }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
+        // Imports can also produce re-export rows. Compute each Python module
+        // path's dependencies once per file, then reuse them for both kinds of row.
+        let mut python_module_dependencies = HashMap::new();
         for (position, (raw, reference_key)) in
             self.refs.iter().zip(self.reference_keys()).enumerate()
         {
@@ -1321,7 +1325,16 @@ impl ParseBlob {
                     .into_iter()
                     .collect()
                 } else if let Some(module) = &raw.module_path {
-                    super::module_dependencies(facts.root, &abs, module, facts)
+                    if data.lang == LangId::Python {
+                        python_module_dependencies
+                            .entry(module.clone())
+                            .or_insert_with(|| {
+                                super::module_dependencies(facts.root, &abs, module, facts)
+                            })
+                            .clone()
+                    } else {
+                        super::module_dependencies(facts.root, &abs, module, facts)
+                    }
                 } else {
                     BTreeSet::new()
                 };

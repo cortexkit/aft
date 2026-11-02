@@ -16612,6 +16612,7 @@ fn collect_reexport_refs(
         memo,
         facts,
         &LineIndex::new(source),
+        None,
     )
 }
 
@@ -16624,15 +16625,21 @@ fn collect_reexport_refs_with_line_index(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
     line_index: &LineIndex,
+    python_root: Option<Node<'_>>,
 ) -> ReexportRefs {
     if lang == LangId::Python {
-        let Ok(tree) = parse_source_with_cached_parser(abs_path, source, LangId::Python) else {
-            return ReexportRefs {
-                raw_refs: Vec::new(),
-                surface_parts: Vec::new(),
+        // Reuse the caller's syntax tree when the source has already been parsed.
+        let exports = if let Some(root) = python_root {
+            callgraph::python::reexports(source, root)
+        } else {
+            let Ok(tree) = parse_source_with_cached_parser(abs_path, source, LangId::Python) else {
+                return ReexportRefs {
+                    raw_refs: Vec::new(),
+                    surface_parts: Vec::new(),
+                };
             };
+            callgraph::python::reexports(source, tree.root_node())
         };
-        let exports = callgraph::python::reexports(source, tree.root_node());
         let mut raw_refs = build_import_refs(
             project_root,
             abs_path,
@@ -19211,7 +19218,7 @@ impl DbFileIndex {
                 }
             }
         }
-        let mut module_targets = HashMap::new();
+        let mut module_targets: HashMap<String, Option<String>> = HashMap::new();
         let mut declared_module_targets = HashMap::new();
         let mut macro_use_module_targets = BTreeSet::new();
         let mut reexports = Vec::new();
@@ -19222,22 +19229,26 @@ impl DbFileIndex {
             let Some(module_path) = &raw_ref.module_path else {
                 continue;
             };
-            let target_file = if extract.lang == LangId::Rust && raw_ref.kind == "reexport" {
-                // Dependency sets include parent-module candidates. Their lexical
-                // order is not Rust resolution order: retain the most-specific
-                // module target for each flattened re-export leaf.
-                module_ref_target(
-                    project_root,
-                    &extract.rel_path,
-                    &raw_ref.kind,
-                    module_path,
-                    &module_memo,
-                    facts,
-                    |file| facts.is_file(&project_root.join(file)),
-                )
-            } else {
-                module_target_from_dependencies(project_root, &raw_ref.dependencies, facts)
-            };
+            // An import and its re-export select the same Python module.
+            let target_file =
+                if extract.lang == LangId::Python && module_targets.contains_key(module_path) {
+                    module_targets.get(module_path).cloned().flatten()
+                } else if extract.lang == LangId::Rust && raw_ref.kind == "reexport" {
+                    // Dependency sets include parent-module candidates. Their lexical
+                    // order is not Rust resolution order: retain the most-specific
+                    // module target for each flattened re-export leaf.
+                    module_ref_target(
+                        project_root,
+                        &extract.rel_path,
+                        &raw_ref.kind,
+                        module_path,
+                        &module_memo,
+                        facts,
+                        |file| facts.is_file(&project_root.join(file)),
+                    )
+                } else {
+                    module_target_from_dependencies(project_root, &raw_ref.dependencies, facts)
+                };
             module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
