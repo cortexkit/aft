@@ -91,6 +91,15 @@ pub(super) struct Objects<'nodes, 'tree, 'source> {
     source: &'source str,
     returns: HashMap<String, String>,
     imports: HashSet<String>,
+    import_node: Option<Node<'tree>>,
+    bindings: HashMap<(usize, &'source str), Option<Node<'tree>>>,
+    writes: HashMap<&'source str, Vec<(usize, usize)>>,
+    aliases: HashSet<&'source str>,
+    return_statements: HashMap<usize, Vec<Node<'tree>>>,
+    returned_literals: HashMap<usize, Node<'tree>>,
+    members: HashMap<(usize, &'source str), usize>,
+    unsafe_objects: HashSet<usize>,
+    generics: HashSet<&'source str>,
 }
 
 impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
@@ -103,6 +112,15 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             nodes,
             source,
             returns: HashMap::new(),
+            import_node: None,
+            bindings: HashMap::new(),
+            writes: HashMap::new(),
+            aliases: HashSet::new(),
+            return_statements: HashMap::new(),
+            returned_literals: HashMap::new(),
+            members: HashMap::new(),
+            unsafe_objects: HashSet::new(),
+            generics: HashSet::new(),
             imports: parse
                 .imports
                 .iter()
@@ -114,14 +132,27 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 })
                 .collect(),
         };
+        result.index_nodes();
+        let mut symbols = HashMap::new();
+        for symbol in parse
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind.as_str(), "function" | "method"))
+        {
+            symbols
+                .entry((symbol.end_line, symbol.end_col))
+                .or_insert(symbol);
+        }
         let mut ambiguous = HashSet::new();
         let mut seen = HashSet::new();
         for node in nodes.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
-            if let Some(symbol) = parse.symbols.iter().find(|s| {
-                s.end_line == node.end_position().row as u32
-                    && s.end_col == node.end_position().column as u32
-                    && matches!(s.kind.as_str(), "function" | "method")
-            }) {
+            if let Some(object) = result.literal_return(*node) {
+                result.returned_literals.insert(node.id(), object);
+            }
+            if let Some(symbol) = symbols.get(&(
+                node.end_position().row as u32,
+                node.end_position().column as u32,
+            )) {
                 if !seen.insert(symbol.scoped_name.clone()) {
                     ambiguous.insert(symbol.scoped_name.clone());
                 }
@@ -142,7 +173,133 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         result
     }
 
+    fn index_binding(&mut self, owner: usize, pattern: Node<'tree>, binding: Node<'tree>) {
+        let names = descendants(pattern)
+            .into_iter()
+            .filter(|node| {
+                matches!(
+                    node.kind(),
+                    "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
+                )
+            })
+            .map(|node| text(node, self.source))
+            .collect::<HashSet<_>>();
+        for name in names {
+            self.bindings
+                .entry((owner, name))
+                .and_modify(|current| {
+                    if current.is_some_and(|previous| previous != binding) {
+                        *current = None;
+                    }
+                })
+                .or_insert(Some(binding));
+        }
+    }
+
+    // Build source-wide indexes once. Receiver queries only follow lexical
+    // ancestors and indexed declarations, never rescan a function's descendants.
+    fn index_nodes(&mut self) {
+        for &node in self.nodes {
+            if node.kind() == "type_parameter" {
+                if let Some(name) = field(node, &["name"]) {
+                    self.generics.insert(text(name, self.source));
+                }
+            }
+            if node.kind() == "import_statement" && self.import_node.is_none() {
+                self.import_node = Some(node);
+            }
+            if node.kind() == "return_statement" {
+                if let Some(function) = enclosing(node, FUNCTIONS) {
+                    self.return_statements
+                        .entry(function.id())
+                        .or_default()
+                        .push(node);
+                }
+            }
+            if node.kind() == "object" {
+                for child in node.named_children(&mut node.walk()) {
+                    if child.kind() == "spread_element" {
+                        self.unsafe_objects.insert(node.id());
+                    }
+                    if let Some(key) = field(child, &["key", "name"]) {
+                        if key.kind() == "computed_property_name" {
+                            self.unsafe_objects.insert(node.id());
+                        }
+                        let name = text(key, self.source).trim_matches(['\'', '"']);
+                        *self.members.entry((node.id(), name)).or_default() += 1;
+                    }
+                }
+            }
+            if matches!(
+                node.kind(),
+                "variable_declarator"
+                    | "required_parameter"
+                    | "optional_parameter"
+                    | "function_declaration"
+                    | "class_declaration"
+                    | "catch_clause"
+                    | "for_in_statement"
+                    | "enum_declaration"
+                    | "internal_module"
+            ) {
+                if let (Some(pattern), Some(owner)) = (
+                    field(node, &["name", "pattern", "parameter", "left"]),
+                    binding_scope(node),
+                ) {
+                    self.index_binding(owner.id(), pattern, node);
+                    if node.kind() == "for_in_statement" {
+                        self.index_binding(node.id(), pattern, node);
+                    }
+                }
+            }
+            if FUNCTIONS.contains(&node.kind()) {
+                if let Some(parameter) = field(node, &["parameter"]) {
+                    self.index_binding(node.id(), parameter, node);
+                }
+                if node.kind() == "function_expression" {
+                    if let Some(name) = field(node, &["name"]) {
+                        self.index_binding(node.id(), name, node);
+                    }
+                }
+            }
+            if node.kind() == "variable_declarator" {
+                if let Some(value) = field(node, &["value"]).filter(|n| n.kind() == "identifier") {
+                    self.aliases.insert(text(value, self.source));
+                }
+            }
+            if matches!(
+                node.kind(),
+                "assignment_expression"
+                    | "augmented_assignment_expression"
+                    | "update_expression"
+                    | "unary_expression"
+            ) {
+                if let Some(mut left) = field(node, &["left", "argument"]) {
+                    while matches!(left.kind(), "member_expression" | "subscript_expression") {
+                        let Some(base) = field(left, &["object"]) else {
+                            break;
+                        };
+                        left = base;
+                    }
+                    if left.kind() == "identifier" {
+                        self.writes
+                            .entry(text(left, self.source))
+                            .or_default()
+                            .push((node.start_byte(), node.end_byte()));
+                    }
+                }
+            }
+        }
+        for writes in self.writes.values_mut() {
+            writes.sort_unstable();
+        }
+    }
+
     fn returned_object(&self, function: Node<'tree>) -> Option<Node<'tree>> {
+        self.returned_literals.get(&function.id()).copied()
+    }
+
+    fn literal_return(&self, function: Node<'tree>) -> Option<Node<'tree>> {
         // An async factory returns a Promise, not the literal itself.
         if matches!(
             function.kind(),
@@ -155,14 +312,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         }
         let body = field(function, &["body"])?;
         let expression = if body.kind() == "statement_block" {
-            let returns = self
-                .nodes
-                .iter()
-                .filter(|n| {
-                    n.kind() == "return_statement" && enclosing(**n, FUNCTIONS) == Some(function)
-                })
-                .copied()
-                .collect::<Vec<_>>();
+            let returns = self.return_statements.get(&function.id())?;
             if returns.len() != 1 || returns[0].parent() != Some(body) {
                 return None;
             }
@@ -175,21 +325,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
     }
 
     pub(super) fn unambiguous_member(&self, object: Node<'tree>, member: &str) -> bool {
-        let mut count = 0;
-        for child in object.named_children(&mut object.walk()) {
-            if child.kind() == "spread_element" {
-                return false;
-            }
-            if let Some(key) = field(child, &["key", "name"]) {
-                if key.kind() == "computed_property_name" {
-                    return false;
-                }
-                if text(key, self.source).trim_matches(['\'', '"']) == member {
-                    count += 1;
-                }
-            }
-        }
-        count == 1
+        !self.unsafe_objects.contains(&object.id())
+            && self.members.get(&(object.id(), member)) == Some(&1)
     }
 
     pub(super) fn extract(&self, facts: &mut DispatchFacts) {
@@ -239,65 +376,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let name = text(identifier, self.source);
         let mut current = identifier.parent();
         while let Some(ancestor) = current {
-            if scope(ancestor) {
-                if ancestor.kind() == "for_in_statement"
-                    && field(ancestor, &["left"]).is_some_and(|left| {
-                        descendants(left).iter().any(|n| {
-                            matches!(
-                                n.kind(),
-                                "identifier" | "shorthand_property_identifier_pattern"
-                            ) && text(*n, self.source) == name
-                        })
-                    })
-                {
-                    return Some(ancestor);
-                }
-                if FUNCTIONS.contains(&ancestor.kind())
-                    && field(ancestor, &["parameter"]).is_some_and(|p| text(p, self.source) == name)
-                {
-                    return Some(ancestor);
-                }
-                if ancestor.kind() == "function_expression"
-                    && field(ancestor, &["name"]).is_some_and(|p| text(p, self.source) == name)
-                {
-                    return Some(ancestor);
-                }
-                let candidates = self
-                    .nodes
-                    .iter()
-                    .filter(|n| {
-                        matches!(
-                            n.kind(),
-                            "variable_declarator"
-                                | "required_parameter"
-                                | "optional_parameter"
-                                | "function_declaration"
-                                | "class_declaration"
-                                | "catch_clause"
-                                | "for_in_statement"
-                                | "enum_declaration"
-                                | "internal_module"
-                        ) && field(**n, &["name", "pattern", "parameter", "left"]).is_some_and(
-                            |key| {
-                                text(key, self.source) == name
-                                    || descendants(key).iter().any(|n| {
-                                        matches!(
-                                            n.kind(),
-                                            "identifier" | "shorthand_property_identifier_pattern"
-                                        ) && text(*n, self.source) == name
-                                    })
-                            },
-                        ) && binding_scope(**n) == Some(ancestor)
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
-                if !candidates.is_empty() {
-                    return Some(if candidates.len() == 1 {
-                        candidates[0]
-                    } else {
-                        identifier
-                    });
-                }
+            if let Some(binding) = self.bindings.get(&(ancestor.id(), name)) {
+                return Some(binding.unwrap_or(identifier));
             }
             current = ancestor.parent();
         }
@@ -308,37 +388,51 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let Some(scope) = binding_scope(binding) else {
             return true;
         };
-        self.nodes.iter().any(|node| {
-            if node.kind() == "variable_declarator"
-                && field(*node, &["value"]).is_some_and(|value| {
-                    value.kind() == "identifier" && text(value, self.source) == name
-                })
-            {
-                return true;
-            }
-            if !matches!(
-                node.kind(),
-                "assignment_expression"
-                    | "augmented_assignment_expression"
-                    | "update_expression"
-                    | "unary_expression"
-            ) || node.start_byte() < scope.start_byte()
-                || node.end_byte() > scope.end_byte()
-            {
-                return false;
-            }
-            field(*node, &["left", "argument"]).is_some_and(|left| {
-                let lhs = text(left, self.source);
-                lhs == name
-                    || lhs
-                        .strip_prefix(name)
-                        .is_some_and(|tail| tail.starts_with('.') || tail.starts_with('['))
-            })
-        })
+        if self.aliases.contains(name) {
+            return true;
+        }
+        let Some(writes) = self.writes.get(name) else {
+            return false;
+        };
+        let index = writes.partition_point(|(start, _)| *start < scope.start_byte());
+        writes
+            .get(index)
+            .is_some_and(|(_, end)| *end <= scope.end_byte())
     }
 
     pub(super) fn receiver(&self, expression: Node<'tree>, call: Node<'tree>) -> Option<String> {
         self.value(expression, call, 0)
+            .or_else(|| self.nominal_receiver(expression, call))
+    }
+
+    fn nominal_receiver(&self, expression: Node<'tree>, call: Node<'tree>) -> Option<String> {
+        if expression.kind() != "identifier" {
+            return None;
+        }
+        let binding = self.binding(expression)?;
+        if enclosing(binding, FUNCTIONS) != enclosing(call, FUNCTIONS) {
+            return None;
+        }
+        let annotation = field(binding, &["type"]).or_else(|| {
+            binding
+                .named_children(&mut binding.walk())
+                .find(|n| n.kind() == "type_annotation")
+        });
+        if let Some(annotation) = annotation {
+            let ty = type_name(text(annotation, self.source));
+            return (!self.generics.contains(ty.as_str())).then_some(ty);
+        }
+        if binding.kind() != "variable_declarator"
+            || binding.start_byte() >= call.start_byte()
+            || self.written(binding, text(expression, self.source))
+        {
+            return None;
+        }
+        let initializer = field(binding, &["value"])?;
+        if initializer.kind() != "new_expression" {
+            return None;
+        }
+        field(initializer, &["constructor"]).map(|n| type_name(text(n, self.source)))
     }
 
     fn value(&self, expression: Node<'tree>, call: Node<'tree>, depth: usize) -> Option<String> {
@@ -389,8 +483,8 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     };
                     self.returned_object(function).map(object_identity)
                 } else if self.imports.contains(name) {
-                    let import = self.nodes.iter().find(|n| n.kind() == "import_statement")?;
-                    (!self.written(*import, name)).then(|| format!("@return:{name}"))
+                    let import = self.import_node?;
+                    (!self.written(import, name)).then(|| format!("@return:{name}"))
                 } else {
                     None
                 }

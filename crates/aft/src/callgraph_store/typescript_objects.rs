@@ -8,6 +8,7 @@ pub(super) struct ObjectDispatch<'a> {
     index: ProjectIndex<'a>,
     parses: BTreeMap<String, join::ParseBlob>,
     targets: BTreeMap<(String, String), (String, String)>,
+    resolutions: HashMap<String, HashMap<usize, join::dispatch::Target>>,
 }
 
 impl<'a> ObjectDispatch<'a> {
@@ -29,6 +30,7 @@ impl<'a> ObjectDispatch<'a> {
             index,
             parses: BTreeMap::new(),
             targets: BTreeMap::new(),
+            resolutions: HashMap::new(),
         }
     }
 
@@ -90,40 +92,14 @@ impl<'a> ObjectDispatch<'a> {
         Ok(())
     }
 
-    pub(super) fn resolve(
-        &mut self,
-        connection: &Connection,
-        reference: &NameMatchRef,
-    ) -> Result<Option<NameMatchCandidate>> {
-        self.load(&reference.caller_file)?;
-        let Some(parse) = self.parses.get(&reference.caller_file) else {
-            return Ok(None);
-        };
-        let start: usize = connection.query_row(
-            "SELECT byte_start FROM refs WHERE ref_id=?1",
-            [&reference.ref_id],
-            |r| r.get(0),
-        )?;
-        let Some(raw) = parse
-            .refs
+    pub(super) fn prepare(&mut self, references: &[NameMatchRef]) -> Result<()> {
+        let callers = references
             .iter()
-            .find(|r| r.kind == join::BlobRefKind::Call && r.byte_start == start)
-        else {
-            return Ok(None);
-        };
-        let Some(site) = parse
-            .dispatch
-            .sites
-            .iter()
-            .find(|s| s.ordinal == raw.ordinal)
-        else {
-            return Ok(None);
-        };
-        // Unknown receivers must not acquire an edge from a global name match.
-        if !site.receiver.as_ref().is_some_and(|r| {
-            r.starts_with("@object:") || r.starts_with("@return:") || r.starts_with("@field:")
-        }) {
-            return Ok(None);
+            .filter(|r| matches!(r.lang.as_str(), "typescript" | "tsx"))
+            .map(|r| r.caller_file.clone())
+            .collect::<BTreeSet<_>>();
+        for file in &callers {
+            self.load(file)?;
         }
         let mut resolver = join::dispatch::Resolver::new(
             self.parses
@@ -132,18 +108,61 @@ impl<'a> ObjectDispatch<'a> {
                 .collect(),
         );
         resolver.type_targets = self.targets.clone();
-        let resolution = resolver.resolve(&reference.caller_file, site);
-        if resolution.targets.len() != 1 {
-            return Ok(None);
+        for file in callers {
+            let Some(parse) = self.parses.get(&file) else {
+                continue;
+            };
+            let starts = parse
+                .refs
+                .iter()
+                .filter(|r| r.kind == join::BlobRefKind::Call)
+                .map(|r| (r.ordinal, r.byte_start))
+                .collect::<HashMap<_, _>>();
+            let mut resolutions = HashMap::new();
+            for site in &parse.dispatch.sites {
+                if !site.receiver.as_ref().is_some_and(|r| {
+                    r.starts_with("@object:")
+                        || r.starts_with("@return:")
+                        || r.starts_with("@field:")
+                }) {
+                    continue;
+                }
+                let resolution = resolver.resolve(&file, site);
+                if resolution.targets.len() == 1 {
+                    if let Some(&start) = starts.get(&site.ordinal) {
+                        resolutions.insert(start, resolution.targets.into_iter().next().unwrap());
+                    }
+                }
+            }
+            self.resolutions.insert(file, resolutions);
         }
-        let target = resolution.targets.into_iter().next().unwrap();
+        Ok(())
+    }
+
+    pub(super) fn resolve(
+        &self,
+        connection: &Connection,
+        reference: &NameMatchRef,
+    ) -> Result<Option<NameMatchCandidate>> {
+        let start: usize = connection.query_row(
+            "SELECT byte_start FROM refs WHERE ref_id=?1",
+            [&reference.ref_id],
+            |r| r.get(0),
+        )?;
+        let Some(target) = self
+            .resolutions
+            .get(&reference.caller_file)
+            .and_then(|sites| sites.get(&start))
+        else {
+            return Ok(None);
+        };
         let Some(node_id) = self.index.node_for_symbol(&target.file, &target.symbol) else {
             return Ok(None);
         };
         Ok(Some(NameMatchCandidate {
             node_id,
-            file_path: target.file,
-            scoped_name: target.symbol,
+            file_path: target.file.clone(),
+            scoped_name: target.symbol.clone(),
             kind: "method".into(),
             start_line: 0,
         }))

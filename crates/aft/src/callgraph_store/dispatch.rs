@@ -298,9 +298,10 @@ pub fn complete_members(
     let mut call_ordinals = parse
         .refs
         .iter()
-        .filter(|r| r.kind == BlobRefKind::Call)
-        .map(|r| r.ordinal)
-        .collect::<HashSet<_>>();
+        .enumerate()
+        .filter(|(_, r)| r.kind == BlobRefKind::Call)
+        .map(|(index, r)| (r.ordinal, index))
+        .collect::<HashMap<_, _>>();
     for call in all
         .into_iter()
         .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
@@ -318,7 +319,7 @@ pub fn complete_members(
         let Some(&ordinal) = spans.get(&(call.start_byte(), call.end_byte())) else {
             continue;
         };
-        if call_ordinals.contains(&ordinal) {
+        if let Some(&index) = call_ordinals.get(&ordinal) {
             if typescript::supported(&parse.language) {
                 if let Some(function) = enclosing(call, FUNCTIONS) {
                     if typescript::object_member(function, source).is_some() {
@@ -326,13 +327,7 @@ pub fn complete_members(
                             function.start_position().row as u32,
                             function.start_position().column as u32,
                         )) {
-                            if let Some(reference) = parse
-                                .refs
-                                .iter_mut()
-                                .find(|r| r.kind == BlobRefKind::Call && r.ordinal == ordinal)
-                            {
-                                reference.caller_symbol = Some(caller.clone());
-                            }
+                            parse.refs[index].caller_symbol = Some(caller.clone());
                         }
                     }
                 }
@@ -350,7 +345,7 @@ pub fn complete_members(
         if caller.is_none() {
             continue;
         }
-        call_ordinals.insert(ordinal);
+        call_ordinals.insert(ordinal, parse.refs.len());
         let full = text(callee, source).to_string();
         let short = full
             .rsplit(['.', ':'])
@@ -714,8 +709,8 @@ pub fn extract(
         }
         let receiver = receiver_node.and_then(|receiver| {
             if let Some(objects) = &ts_objects {
-                if let Some(ty) = objects.receiver(receiver, call) {
-                    return Some(ty);
+                if !matches!(text(receiver, source), "this" | "super") {
+                    return objects.receiver(receiver, call);
                 }
             }
             receiver_type(

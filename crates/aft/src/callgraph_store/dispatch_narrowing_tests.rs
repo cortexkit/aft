@@ -195,6 +195,77 @@ fn typescript_object_store_var_definitions_are_not_bare_name_bindings() {
     assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique' AND provenance='type_match'"), 1);
 }
 
+#[test]
+fn typescript_object_views_and_legacy_answers_are_identical() {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    fn answers(connection: &Connection) -> Vec<(String, String, String, String, u32, bool)> {
+        connection.prepare("SELECT src.file_path,src.scoped_name,e.target_file,e.target_symbol,e.line,e.provenance != 'name_match' FROM edges e JOIN nodes src ON src.id=e.source_node WHERE e.kind='call' ORDER BY 1,2,3,4,5,6")
+            .unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+    let cases: &[(&[(&str, &str)], usize)] = &[
+        (&[("caller.ts", "interface T { handler(): void }\nconst actual = ({ handler: () => {} } satisfies T);\nconst other = { handler: () => {} } as T;\nactual.handler();\nother.handler();")], 2),
+        (&[
+            ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => helper() });\nfunction helper() {}"),
+            ("caller.ts", "import { make as build } from './producer';\nfunction caller() { const adapter = build(); adapter.run(); }\nfunction nestedCaller() { const nested = () => ({ child: { run() {} } }); nested().child.run(); }\nfunction unknown(value) { value.argument(); }\nargument();"),
+        ], 5),
+        (&[("caller.ts", "register({ run: () => helper() });\nregister({ run() { helper(); } });\nfunction helper() {}\nfunction first() { const value = { unique() {} }; value.unique(); }\nfunction second() { const value = { unique() {} }; value.unique(); }\nfunction inline() { ({run: function() {}}).run(); }")], 5),
+        (&[("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }")], 1),
+    ];
+    for &(files, expected) in cases {
+        let fixture = Fixture::from_files(files);
+        let blob_path = fixture.temp.path().join("blobs.sqlite");
+        let blobs = Connection::open(&blob_path).unwrap();
+        blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY,payload BLOB NOT NULL,payload_digest BLOB NOT NULL,payload_schema INTEGER NOT NULL)").unwrap();
+        let manifest = Manifest::new(files.iter().map(|(path, source)| {
+            let payload =
+                join::CallgraphBlob::extract(source, "typescript", "typescript-object-parity")
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+            let digest = blake3::hash(&payload);
+            let key = digest.to_hex().to_string();
+            blobs
+                .execute(
+                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1,?2,?3,1)",
+                    params![
+                        digest.as_bytes().as_slice(),
+                        payload,
+                        digest.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            (
+                RelPath::new(path.as_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key),
+                        semantic: None,
+                    },
+                    resolution_input: false,
+                },
+            )
+        }))
+        .unwrap();
+        drop(blobs);
+        let view_path = fixture.temp.path().join("view.sqlite");
+        crate::views::materialization::materialize_manifest_view_database(
+            &view_path, &blob_path, &manifest,
+        )
+        .unwrap();
+        let view = Connection::open(view_path).unwrap();
+        let legacy = fixture.store.conn.lock().unwrap();
+        let legacy_answers = answers(&legacy);
+        assert_eq!(
+            legacy_answers.len(),
+            expected,
+            "{files:?}: {legacy_answers:?}"
+        );
+        assert_eq!(answers(&view), legacy_answers, "{files:?}");
+    }
+}
+
 impl Fixture {
     fn new(matching: usize, unrelated: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();

@@ -20130,6 +20130,7 @@ fn insert_method_dispatch_edges_cached(
 
     let mut source_cache: DispatchSourceCache = HashMap::new();
     let mut objects = typescript_objects::ObjectDispatch::new(tx, project_root);
+    objects.prepare(&references)?;
     let mut edge_ids = BTreeSet::new();
     for reference in references {
         if matches!(reference.lang.as_str(), "typescript" | "tsx") {
