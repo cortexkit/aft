@@ -189,12 +189,23 @@ pub(crate) fn install_deferred_inspect_stat_gate_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn deferred_inspect_root_count_for_test() -> usize {
-    DEFERRED_INSPECT_ROOTS
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len()
+pub(crate) fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
+    // Unrelated inspect tests may hold permits for other roots in parallel.
+    // Only this fixture's normalized root is evidence of its worker's lifetime.
+    let config = ctx.config();
+    let root = crate::inspect::job::canonicalize_normalized(
+        config
+            .project_root
+            .as_deref()
+            .expect("fixture project root"),
+    );
+    usize::from(
+        DEFERRED_INSPECT_ROOTS
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&root),
+    )
 }
 
 #[cfg(test)]
@@ -8944,7 +8955,7 @@ mod deferred_terminal_tests {
             "daemon_shutdown"
         );
         let deadline = Instant::now() + Duration::from_secs(1);
-        while deferred_inspect_root_count_for_test() != 0 {
+        while deferred_inspect_root_count_for_test(&ctx) != 0 {
             assert!(
                 Instant::now() < deadline,
                 "detached inspect ignored shutdown cancellation"

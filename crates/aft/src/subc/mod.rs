@@ -13331,7 +13331,7 @@ pub(crate) mod test_support {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(ctx),
             0
         );
     }
@@ -13447,7 +13447,7 @@ pub(crate) mod test_support {
             );
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "writer admissions must not finish the detached inspect"
         );
@@ -14413,7 +14413,7 @@ pub(crate) mod test_support {
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-second");
 
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "only one detached body may run for a root"
         );
@@ -14422,7 +14422,7 @@ pub(crate) mod test_support {
         let second_terminal = wait_for_inspect_terminal(&mut second, &ctx);
         assert_eq!(second_terminal.data["inspect_terminal"], "interrupted");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             1,
             "cancelling the queued request must not release the active flight"
         );
@@ -14431,7 +14431,7 @@ pub(crate) mod test_support {
         let first_terminal = wait_for_inspect_terminal(&mut first, &ctx);
         assert_eq!(first_terminal.data["inspect_terminal"], "fresh");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(),
+            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
             0
         );
     }
@@ -14864,7 +14864,7 @@ pub(crate) mod test_support {
         );
         finish_active_tool_call(&active, route, 42);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0 {
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx) != 0 {
             assert!(Instant::now() < deadline, "shutdown cancellation was inert");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -15013,7 +15013,7 @@ pub(crate) mod test_support {
         assert_eq!(by_corr[&52].data["retryable"], true);
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0
+        while crate::commands::inspect::deferred_inspect_root_count_for_test(&inspect_ctx) != 0
             || crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0
         {
             assert!(
