@@ -118,19 +118,36 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
     assert!(!ctx.subc_unbound_quiesced(), "the route remains connected");
     let paths = ctx.storage_paths();
     let family = ctx.memoized_artifact_cache_key(root.as_path());
-    let clock = crate::pins::now_ms() + 3_601_000;
-    let mut removed = 0;
-    while removed == 0 {
-        let report =
-            crate::storage_retention::sweep_checkout_views_at_for_test(&paths, &family, clock);
-        assert!(report.errors.is_empty(), "{report:?}");
-        removed += report.removed_roots;
+    // Releasing the views ends their sessions on a background thread that
+    // needs the same storage reservation lock as the sweep. Poll the session
+    // rows read-only, so repeated sweeps cannot starve that cleanup, then
+    // sweep once at the unchanged idle clock.
+    let ledger =
+        crate::blob_store::v3::LedgerReader::open_existing(paths.artifacts.as_path(), &family)
+            .unwrap();
+    loop {
+        let sessions: u64 = ledger
+            .read(|connection| {
+                Ok(connection
+                    .query_row("SELECT COUNT(*) FROM view_sessions", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        if sessions == 0 {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "checkout member stayed protected: {report:?}"
+            "checkout view sessions stayed open: family={family}, sessions={sessions}"
         );
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let clock = crate::pins::now_ms() + 3_601_000;
+    let report = crate::storage_retention::sweep_checkout_views_at_for_test(&paths, &family, clock);
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert!(
+        report.removed_roots > 0,
+        "checkout member stayed protected: {report:?}"
+    );
     ctx.note_request();
     let reply = crate::commands::grep::handle_grep(&request, &ctx);
     assert!(
