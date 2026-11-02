@@ -1155,8 +1155,18 @@ pub(crate) fn arm_recheck(ctx: &AppContext) -> Option<RawRequest> {
         return None;
     }
     let state = ctx.folder_admission();
+    let probe = state.probe.lock();
     let mut binding = state.binding.lock();
     let binding = binding.as_mut()?;
+    // Poll an unfinished worker without invalidating its eventual answer.
+    let continuing = !binding.force
+        && binding
+            .decision
+            .as_ref()
+            .is_some_and(|cache| !cache.decision.is_determined())
+        && probe
+            .as_ref()
+            .is_some_and(|task| task.generation == binding.generation);
     let keep_serving = !binding.force
         && binding
             .decision
@@ -1165,11 +1175,15 @@ pub(crate) fn arm_recheck(ctx: &AppContext) -> Option<RawRequest> {
         && (state.allowed.load(Ordering::Acquire)
             || state.workspace_allowed.load(Ordering::Acquire));
     binding.pending = !keep_serving;
-    binding.fresh = false;
+    // An inconclusive attempt must not wait out an old cache's ordinary cooldown.
+    binding.fresh = binding
+        .decision
+        .as_ref()
+        .is_some_and(|cache| !cache.decision.is_determined());
     binding.wait_deadline = None;
     binding.checking = keep_serving;
     binding.needs_apply = !keep_serving;
-    binding.needs_off_bind = !keep_serving;
+    binding.needs_off_bind = !keep_serving && !continuing;
     binding.announced.clear();
     binding.configure_announced.clear();
     binding
@@ -1182,10 +1196,12 @@ pub(crate) fn arm_recheck(ctx: &AppContext) -> Option<RawRequest> {
     state.dirty.store(false, Ordering::Release);
     if !keep_serving {
         ctx.set_heavy_root_work_allowed(false);
-        binding.generation = ctx
-            .configure_generation_flag()
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        if !continuing {
+            binding.generation = ctx
+                .configure_generation_flag()
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+        }
     }
     Some(request)
 }
@@ -1381,7 +1397,17 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     }
     let result = immediate
         .map(|cache| ProbeResult::Complete(cache, false))
-        .or_else(|| task.as_ref().and_then(|task| task.receiver.try_recv().ok()));
+        .or_else(|| {
+            task.as_ref()
+                .and_then(|task| match task.receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Some(ProbeResult::Exhausted)
+                    }
+                })
+        });
+    let in_flight = result.is_none() && task.is_some();
     let wait_cap_exceeded = matches!(result, Some(ProbeResult::Exhausted))
         || (result.is_none() && Instant::now() >= deadline);
     let mut cache = match result {
@@ -1470,7 +1496,15 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     };
     state.dirty.store(incomplete, Ordering::Release);
     drop(slot);
-    *task = None;
+    // A caller timeout ends its wait, not useful metadata work already in flight.
+    if !incomplete
+        || !in_flight
+        || task
+            .as_ref()
+            .is_none_or(|task| task.generation != apply_generation)
+    {
+        *task = None;
+    }
     drop(task);
     #[cfg(debug_assertions)]
     trace_for_test(format_args!(
@@ -1925,5 +1959,189 @@ mod tests {
                 .classification,
             FolderClassification::Project
         );
+    }
+
+    #[test]
+    fn incomplete_retry_rechecks_evidence_instead_of_waiting_on_an_old_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        let mut previous = timeout_cache(
+            root.path(),
+            &config,
+            crate::folder_admission::DetectionMode::Auto,
+        );
+        previous.decision.classification = FolderClassification::NotProject;
+        previous.decision.reason = crate::folder_admission::AdmissionReason::NoProjectEvidence;
+        previous.decision.coverage.complete = true;
+        previous.decision.coverage.count_kind = crate::folder_admission::CountKind::Exact;
+        previous.decision.coverage.root_listing_complete = true;
+        previous.decision.coverage.stop = crate::folder_admission::ProbeStop::Complete;
+        // The old observation no longer has a readable identity stamp.
+        previous.stamps = vec![Stamp {
+            path: root.path().to_path_buf(),
+            facts: None,
+        }];
+        persist(&config, root.path(), &previous);
+        std::fs::write(root.path().join("Makefile"), "").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        install_probe_for_test(
+            &ctx,
+            root.path(),
+            config.clone(),
+            crate::folder_admission::exhausted(
+                root.path(),
+                crate::folder_admission::DetectionMode::Auto,
+                ProbeBudgets::default(),
+            ),
+        );
+        ctx.folder_admission()
+            .binding
+            .lock()
+            .as_mut()
+            .unwrap()
+            .next_probe_ms = 0;
+        assert!(arm_recheck(&ctx).is_some());
+        let fresh = ctx
+            .folder_admission()
+            .binding
+            .lock()
+            .as_ref()
+            .unwrap()
+            .fresh;
+        assert!(
+            fresh,
+            "a backed-off incomplete attempt must actually recheck evidence"
+        );
+        let live = ctx.configure_generation_flag();
+        let result = probe_cache(
+            root.path(),
+            &config,
+            false,
+            false,
+            fresh,
+            &live,
+            ctx.configure_generation(),
+        );
+        assert!(
+            matches!(result, ProbeResult::Complete(..)),
+            "a stale cache must not postpone the next observation"
+        );
+    }
+
+    #[test]
+    fn capped_wait_keeps_its_worker_and_accepts_a_late_determination() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Makefile"), "").unwrap();
+        let config = Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        install_probe_for_test(
+            &ctx,
+            root.path(),
+            config.clone(),
+            crate::folder_admission::exhausted(
+                root.path(),
+                crate::folder_admission::DetectionMode::Auto,
+                ProbeBudgets::default(),
+            ),
+        );
+        let generation = ctx.configure_generation();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *ctx.folder_admission().probe.lock() = Some(ProbeTask {
+            generation,
+            receiver,
+        });
+        {
+            let mut slot = ctx.folder_admission().binding.lock();
+            let binding = slot.as_mut().unwrap();
+            binding.pending = true;
+            binding.wait_deadline = Some(Instant::now() - Duration::from_millis(1));
+        }
+        assert!(poll_wait(&ctx));
+        assert_eq!(snapshot(&ctx).unwrap()["classification"], Value::Null);
+        assert!(ctx.folder_admission().probe.lock().is_some());
+        ctx.folder_admission()
+            .binding
+            .lock()
+            .as_mut()
+            .unwrap()
+            .next_probe_ms = 0;
+        assert!(arm_recheck(&ctx).is_some());
+        assert_eq!(
+            ctx.configure_generation(),
+            generation,
+            "backoff must not supersede the still-running worker"
+        );
+        let mut decision = crate::folder_admission::exhausted(
+            root.path(),
+            crate::folder_admission::DetectionMode::Auto,
+            ProbeBudgets::default(),
+        );
+        decision.classification = FolderClassification::Project;
+        decision.reason = crate::folder_admission::AdmissionReason::RootMarker;
+        decision.observed.root_markers.push("Makefile".into());
+        decision.coverage.stop = crate::folder_admission::ProbeStop::StrongEvidence;
+        let cache = Cache {
+            policy: policy(&config, root.path()),
+            checked_ms: now_ms(),
+            stamps: stamps(&decision),
+            decision,
+            relative_paths: false,
+        };
+        assert!(sender.send(ProbeResult::Complete(cache, false)).is_ok());
+        assert!(matches!(resolve(&ctx), ResolveResult::Ready(_)));
+        assert_eq!(snapshot(&ctx).unwrap()["classification"], "project");
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_block_a_new_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        install_probe_for_test(
+            &ctx,
+            root.path(),
+            config,
+            crate::folder_admission::exhausted(
+                root.path(),
+                crate::folder_admission::DetectionMode::Auto,
+                ProbeBudgets::default(),
+            ),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        *ctx.folder_admission().probe.lock() = Some(ProbeTask {
+            generation: ctx.configure_generation(),
+            receiver,
+        });
+        ctx.folder_admission()
+            .binding
+            .lock()
+            .as_mut()
+            .unwrap()
+            .pending = true;
+        assert!(matches!(resolve(&ctx), ResolveResult::Settled));
+        assert!(ctx.folder_admission().probe.lock().is_none());
+        assert_eq!(snapshot(&ctx).unwrap()["classification"], Value::Null);
     }
 }
