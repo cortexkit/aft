@@ -824,3 +824,77 @@ fn a_failed_task_without_exit_proof_does_not_claim_a_process_exit() {
     assert!(record.get("exitCode").is_none());
     assert!(record.get("endReason").is_none());
 }
+
+#[test]
+fn raced_terminal_snapshot_waits_for_the_persisted_completion_claim() {
+    let f = fixture("bash", "display-terminal-claim-race");
+    held(&f);
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
+    let mut running = task();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    reply(&f.key, false, false, None);
+    assert_eq!(
+        publications().len(),
+        1,
+        "cached terminal facts alone must not bypass the durable once-only marker"
+    );
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
+    assert_eq!(
+        publications()
+            .iter()
+            .filter(|write| write.kind == DisplayKind::Completion)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_raced_exit_cannot_replace_the_original_launch_snapshot() {
+    let f = fixture("bash", "display-frozen-launch");
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut running = task();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    terminal(&f, &mut display, BgTaskStatus::Completed, Some(0));
+    assert!(publications().is_empty());
+    reply(&f.key, false, false, None);
+    let writes = publications();
+    let record = writes
+        .iter()
+        .find(|write| write.kind == DisplayKind::Record)
+        .unwrap();
+    let completion = writes
+        .iter()
+        .find(|write| write.kind == DisplayKind::Completion)
+        .unwrap();
+    assert_eq!(record.body["phase"], "background_started");
+    assert_eq!(record.body["outputBytes"], 0);
+    assert_eq!(completion.body["outputBytes"], 3);
+}
+
+#[test]
+fn a_running_hold_preserves_observed_remote_execution() {
+    let f = fixture("bash", "display-remote-running-hold");
+    let _active = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut metadata = task();
+    metadata.status = BgTaskStatus::Running;
+    metadata.remote = Some(
+        serde_json::from_value(json!({
+            "harness":"h", "session":"s", "stdout_len":0, "stderr_len":0,
+            "cancel_requested":false, "accepted":true, "accepted_platform":"linux"
+        }))
+        .unwrap(),
+    );
+    bash_reply(&mut display, bash_bodies(&metadata, Some(0), None), true);
+    reply(&f.key, true, false, Some("running"));
+    let writes = publications();
+    assert_eq!(writes[0].body["execution"], "remote");
+    assert_eq!(writes[0].body["target"], "linux");
+    assert!(writes[0].body.get("endReason").is_none());
+}

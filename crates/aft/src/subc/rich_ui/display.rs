@@ -45,8 +45,12 @@ pub(crate) struct Capture {
     file_snapshot: Option<(Value, Option<Value>)>,
     masker: Option<crate::log_redact::SecretValues>,
     bash: Option<(Value, Value)>,
+    terminal_bash: Option<(Value, Value)>,
     deferred: bool,
     terminal: bool,
+    // A bash exit can race its launch reply. Cached facts may be published
+    // only after the task's persisted completion marker has been claimed.
+    completion_claimed: bool,
 }
 
 #[derive(Clone)]
@@ -166,8 +170,10 @@ pub(in crate::subc) fn register(
                 file_snapshot: None,
                 masker: None,
                 bash: None,
+                terminal_bash: None,
                 deferred: false,
                 terminal: false,
+                completion_claimed: false,
             }))
         });
     }
@@ -499,7 +505,15 @@ pub(crate) fn reply(
                 } else {
                     "held"
                 });
-                body["execution"] = json!("local");
+                if body.get("execution").is_none() {
+                    body["execution"] = json!("local");
+                }
+                if running {
+                    let fields = body.as_object_mut().unwrap();
+                    fields.remove("exitCode");
+                    fields.remove("endReason");
+                    fields.remove("runDurationMs");
+                }
             }
             emit(&capture, DisplayKind::Record, body);
             capture.record_sent = true;
@@ -521,8 +535,21 @@ pub(crate) fn reply(
     let (mut body, detail) = if capture.tool == "bash" {
         capture
             .bash
-            .clone()
-            .map(|(body, detail)| (body, Some(detail)))
+            .as_ref()
+            .or(capture.terminal_bash.as_ref())
+            .cloned()
+            .map(|(body, detail)| {
+                (
+                    body,
+                    Some(
+                        capture
+                            .terminal_bash
+                            .as_ref()
+                            .map(|(_, terminal)| terminal.clone())
+                            .unwrap_or(detail),
+                    ),
+                )
+            })
             .unwrap_or_else(|| {
                 (
                     json!({"outcome":"error","execution":"local","phase":"foreground_finished"}),
@@ -863,7 +890,7 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferr
     };
     capture.began.get_or_insert_with(Instant::now);
     end_person_wait(&mut capture);
-    if capture.bash.is_none() || !capture.terminal {
+    if capture.bash.is_none() {
         capture.bash = Some(body);
     }
     capture.deferred = deferred;
@@ -878,10 +905,10 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: (Value, Value), deferr
 }
 
 fn emit_bash_completion(capture: &mut Capture) {
-    if capture.finished {
+    if capture.finished || !capture.completion_claimed {
         return;
     }
-    let Some((mut record, mut detail)) = capture.bash.clone() else {
+    let Some((mut record, mut detail)) = capture.terminal_bash.clone() else {
         return;
     };
     record["taskId"] = detail.get("taskId").cloned().unwrap_or(Value::Null);
@@ -927,8 +954,11 @@ pub(crate) fn bash_terminal(
     if let Some(capture) = capture {
         if let Ok(mut capture) = capture.lock() {
             if !capture.terminal {
-                capture.bash = Some(bodies);
+                capture.terminal_bash = Some(bodies);
                 capture.terminal = true;
+            }
+            if display.reply_produced && display.deferred && !display.attempted {
+                capture.completion_claimed = true;
             }
             if capture.record_sent && capture.deferred {
                 emit_bash_completion(&mut capture);
@@ -949,9 +979,11 @@ pub(crate) fn bash_terminal(
             files: Vec::new(),
             file_snapshot: None,
             masker: None,
-            bash: Some(bodies),
+            bash: None,
+            terminal_bash: Some(bodies),
             deferred: true,
             terminal: true,
+            completion_claimed: true,
         };
         emit_bash_completion(&mut capture);
     }

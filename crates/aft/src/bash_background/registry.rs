@@ -3338,23 +3338,32 @@ impl BgTaskRegistry {
         metadata: &PersistedTask,
         buffer: &BgBuffer,
     ) {
-        let Some(display) = metadata
+        if metadata
             .display
             .as_ref()
-            .filter(|display| !display.attempted)
-        else {
+            .is_none_or(|display| display.attempted)
+        {
             return;
-        };
+        }
         let bodies = self.display_bodies(task, metadata, buffer);
-        if display.reply_produced && display.deferred {
+        // The handler can release its reply while the terminal snapshot is
+        // being built. Claim from live task metadata, not that older snapshot.
+        let display = {
             let mut db = DeferredDbWrites::new(self, task);
-            if let Ok(mut state) = task.lock_state() {
-                if let Some(display) = state.metadata.display.as_mut() {
-                    if display.attempted {
-                        return;
-                    }
-                    display.attempted = true;
-                }
+            let Ok(mut state) = task.lock_state() else {
+                return;
+            };
+            let Some(display) = state
+                .metadata
+                .display
+                .as_ref()
+                .filter(|display| !display.attempted)
+                .cloned()
+            else {
+                return;
+            };
+            if display.reply_produced && display.deferred {
+                state.metadata.display.as_mut().unwrap().attempted = true;
                 if self
                     .persist_task_locked(task, &state.metadata, &mut db)
                     .is_err()
@@ -3362,9 +3371,10 @@ impl BgTaskRegistry {
                     return;
                 }
             }
-        }
+            display
+        };
         crate::subc::rich_ui::display::bash_terminal(
-            display,
+            &display,
             bodies,
             &metadata.task_id,
             metadata.duration_ms,
@@ -3405,14 +3415,28 @@ impl BgTaskRegistry {
             return;
         };
         crate::subc::rich_ui::display::bash_reply(display, bodies, deferred);
-        {
+        let terminal = {
             let mut db = DeferredDbWrites::new(self, &task);
-            if let Ok(mut state) = task.lock_state() {
-                state.metadata.display = metadata.display.clone();
-                let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
+            let Ok(mut state) = task.lock_state() else {
+                return;
+            };
+            if let Some(current) = state.metadata.display.as_mut() {
+                if !current.reply_produced {
+                    // A terminal worker may already have claimed completion;
+                    // copying reply facts must never reset its durable marker.
+                    let selected = metadata.display.as_ref().unwrap();
+                    current.reply_produced = selected.reply_produced;
+                    current.deferred = selected.deferred;
+                    current.held_ms = selected.held_ms;
+                }
             }
-        }
-        if metadata.is_terminal() {
+            let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
+            state
+                .metadata
+                .is_terminal()
+                .then(|| (state.metadata.clone(), state.buffer.clone()))
+        };
+        if let Some((metadata, buffer)) = terminal {
             self.capture_display_terminal(&task, &metadata, &buffer);
         }
     }
@@ -29739,6 +29763,65 @@ mod a02_tests {
         assert!(!serde_json::to_string(&record)
             .unwrap()
             .contains("private external path"));
+    }
+
+    #[test]
+    fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let pin = crate::subc::tool_views::SHIPPED
+            .keys()
+            .find(|pin| pin.starts_with("tp1:bash:"))
+            .unwrap()
+            .clone();
+        let display = crate::subc::rich_ui::display::TaskDisplay {
+            identity: crate::subc::rich_ui::outbox::Identity {
+                runner: subc_protocol::Principal::Reserved {
+                    module_id: "broca".into(),
+                },
+                call_key: "display-terminal-race".into(),
+                schema_pin: pin,
+            },
+            capture_key: "display-terminal-race".into(),
+            reply_produced: false,
+            deferred: false,
+            held_ms: None,
+            attempted: false,
+        };
+        let (stale, buffer) = {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.display = Some(display);
+            let stale = state.metadata.clone();
+            let current = state.metadata.display.as_mut().unwrap();
+            current.reply_produced = true;
+            current.deferred = true;
+            (stale, state.buffer.clone())
+        };
+        ctx.bash_background()
+            .capture_display_terminal(&task, &stale, &buffer);
+        assert!(
+            task.state
+                .lock()
+                .unwrap()
+                .metadata
+                .display
+                .as_ref()
+                .unwrap()
+                .attempted
+        );
+        let persisted = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+        assert!(persisted.display.as_ref().unwrap().attempted);
+        ctx.bash_background()
+            .capture_display_terminal(&task, &stale, &buffer);
+        assert!(
+            task.state
+                .lock()
+                .unwrap()
+                .metadata
+                .display
+                .as_ref()
+                .unwrap()
+                .attempted
+        );
     }
 
     #[cfg(unix)]
