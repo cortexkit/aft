@@ -278,7 +278,10 @@ fn views_worktree_family_writes_off_refuses_legacy_writer() {
     let checkout = linked_checkout(&fixture);
     let storage = fixture.join("storage");
     let owner = configure_checkout_deferred(&fixture.join("owner"), &storage, false);
-    assert!(!owner.shared_artifacts_read_only());
+    assert!(
+        !owner.shared_artifacts_read_only(),
+        "the owner repository holds the shared store"
+    );
     let ctx = configure_deferred(&checkout, &storage, false);
     assert_eq!(
         ctx.memoized_artifact_cache_key(&checkout),
