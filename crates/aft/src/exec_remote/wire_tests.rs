@@ -1154,14 +1154,29 @@ fn outage_job_records() -> Vec<StreamRecord> {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon() -> OutageDaemon {
-    outage_daemon_with(true, OutageReplay::Finished).await
+    outage_daemon_with(true, OutageReplay::Finished, None).await
 }
 
 /// The outage daemon whose accepted job is still queued (no started or output
 /// records yet) when the provider restarts.
 #[cfg(unix)]
 pub(crate) async fn queued_outage_daemon() -> OutageDaemon {
-    outage_daemon_with(false, OutageReplay::Finished).await
+    outage_daemon_with(false, OutageReplay::Finished, None).await
+}
+
+/// The only keyed recovery answers used here are published exec-remote records.
+/// A never-accepted key stays refused; only a new key can admit a fresh job.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy)]
+pub(crate) enum SubmissionOutage {
+    Accepted,
+    NeverAccepted,
+    Ambiguous,
+}
+
+#[cfg(unix)]
+pub(crate) async fn preaccepted_outage_daemon(answer: SubmissionOutage) -> OutageDaemon {
+    outage_daemon_with(false, OutageReplay::Finished, Some(answer)).await
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -1176,12 +1191,16 @@ pub(crate) enum OutageReplay {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) async fn outage_daemon_with_replay(replay: OutageReplay) -> OutageDaemon {
-    outage_daemon_with(true, replay).await
+    outage_daemon_with(true, replay, None).await
 }
 
 /// `started` controls whether the job has started (and printed) before the
 /// provider restarts; `replay` controls what re-attaching by job id returns.
-async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon {
+async fn outage_daemon_with(
+    started: bool,
+    replay: OutageReplay,
+    submission_answer: Option<SubmissionOutage>,
+) -> OutageDaemon {
     use std::sync::atomic::{AtomicBool, Ordering};
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1196,6 +1215,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
     let release_held = Arc::new(tokio::sync::Notify::new());
     let up = Arc::new(AtomicBool::new(true));
     let finish_job = Arc::new(tokio::sync::Notify::new());
+    let submission = Arc::new(Mutex::new((None::<Value>, false)));
     let server_finish_job = finish_job.clone();
     let (server_log, server_refused, server_up, server_key) = (
         log.clone(),
@@ -1228,6 +1248,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
                 server_release.clone(),
             );
             let finish_job = server_finish_job.clone();
+            let submission = submission.clone();
             connections.spawn(async move {
                 if subc_transport::authenticate_server(
                     &mut socket,
@@ -1302,6 +1323,53 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
                             log.lock().unwrap().push(body.clone());
                             match body["method"].as_str().unwrap() {
                                 "exec.run" => {
+                                    if let Some(answer) = submission_answer {
+                                        let mut saved = submission.lock().unwrap();
+                                        let request = &body["params"];
+                                        assert!(request["submission_key"].is_string());
+                                        if let Some(original) = &saved.0 {
+                                            if request["submission_key"] == original["submission_key"] {
+                                                assert_eq!(request, original, "keyed recovery must repeat the frozen request");
+                                                match answer {
+                                                    SubmissionOutage::Accepted => {
+                                                        // Recovery identifies the existing job. Its records
+                                                        // are available only through exec.attach.
+                                                        replies.push(record(&StreamRecord::Accepted(Accepted::new(id(), 1).with_attached(true))));
+                                                    }
+                                                    SubmissionOutage::NeverAccepted => {
+                                                        replies.push(record(&StreamRecord::Terminal(TerminalRecord::new(
+                                                            Uuid::from_bytes([0x77; 16]),
+                                                            Outcome::RefusedBeforeStart { reason: RefusalReason::SubmissionNeverAccepted },
+                                                            0, 0, 0,
+                                                        ))));
+                                                    }
+                                                    SubmissionOutage::Ambiguous => {
+                                                        replies.push(record(&StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::OutcomeUnknown, 0, 0, 0))));
+                                                    }
+                                                }
+                                            } else {
+                                                assert!(matches!(answer, SubmissionOutage::NeverAccepted));
+                                                assert!(!saved.1, "a never-accepted proof permits only one fresh submission");
+                                                let mut original = original.clone();
+                                                original["submission_key"] = request["submission_key"].clone();
+                                                assert_eq!(*request, original);
+                                                saved.1 = true;
+                                                replies.push(record(&StreamRecord::Accepted(Accepted::new(id(), 1))));
+                                                for job_record in outage_job_records() {
+                                                    replies.push(record(&job_record));
+                                                }
+                                                replies.push(record(&StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0).with_ran(Ran::Remote))));
+                                            }
+                                            replies.push(frame_of(FrameType::StreamEnd, vec![]));
+                                        } else {
+                                            saved.0 = Some(request.clone());
+                                            // The request reached the executor provider, but its caller saw no
+                                            // Accepted before the provider and its route went away.
+                                            replies.push(reply(FrameType::Error, json!({"code":"outcome_unknown", "message":"route closed by subc"})));
+                                            up.store(false, Ordering::SeqCst);
+                                            drop_route = true;
+                                        }
+                                    } else {
                                     replies.push(record(&StreamRecord::Accepted(Accepted::new(
                                         id(),
                                         1,
@@ -1317,6 +1385,7 @@ async fn outage_daemon_with(started: bool, replay: OutageReplay) -> OutageDaemon
                                     replies.push(reply(FrameType::Error, json!({"code":"outcome_unknown", "message":"route closed by subc"})));
                                     up.store(false, Ordering::SeqCst);
                                     drop_route = true;
+                                    }
                                 }
                                 "exec.attach" => {
                                     assert_eq!(body["params"]["job_id"], id().to_string());

@@ -13888,6 +13888,141 @@ fn submission_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde
         .collect()
 }
 
+async fn preaccepted_recovery_fixture(
+    answer: crate::exec_remote::wire_tests::SubmissionOutage,
+) -> (
+    tempfile::TempDir,
+    crate::exec_remote::wire_tests::OutageDaemon,
+    BgTaskRegistry,
+    String,
+) {
+    let daemon = crate::exec_remote::wire_tests::preaccepted_outage_daemon(answer).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let mut launch = launch(daemon.connection.clone());
+    launch.explicit_runon = true;
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        launch,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    wait_for(
+        "the lost submission must retry while the provider is away",
+        || {
+            let task = registry.observed_status(&task_id, "session", 0).unwrap();
+            assert!(
+                !task.info.status.is_terminal(),
+                "abandoned before the provider returned: {task:?}"
+            );
+            (*daemon.refused_connects.borrow() >= 4).then_some(())
+        },
+    )
+    .await;
+    (dir, daemon, registry, task_id)
+}
+
+fn assert_no_preaccepted_local_run(registry: &BgTaskRegistry, task_id: &str) {
+    let task = registry.task(task_id).unwrap();
+    let metadata = read_task(&task.paths.json).unwrap();
+    assert!(!metadata.local_fallback_started);
+    assert!(metadata.child_pid.is_none());
+}
+
+#[tokio::test]
+async fn runon_preaccepted_route_reopens_after_long_admission_wait() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let (_dir, daemon, registry, task_id) =
+        preaccepted_recovery_fixture(SubmissionOutage::NeverAccepted).await;
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        // Windows placement can outlive AFT's estimate of the runner's queue
+        // limit. Recovery needs its own window after the route closes.
+        state.metadata.started_at = unix_millis() - 20 * 60 * 1000;
+        registry.persist_task(&task.paths, &state.metadata).unwrap();
+    }
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
+async fn runon_preaccepted_accepted_answer_attaches_without_fresh_submission() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let (_dir, daemon, registry, task_id) =
+        preaccepted_recovery_fixture(SubmissionOutage::Accepted).await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = daemon.methods("exec.run");
+    assert_eq!(runs.len(), 2, "one dispatch and one same-key recovery");
+    assert_eq!(runs[0]["params"], runs[1]["params"]);
+    let attaches = daemon.methods("exec.attach");
+    assert_eq!(attaches.len(), 1);
+    assert_eq!(attaches[0]["params"]["job_id"], id().to_string());
+    assert_eq!(attaches[0]["params"]["from_seq"], 0);
+    assert_eq!(
+        fs::read(&registry.task(&task_id).unwrap().paths.stdout).unwrap(),
+        b"AB"
+    );
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
+async fn runon_preaccepted_never_accepted_resubmits_exactly_once_with_fresh_key() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let (_dir, daemon, registry, task_id) =
+        preaccepted_recovery_fixture(SubmissionOutage::NeverAccepted).await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let runs = daemon.methods("exec.run");
+    assert_eq!(runs.len(), 3);
+    assert_eq!(runs[0]["params"], runs[1]["params"]);
+    assert_ne!(
+        runs[1]["params"]["submission_key"],
+        runs[2]["params"]["submission_key"]
+    );
+    assert!(runs[2]["params"].get("resume_from_seq").is_none());
+    assert!(daemon.methods("exec.attach").is_empty());
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
+async fn runon_preaccepted_exhausted_recovery_is_fate_unknown() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let daemon =
+        crate::exec_remote::wire_tests::preaccepted_outage_daemon(SubmissionOutage::NeverAccepted)
+            .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let mut launch = launch(daemon.connection.clone());
+    launch.explicit_runon = true;
+    let task_id = start_with_launch(
+        &registry,
+        dir.path(),
+        launch,
+        crate::bash_background::HardKill::After(Duration::from_secs(30)),
+    );
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert!(
+        *daemon.refused_connects.borrow() >= 4,
+        "a restarting provider must get more than a single catalog probe"
+    );
+    assert!(
+        done.output_preview
+            .contains("remote outcome unknown; keyed recovery unavailable or exhausted"),
+        "{done:?}"
+    );
+    assert_eq!(daemon.methods("exec.run").len(), 1);
+    assert!(daemon.methods("exec.attach").is_empty());
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
 #[tokio::test]
 async fn submission_key_attach_resumes_output_exactly_once() {
     let daemon = submission_daemon(false, false, false, 1).await;
