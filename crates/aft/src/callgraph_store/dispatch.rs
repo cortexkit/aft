@@ -366,7 +366,7 @@ pub fn extract(
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
     let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
     let go_index = (language == "go")
-        .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source));
+        .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source, false));
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();

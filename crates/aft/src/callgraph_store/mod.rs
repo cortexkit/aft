@@ -20749,8 +20749,17 @@ fn load_name_match_candidates(
 
 struct ParsedDispatchSource {
     source: String,
-    tree: tree_sitter::Tree,
+    tree: Option<tree_sitter::Tree>,
     go_index: Option<go_dispatch::SourceIndex>,
+}
+
+impl ParsedDispatchSource {
+    fn root(&self) -> tree_sitter::Node<'_> {
+        self.tree
+            .as_ref()
+            .expect("AST retained for non-Go dispatch")
+            .root_node()
+    }
 }
 
 type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
@@ -20813,13 +20822,26 @@ fn parse_dispatch_source(
     let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
     let tree =
         parse_source_with_cached_parser(&project_root.join(caller_file), &source, lang).ok()?;
-    let go_index =
-        (lang == LangId::Go).then(|| go_dispatch::SourceIndex::new(tree.root_node(), &source));
-    Some(ParsedDispatchSource {
-        source,
-        tree,
-        go_index,
-    })
+    if lang == LangId::Go {
+        let go_index = Some(go_dispatch::SourceIndex::new(
+            tree.root_node(),
+            &source,
+            true,
+        ));
+        // All Go lookups use indexed facts; retaining source/ASTs would make
+        // the dispatch cache grow with the corpus's full syntax trees.
+        Some(ParsedDispatchSource {
+            source: String::new(),
+            tree: None,
+            go_index,
+        })
+    } else {
+        Some(ParsedDispatchSource {
+            source,
+            tree: Some(tree),
+            go_index: None,
+        })
+    }
 }
 
 fn parsed_dispatch_source<'a>(
@@ -20862,7 +20884,7 @@ fn infer_java_like_receiver_type(
     }
 
     let parsed = parsed_dispatch_source(project_root, reference, lang, source_cache)?;
-    let root = parsed.tree.root_node();
+    let root = parsed.root();
     let type_node = find_enclosing_java_like_type_node(root, &parsed.source, reference, lang);
 
     let callable_scope = type_node
@@ -20898,7 +20920,7 @@ fn infer_cpp_receiver_type(
     }
 
     let parsed = parsed_dispatch_source(project_root, reference, LangId::Cpp, source_cache)?;
-    let root = parsed.tree.root_node();
+    let root = parsed.root();
     let scope = find_enclosing_cpp_callable_node(root, &parsed.source, reference).unwrap_or(root);
     infer_cpp_receiver_type_from_scope(
         scope,
@@ -21702,8 +21724,7 @@ fn infer_rust_direct_self_field_receiver_type(
     else {
         return ReceiverTypeInference::Unknown;
     };
-    let Some(impl_node) =
-        find_enclosing_rust_impl_node(parsed.tree.root_node(), reference.line.max(1))
+    let Some(impl_node) = find_enclosing_rust_impl_node(parsed.root(), reference.line.max(1))
     else {
         return ReceiverTypeInference::Unknown;
     };
@@ -21722,12 +21743,9 @@ fn infer_rust_direct_self_field_receiver_type(
     }
 
     let module_scope = rust_module_scope(impl_node);
-    let Some(struct_node) = find_unique_rust_struct(
-        parsed.tree.root_node(),
-        &parsed.source,
-        struct_name,
-        &module_scope,
-    ) else {
+    let Some(struct_node) =
+        find_unique_rust_struct(parsed.root(), &parsed.source, struct_name, &module_scope)
+    else {
         return ReceiverTypeInference::KnownButUnresolved;
     };
     let Some(field_type) = rust_struct_field_type_node(struct_node, &parsed.source, field_name)
@@ -21739,7 +21757,7 @@ fn infer_rust_direct_self_field_receiver_type(
     }
     let field_type_name = node_text(field_type, &parsed.source);
     if find_unique_rust_struct(
-        parsed.tree.root_node(),
+        parsed.root(),
         &parsed.source,
         field_type_name,
         &module_scope,
@@ -22095,9 +22113,7 @@ fn rust_direct_self_field_candidate_matches_scope(
     ) else {
         return false;
     };
-    let Some(impl_node) =
-        find_enclosing_rust_impl_node(parsed.tree.root_node(), candidate.start_line)
-    else {
+    let Some(impl_node) = find_enclosing_rust_impl_node(parsed.root(), candidate.start_line) else {
         return false;
     };
     if impl_node.child_by_field_name("trait").is_some()

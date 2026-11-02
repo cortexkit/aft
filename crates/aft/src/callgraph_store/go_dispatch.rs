@@ -126,7 +126,7 @@ fn initializer_type(
 }
 
 impl SourceIndex {
-    pub(super) fn new(root: Node<'_>, source: &str) -> Self {
+    pub(super) fn new(root: Node<'_>, source: &str, by_line: bool) -> Self {
         let mut index = Self {
             package: package(root, source),
             ..Self::default()
@@ -279,18 +279,21 @@ impl SourceIndex {
                     .flatten()
                 });
                 let span = (call.start_byte(), call.end_byte());
-                index.calls.insert(span, ty.clone());
-                index
-                    .calls_by_line
-                    .entry(call.start_position().row as u32 + 1)
-                    .or_default()
-                    .entry((receiver, text(member, source).to_string()))
-                    .and_modify(|old| {
-                        if *old != ty {
-                            *old = None;
-                        }
-                    })
-                    .or_insert(ty);
+                if by_line {
+                    index
+                        .calls_by_line
+                        .entry(call.start_position().row as u32 + 1)
+                        .or_default()
+                        .entry((receiver, text(member, source).to_string()))
+                        .and_modify(|old| {
+                            if *old != ty {
+                                *old = None;
+                            }
+                        })
+                        .or_insert(ty);
+                } else {
+                    index.calls.insert(span, ty);
+                }
             }
         }
         index
@@ -311,6 +314,17 @@ pub(super) fn resolve(
     if reference.colon_dispatch || !receiver_is_bare_identifier(&reference.receiver_expression) {
         return None;
     }
+    let directory = Path::new(&reference.caller_file).parent();
+    // A type defined in the caller's Go package cannot acquire methods from
+    // another directory.
+    // Avoid parsing callers for library-only names such as testing.T helpers.
+    if !candidates.iter().any(|candidate| {
+        Path::new(&candidate.file_path).parent() == directory
+            && (reference.caller_file.ends_with("_test.go")
+                || !candidate.file_path.ends_with("_test.go"))
+    }) {
+        return None;
+    }
     let parsed = parsed_dispatch_source(project_root, reference, LangId::Go, source_cache)?;
     let index = parsed.go_index.as_ref()?;
     let package = index.package.as_ref()?.clone();
@@ -324,7 +338,6 @@ pub(super) fn resolve(
         .as_ref()?
         .clone();
     let scoped = format!("{ty}::{}", reference.method_name);
-    let directory = Path::new(&reference.caller_file).parent();
     let mut found = Vec::new();
     for candidate in candidates.iter().filter(|candidate| {
         candidate.scoped_name == scoped
@@ -376,7 +389,7 @@ mod tests {
                 parse_source_with_cached_parser(Path::new("indexed.go"), &source, LangId::Go)
                     .unwrap();
             WORK.with(|work| work.set((0, 0, 0)));
-            let index = SourceIndex::new(tree.root_node(), &source);
+            let index = SourceIndex::new(tree.root_node(), &source, false);
             let work = WORK.with(|work| work.get());
             assert_eq!(work.1, 3, "analyze each function once, not once per call");
             assert_eq!(work.2, 2, "receiver and local bindings are analyzed once");
@@ -385,7 +398,17 @@ mod tests {
                 assert_eq!(ty.as_deref(), Some("T"));
                 assert_eq!(index.receiver(start, end), Some("T"));
             }
-            for calls in index.calls_by_line.values() {
+            assert!(index.calls_by_line.is_empty());
+            assert_eq!(
+                WORK.with(|work| work.get()),
+                work,
+                "span lookups must not walk the source or function"
+            );
+            WORK.with(|work| work.set((0, 0, 0)));
+            let lines = SourceIndex::new(tree.root_node(), &source, true);
+            assert!(lines.calls.is_empty());
+            assert_eq!(WORK.with(|work| work.get()), work);
+            for calls in lines.calls_by_line.values() {
                 assert_eq!(
                     calls.get(&("x".into(), "run".into())).unwrap().as_deref(),
                     Some("T")
