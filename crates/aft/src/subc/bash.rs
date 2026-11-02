@@ -4665,6 +4665,7 @@ mod grant_path_tests {
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 run_scope: None,
+                keepalive: None,
                 speech_seed: None,
                 scope: None,
                 late_results: false,

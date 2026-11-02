@@ -166,7 +166,7 @@ fn bash_watch_cancel_stops_waiting_but_leaves_silent_child_running() {
             .observed_status(&h.task, SESSION, 0)
             .unwrap();
         if snapshot.info.status.is_terminal() {
-            assert_eq!(snapshot.info.exit_code, Some(7));
+            assert_eq!(snapshot.exit_code, Some(7));
             break;
         }
         assert!(Instant::now() < deadline);
