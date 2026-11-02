@@ -6282,6 +6282,33 @@ impl CheckoutDriver {
         steady.then_some(installed.revision)
     }
 
+    /// A new binding can reuse a live checkout's verification, but Git metadata
+    /// (including a linked worktree's index) need not be covered by its watcher.
+    /// Recheck the old guard without enumerating policy directories again. The
+    /// steady subscription covers new directories; known inputs already name
+    /// all policy files, including absent ones, in the verified directories.
+    pub(crate) fn prepare_steady_bind(&self) {
+        if self.steady_installed_revision().is_none() {
+            return;
+        }
+        let (snapshot, _) = self.installed_cut();
+        let Some(guard) = snapshot
+            .install_cut()
+            .and_then(|cut| cut.verification.as_ref())
+        else {
+            return;
+        };
+        let unchanged =
+            super::verification::BindGuard::capture(self.owner.root(), Some(&guard.inputs))
+                .is_ok_and(|current| current == **guard);
+        if !unchanged {
+            // A changed guard can affect membership, not just reported paths.
+            // Recording an overflow makes the next query walk the checkout
+            // before it can install and serve a fresh snapshot.
+            self.record_watcher_overflow();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn take_reconcile_work(&self) -> ReconcileWork {
         std::mem::take(&mut *self.work.lock().unwrap())

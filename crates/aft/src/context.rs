@@ -12730,27 +12730,39 @@ impl AppContext {
                 Instant::now,
                 |error| crate::views::trigram::bind_is_busy(error),
                 || {
-                    let view = {
+                    let (view, check_bind) = {
                         let mut slot = self.lexical_view.lock();
-                        if !slot
+                        let replace = !slot
                             .as_ref()
-                            .is_some_and(|view| view.matches(&root, &storage, &family, policy))
-                        {
-                            match crate::views::trigram::LexicalView::new_with_import(
-                                root,
-                                storage,
-                                family,
-                                policy,
-                                self.views_import_control(),
-                                self.cold_build_limiter(),
-                            ) {
+                            .is_some_and(|view| view.matches(&root, &storage, &family, policy));
+                        if replace {
+                            let replacement = match slot.as_ref().filter(|view| {
+                                view.matches_checkout(&root, &storage, &family, policy)
+                            }) {
+                                Some(previous) => previous.with_binding(
+                                    self.views_import_control(),
+                                    self.cold_build_limiter(),
+                                ),
+                                None => crate::views::trigram::LexicalView::new_with_import(
+                                    root,
+                                    storage,
+                                    family,
+                                    policy,
+                                    self.views_import_control(),
+                                    self.cold_build_limiter(),
+                                ),
+                            };
+                            match replacement {
                                 Ok(view) => *slot = Some(Arc::new(view)),
                                 Err(error) => return Err(error),
                             }
                         }
-                        slot.as_ref().unwrap().clone()
+                        (slot.as_ref().unwrap().clone(), replace || tool == "bind")
                     };
                     self.record_checkout_pending_watcher_gap();
+                    if check_bind {
+                        view.prepare_bind();
+                    }
                     view.snapshot()
                 },
             )
