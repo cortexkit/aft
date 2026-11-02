@@ -5163,15 +5163,13 @@ impl Drop for AppContext {
 
 /// Result of requesting the persisted callgraph store for a store-backed op.
 ///
-/// The five edge-query ops never block the request thread on a cold build:
-/// a genuine cold build is kicked off in the background and `Building` is
-/// returned so the agent retries, mirroring how semantic search reports a
-/// build in progress. Warm restarts open the on-disk DB synchronously, so
-/// `Building` is only ever seen during a true first cold build.
+/// Cold builds run in the background. Checkout-view acquisitions also run
+/// off the request thread, with a bounded wait before returning `Building`
+/// so the agent can retry while materialization continues.
 pub enum CallgraphStoreAccess {
     /// Store is resident and queryable.
     Ready(Arc<ReadonlyCallGraphStore>),
-    /// A cold build is in flight (or was just started); retry shortly.
+    /// A build or checkout-view acquisition is in flight; retry shortly.
     Building,
     /// The durable build-death breaker refuses this domain until an explicit reset
     /// or a time-to-live check confirms the suspension has expired.
@@ -5192,7 +5190,7 @@ pub(crate) fn checkout_view_callgraph_access(
 ) -> CallgraphStoreAccess {
     match reader {
         Some(Ok(store)) => CallgraphStoreAccess::Ready(store),
-        Some(Err(error)) if error.completion_busy => CallgraphStoreAccess::Building,
+        Some(Err(error)) if error.building => CallgraphStoreAccess::Building,
         // Pending verification and transient contention say nothing about the
         // graph's validity. Use the existing busy error, which every caller
         // presents as busy/pending with a retry.
@@ -12952,7 +12950,7 @@ impl AppContext {
                 Err((reason, busy)) => Err(crate::views::callgraph::CallgraphViewError {
                     reason,
                     busy,
-                    completion_busy: false,
+                    building: false,
                 }),
             },
         )

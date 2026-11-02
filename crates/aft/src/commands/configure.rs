@@ -15434,12 +15434,15 @@ mod tests {
         // also releases it so a regression cannot leave a blocked test thread.
         let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (published_tx, published_rx) = crossbeam_channel::unbounded();
         let _hook = crate::storage_retention::observe_test_hook(
             &root,
             Arc::new(move |step| {
                 if step == "callgraph-materialize" {
                     entered_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                } else if step == "callgraph-reader-acquired" {
+                    let _ = published_tx.send(());
                 }
             }),
         );
@@ -15452,39 +15455,54 @@ mod tests {
         } else {
             callers_request.clone()
         };
-        let (answer_tx, answer_rx) = crossbeam_channel::bounded(1);
-        let worker_ctx = ctx.clone();
-        let worker = std::thread::spawn(move || {
-            let started = Instant::now();
-            let response = if request.command == "zoom" {
-                crate::commands::zoom::handle_zoom(&request, &worker_ctx)
-            } else {
-                crate::commands::callers::handle_callers(&request, &worker_ctx)
-            };
-            answer_tx.send((started.elapsed(), response)).unwrap();
-        });
+        let (answer_tx, answer_rx) = crossbeam_channel::unbounded();
+        let spawn_read = || {
+            let worker_ctx = ctx.clone();
+            let request = request.clone();
+            let answer_tx = answer_tx.clone();
+            std::thread::spawn(move || {
+                let _pin = worker_ctx.pin_config();
+                let started = Instant::now();
+                let response = if request.command == "zoom" {
+                    crate::commands::zoom::handle_zoom(&request, &worker_ctx)
+                } else {
+                    crate::commands::callers::handle_callers(&request, &worker_ctx)
+                };
+                answer_tx.send((started.elapsed(), response)).unwrap();
+            })
+        };
+        let worker = spawn_read();
         let bound = crate::views::contracts::CALLGRAPH_QUERY_WAIT;
         let entered = entered_rx.recv_timeout(Duration::from_secs(10));
-        let bounded_answer = answer_rx.recv_timeout(bound + Duration::from_secs(1));
+        // A reader queued behind the first read gets the same total budget,
+        // not another full wait after the first read releases the query lock.
+        let concurrent = spawn_read();
+        let deadline = Instant::now() + bound + Duration::from_secs(1);
+        let first = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let second = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         release_tx.send(()).unwrap();
         worker.join().unwrap();
+        concurrent.join().unwrap();
         assert!(entered.is_ok(), "request never reached materialization");
-        let answered_in_bound = bounded_answer.is_ok();
-        let (elapsed, answer) = bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
-        eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_in_bound}", elapsed.as_millis(), bound.as_millis());
-        assert!(
-            answered_in_bound,
-            "{command} waited {elapsed:?} for materialization past {bound:?}"
-        );
-        if command == "zoom" {
-            assert!(answer.success, "{:?}", answer.data);
-            assert!(answer.data.to_string().contains("export function target"));
-            assert_eq!(answer.data["callgraph"]["code"], "callgraph_building");
-        } else {
-            assert!(!answer.success, "{:?}", answer.data);
-            assert_eq!(answer.data["code"], "callgraph_building");
+        for bounded_answer in [first, second] {
+            let answered_in_bound = bounded_answer.is_ok();
+            let (elapsed, answer) = bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
+            eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_in_bound}", elapsed.as_millis(), bound.as_millis());
+            assert!(
+                answered_in_bound,
+                "{command} waited {elapsed:?} for materialization past {bound:?}"
+            );
+            if command == "zoom" {
+                assert!(answer.success, "{:?}", answer.data);
+                assert!(answer.data.to_string().contains("export function target"));
+                assert_eq!(answer.data["callgraph"]["code"], "callgraph_building");
+            } else {
+                assert!(!answer.success, "{:?}", answer.data);
+                assert_eq!(answer.data["code"], "callgraph_building");
+            }
         }
 
+        published_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let started = Instant::now();
         let next = crate::commands::callers::handle_callers(&callers_request, &ctx);
         eprintln!("{command}: next_read_ms={}", started.elapsed().as_millis());
