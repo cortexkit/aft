@@ -278,7 +278,7 @@ impl WriterFrame {
                     );
                     if let Ok(rebuilt) = build_legacy_tool_response_frame(
                         frame.header.ver,
-                        route_key(frame.header.channel, frame.header.epoch),
+                        super::route_key(frame.header.channel, frame.header.epoch),
                         frame.header.corr,
                         frame.header.flags,
                         &result,
