@@ -1337,6 +1337,9 @@ fn cached_file_is_fresh(
 #[derive(Clone, Default)]
 pub struct SymbolCache {
     entries: HashMap<PathBuf, CachedSymbols>,
+    // Payload totals exclude the root, which is counted only for a nonempty map.
+    entry_bytes: u64,
+    symbol_count: usize,
     generation: u64,
     // Revisions distinguish real entry changes from successful parses that reuse cached data.
     mutation_revision: u64,
@@ -1378,6 +1381,36 @@ fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
                     .unwrap_or(0),
             )
     })
+}
+
+fn module_bytes(modules: &[RustModule]) -> u64 {
+    modules
+        .iter()
+        .map(|module| {
+            std::mem::size_of::<RustModule>() as u64
+                + module.name.len() as u64
+                + module_bytes(&module.children)
+        })
+        .sum()
+}
+
+fn cached_symbols_estimated_bytes(path: &Path, cached: &CachedSymbols) -> u64 {
+    (std::mem::size_of::<PathBuf>() as u64)
+        .saturating_add(crate::memory::path_bytes(path))
+        .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
+        .saturating_add(symbols_estimated_bytes(&cached.symbols))
+        .saturating_add(
+            cached
+                .modules
+                .as_deref()
+                .map_or(0, |modules| module_bytes(modules)),
+        )
+        .saturating_add(
+            cached
+                .outline_facts
+                .as_deref()
+                .map_or(0, |facts| facts.estimated_bytes()),
+        )
 }
 
 /// A disk symbol cache decoded and checked against the files on disk, not yet
@@ -1493,6 +1526,8 @@ impl SymbolCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            entry_bytes: 0,
+            symbol_count: 0,
             generation: 0,
             mutation_revision: 0,
             persisted_revision: 0,
@@ -1561,6 +1596,19 @@ impl SymbolCache {
                 // caller without a tree passes `None` and must not erase the
                 // module layout, syntax verdict or outline facts on record.
                 if modules.is_some() {
+                    self.entry_bytes = self
+                        .entry_bytes
+                        .saturating_sub(
+                            cached
+                                .modules
+                                .as_deref()
+                                .map_or(0, |modules| module_bytes(modules)),
+                        )
+                        .saturating_add(
+                            modules
+                                .as_deref()
+                                .map_or(0, |modules| module_bytes(modules)),
+                        );
                     cached.modules = modules;
                 }
                 if has_error.is_some() {
@@ -1578,6 +1626,17 @@ impl SymbolCache {
             has_error,
             outline_facts: None,
         };
+        let next_bytes = if let Some((stored_path, previous)) = self.entries.get_key_value(&path) {
+            self.entry_bytes = self
+                .entry_bytes
+                .saturating_sub(cached_symbols_estimated_bytes(stored_path, previous));
+            self.symbol_count = self.symbol_count.saturating_sub(previous.symbols.len());
+            cached_symbols_estimated_bytes(stored_path, &entry)
+        } else {
+            cached_symbols_estimated_bytes(&path, &entry)
+        };
+        self.entry_bytes = self.entry_bytes.saturating_add(next_bytes);
+        self.symbol_count = self.symbol_count.saturating_add(entry.symbols.len());
         self.entries.insert(path, entry);
         self.mutation_revision = self.mutation_revision.wrapping_add(1);
         true
@@ -1662,6 +1721,14 @@ impl SymbolCache {
     fn install_decoded(&mut self, decoded: DecodedSymbolCache) -> SymbolCacheLoadOutcome {
         self.project_root = Some(decoded.root);
         self.entries = decoded.entries;
+        self.entry_bytes = self.entries.iter().fold(0u64, |bytes, (path, cached)| {
+            bytes.saturating_add(cached_symbols_estimated_bytes(path, cached))
+        });
+        self.symbol_count = self
+            .entries
+            .values()
+            .map(|cached| cached.symbols.len())
+            .fold(0usize, usize::saturating_add);
         self.mutation_revision = if decoded.outcome.needs_persistence {
             1
         } else {
@@ -1704,7 +1771,11 @@ impl SymbolCache {
 
     /// Invalidate cached symbols for a specific file.
     pub fn invalidate(&mut self, path: &Path) {
-        if self.entries.remove(path).is_some() {
+        if let Some((stored_path, previous)) = self.entries.remove_entry(path) {
+            self.entry_bytes = self
+                .entry_bytes
+                .saturating_sub(cached_symbols_estimated_bytes(&stored_path, &previous));
+            self.symbol_count = self.symbol_count.saturating_sub(previous.symbols.len());
             self.mutation_revision = self.mutation_revision.wrapping_add(1);
         }
     }
@@ -1712,6 +1783,8 @@ impl SymbolCache {
     /// Clear all entries and advance the generation to ignore stale background writers.
     pub fn reset(&mut self) -> u64 {
         self.entries.clear();
+        self.entry_bytes = 0;
+        self.symbol_count = 0;
         self.project_root = None;
         self.generation = self.generation.wrapping_add(1);
         self.mutation_revision = 0;
@@ -1754,13 +1827,17 @@ impl SymbolCache {
         self.entries.len()
     }
 
-    /// Cheap counters that move whenever the walk in [`Self::estimated_memory`]
-    /// would most likely give a different answer, read without walking.
-    pub(crate) fn memory_shape(&self) -> [u64; 3] {
+    /// Cheap counters for reusing a health estimate, including derived outline
+    /// payloads that change memory without changing the persistence revision.
+    pub(crate) fn memory_shape(&self) -> [u64; 5] {
         [
             self.generation,
             self.mutation_revision,
             self.entries.len() as u64,
+            self.entry_bytes,
+            self.project_root
+                .as_deref()
+                .map_or(0, crate::memory::path_bytes),
         ]
     }
 
@@ -1768,6 +1845,24 @@ impl SymbolCache {
     /// owned by each symbol. Tree-sitter parse trees are request-local and are
     /// therefore not part of this long-lived cache estimate.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let bytes = if self.entries.is_empty() {
+            0
+        } else {
+            self.entry_bytes.saturating_add(
+                self.project_root
+                    .as_deref()
+                    .map_or(0, crate::memory::path_bytes),
+            )
+        };
+        crate::memory::MemoryEstimate::estimated(bytes)
+            .count("entries", self.entries.len())
+            .count("symbols", self.symbol_count)
+    }
+
+    /// The original full walk, kept independent of the running totals as a
+    /// compatibility oracle and an offline performance baseline.
+    #[cfg(test)]
+    pub(crate) fn recounted_memory_for_test(&self) -> crate::memory::MemoryEstimate {
         if self.entries.is_empty() {
             return crate::memory::MemoryEstimate::estimated(0)
                 .count("entries", 0)
@@ -2168,7 +2263,16 @@ impl FileParser {
                 && entry.size == parsed.size
                 && entry.content_hash == parsed.content_hash
             {
+                let previous_bytes = entry
+                    .outline_facts
+                    .as_deref()
+                    .map_or(0, |facts| facts.estimated_bytes());
+                let next_bytes = facts.estimated_bytes();
                 entry.outline_facts = Some(facts);
+                cache.entry_bytes = cache
+                    .entry_bytes
+                    .saturating_sub(previous_bytes)
+                    .saturating_add(next_bytes);
             }
         }
     }
@@ -10370,6 +10474,192 @@ pub(crate) mod outer {
         assert!(estimate.estimated_bytes.unwrap() > 0);
         assert_eq!(estimate.counts["entries"], 1);
         assert_eq!(estimate.counts["symbols"], 1);
+    }
+
+    fn assert_symbol_memory_recount(cache: &SymbolCache, step: &str) {
+        assert_eq!(
+            cache.estimated_memory(),
+            cache.recounted_memory_for_test(),
+            "{step}"
+        );
+    }
+
+    #[test]
+    fn symbol_memory_running_totals_match_recount_after_mixed_mutations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = SymbolCache::default();
+        cache.set_project_root(root.path().join("røøt"));
+        assert_symbol_memory_recount(&cache, "empty root is not counted");
+        let path = root.path().join("nested/first.rs");
+        let other = root.path().join("other.rs");
+        let now = SystemTime::UNIX_EPOCH;
+        let hash = cache_freshness::zero_hash();
+        let mut rich = test_symbol("longer_name");
+        rich.scope_chain = vec!["outer".into(), "inner".into()];
+        rich.parent = Some("parent".into());
+        cache.insert(path.clone(), now, 10, hash, vec![rich.clone()]);
+        assert_symbol_memory_recount(&cache, "insert");
+        cache.insert(other.clone(), now, 10, hash, Vec::new());
+        assert_symbol_memory_recount(&cache, "empty symbol table still counts its path");
+        let alias = root.path().join("nested//first.rs");
+        assert_eq!(path, alias);
+        cache.insert(alias.clone(), now, 10, hash, vec![rich.clone(); 7]);
+        assert_symbol_memory_recount(&cache, "growing replacement");
+        cache.insert(path.clone(), now, 10, hash, vec![test_symbol("x")]);
+        assert_symbol_memory_recount(&cache, "shrinking replacement");
+        cache.insert_shared(
+            path.clone(),
+            now,
+            10,
+            hash,
+            Arc::new(vec![test_symbol("x")]),
+            Some(Arc::new(vec![RustModule {
+                name: "outer".into(),
+                range: rich.range.clone(),
+                exported: false,
+                children: vec![RustModule {
+                    name: "child".into(),
+                    range: rich.range.clone(),
+                    exported: true,
+                    children: Vec::new(),
+                }],
+            }])),
+            Some(false),
+        );
+        assert_symbol_memory_recount(&cache, "same-content module attachment");
+        cache.insert_shared(
+            path.clone(),
+            now,
+            10,
+            hash,
+            Arc::new(vec![test_symbol("x")]),
+            Some(Arc::new(Vec::new())),
+            Some(true),
+        );
+        assert_symbol_memory_recount(&cache, "same-content module replacement");
+        cache.set_project_root(root.path().join("a-longer-project-root"));
+        assert_symbol_memory_recount(&cache, "root replacement");
+        assert_symbol_memory_recount(&cache.clone(), "clone");
+        cache.invalidate(&alias);
+        assert_symbol_memory_recount(&cache, "evict one of two entries");
+        cache.invalidate(&path);
+        assert_symbol_memory_recount(&cache, "evict missing entry");
+        cache.invalidate(&other);
+        assert_symbol_memory_recount(&cache, "evict last entry");
+        cache.insert(path.clone(), now, 10, hash, vec![rich.clone(); 3]);
+        let decoded = DecodedSymbolCache {
+            root: root.path().to_path_buf(),
+            entries: cache.entries.clone(),
+            outcome: SymbolCacheLoadOutcome {
+                loaded: 1,
+                needs_persistence: false,
+            },
+        };
+        cache.insert(other.clone(), now, 10, hash, vec![rich; 5]);
+        cache.install_decoded(decoded);
+        assert_symbol_memory_recount(&cache, "disk installation replaces existing totals");
+        let old_generation = cache.generation();
+        let generation = cache.reset();
+        assert_symbol_memory_recount(&cache, "clear nonempty cache");
+        assert!(!cache.insert_for_generation(
+            old_generation,
+            path.clone(),
+            now,
+            10,
+            hash,
+            vec![test_symbol("stale")]
+        ));
+        assert_symbol_memory_recount(&cache, "stale insert after clear");
+        assert!(cache.insert_for_generation(
+            generation,
+            other,
+            now,
+            10,
+            hash,
+            vec![test_symbol("fresh")]
+        ));
+        assert_symbol_memory_recount(&cache, "insert after clear");
+        cache.reset();
+        cache.reset();
+        assert_symbol_memory_recount(&cache, "repeated clear");
+    }
+
+    #[test]
+    fn symbol_memory_running_totals_include_outline_facts() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("lib.rs");
+        let cache = Arc::new(RwLock::new(SymbolCache::new()));
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::with_symbol_cache(Arc::clone(&cache))),
+            crate::config::Config::default(),
+        );
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "memory-facts", "command": "outline", "files": [&file],
+        }))
+        .unwrap();
+        let mut parser = FileParser::with_symbol_cache(Arc::clone(&cache));
+        for source in [
+            "pub trait Api { fn get(&self); }\n#[cfg(test)] mod tests { #[test] fn works() {} }\n",
+            "pub fn small() {}\n",
+        ] {
+            std::fs::write(&file, source).unwrap();
+            let response = crate::commands::outline::handle_outline(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            assert!(parser.cached_outline(&file).is_some());
+            assert_symbol_memory_recount(&cache.read().unwrap(), "attach facts through outline");
+            let parsed = parser.parse_snapshot(&file).unwrap();
+            let facts = parser.cached_outline(&file).unwrap().facts;
+            parser.store_outline_facts(&file, &parsed, facts);
+            assert_symbol_memory_recount(
+                &cache.read().unwrap(),
+                "replace facts without double counting",
+            );
+        }
+        cache.write().unwrap().invalidate(&file);
+        assert_symbol_memory_recount(&cache.read().unwrap(), "evict entry with facts");
+    }
+
+    #[test]
+    #[ignore = "offline symbol-memory before/after timing probe"]
+    fn symbol_memory_many_projects_timing_probe() {
+        let caches: Vec<_> = (0..190)
+            .map(|project| {
+                let mut cache = SymbolCache::new();
+                for file in 0..500 {
+                    cache.insert(
+                        PathBuf::from(format!("/project-{project}/src/file-{file}.rs")),
+                        SystemTime::UNIX_EPOCH,
+                        10,
+                        cache_freshness::zero_hash(),
+                        (0..20)
+                            .map(|symbol| test_symbol(&format!("symbol_{symbol}")))
+                            .collect(),
+                    );
+                }
+                assert_symbol_memory_recount(&cache, "timing fixture");
+                cache
+            })
+            .collect();
+        let measure = |recount: bool| {
+            let start = std::time::Instant::now();
+            let mut bytes = 0u64;
+            for _ in 0..10 {
+                for cache in &caches {
+                    let cache = std::hint::black_box(cache);
+                    let estimate = if recount {
+                        cache.recounted_memory_for_test()
+                    } else {
+                        cache.estimated_memory()
+                    };
+                    bytes += std::hint::black_box(estimate).estimated_bytes.unwrap();
+                }
+            }
+            (start.elapsed() / 10, bytes)
+        };
+        let (before, before_bytes) = measure(true);
+        let (after, after_bytes) = measure(false);
+        assert_eq!(before_bytes, after_bytes);
+        eprintln!("symbol memory tick: projects=190 files_per_project=500 symbols_per_file=20 before={before:?} after={after:?} bytes_per_tick={}", after_bytes / 10);
     }
 
     #[test]

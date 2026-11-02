@@ -853,7 +853,9 @@ struct ViewState {
     /// it keeps its keys until the view state holding it is dropped.
     live_v3: Option<Arc<Mutex<crate::pins::LivePin>>>,
     active_fills: usize,
-    cache: Option<(CacheKey, Arc<SemanticIndex>)>,
+    // An installed overlay is immutable; retain its private byte total so a
+    // health tick does not revisit its file metadata and tombstones.
+    cache: Option<(CacheKey, Arc<SemanticIndex>, u64)>,
 }
 
 struct ActiveFill(Arc<Mutex<ViewState>>);
@@ -2866,7 +2868,7 @@ impl SemanticPlane {
             unvouched,
         );
         let index = match state.cache.as_ref() {
-            Some((key, index)) if *key == cache_key => Arc::clone(index),
+            Some((key, index, _)) if *key == cache_key => Arc::clone(index),
             _ => {
                 self.overlay_builds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2877,8 +2879,9 @@ impl SemanticPlane {
                     &replacements,
                 );
                 index.set_summary_budget_limited(budget_limited);
+                let private_bytes = index.estimated_memory().estimated_bytes.unwrap_or(0);
                 let index = Arc::new(index);
-                state.cache = Some((cache_key, Arc::clone(&index)));
+                state.cache = Some((cache_key, Arc::clone(&index), private_bytes));
                 index
             }
         };
@@ -2905,7 +2908,7 @@ impl SemanticPlane {
             .get(&(access.family().to_owned(), access.scope().to_owned()))
             .cloned()?;
         let state = lock(&view);
-        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+        state.cache.as_ref().map(|(_, index, _)| Arc::clone(index))
     }
 
     /// The last overlay cached in this snapshot's reader binding. Borrowers
@@ -2918,7 +2921,7 @@ impl SemanticPlane {
     ) -> Option<Arc<SemanticIndex>> {
         let view = self.query_view(access, snapshot);
         let state = lock(&view);
-        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+        state.cache.as_ref().map(|(_, index, _)| Arc::clone(index))
     }
 
     /// How many scored indexes `overlay` has built.
@@ -2933,9 +2936,7 @@ impl SemanticPlane {
     pub fn private_memory(&self, access: &ViewAccess) -> u64 {
         let view = self.view(access);
         let state = lock(&view);
-        state.cache.as_ref().map_or(0, |(_, index)| {
-            index.estimated_memory().estimated_bytes.unwrap_or(0)
-        })
+        state.cache.as_ref().map_or(0, |(_, _, bytes)| *bytes)
     }
 
     /// [`Self::private_memory`] without waiting: `None` while the view's
@@ -2950,9 +2951,7 @@ impl SemanticPlane {
             }
         };
         let state = try_lock(&view)?;
-        Some(state.cache.as_ref().map_or(0, |(_, index)| {
-            index.estimated_memory().estimated_bytes.unwrap_or(0)
-        }))
+        Some(state.cache.as_ref().map_or(0, |(_, _, bytes)| *bytes))
     }
 
     /// Outstanding semantic work for the checkout, as a fill would see it.
@@ -5740,6 +5739,13 @@ mod tests {
                 )
                 .unwrap();
             checkout.query(&snapshot, "model-a", "edited");
+            let recounted = plane
+                .cached_index(&checkout.access)
+                .unwrap()
+                .estimated_memory()
+                .estimated_bytes
+                .unwrap();
+            assert_eq!(plane.try_private_memory(&checkout.access), Some(recounted));
             plane.private_memory(&checkout.access)
         };
         let one = edit(&[("src/gamma.rs", "fn gamma_edited() {}\n")]);

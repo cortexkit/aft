@@ -1942,6 +1942,10 @@ pub(crate) struct BgTaskState {
     pub(crate) kill_in_flight: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
+    // The terminal render is immutable until invalidated. Keep its payload
+    // total outside the render so the estimate's existing size formula stays
+    // unchanged and health does not scan retained recovery lines every tick.
+    terminal_output_cache_bytes: u64,
     /// PTY timeout intent, a known memory stop, or a piped kill's committed
     /// outcome after observing no natural marker before the signal decision.
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
@@ -2895,6 +2899,7 @@ impl BgTaskRegistry {
         if let Some(existing) = state.terminal_output_cache.clone() {
             return Some(existing);
         }
+        state.terminal_output_cache_bytes = terminal_output_cache_estimated_bytes(&cache);
         state.terminal_output_cache = Some(cache.clone());
         Some(cache)
     }
@@ -5516,6 +5521,7 @@ impl BgTaskRegistry {
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
+                terminal_output_cache_bytes: 0,
                 pending_terminal_override: None,
             }),
         });
@@ -5966,6 +5972,7 @@ impl BgTaskRegistry {
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
+                terminal_output_cache_bytes: 0,
                 pending_terminal_override: None,
             }),
         });
@@ -6334,6 +6341,7 @@ impl BgTaskRegistry {
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
+                terminal_output_cache_bytes: 0,
                 pending_terminal_override: None,
             }),
         });
@@ -13064,6 +13072,7 @@ impl BgTaskRegistry {
                 kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
+                terminal_output_cache_bytes: 0,
                 pending_terminal_override: None,
             }),
         };
@@ -15020,9 +15029,9 @@ impl BgTaskRegistry {
                 Ok(state) => state,
                 Err(_) => return crate::memory::MemoryEstimate::busy(),
             };
-            if let Some(cache) = state.terminal_output_cache.as_ref() {
+            if state.terminal_output_cache.is_some() {
                 terminal_output_caches = terminal_output_caches.saturating_add(1);
-                bytes = bytes.saturating_add(terminal_output_cache_estimated_bytes(cache));
+                bytes = bytes.saturating_add(state.terminal_output_cache_bytes);
             }
         }
         let completion_count = match self.inner.completions.try_lock() {
@@ -18386,6 +18395,31 @@ mod tests {
         assert!(!is_gh_structured_command(
             "gh issue list --json number,title |"
         ));
+    }
+
+    #[test]
+    fn bash_memory_terminal_payload_matches_recount_after_refill() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(
+            &registry,
+            &dir,
+            QUICK_SUCCESS_COMMAND,
+            "retained output\nlast line\n",
+            "warning\n",
+            false,
+        );
+        for _ in 0..2 {
+            let cache = registry.ensure_terminal_output_cache(&task).unwrap();
+            let expected = terminal_output_cache_estimated_bytes(&cache);
+            assert_eq!(registry.estimated_memory().estimated_bytes, Some(expected));
+            assert_eq!(
+                registry.estimated_memory().counts["terminal_output_caches"],
+                1
+            );
+            task.lock_state().unwrap().terminal_output_cache = None;
+            assert_eq!(registry.estimated_memory().estimated_bytes, Some(0));
+        }
     }
 
     pub(super) fn insert_terminal_piped_task(
