@@ -813,3 +813,14 @@ fn file_facts_are_frozen_on_the_executor_before_the_reply_is_queued() {
     assert_eq!(writes[0].body["fileCount"], 1);
     assert_eq!(writes[0].body["path"], "a.txt");
 }
+
+#[test]
+fn a_failed_task_without_exit_proof_does_not_claim_a_process_exit() {
+    let mut metadata = task();
+    metadata.status = BgTaskStatus::Failed;
+    metadata.exit_code = None;
+    let (record, _) = bash_bodies(&metadata, Some(0), None);
+    assert_eq!(record["outcome"], "error");
+    assert!(record.get("exitCode").is_none());
+    assert!(record.get("endReason").is_none());
+}

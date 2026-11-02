@@ -824,7 +824,12 @@ pub(crate) fn bash_bodies(
             BgTaskStatus::TimedOut => "timed_out",
             _ => "exited",
         };
-        record["endReason"] = json!(reason);
+        if reason != "exited"
+            || metadata.exit_code.is_some()
+            || metadata.status == BgTaskStatus::Completed
+        {
+            record["endReason"] = json!(reason);
+        }
         if reason != "exited" {
             record["reason"] = json!(reason);
         }

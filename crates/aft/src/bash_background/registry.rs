@@ -3320,7 +3320,16 @@ impl BgTaskRegistry {
                 };
                 Some((mask(&stdout)?, mask(&stderr)?))
             });
-        crate::subc::rich_ui::display::bash_bodies(metadata, Some(bytes), streams)
+        let mut bodies = crate::subc::rich_ui::display::bash_bodies(metadata, Some(bytes), streams);
+        if let Some(refusal) = (!metadata.local_fallback_started)
+            .then(|| remote::remote_refusal(metadata))
+            .flatten()
+        {
+            bodies.0["reason"] = serde_json::json!(refusal.code);
+            bodies.0.as_object_mut().unwrap().remove("endReason");
+            bodies.0.as_object_mut().unwrap().remove("exitCode");
+        }
+        bodies
     }
 
     fn capture_display_terminal(
@@ -29705,6 +29714,31 @@ mod a02_tests {
         assert_eq!(detail["pty"], "ok\n");
         assert!(detail.get("stdout").is_none());
         assert!(detail.get("stderr").is_none());
+    }
+
+    #[test]
+    fn remote_refusal_display_uses_the_proven_code_without_inventing_an_exit() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let mut metadata = task.state.lock().unwrap().metadata.clone();
+        metadata.status = BgTaskStatus::Failed;
+        metadata.exit_code = None;
+        metadata.child_pid = None;
+        metadata.remote = Some(serde_json::from_value(serde_json::json!({
+            "harness":"h", "session":"s", "stdout_len":0, "stderr_len":0,
+            "cancel_requested":false, "explicit_runon":true,
+            "pre_start_refusal":{"code":"runon_cd_outside_checkout","message":"private external path","ran":"none"}
+        })).unwrap());
+        let buffer = task.state.lock().unwrap().buffer.clone();
+        let (record, _) = ctx
+            .bash_background()
+            .display_bodies(&task, &metadata, &buffer);
+        assert_eq!(record["outcome"], "error");
+        assert_eq!(record["reason"], "runon_cd_outside_checkout");
+        assert!(record.get("exitCode").is_none());
+        assert!(record.get("endReason").is_none());
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("private external path"));
     }
 
     #[cfg(unix)]
