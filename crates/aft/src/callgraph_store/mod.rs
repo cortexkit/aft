@@ -20849,7 +20849,7 @@ fn rust_dispatch_data<'a>(
     cache
         .entry(file.to_string())
         .or_insert_with(|| {
-            let source = fs::read_to_string(project_root.join(file)).ok()?;
+            let source = std::fs::read_to_string(project_root.join(file)).ok()?;
             let mut data =
                 callgraph::build_file_data_from_source(&project_root.join(file), &source).ok()?;
             extend_rust_imports_with_nested_uses(&source, &mut data);
@@ -20936,11 +20936,11 @@ fn rust_bound_dispatch_candidate(
             start,
         )?;
         let callee = initializer.child_by_field_name("function")?;
-        let (file, symbol, signature): (String, String, String) = tx.query_row(
-            "SELECT r.target_file, r.target_symbol, n.signature FROM refs r JOIN nodes n ON n.id=r.target_node
+        let (file, symbol, signature, declaration_line): (String, String, String, usize) = tx.query_row(
+            "SELECT r.target_file, r.target_symbol, n.signature, n.start_line FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
             params![reference.caller_file, initializer.start_byte(), initializer.end_byte(), node_text(callee, &parsed.source)],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         ).optional().ok().flatten()?;
         let return_type = signature.split_once("->")?.1.trim();
         if return_type == "Self" {
@@ -20962,6 +20962,21 @@ fn rust_bound_dispatch_candidate(
             let mut declaration_raw = raw.clone();
             declaration_raw.caller_file = file.clone();
             declaration_raw.caller_symbol = Some(symbol.clone());
+            let parsed = parsed_dispatch_source_for_file(
+                project_root,
+                &file,
+                "rust",
+                LangId::Rust,
+                source_cache,
+            )?;
+            declaration_raw.line = declaration_line as u32 + 1;
+            declaration_raw.byte_start = parsed
+                .source
+                .split_inclusive('\n')
+                .take(declaration_line)
+                .map(str::len)
+                .sum();
+            declaration_raw.byte_end = declaration_raw.byte_start;
             let binding =
                 rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
             return rust_exact_dispatch_candidate(
@@ -21028,7 +21043,11 @@ fn rust_visible_initializer<'a>(
     receiver: &str,
     call_byte: usize,
 ) -> Option<Node<'a>> {
-    let mut stack = vec![root];
+    let mut scope = root.descendant_for_byte_range(call_byte, call_byte)?;
+    while !matches!(scope.kind(), "function_item" | "closure_expression") {
+        scope = scope.parent()?;
+    }
+    let mut stack = vec![scope];
     let mut selected = None;
     let mut shadow = 0;
     while let Some(node) = stack.pop() {
