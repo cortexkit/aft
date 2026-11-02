@@ -109,6 +109,7 @@ fn spawn_configured(root: &Path, lsp_paths_extra: &[PathBuf]) -> AftProcess {
 /// outside-access ask, so a test that reads a sibling of `root` must pass a
 /// `tmp` that contains that sibling.
 fn spawn_configured_with_tmp(root: &Path, lsp_paths_extra: &[PathBuf], tmp: &Path) -> AftProcess {
+    crate::test_helpers::project::ensure_project(root).unwrap();
     fs::create_dir_all(tmp).unwrap();
     let mut aft = AftProcess::spawn_with_env(&[("TMPDIR", tmp.as_os_str())]);
     let configure = aft.send(

@@ -4994,7 +4994,7 @@ pub struct AppContext {
     /// The configure-tail stage running on this root and when it started, or
     /// `None` between units. Read by the pending-bind diagnostics.
     configure_tail_stage: parking_lot::Mutex<Option<(&'static str, Instant)>>,
-    configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
+    configured_session_roots: parking_lot::Mutex<BTreeMap<(PathBuf, String), u64>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     // 0: never configured, 1: opening, 2: ready, 3: failed,
@@ -5854,7 +5854,7 @@ impl AppContext {
             callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
             configure_tail_stage: parking_lot::Mutex::new(None),
-            configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
+            configured_session_roots: parking_lot::Mutex::new(BTreeMap::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             database_runtime_state: AtomicU8::new(0),
@@ -7306,13 +7306,14 @@ impl AppContext {
         record_configure_bind_effect_for_test(&root, &session_id, ConfigureBindEffect::Session);
         self.configured_session_roots
             .lock()
-            .insert((root, session_id))
+            .insert((root, session_id), self.configure_generation())
+            .is_none()
     }
 
     pub(crate) fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
         self.configured_session_roots
             .lock()
-            .contains(&(root.to_path_buf(), session_id.to_string()))
+            .contains_key(&(root.to_path_buf(), session_id.to_string()))
     }
 
     /// Undo [`Self::note_configure_session_binding`] when the maintenance job
@@ -7323,6 +7324,22 @@ impl AppContext {
             .lock()
             .remove(&(root.to_path_buf(), session_id.to_string()));
         self.repeat_breaker.clear_session(session_id);
+    }
+
+    pub(crate) fn forget_configure_session_binding_for_generation(
+        &self,
+        root: &Path,
+        session_id: &str,
+        generation: u64,
+    ) {
+        let key = (root.to_path_buf(), session_id.to_owned());
+        let mut bindings = self.configured_session_roots.lock();
+        // Admission replays configure before an earlier maintenance job can be
+        // retired. The old job must not erase the newer bind or its repeat observations.
+        if bindings.get(&key) == Some(&generation) {
+            bindings.remove(&key);
+            self.repeat_breaker.clear_session(session_id);
+        }
     }
 
     pub fn repeat_breaker(&self) -> &crate::response_finalize::repeat_breaker::RepeatBreaker {
@@ -10159,7 +10176,8 @@ impl AppContext {
     }
 
     pub fn root_too_broad(&self) -> bool {
-        crate::folder_admission_runtime::blocked(self)
+        (crate::folder_admission_runtime::blocked(self)
+            && !crate::folder_admission_runtime::workspace_watcher_allowed(self))
             || self
                 .degraded_reasons
                 .lock()
@@ -12149,7 +12167,7 @@ impl AppContext {
         let mut roots = self
             .configured_session_roots
             .lock()
-            .iter()
+            .keys()
             .map(|(root, _session)| root.clone())
             .collect::<BTreeSet<_>>();
         roots.insert(current_root.to_path_buf());

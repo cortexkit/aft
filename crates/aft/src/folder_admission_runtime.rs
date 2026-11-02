@@ -747,7 +747,7 @@ fn install_bound_cache(ctx: &AppContext, config: Config, root: PathBuf, cache: C
     }
 }
 
-fn snapshot_binding(binding: &Binding) -> Value {
+fn snapshot_binding(binding: &Binding, watcher_active: bool) -> Value {
     let mut value = binding
         .decision
         .as_ref()
@@ -793,7 +793,7 @@ fn snapshot_binding(binding: &Binding) -> Value {
         value["indexes"] = json!({"text": "off", "semantic": "off", "call_graph": "off", "background_symbols": "off"});
         value["fallback"] = json!({"grep": "bounded_walk", "glob": "bounded_walk"});
         if !binding.pending && !binding.needs_apply {
-            value["recursive_watcher"] = json!("off");
+            value["recursive_watcher"] = json!(if watcher_active { "on" } else { "off" });
         }
     }
     if binding
@@ -811,7 +811,7 @@ pub(crate) fn snapshot(ctx: &AppContext) -> Option<Value> {
         .binding
         .lock()
         .as_ref()
-        .map(snapshot_binding)
+        .map(|binding| snapshot_binding(binding, ctx.watcher_runtime_active()))
 }
 
 pub(crate) fn try_snapshot(ctx: &AppContext) -> Option<Value> {
@@ -819,7 +819,7 @@ pub(crate) fn try_snapshot(ctx: &AppContext) -> Option<Value> {
         .binding
         .try_lock()?
         .as_ref()
-        .map(snapshot_binding)
+        .map(|binding| snapshot_binding(binding, ctx.watcher_runtime_active()))
 }
 
 fn reply_snapshot(ctx: &AppContext) -> Option<Value> {
@@ -831,6 +831,13 @@ fn reply_snapshot(ctx: &AppContext) -> Option<Value> {
 pub(crate) fn blocked(ctx: &AppContext) -> bool {
     let state = ctx.folder_admission();
     state.bound.load(Ordering::Acquire) && !state.allowed.load(Ordering::Acquire)
+}
+
+pub(crate) fn workspace_watcher_allowed(ctx: &AppContext) -> bool {
+    ctx.folder_admission()
+        .workspace_allowed
+        .load(Ordering::Acquire)
+        && ctx.config().views.enabled
 }
 
 pub(crate) fn reason(ctx: &AppContext) -> Option<String> {

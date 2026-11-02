@@ -607,6 +607,8 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
         );
         assert!(!ctx.heavy_root_work_allowed());
         assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(!ctx.root_too_broad());
+        assert!(admission::workspace_watcher_allowed(&ctx));
         assert!(!ctx.watcher_runtime_active());
         let session = crate::views::parent::session_for_root(root.path()).unwrap();
         assert!(session.wait_rounds(1, Duration::from_secs(30)));

@@ -9,18 +9,7 @@ use serde_json::{json, Value};
 use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
-    let temp_dir = crate::test_helpers::project::project_tempdir();
-
-    // Ignore-rule fixtures need a real repository: a partial .git directory is
-    // corrupt metadata, not evidence that this project is outside Git.
-    if files.iter().any(|(path, _)| path.starts_with(".git/")) {
-        let output = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(temp_dir.path())
-            .output()
-            .expect("initialize fixture repository");
-        assert!(output.status.success(), "{output:?}");
-    }
+    let temp_dir = crate::test_helpers::project::git_project_tempdir();
 
     for (relative_path, content) in files {
         let path = temp_dir.path().join(relative_path);

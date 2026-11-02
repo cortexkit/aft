@@ -1043,6 +1043,17 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
         "parent folder watcher: edit visible to parent grep after {} ms",
         started.elapsed().as_millis()
     );
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["recursive_watcher"], "on", "{folder}");
+    assert_eq!(folder["indexes"]["text"], "off", "{folder}");
+    assert_eq!(folder["indexes"]["call_graph"], "off", "{folder}");
+
+    let configured = aft.send(&configure_request(&root, false));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let folder = aft.wait_for_folder_admission();
+    assert_eq!(folder["classification"], "workspace", "{folder}");
+    assert_eq!(folder["recursive_watcher"], "off", "{folder}");
+    assert_eq!(folder["indexes"]["text"], "off", "{folder}");
     assert!(aft.shutdown().success());
 }
 

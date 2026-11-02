@@ -1795,6 +1795,7 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let (tx, rx) = mpsc::sync_channel(1);
     let admitted_config =
         (!aft::folder_admission_runtime::request_waits(&req, &ctx)).then(|| ctx.config());
+    let waited_for_admission = admitted_config.is_none();
     let database_command = attach_command.clone();
     let ask_route = aft::access_policy::capture_ask_route();
     thread::spawn(move || {
@@ -1827,7 +1828,15 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
             &id,
             &command,
             tx,
-            || log_ctx::with_session(worker_session_id, || dispatch(req, &ctx)),
+            || {
+                log_ctx::with_session(worker_session_id, || {
+                    if waited_for_admission {
+                        dispatch_after_folder_admission(req, &ctx)
+                    } else {
+                        dispatch(req, &ctx)
+                    }
+                })
+            },
             wake_standalone_loop_for_deferred_response,
         );
     });
@@ -1852,6 +1861,31 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
             cancelled_deferred_response(&shutdown_request_id, &shutdown_command)
         })),
     )
+}
+
+fn dispatch_after_folder_admission(req: RawRequest, ctx: &Arc<AppContext>) -> Response {
+    // Admission delays a request, not its dispatch contract. Re-enter the normal
+    // route so foreground bash still waits and observes repeat-breaker state.
+    let mut pending = PendingResponses::default();
+    match dispatch_outcome(req, ctx) {
+        DispatchOutcome::Immediate(response) => return response,
+        DispatchOutcome::Deferred(response) => pending
+            .register(response)
+            .unwrap_or_else(|_| unreachable!("the admission worker owns only one request")),
+    }
+    loop {
+        if aft::executor::current_job_cancelled() {
+            return pending
+                .drain_on_shutdown_with(ctx)
+                .pop()
+                .expect("the admission worker still owns its pending request")
+                .response;
+        }
+        if let Some(ready) = pending.poll_ready(ctx).pop() {
+            return ready.response;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn complete_deferred_dispatch(

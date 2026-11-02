@@ -78,6 +78,10 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     let ack = response(&mut aft, "bind");
     assert_eq!(ack["success"], true, "{ack}");
     assert_eq!(ack["folder"]["state"], "pending", "{ack}");
+    assert!(
+        !dir.path().join("storage/retention/roots").exists(),
+        "an admission-pending bind must not record a provisional artifact identity"
+    );
     let deadline = Instant::now() + Duration::from_secs(2);
     while !started.exists() {
         assert!(Instant::now() < deadline, "admission probe did not start");
@@ -137,6 +141,39 @@ fn full_validation_call_does_not_starve_its_admission_replay() {
         "{tool}"
     );
     assert_ne!(tool["code"], "folder_not_admitted", "{tool}");
+}
+
+#[test]
+fn bash_queued_with_configure_keeps_foreground_orchestration() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT", "2".as_ref())]);
+    let mut bind = configure(project.path(), storage.path(), "bash-bind", false);
+    bind["config"] = user_config(json!({
+        "bash": {"background": true},
+        "indexes": {"trigram": false, "semantic": false, "callgraph": false}
+    }));
+    aft.send_silent(&bind.to_string());
+    aft.send_silent(
+        &json!({
+            "id": "queued-bash", "command": "bash",
+            "params": {"command": "printf admission-orchestrated", "foreground_orchestrate": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        response(&mut aft, "bash-bind")["folder"]["state"],
+        "pending"
+    );
+    let reply = response(&mut aft, "queued-bash");
+    assert_eq!(reply["status"], "completed", "{reply}");
+    assert_eq!(reply["exit_code"], 0, "{reply}");
+    assert!(reply["output"]
+        .as_str()
+        .unwrap()
+        .contains("admission-orchestrated"));
+    assert!(aft.shutdown().success());
 }
 
 #[test]

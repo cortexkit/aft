@@ -4928,7 +4928,9 @@ fn handle_configure_inner(
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
     ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
-    let retention_result = if cache_available && !identity_provisional {
+    // A pending folder check has not resolved the artifact identity yet. Its
+    // replay records retention only after the identity can be judged final.
+    let retention_result = if cache_available && admission.is_some() && !identity_provisional {
         crate::storage_retention::record_bind(
             &crate::root_cache::StoragePaths::new(durable_root.clone(), storage_root.clone()),
             &canonical_cache_root,
@@ -8149,7 +8151,11 @@ fn replay_configure_session_parts(
 
 fn forget_configure_job_binding(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
     if job.run_bash_replay {
-        ctx.forget_configure_session_binding(&job.canonical_cache_root, &job.session_id);
+        ctx.forget_configure_session_binding_for_generation(
+            &job.canonical_cache_root,
+            &job.session_id,
+            job.generation,
+        );
     }
 }
 
@@ -9189,7 +9195,9 @@ fn run_configure_maintenance_unit_inner(
                     ctx.stop_watcher_runtime();
                     if ctx
                         .run_if_subc_bound_generation(job.generation, || {
-                            if !job.root_too_broad {
+                            if !job.root_too_broad
+                                || crate::folder_admission_runtime::workspace_watcher_allowed(ctx)
+                            {
                                 start_project_watcher(ctx, &job.canonical_cache_root);
                             }
                         })
