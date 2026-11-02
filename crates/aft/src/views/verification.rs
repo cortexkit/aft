@@ -367,7 +367,7 @@ fn determined_policy_query(
     output: io::Result<std::process::Output>,
 ) -> io::Result<std::process::Output> {
     let output = output.map_err(|source| undetermined_policy_query(query, source))?;
-    if !output.status.success() {
+    if output.status.code().is_none() {
         return Err(undetermined_policy_query(
             query,
             io::Error::other(format!(
@@ -543,8 +543,8 @@ fn git_policy_dirs(root: &Path) -> io::Result<Option<(PathBuf, Option<PathBuf>)>
 }
 
 impl Policy {
-    /// A failed query returns no policy, so unknown observations cannot match
-    /// each other or take part in checkout-change comparisons.
+    /// An unfinished query returns no policy. A completed refusal still produces
+    /// non-reusable evidence, including on Git versions without attribute queries.
     pub fn capture(root: &Path, metadata: &[PathBuf]) -> io::Result<Self> {
         let queries =
             crate::git_index_reader::GitQueries::new(root.to_path_buf(), Duration::from_secs(2));
@@ -584,14 +584,19 @@ impl Policy {
         output: io::Result<std::process::Output>,
         sources: [io::Result<std::process::Output>; 2],
     ) -> io::Result<Self> {
-        // A failed query supplies no policy evidence. Hashing a failure as an
-        // empty configuration could both invent a change and match two unknowns.
-        let config = determined_policy_query("Git config", output)?.stdout;
+        // An unfinished query supplies no policy evidence. A completed config
+        // refusal uses empty config and requires reading checkout files again.
+        let output = determined_policy_query("Git config", output)?;
         let mut hash = blake3::Hasher::new();
         hash.update(b"aft/views-v3/conversion-policy/1");
-        let mut reusable = true;
+        let mut reusable = output.status.success();
         hash.update(&[u8::from(reusable)]);
         let config_read = reusable;
+        let config = if config_read {
+            output.stdout
+        } else {
+            Vec::new()
+        };
         hash.update(&config);
         // Inputs for the location-independent digest: present sources by
         // logical name, and Git configuration by effective entry only. Its
@@ -606,6 +611,7 @@ impl Policy {
             }
         };
         let mut config_entries = Vec::new();
+        let mut unknown_sources = Vec::new();
         for (query, output) in ["Git system attributes", "Git global attributes"]
             .into_iter()
             .zip(sources)
@@ -613,22 +619,29 @@ impl Policy {
             let output = determined_policy_query(query, output)?;
             let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
             let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-            if bytes.is_empty() || bytes.contains(&b'\n') {
-                return Err(undetermined_policy_query(
-                    query,
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "attribute source path is missing or malformed",
-                    ),
-                ));
+            if !output.status.success() || bytes.is_empty() || bytes.contains(&b'\n') {
+                // Older Git versions and GIT_ATTR_NOSYSTEM can refuse these
+                // queries. Their completed responses describe unavailable
+                // provenance, not pending work, and must hash the same on retry.
+                reusable = false;
+                let mut unknown = blake3::Hasher::new();
+                unknown.update(query.as_bytes());
+                unknown.update(
+                    &output
+                        .status
+                        .code()
+                        .expect("completed Git query")
+                        .to_le_bytes(),
+                );
+                for bytes in [&output.stdout, &output.stderr] {
+                    unknown.update(&(bytes.len() as u64).to_le_bytes());
+                    unknown.update(bytes);
+                }
+                unknown_sources.push(unknown.finalize());
+                continue;
             }
-            let path = path_from_bytes(bytes).map_err(|e| {
-                at(
-                    "decoding Git attribute source for",
-                    root,
-                    undetermined_policy_query(query, e),
-                )
-            })?;
+            let path = path_from_bytes(bytes)
+                .map_err(|e| at("decoding Git attribute source for", root, e))?;
             let path = if path.is_absolute() {
                 path
             } else {
@@ -726,6 +739,12 @@ impl Policy {
             base.update(name);
             base.update(&(bytes.len() as u64).to_le_bytes());
             base.update(bytes);
+        }
+        for unknown in unknown_sources {
+            for digest in [&mut hash, &mut base] {
+                digest.update(b"unknown-attribute-source\0");
+                digest.update(unknown.as_bytes());
+            }
         }
         base.update(&[u8::from(reusable)]);
         Ok(Self {
@@ -1464,8 +1483,24 @@ mod tests {
         })
     }
 
+    fn refused(code: u8, bytes: &[u8]) -> io::Result<std::process::Output> {
+        let mut output = success(bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            output.status = std::process::ExitStatus::from_raw(i32::from(code) << 8);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            output.status = std::process::ExitStatus::from_raw(u32::from(code));
+        }
+        output.stderr = b"unsupported Git source query".to_vec();
+        Ok(output)
+    }
+
     #[test]
-    fn known_conversions_disable_stat_provenance() {
+    fn conversion_or_unknown_attribute_sources_disable_stat_provenance() {
         let root = tempfile::tempdir().unwrap();
         let sources = || {
             [
@@ -1499,6 +1534,16 @@ mod tests {
                     .reusable
             );
         }
+        assert!(
+            !Policy::capture_sources(
+                root.path(),
+                &[],
+                success(b""),
+                [refused(129, b""), success(b"unused")],
+            )
+            .unwrap()
+            .reusable
+        );
         let attribute = root.path().join(".gitattributes");
         fs::write(&attribute, b"*.rs text\n").unwrap();
         assert!(
@@ -1619,63 +1664,103 @@ mod tests {
     #[test]
     fn failed_policy_queries_do_not_produce_evidence() {
         let root = tempfile::tempdir().unwrap();
+        let expect_undetermined = |query: usize, failure: io::Result<std::process::Output>| {
+            let mut outputs = [
+                success(b""),
+                success(b"system-attributes"),
+                success(b"global-attributes"),
+            ];
+            outputs[query] = failure;
+            let [config, system, global] = outputs;
+            let error =
+                Policy::capture_sources(root.path(), &[], config, [system, global]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{query}: {error}");
+            assert!(error.get_ref().unwrap().is::<PolicyQueryUndetermined>());
+            assert!(
+                error.to_string().contains(POLICY_QUERY_UNDETERMINED),
+                "{error}"
+            );
+            assert!(
+                super::super::trigram::bind_is_busy(&error.to_string()),
+                "{error}"
+            );
+        };
         for query in 0..3 {
-            for failure in 0..3 {
-                let mut outputs = [
-                    success(b""),
-                    success(b"system-attributes"),
-                    success(b"global-attributes"),
-                ];
-                outputs[query] = match failure {
-                    0 => Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "metadata deadline exceeded",
-                    )),
-                    1 => Err(io::Error::other("query unavailable")),
-                    _ => {
-                        let mut output = success(b"").unwrap();
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::process::ExitStatusExt;
-                            output.status = std::process::ExitStatus::from_raw(256);
-                        }
-                        #[cfg(windows)]
-                        {
-                            use std::os::windows::process::ExitStatusExt;
-                            output.status = std::process::ExitStatus::from_raw(1);
-                        }
-                        Ok(output)
-                    }
-                };
-                let [config, system, global] = outputs;
-                let error = Policy::capture_sources(root.path(), &[], config, [system, global])
-                    .unwrap_err();
-                assert_eq!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock,
-                    "{query}/{failure}: {error}"
-                );
-                assert!(error.get_ref().unwrap().is::<PolicyQueryUndetermined>());
-                assert!(
-                    error.to_string().contains(POLICY_QUERY_UNDETERMINED),
-                    "{error}"
-                );
-                assert!(
-                    super::super::trigram::bind_is_busy(&error.to_string()),
-                    "{error}"
-                );
+            expect_undetermined(
+                query,
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "metadata deadline exceeded",
+                )),
+            );
+            expect_undetermined(
+                query,
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "could not spawn Git",
+                )),
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                let mut killed = success(b"").unwrap();
+                killed.status = std::process::ExitStatus::from_raw(libc::SIGTERM);
+                assert!(killed.status.code().is_none());
+                expect_undetermined(query, Ok(killed));
             }
         }
-        for path in [b"".as_slice(), b"first\nsecond\n"] {
-            let error = Policy::capture_sources(
-                root.path(),
-                &[],
-                success(b""),
-                [success(path), success(b"global-attributes")],
-            )
-            .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+    }
+
+    #[test]
+    fn completed_attribute_refusals_and_missing_paths_are_stable_non_reusable_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let healthy = || [success(b"system-attributes"), success(b"global-attributes")];
+        let known = Policy::capture_sources(root.path(), &[], success(b""), healthy()).unwrap();
+        let mut fingerprints = std::collections::BTreeSet::new();
+        for query in 0..2 {
+            for response in 0..4 {
+                let capture = || {
+                    let mut sources = healthy();
+                    sources[query] = match response {
+                        0 => refused(1, b""),
+                        1 => refused(129, b"usage: git var"),
+                        2 => success(b""),
+                        _ => success(b"first\nsecond\n"),
+                    };
+                    Policy::capture_sources(root.path(), &[], success(b""), sources).unwrap()
+                };
+                let before = capture();
+                assert!(!before.reusable);
+                assert_eq!(before, capture());
+                assert_ne!(before.digest, known.digest);
+                assert_ne!(before.base_digest, known.base_digest);
+                assert!(fingerprints.insert(before.digest));
+            }
         }
+    }
+
+    #[test]
+    fn completed_config_refusal_is_empty_but_still_hashes_known_policy_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(".gitattributes");
+        fs::write(&source, b"*.rs text\n").unwrap();
+        let capture = |output| {
+            Policy::capture_sources(
+                root.path(),
+                std::slice::from_ref(&source),
+                output,
+                [success(b"system-attributes"), success(b"global-attributes")],
+            )
+            .unwrap()
+        };
+        let before = capture(refused(1, b"filter.custom.clean\nignored-output\0"));
+        assert!(!before.reusable);
+        assert_eq!(before, capture(refused(129, b"")));
+        fs::write(&source, b"*.rs filter=custom\n").unwrap();
+        let after = capture(refused(1, b""));
+        assert!(!after.reusable);
+        assert_ne!(before.digest, after.digest);
+        assert_ne!(before.base_digest, after.base_digest);
     }
 
     #[test]
