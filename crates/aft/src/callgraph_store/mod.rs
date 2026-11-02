@@ -20941,20 +20941,11 @@ fn rust_bound_dispatch_candidate(
             start,
         )?;
         let callee = initializer.child_by_field_name("function")?;
-        #[cfg(test)]
-        if reference.caller_symbol == "Manager::run" {
-            eprintln!(
-                "initializer {} {}..{}",
-                node_text(callee, &parsed.source),
-                initializer.start_byte(),
-                initializer.end_byte()
-            );
-        }
-        let (file, symbol, end_line, end_col): (String, String, usize, usize) = tx.query_row(
-            "SELECT r.target_file, r.target_symbol, n.end_line, n.end_col FROM refs r JOIN nodes n ON n.id=r.target_node
+        let (file, symbol): (String, String) = tx.query_row(
+            "SELECT r.target_file, r.target_symbol FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
             params![reference.caller_file, initializer.start_byte(), initializer.end_byte(), node_text(callee, &parsed.source)],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional().ok().flatten()?;
         let parsed = parsed_dispatch_source_for_file(
             project_root,
@@ -20963,16 +20954,7 @@ fn rust_bound_dispatch_candidate(
             LangId::Rust,
             source_cache,
         )?;
-        let mut declaration = parsed.tree.root_node().descendant_for_point_range(
-            tree_sitter::Point::new(end_line, end_col.checked_sub(1)?),
-            tree_sitter::Point::new(end_line, end_col.checked_sub(1)?),
-        )?;
-        while declaration.kind() != "function_item" {
-            declaration = declaration.parent()?;
-        }
-        if declaration.end_position() != tree_sitter::Point::new(end_line, end_col) {
-            return None;
-        }
+        let declaration = rust_scoped_function(parsed.tree.root_node(), &parsed.source, &symbol)?;
         let declaration_byte = declaration.start_byte();
         let declaration_line = declaration.start_position().row;
         let return_type = node_text(
@@ -20980,10 +20962,6 @@ fn rust_bound_dispatch_candidate(
             &parsed.source,
         )
         .to_string();
-        #[cfg(test)]
-        if reference.caller_symbol == "Manager::run" {
-            eprintln!("return {file} {symbol} {return_type}");
-        }
         if return_type == "Self" {
             let (owner, _) = symbol.rsplit_once("::")?;
             let owner = owner.split_once(" for ").map_or(owner, |(_, ty)| ty);
@@ -21008,10 +20986,6 @@ fn rust_bound_dispatch_candidate(
             declaration_raw.byte_end = declaration_raw.byte_start;
             let binding =
                 rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
-            #[cfg(test)]
-            if reference.caller_symbol == "Manager::run" {
-                eprintln!("trait binding {binding:?}");
-            }
             return rust_exact_dispatch_candidate(
                 tx,
                 &binding.0,
@@ -21066,6 +21040,55 @@ fn rust_bound_dispatch_candidate(
             return None;
         }
         selected = Some(candidate);
+    }
+    selected
+}
+
+// Legacy node ranges may cover only a declaration's name. Recover its return
+// syntax from the declared owner, rejecting duplicate declaration identities.
+fn rust_scoped_function<'a>(root: Node<'a>, source: &str, symbol: &str) -> Option<Node<'a>> {
+    let (owner, name) = symbol.rsplit_once("::").unwrap_or(("", symbol));
+    let mut stack = vec![root];
+    let mut selected = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "function_item"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|n| node_text(n, source) == name)
+        {
+            let mut scope = Vec::new();
+            let mut parent = node.parent();
+            let mut implementation = false;
+            while let Some(ancestor) = parent {
+                if ancestor.kind() == "impl_item" {
+                    let ty = node_text(ancestor.child_by_field_name("type")?, source);
+                    scope.push(
+                        if let Some(trait_node) = ancestor.child_by_field_name("trait") {
+                            format!("{} for {ty}", node_text(trait_node, source))
+                        } else {
+                            ty.to_string()
+                        },
+                    );
+                    implementation = true;
+                    break;
+                }
+                if matches!(ancestor.kind(), "mod_item" | "trait_item") {
+                    scope
+                        .push(node_text(ancestor.child_by_field_name("name")?, source).to_string());
+                }
+                parent = ancestor.parent();
+            }
+            if !implementation {
+                scope.reverse();
+            }
+            if scope.join("::") == owner {
+                if selected.is_some() {
+                    return None;
+                }
+                selected = Some(node);
+            }
+        }
+        push_named_children(node, &mut stack);
     }
     selected
 }
@@ -34250,6 +34273,7 @@ mod types;
 use types::{Symbol, Analyzer, Generic};
 pub struct Manager;
 impl Manager {
+    /// Select the analyzer contract.
     fn get(&self) -> &dyn Analyzer { todo!() }
     pub fn run(&self) { let analyzer = self.get(); analyzer.analyze(); }
 }
@@ -34289,36 +34313,6 @@ impl Other { pub fn qualified(self) -> Self { self } }
             "Analyzer for Generic::analyze",
             "src/lib.rs",
             "run",
-        );
-        let debug_conn = Connection::open(store.sqlite_path()).unwrap();
-        let mut debug_stmt = debug_conn.prepare("SELECT caller_file, full_ref, status, target_symbol, byte_start, byte_end FROM refs WHERE kind='call'").unwrap();
-        eprintln!(
-            "refs: {:?}",
-            debug_stmt
-                .query_map([], |r| Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, usize>(4)?,
-                    r.get::<_, usize>(5)?
-                )))
-                .unwrap()
-                .collect::<Vec<_>>()
-        );
-        let mut debug_nodes = debug_conn.prepare("SELECT scoped_name, start_line, start_col, end_line, end_col FROM nodes WHERE file_path='src/lib.rs'").unwrap();
-        eprintln!(
-            "nodes: {:?}",
-            debug_nodes
-                .query_map([], |r| Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, usize>(1)?,
-                    r.get::<_, usize>(2)?,
-                    r.get::<_, usize>(3)?,
-                    r.get::<_, usize>(4)?
-                )))
-                .unwrap()
-                .collect::<Vec<_>>()
         );
         assert_direct_caller(
             &store,
