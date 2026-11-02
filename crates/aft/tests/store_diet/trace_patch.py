@@ -23,7 +23,8 @@ fn install(result: rusqlite::Result<Connection>) -> rusqlite::Result<Connection>
             let _guard = LOCK.lock().unwrap();
             let path = std::env::var_os("AFT_STORE_DIET_SQL_TRACE").unwrap();
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-            writeln!(file, "{}", serde_json::to_string(sql).unwrap()).unwrap();
+            let line = serde_json::to_string(sql).unwrap() + "\\n";
+            file.write_all(line.as_bytes()).unwrap();
         }));
     }
     Ok(connection)
@@ -50,7 +51,8 @@ pub(crate) fn open_in_memory() -> rusqlite::Result<Connection> {
 def main():
     chunks = []
     sites = []
-    for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
+    paths = list((ROOT / 'crates/aft/src').rglob('*.rs')) + [HERE / 'harness.rs']
+    for path in sorted(paths):
         before = path.read_text()
         # Both tracked connection types ultimately call these raw open seams.
         # Match the complete type name, not IdentityConnection/TrackedConnection.

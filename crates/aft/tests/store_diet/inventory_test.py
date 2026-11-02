@@ -65,6 +65,15 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertEqual(sum(r['command'] == 'trace_to_symbol' for r in requests), 100)
         self.assertEqual(len({r['id'] for r in requests}), len(requests))
 
+    def test_metadata_normalisation_preserves_nested_rows_and_wire_bytes(self):
+        raw = b' { "search_ms": 1.25, "rows": [{"search_ms": 9}], "notes": ["unchanged"] }\n'
+        expected = b' { "search_ms": 0, "rows": [{"search_ms": 9}], "notes": ["unchanged"] }\n'
+        self.assertEqual(parity.normalise_metadata(raw, ['search_ms']), expected)
+        with self.assertRaisesRegex(AssertionError, 'cannot be normalised'):
+            parity.normalise_metadata(raw, ['rows'])
+        with self.assertRaisesRegex(AssertionError, 'metadata type changed'):
+            parity.normalise_metadata(b'{"search_ms": []}', ['search_ms'])
+
     def test_parity_rejects_changed_reply_bytes_and_empty_capture(self):
         # Keep scratch beneath the checkout.
         scratch = inventory.ROOT / 'target/scratch'

@@ -148,7 +148,7 @@ def variants(row, tables):
         expanded = [(label, sql.replace('{filter}', value)) for label, value in [('all', ''), ('non-test', f' AND COALESCE({alias}is_test, 0) = 0')]]
     elif '{identity}' in sql and 'FROM files' in sql:
         expanded = [(label, sql.replace('{identity}', value)) for label, value in [('identity', 'source_identity'), ('old-shape', 'NULL')]]
-    elif '{table}' in sql:
+    elif '{table}' in sql and graph_statement(row):
         expanded = []
         stable = any(site['path'].endswith('/stable_rows.rs') for site in row['sites'])
         shapes = stable_write_shapes() if stable else {}
@@ -184,22 +184,20 @@ def stable_write_shapes():
 
 def source_inventory():
     result = {'rust_order': [], 'id_text_readers': [], 'connection_helpers': [], 'attach': []}
-    for folder in ['callgraph_store', 'views', 'commands', 'db']:
-        for path in sorted((ROOT / 'crates/aft/src' / folder).rglob('*.rs')):
-            if folder == 'commands' and not any(x in path.name for x in ['callgraph', 'inspect', 'search', 'zoom']):
-                continue
-            lines = path.read_text().splitlines()
-            for i, line in enumerate(lines):
-                site = {'path': str(path.relative_to(ROOT)), 'line': i + 1, 'text': line.strip()}
-                if re.search(r'\.sort(?:_unstable)?(?:_by(?:_key|_cached_key)?)?\(|\.(?:min|max)_by(?:_key)?\(|\.dedup(?:_by(?:_key)?)?\(|BTree(?:Map|Set)|\.group_by\(', line):
-                    result['rust_order'].append(site)
-                if re.search(r'(?:strip_prefix|starts_with|split_once|rsplit_once|strip_suffix|split|contains)\(', line) and any(re.search(r'\b(?:id|ref_id|node_id|site_ref_id)\b|pos:symbol:|view:|top:|dispatch:|edge:', context) for context in lines[max(0, i - 2):i + 3]):
-                    result['id_text_readers'].append(site)
-                if re.search(r'(?:Connection|Self)::open(?:_in_memory|_with_flags)?\(', line):
-                    result['connection_helpers'].append(site)
-                if re.search(r'\bATTACH\b', line):
-                    result['attach'].append(site)
+    for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
+        lines = path.read_text().splitlines()
+        for i, line in enumerate(lines):
+            site = {'path': str(path.relative_to(ROOT)), 'line': i + 1, 'text': line.strip()}
+            if re.search(r'\.sort(?:_unstable)?(?:_by(?:_key|_cached_key)?)?\(|\.(?:min|max)_by(?:_key)?\(|\.dedup(?:_by(?:_key)?)?\(|BTree(?:Map|Set)|BinaryHeap|\.group_by\(', line):
+                result['rust_order'].append(site)
+            if re.search(r'(?:strip_prefix|starts_with|split_once|rsplit_once|strip_suffix|split|contains)\(', line) and any(re.search(r'\b(?:id|ref_id|node_id|site_ref_id)\b|pos:symbol:|view:|top:|dispatch:|edge:', context) for context in lines[max(0, i - 2):i + 3]):
+                result['id_text_readers'].append(site)
+            if re.search(r'(?:Connection|Self)::open(?:_in_memory|_with_flags)?\(', line):
+                result['connection_helpers'].append(site)
+            if re.search(r'\bATTACH\b', line):
+                result['attach'].append(site)
     return result
+
 
 
 def sweep_references(tables, rows):
@@ -232,7 +230,7 @@ def sweep_references(tables, rows):
     return result
 
 
-def coverage(inventory, traces):
+def coverage(inventory, traces, report=None):
     # SQLite expands parameters, but fixed literals remain part of a statement's
     # identity: a resolved-ref query must not cover an unresolved-ref query.
     def canonical(sql):
@@ -251,6 +249,8 @@ def coverage(inventory, traces):
         matcher = pattern(sql)
         if not any(matcher.fullmatch(traced) for traced in seen) and key not in exemptions:
             missing.append(key)
+    if report:
+        dump(report, [{'id': key, 'sql': variants[key], 'sites': next(row['sites'] for row in inventory if key.startswith(row['id'] + ':'))} for key in missing])
     if missing:
         raise SystemExit('uncovered SQL statements: ' + ', '.join(missing))
     assert all(isinstance(reason, str) and reason.strip() for reason in exemptions.values()), 'empty trace exemption reason'
@@ -304,6 +304,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['capture', 'check', 'coverage', 'compare-plans'])
     parser.add_argument('paths', nargs='*', type=pathlib.Path)
+    parser.add_argument('--report', type=pathlib.Path)
     args = parser.parse_args()
     path = HERE / 'statements.json'
     if args.command == 'capture':
@@ -327,7 +328,7 @@ def main():
         assert json.loads((HERE / 'sweep_references.json').read_text()) == sweep_references(schemas(actual), actual), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
-        coverage(json.loads(path.read_text()), args.paths)
+        coverage(json.loads(path.read_text()), args.paths, args.report)
     else:
         assert len(args.paths) == 2, 'compare-plans BASELINE.json CANDIDATE.json'
         compare_plans(*(json.loads(p.read_text()) for p in args.paths))

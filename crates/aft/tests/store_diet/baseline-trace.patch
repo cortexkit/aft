@@ -3332,9 +3332,29 @@
  }
  
  #[cfg(test)]
+--- a/crates/aft/tests/store_diet/harness.rs
++++ b/crates/aft/tests/store_diet/harness.rs
+@@ -147,7 +147,7 @@
+ fn view_store(temp: &Path, root: &Path, files: &[PathBuf]) -> CallGraphStore {
+     use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+     let blobs = temp.join("blobs.sqlite");
+-    let connection = Connection::open(&blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&blobs).unwrap();
+     connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
+     let mut entries = Vec::new();
+     for file in files {
+@@ -237,7 +237,7 @@
+     // Other databases and transaction-local tables do not live in a finished
+     // graph fixture. Keep their schemas on a separate in-memory connection.
+     // Actual graph plans always use the real fixture's schema first.
+-    let auxiliary = Connection::open_in_memory().unwrap();
++    let auxiliary = crate::db::store_diet_trace::open_in_memory().unwrap();
+     let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
+     for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+         let _ = auxiliary.execute_batch(&sql.unwrap());
 --- /dev/null
 +++ b/crates/aft/src/db/store_diet_trace.rs
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +//! SQL capture for offline baseline replay, never part of a release build.
 +use rusqlite::{Connection, OpenFlags};
 +use std::path::Path;
@@ -3348,7 +3368,8 @@
 +            let _guard = LOCK.lock().unwrap();
 +            let path = std::env::var_os("AFT_STORE_DIET_SQL_TRACE").unwrap();
 +            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
-+            writeln!(file, "{}", serde_json::to_string(sql).unwrap()).unwrap();
++            let line = serde_json::to_string(sql).unwrap() + "\n";
++            file.write_all(line.as_bytes()).unwrap();
 +        }));
 +    }
 +    Ok(connection)

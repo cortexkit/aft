@@ -1894,5 +1894,19 @@
         "helper": "open_connection"
       }
     ]
+  },
+  {
+    "path": "crates/aft/tests/store_diet/harness.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 150,
+        "helper": "view_store"
+      },
+      {
+        "line": 240,
+        "helper": "plans"
+      }
+    ]
   }
 ]

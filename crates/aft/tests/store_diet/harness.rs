@@ -242,6 +242,23 @@ fn plans(store: &CallGraphStore) -> Value {
     for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
         let _ = auxiliary.execute_batch(&sql.unwrap());
     }
+    let tables: Vec<Value> =
+        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("table_encoding.json")).unwrap())
+            .unwrap();
+    for table in tables {
+        let declaration = regex::Regex::new(&format!(r"(?i)^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{}\s*\(", regex::escape(table["table"].as_str().unwrap()))).unwrap();
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row["id"] == table["schema_statement"])
+        {
+            for variant in row["variants"].as_array().unwrap() {
+                let sql = variant["sql"].as_str().unwrap();
+                if declaration.is_match(sql) {
+                    let _ = auxiliary.execute_batch(sql);
+                }
+            }
+        }
+    }
     for _ in 0..2 {
         for row in &rows {
             for variant in row["variants"].as_array().unwrap() {
