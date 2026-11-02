@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/parser.rs"
+  ],
+  "slices": [
+    "health-memory-running-totals"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/parser.rs. The symbol cache now keeps running byte and symbol totals for the health report's memory estimate instead of walking every entry on each tick. Which symbols are cached, how they are parsed, and every read path that search uses are unchanged; ranked rows must remain byte-identical to the committed reference. Tests compare the running totals with a full recount after every mutation."
+}
