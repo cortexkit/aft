@@ -126,6 +126,108 @@ fn set(files: &[&str]) -> BTreeSet<String> {
     files.iter().map(|file| file.to_string()).collect()
 }
 
+fn go_typed_edges(store: &CallGraphStore) -> Vec<(String, String, String)> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.caller_file, e.target_file, e.target_symbol FROM edges e
+         JOIN refs r ON r.ref_id=e.ref_id JOIN files f ON f.path=r.caller_file
+         WHERE f.lang='go' AND e.provenance='type_match' ORDER BY 1,2,3",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn go_concrete_method_receivers_bind_across_test_package_files() {
+    let fixture = Fixture::from_files(&[
+        ("suite_test.go", "package db\ntype testSuite struct{}\n"),
+        ("issue_test.go", "package db\nfunc (s *testSuite) issueUseCase() {}\n"),
+        ("close_test.go", "package db\nfunc (s *testSuite) close() { s.issueUseCase() }\nfunc (s testSuite) check() { s.issueUseCase() }\n"),
+        ("external_test.go", "package db_test\ntype testSuite struct{}\nfunc (s *testSuite) issueUseCase() {}\n"),
+        ("web/other.go", "package db\ntype testSuite struct{}\nfunc (s *testSuite) issueUseCase() {}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "close_test.go".into(),
+                "issue_test.go".into(),
+                "testSuite::issueUseCase".into()
+            ),
+            (
+                "close_test.go".into(),
+                "issue_test.go".into(),
+                "testSuite::issueUseCase".into()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn go_concrete_factory_return_and_local_declarations_bind_exactly() {
+    let fixture = Fixture::from_files(&[
+        ("fixture_test.go", "package p\ntype Fixture struct{}\nfunc (f *Fixture) commitLane() {}\ntype Other struct{}\nfunc (f *Other) commitLane() {}\ntype Contract interface { commitLane() }\n"),
+        ("caller_test.go", "package p\nfunc newFixture() *Fixture { return &Fixture{} }\nfunc caller() {\n f := newFixture(); f.commitLane()\n var x Fixture; x.commitLane()\n y := &Fixture{}; y.commitLane()\n z := Fixture{}; z.commitLane()\n}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            );
+            4
+        ]
+    );
+    let changed = edit(
+        &fixture.root,
+        "caller_test.go",
+        "newFixture() *Fixture { return &Fixture{} }",
+        "newFixture() *Other { return &Other{} }",
+    );
+    fixture.refresh_and_compare("go-factory-result", &[changed]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Other::commitLane".into()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn go_concrete_binding_refuses_shadows_interfaces_and_nonlocal_packages() {
+    let fixture = Fixture::from_files(&[
+        ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype I interface { run() }\nfunc factory() *T { return &T{} }\n"),
+        ("caller_test.go", "package p\nfunc shadowed(x *T) { { x := unknown(); x.run() }; x.run() }\nfunc localType() { type T struct{}; var x T; x.run() }\nfunc shadowFactory(factory func() I) { x := factory(); x.run() }\nfunc contract(x I) { x.run() }\nfunc sibling() { { var x T }; x.run() }\nfunc closure(x *T) { f := func(x I) { x.run() }; _ = f }\nfunc unknown() I { return nil }\n"),
+        ("external_test.go", "package p_test\nfunc outsider(x *T) { x.run() }\n"),
+    ]);
+    assert!(go_typed_edges(&fixture.store).is_empty());
+}
+
 /// A cold-built fixture store that edit shapes are applied to.
 struct Fixture {
     temp: tempfile::TempDir,
@@ -149,6 +251,7 @@ impl Fixture {
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
         for (rel, text) in files {
+            fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
             fs::write(root.join(rel), text).unwrap();
         }
         let store = CallGraphStore::open(temp.path().join("incremental"), root.clone()).unwrap();

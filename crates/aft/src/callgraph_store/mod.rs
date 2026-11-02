@@ -1758,6 +1758,8 @@ thread_local! {
 mod dead_code_projection;
 #[cfg(test)]
 mod dispatch_narrowing_tests;
+
+mod go_dispatch;
 #[cfg(test)]
 mod incremental_parity;
 #[cfg(test)]
@@ -20142,6 +20144,25 @@ fn insert_method_dispatch_edges_cached(
                 entry.insert(candidates)
             }
         };
+
+        if reference.lang == "go" {
+            if let Some(candidate) = go_dispatch::resolve(
+                project_root,
+                &reference,
+                candidates.as_slice(),
+                &mut source_cache,
+            ) {
+                if let Some(candidate) = candidate {
+                    edge_ids.insert(insert_method_dispatch_edge(
+                        tx,
+                        &reference,
+                        &candidate,
+                        PROVENANCE_TYPE_MATCH,
+                    )?);
+                }
+                continue;
+            }
+        }
 
         match infer_receiver_type_state(project_root, &reference, &mut source_cache) {
             ReceiverTypeInference::Known(receiver_type) => {
