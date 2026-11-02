@@ -12,6 +12,7 @@ pub mod join;
 mod readiness_watch_macos;
 pub(crate) mod resolution_config;
 mod source_stat;
+mod typescript_objects;
 use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
 use source_stat::{SourceStat, StoredFile, ValidatedStat};
@@ -5678,6 +5679,9 @@ impl CallerSymbolMemo {
                 // remain ambiguous even when one candidate is file-level.
                 if symbol.contains("::") {
                     self.symbols.insert(symbol.clone(), Some(symbol.clone()));
+                }
+                if symbol.starts_with("@object:") {
+                    continue;
                 }
                 let bare = symbol.rsplit("::").next().unwrap_or(symbol);
                 self.symbols
@@ -20125,8 +20129,20 @@ fn insert_method_dispatch_edges_cached(
     }
 
     let mut source_cache: DispatchSourceCache = HashMap::new();
+    let mut objects = typescript_objects::ObjectDispatch::new(tx, project_root);
     let mut edge_ids = BTreeSet::new();
     for reference in references {
+        if matches!(reference.lang.as_str(), "typescript" | "tsx") {
+            if let Some(candidate) = objects.resolve(tx, &reference)? {
+                edge_ids.insert(insert_method_dispatch_edge(
+                    tx,
+                    &reference,
+                    &candidate,
+                    PROVENANCE_TYPE_MATCH,
+                )?);
+                continue;
+            }
+        }
         let key = (reference.method_name.clone(), reference.lang.clone());
         let candidates = match candidates_by_name.entry(key) {
             Entry::Occupied(entry) => entry.into_mut(),
@@ -20184,7 +20200,12 @@ fn insert_method_dispatch_edges_cached(
             continue;
         }
 
-        let Some(candidate) = select_name_match_candidate(&reference, candidates.as_slice()) else {
+        let eligible = candidates
+            .iter()
+            .filter(|c| !c.scoped_name.starts_with("@object:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(candidate) = select_name_match_candidate(&reference, eligible.as_slice()) else {
             continue;
         };
         edge_ids.insert(insert_method_dispatch_edge(

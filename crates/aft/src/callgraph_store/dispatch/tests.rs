@@ -211,6 +211,13 @@ fn typescript_object_ambiguous_or_mutated_values_do_not_gain_edges() {
         "async function make() { return { run() {} }; } const value = make(); value.run();",
         "const value = { run() {} }; function caller(value) { value.run(); }",
         "register({ run() {} }); function callback(value) { value.run(); }",
+        "const value = { run() {} }; const alias = value; alias.run = unknown; value.run();",
+        "import {make} from './producer'; function caller() { const {make} = unknown; make().run(); }",
+        "import {make} from './producer'; const callback = make => make().run();",
+        "import {make} from './producer'; function caller() { try {} catch(make) { make().run(); } }",
+        "const make = function*() { return { run() {} }; }; make().run();",
+        "const value = { run: function internal() {} }; value.internal();",
+        "const value = { run: () => this.other(), other() {} };",
     ] {
         let parse = parse(source, "typescript");
         assert!(resolutions(&parse).iter().all(|r| r.targets.is_empty()), "{source}\n{parse:#?}");

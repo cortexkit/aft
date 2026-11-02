@@ -133,6 +133,46 @@ struct Fixture {
     store: CallGraphStore,
 }
 
+#[test]
+fn typescript_object_store_records_wrapped_returned_and_argument_methods() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => {} });"),
+        ("caller.ts", "import { make as build } from './producer';\nexport function caller() { const adapter = build(); adapter.run(); }\nconst direct = { wrapped: () => {} } satisfies Contract;\ndirect.wrapped();\nfunction unknown(value) { value.argument(); }\nargument();"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM nodes WHERE name IN ('run','argument','wrapped') AND kind='method'"), 3);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 2);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::argument'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn typescript_object_store_factory_edits_match_a_cold_build() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export function make() { return { run() {} }; }"),
+        ("caller.ts", "import { make } from './producer';\nexport function caller() { const adapter = make(); adapter.run(); }"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 1);
+    let changed = edit(
+        &fixture.root,
+        "producer.ts",
+        "return { run() {} };",
+        "const unused = { run() {} }; return unknown;",
+    );
+    fixture.refresh_and_compare("typescript-object-return-removed", &[changed]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%'"
+        ),
+        0
+    );
+}
+
 impl Fixture {
     fn new(matching: usize, unrelated: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();

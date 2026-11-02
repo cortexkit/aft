@@ -96,33 +96,13 @@ const TS_QUERY: &str = r#"
       name: (_) @interface_property.name) @interface_property.def))
 
 ;; callable object-literal properties
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (arrow_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (function_expression) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (pair
-        key: (_) @object_property.name
-        value: (generator_function) @object_property.value) @object_property.def)))
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @object_property.object_name
-    value: (object
-      (method_definition
-        name: (_) @object_property.name) @object_property.def)))
+(object
+  (pair
+    key: (_) @object_property.name
+    value: [(arrow_function) (function_expression) (generator_function)] @object_property.value) @object_property.def) @object_property.object
+(object
+  (method_definition
+    name: (_) @object_property.name) @object_property.def) @object_property.object
 
 ;; enum declarations
 (enum_declaration
@@ -3100,6 +3080,22 @@ fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
     }
 }
 
+pub(crate) fn ts_object_scope(source: &str, object: Node<'_>) -> String {
+    if let Some(declaration) = object
+        .parent()
+        .filter(|n| n.kind() == "variable_declarator")
+    {
+        if let Some(name) = declaration
+            .child_by_field_name("name")
+            .filter(|n| n.kind() == "identifier")
+        {
+            return node_text(source, &name).to_string();
+        }
+    }
+    let position = object.start_position();
+    format!("@object:{}:{}", position.row, position.column)
+}
+
 fn push_ts_member_symbol(
     symbols: &mut Vec<Symbol>,
     source: &str,
@@ -3160,7 +3156,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut interface_property_interface_name_node = None;
         let mut interface_property_name_node = None;
         let mut interface_property_def_node = None;
-        let mut object_property_object_name_node = None;
+        let mut object_property_object_node = None;
         let mut object_property_name_node = None;
         let mut object_property_value_node = None;
         let mut object_property_def_node = None;
@@ -3204,7 +3200,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 }
                 "interface_property.name" => interface_property_name_node = Some(cap.node),
                 "interface_property.def" => interface_property_def_node = Some(cap.node),
-                "object_property.object_name" => object_property_object_name_node = Some(cap.node),
+                "object_property.object" => object_property_object_node = Some(cap.node),
                 "object_property.name" => object_property_name_node = Some(cap.node),
                 "object_property.value" => object_property_value_node = Some(cap.node),
                 "object_property.def" => object_property_def_node = Some(cap.node),
@@ -3349,19 +3345,19 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         // Callable object-literal property. The property key is the public callable name.
-        if let (Some(object_name_node), Some(name_node), Some(def_node)) = (
-            object_property_object_name_node,
+        if let (Some(object_node), Some(name_node), Some(def_node)) = (
+            object_property_object_node,
             object_property_name_node,
             object_property_def_node,
         ) {
-            let object_name = node_text(source, &object_name_node);
+            let object_name = ts_object_scope(source, object_node);
             let property_name = node_text(source, &name_node);
             push_ts_member_symbol(
                 &mut symbols,
                 source,
                 name_node,
                 def_node,
-                object_name,
+                &object_name,
                 SymbolKind::Method,
             );
 
@@ -3374,7 +3370,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                             source,
                             function_name_node,
                             value_node,
-                            object_name,
+                            &object_name,
                             SymbolKind::Function,
                         );
                     }

@@ -1630,7 +1630,7 @@ fn manifest_payloads(
     Ok(loaded)
 }
 
-/// The receiver type names of one Rust file that method-call resolution may
+/// The receiver type names of one file that method-call resolution may
 /// look up through ordinary Rust path binding: declared types and their bases,
 /// method owners and traits, field and return types, and each call site's
 /// receiver with any field or return-value wrapper removed.
@@ -1661,10 +1661,10 @@ fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names
 }
 
-/// Bind one Rust file's receiver type names with the same workspace, module and
-/// re-export rules as ordinary Rust paths. A name maps to its target file and
+/// Bind receiver type names with the same import and re-export rules as
+/// ordinary paths. A name maps to its target file and
 /// symbol only when the target names a node of the index.
-fn resolve_dispatch_type_names<I: super::ResolverIndex>(
+pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
     index: &I,
     file: &str,
     parse: &ParseBlob,
@@ -1692,7 +1692,20 @@ fn resolve_dispatch_type_names<I: super::ResolverIndex>(
             byte_end: 0,
             dependencies: BTreeSet::new(),
         };
-        let resolved = super::resolve_rust_target(index, file, &name, short, data, &raw);
+        let resolved = if parse.language == "rust" {
+            super::resolve_rust_target(index, file, &name, short, data, &raw)
+        } else if parse.imports.iter().any(|import| {
+            !import.type_only
+                && (import.default_import.as_deref() == Some(&name)
+                    || import
+                        .names
+                        .iter()
+                        .any(|spec| crate::imports::specifier_local_name(spec) == name))
+        }) {
+            super::resolve_js_ts_target(index, file, &name, &name, data)
+        } else {
+            None
+        };
         if let Some((_, target_file, symbol)) = resolved {
             if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
                 targets.insert(name, (target_file, symbol));
@@ -2759,7 +2772,10 @@ fn join_manifest_with_surfaces(
             let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
                 continue;
             };
-            if blob.language != "rust" {
+            if !matches!(
+                blob.language.as_str(),
+                "rust" | "typescript" | "tsx" | "javascript"
+            ) {
                 continue;
             }
             // The caller data is the file's own parse; binding consults path

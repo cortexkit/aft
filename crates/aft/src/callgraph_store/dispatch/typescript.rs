@@ -65,9 +65,20 @@ fn scope(node: Node<'_>) -> bool {
 }
 
 fn binding_scope(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "catch_clause" {
+        return Some(node);
+    }
+    let function_scoped = node.kind() == "variable_declarator"
+        && node
+            .parent()
+            .is_some_and(|p| p.kind() == "variable_declaration");
     let mut parent = node.parent()?;
     loop {
-        if scope(parent) {
+        if scope(parent)
+            && (!function_scoped
+                || parent.kind() == "program"
+                || FUNCTIONS.contains(&parent.kind()))
+        {
             return Some(parent);
         }
         parent = parent.parent()?;
@@ -77,7 +88,6 @@ fn binding_scope(node: Node<'_>) -> Option<Node<'_>> {
 pub(super) struct Objects<'nodes, 'tree, 'source> {
     nodes: &'nodes [Node<'tree>],
     source: &'source str,
-    symbols: HashMap<(usize, usize), String>,
     returns: HashMap<String, String>,
     imports: HashSet<String>,
 }
@@ -91,7 +101,6 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let mut result = Self {
             nodes,
             source,
-            symbols: HashMap::new(),
             returns: HashMap::new(),
             imports: parse
                 .imports
@@ -104,29 +113,40 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 })
                 .collect(),
         };
+        let mut ambiguous = HashSet::new();
+        let mut seen = HashSet::new();
         for node in nodes.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
             if let Some(symbol) = parse.symbols.iter().find(|s| {
                 s.end_line == node.end_position().row as u32
                     && s.end_col == node.end_position().column as u32
                     && matches!(s.kind.as_str(), "function" | "method")
             }) {
-                result.symbols.insert(
-                    (node.start_byte(), node.end_byte()),
-                    symbol.scoped_name.clone(),
-                );
+                if !seen.insert(symbol.scoped_name.clone()) {
+                    ambiguous.insert(symbol.scoped_name.clone());
+                }
                 if let Some(object) = result.returned_object(*node) {
-                    result
+                    if result
                         .returns
-                        .insert(symbol.scoped_name.clone(), object_identity(object));
+                        .insert(symbol.scoped_name.clone(), object_identity(object))
+                        .is_some()
+                    {
+                        ambiguous.insert(symbol.scoped_name.clone());
+                    }
                 }
             }
         }
+        result
+            .returns
+            .retain(|symbol, _| !ambiguous.contains(symbol));
         result
     }
 
     fn returned_object(&self, function: Node<'tree>) -> Option<Node<'tree>> {
         // An async factory returns a Promise, not the literal itself.
-        if function
+        if matches!(
+            function.kind(),
+            "generator_function" | "generator_function_declaration"
+        ) || function
             .children(&mut function.walk())
             .any(|n| n.kind() == "async")
         {
@@ -211,6 +231,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 symbol: symbol.clone(),
                 ty: ty.clone(),
             }));
+        facts.returns.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     }
 
     fn binding(&self, identifier: Node<'tree>) -> Option<Node<'tree>> {
@@ -218,6 +239,16 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         let mut current = identifier.parent();
         while let Some(ancestor) = current {
             if scope(ancestor) {
+                if FUNCTIONS.contains(&ancestor.kind())
+                    && field(ancestor, &["parameter"]).is_some_and(|p| text(p, self.source) == name)
+                {
+                    return Some(ancestor);
+                }
+                if ancestor.kind() == "function_expression"
+                    && field(ancestor, &["name"]).is_some_and(|p| text(p, self.source) == name)
+                {
+                    return Some(ancestor);
+                }
                 let candidates = self
                     .nodes
                     .iter()
@@ -230,14 +261,21 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                                 | "function_declaration"
                                 | "class_declaration"
                                 | "catch_clause"
-                        ) && field(**n, &["name", "pattern", "parameter"])
-                            .is_some_and(|key| text(key, self.source) == name)
-                            && binding_scope(**n) == Some(ancestor)
+                        ) && field(**n, &["name", "pattern", "parameter"]).is_some_and(|key| {
+                            text(key, self.source) == name
+                                || descendants(key).iter().any(|n| {
+                                    n.kind() == "identifier" && text(*n, self.source) == name
+                                })
+                        }) && binding_scope(**n) == Some(ancestor)
                     })
                     .copied()
                     .collect::<Vec<_>>();
                 if !candidates.is_empty() {
-                    return (candidates.len() == 1).then_some(candidates[0]);
+                    return Some(if candidates.len() == 1 {
+                        candidates[0]
+                    } else {
+                        identifier
+                    });
                 }
             }
             current = ancestor.parent();
@@ -250,6 +288,13 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             return true;
         };
         self.nodes.iter().any(|node| {
+            if node.kind() == "variable_declarator"
+                && field(*node, &["value"]).is_some_and(|value| {
+                    value.kind() == "identifier" && text(value, self.source) == name
+                })
+            {
+                return true;
+            }
             if !matches!(
                 node.kind(),
                 "assignment_expression"
@@ -286,6 +331,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                 let binding = self.binding(expression)?;
                 let name = text(expression, self.source);
                 if binding.kind() != "variable_declarator"
+                    || field(binding, &["name"]).is_none_or(|n| n.kind() != "identifier")
                     || binding.start_byte() >= call.start_byte()
                     || self.written(binding, name)
                 {
@@ -311,14 +357,14 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     let function = if binding.kind() == "function_declaration" {
                         binding
                     } else if binding.kind() == "variable_declarator" {
+                        if field(binding, &["name"]).is_none_or(|n| n.kind() != "identifier") {
+                            return None;
+                        }
                         unwrap(field(binding, &["value"])?)
                     } else {
                         return None;
                     };
-                    let symbol = self
-                        .symbols
-                        .get(&(function.start_byte(), function.end_byte()))?;
-                    self.returns.get(symbol).cloned()
+                    self.returned_object(function).map(object_identity)
                 } else if self.imports.contains(name) {
                     Some(format!("@return:{name}"))
                 } else {

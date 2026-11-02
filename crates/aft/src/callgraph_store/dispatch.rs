@@ -183,6 +183,9 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
         if let Some((object, _)) = typescript::object_member(node, source) {
             return Some((typescript::object_identity(object), None));
         }
+        if matches!(node.kind(), "function_expression" | "generator_function") {
+            return None;
+        }
     }
     if language == "rust" {
         if let Some(implementation) = enclosing(node, &["impl_item"]) {
@@ -316,6 +319,24 @@ pub fn complete_members(
             continue;
         };
         if call_ordinals.contains(&ordinal) {
+            if typescript::supported(&parse.language) {
+                if let Some(function) = enclosing(call, FUNCTIONS) {
+                    if typescript::object_member(function, source).is_some() {
+                        if let Some(caller) = callers.get(&(
+                            function.start_position().row as u32,
+                            function.start_position().column as u32,
+                        )) {
+                            if let Some(reference) = parse
+                                .refs
+                                .iter_mut()
+                                .find(|r| r.kind == BlobRefKind::Call && r.ordinal == ordinal)
+                            {
+                                reference.caller_symbol = Some(caller.clone());
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
         let caller = enclosing(call, FUNCTIONS).and_then(|function| {
@@ -517,8 +538,9 @@ pub fn extract(
             continue;
         };
         if ts_objects.as_ref().is_some_and(|objects| {
-            typescript::object_member(node, source)
-                .is_some_and(|(object, name)| !objects.unambiguous_member(object, &name))
+            typescript::object_member(node, source).is_some_and(|(object, name)| {
+                name != symbol.name || !objects.unambiguous_member(object, &name)
+            })
         }) {
             continue;
         }
