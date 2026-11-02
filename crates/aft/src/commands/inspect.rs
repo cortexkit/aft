@@ -1455,7 +1455,7 @@ pub(crate) fn handle_inspect_deferred_with_reply_deadline(
     handle_inspect_deferred_with_clock(req, ctx, force_restrict, reply_deadline, Instant::now)
 }
 
-fn handle_inspect_deferred_with_clock(
+pub(crate) fn handle_inspect_deferred_with_clock(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     force_restrict: bool,
