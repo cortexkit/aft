@@ -15,7 +15,8 @@ use crate::protocol::Response;
 pub const TEXT_LIMIT: usize = 50 * 1024;
 pub const SAVED_FILE_LIMIT: usize = 64 * 1024 * 1024;
 pub const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
-// Approved by Ufuk as agent-visible wording; keep this trailer byte-identical.
+// Agents see this trailer, and the project owner approved its exact wording;
+// keep it byte-identical, and get the owner's approval before changing it.
 pub const SAVE_FAILED_TRAILER: &str =
     "[output cut at 50 KB of <total> KB; the full result could not be saved: <reason>]";
 
@@ -44,7 +45,7 @@ pub(crate) struct OutputFiles {
     canonicalizations: std::sync::atomic::AtomicUsize,
 }
 
-/// A deferred subc tool reply can be sent after its AppContext is evicted.
+/// A deferred daemon (subc) tool reply can be sent after its AppContext is evicted.
 /// Capture only the private output store and task registry needed to save it,
 /// without retaining the project's indexes or other runtime state.
 pub(crate) struct OutputScope {
@@ -188,9 +189,10 @@ impl OutputFiles {
             .map(|artifact| artifact.session.clone())
     }
 
-    /// Reopen only generated names in the exact session namespace after an
-    /// actor has been evicted. A directory-prefix grant would expose other
-    /// private stores or another session's results.
+    /// Re-register a saved result after the project's AppContext was evicted
+    /// and rebuilt, which empties the in-memory table. Only generated names in
+    /// the exact session folder qualify: a folder-prefix grant would expose
+    /// other private stores or another session's results.
     pub(crate) fn restore(&self, ctx: &AppContext, session: &str, path: &Path) {
         if !generated_name(path) {
             return;
@@ -330,7 +332,7 @@ fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
     STORES.get_or_init(Default::default)
 }
 
-/// Counts the directory entries and filesystem work examined in one GC pass.
+/// Counts the directory entries and filesystem work examined in one cleanup pass.
 #[derive(Debug, Default)]
 pub(crate) struct CleanupReport {
     pub session_entries: usize,
