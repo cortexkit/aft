@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessConfigPaths } from "../adapters/types.js";
-import { buildDoctorFixPlan, runDoctor } from "../commands/doctor.js";
+import { buildDoctorFixPlan, fixPluginEntries, runDoctor } from "../commands/doctor.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import {
   collectDiagnostics,
@@ -505,6 +505,30 @@ describe("doctor never downgrades OpenCode", () => {
     expect(compareSemver("0.63.4+build.2", "0.63.4+build.1")).toBe(0);
     expect(compareSemver("latest", "0.63.4")).toBeUndefined();
     expect(compareSemver("0.63.5-beta.02", "0.63.4")).toBeUndefined();
+  });
+
+  test("the real doctor writer repairs V2 shapes while preserving newer and unresolved specs", async () => {
+    captureOutput();
+    for (const spec of [newer, "latest", "^0.63.0"]) {
+      const entry = `${AFT_OPENCODE_PACKAGE}@${spec}`;
+      const { adapter, report } = fixture(entry, newer);
+      rmSync(join(root, "xdg-cache"), { recursive: true, force: true });
+      adapter.useHostDetection(V2);
+      const config = {
+        plugins: [[entry, { enabled: true }], "unrelated@1"],
+        plugin: ["v1-only@1"],
+      };
+      writeFileSync(join(root, "opencode.json"), JSON.stringify(config));
+      report.harnesses[0]!.pluginCache = adapter.getPluginCacheInfo();
+      const plan = buildDoctorFixPlan([adapter], report);
+      expect(plan.some((item) => item.message.includes(entry))).toBe(true);
+      expect(plan.some((item) => item.message.includes(PINNED))).toBe(false);
+      expect((await fixPluginEntries([adapter])).changed).toBe(1);
+      expect(JSON.parse(readFileSync(join(root, "opencode.json"), "utf8"))).toEqual({
+        ...config,
+        plugins: [{ package: entry, options: { enabled: true } }, "unrelated@1"],
+      });
+    }
   });
 
   test.skipIf(process.platform === "win32")(
