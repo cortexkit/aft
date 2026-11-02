@@ -560,7 +560,7 @@ fn folder_admission_refresh_and_live_policy_changes_recheck_the_root() {
     isolated(root.path(), || {
         let ctx = context(storage.path());
         assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
-        settle(&ctx);
+        crate::test_admission::settle(&ctx);
         assert_eq!(
             admission::snapshot(&ctx).unwrap()["reason"],
             "no_project_evidence"
@@ -568,7 +568,7 @@ fn folder_admission_refresh_and_live_policy_changes_recheck_the_root() {
         std::fs::write(root.path().join("one.rs"), "pub fn one() {}\n").unwrap();
         std::fs::write(root.path().join("two.rs"), "pub fn two() {}\n").unwrap();
         assert!(configure(root.path(), storage.path(), &ctx, false, true).success);
-        settle(&ctx);
+        crate::test_admission::settle(&ctx);
         assert_eq!(
             admission::snapshot(&ctx).unwrap()["classification"],
             "project"
@@ -585,7 +585,7 @@ fn folder_admission_refresh_and_live_policy_changes_recheck_the_root() {
         admission::policy_changed(&ctx, &ctx.config());
         assert!(ctx.configure_generation() > generation);
         assert!(!ctx.heavy_root_work_allowed());
-        settle(&ctx);
+        crate::test_admission::settle(&ctx);
         let folder = admission::snapshot(&ctx).unwrap();
         assert_eq!(folder["state"], "decided");
         assert_eq!(folder["classification"], "not_project");
