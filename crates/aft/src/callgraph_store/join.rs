@@ -1673,27 +1673,30 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
 ) -> BTreeMap<String, (String, String)> {
     let mut targets = BTreeMap::new();
     for name in dispatch_type_names(parse) {
+        if parse.language != "rust" && name.starts_with('@') {
+            continue;
+        }
         let short = name.rsplit("::").next().unwrap_or(&name);
-        let raw = super::RawRef {
-            ref_id: String::new(),
-            caller_node: None,
-            caller_symbol: None,
-            caller_file: file.to_string(),
-            kind: "call".into(),
-            short_name: Some(short.into()),
-            full_ref: Some(name.clone()),
-            module_path: None,
-            import_kind: None,
-            local_name: None,
-            requested_name: None,
-            namespace_alias: None,
-            wildcard: false,
-            line: 0,
-            byte_start: 0,
-            byte_end: 0,
-            dependencies: BTreeSet::new(),
-        };
         let resolved = if parse.language == "rust" {
+            let raw = super::RawRef {
+                ref_id: String::new(),
+                caller_node: None,
+                caller_symbol: None,
+                caller_file: file.to_string(),
+                kind: "call".into(),
+                short_name: Some(short.into()),
+                full_ref: Some(name.clone()),
+                module_path: None,
+                import_kind: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                line: 0,
+                byte_start: 0,
+                byte_end: 0,
+                dependencies: BTreeSet::new(),
+            };
             super::resolve_rust_target(index, file, &name, short, data, &raw)
         } else if parse.imports.iter().any(|import| {
             !import.type_only

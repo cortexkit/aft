@@ -3047,7 +3047,7 @@ fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) 
 }
 
 /// Extract the first line of a node as its signature.
-pub(crate) fn extract_signature(source: &str, node: &Node) -> String {
+fn extract_signature(source: &str, node: &Node) -> String {
     let text = node_text(source, node);
     let first_line = text.lines().next().unwrap_or(text);
     // Trim trailing opening brace if present

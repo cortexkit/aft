@@ -78,7 +78,17 @@ pub(super) fn complete_symbols(
                 }
                 continue;
             }
-            let mut signature = crate::parser::extract_signature(source, &definition);
+            let header_end =
+                field(node, &["body"]).map_or(definition.end_byte(), |body| body.start_byte());
+            let header = source
+                .get(definition.start_byte()..header_end)
+                .unwrap_or_default();
+            let mut signature = header
+                .lines()
+                .next()
+                .unwrap_or(header)
+                .trim_end()
+                .to_string();
             crate::parser::truncate_signature(&mut signature);
             positions.insert(key, symbols.len());
             symbols.push(Symbol {

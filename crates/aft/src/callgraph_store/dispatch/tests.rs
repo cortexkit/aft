@@ -172,6 +172,13 @@ fn typescript_object_definitions_are_graph_only() {
             "{name}"
         );
     }
+    let run = data
+        .symbol_metadata
+        .iter()
+        .find(|(name, _)| name.ends_with("::run"))
+        .unwrap()
+        .1;
+    assert_eq!(run.signature.as_deref(), Some("run()"));
     assert!(data
         .calls_by_symbol
         .iter()

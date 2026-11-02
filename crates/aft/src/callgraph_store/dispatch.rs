@@ -156,6 +156,16 @@ pub(crate) fn typescript_objects_from_data(
     parse
         .refs
         .retain(|reference| site_ordinals.contains(&reference.ordinal));
+    // Site hints already own the binding information. The retained join data
+    // needs symbol positions and ref offsets, not signatures or caller copies.
+    for symbol in &mut parse.symbols {
+        symbol.signature = None;
+    }
+    for reference in &mut parse.refs {
+        reference.caller_symbol = None;
+        reference.short_name = None;
+        reference.full_ref = None;
+    }
     parse.dispatch = facts;
     Some(parse)
 }
@@ -687,13 +697,19 @@ pub fn extract(
         }) {
             continue;
         }
+        // TypeScript dispatch uses declaration owners, not structural method
+        // signatures (the latter are compared only for Go interface matching).
         facts.methods.push(MethodHint {
             owner,
             trait_name,
             name: symbol.name.clone(),
             symbol: symbol.scoped_name.clone(),
             has_body: field(node, &["body"]).is_some(),
-            shape: method_shape(node, source),
+            shape: if typescript::supported(language) {
+                String::new()
+            } else {
+                method_shape(node, source)
+            },
             private: text(node, source)
                 .split('{')
                 .next()
@@ -740,7 +756,11 @@ pub fn extract(
                 name,
                 symbol,
                 has_body: field(*node, &["body"]).is_some(),
-                shape: method_shape(*node, source),
+                shape: if typescript::supported(language) {
+                    String::new()
+                } else {
+                    method_shape(*node, source)
+                },
                 private: text(*node, source)
                     .split('{')
                     .next()
