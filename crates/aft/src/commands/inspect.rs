@@ -1193,9 +1193,14 @@ fn handle_inspect_payload(
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
+                let reserve_reason = view_callgraph_observation
+                    .as_ref()
+                    .and_then(|(observation, _)| observation.unavailable_reason.as_ref())
+                    .filter(|reason| crate::view_storage_reserve::is_message(reason));
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
                     JobOutcome::Stale { .. } => "cached analysis freshness could not be verified".into(),
+                    _ if reserve_reason.is_some() => reserve_reason.unwrap().clone(),
                     _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),

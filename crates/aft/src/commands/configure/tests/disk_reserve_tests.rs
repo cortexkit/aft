@@ -158,13 +158,17 @@ fn disk_reserve_callgraph_routes_use_the_approved_sentence() {
     let answer = crate::commands::inspect::handle_inspect(&inspect, &ctx);
     assert!(answer.success, "{:?}", answer.data);
     assert_eq!(answer.data["complete"], false);
-    assert!(
-        serde_json::to_string(&answer.data["summary"])
-            .unwrap()
-            .contains(MESSAGE),
-        "{:?}",
-        answer.data
-    );
+    for category in ["dead_code", "unused_exports"] {
+        assert_eq!(answer.data["summary"][category]["status"], "unavailable");
+        assert_eq!(
+            answer.data["summary"][category]["gaps"][0]["kind"],
+            "tier2_unavailable"
+        );
+        assert_eq!(
+            answer.data["summary"][category]["gaps"][0]["reason"],
+            MESSAGE
+        );
+    }
     assert!(
         !serde_json::to_string(&answer.data)
             .unwrap()
