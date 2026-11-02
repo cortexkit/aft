@@ -782,7 +782,10 @@ fn workspace_views_with_ready_children(busy_child: bool) {
                         .expect_err(
                             "an unbound child must not guess an identity while pins are unreadable",
                         );
-                assert!(error.contains("aft.db was busy at bind"), "{error}");
+                assert!(
+                    error.to_string().contains("aft.db was busy at bind"),
+                    "{error}"
+                );
                 eprintln!("parent child resolver before readiness: {error}");
                 lock
             });
