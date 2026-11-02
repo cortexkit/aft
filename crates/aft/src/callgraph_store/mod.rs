@@ -1756,12 +1756,16 @@ thread_local! {
 }
 
 mod dead_code_projection;
+
 #[cfg(test)]
 mod dispatch_narrowing_tests;
 #[cfg(test)]
 mod incremental_parity;
 #[cfg(test)]
 mod manifest_refresh_tests;
+#[cfg(test)]
+#[path = "../../tests/store_diet/harness.rs"]
+mod store_diet;
 
 #[cfg(test)]
 pub(crate) mod perf_tests;

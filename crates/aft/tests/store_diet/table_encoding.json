@@ -1,0 +1,1391 @@
+[
+  {
+    "table": "backend_file_state",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "backend",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "workspace_root",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "content_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "status",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "updated_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "blob_payloads",
+    "schema_statement": "sql-fdddb9c1e7c5d1f46c43",
+    "columns": [
+      {
+        "column": "full_key",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload_digest",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "payload_schema",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "blob_receipts",
+    "schema_statement": "sql-070cf069300e73d631d3",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "record",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "changed_view_paths",
+    "schema_statement": "sql-2e4911bc99a51f786206",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "derived_outputs",
+    "schema_statement": "sql-87e6e5f019237c9671e5",
+    "columns": [
+      {
+        "column": "scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "identity",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "published_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "dispatch_hints",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "method_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "caller_node",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "byte_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "byte_end",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "provenance",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "edges",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "edge_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "ref_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "source_node",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "target_node",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "target_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "target_symbol",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "provenance",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "emitted_view_rows",
+    "schema_statement": "sql-2e4911bc99a51f786206",
+    "columns": [
+      {
+        "column": "table_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "row_key",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "evidence_meta",
+    "schema_statement": "sql-911518fa35a03c6bdb4e",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "format_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "policy",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "family_free_usage",
+    "schema_statement": "sql-8d7e6a167b52a5aeeb52",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "free_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "measured_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "family_usage",
+    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "file_bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "measured_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "file_dependencies",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "dep_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "interned string id; decode text for comparisons and output"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "files",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "content_hash",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "mtime_ns",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "size",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "lang",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "is_dead_code_root",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "is_public_api",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "surface_fingerprint",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "indexed_at",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "source_identity",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "members",
+    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "columns": [
+      {
+        "column": "scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "view_dir",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "registered_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_bind_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "last_publish_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "state",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "missing_sweeps",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "meta",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "k",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "v",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "nodes",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "scoped_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "start_line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "start_col",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "end_line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "end_col",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "range_ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "signature",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "exported",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "is_default_export",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "is_type_like",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "is_callgraph_entry_point",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "provenance",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "is_test",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "pointer",
+    "schema_statement": "sql-ea3f88cecf2c089accee",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "generation",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "proof_meta",
+    "schema_statement": "sql-070cf069300e73d631d3",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "format_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "base_scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "identity_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "membership_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "object_format",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "head_tree",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "root",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "policy",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "receipts_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "readers",
+    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "columns": [
+      {
+        "column": "reader_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "label",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "registered_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "refs",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "ref_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "caller_node",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "caller_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "short_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "callee_last_segment",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "full_ref",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "module_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "import_kind",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "local_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "requested_name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "namespace_alias",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "wildcard",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "line",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "byte_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "byte_end",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "status",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      },
+      {
+        "column": "target_node",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "target_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "target_symbol",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "provenance",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "append-only vocabulary integer; compare/order by vocabulary text"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "registry_meta",
+    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "schema_version",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "gc_epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "resolution_config_fields",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "fields",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "staging_file_inventory",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "size",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "staging_ref_context",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "ref_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "content-derived 64-bit identity; retain full constructor inputs (identities.md)"
+      },
+      {
+        "column": "caller_symbol",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "interned string id; decode text for comparisons and output"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "stat_evidence",
+    "schema_statement": "sql-911518fa35a03c6bdb4e",
+    "columns": [
+      {
+        "column": "path",
+        "baseline_type": "BLOB",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "record",
+        "baseline_type": "BLOB",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "sweep_lease",
+    "schema_statement": "sql-d9d9a8a5a2a3c03167fe",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "epoch",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "acquired_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "sweep_schedule",
+    "schema_statement": "sql-3fe59cdef23b2d53637b",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "completed_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "type_ref_names",
+    "schema_statement": "sql-858e89d31fae88f7a81d",
+    "columns": [
+      {
+        "column": "name",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "usage_record",
+    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "columns": [
+      {
+        "column": "singleton",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "complete",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "measured_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": false
+  },
+  {
+    "table": "view_bindings",
+    "schema_statement": "sql-e19e7ddd1e58688991b5",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "compressed bytes of identical JSON"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_dispatch_dependencies",
+    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "dependency",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_dispatch_files",
+    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "facts_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "sites_digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "facts",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "type_target_trace",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "sites",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_dispatch_sites",
+    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "columns": [
+      {
+        "column": "caller_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "language",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "unresolved_receiver_sites",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "dynamic_member_sites",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "external",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_file_surfaces",
+    "schema_statement": "sql-e19e7ddd1e58688991b5",
+    "columns": [
+      {
+        "column": "file_path",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "payload",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "compressed bytes of identical JSON"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_module_digest_inputs",
+    "schema_statement": "sql-6dbf4fa20c677743072f",
+    "columns": [
+      {
+        "column": "input",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "digest",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_module_path_targets",
+    "schema_statement": "sql-6dbf4fa20c677743072f",
+    "columns": [
+      {
+        "column": "target",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "source",
+        "baseline_type": "TEXT",
+        "primary_key_position": 2,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "declared",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "present",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "indirect",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_sessions",
+    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "columns": [
+      {
+        "column": "session_id",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_pid",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "owner_start",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "opened_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_unknown_live",
+    "schema_statement": "sql-f8a44d8ade115b08429f",
+    "columns": [
+      {
+        "column": "caller_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "ordinal",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 2,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "target_file",
+        "baseline_type": "TEXT",
+        "primary_key_position": 3,
+        "encoding": "interned string id; decode text for comparisons and output"
+      },
+      {
+        "column": "target_symbol",
+        "baseline_type": "TEXT",
+        "primary_key_position": 4,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  },
+  {
+    "table": "view_usage",
+    "schema_statement": "sql-6aa0ab025f97072480fc",
+    "columns": [
+      {
+        "column": "scope",
+        "baseline_type": "TEXT",
+        "primary_key_position": 1,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "bytes",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "held",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      },
+      {
+        "column": "measured_at_ms",
+        "baseline_type": "INTEGER",
+        "primary_key_position": 0,
+        "encoding": "unchanged"
+      }
+    ],
+    "graph_data": true
+  }
+]
