@@ -526,7 +526,7 @@ impl WriterFrame {
             header.corr,
             header.flags,
             result,
-            policy,
+            policy.clone(),
             limit,
         )?;
         Ok(Some((projected.0, projected.1, policy, limit)))
@@ -1127,7 +1127,7 @@ impl ToolResponsePolicy {
         }
     }
 
-    fn include_structured(self) -> bool {
+    fn include_structured(&self) -> bool {
         !matches!(self.trust, BindTrust::Untrusted) && !self.model_only
     }
 
