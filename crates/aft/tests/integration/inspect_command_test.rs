@@ -10152,6 +10152,7 @@ fn scoped_rust_inspect_keeps_certified_compiler_errors_without_a_matching_docume
             &ctx,
         );
         assert!(response.success, "{response:?}");
+        crate::test_helpers::admission::settle(&ctx);
         configure_fake_rust_lsp(&ctx);
         for flag in [
             "AFT_FAKE_LSP_PULL",
