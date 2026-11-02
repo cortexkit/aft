@@ -9,6 +9,9 @@ use tree_sitter::Node;
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
+#[path = "dispatch/typescript.rs"]
+mod typescript;
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
     pub types: Vec<TypeHint>,
@@ -159,9 +162,14 @@ const FUNCTIONS: &[&str] = &[
     "method_declaration",
     "function_signature_item",
     "arrow_function",
+    "function_expression",
+    "generator_function",
     "lambda_expression",
 ];
 fn named(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some((_, name)) = typescript::object_member(node, source) {
+        return Some(name);
+    }
     field(node, &["name"])
         .or_else(|| {
             node.named_children(&mut node.walk()).find(|n| {
@@ -171,6 +179,11 @@ fn named(node: Node<'_>, source: &str) -> Option<String> {
         .map(|name| text(name, source).to_string())
 }
 fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option<String>)> {
+    if typescript::supported(language) {
+        if let Some((object, _)) = typescript::object_member(node, source) {
+            return Some((typescript::object_identity(object), None));
+        }
+    }
     if language == "rust" {
         if let Some(implementation) = enclosing(node, &["impl_item"]) {
             return Some((
@@ -386,6 +399,11 @@ pub fn extract(
             .or_insert(node);
     }
     let mut facts = DispatchFacts::default();
+    let ts_objects =
+        typescript::supported(language).then(|| typescript::Objects::new(&all, source, parse));
+    if let Some(objects) = &ts_objects {
+        objects.extract(&mut facts);
+    }
     if language == "rust" {
         for node in &all {
             if node.kind() == "field_declaration" {
@@ -498,6 +516,12 @@ pub fn extract(
         let Some((owner, trait_name)) = owner(node, source, language) else {
             continue;
         };
+        if ts_objects.as_ref().is_some_and(|objects| {
+            typescript::object_member(node, source)
+                .is_some_and(|(object, name)| !objects.unambiguous_member(object, &name))
+        }) {
+            continue;
+        }
         facts.methods.push(MethodHint {
             owner,
             trait_name,
@@ -667,6 +691,11 @@ pub fn extract(
             continue;
         }
         let receiver = receiver_node.and_then(|receiver| {
+            if let Some(objects) = &ts_objects {
+                if let Some(ty) = objects.receiver(receiver, call) {
+                    return Some(ty);
+                }
+            }
             receiver_type(
                 receiver,
                 call,
@@ -925,7 +954,14 @@ fn receiver_type<'tree>(
     }
     match language {
         "typescript" | "tsx" | "javascript" | "java" | "csharp" | "kotlin" if value == "this" => {
-            return current_owner
+            if current_owner
+                .as_ref()
+                .is_some_and(|name| name.starts_with("@object:"))
+                && function.kind() != "method_definition"
+            {
+                return None;
+            }
+            return current_owner;
         }
         "python" if value == "self" => return current_owner,
         "python" if value == "cls" => {
