@@ -357,7 +357,9 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     let function = if binding.kind() == "function_declaration" {
                         binding
                     } else if binding.kind() == "variable_declarator" {
-                        if field(binding, &["name"]).is_none_or(|n| n.kind() != "identifier") {
+                        if binding.start_byte() >= call.start_byte()
+                            || field(binding, &["name"]).is_none_or(|n| n.kind() != "identifier")
+                        {
                             return None;
                         }
                         unwrap(field(binding, &["value"])?)

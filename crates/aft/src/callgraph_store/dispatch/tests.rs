@@ -230,7 +230,10 @@ fn typescript_object_ambiguous_or_mutated_values_do_not_gain_edges() {
         "const value = { run: () => this.other(), other() {} };",
     ] {
         let parse = parse(source, "typescript");
-        assert!(resolutions(&parse).iter().all(|r| r.targets.is_empty()), "{source}\n{parse:#?}");
+        let producer = self::parse("export function make() { return { run() {} }; }", "typescript");
+        let mut resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parse), ("producer.ts".into(), &producer)]));
+        resolver.type_targets.insert(("fixture".into(), "make".into()), ("producer.ts".into(), "make".into()));
+        assert!(parse.dispatch.sites.iter().all(|site| resolver.resolve("fixture", site).targets.is_empty()), "{source}\n{parse:#?}");
     }
 }
 

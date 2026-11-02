@@ -49,7 +49,33 @@ impl<'a> ObjectDispatch<'a> {
         let data = parse
             .file_data(file)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        // The lazy index normally loads imports only for re-extracted callers.
+        // This pass reparses callers independently, so install their import
+        // module targets before asking the ordinary export resolver to bind a
+        // factory name.
+        if let Some(mut file_index) = self.index.file_index(file).map(|index| (*index).clone()) {
+            let lazy = self.index.lazy.as_ref().unwrap();
+            let facts = lazy.fact_paths();
+            for import in &parse.imports {
+                file_index.module_targets.insert(
+                    import.module_path.clone(),
+                    module_ref_target(
+                        &self.root,
+                        file,
+                        "import",
+                        &import.module_path,
+                        &lazy.module_resolution_memo,
+                        &facts,
+                        &|path| lazy.contains_file(path),
+                    ),
+                );
+            }
+            self.index.files.insert(file.to_string(), file_index);
+        }
         let targets = join::resolve_dispatch_type_names(&self.index, file, &parse, &data);
+        if let Some(error) = self.index.take_lazy_load_error() {
+            return Err(error.into());
+        }
         self.targets.extend(
             targets
                 .iter()
