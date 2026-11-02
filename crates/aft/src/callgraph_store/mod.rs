@@ -17765,6 +17765,9 @@ fn resolve_rust_target<I: ResolverIndex>(
             }
         }
     }
+    if full_ref.contains('.') {
+        return None;
+    }
     if short_name.ends_with('!') && !full_ref.contains("::") {
         if index.node_for_symbol(caller_file, short_name).is_some() {
             return Some((
@@ -20956,55 +20959,60 @@ fn rust_bound_dispatch_candidate(
             .binding(&reference.receiver, start)?
             .initializer
             .as_ref()?;
-        let rust_bindings::Initializer::Call { callee, bytes } = initializer else {
-            return None;
-        };
-        let (file, symbol): (String, String) = tx.query_row(
+        if let rust_bindings::Initializer::Nominal(name) = initializer {
+            rust_type_binding(index, &reference.caller_file, name, &data, &raw)?
+        } else {
+            let rust_bindings::Initializer::Call { callee, bytes } = initializer else {
+                return None;
+            };
+            let (file, symbol): (String, String) = tx.query_row(
             "SELECT r.target_file, r.target_symbol FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
             params![reference.caller_file, bytes.start, bytes.end, callee],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional().ok().flatten()?;
-        let parsed = parsed_dispatch_source_for_file(
-            project_root,
-            &file,
-            "rust",
-            LangId::Rust,
-            source_cache,
-        )?;
-        let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
-        let declaration_byte = declaration.bytes.start;
-        let declaration_line = declaration.line;
-        let declaration_owner = declaration.owner.clone();
-        let return_type = declaration.return_type.as_deref()?.to_string();
-        if return_type == "Self" {
-            let owner = declaration_owner?;
-            let target = format!("{owner}::{}", reference.method_name);
-            if let Some(candidate) = rust_exact_dispatch_candidate(tx, &file, &target) {
-                return Some(candidate);
+            let parsed = parsed_dispatch_source_for_file(
+                project_root,
+                &file,
+                "rust",
+                LangId::Rust,
+                source_cache,
+            )?;
+            let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+            let declaration_byte = declaration.bytes.start;
+            let declaration_line = declaration.line;
+            let declaration_owner = declaration.owner.clone();
+            let return_type = declaration.return_type.as_deref()?.to_string();
+            if return_type == "Self" {
+                let owner = declaration_owner?;
+                let target = format!("{owner}::{}", reference.method_name);
+                if let Some(candidate) = rust_exact_dispatch_candidate(tx, &file, &target) {
+                    return Some(candidate);
+                }
+                (file, owner)
+            } else {
+                // A declared trait-object return binds the contract, not an arbitrary
+                // implementation whose method happens to have the same name.
+                let trait_name = return_type.strip_prefix("&dyn ")?;
+                if !receiver_is_bare_identifier(trait_name) {
+                    return None;
+                }
+                let return_data =
+                    rust_dispatch_data(project_root, &file, source_cache, data_cache)?;
+                let mut declaration_raw = raw.clone();
+                declaration_raw.caller_file = file.clone();
+                declaration_raw.caller_symbol = Some(symbol.clone());
+                declaration_raw.line = declaration_line;
+                declaration_raw.byte_start = declaration_byte;
+                declaration_raw.byte_end = declaration_raw.byte_start;
+                let binding =
+                    rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
+                return rust_exact_dispatch_candidate(
+                    tx,
+                    &binding.0,
+                    &format!("{}::{}", binding.1, reference.method_name),
+                );
             }
-            (file, owner)
-        } else {
-            // A declared trait-object return binds the contract, not an arbitrary
-            // implementation whose method happens to have the same name.
-            let trait_name = return_type.strip_prefix("&dyn ")?;
-            if !receiver_is_bare_identifier(trait_name) {
-                return None;
-            }
-            let return_data = rust_dispatch_data(project_root, &file, source_cache, data_cache)?;
-            let mut declaration_raw = raw.clone();
-            declaration_raw.caller_file = file.clone();
-            declaration_raw.caller_symbol = Some(symbol.clone());
-            declaration_raw.line = declaration_line;
-            declaration_raw.byte_start = declaration_byte;
-            declaration_raw.byte_end = declaration_raw.byte_start;
-            let binding =
-                rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
-            return rust_exact_dispatch_candidate(
-                tx,
-                &binding.0,
-                &format!("{}::{}", binding.1, reference.method_name),
-            );
         }
     };
     let suffix = format!(" for {}::{}", binding.1, reference.method_name);
@@ -34277,11 +34285,60 @@ impl Other { pub fn qualified(self) -> Self { self } }
                 .collect::<rusqlite::Result<BTreeSet<_>>>()
                 .unwrap()
         };
+        let legacy_rows = rows(legacy.sqlite_path());
+        let view_rows = rows(&view);
+        if legacy_rows != view_rows {
+            let conn = Connection::open(&view).unwrap();
+            let mut facts = conn
+                .prepare("SELECT file_path,facts FROM view_dispatch_files")
+                .unwrap();
+            eprintln!(
+                "dispatch facts: {:?}",
+                facts
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            );
+        }
         assert_eq!(
-            rows(legacy.sqlite_path()),
-            rows(&view),
+            legacy_rows, view_rows,
             "exact declaration edges differ between graph producers"
         );
+    }
+
+    #[test]
+    fn rust_study_unit_struct_receiver_is_not_a_wildcard_imported_function() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "unit-receiver-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"
+pub trait Reporter { fn report(&self); }
+pub struct Console;
+impl Reporter for Console { fn report(&self) {} }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reports() { let reporter = Console; reporter.report(); }
+}
+"#,
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Reporter for Console::report",
+            "src/lib.rs",
+            "tests::reports",
+        );
+        assert!(store
+            .direct_callers_of(Path::new("src/lib.rs"), "Reporter::report")
+            .unwrap()
+            .is_empty());
+        assert_rust_exact_view_parity(root, &store);
     }
 
     #[test]

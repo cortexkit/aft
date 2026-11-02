@@ -1062,6 +1062,14 @@ fn receiver_type<'tree>(
         return match binding.initializer.as_ref()? {
             Initializer::Nominal(name) => Some(type_name(name)),
             Initializer::Call { callee, .. } => {
+                if let Some((ty, "new")) = callee.split_once("::") {
+                    if bindings.declaration(callee).is_some_and(|declaration| {
+                        declaration.return_type.as_deref() == Some("Self")
+                            && declaration.owner.as_deref() == Some(ty)
+                    }) {
+                        return Some(type_name(ty));
+                    }
+                }
                 let expression = if let Some(member) = callee
                     .strip_prefix("self.")
                     .or_else(|| callee.strip_prefix("Self::"))

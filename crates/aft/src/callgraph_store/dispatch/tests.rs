@@ -390,7 +390,7 @@ fn trait_and_go_interface_fanout_and_rust_generic_bound_forms() {
         let parsed = parse(source, "rust");
         let result = resolutions(&parsed);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].targets.len(), 3, "{:#?}", parsed.dispatch);
+        assert_eq!(result[0].targets.len(), 3, "{:#?}\nsymbols: {:#?}", parsed.dispatch, parsed.symbols);
         assert_eq!(result[0].targets.iter().filter(|t| t.provenance == "dispatch").count(), 2);
         assert_eq!(result[0].targets.iter().filter(|t| t.provenance == "exact").count(), 1);
     }

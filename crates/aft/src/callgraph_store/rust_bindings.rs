@@ -337,4 +337,12 @@ mod tests {
             index("struct Item; impl Item { fn new() -> Self { Self } fn new() -> Self { Self } }");
         assert!(index.declaration("Item::new").is_none());
     }
+
+    #[test]
+    fn distinct_trait_implementations_keep_distinct_declarations() {
+        let index = index("trait I { fn m(&self); } struct A; struct B; impl I for A { fn m(&self) {} } impl I for B { fn m(&self) {} }");
+        assert!(index.declaration("I::m").is_some());
+        assert!(index.declaration("I for A::m").is_some());
+        assert!(index.declaration("I for B::m").is_some());
+    }
 }
