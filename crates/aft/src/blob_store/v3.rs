@@ -1124,6 +1124,15 @@ fn with_floor_reclaim<T>(
         Err(Error::Refused("device_free_space_floor")) => {}
         result => return result,
     }
+    // An unopened family has nothing to reclaim. Keep the read-only
+    // preflight's guarantee that a refused first write creates no store.
+    if !family_dir(storage, family)?
+        .join("members.sqlite")
+        .try_exists()
+        .unwrap_or(false)
+    {
+        return Err(Error::Refused("device_free_space_floor"));
+    }
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let owned_lock;
     let lock = match lock {
