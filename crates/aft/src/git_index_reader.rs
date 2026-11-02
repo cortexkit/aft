@@ -726,7 +726,7 @@ impl GitQueries {
         #[cfg(test)]
         if let Some((path, before)) = index_before {
             let after = crate::views::verification::NativeStat::strict_read(&path).ok();
-            if before != after || result.is_err() {
+            if before != after || !result.as_ref().is_ok_and(|output| output.status.success()) {
                 eprintln!("Git query {args:?} at {:?}: {result:?}; index {path:?}: old={before:?}; new={after:?}", self.root);
             }
         }

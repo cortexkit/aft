@@ -2139,7 +2139,7 @@ mod tests {
 
         for root in [&main, &linked] {
             for name in ["a.ts", "b.ts", "package.json", "notes.md"] {
-                std::fs::File::open(root.join(name))
+                std::fs::File::options().write(true).open(root.join(name))
                     .unwrap()
                     .set_times(std::fs::FileTimes::new().set_modified(
                         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
@@ -2198,11 +2198,15 @@ mod tests {
         // A store with only the worktree builds the same base cold.
         drop((main_view, linked_view));
         let cold_storage = temp.path().join("cold-storage");
+        let before = super::super::verification::BindGuard::capture(&linked, None).unwrap();
         let cold_view = view(&linked, &cold_storage);
         assert_eq!(
             callers(&cold_view.reader().unwrap(), "a.ts", "target"),
             patched
         );
+        let after = super::super::verification::BindGuard::capture(&linked, None).unwrap();
+        eprintln!("cold linked checkout old={before:?}; new={after:?}");
+        assert_eq!(before, after);
         assert!(!events(&base_dir(&cold_storage, &linked))
             .iter()
             .any(|event| matches!(event, DonorEvent::Cloned(_))));
