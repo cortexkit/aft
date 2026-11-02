@@ -18,11 +18,22 @@ use std::path::Path;
 /// What a file under a member view is charged: the bytes it holds alone where
 /// the filesystem can report them, otherwise `allocated`, its `stat` charge.
 /// Never more than `allocated`.
-#[cfg(test)]
+#[cfg(any(test, not(target_os = "macos")))]
 pub(super) fn charge(path: &Path, allocated: u64) -> u64 {
-    measure(path, allocated).0
+    #[cfg(target_os = "macos")]
+    {
+        measure(path, allocated).0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        #[cfg(test)]
+        let _profile = super::work_profile::span("private_size_measurement");
+        allocated
+    }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn measure(path: &Path, allocated: u64) -> (u64, bool) {
     #[cfg(test)]
     let _profile = super::work_profile::span("private_size_measurement");
@@ -35,16 +46,16 @@ pub(super) fn measure(path: &Path, allocated: u64) -> (u64, bool) {
     match measured {
         Some(bytes) => (bytes.min(allocated), true),
         // A failed native probe must be retried even if metadata is unchanged.
-        None => (allocated, !cfg!(target_os = "macos")),
+        None => (allocated, false),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 thread_local! {
     static PRIVATE_BYTES: std::cell::RefCell<Option<Box<dyn Fn(&Path) -> Option<u64>>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(super) fn with_private_bytes_for_test<T>(
     probe: impl Fn(&Path) -> Option<u64> + 'static,
     body: impl FnOnce() -> T,
@@ -109,11 +120,6 @@ fn private_bytes(path: &Path) -> Option<u64> {
     }
     let private_size = reply.private_size;
     u64::try_from(private_size).ok()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn private_bytes(_path: &Path) -> Option<u64> {
-    None
 }
 
 #[cfg(test)]

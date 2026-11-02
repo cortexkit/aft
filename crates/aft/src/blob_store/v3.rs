@@ -38,6 +38,7 @@ mod connections;
 pub(crate) use connections::FillConnections;
 mod copy;
 mod initialization;
+#[cfg(target_os = "macos")]
 mod inventory;
 #[cfg(test)]
 mod layout_gate;
@@ -479,7 +480,14 @@ pub fn allocated_bytes(path: &Path) -> Result<u64> {
 pub fn allocated_bytes_until(path: &Path, deadline: Option<Instant>) -> Result<Option<u64>> {
     #[cfg(test)]
     let _profile = work_profile::span("namespace_walk");
-    inventory::measure(path, deadline)
+    #[cfg(target_os = "macos")]
+    {
+        inventory::measure(path, deadline)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        walk_stat_allocated(path, deadline, Level::Family)
+    }
 }
 
 /// Where a walk is inside a family directory.
@@ -517,6 +525,7 @@ impl Level {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn walk_allocated(
     path: &Path,
     root: &Path,
@@ -545,10 +554,7 @@ fn walk_allocated(
                 hook(&path);
             }
         });
-        // Windows directory entries already contain size and type. Reopening a
-        // name here can fail with access denied while it is being deleted; use
-        // the listed size as a conservative charge until the next measurement.
-        // On Unix this still stats without following symlinks. Vanished entries
+        // Stat without following symlinks. Vanished entries
         // occupy no bytes; other errors must leave accounting unknown.
         let meta = match entry.metadata() {
             Ok(meta) => meta,
@@ -581,6 +587,65 @@ fn walk_allocated(
         }
     }
     Ok(true)
+}
+
+// Without a private-size probe every charge comes directly from the metadata
+// already needed by the walk. Keep that path free of cache keys and inventories.
+#[cfg(not(target_os = "macos"))]
+fn walk_stat_allocated(
+    path: &Path,
+    deadline: Option<Instant>,
+    level: Level,
+) -> Result<Option<u64>> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)
+        .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
+    {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        WALK_DELAY.with(|delay| {
+            if !delay.get().is_zero() {
+                std::thread::sleep(delay.get());
+            }
+        });
+        let entry =
+            entry.map_err(|e| crate::views::io::at("reading v3 accounting entry", path, e))?;
+        let path = entry.path();
+        #[cfg(test)]
+        WALK_BEFORE_STAT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&path);
+            }
+        });
+        // Windows directory entries already contain size and type. Reopening a
+        // name here can fail with access denied while it is being deleted; use
+        // the listed size as a conservative charge until the next measurement.
+        // On Unix this still stats without following symlinks. Vanished entries
+        // occupy no bytes; other errors must leave accounting unknown.
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(
+                    crate::views::io::at("reading v3 accounting metadata", &path, error).into(),
+                )
+            }
+        };
+        if meta.is_dir() {
+            let child = level.child(&entry.file_name());
+            let Some(bytes) = walk_stat_allocated(&path, deadline, child)? else {
+                return Ok(None);
+            };
+            total = total.saturating_add(bytes);
+        } else if level == Level::Member && meta.is_file() {
+            total = total.saturating_add(unshared::charge(&path, file_allocated(&meta)));
+        } else {
+            total = total.saturating_add(file_allocated(&meta));
+        }
+    }
+    Ok(Some(total))
 }
 
 /// The bytes one non-directory entry is charged in the namespace inventory.

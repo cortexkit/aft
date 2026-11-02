@@ -264,7 +264,7 @@ mod tests {
         fs::write(&survivor, [1; 4096]).unwrap();
         fs::write(&sibling, [1; 4096]).unwrap();
         let probe_sibling = sibling.clone();
-        // Model APFS's private-size change on unlink on every test platform.
+        // Model APFS's private-size change on unlink independently of the native probe.
         // The native APFS test below also checks the real filesystem query.
         unshared::with_private_bytes_for_test(
             move |_| Some(if probe_sibling.exists() { 0 } else { 4096 }),

@@ -5982,6 +5982,7 @@ mod v3_store_tests {
                 profile.get("connection_open").unwrap().0 <= 3,
                 "{profile:?}"
             );
+            #[cfg(target_os = "macos")]
             if pass == 1 {
                 assert!(
                     !profile.contains_key("private_size_measurement"),

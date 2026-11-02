@@ -4,6 +4,23 @@ use tempfile::tempdir;
 
 const A: &str = "0123456789abcdef";
 const B: &str = "fedcba9876543210";
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn stat_only_measurement_recharges_unchanged_members_without_an_inventory_cache() {
+    let root = tempdir().unwrap();
+    let member = root.path().join("views/worker");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(member.join("payload"), [7; 8192]).unwrap();
+    let first = allocated_bytes(root.path()).unwrap();
+    let charges = work_profile::count("private_size_measurement");
+    assert_eq!(allocated_bytes(root.path()).unwrap(), first);
+    // The stat-only path charges the listed metadata on every visit, rather
+    // than storing or looking up a file identity and a cached charge.
+    assert_eq!(work_profile::count("private_size_measurement"), charges + 1);
+    assert_eq!(work_profile::count("getattrlist_call"), 0);
+}
+
 pub(crate) struct SerialTestGuard {
     _unlimited: UnlimitedFreeSpaceForTestProcess,
     _serial: MutexGuard<'static, ()>,
