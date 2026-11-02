@@ -986,6 +986,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
     let width = end.to_string().len();
     for (offset, line) in lines[start..end].iter().enumerate() {
         let line_number = start + offset + 1;
@@ -1003,6 +1004,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         output_bytes = output_bytes.saturating_add(display.len());
         if output_bytes > MAX_BYTES {
             truncated_by_size = true;
+            read_output_tail = Some(output.len());
             output.push_str(&format!(
                 "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                 MAX_BYTES / 1024
@@ -1024,6 +1026,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
             "start_line": start_line,
             "end_line": actual_end,
             "truncated": truncated,
+            "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
     )
@@ -1652,6 +1655,7 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .copied()
                     .unwrap_or(first_line);
                 data.insert("content".into(), Value::String(rendering.text));
+                data.remove("read_output_tail");
                 data.insert(
                     "requested_path".into(),
                     Value::String(rendering.requested_path),
@@ -1668,6 +1672,7 @@ fn handle_read_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             crate::hashline::snapshot::ReadPublication::Tagless { rendering, reason } => {
                 if !rendering.text.is_empty() {
                     data.insert("content".into(), Value::String(rendering.text));
+                    data.remove("read_output_tail");
                 }
                 data.insert(
                     "requested_path".into(),
@@ -2199,6 +2204,7 @@ fn render_text_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
 
     let line_num_width = format!("{}", end_idx).len();
 
@@ -2244,6 +2250,7 @@ fn render_text_read(
             truncated_by_size = true;
             // Add truncation notice
             if !skip_render {
+                read_output_tail = Some(output.len());
                 output.push_str(&format!(
                     "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                     MAX_BYTES / 1024
@@ -2271,6 +2278,7 @@ fn render_text_read(
             "start_line": start_line,
             "end_line": actual_end,
             "truncated": has_more,
+            "read_output_tail": read_output_tail,
             "byte_size": byte_size,
         }),
     )
@@ -2506,6 +2514,7 @@ fn handle_streaming_range_read(
     let mut output_bytes = 0usize;
     let mut lines_read = 0u32;
     let mut truncated_by_size = false;
+    let mut read_output_tail = None;
     let line_num_width = format!("{}", requested_start_idx + selected_lines.len()).len();
 
     for (i, line) in selected_lines.iter().enumerate() {
@@ -2525,6 +2534,7 @@ fn handle_streaming_range_read(
         output_bytes += display_line.len();
         if output_bytes > MAX_BYTES {
             truncated_by_size = true;
+            read_output_tail = Some(output.len());
             output.push_str(&format!(
                 "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
                 MAX_BYTES / 1024
@@ -2540,6 +2550,7 @@ fn handle_streaming_range_read(
     let has_more = requested_start_idx > 0 || has_more_after_range;
     let truncated = has_more || truncated_by_size || scan_gap;
     if scan_gap {
+        read_output_tail.get_or_insert(output.len());
         output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
     }
 
@@ -2552,6 +2563,7 @@ fn handle_streaming_range_read(
         "start_line": start_line,
         "end_line": actual_end,
         "truncated": truncated,
+        "read_output_tail": read_output_tail,
         "byte_size": byte_size as usize,
     });
     if let Some(total_lines) = exact_total_lines {

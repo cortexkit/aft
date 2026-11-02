@@ -516,6 +516,9 @@ pub(crate) fn cap_with_scope(
         }
         return;
     }
+    if cap_read(response, text).is_some() {
+        return;
+    }
     let total = text.len();
     let existing = response.data.get("output_path").and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
@@ -577,6 +580,69 @@ pub(crate) fn cap_with_scope(
     } else {
         render_cut_with_data(text, &trailer, &envelope, &response.data);
     }
+}
+
+/// Read already supplies a recovery footer. Reclaim whole source lines for its
+/// marked tail and finalization notices instead of saving another copy of the file.
+fn cap_read(response: &Response, text: &mut String) -> Option<()> {
+    let data = std::iter::once(&response.data)
+        .chain(response.data.get("details"))
+        .find(|data| {
+            data.get("read_output_tail")
+                .is_some_and(serde_json::Value::is_u64)
+        })?;
+    let content = data.get("content")?.as_str()?;
+    let body_end = usize::try_from(data["read_output_tail"].as_u64()?).ok()?;
+    let body = content.get(..body_end)?;
+    let native_tail = content.get(body_end..)?;
+    let start = text.find(content)?;
+    let after_content = start + content.len();
+    let paging = crate::subc_format::format_read_footer(false, data);
+    let has_paging = !paging.is_empty() && text[after_content..].starts_with(&paging);
+    let after_paging = after_content + if has_paging { paging.len() } else { 0 };
+    let mut appended = &text[after_paging..];
+    let fixed_bytes = start + native_tail.len() + if has_paging { paging.len() } else { 0 };
+    let remaining = TEXT_LIMIT.checked_sub(fixed_bytes)?;
+    if appended.len() > remaining {
+        // If notices alone exceed the budget, retain their whole-line suffix
+        // (including the status bar) after the read recovery text.
+        let excess = appended.len() - remaining;
+        let skip = appended.as_bytes()[excess..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(appended.len(), |newline| excess + newline + 1);
+        appended = &appended[skip..];
+    }
+    let allowance = remaining - appended.len();
+    let end = body.as_bytes()[..allowance.min(body.len())]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let kept = body[..end].lines().count();
+    let mut visible_data = data.clone();
+    visible_data["lines_read"] = kept.into();
+    let first = data.get("start_line")?.as_u64()?;
+    visible_data["end_line"] = (first + kept.saturating_sub(1) as u64).into();
+    let mut tail = native_tail.to_string();
+    if data
+        .get("scan_gap")
+        .is_some_and(serde_json::Value::is_string)
+    {
+        tail = tail.replacen(
+            &format!("\nshown {} of ", data["lines_read"]),
+            &format!("\nshown {kept} of "),
+            1,
+        );
+    }
+    if has_paging {
+        tail.push_str(&crate::subc_format::format_read_footer(
+            false,
+            &visible_data,
+        ));
+    }
+    tail.push_str(appended);
+    text.replace_range(start + end.., &tail);
+    Some(())
 }
 
 fn save_failed_trailer(total: usize, reason: &str) -> String {
@@ -1186,6 +1252,125 @@ mod tests {
             text.lines().filter(|row| row.starts_with("shown ")).count(),
             1
         );
+        assert!(!text.contains("[output cut"));
+        assert!(ctx.output_files().files.lock().is_empty());
+    }
+
+    #[test]
+    fn tool_output_cap_read_keeps_native_footer_with_long_reminders_and_status() {
+        for (ranged, artifact) in [(false, false), (true, false), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let ctx = context(temp.path(), &temp.path().join("store"));
+            let source: String = (1..=2000)
+                .map(|line| format!("line-{line}-{}\n", "界".repeat(27)))
+                .collect();
+            let path = if artifact {
+                let scope = OutputScope::new(&ctx, "owner", None);
+                scope.files.save(&scope, &source).unwrap()
+            } else {
+                let path = temp.path().join("huge.txt");
+                std::fs::write(&path, &source).unwrap();
+                path
+            };
+            let files_before = ctx.output_files().files.lock().len();
+            let mut params = json!({"file":path});
+            if ranged {
+                params["start_line"] = 31.into();
+                params["end_line"] = 2000.into();
+            }
+            let request = crate::protocol::RawRequest {
+                id: "read-cap".into(),
+                command: "read".into(),
+                lsp_hints: None,
+                session_id: Some("owner".into()),
+                params,
+            };
+            let response = crate::commands::read::handle_read(&request, &ctx);
+            assert!(response.success, "{response:?}");
+            let original_data = response.data.clone();
+            let mut text = crate::subc_format::format_response("read", &response, ranged);
+            let notices = format!(
+                "\n<system-reminder>\n{}</system-reminder>\nstatus bar",
+                "long completion reminder\n".repeat(800)
+            );
+            text.push_str(&notices);
+            assert!(text.len() > TEXT_LIMIT);
+            cap(&ctx, "owner", "read", &response, &mut text);
+
+            assert!(text.len() <= TEXT_LIMIT, "{} bytes", text.len());
+            assert!(text.ends_with(&notices));
+            assert!(!text.contains("[output cut"));
+            assert_eq!(ctx.output_files().files.lock().len(), files_before);
+            assert_eq!(response.data, original_data);
+
+            let rows: Vec<_> = text
+                .lines()
+                .take_while(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+                .collect();
+            assert!(!rows.is_empty());
+            let first = if ranged { 31 } else { 1 };
+            for (index, row) in rows.iter().enumerate() {
+                let (number, content) = row.trim_start().split_once(": ").unwrap();
+                let number: usize = number.parse().unwrap();
+                assert_eq!(number, first + index);
+                assert_eq!(content, source.lines().nth(number - 1).unwrap());
+            }
+            let last = first + rows.len() - 1;
+            assert!(last < response.data["end_line"].as_u64().unwrap() as usize);
+            let last_row = *rows.last().unwrap();
+            let tail = &text[text.find(last_row).unwrap() + last_row.len() + 1..];
+            if artifact || !ranged {
+                assert!(tail.starts_with(
+                    "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
+                ));
+            }
+            if ranged && !artifact {
+                assert!(tail.starts_with(&format!("\nshown {} of at least ", rows.len())));
+                assert!(
+                    tail.contains("(line or response scan budget) · narrow: start_line/end_line;")
+                );
+            }
+            if !ranged {
+                assert!(tail.contains(&format!(
+                    "\n(Showing lines 1-{last} of 2000. Use startLine/endLine or offset/limit to read other sections.)"
+                )));
+            }
+
+            let next = crate::protocol::RawRequest {
+                params: json!({"file":path, "start_line":last + 1,"end_line":last + 1}),
+                ..request
+            };
+            let next_response = crate::commands::read::handle_read(&next, &ctx);
+            assert!(next_response.success, "{next_response:?}");
+            assert_eq!(
+                next_response.data["content"],
+                format!("{}: {}\n", last + 1, source.lines().nth(last).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn tool_output_cap_read_keeps_recovery_when_notices_alone_exceed_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let response = Response::success(
+            "id",
+            json!({
+                "content":"1: first\n... (output truncated at 50KB, use start_line/end_line to read sections)\n",
+                "read_output_tail":9,"lines_read":1,"start_line":1,"end_line":1,
+                "total_lines":2000,"truncated":true
+            }),
+        );
+        let mut text = crate::subc_format::format_response("read", &response, false);
+        text.push_str(&"界".repeat(TEXT_LIMIT));
+        text.push_str("\nstatus bar");
+        cap(&ctx, "owner", "read", &response, &mut text);
+        assert!(text.len() <= TEXT_LIMIT);
+        assert!(text.starts_with(
+            "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
+        ));
+        assert!(text.contains("Use startLine/endLine or offset/limit to read other sections."));
+        assert!(text.ends_with("\nstatus bar"));
         assert!(!text.contains("[output cut"));
         assert!(ctx.output_files().files.lock().is_empty());
     }

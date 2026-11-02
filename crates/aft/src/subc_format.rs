@@ -1841,7 +1841,7 @@ fn format_attachment_size(bytes: u64) -> String {
     }
 }
 
-fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
+pub(crate) fn format_read_footer(agent_specified_range: bool, data: &Value) -> String {
     if agent_specified_range {
         return String::new();
     }
