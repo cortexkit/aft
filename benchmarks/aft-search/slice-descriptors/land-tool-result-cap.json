@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/lib.rs"
+  ],
+  "slices": [
+    "tool-result-cap"
+  ],
+  "note": "The only ranking fence hit is crates/aft/src/lib.rs, which declares the new tool_output module. The cap applies after rendering and only to replies over 50 KB; aft_search replies in the benchmark are far smaller, so ranked rows must remain byte-identical to the committed reference. Scoring and routing are unchanged."
+}
