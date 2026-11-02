@@ -13932,6 +13932,80 @@ fn assert_no_preaccepted_local_run(registry: &BgTaskRegistry, task_id: &str) {
 }
 
 #[tokio::test]
+async fn runon_preaccepted_separate_interruptions_each_get_a_recovery_window() {
+    use crate::exec_remote::wire_tests::SubmissionOutage;
+    let (_dir, daemon, registry, task_id) =
+        preaccepted_recovery_fixture(SubmissionOutage::Repeated).await;
+    daemon.restore();
+    let task = registry.task(&task_id).unwrap();
+    wait_for(
+        "the recovered stream must report placement progress",
+        || {
+            let state = task.state.lock().unwrap();
+            state.remote_admission_note.is_some().then_some(())
+        },
+    )
+    .await;
+    {
+        let mut state = task.state.lock().unwrap();
+        assert!(!state.metadata.remote.as_ref().unwrap().accepted);
+        // Age the live submission by an hour without waiting in real time.
+        // Any uncleared interruption timestamp ages with it, reproducing a
+        // second outage long after the first recovery window would expire.
+        let elapsed = 60 * 60 * 1000;
+        state.metadata.started_at -= elapsed;
+        let submission = state
+            .metadata
+            .remote
+            .as_mut()
+            .unwrap()
+            .submission
+            .as_mut()
+            .unwrap();
+        submission.created_at_ms -= elapsed;
+        if let Some(started) = &mut submission.recovery_started_at_ms {
+            *started -= elapsed;
+        }
+        registry.persist_task(&task.paths, &state.metadata).unwrap();
+    }
+    let refused_before = *daemon.refused_connects.borrow();
+    daemon.interrupt_submission();
+    wait_for(
+        "the second interruption must retry, not reuse the expired first window",
+        || {
+            let snapshot = registry.observed_status(&task_id, "session", 0).unwrap();
+            assert!(
+                !snapshot.info.status.is_terminal(),
+                "second interruption was abandoned: {snapshot:?}"
+            );
+            (*daemon.refused_connects.borrow() > refused_before).then_some(())
+        },
+    )
+    .await;
+    daemon.restore();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let saved = read_task(&task.paths.json).unwrap();
+    let submission = saved.remote.unwrap().submission.unwrap();
+    assert_eq!(
+        (submission.recovery_started_at_ms, submission.attempts),
+        (None, 0),
+        "successful recovery must durably retire both its deadline and attempts"
+    );
+    let runs = daemon.methods("exec.run");
+    assert_eq!(
+        runs.len(),
+        3,
+        "one dispatch and one keyed recovery per interruption"
+    );
+    assert_eq!(runs[0]["params"], runs[1]["params"]);
+    assert_eq!(runs[1]["params"], runs[2]["params"]);
+    assert_eq!(daemon.methods("exec.attach").len(), 1);
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"AB");
+    assert_no_preaccepted_local_run(&registry, &task_id);
+}
+
+#[tokio::test]
 async fn runon_preaccepted_route_reopens_after_long_admission_wait() {
     use crate::exec_remote::wire_tests::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =

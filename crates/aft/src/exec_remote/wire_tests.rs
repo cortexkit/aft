@@ -1069,6 +1069,7 @@ pub(crate) struct OutageDaemon {
     release_held: Arc<tokio::sync::Notify>,
     up: Arc<std::sync::atomic::AtomicBool>,
     finish_job: Arc<tokio::sync::Notify>,
+    interrupt_submission: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -1083,6 +1084,11 @@ impl OutageDaemon {
     /// Complete the running job, even if no caller is attached yet.
     pub(crate) fn finish_job(&self) {
         self.finish_job.notify_one();
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn interrupt_submission(&self) {
+        self.interrupt_submission.notify_one();
     }
 
     /// Hold the next connection's catalog request unanswered until
@@ -1172,6 +1178,7 @@ pub(crate) enum SubmissionOutage {
     Accepted,
     NeverAccepted,
     Ambiguous,
+    Repeated,
 }
 
 #[cfg(unix)]
@@ -1215,7 +1222,9 @@ async fn outage_daemon_with(
     let release_held = Arc::new(tokio::sync::Notify::new());
     let up = Arc::new(AtomicBool::new(true));
     let finish_job = Arc::new(tokio::sync::Notify::new());
-    let submission = Arc::new(Mutex::new((None::<Value>, false)));
+    let interrupt_submission = Arc::new(tokio::sync::Notify::new());
+    let server_interrupt_submission = interrupt_submission.clone();
+    let submission = Arc::new(Mutex::new((None::<Value>, false, 0)));
     let server_finish_job = finish_job.clone();
     let (server_log, server_refused, server_up, server_key) = (
         log.clone(),
@@ -1248,6 +1257,7 @@ async fn outage_daemon_with(
                 server_release.clone(),
             );
             let finish_job = server_finish_job.clone();
+            let interrupt_submission = server_interrupt_submission.clone();
             let submission = submission.clone();
             connections.spawn(async move {
                 if subc_transport::authenticate_server(
@@ -1285,6 +1295,7 @@ async fn outage_daemon_with(
                     };
                     let mut replies = Vec::new();
                     let mut drop_route = false;
+                    let mut hold_submission = false;
                     match header.ty {
                         FrameType::Hello => replies.push(reply(
                             FrameType::HelloAck,
@@ -1306,7 +1317,11 @@ async fn outage_daemon_with(
                                 }
                                 // A provider that is restarting is absent from the catalog.
                                 let modules = if up.load(Ordering::SeqCst) {
-                                    json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":["exec-remote/v1", "exec-remote-submission-key/v1"], "requires":[]}}])
+                                    let mut claims = vec!["exec-remote/v1", "exec-remote-submission-key/v1"];
+                                    if matches!(submission_answer, Some(SubmissionOutage::Repeated)) {
+                                        claims.push(PROGRESS_CAPABILITY);
+                                    }
+                                    json!([{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}])
                                 } else {
                                     refused.send_modify(|count| *count += 1);
                                     json!([])
@@ -1330,6 +1345,7 @@ async fn outage_daemon_with(
                                         if let Some(original) = &saved.0 {
                                             if request["submission_key"] == original["submission_key"] {
                                                 assert_eq!(request, original, "keyed recovery must repeat the frozen request");
+                                                saved.2 += 1;
                                                 match answer {
                                                     SubmissionOutage::Accepted => {
                                                         // Recovery identifies the existing job. Its records
@@ -1346,6 +1362,16 @@ async fn outage_daemon_with(
                                                     SubmissionOutage::Ambiguous => {
                                                         replies.push(record(&StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::OutcomeUnknown, 0, 0, 0))));
                                                     }
+                                                    SubmissionOutage::Repeated if saved.2 == 1 => {
+                                                        // A recovered subscription can still be waiting for
+                                                        // placement, without a runner-assigned job ID.
+                                                        assert_eq!(request["progress"], true);
+                                                        replies.push(record(&StreamRecord::Progress(Progress::new(ProgressPhase::PlacementWait, 0, None).unwrap())));
+                                                        hold_submission = true;
+                                                    }
+                                                    SubmissionOutage::Repeated => {
+                                                        replies.push(record(&StreamRecord::Accepted(Accepted::new(id(), 1).with_attached(true))));
+                                                    }
                                                 }
                                             } else {
                                                 assert!(matches!(answer, SubmissionOutage::NeverAccepted));
@@ -1360,7 +1386,9 @@ async fn outage_daemon_with(
                                                 }
                                                 replies.push(record(&StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0).with_ran(Ran::Remote))));
                                             }
-                                            replies.push(frame_of(FrameType::StreamEnd, vec![]));
+                                            if !hold_submission {
+                                                replies.push(frame_of(FrameType::StreamEnd, vec![]));
+                                            }
                                         } else {
                                             saved.0 = Some(request.clone());
                                             // The request reached the executor provider, but its caller saw no
@@ -1433,6 +1461,13 @@ async fn outage_daemon_with(
                             return;
                         }
                     }
+                    if hold_submission {
+                        interrupt_submission.notified().await;
+                        up.store(false, Ordering::SeqCst);
+                        let error = reply(FrameType::Error, json!({"code":"outcome_unknown", "message":"route closed by subc"}));
+                        let _ = subc_transport::write_frame(&mut writer, &error).await;
+                        return;
+                    }
                     if body["method"] == "exec.attach" && matches!(replay, OutageReplay::Running) {
                         finish_job.notified().await;
                         let terminal = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0)
@@ -1485,6 +1520,7 @@ async fn outage_daemon_with(
         release_held,
         up,
         finish_job,
+        interrupt_submission,
         server,
         _dir: dir,
     }
