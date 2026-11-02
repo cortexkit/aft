@@ -5,6 +5,14 @@ mod shared;
 pub(crate) use shared::settle;
 
 pub(crate) fn prepare_project(ctx: &crate::context::AppContext, root: &std::path::Path) {
+    prepare(ctx, root, true);
+}
+
+pub(crate) fn prepare_folder(ctx: &crate::context::AppContext, root: &std::path::Path) {
+    prepare(ctx, root, false);
+}
+
+fn prepare(ctx: &crate::context::AppContext, root: &std::path::Path, project_required: bool) {
     assert!(crate::folder_admission_runtime::snapshot(ctx).is_none());
     let root = root.canonicalize().unwrap();
     let mut config = (*ctx.config()).clone();
@@ -14,15 +22,19 @@ pub(crate) fn prepare_project(ctx: &crate::context::AppContext, root: &std::path
         ..Default::default()
     };
     let mut decision = crate::folder_admission::probe(&root, &config.project_detection, budgets);
-    if decision.classification != crate::folder_admission::FolderClassification::Project {
+    if project_required
+        && decision.classification != crate::folder_admission::FolderClassification::Project
+    {
         crate::test_project::mark_project(&root).unwrap();
         decision = crate::folder_admission::probe(&root, &config.project_detection, budgets);
     }
-    assert_eq!(
-        decision.classification,
-        crate::folder_admission::FolderClassification::Project,
-        "project fixture was not admitted: {decision:?}"
-    );
+    if project_required {
+        assert_eq!(
+            decision.classification,
+            crate::folder_admission::FolderClassification::Project,
+            "project fixture was not admitted: {decision:?}"
+        );
+    }
     // Seed only the classifier's decision. Index loaders and configure tail
     // stages must still start through the handler and gates under test.
     // A prior checkout's persisted observation is not part of this setup.

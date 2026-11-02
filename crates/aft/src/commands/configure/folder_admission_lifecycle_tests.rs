@@ -90,6 +90,26 @@ fn folder_admission_off_notice_is_pinned_byte_for_byte() {
 }
 
 #[test]
+fn stale_configure_maintenance_preserves_a_replayed_session_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(storage.path());
+    assert!(ctx.note_configure_session_binding(root.path().to_path_buf(), "session".into()));
+    let earlier = ctx.configure_generation();
+    ctx.configure_generation_flag()
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(!ctx.note_configure_session_binding(root.path().to_path_buf(), "session".into()));
+    ctx.forget_configure_session_binding_for_generation(root.path(), "session", earlier);
+    assert!(ctx.has_configure_session_binding(root.path(), "session"));
+    ctx.forget_configure_session_binding_for_generation(
+        root.path(),
+        "session",
+        ctx.configure_generation(),
+    );
+    assert!(!ctx.has_configure_session_binding(root.path(), "session"));
+}
+
+#[test]
 fn folder_admission_replay_does_not_force_a_callgraph_generation() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -609,7 +629,10 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
         assert!(ctx.search_index().read().unwrap().is_none());
         assert!(!ctx.root_too_broad());
         assert!(admission::workspace_watcher_allowed(&ctx));
-        assert!(!ctx.watcher_runtime_active());
+        assert_eq!(
+            ctx.watcher_runtime_active(),
+            !super::file_watcher_disabled_for_test()
+        );
         let session = crate::views::parent::session_for_root(root.path()).unwrap();
         assert!(session.wait_rounds(1, Duration::from_secs(30)));
         let grep = crate::commands::grep::handle_grep(
@@ -637,6 +660,15 @@ fn folder_admission_workspace_views_serve_children_without_a_parent_index() {
             0
         );
         assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        settle(&ctx);
+        assert!(ctx.root_too_broad());
+        assert!(!admission::workspace_watcher_allowed(&ctx));
+        assert!(!ctx.watcher_runtime_active());
+        assert_eq!(
+            admission::snapshot(&ctx).unwrap()["recursive_watcher"],
+            "off"
+        );
         crate::views::parent::deactivate(root.path());
     });
 }

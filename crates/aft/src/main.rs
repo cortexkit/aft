@@ -1810,10 +1810,9 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
             }
             // The SQLite open keeps its own bounded retry budget. Allow worker
             // scheduling time as well, without retrying the tool operation.
-            ctx.wait_for_standalone_database_runtime(
-                &database_command,
-                std::time::Instant::now() + Duration::from_secs(15),
-            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            ctx.wait_for_standalone_database_runtime(&database_command, deadline);
+            ctx.wait_for_standalone_session_replay(req.session(), deadline);
         }
         if aft::executor::current_job_cancelled() {
             let _ = tx.send(cancelled_deferred_response(&req.id, &req.command));

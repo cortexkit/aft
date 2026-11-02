@@ -4994,7 +4994,8 @@ pub struct AppContext {
     /// The configure-tail stage running on this root and when it started, or
     /// `None` between units. Read by the pending-bind diagnostics.
     configure_tail_stage: parking_lot::Mutex<Option<(&'static str, Instant)>>,
-    configured_session_roots: parking_lot::Mutex<BTreeMap<(PathBuf, String), u64>>,
+    /// Latest bind generation and whether configure restored the session's saved bash tasks.
+    configured_session_roots: parking_lot::Mutex<BTreeMap<(PathBuf, String), (u64, bool)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
     // 0: never configured, 1: opening, 2: ready, 3: failed,
@@ -7304,10 +7305,13 @@ impl AppContext {
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
         #[cfg(test)]
         record_configure_bind_effect_for_test(&root, &session_id, ConfigureBindEffect::Session);
-        self.configured_session_roots
-            .lock()
-            .insert((root, session_id), self.configure_generation())
-            .is_none()
+        let generation = self.configure_generation();
+        let mut bindings = self.configured_session_roots.lock();
+        let key = (root, session_id);
+        let ready = bindings
+            .get(&key)
+            .is_some_and(|&(previous, ready)| previous == generation && ready);
+        bindings.insert(key, (generation, ready)).is_none()
     }
 
     pub(crate) fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
@@ -7336,9 +7340,51 @@ impl AppContext {
         let mut bindings = self.configured_session_roots.lock();
         // Admission replays configure before an earlier maintenance job can be
         // retired. The old job must not erase the newer bind or its repeat observations.
-        if bindings.get(&key) == Some(&generation) {
+        if bindings
+            .get(&key)
+            .is_some_and(|&(bound, _)| bound == generation)
+        {
             bindings.remove(&key);
             self.repeat_breaker.clear_session(session_id);
+        }
+    }
+
+    pub(crate) fn finish_configure_session_replay(&self, session_id: &str) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            return;
+        };
+        if let Some((generation, ready)) = self
+            .configured_session_roots
+            .lock()
+            .get_mut(&(root, session_id.to_owned()))
+        {
+            if *generation == self.configure_generation() {
+                *ready = true;
+            }
+        }
+    }
+
+    /// Admission can finish before configure restores saved bash tasks. A queued
+    /// task lookup or completion drain must not overtake that session replay.
+    pub fn wait_for_standalone_session_replay(&self, session_id: &str, deadline: Instant) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            return;
+        };
+        let key = (root, session_id.to_owned());
+        while self.database_runtime_state.load(Ordering::Acquire) == 2
+            && self
+                .configured_session_roots
+                .lock()
+                .get(&key)
+                .is_some_and(|&(generation, ready)| {
+                    generation == self.configure_generation() && !ready
+                })
+            && Instant::now() < deadline
+        {
+            if crate::executor::current_job_cancelled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -15065,6 +15111,16 @@ impl AppContext {
         thread_live && self.watcher_rx.lock().is_some()
     }
 
+    pub(crate) fn try_watcher_runtime_active(&self) -> Option<bool> {
+        let _runtime_guard = self.watcher_runtime_lock.try_lock()?;
+        let thread_live = self
+            .watcher_thread
+            .try_lock()?
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished());
+        Some(thread_live && self.watcher_rx.try_lock()?.is_some())
+    }
+
     /// Return whether artifact eviction would discard work that still needs a
     /// live handle. Callers use this as the single safety gate before clearing
     /// resident stores and inspect caches.
@@ -20590,6 +20646,7 @@ mod callgraph_store_for_ops_tests {
 
     fn configure_context(project_root: &Path, storage_dir: &Path) -> AppContext {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        crate::test_admission::prepare_folder(&ctx, project_root);
         let response = crate::commands::configure::handle_configure(
             &configure_request_with_params(json!({
                 "project_root": project_root,

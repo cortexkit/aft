@@ -22,12 +22,14 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, harness: &str
         .to_string(),
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
-    aft.wait_for_folder_admission();
 }
 
 fn configured_aft(project: &Path, storage: &Path, harness: &str) -> AftProcess {
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project, storage, harness);
+    if project.join(".git").exists() {
+        aft.wait_for_folder_admission();
+    }
     aft
 }
 
@@ -807,6 +809,7 @@ fn provisional_bind_then_finalize(path_pin: bool) -> String {
     // The same bind again, from the same session: it must not take the
     // equivalent-configure shortcut, so it reads the pin and finalizes.
     configure(&mut aft, &fixture.root, storage, "opencode");
+    aft.wait_for_folder_admission();
     assert!(
         !degraded_reasons(&mut aft).contains(&PROVISIONAL_REASON.to_string()),
         "a finalizing bind clears the provisional reason"

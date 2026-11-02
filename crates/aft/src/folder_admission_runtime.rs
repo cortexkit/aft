@@ -807,19 +807,21 @@ fn snapshot_binding(binding: &Binding, watcher_active: bool) -> Value {
 }
 
 pub(crate) fn snapshot(ctx: &AppContext) -> Option<Value> {
+    let watcher_active = ctx.watcher_runtime_active();
     ctx.folder_admission()
         .binding
         .lock()
         .as_ref()
-        .map(|binding| snapshot_binding(binding, ctx.watcher_runtime_active()))
+        .map(|binding| snapshot_binding(binding, watcher_active))
 }
 
 pub(crate) fn try_snapshot(ctx: &AppContext) -> Option<Value> {
+    let watcher_active = ctx.try_watcher_runtime_active()?;
     ctx.folder_admission()
         .binding
         .try_lock()?
         .as_ref()
-        .map(|binding| snapshot_binding(binding, ctx.watcher_runtime_active()))
+        .map(|binding| snapshot_binding(binding, watcher_active))
 }
 
 fn reply_snapshot(ctx: &AppContext) -> Option<Value> {
@@ -837,7 +839,6 @@ pub(crate) fn workspace_watcher_allowed(ctx: &AppContext) -> bool {
     ctx.folder_admission()
         .workspace_allowed
         .load(Ordering::Acquire)
-        && ctx.config().views.enabled
 }
 
 pub(crate) fn reason(ctx: &AppContext) -> Option<String> {
@@ -960,7 +961,7 @@ pub(crate) fn commit(
         );
         state.workspace_allowed.store(
             !binding.pending
-                && ctx.config().views.enabled
+                && binding.requested.views.enabled
                 && ctx.cache_unavailable_reason().is_none()
                 && binding
                     .decision

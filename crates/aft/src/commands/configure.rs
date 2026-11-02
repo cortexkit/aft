@@ -5176,7 +5176,7 @@ fn handle_configure_inner(
     {
         ctx.reset_symbol_cache();
     }
-    if root_too_broad {
+    if root_too_broad || (workspace && !next_config.views.enabled) {
         ctx.stop_watcher_runtime();
         crate::views::parent::release_context(ctx);
     }
@@ -8147,6 +8147,7 @@ fn replay_configure_session_parts(
     {
         slog_warn!("failed to replay background bash tasks: {error}");
     }
+    ctx.finish_configure_session_replay(session_id);
 }
 
 fn forget_configure_job_binding(ctx: &AppContext, job: &ConfigureMaintenanceJob) {
