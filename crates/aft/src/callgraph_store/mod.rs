@@ -20941,6 +20941,15 @@ fn rust_bound_dispatch_candidate(
             start,
         )?;
         let callee = initializer.child_by_field_name("function")?;
+        #[cfg(test)]
+        if reference.caller_symbol == "Manager::run" {
+            eprintln!(
+                "initializer {} {}..{}",
+                node_text(callee, &parsed.source),
+                initializer.start_byte(),
+                initializer.end_byte()
+            );
+        }
         let (file, symbol, end_line, end_col): (String, String, usize, usize) = tx.query_row(
             "SELECT r.target_file, r.target_symbol, n.end_line, n.end_col FROM refs r JOIN nodes n ON n.id=r.target_node
              WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
@@ -20971,6 +20980,10 @@ fn rust_bound_dispatch_candidate(
             &parsed.source,
         )
         .to_string();
+        #[cfg(test)]
+        if reference.caller_symbol == "Manager::run" {
+            eprintln!("return {file} {symbol} {return_type}");
+        }
         if return_type == "Self" {
             let (owner, _) = symbol.rsplit_once("::")?;
             let owner = owner.split_once(" for ").map_or(owner, |(_, ty)| ty);
@@ -20995,6 +21008,10 @@ fn rust_bound_dispatch_candidate(
             declaration_raw.byte_end = declaration_raw.byte_start;
             let binding =
                 rust_type_binding(index, &file, trait_name, &return_data, &declaration_raw)?;
+            #[cfg(test)]
+            if reference.caller_symbol == "Manager::run" {
+                eprintln!("trait binding {binding:?}");
+            }
             return rust_exact_dispatch_candidate(
                 tx,
                 &binding.0,
@@ -34272,6 +34289,36 @@ impl Other { pub fn qualified(self) -> Self { self } }
             "Analyzer for Generic::analyze",
             "src/lib.rs",
             "run",
+        );
+        let debug_conn = Connection::open(store.sqlite_path()).unwrap();
+        let mut debug_stmt = debug_conn.prepare("SELECT caller_file, full_ref, status, target_symbol, byte_start, byte_end FROM refs WHERE kind='call'").unwrap();
+        eprintln!(
+            "refs: {:?}",
+            debug_stmt
+                .query_map([], |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, usize>(4)?,
+                    r.get::<_, usize>(5)?
+                )))
+                .unwrap()
+                .collect::<Vec<_>>()
+        );
+        let mut debug_nodes = debug_conn.prepare("SELECT scoped_name, start_line, start_col, end_line, end_col FROM nodes WHERE file_path='src/lib.rs'").unwrap();
+        eprintln!(
+            "nodes: {:?}",
+            debug_nodes
+                .query_map([], |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, usize>(1)?,
+                    r.get::<_, usize>(2)?,
+                    r.get::<_, usize>(3)?,
+                    r.get::<_, usize>(4)?
+                )))
+                .unwrap()
+                .collect::<Vec<_>>()
         );
         assert_direct_caller(
             &store,
