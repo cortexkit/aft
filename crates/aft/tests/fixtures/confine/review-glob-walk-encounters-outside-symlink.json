@@ -2,6 +2,7 @@
   "id": "confine-vector",
   "success": true,
   "text": "1 file matching **/*.rs\n\nonly.rs",
+  "rendered_files": 1,
   "complete": true,
   "no_files_matched_scope": false,
   "skipped_foreign_mounts": 0,
