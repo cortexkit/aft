@@ -743,10 +743,13 @@ fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: 
     if unit == "files" {
         return crate::subc_format::visible_file_row_count(data, full, visible);
     }
+    let infer_from_text =
+        data.is_null() || data.as_object().is_some_and(|object| object.is_empty());
     let tree_rows = data
         .get("tree_list_envelope")
         .is_some_and(serde_json::Value::is_object)
-        || (unit == "items"
+        || (infer_from_text
+            && unit == "items"
             && full
                 .lines()
                 .filter_map(|line| line.strip_prefix("  ↳ "))
@@ -767,7 +770,7 @@ fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: 
         && (data
             .get("callers_list_envelope")
             .is_some_and(serde_json::Value::is_object)
-            || full.lines().any(|line| line.starts_with("  ↳ ")))
+            || (infer_from_text && full.lines().any(|line| line.starts_with("  ↳ "))))
     {
         return visible
             .lines()
@@ -819,9 +822,10 @@ fn visible_list_rows(data: &serde_json::Value, full: &str, visible: &str, tail: 
         && (data
             .get("details")
             .is_some_and(serde_json::Value::is_object)
-            || full.lines().any(|line| {
-                line.starts_with("Dead code:") || line.starts_with("diagnostics details")
-            }))
+            || (infer_from_text
+                && full.lines().any(|line| {
+                    line.starts_with("Dead code:") || line.starts_with("diagnostics details")
+                })))
     {
         return visible_inspect_rows(full, visible, tail);
     }
@@ -1272,6 +1276,7 @@ mod tests {
         let ctx = context(temp.path(), &temp.path().join("store"));
         for (key, row, weight) in [
             ("callers_list_envelope", "  ↳ run:9, 12\n", 2),
+            ("callers_list_envelope", "  ↳ operator []:9, 12\n", 2),
             (
                 "tree_list_envelope",
                 "  ↳ + 5 unresolved external calls: a, b\n",
