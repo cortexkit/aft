@@ -29,6 +29,10 @@ async function recordInstall(
   const trace = join(root, "argv.jsonl");
   const pids = join(root, "probe-pids");
   mkdirSync(bin);
+  writeFileSync(
+    join(bin, "package.json"),
+    JSON.stringify({ name: "npm", version: "11.6.0", bin: { npm: "npm" } }),
+  );
   mkdirSync(project);
   for (const name of ["main.py", "config.yaml", "main.sh"]) {
     writeFileSync(join(project, name), "fixture\n");

@@ -16590,7 +16590,7 @@ impl AppContext {
         // Mutating tools validate here, so a helper that is merely slow to be
         // scheduled must not refuse the user's change (see `MutationScope`).
         let _io = crate::bounded_io::enter_mutation();
-        self.validate_path_with_artifact_session(req_id, path, None, None)
+        self.validate_path_with_artifact_session(req_id, path, None, None, true)
     }
 
     /// Validate a write location without following its final path component.
@@ -16638,7 +16638,7 @@ impl AppContext {
             // is what gets checked, and the handler must touch the same one
             // rather than resolve the spelling against the daemon's cwd.
             let rooted = self.resolve_relative_path(path);
-            let identity = self.check_path_access(req_id, path, &rooted, None, None, true)?;
+            let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
             return Ok((rooted, identity));
         };
         let normalized = normalize_path(&path_for_resolution);
@@ -16668,7 +16668,7 @@ impl AppContext {
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        let identity = self.check_path_access(req_id, path, &resolved, None, None, true)?;
+        let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
         Ok((resolved, identity))
     }
 
@@ -16684,9 +16684,37 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_read_path_with_approval(req_id, session_id, path, true)
+    }
+
+    /// Apply the normal session read policy without entering an approval route.
+    /// Keep the caller's policy context intact, including plugin read exemptions,
+    /// but refuse a path that would require an outside-access ask.
+    pub(crate) fn validate_read_path_without_approval(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        self.validate_read_path_with_approval(req_id, session_id, path, false)
+    }
+
+    fn validate_read_path_with_approval(
+        &self,
+        req_id: &str,
+        session_id: &str,
+        path: &Path,
+        allow_approval: bool,
+    ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         self.output_files
             .restore(self, session_id, &self.resolve_relative_path(path));
-        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id), None);
+        let result = self.validate_path_with_artifact_session(
+            req_id,
+            path,
+            Some(session_id),
+            None,
+            allow_approval,
+        );
         if crate::context::confinement::for_request(req_id) {
             // Canonical targets and symlink destinations are private outside the
             // fence. Always report the caller's spelling, including on failure.
@@ -16703,7 +16731,13 @@ impl AppContext {
         path: &Path,
         search_tool: WorkerSearchTool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_path_with_artifact_session(req_id, path, Some(session_id), Some(search_tool))
+        self.validate_path_with_artifact_session(
+            req_id,
+            path,
+            Some(session_id),
+            Some(search_tool),
+            true,
+        )
     }
 
     /// Refuse `location` unless it lies under the resolved project root,
@@ -16745,6 +16779,7 @@ impl AppContext {
         path: &Path,
         artifact_session_id: Option<&str>,
         search_tool: Option<WorkerSearchTool>,
+        allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
@@ -16783,6 +16818,7 @@ impl AppContext {
                         artifact_session_id,
                         search_tool,
                         false,
+                        allow_approval,
                     )?;
                     return Ok(resolved);
                 }
@@ -16794,6 +16830,7 @@ impl AppContext {
                 artifact_session_id,
                 search_tool,
                 false,
+                allow_approval,
             )?;
             return Ok(rooted);
         };
@@ -16840,6 +16877,7 @@ impl AppContext {
             artifact_session_id,
             search_tool,
             false,
+            allow_approval,
         )?;
         Ok(resolved)
     }
@@ -17395,6 +17433,7 @@ impl AppContext {
         artifact_session: Option<&str>,
         search_tool: Option<WorkerSearchTool>,
         preserve_final: bool,
+        allow_approval: bool,
     ) -> Result<PathBuf, crate::protocol::Response> {
         use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
         if let Some(response) = self.worker_root_search_refusal(req_id, original, search_tool) {
@@ -17592,6 +17631,10 @@ impl AppContext {
                 crate::bounded_io::probe_access(req_id, &identity).map(|()| identity)
             }
             AccessDecision::Ask => {
+                if !allow_approval {
+                    let root = self.config().project_root.clone().unwrap_or_default();
+                    return Err(path_error_response(req_id, original, &root));
+                }
                 let operation = if preserve_final {
                     AccessOperation::Write
                 } else {

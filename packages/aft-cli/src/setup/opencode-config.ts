@@ -1,4 +1,5 @@
 import modernV1VersionText from "../../../../.github/opencode-version.txt" with { type: "text" };
+import { compareSemver } from "../lib/semver.js";
 
 export const AFT_OPENCODE_PACKAGE = "@cortexkit/aft-opencode";
 export const MODERN_V1_VERSION = modernV1VersionText.trim();
@@ -42,6 +43,43 @@ export function pinnedPluginEntry(version: string): string {
   return `${AFT_OPENCODE_PACKAGE}@${version}`;
 }
 
+// Approved by Ufuk. Keep the wording identical in diagnosis, planning, and repair.
+export const DOCTOR_NO_DOWNGRADE =
+  "This doctor is AFT <cli>; OpenCode is configured for AFT plugin <plugin>. Doctor will not downgrade that entry. Run doctor with a matching or newer CLI.";
+
+export function preserveDoctorPluginEntry(
+  cli: string,
+  entry: string | undefined,
+  installed?: string,
+): boolean {
+  const configured = entry ? exactPinnedVersion(entry) : null;
+  const configuredOrder = configured ? compareSemver(configured, cli) : undefined;
+  const installedOrder = installed ? compareSemver(installed, cli) : undefined;
+  if (installed && (installedOrder === undefined || installedOrder > 0)) return true;
+  if (configured && (configuredOrder === undefined || configuredOrder > 0)) return true;
+  // A bare registration gains this CLI's exact pin unless installed evidence
+  // above shows that pinning would replace a newer or unreadable installation.
+  if (entry === AFT_OPENCODE_PACKAGE) return false;
+  // A tag or range is not version evidence. An independently installed older
+  // version can establish an upgrade; an unresolved entry alone cannot.
+  return Boolean(entry && configuredOrder === undefined && installedOrder === undefined);
+}
+
+export function doctorNoDowngradeMessage(cli: string, entry?: string, installed?: string): string {
+  const configured = entry ? exactPinnedVersion(entry) : null;
+  const newerInstalled = installed && (compareSemver(installed, cli) ?? 1) > 0;
+  const plugin = newerInstalled
+    ? installed
+    : (configured ?? entry?.slice(AFT_OPENCODE_PACKAGE.length + 1)) || "unknown";
+  return DOCTOR_NO_DOWNGRADE.replace("<cli>", cli).replace("<plugin>", plugin);
+}
+
+export interface PluginVersionPolicy {
+  doctor?: boolean;
+  installedVersion?: string;
+  fallbackEntry?: string;
+}
+
 /**
  * Why an npm plugin entry other than this CLI's exact pin is a problem, as a
  * clause that follows "the plugin entry <entry>". Doctor's OpenCode section and
@@ -63,8 +101,8 @@ const EXACT_VERSION =
 /**
  * `@latest` or an exact version: the OpenCode 1 registrations doctor does not
  * report as a problem, because the host loads them correctly. `doctor --fix`
- * and setup still rewrite them to this CLI's exact version (the exact-pin
- * rule); only an entry with no version at all is reported.
+ * and setup can normalize their shape; doctor preserves a newer or unresolved
+ * version rather than assuming the invoking CLI is the newest release.
  */
 export function acceptV1Entry(entry: string): boolean {
   if (!entry.startsWith(`${AFT_OPENCODE_PACKAGE}@`)) return false;
@@ -191,8 +229,9 @@ export function ensurePinnedPluginConfig(
   version: string,
   hasLocalAftEntry: (entry: string) => boolean = () => false,
   generation: OpenCodeConfigGeneration = "unknown",
+  policy: PluginVersionPolicy = {},
 ): PluginConfigUpdate {
-  const entry = pinnedPluginEntry(version);
+  const entry = policy.fallbackEntry ?? pinnedPluginEntry(version);
   const key = openCodePluginKey(generation);
   const hadKey = Array.isArray(value[key]);
   const list = hadKey ? (value[key] as unknown[]) : [];
@@ -206,6 +245,30 @@ export function ensurePinnedPluginConfig(
 
   if (npmIndexes.length > 0) {
     const firstIndex = npmIndexes[0] as number;
+    if (
+      policy.doctor &&
+      npmIndexes.some((index) =>
+        preserveDoctorPluginEntry(
+          version,
+          pluginEntryPackage(list[index]) ?? undefined,
+          policy.installedVersion,
+        ),
+      )
+    ) {
+      let changed = false;
+      for (const index of npmIndexes) {
+        const spec = pluginEntryPackage(list[index]) as string;
+        const shaped = shapePluginEntry(key, spec, pluginEntryOptions(list[index]));
+        changed ||= !sameEntry(list[index], shaped);
+        list[index] = shaped;
+      }
+      return {
+        action: changed ? "updated" : "already_present",
+        changed,
+        entry: pluginEntryPackage(list[firstIndex]) as string,
+        key,
+      };
+    }
     const shaped = shapePluginEntry(key, entry, pluginEntryOptions(list[firstIndex]));
     const wasExact = sameEntry(list[firstIndex], shaped);
     list[firstIndex] = shaped;
@@ -236,6 +299,21 @@ export function ensurePinnedPluginConfig(
   // relocate; every other plugin's entry stays where the user wrote it.
   const sibling = value[otherOpenCodePluginKey(key)];
   const siblingList = Array.isArray(sibling) ? sibling : null;
+  if (policy.doctor && siblingList) {
+    const preserved = siblingList.find((candidate) => {
+      const spec = pluginEntryPackage(candidate);
+      return (
+        spec !== null &&
+        isAftNpmEntry(spec) &&
+        preserveDoctorPluginEntry(version, spec, policy.installedVersion)
+      );
+    });
+    const spec = pluginEntryPackage(preserved);
+    if (spec) {
+      list.push(shapePluginEntry(key, spec, pluginEntryOptions(preserved)));
+      return { action: "added", changed: true, entry: spec, key };
+    }
+  }
   const carried = siblingList ? findLocalAftEntry(siblingList, hasLocalAftEntry) : null;
   list.push(carried ? shapePluginEntry(key, carried.packageSpec, carried.options) : entry);
   if (carried && siblingList) siblingList.splice(carried.index, 1);
@@ -247,6 +325,7 @@ export function pluginConfigNeedsUpdate(
   version: string,
   hasLocalAftEntry: (entry: string) => boolean = () => false,
   generation: OpenCodeConfigGeneration = "unknown",
+  policy: PluginVersionPolicy = {},
 ): boolean {
   const key = openCodePluginKey(generation);
   const list = value[key];
@@ -257,9 +336,20 @@ export function pluginConfigNeedsUpdate(
     return packageSpec !== null && isAftNpmEntry(packageSpec);
   });
   if (npmEntries.length > 0) {
+    if (
+      policy.doctor &&
+      npmEntries.some((candidate) =>
+        preserveDoctorPluginEntry(
+          version,
+          pluginEntryPackage(candidate) ?? undefined,
+          policy.installedVersion,
+        ),
+      )
+    )
+      return npmEntries.some((candidate) => !pluginEntryFitsKey(candidate, key));
     return (
       npmEntries.length !== 1 ||
-      pluginEntryPackage(npmEntries[0]) !== pinnedPluginEntry(version) ||
+      pluginEntryPackage(npmEntries[0]) !== (policy.fallbackEntry ?? pinnedPluginEntry(version)) ||
       !pluginEntryFitsKey(npmEntries[0], key)
     );
   }

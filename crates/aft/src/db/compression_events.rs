@@ -614,12 +614,6 @@ fn apply_prepared_retention_tick_timed(
     let event_prune_started = Instant::now();
     let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
     crate::db::rich_ui::prune_presets(&tx, now_ms)?;
-    // Templates stay while any record references them; the tick removes the
-    // rest, keeping only digests the binary ships (none until publication).
-    crate::db::rich_ui::prune_orphaned_templates(
-        &tx,
-        &crate::db::rich_ui::shipped_template_digests(),
-    )?;
     let event_prune_micros = event_prune_started.elapsed().as_micros();
     let commit_started = Instant::now();
     tx.commit()?;

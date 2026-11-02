@@ -34,6 +34,12 @@ export interface PluginCacheInfo {
   /** An installed manifest could not be read; its binary version may still be in use. */
   readError?: string;
   latest?: string;
+  /** This CLI's repair target, not a registry lookup. */
+  cliVersion?: string;
+  manifestPath?: string;
+  version?: string;
+  versionSource?: "installed" | "configured" | "unknown";
+  local?: boolean;
   exists: boolean;
   /**
    * The npm registration the harness config holds for the plugin, exactly as
@@ -82,7 +88,7 @@ export interface HarnessAdapter {
    * Ensure the plugin is registered. May prompt, may run shell commands (Pi),
    * may edit config files (OpenCode). Idempotent.
    */
-  ensurePluginEntry(): Promise<PluginEntryResult>;
+  ensurePluginEntry(options?: { doctor?: boolean }): Promise<PluginEntryResult>;
 
   /**
    * Optional TUI-surface registration (OpenCode's tui.json(c) sidebar plugin).
@@ -90,7 +96,7 @@ export interface HarnessAdapter {
    * this entry itself, so removing the entry stays removed across launches.
    */
   hasTuiPluginEntry?(): boolean;
-  ensureTuiPluginEntry?(): Promise<PluginEntryResult>;
+  ensureTuiPluginEntry?(options?: { doctor?: boolean }): Promise<PluginEntryResult>;
   /**
    * Whether this host reads a TUI config entry at all. OpenCode 2 loads the
    * TUI plugin from the package's own entrypoint, so a missing tui.json entry

@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "land-semantic-fill-diagnostics"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. Test-only diagnostics: the meaning-search fill observer records the lane state and retry status at settlement, and the configure reconnect test prints them with the query gaps when its first fill check fails. All instrumentation is cfg(test). No search, ranking or routing code changes."
+}

@@ -56,7 +56,7 @@ pub(super) fn admit(identity: &RouteIdentity, envelope: &Value) -> Result<(), Er
     // Discovery is read-only too. Every other operation, including cancellation
     // and result retrieval, must name a tool in the closed allowlist.
     if let Some(name) = name {
-        if !matches!(name, "tool.catalog" | "role.describe") && !allowed(name) {
+        if !matches!(name, "tool.catalog" | "tool.views" | "role.describe") && !allowed(name) {
             return Err(ErrorBody::new(
                 "carrier_read_only",
                 REFUSAL_MESSAGE.replace("<tool>", name),

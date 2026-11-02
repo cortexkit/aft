@@ -56,8 +56,7 @@ fn save_row(f: &Fixture, layout: &ResolvedTask, task: &PersistedTask) {
     let row = task
         .to_bash_task_row(&harness.storage_segment(), &layout.paths)
         .unwrap();
-    crate::db::rich_ui::upsert_task_row_with_view(&f.ctx.db().unwrap().lock().unwrap(), &row, task)
-        .unwrap();
+    crate::db::bash_tasks::upsert_bash_task(&f.ctx.db().unwrap().lock().unwrap(), &row).unwrap();
 }
 
 pub(super) async fn query(f: &Fixture, id: &str, key: &str, extra: Value) -> Value {
@@ -157,7 +156,7 @@ async fn exchange_watch_received_at(
 async fn command_watch_late_admission_keeps_the_original_receipt_deadline() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("worker");
     let requester = principal(&f.policy).unwrap();
     seed(&f, TASK, &f.policy.session, requester, "call", true, false);
@@ -201,7 +200,7 @@ fn reopen(f: &Fixture) {
 async fn command_watch_matches_literal_and_regex_and_reports_exit() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for kind in ["head", "worker"] {
         let f = Fixture::new(kind);
         let requester = principal(&f.policy).unwrap();
@@ -239,7 +238,7 @@ async fn command_watch_matches_literal_and_regex_and_reports_exit() {
 async fn command_watch_polls_for_later_output_and_task_exit() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for exits in [false, true] {
         let f = Fixture::new("worker");
         let requester = principal(&f.policy).unwrap();
@@ -280,7 +279,7 @@ async fn command_watch_polls_for_later_output_and_task_exit() {
 async fn command_watch_clamps_timeout_and_does_not_recover_or_change_worker_window() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::with_config("worker", |config| config.bash.watch_sync_max_ms = 5000);
     let requester = principal(&f.policy).unwrap();
     let (layout, task) = seed(&f, TASK, &f.policy.session, requester, "call", true, false);
@@ -324,7 +323,7 @@ async fn command_watch_clamps_timeout_and_does_not_recover_or_change_worker_wind
 async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (dir, ctx, task) =
         crate::bash_background::registry::default_kill_tests::wait_fixture(Some(1950));
     let root = dir.path().canonicalize().unwrap();
@@ -394,7 +393,7 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
 async fn command_views_resolve_storage_segment_and_fresh_status_after_exit() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for kind in ["head", "worker"] {
         let f = Fixture::new(kind);
         let requester = principal(&f.policy).unwrap();
@@ -430,7 +429,7 @@ async fn command_views_resolve_storage_segment_and_fresh_status_after_exit() {
 async fn command_output_cursor_survives_reopen_and_uses_database_key() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("worker");
     let (layout, task) = seed(
         &f,
@@ -529,7 +528,7 @@ async fn command_output_cursor_survives_reopen_and_uses_database_key() {
 async fn command_views_refuse_foreign_minted_duplicates_and_erased_rows() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     for fault in ["foreign", "minted", "duplicate", "erased", "worker-owned"] {
         let f = Fixture::new("head");
         let requester = principal(&f.policy).unwrap();
@@ -589,7 +588,7 @@ async fn command_views_refuse_foreign_minted_duplicates_and_erased_rows() {
 async fn command_output_pty_has_no_stderr_and_keeps_escape_bytes() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
     seed(
         &f,
@@ -611,7 +610,7 @@ async fn command_output_pty_has_no_stderr_and_keeps_escape_bytes() {
 async fn command_output_reports_unknown_origin_for_trimmed_and_legacy_artifacts() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
     let (layout, _) = seed(
         &f,
@@ -654,7 +653,7 @@ async fn command_output_reports_unknown_origin_for_trimmed_and_legacy_artifacts(
 async fn command_status_observation_leaves_completion_for_agents_next_call() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
     let (layout, _) = seed(
         &f,
@@ -704,7 +703,7 @@ async fn command_status_observation_leaves_completion_for_agents_next_call() {
 async fn command_status_frame_keys_replay_only_the_carrier_frame_not_the_viewed_call() {
     let _storage_env = crate::test_env::without_storage_override();
     let _manifest =
-        super::super::super::chunks::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
+        super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let f = Fixture::new("head");
     let (layout, mut task) = seed(
         &f,

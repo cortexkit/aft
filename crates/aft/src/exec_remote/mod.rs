@@ -17,6 +17,7 @@ pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
 // Only the Unix remote-dispatch path filters environment names.
 #[cfg(unix)]
 pub(crate) use request::denied_environment_name;
+pub(crate) use request::SIBLINGS_REFUSAL;
 pub use request::{
     build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
     RETURN_TOTAL_CAP_BYTES,

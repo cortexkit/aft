@@ -22,6 +22,7 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
             false,
         ),
         ("connections.rs", include_str!("connections.rs"), false),
+        ("inventory.rs", include_str!("inventory.rs"), false),
         ("read_audit.rs", include_str!("read_audit.rs"), false),
         ("copy.rs", include_str!("copy.rs"), false),
         ("replay.rs", include_str!("replay.rs"), false),
@@ -48,6 +49,7 @@ fn native_sqlite_file_sets_have_no_out_of_band_content_access() {
         assert!(
             [
                 "connections",
+                "inventory",
                 "initialization",
                 "read_audit",
                 "replay",

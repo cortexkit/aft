@@ -17,10 +17,9 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { __test__ } from "../index.js";
 
 /** How long the process may live after its shutdown hook returned. */
@@ -73,12 +72,19 @@ function spawnHarness(
   const configDir = join(tempDir, "config");
   const npmMarker = join(tempDir, "npm.pid");
   mkdirSync(binDir, { recursive: true });
+  const npmRoot = join(binDir, "node_modules", "npm");
+  const npmCli = join(npmRoot, "bin", "npm-cli.js");
+  mkdirSync(join(npmRoot, "bin"), { recursive: true });
+  writeFileSync(
+    join(npmRoot, "package.json"),
+    JSON.stringify({ name: "npm", version: "10.9.2", bin: { npm: "bin/npm-cli.js" } }),
+  );
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(join(configDir, "cortexkit"), { recursive: true });
   // Only the install should sleep and record its PID. A stalled version probe
   // could overwrite the marker and make shutdown assertions check the wrong child.
-  linkCachedExecutable(
-    join(binDir, "npm"),
+  writeFileSync(
+    npmCli,
     [
       "#!/bin/sh",
       'if [ "$1" = "--version" ]; then echo 10.9.2; exit 0; fi',
@@ -87,7 +93,9 @@ function spawnHarness(
       "exec sleep 60",
       "",
     ].join("\n"),
+    { mode: 0o755 },
   );
+  symlinkSync(npmCli, join(binDir, "npm"));
   // A TypeScript project makes typescript-language-server relevant; pinning
   // its version and disabling the other relevant servers avoids registry lookups.
   writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");

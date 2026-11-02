@@ -2053,7 +2053,8 @@ impl CheckoutDriver {
                 ignore_fingerprint: ignore_fingerprint.clone(),
             },
             &self.base_claim,
-        );
+        )
+        .map_err(SiblingLoader::error)?;
         let resolved =
             match super::tree_base::resolve_preferring(tree_base, &route, &expected.scope) {
                 Ok(base) => base,
@@ -3356,6 +3357,10 @@ impl CheckoutDriver {
                 // intent row for reconciliation; the next job revalidates
                 // from disk.
                 self.retry.store(true, std::sync::atomic::Ordering::Release);
+                let reason = error.to_string();
+                if reason.contains(super::verification::POLICY_QUERY_UNDETERMINED) {
+                    return Err(SiblingLoader::error(reason));
+                }
                 Err(SiblingLoader::error(format!(
                     "{CHECKOUT_CHANGED_BEFORE_INSTALL}: v3 worker publication failed or may have landed; revalidate: {error}"
                 )))

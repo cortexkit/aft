@@ -36,9 +36,11 @@ import {
   cachedFileSha256Sync,
   isSafeVersion,
   lspNpmInstallInvocation,
+  lspNpmRefusal,
   lspPublicationCutoff,
   npmSpawnEnv,
   resolveNpm,
+  selectLspNpm,
   spawn,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
@@ -305,19 +307,28 @@ async function runInstall(
   // resolveNpm() handles discovery, npmSpawnEnv() makes npm's node sibling
   // reachable, and the shared policy safely routes Windows shims through cmd.exe
   // without enabling shell parsing on other platforms.
-  const npm = resolveNpm();
-  if (!npm) {
+  const preferredNpm = resolveNpm();
+  if (!preferredNpm) {
     warn(`[lsp] npm not found on PATH or known locations; cannot install ${target}`);
     return false;
   }
 
+  const selected = await selectLspNpm(preferredNpm, undefined, signal);
+  if (signal?.aborted) return false;
+  if (!selected.npm) {
+    warn(`[lsp] ${selected.refusal}`);
+    return false;
+  }
+  const npm = selected.npm;
   const invocation = await lspNpmInstallInvocation(npm, target, before);
   if (signal?.aborted) {
     warn(`[lsp] install ${target} aborted during npm capability probe`);
     return false;
   }
   if (!invocation) {
-    warn(`[lsp] npm cannot enforce the publication cutoff; cannot install ${target}`);
+    warn(
+      `[lsp] ${lspNpmRefusal(npm.command, "probe failed: cannot verify publication-cutoff support")}`,
+    );
     return false;
   }
   ensureInstallAnchor(cwd);
@@ -410,6 +421,9 @@ async function runInstall(
         log(`[lsp] installed ${target}`);
         finish(true);
       } else {
+        const rejectedOption = /--(?:no-save|before|ignore-scripts)\b/.exec(stderrBuf)?.[0];
+        if (rejectedOption)
+          warn(`[lsp] ${lspNpmRefusal(npm.command, `rejected option: ${rejectedOption}`)}`);
         error(
           `[lsp] install ${target} exited with code ${code}; last stderr:\n${stderrBuf.trim()}`,
         );

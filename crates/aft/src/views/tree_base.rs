@@ -226,16 +226,24 @@ fn prove_until(
     })
 }
 
-/// Resolves or builds the tree-keyed base of a fresh checkout. `None` means no
+/// Resolves or builds the tree-keyed base of a fresh checkout. `Ok(None)` means no
 /// tree-keyed base is available now (no proof, a busy or capped claim, a
 /// refused admission or a failed build); the caller then takes its
-/// membership-keyed path unchanged. A claim this call keeps is left in
-/// `claim_slot` for the caller to retire, as for membership-keyed builds.
+/// membership-keyed path unchanged. An undetermined policy instead asks the
+/// caller to retry without publishing under unknown conversion rules.
+/// A claim this call keeps is left in `claim_slot` for the caller to retire,
+/// as for membership-keyed builds.
 pub(crate) fn bootstrap(
     input: TreeBaseInput<'_>,
     claim_slot: &Mutex<Option<BuildClaim>>,
-) -> Option<AuthenticatedBase> {
-    try_bootstrap(input, claim_slot).ok()
+) -> Result<Option<AuthenticatedBase>, String> {
+    match try_bootstrap(input, claim_slot) {
+        Ok(base) => Ok(Some(base)),
+        Err(reason) if reason.contains(super::verification::POLICY_QUERY_UNDETERMINED) => {
+            Err(reason)
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 /// [`bootstrap`] with the reason a tree-keyed base is unavailable.

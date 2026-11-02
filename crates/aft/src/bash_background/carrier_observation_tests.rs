@@ -127,7 +127,7 @@ fn carrier_status_skips_head_worker_and_unscoped_project_fallbacks() {
     let row = metadata
         .to_bash_task_row("opencode", &layout.paths)
         .unwrap();
-    crate::db::rich_ui::upsert_task_row_with_view(&db.lock().unwrap(), &row, &metadata).unwrap();
+    crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
     for scope in [Some(head), None] {
         if scope.is_none() {
             // Relaxed project lookup applies only to unstamped tasks, not to
@@ -141,8 +141,7 @@ fn carrier_status_skips_head_worker_and_unscoped_project_fallbacks() {
             fs::write(&plain.paths.stdout, "project-output").unwrap();
             fs::write(&plain.paths.stderr, "").unwrap();
             let row = metadata.to_bash_task_row("opencode", &plain.paths).unwrap();
-            crate::db::rich_ui::upsert_task_row_with_view(&db.lock().unwrap(), &row, &metadata)
-                .unwrap();
+            crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
         }
         let req = request(&metadata.task_id, "head-session");
         crate::access_policy::with_scope(scope, || {

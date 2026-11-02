@@ -457,7 +457,7 @@ fn check_bound(
             expected: "an integer",
         });
     };
-    if i128::from(number).abs() > super::canonical::MAX_SAFE_INTEGER {
+    if i128::from(number).abs() > 9_007_199_254_740_991i128 {
         return Err(SchemaError::BoundOutOfRange {
             path: path.to_string(),
             keyword: keyword.to_string(),
@@ -536,7 +536,7 @@ fn validate_at(schema: &Value, value: &Value, path: &String) -> Result<(), Schem
                 return Err(mismatch(path, "integer", value));
             };
             let integer = i128::from(number);
-            if integer.abs() > super::canonical::MAX_SAFE_INTEGER {
+            if integer.abs() > 9_007_199_254_740_991i128 {
                 return Err(SchemaError::IntegerOutOfRange {
                     path: path.clone(),
                     value: integer.to_string(),
