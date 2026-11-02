@@ -4348,6 +4348,27 @@ fn extract_rs_symbols_from_root(
                 if let Some(symbol) = item_symbol(node, SymbolKind::Interface) {
                     symbols.push(symbol);
                 }
+                if let (Some(name), Some(body)) =
+                    (symbol_name(&node), node.child_by_field_name("body"))
+                {
+                    let mut scope = rust_mod_scope_chain(&node, source);
+                    scope.push(name.clone());
+                    for method in body.named_children(&mut body.walk()) {
+                        if matches!(method.kind(), "function_item" | "function_signature_item") {
+                            if let Some(method_name) = symbol_name(&method) {
+                                symbols.push(Symbol {
+                                    name: method_name,
+                                    kind: SymbolKind::Method,
+                                    range: node_range_with_decorators(&method, source, lang),
+                                    signature: Some(extract_signature(source, &method)),
+                                    scope_chain: scope.clone(),
+                                    exported: is_pub(&node),
+                                    parent: Some(name.clone()),
+                                });
+                            }
+                        }
+                    }
+                }
             }
             "impl_item" => {
                 let mut type_names = Vec::new();
