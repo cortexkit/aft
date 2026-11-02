@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/bash_permissions/writes.rs"
+  ],
+  "slices": [
+    "land-runon-edit-refusal"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. AFT refuses runon commands that write checkout files before submitting them, and the bash guidance gains one approved sentence. No search, ranking or routing code changes."
+}
