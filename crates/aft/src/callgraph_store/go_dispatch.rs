@@ -179,14 +179,13 @@ fn receiver_type(call: Node<'_>, parsed: &ParsedDispatchSource, receiver: &str) 
     Some(ty)
 }
 
-/// `None` means no supported binding; `Some(None)` means a bound receiver whose
-/// method is absent or ambiguous, so name-only fallback must not replace it.
+/// Select a uniquely declared method in the receiver's own Go package.
 pub(super) fn resolve(
     project_root: &Path,
     reference: &NameMatchRef,
     candidates: &[NameMatchCandidate],
     source_cache: &mut DispatchSourceCache,
-) -> Option<Option<NameMatchCandidate>> {
+) -> Option<NameMatchCandidate> {
     if reference.colon_dispatch || !receiver_is_bare_identifier(&reference.receiver_expression) {
         return None;
     }
@@ -258,5 +257,9 @@ pub(super) fn resolve(
             found.push(candidate.clone());
         }
     }
-    Some(if found.len() == 1 { found.pop() } else { None })
+    if found.len() == 1 {
+        found.pop()
+    } else {
+        None
+    }
 }

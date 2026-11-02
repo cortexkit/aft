@@ -17538,7 +17538,9 @@ fn resolve_go_target<I: ResolverIndex>(
         if member != short_name || member.contains('.') {
             return None;
         }
-        caller_data
+        // An object selector is not a package-level symbol lookup. Leave
+        // it for receiver-aware dispatch rather than binding its bare name.
+        let import = caller_data
             .import_block
             .imports
             .iter()
@@ -17551,8 +17553,8 @@ fn resolve_go_target<I: ResolverIndex>(
                         import.module_path.rsplit('/').next().unwrap_or("")
                     }
                 }) == alias
-            })
-            .map(|import| import.module_path.as_str())
+            })?;
+        Some(import.module_path.as_str())
     } else {
         None
     };
@@ -20152,16 +20154,16 @@ fn insert_method_dispatch_edges_cached(
                 candidates.as_slice(),
                 &mut source_cache,
             ) {
-                if let Some(candidate) = candidate {
-                    edge_ids.insert(insert_method_dispatch_edge(
-                        tx,
-                        &reference,
-                        &candidate,
-                        PROVENANCE_TYPE_MATCH,
-                    )?);
-                }
-                continue;
+                edge_ids.insert(insert_method_dispatch_edge(
+                    tx,
+                    &reference,
+                    &candidate,
+                    PROVENANCE_TYPE_MATCH,
+                )?);
             }
+            // Go selectors without a concrete binding must not acquire a
+            // method merely because its name resembles the receiver spelling.
+            continue;
         }
 
         match infer_receiver_type_state(project_root, &reference, &mut source_cache) {
