@@ -3,9 +3,9 @@ import { dirname, join, resolve } from "node:path";
 import { lspNpmInstallInvocation } from "./lsp-npm-policy.js";
 import { type NpmInvocation, npmCandidates, type ResolvedNpm } from "./npm-resolver.js";
 
-// Pending Ufuk's approval.
+// Approved by Ufuk (2026-11-02).
 export const LSP_NPM_REFUSAL =
-  "Cannot use npm at <path> for protected LSP installation (<reason>). Select a genuine npm 7 or newer; pinning a server version does not fix package-manager incompatibility.";
+  "AFT can't install language servers with the npm at <path> (<reason>). Put a real npm 7 or newer first on PATH; pinning a server version won't help.";
 
 export function lspNpmRefusal(path: string, reason: string): string {
   return LSP_NPM_REFUSAL.replace("<path>", path).replace("<reason>", reason);

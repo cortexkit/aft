@@ -4,8 +4,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "../child-process.js";
 import { lspNpmInstallInvocation } from "../lsp-npm-policy.js";
-import { LSP_NPM_REFUSAL, prepareLspNpmInstall, selectLspNpm } from "../lsp-npm-selection.js";
+import {
+  LSP_NPM_REFUSAL,
+  lspNpmRefusal,
+  prepareLspNpmInstall,
+  selectLspNpm,
+} from "../lsp-npm-selection.js";
 import { npmInvocation, npmSpawnEnv, resolveNpm } from "../npm-resolver.js";
+
+// Approved by Ufuk (2026-11-02); users see this when no real npm can install
+// a language server, so any change needs his approval again.
+test("the npm refusal keeps its approved wording", () => {
+  expect(lspNpmRefusal("/opt/bin/npm", "not npm")).toBe(
+    "AFT can't install language servers with the npm at /opt/bin/npm (not npm). Put a real npm 7 or newer first on PATH; pinning a server version won't help.",
+  );
+});
 
 const roots: string[] = [];
 afterEach(() => {

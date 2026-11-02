@@ -550,9 +550,9 @@ describe("doctor never downgrades OpenCode", () => {
       expect(report.binaryPath).toBe(path);
       const markdown = renderDiagnosticsMarkdown(report);
       expect(markdown).toContain(
-        `CLI lookup of AFT binary: ${binaryVersion} at ${path} (not a probe of the running plugin worker)`,
+        `AFT binary this CLI found: ${binaryVersion} at ${path} (the plugin may run a different one)`,
       );
-      expect(markdown).toContain('"CLI version cached":');
+      expect(markdown).toContain('"Cached binary for this CLI":');
       expect(markdown).not.toContain('"activeVersion":');
     },
   );
