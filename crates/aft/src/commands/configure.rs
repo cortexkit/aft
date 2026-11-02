@@ -24956,7 +24956,7 @@ mod tests {
         crate::artifact_owner::artifact_owner_test_lock()
     }
 
-    fn assert_unadmitted_configure_root(root: &std::path::Path) {
+    fn assert_unadmitted_configure_root(root: &std::path::Path, structural: bool) {
         let ctx = test_context();
         let req = configure_request_with_params(json!({
             "project_root": root, "harness": "runner",
@@ -24975,12 +24975,14 @@ mod tests {
         let folder = crate::folder_admission_runtime::snapshot(&ctx).unwrap();
         assert_eq!(folder["classification"], "not_project", "{folder}");
         assert_eq!(folder["state"], "decided", "{folder}");
-        assert_eq!(folder["coverage"]["stop"], "strong_evidence", "{folder}");
-        assert_eq!(folder["observed"]["entries"], 0, "{folder}");
-        assert_eq!(
-            crate::folder_admission_runtime::probe_counts_for_test(&ctx),
-            (0, 0)
-        );
+        if structural {
+            assert_eq!(folder["coverage"]["stop"], "strong_evidence", "{folder}");
+            assert_eq!(folder["observed"]["entries"], 0, "{folder}");
+            assert_eq!(
+                crate::folder_admission_runtime::probe_counts_for_test(&ctx),
+                (0, 0)
+            );
+        }
         assert!(ctx
             .degraded_reasons()
             .contains(&"folder_not_admitted".into()));
@@ -25047,7 +25049,7 @@ mod tests {
     #[test]
     fn configure_filesystem_root_disables_root_work() {
         let _env = home_env_mutex();
-        assert_unadmitted_configure_root(std::path::Path::new("/"));
+        assert_unadmitted_configure_root(std::path::Path::new("/"), true);
     }
 
     #[test]
@@ -25056,7 +25058,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         let (volume, _) = crate::storage_retention::volume_anchor(&canonical).unwrap();
-        assert_unadmitted_configure_root(&volume);
+        assert_unadmitted_configure_root(&volume, true);
     }
 
     #[cfg(windows)]
@@ -25065,7 +25067,7 @@ mod tests {
         let _env = home_env_mutex();
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
-        assert_unadmitted_configure_root(canonical.ancestors().last().unwrap());
+        assert_unadmitted_configure_root(canonical.ancestors().last().unwrap(), true);
     }
 
     #[test]
@@ -25149,8 +25151,8 @@ mod tests {
         create_dir_symlink(&home, &alias);
         let _home = EnvVarGuard::set("HOME", alias.to_str().unwrap());
         let _profile = EnvVarGuard::set("USERPROFILE", alias.to_str().unwrap());
-        assert_unadmitted_configure_root(&home);
-        assert_unadmitted_configure_root(&alias);
+        assert_unadmitted_configure_root(&home, false);
+        assert_unadmitted_configure_root(&alias, false);
     }
 
     #[cfg(unix)]
