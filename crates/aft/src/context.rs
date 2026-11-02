@@ -5879,7 +5879,7 @@ impl AppContext {
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
-            output_files: Arc::default(),
+            output_files: crate::tool_output::OutputFiles::shared(),
             #[cfg(unix)]
             escalation_grants: parking_lot::Mutex::new(
                 crate::sandbox_spawn::EscalationGrantStore::default(),

@@ -9621,6 +9621,7 @@ impl BgTaskRegistry {
             }
         }
         for root in requested {
+            crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
             self.request_persisted_gc(&root);
         }
     }
@@ -15153,6 +15154,15 @@ impl BgTaskRegistry {
                 .recv_timeout(Duration::from_secs(10))
                 .expect("bootstrap release test controller");
         }
+    }
+
+    pub(crate) fn retain_tool_output_store(&self, harness: &Path) {
+        self.inner
+            .persisted_gc_storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(harness.to_path_buf());
+        self.start_watchdog();
     }
 
     fn start_watchdog(&self) {

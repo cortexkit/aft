@@ -92,6 +92,12 @@ impl OutputScope {
 }
 
 impl OutputFiles {
+    pub(crate) fn shared() -> std::sync::Arc<Self> {
+        let files = std::sync::Arc::new(Self::default());
+        stores().lock().push(std::sync::Arc::downgrade(&files));
+        files
+    }
+
     fn session_dir(ctx: &AppContext, session: &str) -> PathBuf {
         harness_root(ctx)
             .join("tool-results")
@@ -144,6 +150,9 @@ impl OutputFiles {
                     file: Mutex::new(file),
                 },
             );
+            if let Some(harness) = scope.directory.parent().and_then(Path::parent) {
+                scope.bash.retain_tool_output_store(harness);
+            }
             return Ok(path);
         }
     }
@@ -288,6 +297,66 @@ impl OutputFiles {
             }
             let _ = std::fs::remove_dir(dir);
         }
+    }
+}
+
+fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
+    static STORES: std::sync::OnceLock<Mutex<Vec<std::sync::Weak<OutputFiles>>>> =
+        std::sync::OnceLock::new();
+    STORES.get_or_init(Default::default)
+}
+
+/// The task-artifact watchdog calls this with the same retention window as
+/// finished shell output. Disk scanning also removes files left by a restart.
+pub(crate) fn cleanup_expired(harness: &Path, retention: std::time::Duration) {
+    const SCAN_ENTRIES: usize = 256;
+    let root = crate::access_policy::policy_path(&harness.join("tool-results"));
+    let expired = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file() && !meta.file_type().is_symlink())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.elapsed().ok())
+            .is_some_and(|age| age >= retention)
+    };
+    let live = {
+        let mut stores = stores().lock();
+        let live: Vec<_> = stores.iter().filter_map(std::sync::Weak::upgrade).collect();
+        stores.retain(|store| store.strong_count() > 0);
+        live
+    };
+    let mut remove = Vec::new();
+    for store in live {
+        let mut files = store.files.lock();
+        let paths: Vec<_> = files
+            .keys()
+            .filter(|path| path.starts_with(&root) && expired(path))
+            .cloned()
+            .collect();
+        for path in paths {
+            drop(files.remove(&path));
+            remove.push(path);
+        }
+    }
+    // Close every context's reader handle before unlinking on Windows.
+    for path in remove {
+        let _ = std::fs::remove_file(path);
+    }
+    let Ok(sessions) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for session in sessions.flatten().take(SCAN_ENTRIES) {
+        if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if let Ok(files) = std::fs::read_dir(session.path()) {
+            for file in files.flatten().take(SCAN_ENTRIES) {
+                if generated_name(&file.path()) && expired(&file.path()) {
+                    let _ = std::fs::remove_file(file.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(session.path());
     }
 }
 
@@ -652,5 +721,37 @@ mod tests {
             normalized,
             include_str!("../tests/fixtures/tool-result-cap.txt").trim_end()
         );
+    }
+
+    #[test]
+    fn tool_output_cap_retention_cleans_live_and_restarted_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = context(temp.path(), &temp.path().join("store"));
+        let mut text = "row\n".repeat(20_000);
+        cap(
+            &ctx,
+            "owner",
+            "zoom",
+            &Response::success("id", json!({})),
+            &mut text,
+        );
+        let path = saved_path(&text);
+        let mut restarted = "orphaned row\n".repeat(20_000);
+        {
+            let other = context(temp.path(), &temp.path().join("store"));
+            cap(
+                &other,
+                "restarted",
+                "zoom",
+                &Response::success("id", json!({})),
+                &mut restarted,
+            );
+        }
+        let persisted = saved_path(&restarted);
+        cleanup_expired(&ctx.harness_dir(), std::time::Duration::from_secs(3600));
+        assert!(path.exists() && persisted.exists());
+        cleanup_expired(&ctx.harness_dir(), std::time::Duration::ZERO);
+        assert!(!path.exists() && !persisted.exists());
+        assert!(ctx.output_files().owner(&path).is_none());
     }
 }
