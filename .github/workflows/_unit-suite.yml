@@ -737,20 +737,18 @@ jobs:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     runs-on: macos-26
-    # A cold compile of the crate's lib tests takes 19-28 min on these
-    # runners, and a slow runner reached 30 min in 2 of 12 recent main runs.
-    # The job then shows as cancelled and fails the whole macOS unit suite
-    # without any test having run.
+    # Keep the hang ceiling independent of compiler tuning: even a hot
+    # dependency cache cannot cache the library's executable test harness.
     timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
-      # Non-incremental Cargo builds default to 16 codegen units. Split the
-      # large library harness more finely without changing dependency profiles,
-      # debug assertions, unwind behavior, or the backtrace probe's line tables.
-      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
+      # Use the non-incremental default rather than 256 LLVM modules on the
+      # memory-constrained macOS runner. Keep dependency profiles and the
+      # backtrace probe's line tables unchanged.
+      LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=16
     steps:
       - uses: actions/checkout@v5
 
@@ -774,7 +772,7 @@ jobs:
       - name: Build nextest archive (macOS lib tests)
         # The selected integration probe makes Cargo build the real aft CLI.
         # Its tests are filtered out; only the library bucket enters this archive.
-        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
+        run: /usr/bin/time -l cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 

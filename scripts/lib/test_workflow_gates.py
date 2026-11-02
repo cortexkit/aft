@@ -670,25 +670,24 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         # 30-minute runs were cancelled while their tests were still passing.
         self.assertEqual(job["timeout-minutes"], "45")
 
-    def test_libtest_codegen_is_split_without_rebuilding_dependencies(self) -> None:
+    def test_libtest_codegen_keeps_dependency_profiles_and_resource_timings(self) -> None:
         root = Path(__file__).resolve().parents[2]
         suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
         job = suite["jobs"]["unit-macos-libtest-archive"]
         self.assertEqual(
             job["env"].get("LIBTEST_CARGO_CONFIG"),
-            "profile.test.package.agent-file-tools.codegen-units=256",
+            "profile.test.package.agent-file-tools.codegen-units=16",
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
-        # 45 minutes: the split build still runs 19-28 min, and a slow
-        # macOS runner has reached 30.
         self.assertEqual(job["timeout-minutes"], "45")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
-        build_steps = [command for command in cargo_steps if command.startswith("cargo ")]
+        build_steps = [command for command in cargo_steps if command.startswith(("cargo ", "/usr/bin/time -l cargo "))]
         self.assertEqual(len(build_steps), 3)
         for command in build_steps:
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
         archive = next(command for command in build_steps if "nextest archive" in command)
+        self.assertTrue(archive.startswith("/usr/bin/time -l cargo nextest archive "))
         self.assertIn("--timings", archive)
         upload = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-archive")
         paths = upload["with"]["path"].splitlines()
