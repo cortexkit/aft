@@ -971,7 +971,11 @@ fn plan(name: &str) -> Value {
 }
 
 fn fetch(plan: &Value) -> Value {
-    json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
+    let mut request = json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]});
+    // Wire vectors name illustrative checkouts on another machine. Tests that
+    // export siblings must supply real, readable checkout roots of their own.
+    request["params"]["siblings"] = json!([]);
+    request
 }
 
 #[cfg(unix)]
@@ -1865,7 +1869,8 @@ fn exec_remote_catalog_validates_vocabulary_and_rejects_malformed_routing() {
 fn exec_remote_catalog_paramless_and_unscoped_parity() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let sibling = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("sibling");
+    std::fs::create_dir_all(sibling.join(".git")).unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let bind = identity(root.path(), "one", 7, false);
     for preset in ["head", "worker", "reader"] {
@@ -1884,7 +1889,7 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
     // as a paramless fetch, and nothing is frozen without a scope.
     let mut planned_fetch = fetch(&plan("broca-worker"));
     // The frozen plan uses Unix paths; validation needs a native absolute path.
-    planned_fetch["params"]["siblings"] = json!([sibling.path()]);
+    planned_fetch["params"]["siblings"] = json!([sibling]);
     let mut paramless_fetch = planned_fetch.clone();
     paramless_fetch.as_object_mut().unwrap().remove("params");
     let paramless = catalog(paramless_fetch, &bind, &ctx).unwrap();
@@ -1958,6 +1963,8 @@ async fn exercise_catalog_remote_bash(
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let (writer, mut replies) = mpsc::channel(8);
     let frame = Frame::build(FrameType::Request, control_flags(), 41, 1, 7, vec![]).unwrap();
+    let mut request = fetch(&plan("broca-worker"));
+    request["params"]["siblings"] = json!([root.path()]);
     submit_provider_read(
         &writer,
         &frame,
@@ -1966,7 +1973,7 @@ async fn exercise_catalog_remote_bash(
         &Arc::default(),
         &Arc::new(DispatchPathMetrics::new()),
         "tool.catalog",
-        fetch(&plan("broca-worker")),
+        request,
         PhaseTrace::new(Instant::now()),
         test_support::test_request_meta(),
     )
@@ -2086,7 +2093,7 @@ async fn exercise_catalog_remote_bash(
         .1;
     assert_eq!(
         request["params"]["siblings"],
-        plan("broca-worker")["tool_items"][0]["params"]["siblings"]
+        json!([root.path().canonicalize().unwrap()])
     );
 }
 
@@ -2370,6 +2377,7 @@ fn head_worker_preflight_catalog_matches_worker_catalog() {
 #[test]
 fn head_worker_preflight_validates_routing_without_a_policy_store() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
     let ctx = AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
@@ -2399,6 +2407,219 @@ fn head_worker_preflight_validates_routing_without_a_policy_store() {
         assert!(catalog(json!({"preset":"worker", "params":params}), &head, &ctx).is_err());
     }
     assert!(!confined(&ctx, &head).unwrap());
+}
+
+#[test]
+fn siblings_catalog_refuses_outside_checkout_and_dotdot_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workdir");
+    let outside = dir.path().join("unrelated-checkout");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(outside.join(".git")).unwrap();
+    let ctx = context(&root, &dir.path().join("store"), None);
+    ctx.update_config(|config| config.restrict_to_project_root = false);
+    let worker = identity(&root, "siblings-outside", 7, true);
+    for sibling in [outside.clone(), root.join("..").join("unrelated-checkout")] {
+        let error = catalog(
+            json!({"preset":"worker", "params":{"siblings":[sibling]}}),
+            &worker,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+        assert!(lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn siblings_catalog_refuses_symlink_to_outside_checkout() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outside.path().join(".git")).unwrap();
+    let link = root.path().join("sibling");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let worker = identity(root.path(), "siblings-symlink", 7, true);
+    ctx.update_config(|config| config.restrict_to_project_root = false);
+    let error = catalog(
+        json!({"preset":"worker", "params":{"siblings":[link]}}),
+        &worker,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+}
+
+#[test]
+fn siblings_catalog_requires_checkout_root_and_saves_canonical_workdir() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    let folder = root.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let worker = identity(root.path(), "siblings-workdir", 7, true);
+    let error = catalog(
+        json!({"preset":"worker", "params":{"siblings":[folder]}}),
+        &worker,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    catalog(
+        json!({"preset":"worker", "params":{"siblings":[folder.join("..")]}}),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let saved = lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).unwrap();
+    assert_eq!(
+        saved.params.siblings,
+        [root.path().canonicalize().unwrap().to_str().unwrap()]
+    );
+}
+
+#[test]
+fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outside.path().join(".git")).unwrap();
+    std::fs::create_dir(outside.path().join("child")).unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let mut head = identity(root.path(), "siblings-head", 7, true);
+    let head_stamp = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
+    head_stamp.kind = subc_protocol::scope::ScopeKind::Head;
+    head_stamp.scope_ref = "siblings-head".into();
+    access_grants::register(&head, &ctx).unwrap();
+    let mut worker = identity(root.path(), "siblings-worker", 7, true);
+    Arc::get_mut(&mut worker.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent = Some(
+        serde_json::from_value(json!({
+            "owner":head.scope.as_ref().unwrap().owner,
+            "ref":"siblings-head", "scope_epoch":7
+        }))
+        .unwrap(),
+    );
+    let request =
+        json!({"preset":"worker", "params":{"siblings":[outside.path().join("child/..")]}});
+    for route in [&head, &worker] {
+        let error = catalog(request.clone(), route, &ctx).unwrap_err();
+        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    }
+    let granted_path = crate::access_policy::policy_path(outside.path());
+    crate::db::access_grants::insert(
+        &ctx.db().unwrap().lock().unwrap(),
+        &access_grants::policy_scope_key(&head),
+        &AccessGrant {
+            path: granted_path.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    catalog(request.clone(), &head, &ctx).unwrap();
+    // A head's grant is not inherited merely because the worker belongs to its project.
+    assert!(catalog(request.clone(), &worker, &ctx).is_err());
+    let mut worker = identity(root.path(), "siblings-granted-worker", 7, true);
+    let stamp = Arc::get_mut(&mut worker.0).unwrap().scope.as_mut().unwrap();
+    stamp.scope_ref = "siblings-granted-worker".into();
+    stamp.parent = Some(
+        serde_json::from_value(json!({
+            "owner":head.scope.as_ref().unwrap().owner,
+            "ref":"siblings-head", "scope_epoch":7
+        }))
+        .unwrap(),
+    );
+    let mut request = request;
+    request["params"]["allow_paths"] = json!([{"path":granted_path, "mode":"read"}]);
+    catalog(request, &worker, &ctx).unwrap();
+    let saved = lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).unwrap();
+    assert_eq!(
+        saved.params.siblings,
+        [outside.path().canonicalize().unwrap().to_str().unwrap()]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let daemon = crate::exec_remote::wire_tests::daemon(
+        crate::exec_remote::wire_tests::Script::Plain,
+        "exec-remote/v1",
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    init_remote_git_fixture(root.path());
+    std::fs::create_dir(sibling.path().join(".git")).unwrap();
+    let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    let mut head = identity(root.path(), "siblings-submit-head", 7, true);
+    let stamp = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
+    stamp.kind = subc_protocol::scope::ScopeKind::Head;
+    stamp.scope_ref = "siblings-submit-head".into();
+    access_grants::register(&head, &ctx).unwrap();
+    let path = crate::access_policy::policy_path(sibling.path());
+    crate::db::access_grants::insert(
+        &ctx.db().unwrap().lock().unwrap(),
+        &access_grants::policy_scope_key(&head),
+        &AccessGrant {
+            path: path.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let mut worker = identity(root.path(), "session", 7, true);
+    Arc::get_mut(&mut worker.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent = Some(
+        serde_json::from_value(json!({
+            "owner":head.scope.as_ref().unwrap().owner,
+            "ref":"siblings-submit-head", "scope_epoch":7
+        }))
+        .unwrap(),
+    );
+    catalog(
+        json!({"preset":"worker", "params":{
+            "remote_exec":{"enabled":true}, "siblings":[path],
+            "allow_paths":[{"path":path, "mode":"read"}]
+        }}),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let launch = lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).unwrap();
+    let scope = access_grants::policy_scope_key(&worker);
+    assert_eq!(
+        crate::db::access_grants::revoke(&ctx.db().unwrap().lock().unwrap(), &scope, &path)
+            .unwrap(),
+        1
+    );
+    let _scope = crate::access_policy::scope_guard(Some(scope));
+    let _ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
+            once: vec![],
+            launch: access_grants::launch_key(&worker, "worker"),
+        }));
+    crate::bash_background::registry::remote::assert_siblings_submit_refused_before_connect(
+        &ctx, launch, &daemon,
+    );
 }
 
 #[cfg(unix)]
@@ -2540,11 +2761,12 @@ fn remote_enabled_catalog_is_rendered_once_after_validation() {
 fn malformed_routing_policy_is_refused_before_freeze_and_valid_retry_can_freeze() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let sibling = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("sibling");
+    std::fs::create_dir_all(sibling.join(".git")).unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let mut valid_fetch = fetch(&plan("broca-worker"));
     // Keep the plan's policy but replace its Unix sibling path for native validation.
-    valid_fetch["params"]["siblings"] = json!([sibling.path()]);
+    valid_fetch["params"]["siblings"] = json!([sibling]);
     for (index, (field, malformed)) in [
         ("remote_exec", json!({"remote_exec":{"enabled":"yes"}})),
         (

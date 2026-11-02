@@ -36,6 +36,38 @@ pub enum RootConfinement {
 }
 
 impl FrozenParams {
+    /// Authorize snapshot inputs with the file tools' read gate. A permission
+    /// request is a refusal here, not authority to export an outside checkout.
+    pub(crate) fn validate_siblings(
+        &mut self,
+        ctx: &crate::context::AppContext,
+        request_id: &str,
+        session_id: &str,
+    ) -> Result<(), &'static str> {
+        let siblings = self
+            .siblings
+            .iter()
+            .map(|sibling| {
+                let path = Path::new(sibling);
+                if !path.is_absolute() {
+                    return Err(SIBLINGS_REFUSAL);
+                }
+                let path = crate::bounded_io::canonicalize(path).map_err(|_| SIBLINGS_REFUSAL)?;
+                let path = ctx
+                    .validate_read_path(request_id, session_id, &path)
+                    .map_err(|_| SIBLINGS_REFUSAL)?;
+                let marker = crate::bounded_io::metadata(&path.join(".git"))
+                    .map_err(|_| SIBLINGS_REFUSAL)?;
+                if !marker.is_dir() && !marker.is_file() {
+                    return Err(SIBLINGS_REFUSAL);
+                }
+                path.to_str().map(str::to_owned).ok_or(SIBLINGS_REFUSAL)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.siblings = siblings;
+        Ok(())
+    }
+
     pub fn decode(params: &serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
         let remote_exec = params
             .get("remote_exec")
@@ -76,6 +108,9 @@ impl FrozenParams {
         })
     }
 }
+
+pub(crate) const SIBLINGS_REFUSAL: &str =
+    "siblings must be git checkout roots the session's file tools may read; the command was not run";
 
 /// Caller-side defense in depth, independent of ck-motor's authoritative
 /// allowlist. Only names are inspected; no allowlist is mirrored here.

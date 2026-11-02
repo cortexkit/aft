@@ -6449,6 +6449,49 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
         .collect()
 }
 
+pub(crate) fn assert_siblings_submit_refused_before_connect(
+    ctx: &crate::context::AppContext,
+    launch: crate::bash_background::RemoteLaunch,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+) {
+    let marker = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .unwrap()
+        .join("must-not-run-locally");
+    let response = handle_with_policy(
+        ctx,
+        Some(launch),
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()), "runon":"linux",
+            "background":true, "compressed":false,
+        }),
+    );
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_run_refused", "{response:?}");
+    assert!(
+        response.data["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("runon refused: siblings"),
+        "{response:?}"
+    );
+    assert!(
+        !marker.exists(),
+        "a refused sibling must not trigger local fallback"
+    );
+    assert!(
+        daemon.log.lock().unwrap().is_empty(),
+        "no daemon frame may be sent"
+    );
+    assert_eq!(
+        daemon.connections.load(Ordering::SeqCst),
+        0,
+        "the daemon must not be contacted"
+    );
+}
+
 #[tokio::test]
 async fn runon_windows_not_advertised_refuses_without_remote_or_local_spawn() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
