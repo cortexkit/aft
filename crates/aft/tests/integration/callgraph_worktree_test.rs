@@ -115,6 +115,10 @@ fn configure_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContex
 }
 
 fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContext {
+    // These tests configure first and read the linked-checkout bridge state from
+    // the acknowledgement, which precedes the folder decision. A marker gives
+    // the fixture root its own project evidence so that state is ready at once.
+    crate::test_helpers::project::mark_project(checkout).unwrap();
     crate::test_helpers::disable_in_process_file_watcher();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),

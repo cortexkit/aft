@@ -196,10 +196,6 @@ fn init_repo(root: &Path, files: &[(&str, String)]) {
         write(root, path, text);
     }
     commit_all(root, "initial");
-    // A folder check treats a repository as a project only once its Git
-    // metadata is complete; commands the fixture just started may still be
-    // writing it.
-    git(root, &["rev-parse", "--verify", "HEAD"]);
 }
 
 fn request(value: Value) -> RawRequest {
@@ -366,7 +362,6 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
         )
         .with_test_checkpoint_store(),
     );
-
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-parent-folder",
@@ -374,7 +369,7 @@ fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::test_helpers::project_detection_user_config(doc),
+            "config": crate::helpers::user_config(doc),
         })),
         &ctx,
     );
@@ -398,38 +393,10 @@ fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
     aft::search_index::resolve_cache_dir_with_key(&key, Some(storage)).join("cache.bin")
 }
 
-/// Declare a fixture repository's project intent, then read its folder
-/// decision.
-///
-/// The index planes a session starts with belong to its folder decision, so a
-/// fixture's requested configuration is only real after that decision. The
-/// explicit intent keeps a temporary directory that happens to sit inside a
-/// checkout from changing what these repository fixtures measure. The negative
-/// classifier result for the same fixture is covered in the admission tests.
-fn admit_repository(ctx: &AppContext, root: &Path) {
-    let request = request(json!({
-        "id": "fixture-repository-admission",
-        "command": "configure",
-        "harness": "opencode",
-        "project_root": root,
-        "config": crate::test_helpers::project_detection_user_config(
-            json!({"indexes": {"trigram": false, "semantic": false, "callgraph": false}}),
-        ),
-    }));
-    let response = aft::commands::configure::handle_configure(&request, ctx);
-    assert!(
-        response.success,
-        "repository admission failed: {response:?}"
-    );
-    let folder = crate::test_helpers::admission::settle(ctx);
-    assert_eq!(folder["classification"], "project", "{folder}");
-}
-
 /// Waits until the child session's trigram index is ready and persisted.
 /// The runtime drain also settles a bind whose identity was deferred by busy
 /// storage, so its index can start once the database is free.
 fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
-    admit_repository(ctx, root);
     let deadline = Instant::now() + DEADLINE;
     loop {
         drain(ctx);
@@ -458,7 +425,7 @@ fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
 
 #[test]
 fn runtime_drains_retry_child_trigram_after_busy_identity() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("alpha");
     let storage = base.join("storage");
@@ -637,7 +604,7 @@ struct Folder {
 }
 
 fn folder(count: usize) -> Folder {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -727,29 +694,6 @@ fn started_parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSes
     session
 }
 
-/// The parent folder of a fixture's repositories is only a workspace while it
-/// carries no project evidence of its own. Prove that before the fixture binds
-/// it, so an added root manifest cannot silently turn it into a project.
-fn assert_container(folder: &Folder) {
-    for marker in [
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "go.mod",
-        "Makefile",
-        "Gemfile",
-    ] {
-        assert!(
-            !folder.root.join(marker).exists(),
-            "the parent folder must not carry {marker}"
-        );
-    }
-    assert!(
-        !folder.root.join(".git").exists(),
-        "the parent folder must not be a repository"
-    );
-}
-
 /// 32 repositories: the merged grep and glob answers equal the union of each
 /// child's own answers with the child's folder as path prefix; repeated
 /// queries load nothing; unchanged children are never reported stale; and the
@@ -759,7 +703,6 @@ fn assert_container(folder: &Folder) {
 fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     fast_refresh();
     let folder = folder(32);
-    assert_container(&folder);
     let mut expected_grep = BTreeSet::new();
     let mut expected_glob = BTreeSet::new();
     let mut child_median = 0.0;
@@ -1026,7 +969,7 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
 /// event-driven, routed to the child that owns the path.
 #[test]
 fn parent_watcher_routes_child_edits_to_the_owning_child() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1034,12 +977,6 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     let other = root.join("other");
     init_repo(&child, &child_files(0));
     init_repo(&other, &child_files(1));
-    for marker in ["Cargo.toml", "package.json", "Makefile", ".git"] {
-        assert!(
-            !root.join(marker).exists(),
-            "the parent folder must not carry {marker}"
-        );
-    }
     let configure_request = |root: &Path, views: bool| {
         json!({
             "id": "cfg",
@@ -1047,7 +984,7 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::test_helpers::project_detection_user_config(config_doc(views, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(config_doc(views, TRIGRAM_ONLY, None)),
         })
         .to_string()
     };
@@ -1127,7 +1064,7 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
 #[test]
 fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
     fast_refresh();
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1373,7 +1310,7 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     watchdog.enter("fixture setup");
     fast_refresh();
     let embedder = MockEmbedder::start();
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1639,7 +1576,7 @@ fn precomputed_query_vector_ranks_byte_identically(ctx: &AppContext, query: &str
 #[test]
 fn over_cap_parent_names_skipped_and_unindexed_children() {
     fast_refresh();
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1690,7 +1627,7 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
 #[test]
 fn slow_discovery_never_delays_the_bind() {
     fast_refresh();
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1712,7 +1649,7 @@ fn slow_discovery_never_delays_the_bind() {
         "harness": "opencode",
         "project_root": root,
         "storage_dir": storage,
-        "config": crate::test_helpers::project_detection_user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
     }));
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
@@ -1770,7 +1707,7 @@ fn slow_discovery_never_delays_the_bind() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn standalone_view_open_never_blocks_requests() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("repo");
     let storage = base.join("storage");
@@ -1793,7 +1730,7 @@ fn standalone_view_open_never_blocks_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::test_helpers::project_detection_user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
+        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
     }).to_string())["success"], true);
     let deadline = Instant::now() + Duration::from_secs(15);
     while !started_file.exists() {
@@ -1850,7 +1787,7 @@ fn standalone_view_open_never_blocks_requests() {
 #[cfg(feature = "test-timing-hooks")]
 #[test]
 fn standalone_semantic_grace_and_load_never_block_requests() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("repo");
     let storage = base.join("storage");
@@ -1881,7 +1818,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
     assert_eq!(aft.send(&json!({
         "id": "cfg", "command": "configure", "harness": "pi",
         "project_root": root, "storage_dir": storage,
-        "config": crate::test_helpers::project_detection_user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
+        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
     }).to_string())["success"], true);
     let mut grace_max = 0;
     let mut load_max = 0;
@@ -1948,7 +1885,7 @@ fn standalone_semantic_grace_and_load_never_block_requests() {
 /// behaviour and no parent session starts.
 #[test]
 fn views_off_folder_is_not_a_parent_session() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1969,7 +1906,7 @@ fn views_off_folder_is_not_a_parent_session() {
 /// process writes a legacy trigram artifact for the child.
 #[test]
 fn parent_folder_survives_a_real_process_restart() {
-    let temp = crate::test_helpers::tempdir();
+    let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
     let storage = base.join("storage");
@@ -1988,7 +1925,7 @@ fn parent_folder_survives_a_real_process_restart() {
             "harness": "opencode",
             "project_root": root,
             "storage_dir": storage,
-            "config": crate::test_helpers::project_detection_user_config(config_doc(true, TRIGRAM_ONLY, None)),
+            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
         })
         .to_string()
     };

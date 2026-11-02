@@ -39,10 +39,23 @@ fn response(aft: &mut AftProcess, id: &str) -> Value {
 fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Value {
     let _timing = timing_guard();
     let dir = crate::test_helpers::tempdir();
-    let project = dir.path().join("project");
+    // The refusing case gives the fixture's parent its own Git metadata, so a
+    // temporary directory that happens to sit inside a checkout cannot supply
+    // the project evidence the refusal is meant to disprove.
+    let root_parent = dir.path().join("root");
+    std::fs::create_dir(&root_parent).unwrap();
+    let project = root_parent.join("project");
     std::fs::create_dir(&project).unwrap();
     if project_evidence {
         crate::test_helpers::project::mark_project(&project).unwrap();
+    } else {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root_parent)
+            .args(["init", "-q", "--template="])
+            .status()
+            .expect("git init for the refusing fixture parent");
+        assert!(status.success(), "git init failed for the refusing fixture");
     }
     std::fs::write(
         project.join("main.rs"),
@@ -102,8 +115,16 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     let tool = response(&mut aft, "first-tool");
     let status = aft.send(r#"{"id":"admitted-status","command":"status"}"#);
     assert_eq!(status["folder"]["state"], "decided", "{status}");
-    if full_validation {
+    if full_validation || project_evidence {
         assert_eq!(status["folder"]["classification"], "project", "{status}");
+    } else {
+        // A check that ended on its evidence budget reports an incomplete
+        // classification, which is not the negative decision this case is about.
+        assert_eq!(
+            status["folder"]["classification"], "not_project",
+            "{status}"
+        );
+        assert_eq!(status["folder"]["reason"], "no_project_evidence");
     }
     let (status, stderr) = aft.stderr_output();
     if tool["success"] != true {

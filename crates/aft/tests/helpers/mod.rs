@@ -58,6 +58,10 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// Shared host directories tried after the temp directory and the checkout's
+/// own parent, for a checkout mounted read-only next to nothing writable.
+const SYSTEM_FALLBACK_DIRECTORIES: [&str; 2] = ["/var/tmp", "/tmp"];
+
 thread_local! {
     static THREAD_SCRATCH_DIR: tempfile::TempDir = tempfile::Builder::new()
         .prefix("aft-test-scratch-")
@@ -113,6 +117,13 @@ fn prepare_fixture_temp_directory() {
         .into_iter()
         .flatten()
         .find(|candidate| temp_outside_git_work_tree(candidate))
+        .or_else(|| {
+            SYSTEM_FALLBACK_DIRECTORIES
+                .map(PathBuf::from)
+                .into_iter()
+                .map(|system| system.join(format!("aft-fixture-tmp-{}", std::process::id())))
+                .find(|candidate| temp_outside_git_work_tree(candidate))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "the test temp directory {} is inside the Git work tree {}, and no directory \
