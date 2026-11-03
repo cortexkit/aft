@@ -465,7 +465,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "gh_shim/read_render.rs",
         enclosing_item: "list, search, native",
-        location_or_primitive: "per_page 100, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
+        location_or_primitive: "per_page caps of 100 (10 for Actions runs), adaptive page-size retries, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
         reason: "REST API paging and gh-compatible explicit output limits, not an AFT tool result list; over-return is a fetch error",
     },
     ExclusionEntry {
