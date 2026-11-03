@@ -40,7 +40,10 @@ fn quiescent(metadata: &PersistedTask) -> bool {
         return false;
     }
     let Some(pgid) = metadata.pgid else {
-        return metadata.child_pid.is_none() && metadata.group_member_identities.is_empty();
+        return metadata.child_pid.is_none()
+            && metadata.group_member_identities.is_empty()
+            && metadata.live_descendants.as_ref().is_none_or(Vec::is_empty)
+            && metadata.live_descendants_omitted == 0;
     };
     // Windows cannot enumerate task descendants. A dead shell alone is not
     // proof they exited, including after replay; keep its image until durable
@@ -49,6 +52,19 @@ fn quiescent(metadata: &PersistedTask) -> bool {
         return false;
     };
     if !listing.is_clean() {
+        return false;
+    }
+    // A sample can name a survivor whose start time was unreadable. Without
+    // an identity to rule out PID reuse, a still-live PID must retain the image.
+    if metadata.live_descendants.as_ref().is_some_and(|members| {
+        members.iter().any(|member| {
+            !metadata
+                .group_member_identities
+                .iter()
+                .any(|identity| identity.pid == member.pid)
+                && super::super::process::is_process_alive(member.pid)
+        })
+    }) {
         return false;
     }
     // A saved member may have left the original group. PID reuse is not a
@@ -317,6 +333,25 @@ mod tests {
         let pgid = i32::MAX - 123;
         metadata.pgid = Some(pgid);
         super::super::super::process::test_hooks::fail_listing(pgid);
+        let result = cleanup_image(&task.paths, &metadata, || true);
+        assert_eq!((result.removed, result.remaining), (0, 1));
+        assert!(task.paths.io_dir.join(TASK_IMAGE_DIR).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_survivor_without_readable_start_time_keeps_the_image() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = saved_image(storage.path(), 1);
+        metadata.pgid = Some(i32::MAX - 124);
+        metadata.live_descendants = Some(vec![LiveDescendant {
+            pid: std::process::id(),
+            comm: "unknown".into(),
+            argv0: "unknown".into(),
+            user: None,
+            command: None,
+        }]);
+        assert!(metadata.group_member_identities.is_empty());
         let result = cleanup_image(&task.paths, &metadata, || true);
         assert_eq!((result.removed, result.remaining), (0, 1));
         assert!(task.paths.io_dir.join(TASK_IMAGE_DIR).exists());
