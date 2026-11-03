@@ -28,6 +28,9 @@ use crate::inspect::{
 };
 use crate::parser::{detect_language, grammar_for, LangId};
 
+use super::source_text::{
+    read_source_text, source_scan_permit, SourceText, MAX_SOURCE_BYTES, TOO_LARGE,
+};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 11;
@@ -239,6 +242,7 @@ struct ImportedExportLiveness {
 
 #[derive(Debug, Default)]
 struct FileAnalysis {
+    oversized: bool,
     freshness: Option<crate::cache_freshness::FileFreshness>,
     rust_api: Option<RustApiFacts>,
     go_dispatch: Option<GoDispatchFacts>,
@@ -329,14 +333,22 @@ impl DeadCodeFileAnalyzer {
         }
 
         let metadata = fs::metadata(file).ok();
+        let _permit = source_scan_permit(metadata.as_ref().map_or(0, fs::Metadata::len));
         #[cfg(test)]
         AFTER_SOURCE_METADATA.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        let Ok(source) = crate::project_content::read_to_string(file) else {
-            return FileAnalysis::default();
+        let source = match read_source_text(file) {
+            Ok(SourceText::Text(source)) => source,
+            Ok(SourceText::TooLarge) => {
+                return FileAnalysis {
+                    oversized: true,
+                    ..Default::default()
+                }
+            }
+            _ => return FileAnalysis::default(),
         };
         let needs_tree = needs_type_refs
             || needs_ts_raw_facts
@@ -450,6 +462,7 @@ impl DeadCodeFileAnalyzer {
         };
 
         let analysis = FileAnalysis {
+            oversized: false,
             freshness: Some(crate::cache_freshness::FileFreshness {
                 mtime: metadata
                     .and_then(|metadata| metadata.modified().ok())
@@ -735,6 +748,13 @@ fn gather_file_contribution(
     file_analyzer: &mut DeadCodeFileAnalyzer,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
+    if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_SOURCE_BYTES)
+        || oxc_parse_errors_by_file
+            .get(&file_name)
+            .is_some_and(|errors| errors.iter().any(|error| error == TOO_LARGE))
+    {
+        return oversized_file_contribution(file, &file_name);
+    }
     let generated = crate::inspect::generated::is_generated_file(&job.project_root, file);
     if let Some(language) = dead_code_skipped_language(file) {
         return FileContribution::new(
@@ -761,6 +781,7 @@ fn gather_file_contribution(
                 .unwrap_or_default()
         });
     let FileAnalysis {
+        oversized,
         freshness,
         rust_api,
         go_dispatch,
@@ -775,6 +796,9 @@ fn gather_file_contribution(
         trait_impl_methods,
         type_ref_names,
     } = file_analyzer.analyze_file(file, &file_name, oxc_facts.is_some());
+    if oversized {
+        return oversized_file_contribution(file, &file_name);
+    }
 
     let mut payload = json!({
         "file": file_name,
@@ -881,6 +905,30 @@ fn gather_file_contribution(
         payload,
     )
     .with_type_ref_names(type_ref_names)
+}
+
+fn oversized_file_contribution(file: &Path, file_name: &str) -> FileContribution {
+    let freshness = fs::metadata(file)
+        .ok()
+        .map(|metadata| FileFreshness {
+            mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+            size: metadata.len(),
+            content_hash: cache_freshness::zero_hash(),
+        })
+        .unwrap_or(FileFreshness {
+            mtime: UNIX_EPOCH,
+            size: 0,
+            content_hash: cache_freshness::zero_hash(),
+        });
+    FileContribution::new(
+        InspectCategory::DeadCode,
+        file.to_path_buf(),
+        freshness,
+        json!({
+            "file": file_name, "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
+            "exports": [], "skipped_files": [{"file": file_name, "reason": TOO_LARGE}]
+        }),
+    )
 }
 
 fn oxc_fact_export_contributions(facts: &FileFacts) -> Vec<ExportContribution> {
@@ -1076,12 +1124,14 @@ fn aggregate_dead_code_contributions_incremental_body(
     let parsed = parse_dead_code_contributions(project_root, contributions);
     // Unchanged-state reuse must not hide a new gap or retain an error after
     // repair. Rebuild from the current facts while either state has a gap.
-    let has_decode_gaps = parsed.iter().any(|contribution| contribution.decode_failed)
+    let has_coverage_gaps = has_oversized_sources(&parsed)
+        || parsed.iter().any(|contribution| contribution.decode_failed)
         || previous.is_some_and(|state| {
-            state
-                .materialized
-                .iter()
-                .any(|contribution| contribution.decode_failed)
+            has_oversized_sources(&state.materialized)
+                || state
+                    .materialized
+                    .iter()
+                    .any(|contribution| contribution.decode_failed)
         });
     let contribution_hashes = contribution_hashes(
         previous.map(|state| &state.contribution_hashes),
@@ -1115,7 +1165,7 @@ fn aggregate_dead_code_contributions_incremental_body(
                 && fragment.production_reachable_exports
                     == reachable_symbols_for_file(&previous.production.reachable, file)
         });
-        if !has_decode_gaps
+        if !has_coverage_gaps
             && previous.contribution_hashes == contribution_hashes
             && previous.public_api_files == *public_api_files
             && previous.roles_fingerprint == roles_fingerprint
@@ -1145,7 +1195,7 @@ fn aggregate_dead_code_contributions_incremental_body(
         .union(&changed_graph_files)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if has_decode_gaps
+    if has_coverage_gaps
         || previous.is_none()
         || previous.is_some_and(|state| {
             state.public_api_files != *public_api_files
@@ -1664,6 +1714,7 @@ fn fold_dead_code_fragments(
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
     if !skipped_files.is_empty() {
+        aggregate["skipped_files_count"] = json!(skipped_files.len());
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     let mut excluded = ExcludedTestTally::default();
@@ -2325,7 +2376,13 @@ fn aggregate_materialized_dead_code_contributions(
     let mut uncertain_count = 0usize;
     let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
     let mut excluded_by_file: BTreeMap<String, usize> = BTreeMap::new();
+    // A skipped source can be the only caller/importer of a symbol elsewhere.
+    // With no edges from that file, deadness cannot be established graph-wide.
+    let has_source_gaps = has_oversized_sources(facts);
     for contribution in parsed {
+        if has_source_gaps {
+            continue;
+        }
         let generated_file = crate::inspect::generated::is_generated_file_with_cached_hint(
             project_root,
             &contribution.file,
@@ -2547,6 +2604,7 @@ fn aggregate_materialized_dead_code_contributions(
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
     if !skipped_files.is_empty() {
+        aggregate["skipped_files_count"] = json!(skipped_files.len());
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     let mut excluded = ExcludedTestTally::default();
@@ -2632,6 +2690,15 @@ fn dead_code_honesty_fields(
         skipped_files,
         languages_skipped.into_iter().collect(),
     )
+}
+
+fn has_oversized_sources(contributions: &[DeadCodeContribution]) -> bool {
+    contributions.iter().any(|contribution| {
+        contribution
+            .skipped_files
+            .iter()
+            .any(|skip| skip["reason"] == TOO_LARGE)
+    })
 }
 
 fn edges_by_source(
@@ -7329,11 +7396,13 @@ fn supports_type_refs(lang: LangId) -> bool {
 }
 
 fn collect_freshness(file: &Path) -> FileFreshness {
-    cache_freshness::collect(file).unwrap_or_else(|_| FileFreshness {
-        mtime: UNIX_EPOCH,
-        size: 0,
-        content_hash: cache_freshness::zero_hash(),
-    })
+    super::source_text::source_freshness(file)
+        .map(|(freshness, _permit)| freshness)
+        .unwrap_or_else(|_| FileFreshness {
+            mtime: UNIX_EPOCH,
+            size: 0,
+            content_hash: cache_freshness::zero_hash(),
+        })
 }
 
 fn relative_path(project_root: &Path, path: &Path) -> String {
@@ -9091,6 +9160,79 @@ mod tests {
             .collect::<Vec<_>>();
 
         (temp_dir, root, paths)
+    }
+
+    #[test]
+    fn oversized_js_ts_sources_are_unopened_graph_wide_gaps_including_incremental_rollups() {
+        for extension in ["js", "ts"] {
+            let importer = format!("src/importer.{extension}");
+            let target = format!("src/target.{extension}");
+            let (_temp, root, files) = fixture_project(&[
+                (&importer, "export function inLarge() {}\n"),
+                (&target, "export function used() {}\n"),
+            ]);
+            let snapshot = snapshot(
+                files.clone(),
+                vec![
+                    export(&root, &importer, "inLarge", "function"),
+                    export(&root, &target, "used", "function"),
+                ],
+                vec![],
+            );
+            let scan_job = job(&root, files.clone(), snapshot.clone());
+            let public = BTreeSet::new();
+            let roles = crate::inspect::entry_points::ProjectRoles::default();
+            for oxc in [false, true] {
+                let scan = || {
+                    if oxc {
+                        scan_success_with_oxc(scan_job.clone())
+                    } else {
+                        run_dead_code_scan(&scan_job).outcome.unwrap()
+                    }
+                };
+                let rollup = |facts: &[FileContribution],
+                              previous: Option<&DeadCodeRollupState>| {
+                    aggregate_dead_code_contributions_incremental(
+                        &root,
+                        &snapshot,
+                        facts,
+                        &public,
+                        &roles,
+                        None,
+                        None,
+                        previous,
+                        &BTreeSet::from([importer.clone()]),
+                    )
+                };
+                let initial = scan();
+                assert_eq!(initial.aggregate["count"], 2);
+                let (_, initial_state, _) = rollup(&initial.contributions, None);
+                fs::write(&files[0], format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n//{}", "x".repeat(MAX_SOURCE_BYTES as usize))).unwrap();
+                let probe = crate::project_content::Probe::new(&root);
+                let skipped = scan();
+                let expected = json!([{"file": importer, "reason": "over the 1 MiB size limit"}]);
+                assert_eq!(
+                    skipped.aggregate["count"], 0,
+                    "{extension}, oxc={oxc}: {}",
+                    skipped.aggregate
+                );
+                assert_eq!(skipped.aggregate["complete"], false);
+                assert_eq!(skipped.aggregate["skipped_files"], expected);
+                let (cached, state, _) = rollup(&skipped.contributions, Some(&initial_state));
+                assert_eq!(cached, skipped.aggregate);
+                let (warm, _, _) = rollup(&skipped.contributions, Some(&state));
+                assert_eq!(warm, cached);
+                assert!(
+                    !probe.paths().contains(&files[0]),
+                    "oversized source was opened"
+                );
+                drop(probe);
+                fs::write(&files[0], "export function inLarge() {}\n").unwrap();
+                let repaired = scan();
+                let (cached_repair, _, _) = rollup(&repaired.contributions, Some(&state));
+                assert_eq!(cached_repair, initial.aggregate);
+            }
+        }
     }
 
     fn job(root: &Path, scope_files: Vec<PathBuf>, snapshot: CallgraphSnapshot) -> InspectJob {

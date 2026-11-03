@@ -16,6 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::inspect::scanners::source_text::{
+    read_source_text, source_scan_permit, SourceText, TOO_LARGE,
+};
 use oxc_span::SourceType;
 
 use facts::parse_file_facts;
@@ -84,14 +87,28 @@ impl OxcFactsCache {
         path: &Path,
         force_reparse: bool,
         stats: &mut OxcFactsCacheStats,
-    ) -> std::io::Result<FileFacts> {
+    ) -> Result<FileFacts, String> {
         let source_type = SourceType::from_path(path).unwrap_or_default();
         let source_type_key = source_type_cache_key(source_type);
-        let metadata = fs::metadata(path)?;
+        let metadata = fs::metadata(path).map_err(|error| format!("read: {error}"))?;
         let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
         let size = metadata.len();
         let path_key = path.to_path_buf();
-        let source = crate::project_content::read_to_string(path)?;
+        let _permit = source_scan_permit(size);
+        let source = match read_source_text(path) {
+            Ok(SourceText::Text(source)) => source,
+            Ok(SourceText::TooLarge) => return Err(TOO_LARGE.to_string()),
+            Ok(SourceText::NotUtf8) => {
+                return Err("read: stream did not contain valid UTF-8".to_string())
+            }
+            Ok(SourceText::Vanished) => {
+                return Err(format!(
+                    "read: {}",
+                    std::io::Error::from(std::io::ErrorKind::NotFound)
+                ))
+            }
+            Err(error) => return Err(format!("read: {error}")),
+        };
 
         if !force_reparse {
             if let Some(entry) = self.entries_by_path.get(&path_key) {
@@ -264,7 +281,7 @@ pub fn analyze_files_with_cache(
             Ok(file_facts) => facts.push(file_facts),
             Err(error) => errors.push(OxcEngineError {
                 file: path.clone(),
-                message: format!("read: {error}"),
+                message: error,
             }),
         }
         if let Some(progress) = &progress {
@@ -332,7 +349,7 @@ fn analyze_preparsed_facts(
     let public_api_files = normalize_option_paths(&options.public_api_files);
     let executable_root_exports =
         normalize_executable_root_exports(&options.executable_root_exports);
-    let file_verdicts = compute_verdicts(
+    let mut file_verdicts = compute_verdicts(
         &project_root,
         &resolved_modules,
         &entry_points,
@@ -340,6 +357,11 @@ fn analyze_preparsed_facts(
         &executable_root_exports,
         options.entry_reachability,
     );
+    // An unread importer can reference any module, including through a dynamic
+    // import. Missing edges cannot establish that any export is unused.
+    if errors.iter().any(|error| error.message == TOO_LARGE) {
+        mark_oversized_graph_uncertain(&mut file_verdicts);
+    }
     let resolved_edges = edges
         .iter()
         .filter(|edge| edge.resolved_file.is_some())
@@ -363,6 +385,15 @@ fn analyze_preparsed_facts(
         },
         errors,
         skipped_outside_root,
+    }
+}
+
+fn mark_oversized_graph_uncertain(files: &mut [OxcFileVerdicts]) {
+    for file in files {
+        for export in &mut file.exports {
+            export.verdict = LivenessVerdict::Uncertain;
+            export.reason = TOO_LARGE.to_string();
+        }
     }
 }
 

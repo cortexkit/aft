@@ -6807,7 +6807,15 @@ fn roll_up_unused_exports_contributions(
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
+    let has_source_gaps = parsed.iter().any(|scan| {
+        scan.skipped_files
+            .iter()
+            .any(|skip| skip["reason"] == super::scanners::source_text::TOO_LARGE)
+    });
     for scan in &parsed {
+        if has_source_gaps {
+            continue;
+        }
         if public_api_files.contains(&scan.file) {
             continue;
         }
@@ -6940,6 +6948,7 @@ fn roll_up_unused_exports_contributions(
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
     if !skipped_files.is_empty() {
+        aggregate["skipped_files_count"] = json!(skipped_files.len());
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     if !package_warnings.is_empty() {
@@ -7014,8 +7023,13 @@ fn roll_up_unused_exports_oxc_contributions(
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
+    let has_source_gaps = parsed.iter().any(|scan| {
+        scan.skipped_files
+            .iter()
+            .any(|skip| skip["reason"] == super::scanners::source_text::TOO_LARGE)
+    });
     for file in &oxc_result.files {
-        if public_api_files.contains(&file.relative_file) {
+        if has_source_gaps || public_api_files.contains(&file.relative_file) {
             continue;
         }
         let test_tree = is_test_tree_file(&file.relative_file);
@@ -7199,6 +7213,7 @@ fn roll_up_unused_exports_oxc_contributions(
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
     if !skipped_files.is_empty() {
+        aggregate["skipped_files_count"] = json!(skipped_files.len());
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     if !package_warnings.is_empty() {
@@ -9470,6 +9485,88 @@ export function bannerUnused() {}
         assert_eq!(rolled_up["count"], 1, "{rolled_up:#}");
         assert_eq!(rolled_up["generated_count"], 2, "{rolled_up:#}");
         assert_eq!(rolled_up["total_count"], 3, "{rolled_up:#}");
+    }
+
+    #[test]
+    fn unused_exports_oversized_js_ts_sources_are_unopened_and_cached_as_graph_wide_gaps() {
+        use super::super::scanners::source_text::MAX_SOURCE_BYTES;
+        use super::super::scanners::unused_exports::{
+            run_unused_exports_scan, run_unused_exports_scan_with_oxc,
+        };
+        for extension in ["js", "ts"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let large = root.join(format!("importer.{extension}"));
+            let small = root.join(format!("target.{extension}"));
+            fs::write(&small, "export function used() {}\n").unwrap();
+            fs::write(&large, format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n//{}", "x".repeat(MAX_SOURCE_BYTES as usize))).unwrap();
+            let paths = vec![large.clone(), small];
+            let job = unused_exports_job(root, paths.clone());
+            let probe = crate::project_content::Probe::new(root);
+            let mut cache = super::super::oxc_engine::OxcFactsCache::new();
+            for oxc in [false, true] {
+                let success = if oxc {
+                    let result = super::super::oxc_engine::analyze_files_with_cache(
+                        root,
+                        &paths,
+                        AnalyzeOptions::default(),
+                        &mut cache,
+                    )
+                    .unwrap();
+                    assert!(!result.facts.iter().any(|facts| facts.path == large));
+                    assert!(result
+                        .files
+                        .iter()
+                        .flat_map(|file| &file.exports)
+                        .all(|export| export.verdict == LivenessVerdict::Uncertain));
+                    run_unused_exports_scan_with_oxc(&job, Some(&result))
+                } else {
+                    run_unused_exports_scan(&job)
+                }
+                .outcome
+                .unwrap();
+                let aggregate = &success.aggregate;
+                assert_eq!(aggregate["count"], 0, "{aggregate}");
+                assert_eq!(aggregate["complete"], false);
+                assert_eq!(aggregate["skipped_files_count"], 1);
+                assert_eq!(
+                    aggregate["skipped_files"],
+                    json!([{"file": format!("importer.{extension}"), "reason": "over the 1 MiB size limit"}])
+                );
+                let cached =
+                    roll_up_unused_exports_contributions(&job, &success.contributions, None);
+                for key in [
+                    "count",
+                    "items",
+                    "skipped_files",
+                    "skipped_files_count",
+                    "complete",
+                    "uncertain_count",
+                ] {
+                    assert_eq!(cached[key], aggregate[key], "{key}, oxc={oxc}");
+                }
+            }
+            assert!(
+                !probe.paths().contains(&large),
+                "oversized source was opened"
+            );
+            drop(probe);
+            fs::write(&large, "export function nowSmall() {}\n").unwrap();
+            let result = super::super::oxc_engine::analyze_files_with_cache(
+                root,
+                &paths,
+                AnalyzeOptions::default(),
+                &mut cache,
+            )
+            .unwrap();
+            assert!(result.errors.is_empty());
+            let repaired = run_unused_exports_scan_with_oxc(&job, Some(&result))
+                .outcome
+                .unwrap();
+            assert_eq!(repaired.aggregate["count"], 2);
+            assert_eq!(repaired.aggregate["complete"], true);
+            assert!(repaired.aggregate.get("skipped_files").is_none());
+        }
     }
 
     #[test]

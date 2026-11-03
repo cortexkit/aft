@@ -8,8 +8,11 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tree_sitter::{Node, Tree};
 
+use super::source_text::{
+    read_source_text, source_freshness, SourceText, MAX_SOURCE_BYTES, TOO_LARGE,
+};
 use crate::cache_freshness;
-use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
+use crate::imports::{parse_imports, specifier_imported_name, ImportBlock, ImportStatement};
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::oxc_engine::{
     ExportFact, FileFacts, LivenessVerdict, OxcEngineError, OxcEngineResult, FACTS_FORMAT_VERSION,
@@ -139,7 +142,18 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
+    // Without the skipped files' imports, even exports in other files may
+    // have consumers that are absent from the graph.
+    let has_source_gaps = per_file.iter().any(|scan| {
+        scan.contribution
+            .contribution
+            .get("skipped_files")
+            .is_some()
+    });
     for scan in &per_file {
+        if has_source_gaps {
+            continue;
+        }
         if public_api_entries.is_public_api_file(&scan.file_path) {
             continue;
         }
@@ -241,6 +255,21 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         "uncertain_items": uncertain_items,
     });
     excluded.write_into(&mut aggregate);
+    let skipped = per_file
+        .iter()
+        .flat_map(|scan| {
+            scan.contribution.contribution["skipped_files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        aggregate["complete"] = json!(false);
+        aggregate["skipped_files_count"] = json!(skipped.len());
+        aggregate["skipped_files"] = json!(skipped);
+    }
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
@@ -284,7 +313,40 @@ fn run_unused_exports_oxc_scan(
         .iter()
         .map(|facts| (normalize_path(&facts.path), facts))
         .collect::<BTreeMap<_, _>>();
-    let mut contributions = Vec::new();
+    let mut contributions = oxc_result
+        .files
+        .iter()
+        .filter_map(|file| {
+            let path = normalize_path(&file.file);
+            oxc_unused_exports_contribution(
+                &project_root,
+                facts_by_file.get(&path)?,
+                parse_errors_by_file.get(&path),
+                &skipped_files_payload,
+            )
+        })
+        .collect::<Vec<_>>();
+    let non_js_scans = job
+        .scope_files
+        .iter()
+        .filter(|path| !oxc_paths.contains(&normalize_path(path)))
+        .filter_map(|path| scan_non_js_empty_file(path, &project_root))
+        .collect::<Vec<_>>();
+    let languages_skipped = non_js_scans
+        .iter()
+        .filter_map(|scan| scan.skipped_language)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
+    let has_source_gaps = skipped_files_payload
+        .iter()
+        .any(|skip| skip["reason"] == TOO_LARGE)
+        || contributions.iter().any(|contribution| {
+            contribution.contribution["skipped_files"]
+                .as_array()
+                .is_some_and(|skips| skips.iter().any(|skip| skip["reason"] == TOO_LARGE))
+        });
     let mut count = 0usize;
     let mut headline_items = Vec::new();
     let mut generated_count = 0usize;
@@ -296,18 +358,7 @@ fn run_unused_exports_oxc_scan(
     let mut excluded = ExcludedTestTally::default();
 
     for file in &oxc_result.files {
-        if let Some(facts) = facts_by_file.get(&normalize_path(&file.file)) {
-            if let Some(contribution) = oxc_unused_exports_contribution(
-                &project_root,
-                facts,
-                parse_errors_by_file.get(&normalize_path(&file.file)),
-                &skipped_files_payload,
-            ) {
-                contributions.push(contribution);
-            }
-        }
-
-        if public_api_entries.is_public_api_file(&file.file) {
+        if has_source_gaps || public_api_entries.is_public_api_file(&file.file) {
             continue;
         }
         // Test files and fixtures are still analyzed (their imports keep
@@ -440,20 +491,6 @@ fn run_unused_exports_oxc_scan(
         }
     }
 
-    let non_js_scans = job
-        .scope_files
-        .iter()
-        .filter(|path| !oxc_paths.contains(&normalize_path(path)))
-        .filter_map(|path| scan_non_js_empty_file(path, &project_root))
-        .collect::<Vec<_>>();
-    let languages_skipped = non_js_scans
-        .iter()
-        .filter_map(|scan| scan.skipped_language)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
-
     let headline_items =
         crate::inspect::entry_points::rank_and_truncate_items(headline_items, &roles, None);
     let generated_items =
@@ -495,6 +532,24 @@ fn run_unused_exports_oxc_scan(
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
     add_oxc_honesty_fields(&mut aggregate, &project_root, oxc_result);
+    let skipped = contributions
+        .iter()
+        .flat_map(|contribution| {
+            contribution.contribution["skipped_files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|skip| {
+            Some((
+                skip["file"].as_str()?.to_string(),
+                skip["reason"].as_str()?.to_string(),
+            ))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    super::source_text::write_skipped_files(&mut aggregate, skipped, None);
 
     let success = InspectScanSuccess {
         scanned_files: contributions
@@ -522,7 +577,18 @@ fn oxc_unused_exports_contribution(
     parse_errors: Option<&Vec<String>>,
     skipped_files: &[Value],
 ) -> Option<FileContribution> {
-    let freshness = cache_freshness::collect(&facts.path).ok()?;
+    let (freshness, _permit) = source_freshness(&facts.path).ok()?;
+    if freshness.size > MAX_SOURCE_BYTES {
+        return Some(
+            oversized_file_scan(
+                project_root,
+                facts.path.clone(),
+                relative_string(project_root, &facts.path),
+                freshness,
+            )
+            .contribution,
+        );
+    }
     let exports = facts
         .exports
         .iter()
@@ -600,8 +666,10 @@ fn oxc_read_error_contribution(
         normalize_path(&project_root.join(&relative_file))
     };
     let freshness = freshness_for_oxc_error_file(&file_path)?;
-    let generated = crate::inspect::generated::is_generated_file(project_root, &file_path);
-    let contribution = json!({
+    let oversized = error.message == TOO_LARGE;
+    let generated =
+        !oversized && crate::inspect::generated::is_generated_file(project_root, &file_path);
+    let mut contribution = json!({
         "file": relative_file,
         "generated": generated,
         "exports": [],
@@ -611,6 +679,10 @@ fn oxc_read_error_contribution(
             "message": error.message,
         }],
     });
+    if oversized {
+        contribution.as_object_mut()?.remove("parse_errors");
+        contribution["skipped_files"] = json!([{"file": relative_file, "reason": TOO_LARGE}]);
+    }
     Some(FileContribution::new(
         InspectCategory::UnusedExports,
         file_path,
@@ -651,7 +723,15 @@ fn scan_non_js_empty_file(path: &Path, project_root: &Path) -> Option<FileScan> 
         return None;
     }
     let relative_file = relative_string(project_root, &file_path);
-    let freshness = cache_freshness::collect(&file_path).ok()?;
+    let (freshness, _permit) = source_freshness(&file_path).ok()?;
+    if freshness.size > MAX_SOURCE_BYTES {
+        return Some(oversized_file_scan(
+            project_root,
+            file_path,
+            relative_file,
+            freshness,
+        ));
+    }
     let skipped_language = detect_language(&file_path).map(language_name);
     Some(empty_file_scan(
         project_root,
@@ -672,6 +752,9 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
                 "reason": "outside_project_root",
             })
         })
+        .chain(oxc_result.errors.iter().filter(|error| error.message == TOO_LARGE).map(|error| {
+            json!({"file": relative_string(project_root, &error.file), "reason": TOO_LARGE})
+        }))
         .collect::<Vec<_>>()
 }
 
@@ -684,6 +767,7 @@ fn add_oxc_honesty_fields(
     let parse_errors = oxc_result
         .errors
         .iter()
+        .filter(|error| error.message != TOO_LARGE)
         .map(|error| {
             json!({
                 "file": relative_string(project_root, &error.file),
@@ -692,6 +776,8 @@ fn add_oxc_honesty_fields(
         })
         .collect::<Vec<_>>();
     if !skipped_files.is_empty() {
+        aggregate["complete"] = json!(false);
+        aggregate["skipped_files_count"] = json!(skipped_files.len());
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
     if !parse_errors.is_empty() {
@@ -724,7 +810,15 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
     }
 
     let relative_file = relative_string(project_root, &file_path);
-    let freshness = cache_freshness::collect(&file_path).ok()?;
+    let (freshness, _permit) = source_freshness(&file_path).ok()?;
+    if freshness.size > MAX_SOURCE_BYTES {
+        return Some(oversized_file_scan(
+            project_root,
+            file_path,
+            relative_file,
+            freshness,
+        ));
+    }
     let Some(lang) = detect_language(&file_path) else {
         return Some(empty_file_scan(
             project_root,
@@ -745,7 +839,27 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         ));
     }
 
-    let Ok((source, tree, import_block)) = parse_file_imports(&file_path, lang) else {
+    let source = match read_source_text(&file_path) {
+        Ok(SourceText::Text(source)) => source,
+        Ok(SourceText::TooLarge) => {
+            return Some(oversized_file_scan(
+                project_root,
+                file_path,
+                relative_file,
+                freshness,
+            ))
+        }
+        _ => {
+            return Some(empty_file_scan(
+                project_root,
+                file_path,
+                relative_file,
+                freshness,
+                None,
+            ))
+        }
+    };
+    let Ok(tree) = crate::parser::parse_source_with_cached_parser(&file_path, &source, lang) else {
         return Some(empty_file_scan(
             project_root,
             file_path,
@@ -754,6 +868,7 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
             None,
         ));
     };
+    let import_block = parse_imports(&source, &tree, lang);
 
     let generated =
         crate::inspect::generated::is_generated_file_from_source(project_root, &file_path, &source);
@@ -779,6 +894,29 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         skipped_language: None,
         generated,
     })
+}
+
+fn oversized_file_scan(
+    _project_root: &Path,
+    file_path: PathBuf,
+    relative_file: String,
+    freshness: cache_freshness::FileFreshness,
+) -> FileScan {
+    FileScan {
+        contribution: FileContribution::new(
+            InspectCategory::UnusedExports,
+            file_path.clone(),
+            freshness,
+            json!({"file": relative_file, "generated": false, "exports": [], "imports": [],
+                "skipped_files": [{"file": relative_file, "reason": TOO_LARGE}]}),
+        ),
+        file_path,
+        relative_file,
+        exports: Vec::new(),
+        imports: Vec::new(),
+        skipped_language: None,
+        generated: false,
+    }
 }
 
 fn empty_file_scan(
