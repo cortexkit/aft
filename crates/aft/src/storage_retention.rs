@@ -13407,7 +13407,7 @@ mod storage_retention_tests {
         fs::remove_dir(&root).unwrap();
         let domain = temp.path().join("opencode/inspect");
         fs::create_dir_all(&domain).unwrap();
-        let payload = domain.join(format!("{key}.payload"));
+        let payload = domain.join(format!("{key}.sqlite"));
         fs::write(&payload, "payload").unwrap();
         let replacement = payload.clone();
         let _hook = observe_test_hook(
