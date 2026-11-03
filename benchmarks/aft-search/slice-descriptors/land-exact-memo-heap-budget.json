@@ -9,8 +9,9 @@
     "commands::semantic_search::tests::repeated_paged_search_reads_exact_candidates_once_per_query_generation"
   ],
   "fenced_files": [
-    "crates/aft/src/commands/semantic_search/memo.rs"
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/lib.rs"
   ],
   "slices": ["exact-memo-heap-budget"],
-  "note": "Bound retained exact-search payload capacity and retire obsolete generations of the same query. Cache admission never cuts the verified set or the ranking input; oversized sets are served in full without retention. Routing, candidate verification and score-free ordering are unchanged; benchmark rows must remain byte-identical. The descriptor is conservatively ranking-classed because the memo is inside the ranking fence."
+  "note": "Bound retained exact-search payload capacity and retire obsolete generations of the same query. Cache admission never cuts the verified set or the ranking input; oversized sets are served in full without retention. Routing, candidate verification and score-free ordering are unchanged; benchmark rows must remain byte-identical. The descriptor is conservatively ranking-classed because the memo is inside the ranking fence. The lib.rs change only registers the Linux test-only heap probe."
 }
