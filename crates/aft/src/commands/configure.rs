@@ -26869,11 +26869,11 @@ mod tests {
             ],
         );
         let head = git_stdout(&main, &["rev-parse", "HEAD"]);
-        std::fs::write(
-            main.join(".git/objects").join(&head[..2]).join(&head[2..]),
-            b"broken",
-        )
-        .unwrap();
+        let object = main.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"broken").unwrap();
         let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
         assert!(test_context()
             .memoized_artifact_cache_key_for_configure_profiled(
