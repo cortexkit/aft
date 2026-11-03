@@ -790,20 +790,14 @@ fn bench_repository_cold_materialization() {
         })
         .unwrap();
     println!("repository files={} materialize_ms={} derived_bytes={} unknown_live_rows={} payload_reads={} payload_bytes={}", prepared.report.manifest.as_ref().unwrap().entries().count(), prepared.profile.materialization_call_ms, fs::metadata(path).unwrap().len(), unknown, reads.blake3_calls, reads.bytes);
-    for name in [
-        "refs",
-        "edges",
-        "view_bindings",
-        "view_unknown_live",
-        "view_dispatch_files",
-    ] {
-        let bytes: i64 = connection
-            .query_row(
-                "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name=?1",
-                [name],
-                |row| row.get(0),
-            )
-            .unwrap();
+    let mut tables = connection
+        .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC")
+        .unwrap();
+    for row in tables
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .unwrap()
+    {
+        let (name, bytes) = row.unwrap();
         println!("repository table={name} allocated_bytes={bytes}");
     }
 }
