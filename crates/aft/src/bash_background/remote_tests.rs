@@ -7212,7 +7212,11 @@ async fn runon_memory_without_capability_refuses_before_submission() {
     .await;
     assert!(!reply.success, "{reply:?}");
     let message = reply.data["message"].as_str().unwrap();
-    assert!(message.contains("This build server can't take a memory size yet; run the job without one."), "{message}");
+    assert!(
+        message
+            .contains("This build server can't take a memory size yet; run the job without one."),
+        "{message}"
+    );
     assert!(exec_runs(&daemon).is_empty(), "nothing may be submitted");
     assert!(!marker.exists(), "a refused runon never runs locally");
 }
