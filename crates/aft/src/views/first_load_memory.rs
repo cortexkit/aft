@@ -119,9 +119,9 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
     let storage = scratch.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
     // Git before 2.42 cannot name its system and global attribute files, so
-    // the checkout's conversion policy is not reusable and every walk reads
-    // every file again. AFT_VIEW_FRESH_MODERN_GIT=1 models a newer Git that
-    // reports both files as absent.
+    // the checkout's conversion policy is not reusable and tree-base receipts
+    // are refused. AFT_VIEW_FRESH_MODERN_GIT=1 models a newer Git that reports
+    // both files as absent.
     let _modern_git = std::env::var_os("AFT_VIEW_FRESH_MODERN_GIT")
         .map(|_| crate::views::verification::known_attribute_sources_for_test(scratch.path()));
     let checkout = |name: &str| {
