@@ -9676,7 +9676,7 @@ export function bannerUnused() {}
             let project_key = crate::search_index::artifact_cache_key(&root);
             crate::root_cache::configure_artifact_access(&root, &project_key, false);
             let (store, _) = CallGraphStore::cold_build_with_lease(
-                storage.join(name).join("callgraph"),
+                storage.join("callgraph").join(&project_key),
                 root.clone(),
                 &files,
             )
@@ -9684,7 +9684,7 @@ export function bannerUnused() {}
             let snapshot = Arc::new(
                 crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
             );
-            let mut job = snapshot_job(&root, &storage.join(name).join("inspect"), true);
+            let mut job = snapshot_job(&root, &storage.join("inspect").join(&project_key), true);
             job.scope_files = files.clone();
             job.callgraph_snapshot = Some(snapshot.clone());
             let entries = super::super::entry_points::resolve_entry_points(&root);
