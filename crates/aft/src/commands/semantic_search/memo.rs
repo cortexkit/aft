@@ -1256,25 +1256,57 @@ mod tests {
 
         assert!(memo.entry_count() <= MAX_EXACT_MEMO_ENTRIES);
     }
-}
-#[test]
-fn exact_memo_releases_old_generations_of_the_same_query() {
-    let memo = ExactMemoStore::new();
-    for revision in 0..32 {
-        let key = MemoKey::new(
-            "/project",
-            GenerationToken::new_with_str(&format!("generation-{revision}")),
-            "same query",
-            false,
+    #[test]
+    fn exact_memo_releases_old_generations_of_the_same_query() {
+        let memo = ExactMemoStore::new();
+        for revision in 0..32 {
+            let key = MemoKey::new(
+                "/project",
+                GenerationToken::new_with_str(&format!("generation-{revision}")),
+                "same query",
+                false,
+            );
+            let results = vec![CandidateResult::new_exact(
+                PathBuf::from("/project/file.rs"),
+                None,
+                EvidenceDescriptor::for_e1(revision + 1, true, false),
+            )];
+            let expected = results.clone();
+            let page = memo
+                .get_or_verify(&key, 0, 10, || {
+                    Ok(VerifiedExactSet {
+                        results,
+                        file_digests: HashMap::new(),
+                        bound_disclosure: None,
+                        stability_void: false,
+                    })
+                })
+                .unwrap();
+            assert_eq!(page.results, expected);
+        }
+        assert_eq!(
+            memo.entry_count(),
+            1,
+            "old index generations must not retain historical candidate sets"
         );
-        let results = vec![CandidateResult::new_exact(
-            PathBuf::from("/project/file.rs"),
-            None,
-            EvidenceDescriptor::for_e1(revision + 1, true, false),
-        )];
+    }
+
+    #[test]
+    fn exact_memo_oversized_entry_is_served_in_full_but_not_retained() {
+        let memo = ExactMemoStore::new();
+        let key = audit01_key("oversized");
+        let mut results =
+            Vec::with_capacity(MAX_EXACT_MEMO_BYTES / std::mem::size_of::<CandidateResult>() + 1);
+        for n in 0..20 {
+            results.push(CandidateResult::new_exact(
+                PathBuf::from(format!("/project/{n}.rs")),
+                None,
+                EvidenceDescriptor::for_e1(1, true, false),
+            ));
+        }
         let expected = results.clone();
         let page = memo
-            .get_or_verify(&key, 0, 10, || {
+            .get_or_verify(&key, 0, usize::MAX, || {
                 Ok(VerifiedExactSet {
                     results,
                     file_digests: HashMap::new(),
@@ -1283,45 +1315,13 @@ fn exact_memo_releases_old_generations_of_the_same_query() {
                 })
             })
             .unwrap();
-        assert_eq!(page.results, expected);
+        assert_eq!(
+            page.results, expected,
+            "a cache budget must never cut the exact ranking input"
+        );
+        assert!(
+            !memo.has_live_entry(&key),
+            "oversized payload remains retained"
+        );
     }
-    assert_eq!(
-        memo.entry_count(),
-        1,
-        "old index generations must not retain historical candidate sets"
-    );
-}
-
-#[test]
-fn exact_memo_oversized_entry_is_served_in_full_but_not_retained() {
-    let memo = ExactMemoStore::new();
-    let key = audit01_key("oversized");
-    let mut results =
-        Vec::with_capacity(MAX_EXACT_MEMO_BYTES / std::mem::size_of::<CandidateResult>() + 1);
-    for n in 0..20 {
-        results.push(CandidateResult::new_exact(
-            PathBuf::from(format!("/project/{n}.rs")),
-            None,
-            EvidenceDescriptor::for_e1(1, true, false),
-        ));
-    }
-    let expected = results.clone();
-    let page = memo
-        .get_or_verify(&key, 0, usize::MAX, || {
-            Ok(VerifiedExactSet {
-                results,
-                file_digests: HashMap::new(),
-                bound_disclosure: None,
-                stability_void: false,
-            })
-        })
-        .unwrap();
-    assert_eq!(
-        page.results, expected,
-        "a cache budget must never cut the exact ranking input"
-    );
-    assert!(
-        !memo.has_live_entry(&key),
-        "oversized payload remains retained"
-    );
 }
