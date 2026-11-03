@@ -109,7 +109,11 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
         expect(probe.matches).toHaveLength(1);
         break;
       }
-      if (Date.now() >= deadline) throw new Error(`Index not ready: ${probe.index_status}`);
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Index not ready: ${probe.index_status}; response=${JSON.stringify(probe)}`,
+        );
+      }
       await Bun.sleep(100);
     }
 

@@ -306,6 +306,7 @@ async function waitForSearchIndexStatus(
 ): Promise<void> {
   const started = Date.now();
   let lastStatus = "unknown";
+  let lastResponse = "";
   while (Date.now() - started < timeoutMs) {
     const response = await harness.bridge.send("grep", { pattern: "SearchIndex", path: "src" });
     if (response.success !== true) {
@@ -315,10 +316,11 @@ async function waitForSearchIndexStatus(
     }
     lastStatus = String(response.index_status ?? "unknown").toLowerCase();
     if (lastStatus === expectedIndexStatus) return;
+    lastResponse = JSON.stringify(response);
     await sleep(100);
   }
   throw new Error(
-    `timed out waiting for search index status ${expectedIndexStatus}; last status=${lastStatus}`,
+    `timed out waiting for search index status ${expectedIndexStatus}; last status=${lastStatus}; response=${lastResponse}`,
   );
 }
 
