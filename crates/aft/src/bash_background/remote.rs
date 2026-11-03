@@ -2716,6 +2716,7 @@ impl BgTaskRegistry {
                     platform: launch.requested_platform,
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
+                    memory_mib: launch.requested_memory_mib,
                     network: launch.requested_network.then_some(Network::Outbound),
                     return_paths: launch.return_paths,
                     ..Default::default()

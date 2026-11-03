@@ -9,6 +9,8 @@ pub struct PresetParams {
     pub platform: Option<super::types::Platform>,
     pub siblings: Vec<String>,
     pub weight_hint: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
     pub queue_wait_limit_s: Option<u64>,
     pub network: Option<super::types::Network>,
     /// Files the runner copies back after the command, relative to `cwd`.
@@ -193,6 +195,9 @@ pub fn build_request(
     }
     if let Some(weight) = preset.weight_hint {
         request = request.with_weight_hint(weight);
+    }
+    if let Some(memory_mib) = preset.memory_mib {
+        request = request.with_memory_mib(memory_mib);
     }
     if let Some(network) = &preset.network {
         request = request.with_network(network.clone());

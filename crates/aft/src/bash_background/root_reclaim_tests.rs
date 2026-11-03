@@ -324,6 +324,7 @@ fn root_reclaim_identity_is_resolved_before_spawn_admission() {
                         harness: "reclaim".into(),
                         session: "reclaim".into(),
                         requested_vcpus: None,
+                        requested_memory_mib: None,
                         requested_network: false,
                         configured_env_names: Vec::new(),
                         return_paths: Vec::new(),

@@ -2184,6 +2184,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     session: "session".into(),
                     requested_platform: None,
                     requested_vcpus: None,
+                    requested_memory_mib: None,
                     requested_network: false,
                     configured_env_names: Vec::new(),
                     return_paths: Vec::new(),
