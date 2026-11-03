@@ -13235,6 +13235,8 @@ impl AppContext {
             .lock()
             .as_ref()
             .is_some_and(|view| view.matches(&root, &storage, &family, policy));
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-route-ready");
         if !own_view_bound || self.callgraph_borrow.lock().is_some() {
             if let Some(borrowed) =
                 self.borrowed_callgraph_view_reader(&root, &storage, &family, policy, false)
@@ -13256,6 +13258,8 @@ impl AppContext {
                 return Some(borrowed);
             }
         }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-select-begin");
         let view = {
             let mut slot = self.callgraph_view.lock();
             if !slot
@@ -13319,13 +13323,19 @@ impl AppContext {
             }
             slot.as_ref().unwrap().clone()
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-selected");
         self.record_checkout_pending_watcher_gap();
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-gap-recorded");
         let result = match acquire(&view) {
             Err(error) if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) => self
                 .borrowed_callgraph_view_reader(&root, &storage, &family, policy, true)
                 .unwrap_or(Err(error)),
             result => result,
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-read-return");
         if pinned_config_for(self.config_pin_key()).is_some() {
             CALLGRAPH_QUERY_READERS.with(|readers| {
                 readers
@@ -13341,6 +13351,8 @@ impl AppContext {
                 self.note_classified_view_load_failure("callgraph", &error.reason, false);
             }
         }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-accounted");
         Some(result)
     }
 
