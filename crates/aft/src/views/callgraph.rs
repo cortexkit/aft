@@ -1893,8 +1893,10 @@ mod tests {
             }),
         );
         drop(graph.ready_reader_for_test());
+        // Positive waits: a loaded Windows runner can take seconds to schedule
+        // an acquisition. Only the cancellation check below is timing-sensitive.
         let old = tokens_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap();
         let added = root.join("c.ts");
         std::fs::write(
@@ -1906,7 +1908,7 @@ mod tests {
         let next_graph = graph.clone();
         let next = std::thread::spawn(move || next_graph.reader());
         let current = tokens_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap();
         assert_ne!(old.progress_key(), current.progress_key());
         graph.cancel();
