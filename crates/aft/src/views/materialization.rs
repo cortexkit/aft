@@ -130,7 +130,7 @@ pub(crate) fn apply_manifest_diff_profiled(
 mod module_digest;
 #[cfg(test)]
 pub(crate) mod parity;
-mod payload;
+pub(crate) mod payload;
 pub(crate) mod profile;
 mod resolution_facts;
 mod stable_rows;
