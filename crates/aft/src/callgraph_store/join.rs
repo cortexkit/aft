@@ -1679,13 +1679,31 @@ fn resolve_dispatch_type_names<I: super::ResolverIndex>(
         .filter(|raw| matches!(raw.kind, BlobRefKind::Call | BlobRefKind::Construction))
         .map(|raw| (raw.ordinal, raw))
         .collect::<HashMap<_, _>>();
-    let mut contexts = HashMap::<String, BTreeMap<u32, &BlobRef>>::new();
+    // Path binding depends on the enclosing scope and the visible import prefix,
+    // not on a call's identity. Resolve repeated uses in the same context once,
+    // while retaining distinct inline modules, impl owners and import scopes.
+    fn context_key<'a>(raw: &'a BlobRef, data: &FileCallData) -> (Option<(&'a str, bool)>, usize) {
+        (
+            raw.caller_symbol.as_deref().map(|caller| {
+                (
+                    caller.rsplit_once("::").map_or("", |(scope, _)| scope),
+                    data.symbol_metadata
+                        .get(caller)
+                        .is_some_and(|meta| meta.kind == SymbolKind::Method),
+                )
+            }),
+            data.import_block
+                .imports
+                .partition_point(|import| import.byte_range.start <= raw.byte_start),
+        )
+    }
+    let mut contexts = HashMap::<_, BTreeMap<_, &BlobRef>>::new();
     for raw in references.values() {
-        if let Some(name) = &raw.full_ref {
+        if let Some(name) = raw.full_ref.as_ref().filter(|name| names.contains(*name)) {
             contexts
-                .entry(name.clone())
+                .entry(name.as_str())
                 .or_default()
-                .insert(raw.ordinal, raw);
+                .insert(context_key(raw, data), raw);
         }
     }
     for site in &parse.dispatch.sites {
@@ -1702,15 +1720,15 @@ fn resolve_dispatch_type_names<I: super::ResolverIndex>(
         }
         name = name.strip_prefix("@return:").unwrap_or(name);
         contexts
-            .entry(name.to_string())
+            .entry(name)
             .or_default()
-            .insert(reference.ordinal, reference);
+            .insert(context_key(reference, data), reference);
     }
     let mut targets = BTreeMap::new();
     for name in names {
         let short = name.rsplit("::").next().unwrap_or(&name);
         let sites = contexts
-            .get(&name)
+            .get(name.as_str())
             .map(|refs| refs.values().copied().map(Some).collect::<Vec<_>>())
             .unwrap_or_else(|| vec![None]);
         let mut bindings = BTreeSet::new();

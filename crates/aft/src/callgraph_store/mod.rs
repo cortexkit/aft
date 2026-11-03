@@ -5582,6 +5582,7 @@ struct NameMatchRef {
     method_name: String,
     colon_dispatch: bool,
     line: u32,
+    byte_range: std::ops::Range<usize>,
     lang: String,
 }
 
@@ -20727,7 +20728,8 @@ fn load_name_match_refs(
     // Existing dispatch edges remain until the incremental pass has computed the
     // expected IDs. Do not let those edges hide unresolved calls that still need processing.
     let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,
-                           n.signature, r.short_name, r.full_ref, r.line, f.lang
+                           n.signature, r.short_name, r.full_ref, r.line, f.lang,
+                           r.byte_start, r.byte_end
                     FROM refs r
                     JOIN files f ON f.path = r.caller_file
                     JOIN nodes n ON n.id = r.caller_node
@@ -20758,6 +20760,7 @@ fn load_name_match_refs(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, usize>(9)?..row.get::<_, usize>(10)?,
                 ))
             })?;
             for row in rows {
@@ -20771,6 +20774,7 @@ fn load_name_match_refs(
                     full_ref,
                     line,
                     lang,
+                    byte_range,
                 ) = row?;
                 if let Some(reference) = name_match_ref_from_parts(
                     ref_id,
@@ -20782,6 +20786,7 @@ fn load_name_match_refs(
                     full_ref,
                     line,
                     lang,
+                    byte_range,
                 ) {
                     references.push(reference);
                 }
@@ -20803,6 +20808,7 @@ fn load_name_match_refs(
             row.get::<_, Option<String>>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, String>(8)?,
+            row.get::<_, usize>(9)?..row.get::<_, usize>(10)?,
         ))
     })?;
     for row in rows {
@@ -20816,6 +20822,7 @@ fn load_name_match_refs(
             full_ref,
             line,
             lang,
+            byte_range,
         ) = row?;
         if let Some(reference) = name_match_ref_from_parts(
             ref_id,
@@ -20827,6 +20834,7 @@ fn load_name_match_refs(
             full_ref,
             line,
             lang,
+            byte_range,
         ) {
             references.push(reference);
         }
@@ -20845,6 +20853,7 @@ fn name_match_ref_from_parts(
     full_ref: Option<String>,
     line: i64,
     lang: String,
+    byte_range: std::ops::Range<usize>,
 ) -> Option<NameMatchRef> {
     let caller_node = caller_node?;
     let full_ref = full_ref?;
@@ -20865,6 +20874,7 @@ fn name_match_ref_from_parts(
         method_name,
         colon_dispatch,
         line: line.max(0) as u32,
+        byte_range,
         lang,
     })
 }
@@ -20959,6 +20969,14 @@ fn rust_dispatch_data<'a>(
             )
             .ok()?;
             extend_rust_imports_from_tree(&parsed.source, parsed.tree.root_node(), &mut data);
+            // Receiver binding reads declaration/import data and callable names,
+            // not the call-site vectors. Do not retain a second graph per chunk.
+            for calls in data.calls_by_symbol.values_mut() {
+                *calls = Vec::new();
+            }
+            data.value_refs_by_symbol.clear();
+            data.macro_body_calls_by_macro.clear();
+            data.macro_mentions_by_symbol.clear();
             Some(Rc::new(data))
         })
         .as_ref()
@@ -20992,9 +21010,10 @@ fn rust_exact_dispatch_candidate(
     file: &str,
     symbol: &str,
 ) -> Option<NameMatchCandidate> {
-    tx.query_row(
+    tx.prepare_cached(
         "SELECT id, kind, start_line FROM nodes WHERE file_path=?1 AND scoped_name=?2 AND kind='method'
          AND (SELECT COUNT(*) FROM nodes WHERE file_path=?1 AND scoped_name=?2)=1",
+    ).ok()?.query_row(
         params![file, symbol], |row| Ok(NameMatchCandidate {
             node_id: row.get(0)?, file_path: file.to_string(), scoped_name: symbol.to_string(),
             kind: row.get(1)?, start_line: row.get::<_, u32>(2)? + 1,
@@ -21010,13 +21029,7 @@ fn rust_bound_dispatch_candidate(
     source_cache: &mut DispatchSourceCache,
     data_cache: &mut HashMap<String, Option<Rc<FileCallData>>>,
 ) -> Option<NameMatchCandidate> {
-    let (start, end): (usize, usize) = tx
-        .query_row(
-            "SELECT byte_start, byte_end FROM refs WHERE ref_id=?1",
-            [&reference.ref_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()?;
+    let (start, end) = (reference.byte_range.start, reference.byte_range.end);
     let raw = rust_dispatch_raw(reference, start, end);
     let data = rust_dispatch_data(
         project_root,
@@ -36073,6 +36086,7 @@ class OnlyService {
             method_name: method_name.to_string(),
             colon_dispatch: false,
             line,
+            byte_range: 0..0,
             lang: lang.to_string(),
         }
     }
