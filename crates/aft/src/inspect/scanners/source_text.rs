@@ -22,8 +22,10 @@ use serde_json::{json, Value};
 pub(crate) const NOT_VALID_UTF8: &str = "not valid UTF-8";
 
 pub(crate) const MAX_SOURCE_BYTES: u64 = crate::search_index::DEFAULT_MAX_FILE_SIZE;
+pub(crate) const MAX_GRAPH_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 // Agent-visible reason, approved by Ufuk; change it only with his approval.
 pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
+pub(crate) const GRAPH_TOO_LARGE: &str = "over the 4 MiB size limit";
 
 // Charge source bytes, not file count, so small files can use the whole Rayon
 // pool. Reservations stay live through parsing and tree traversal. Source-byte
@@ -47,7 +49,11 @@ impl SourceScanBudget {
     }
 
     fn reserve(&self, stat_size: u64) -> SourceScanPermit<'_> {
-        let bytes = stat_size.min(MAX_SOURCE_BYTES);
+        self.reserve_with_limit(stat_size, MAX_SOURCE_BYTES)
+    }
+
+    fn reserve_with_limit(&self, stat_size: u64, limit: u64) -> SourceScanPermit<'_> {
+        let bytes = stat_size.min(limit);
         let mut active = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         // One file must make progress even if the budget is smaller than that
         // file's reservation; other nonempty reservations wait for its release.
@@ -74,6 +80,36 @@ pub(crate) fn source_scan_permit(stat_size: u64) -> SourceScanPermit<'static> {
     SOURCE_SCANS.reserve(stat_size)
 }
 
+pub(crate) fn graph_source_permit(stat_size: u64) -> SourceScanPermit<'static> {
+    SOURCE_SCANS.reserve_with_limit(stat_size, MAX_GRAPH_SOURCE_BYTES)
+}
+
+/// Generated and minified JS/TS inputs are deliberate graph exclusions, not
+/// missing coverage. Name-only classifications avoid even a header read.
+pub(crate) fn graph_source_excluded(project_root: &Path, path: &Path) -> bool {
+    use crate::file_kind::ContentKind;
+    use crate::parser::LangId;
+    let _permit = source_scan_permit(crate::file_kind::HEAD_BYTES as u64);
+    matches!(
+        crate::parser::detect_language(path),
+        Some(LangId::JavaScript | LangId::TypeScript | LangId::Tsx)
+    ) && matches!(
+        crate::file_kind::classify(project_root, path, None).content,
+        ContentKind::Generated | ContentKind::Minified
+    )
+}
+
+pub(crate) fn metadata_freshness(
+    path: &Path,
+) -> std::io::Result<crate::cache_freshness::FileFreshness> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(crate::cache_freshness::FileFreshness {
+        mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash: crate::cache_freshness::zero_hash(),
+    })
+}
+
 impl Drop for SourceScanPermit<'_> {
     fn drop(&mut self) {
         let mut active = self
@@ -95,26 +131,30 @@ pub(crate) enum SourceBytes {
 /// Admit by metadata before opening, then bound the read too: a file can grow
 /// between stat and read. The extra byte detects overflow, never a partial parse.
 pub(crate) fn read_source_bytes(path: &Path) -> std::io::Result<SourceBytes> {
+    read_source_bytes_with_limit(path, MAX_SOURCE_BYTES)
+}
+
+fn read_source_bytes_with_limit(path: &Path, limit: u64) -> std::io::Result<SourceBytes> {
     if crate::project_content::is_excluded(path) {
         return Ok(SourceBytes::Vanished);
     }
     let read = || -> std::io::Result<SourceBytes> {
         let metadata = std::fs::metadata(path)?;
-        if metadata.len() > MAX_SOURCE_BYTES {
+        if metadata.len() > limit {
             return Ok(SourceBytes::TooLarge);
         }
         let file = crate::project_content::open(path)?;
-        if file.metadata()?.len() > MAX_SOURCE_BYTES {
+        if file.metadata()?.len() > limit {
             return Ok(SourceBytes::TooLarge);
         }
         #[cfg(debug_assertions)]
         bump_source_read_count(path);
         let mut bytes = Vec::new();
-        file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut bytes)?;
+        file.take(limit + 1).read_to_end(&mut bytes)?;
         crate::views::io::WORK
             .content_read_bytes
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        Ok(if bytes.len() as u64 > limit {
             SourceBytes::TooLarge
         } else {
             SourceBytes::Bytes(bytes)
@@ -135,9 +175,28 @@ pub(crate) fn source_freshness(
     crate::cache_freshness::FileFreshness,
     SourceScanPermit<'static>,
 )> {
+    source_freshness_with_limit(path, MAX_SOURCE_BYTES)
+}
+
+pub(crate) fn graph_source_freshness(
+    path: &Path,
+) -> std::io::Result<(
+    crate::cache_freshness::FileFreshness,
+    SourceScanPermit<'static>,
+)> {
+    source_freshness_with_limit(path, MAX_GRAPH_SOURCE_BYTES)
+}
+
+fn source_freshness_with_limit(
+    path: &Path,
+    limit: u64,
+) -> std::io::Result<(
+    crate::cache_freshness::FileFreshness,
+    SourceScanPermit<'static>,
+)> {
     let metadata = std::fs::metadata(path)?;
-    let permit = source_scan_permit(metadata.len());
-    if metadata.len() > MAX_SOURCE_BYTES {
+    let permit = SOURCE_SCANS.reserve_with_limit(metadata.len(), limit);
+    if metadata.len() > limit {
         return Ok((
             crate::cache_freshness::FileFreshness {
                 mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
@@ -173,7 +232,15 @@ pub(crate) enum SourceText {
 /// example permission denied) are returned unchanged so each scanner keeps
 /// its existing contract for them.
 pub(crate) fn read_source_text(path: &Path) -> std::io::Result<SourceText> {
-    match read_source_bytes(path)? {
+    read_source_text_with_limit(path, MAX_SOURCE_BYTES)
+}
+
+pub(crate) fn read_graph_source_text(path: &Path) -> std::io::Result<SourceText> {
+    read_source_text_with_limit(path, MAX_GRAPH_SOURCE_BYTES)
+}
+
+fn read_source_text_with_limit(path: &Path, limit: u64) -> std::io::Result<SourceText> {
+    match read_source_bytes_with_limit(path, limit)? {
         SourceBytes::Bytes(bytes) => Ok(match String::from_utf8(bytes) {
             Ok(text) => SourceText::Text(text),
             Err(_) => SourceText::NotUtf8,
@@ -367,6 +434,65 @@ mod tests {
             matches!(read_source_bytes(&path).unwrap(), SourceBytes::Bytes(bytes) if bytes.len() as u64 == MAX_SOURCE_BYTES)
         );
         assert_eq!(probe.paths(), vec![path]);
+    }
+
+    #[test]
+    fn graph_sources_have_a_separate_four_mib_limit_and_byte_reservations() {
+        assert_eq!(MAX_SOURCE_BYTES, 1_048_576);
+        assert_eq!(MAX_GRAPH_SOURCE_BYTES, 4_194_304);
+        assert_eq!(GRAPH_TOO_LARGE, "over the 4 MiB size limit");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handwritten.ts");
+        std::fs::write(&path, "// handwritten source\n".repeat(75_000)).unwrap();
+        assert!(matches!(
+            read_source_text(&path).unwrap(),
+            SourceText::TooLarge
+        ));
+        assert!(
+            matches!(read_graph_source_text(&path).unwrap(), SourceText::Text(source) if source.len() > 1_572_864)
+        );
+        let budget = SourceScanBudget::new(SOURCE_SCAN_BUDGET_BYTES);
+        let permit = budget.reserve_with_limit(3 * 1024 * 1024, MAX_GRAPH_SOURCE_BYTES);
+        assert_eq!(permit.bytes, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn graph_classifier_reads_only_a_header_for_content_exclusions() {
+        use crate::inspect::{InspectCategory, InspectJob, JobKey};
+        use std::sync::{Arc, RwLock};
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in [
+            (
+                "header.ts",
+                format!("// @generated\n{}", "// generated source\n".repeat(10_000)),
+            ),
+            ("dense.js", "export const minified = 1;".repeat(10_000)),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source).unwrap();
+            let job = InspectJob {
+                job_id: 1,
+                key: JobKey::for_project_category(InspectCategory::UnusedExports),
+                category: InspectCategory::UnusedExports,
+                scope_files: vec![path.clone()],
+                project_root: dir.path().to_path_buf(),
+                inspect_dir: dir.path().join("inspect"),
+                config: Arc::new(crate::config::Config::default()),
+                symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
+                inspect_writer: true,
+                callgraph_writer: true,
+                callgraph_snapshot: None,
+            };
+            let success = super::super::unused_exports::run_unused_exports_scan(&job)
+                .outcome
+                .unwrap();
+            assert_eq!(success.aggregate["count"], 0);
+            assert!(success.aggregate.get("skipped_files").is_none());
+            assert_eq!(source_read_count_for_debug(&path), 0);
+            assert!(
+                crate::file_kind::read_probe::bytes_read(&path) <= crate::file_kind::HEAD_BYTES
+            );
+        }
     }
 
     #[test]

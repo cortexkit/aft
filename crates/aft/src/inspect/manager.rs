@@ -6810,10 +6810,10 @@ fn roll_up_unused_exports_contributions(
     let has_source_gaps = parsed.iter().any(|scan| {
         scan.skipped_files
             .iter()
-            .any(|skip| skip["reason"] == super::scanners::source_text::TOO_LARGE)
+            .any(|skip| skip["reason"] == super::scanners::source_text::GRAPH_TOO_LARGE)
     });
     for scan in &parsed {
-        if has_source_gaps {
+        if has_source_gaps || scan.excluded_from_graph {
             continue;
         }
         if public_api_files.contains(&scan.file) {
@@ -6966,6 +6966,9 @@ fn roll_up_unused_exports_oxc_contributions(
     let facts = parsed
         .iter()
         .filter_map(|scan| {
+            if scan.excluded_from_graph {
+                return None;
+            }
             let oxc_facts = scan.oxc_facts.as_ref()?;
             let path = job.project_root.join(&scan.file);
             Some(FileFacts {
@@ -6991,11 +6994,12 @@ fn roll_up_unused_exports_oxc_contributions(
         .map(|scan| {
             (
                 scan.file.clone(),
-                super::generated::is_generated_file_with_cached_hint(
-                    &job.project_root,
-                    &scan.file,
-                    scan.generated,
-                ),
+                !scan.excluded_from_graph
+                    && super::generated::is_generated_file_with_cached_hint(
+                        &job.project_root,
+                        &scan.file,
+                        scan.generated,
+                    ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -7026,7 +7030,7 @@ fn roll_up_unused_exports_oxc_contributions(
     let has_source_gaps = parsed.iter().any(|scan| {
         scan.skipped_files
             .iter()
-            .any(|skip| skip["reason"] == super::scanners::source_text::TOO_LARGE)
+            .any(|skip| skip["reason"] == super::scanners::source_text::GRAPH_TOO_LARGE)
     });
     for file in &oxc_result.files {
         if has_source_gaps || public_api_files.contains(&file.relative_file) {
@@ -7321,6 +7325,8 @@ struct DeadCodeRefreshContribution {
 
 #[derive(Debug, Clone, Deserialize)]
 struct UnusedExportsContribution {
+    #[serde(default)]
+    excluded_from_graph: bool,
     file: String,
     #[serde(default)]
     generated: Option<bool>,
@@ -9449,7 +9455,7 @@ export function bannerUnused() {}
     }
 
     #[test]
-    fn unused_exports_oxc_cached_rollup_preserves_generated_split() {
+    fn unused_exports_oxc_cached_rollup_preserves_generated_exclusions() {
         let (_dir, root, paths) = generated_unused_exports_fixture();
         let job = unused_exports_job(&root, paths.clone());
         let entry_points = crate::inspect::entry_points::resolve_entry_points(&root);
@@ -9483,8 +9489,8 @@ export function bannerUnused() {}
             "cached rollup must match fresh scan"
         );
         assert_eq!(rolled_up["count"], 1, "{rolled_up:#}");
-        assert_eq!(rolled_up["generated_count"], 2, "{rolled_up:#}");
-        assert_eq!(rolled_up["total_count"], 3, "{rolled_up:#}");
+        assert_eq!(rolled_up["generated_count"], 0, "{rolled_up:#}");
+        assert_eq!(rolled_up["total_count"], 1, "{rolled_up:#}");
     }
 
     #[test]
@@ -9627,6 +9633,106 @@ export function bannerUnused() {}
         assert!(!probe.paths().contains(&minified));
     }
 
+    /// Capture uncapped scanner findings and importer evidence for a frozen
+    /// real-repository corpus. Storage and output are supplied by the caller.
+    #[test]
+    #[ignore = "real-repository graph admission measurement; requires AFT_GRAPH_MEASURE_SPEC and AFT_GRAPH_MEASURE_OUTPUT"]
+    fn measure_graph_source_admission_on_real_repositories() {
+        let specs: Value = serde_json::from_str(
+            &std::env::var("AFT_GRAPH_MEASURE_SPEC").expect("measurement spec"),
+        )
+        .unwrap();
+        let output =
+            PathBuf::from(std::env::var("AFT_GRAPH_MEASURE_OUTPUT").expect("measurement output"));
+        let storage = output.with_extension("storage");
+        let mut results = Vec::new();
+        for spec in specs.as_array().unwrap() {
+            let name = spec["name"].as_str().unwrap();
+            let root = std::fs::canonicalize(spec["root"].as_str().unwrap()).unwrap();
+            let prefix = spec["prefix"].as_str().unwrap_or("");
+            let files = crate::callgraph::walk_project_files(&root)
+                .filter(|path| {
+                    path.strip_prefix(&root)
+                        .is_ok_and(|path| path.starts_with(prefix))
+                        && crate::parser::detect_language(path).is_some_and(is_js_ts_language)
+                })
+                .collect::<Vec<_>>();
+            assert!(!files.is_empty(), "empty corpus: {name}");
+            let excluded = files
+                .iter()
+                .filter_map(|path| {
+                    let kind = crate::file_kind::classify(&root, path, None).content;
+                    matches!(
+                        kind,
+                        crate::file_kind::ContentKind::Generated
+                            | crate::file_kind::ContentKind::Minified
+                    )
+                    .then(|| json!({"file": relative_cache_key(&root, path), "kind": kind.label()}))
+                })
+                .collect::<Vec<_>>();
+            if name != "aft-packages" {
+                assert!(!excluded.is_empty(), "no generated/minified inputs: {name}");
+            }
+            let project_key = crate::search_index::artifact_cache_key(&root);
+            crate::root_cache::configure_artifact_access(&root, &project_key, false);
+            let (store, _) = CallGraphStore::cold_build_with_lease(
+                storage.join(name).join("callgraph"),
+                root.clone(),
+                &files,
+            )
+            .unwrap();
+            let snapshot = Arc::new(
+                crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap(),
+            );
+            let mut job = snapshot_job(&root, &storage.join(name).join("inspect"), true);
+            job.scope_files = files.clone();
+            job.callgraph_snapshot = Some(snapshot.clone());
+            let entries = super::super::entry_points::resolve_entry_points(&root);
+            let options = |entry_reachability| AnalyzeOptions {
+                entry_points: snapshot.entry_points.iter().cloned().collect(),
+                public_api_files: entries.public_api_files(),
+                executable_root_exports: entries.executable_root_exports(),
+                force_reparse_files: Vec::new(),
+                entry_reachability,
+            };
+            let dead_oxc =
+                super::super::oxc_engine::analyze_files(&root, &files, options(true)).unwrap();
+            let dead = super::super::scanners::dead_code::run_dead_code_scan_with_oxc(
+                &job,
+                Some(&dead_oxc),
+            )
+            .outcome
+            .unwrap()
+            .aggregate;
+            job.category = InspectCategory::UnusedExports;
+            job.key = JobKey::for_project_category(job.category);
+            let unused_oxc =
+                super::super::oxc_engine::analyze_files(&root, &files, options(false)).unwrap();
+            let unused = super::super::scanners::unused_exports::run_unused_exports_scan_with_oxc(
+                &job,
+                Some(&unused_oxc),
+            )
+            .outcome
+            .unwrap()
+            .aggregate;
+            let calls = snapshot.outbound_calls.iter().map(|call| json!({
+                "caller_file": relative_cache_key(&root, &call.caller_file), "caller_symbol": call.caller_symbol,
+                "target": call.target, "line": call.line,
+            })).collect::<Vec<_>>();
+            println!(
+                "GRAPH_MEASURE {name}: files={} excluded={} dead={} unused={}",
+                files.len(),
+                excluded.len(),
+                dead["count"],
+                unused["count"]
+            );
+            results.push(json!({"name": name, "root": root, "files": files.len(), "excluded": excluded,
+                "dead_code": dead, "unused_exports": unused, "oxc": unused_oxc, "snapshot_calls": calls}));
+        }
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(output, serde_json::to_vec(&results).unwrap()).unwrap();
+    }
+
     #[test]
     fn unused_exports_cached_generated_state_avoids_reprobe_with_legacy_fallback() {
         let (_dir, root, paths) = generated_unused_exports_fixture();
@@ -9682,8 +9788,25 @@ export function bannerUnused() {}
         assert_eq!(legacy_cached, fresh.aggregate);
         assert_eq!(
             crate::inspect::generated::file_probe_count_for_debug(&root),
+            0,
+            "deliberate exclusions must not be reprobed when a legacy generated hint is absent"
+        );
+        contributions
+            .iter_mut()
+            .find(|contribution| contribution.file_path.ends_with("src/hand.ts"))
+            .unwrap()
+            .contribution
+            .as_object_mut()
+            .unwrap()
+            .remove("generated");
+        crate::inspect::generated::reset_file_probe_count_for_debug(&root);
+        let legacy_handwritten =
+            roll_up_unused_exports_contributions(&job, &contributions, Some(MAX_DRILL_DOWN_ITEMS));
+        assert_eq!(legacy_handwritten, fresh.aggregate);
+        assert_eq!(
+            crate::inspect::generated::file_probe_count_for_debug(&root),
             1,
-            "a legacy contribution without generated must probe and recover its classification"
+            "legacy handwritten contributions still recover a missing classification hint"
         );
     }
 

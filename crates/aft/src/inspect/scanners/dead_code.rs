@@ -29,7 +29,8 @@ use crate::inspect::{
 use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::source_text::{
-    read_source_text, source_scan_permit, SourceText, MAX_SOURCE_BYTES, TOO_LARGE,
+    graph_source_permit, read_graph_source_text, SourceText, GRAPH_TOO_LARGE,
+    MAX_GRAPH_SOURCE_BYTES,
 };
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
@@ -333,14 +334,14 @@ impl DeadCodeFileAnalyzer {
         }
 
         let metadata = fs::metadata(file).ok();
-        let _permit = source_scan_permit(metadata.as_ref().map_or(0, fs::Metadata::len));
+        let _permit = graph_source_permit(metadata.as_ref().map_or(0, fs::Metadata::len));
         #[cfg(test)]
         AFTER_SOURCE_METADATA.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        let source = match read_source_text(file) {
+        let source = match read_graph_source_text(file) {
             Ok(SourceText::Text(source)) => source,
             Ok(SourceText::TooLarge) => {
                 return FileAnalysis {
@@ -748,10 +749,23 @@ fn gather_file_contribution(
     file_analyzer: &mut DeadCodeFileAnalyzer,
 ) -> FileContribution {
     let file_name = relative_path(&job.project_root, file);
-    if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_SOURCE_BYTES)
+    if super::source_text::graph_source_excluded(&job.project_root, file) {
+        return FileContribution::new(
+            InspectCategory::DeadCode,
+            file.to_path_buf(),
+            super::source_text::metadata_freshness(file).unwrap_or(FileFreshness {
+                mtime: UNIX_EPOCH,
+                size: 0,
+                content_hash: cache_freshness::zero_hash(),
+            }),
+            json!({"file": file_name, "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
+                "exports": [], "generated": false, "excluded_from_graph": true}),
+        );
+    }
+    if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_GRAPH_SOURCE_BYTES)
         || oxc_parse_errors_by_file
             .get(&file_name)
-            .is_some_and(|errors| errors.iter().any(|error| error == TOO_LARGE))
+            .is_some_and(|errors| errors.iter().any(|error| error == GRAPH_TOO_LARGE))
     {
         return oversized_file_contribution(file, &file_name);
     }
@@ -926,7 +940,7 @@ fn oversized_file_contribution(file: &Path, file_name: &str) -> FileContribution
         freshness,
         json!({
             "file": file_name, "facts_format_version": DEAD_CODE_FACTS_FORMAT_VERSION,
-            "exports": [], "skipped_files": [{"file": file_name, "reason": TOO_LARGE}]
+            "exports": [], "skipped_files": [{"file": file_name, "reason": GRAPH_TOO_LARGE}]
         }),
     )
 }
@@ -1133,6 +1147,16 @@ fn aggregate_dead_code_contributions_incremental_body(
                     .iter()
                     .any(|contribution| contribution.decode_failed)
         });
+    let exclusions_changed = previous.is_some_and(|state| {
+        let exclusions = |facts: &[DeadCodeContribution]| {
+            facts
+                .iter()
+                .filter(|fact| fact.excluded_from_graph)
+                .map(|fact| fact.file.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        exclusions(&parsed) != exclusions(&state.materialized)
+    });
     let contribution_hashes = contribution_hashes(
         previous.map(|state| &state.contribution_hashes),
         contributions,
@@ -1166,6 +1190,7 @@ fn aggregate_dead_code_contributions_incremental_body(
                     == reachable_symbols_for_file(&previous.production.reachable, file)
         });
         if !has_coverage_gaps
+            && !exclusions_changed
             && previous.contribution_hashes == contribution_hashes
             && previous.public_api_files == *public_api_files
             && previous.roles_fingerprint == roles_fingerprint
@@ -1196,6 +1221,7 @@ fn aggregate_dead_code_contributions_incremental_body(
         .cloned()
         .collect::<BTreeSet<_>>();
     if has_coverage_gaps
+        || exclusions_changed
         || previous.is_none()
         || previous.is_some_and(|state| {
             state.public_api_files != *public_api_files
@@ -1889,6 +1915,11 @@ fn materialize_dead_code_contributions(
     parsed
         .into_iter()
         .map(|mut contribution| {
+            // Cached callgraph edges from deliberately excluded files must not
+            // keep another file's symbols live after their source is omitted.
+            if contribution.excluded_from_graph {
+                return contribution;
+            }
             if !affected_files.contains(&contribution.file) {
                 if let Some(previous) = previous_by_file.get(contribution.file.as_str()) {
                     return (*previous).clone();
@@ -2697,7 +2728,7 @@ fn has_oversized_sources(contributions: &[DeadCodeContribution]) -> bool {
         contribution
             .skipped_files
             .iter()
-            .any(|skip| skip["reason"] == TOO_LARGE)
+            .any(|skip| skip["reason"] == GRAPH_TOO_LARGE)
     })
 }
 
@@ -7396,7 +7427,7 @@ fn supports_type_refs(lang: LangId) -> bool {
 }
 
 fn collect_freshness(file: &Path) -> FileFreshness {
-    super::source_text::source_freshness(file)
+    super::source_text::graph_source_freshness(file)
         .map(|(freshness, _permit)| freshness)
         .unwrap_or_else(|_| FileFreshness {
             mtime: UNIX_EPOCH,
@@ -7467,6 +7498,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DeadCodeContribution {
+    #[serde(default)]
+    excluded_from_graph: bool,
     // This marker belongs only to the in-memory rollup, never cached JSON.
     #[serde(skip)]
     decode_failed: bool,
@@ -9256,14 +9289,20 @@ mod tests {
             ("src/bundle.min.js", "export function minifiedUnused() {}\n"),
             ("src/target.ts", "export function used() {}\n"),
         ]);
-        let snapshot = snapshot(
+        let snapshot = snapshot_with_entry_points(
             files.clone(),
             vec![
                 export(&root, "src/api.generated.ts", "generatedUnused", "function"),
                 export(&root, "src/bundle.min.js", "minifiedUnused", "function"),
                 export(&root, "src/target.ts", "used", "function"),
             ],
-            vec![],
+            vec![outbound(
+                &root,
+                "src/api.generated.ts",
+                "<top-level>",
+                "used",
+            )],
+            BTreeSet::from([files[0].clone()]),
         );
         let scan_job = job(&root, files.clone(), snapshot);
         let probe = crate::project_content::Probe::new(&root);
@@ -11054,7 +11093,7 @@ throughBarrel();
     }
 
     #[test]
-    fn oxc_dead_code_buckets_generated_exports_below_headline() {
+    fn oxc_dead_code_excludes_generated_exports_from_the_graph() {
         let (_temp_dir, root, paths) = fixture_project(&[
             ("package.json", r#"{"main":"src/main.ts"}"#),
             (
@@ -11096,20 +11135,20 @@ export function bannerDead() {}
 
         assert_eq!(first.aggregate["count"], 1, "{:#}", first.aggregate);
         assert_eq!(
-            first.aggregate["generated_count"], 2,
+            first.aggregate["generated_count"], 0,
             "{:#}",
             first.aggregate
         );
-        assert_eq!(first.aggregate["total_count"], 3, "{:#}", first.aggregate);
+        assert_eq!(first.aggregate["total_count"], 1, "{:#}", first.aggregate);
         assert!(aggregate_item(&first.aggregate, "src/hand.ts", "handDead").is_some());
         assert!(aggregate_generated_item(
             &first.aggregate,
             "gen/schema_pb.ts",
             "generatedPathDead"
         )
-        .is_some());
+        .is_none());
         assert!(
-            aggregate_generated_item(&first.aggregate, "src/banner.ts", "bannerDead").is_some()
+            aggregate_generated_item(&first.aggregate, "src/banner.ts", "bannerDead").is_none()
         );
 
         let item_files = first.aggregate["items"]

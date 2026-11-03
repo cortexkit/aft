@@ -202,9 +202,9 @@ impl From<serde_json::Error> for InspectCacheError {
 /// undecodable dead-code rows remain explicit coverage gaps.
 /// v43: source-size admission excludes oversized complexity/duplicate inputs
 /// and reports their coverage gaps instead of reusing unbounded scan results.
-/// v44: dead-code and unused-export source-size gaps invalidate graph-wide
-/// deadness claims, including cached results produced before source-size
-/// admission was enforced.
+/// v44: dead-code and unused-export readers admit at most 4 MiB of source,
+/// omit generated/minified JS/TS, and invalidate graph-wide deadness claims
+/// when a source file exceeds the limit.
 pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 44;
 // Reserved metadata category: its integer is an epoch, never a scan timestamp.
 const CACHE_VERSION_CATEGORY: &str = "__cache_version__";

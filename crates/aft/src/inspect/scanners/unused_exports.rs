@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use tree_sitter::{Node, Tree};
 
 use super::source_text::{
-    read_source_text, source_freshness, SourceText, MAX_SOURCE_BYTES, TOO_LARGE,
+    graph_source_freshness, read_graph_source_text, SourceText, GRAPH_TOO_LARGE,
+    MAX_GRAPH_SOURCE_BYTES,
 };
 use crate::cache_freshness;
 use crate::imports::{parse_imports, specifier_imported_name, ImportBlock, ImportStatement};
@@ -253,6 +254,7 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         "languages_skipped": languages_skipped,
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
+        "complete": true,
     });
     excluded.write_into(&mut aggregate);
     let skipped = per_file
@@ -339,13 +341,18 @@ fn run_unused_exports_oxc_scan(
         .into_iter()
         .collect::<Vec<_>>();
     contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
+    let excluded_paths = contributions
+        .iter()
+        .filter(|contribution| contribution.contribution["excluded_from_graph"] == true)
+        .map(|contribution| normalize_path(&contribution.file_path))
+        .collect::<BTreeSet<_>>();
     let has_source_gaps = skipped_files_payload
         .iter()
-        .any(|skip| skip["reason"] == TOO_LARGE)
+        .any(|skip| skip["reason"] == GRAPH_TOO_LARGE)
         || contributions.iter().any(|contribution| {
             contribution.contribution["skipped_files"]
                 .as_array()
-                .is_some_and(|skips| skips.iter().any(|skip| skip["reason"] == TOO_LARGE))
+                .is_some_and(|skips| skips.iter().any(|skip| skip["reason"] == GRAPH_TOO_LARGE))
         });
     let mut count = 0usize;
     let mut headline_items = Vec::new();
@@ -358,7 +365,10 @@ fn run_unused_exports_oxc_scan(
     let mut excluded = ExcludedTestTally::default();
 
     for file in &oxc_result.files {
-        if has_source_gaps || public_api_entries.is_public_api_file(&file.file) {
+        if has_source_gaps
+            || excluded_paths.contains(&normalize_path(&file.file))
+            || public_api_entries.is_public_api_file(&file.file)
+        {
             continue;
         }
         // Test files and fixtures are still analyzed (their imports keep
@@ -577,8 +587,11 @@ fn oxc_unused_exports_contribution(
     parse_errors: Option<&Vec<String>>,
     skipped_files: &[Value],
 ) -> Option<FileContribution> {
-    let (freshness, _permit) = source_freshness(&facts.path).ok()?;
-    if freshness.size > MAX_SOURCE_BYTES {
+    if super::source_text::graph_source_excluded(project_root, &facts.path) {
+        return Some(excluded_file_scan(project_root, facts.path.clone())?.contribution);
+    }
+    let (freshness, _permit) = graph_source_freshness(&facts.path).ok()?;
+    if freshness.size > MAX_GRAPH_SOURCE_BYTES {
         return Some(
             oversized_file_scan(
                 project_root,
@@ -666,7 +679,7 @@ fn oxc_read_error_contribution(
         normalize_path(&project_root.join(&relative_file))
     };
     let freshness = freshness_for_oxc_error_file(&file_path)?;
-    let oversized = error.message == TOO_LARGE;
+    let oversized = error.message == GRAPH_TOO_LARGE;
     let generated =
         !oversized && crate::inspect::generated::is_generated_file(project_root, &file_path);
     let mut contribution = json!({
@@ -681,7 +694,7 @@ fn oxc_read_error_contribution(
     });
     if oversized {
         contribution.as_object_mut()?.remove("parse_errors");
-        contribution["skipped_files"] = json!([{"file": relative_file, "reason": TOO_LARGE}]);
+        contribution["skipped_files"] = json!([{"file": relative_file, "reason": GRAPH_TOO_LARGE}]);
     }
     Some(FileContribution::new(
         InspectCategory::UnusedExports,
@@ -720,11 +733,14 @@ fn scan_non_js_empty_file(path: &Path, project_root: &Path) -> Option<FileScan> 
         return None;
     }
     if is_js_ts_path(&file_path) {
+        if super::source_text::graph_source_excluded(project_root, &file_path) {
+            return excluded_file_scan(project_root, file_path);
+        }
         return None;
     }
     let relative_file = relative_string(project_root, &file_path);
-    let (freshness, _permit) = source_freshness(&file_path).ok()?;
-    if freshness.size > MAX_SOURCE_BYTES {
+    let (freshness, _permit) = graph_source_freshness(&file_path).ok()?;
+    if freshness.size > MAX_GRAPH_SOURCE_BYTES {
         return Some(oversized_file_scan(
             project_root,
             file_path,
@@ -752,8 +768,8 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
                 "reason": "outside_project_root",
             })
         })
-        .chain(oxc_result.errors.iter().filter(|error| error.message == TOO_LARGE).map(|error| {
-            json!({"file": relative_string(project_root, &error.file), "reason": TOO_LARGE})
+        .chain(oxc_result.errors.iter().filter(|error| error.message == GRAPH_TOO_LARGE).map(|error| {
+            json!({"file": relative_string(project_root, &error.file), "reason": GRAPH_TOO_LARGE})
         }))
         .collect::<Vec<_>>()
 }
@@ -767,7 +783,7 @@ fn add_oxc_honesty_fields(
     let parse_errors = oxc_result
         .errors
         .iter()
-        .filter(|error| error.message != TOO_LARGE)
+        .filter(|error| error.message != GRAPH_TOO_LARGE)
         .map(|error| {
             json!({
                 "file": relative_string(project_root, &error.file),
@@ -810,8 +826,11 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
     }
 
     let relative_file = relative_string(project_root, &file_path);
-    let (freshness, _permit) = source_freshness(&file_path).ok()?;
-    if freshness.size > MAX_SOURCE_BYTES {
+    if super::source_text::graph_source_excluded(project_root, &file_path) {
+        return excluded_file_scan(project_root, file_path);
+    }
+    let (freshness, _permit) = graph_source_freshness(&file_path).ok()?;
+    if freshness.size > MAX_GRAPH_SOURCE_BYTES {
         return Some(oversized_file_scan(
             project_root,
             file_path,
@@ -839,7 +858,7 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         ));
     }
 
-    let source = match read_source_text(&file_path) {
+    let source = match read_graph_source_text(&file_path) {
         Ok(SourceText::Text(source)) => source,
         Ok(SourceText::TooLarge) => {
             return Some(oversized_file_scan(
@@ -908,7 +927,7 @@ fn oversized_file_scan(
             file_path.clone(),
             freshness,
             json!({"file": relative_file, "generated": false, "exports": [], "imports": [],
-                "skipped_files": [{"file": relative_file, "reason": TOO_LARGE}]}),
+                "skipped_files": [{"file": relative_file, "reason": GRAPH_TOO_LARGE}]}),
         ),
         file_path,
         relative_file,
@@ -917,6 +936,25 @@ fn oversized_file_scan(
         skipped_language: None,
         generated: false,
     }
+}
+
+fn excluded_file_scan(project_root: &Path, file_path: PathBuf) -> Option<FileScan> {
+    let relative_file = relative_string(project_root, &file_path);
+    let freshness = super::source_text::metadata_freshness(&file_path).ok()?;
+    Some(FileScan {
+        contribution: FileContribution::new(
+            InspectCategory::UnusedExports,
+            file_path.clone(),
+            freshness,
+            json!({"file": relative_file, "generated": false, "excluded_from_graph": true, "exports": [], "imports": []}),
+        ),
+        file_path,
+        relative_file,
+        exports: Vec::new(),
+        imports: Vec::new(),
+        skipped_language: None,
+        generated: false,
+    })
 }
 
 fn empty_file_scan(
@@ -1783,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn unused_exports_buckets_generated_exports_below_headline() {
+    fn unused_exports_excludes_generated_exports_from_the_graph() {
         let (_temp_dir, root, paths) = fixture_project(&[
             (
                 "src/hand.ts",
@@ -1819,13 +1857,13 @@ export function bannerUnused() {}
         assert_eq!(first, second, "twice-cold scan must be deterministic");
 
         assert_eq!(first["count"], 1, "{first:#}");
-        assert_eq!(first["generated_count"], 2, "{first:#}");
-        assert_eq!(first["total_count"], 3, "{first:#}");
+        assert_eq!(first["generated_count"], 0, "{first:#}");
+        assert_eq!(first["total_count"], 1, "{first:#}");
         assert!(aggregate_item(&first, "src/hand.ts", "handUnused").is_some());
         assert!(
-            aggregate_generated_item(&first, "gen/schema_pb.ts", "generatedPathUnused").is_some()
+            aggregate_generated_item(&first, "gen/schema_pb.ts", "generatedPathUnused").is_none()
         );
-        assert!(aggregate_generated_item(&first, "src/banner.ts", "bannerUnused").is_some());
+        assert!(aggregate_generated_item(&first, "src/banner.ts", "bannerUnused").is_none());
 
         let item_files = first["items"]
             .as_array()

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::inspect::scanners::source_text::{
-    read_source_text, source_scan_permit, SourceText, TOO_LARGE,
+    graph_source_permit, read_graph_source_text, SourceText, GRAPH_TOO_LARGE,
 };
 use oxc_span::SourceType;
 
@@ -94,10 +94,10 @@ impl OxcFactsCache {
         let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
         let size = metadata.len();
         let path_key = path.to_path_buf();
-        let _permit = source_scan_permit(size);
-        let source = match read_source_text(path) {
+        let _permit = graph_source_permit(size);
+        let source = match read_graph_source_text(path) {
             Ok(SourceText::Text(source)) => source,
-            Ok(SourceText::TooLarge) => return Err(TOO_LARGE.to_string()),
+            Ok(SourceText::TooLarge) => return Err(GRAPH_TOO_LARGE.to_string()),
             Ok(SourceText::NotUtf8) => {
                 return Err("read: stream did not contain valid UTF-8".to_string())
             }
@@ -272,6 +272,12 @@ pub fn analyze_files_with_cache(
     let progress = crate::run_tool_call::progress::FileProgress::current();
 
     for (idx, path) in files.iter().enumerate() {
+        if crate::inspect::scanners::source_text::graph_source_excluded(&project_root, path) {
+            if let Some(progress) = &progress {
+                progress.finished();
+            }
+            continue;
+        }
         match cache.facts_for_file(
             FileId(idx),
             path,
@@ -359,7 +365,7 @@ fn analyze_preparsed_facts(
     );
     // An unread importer can reference any module, including through a dynamic
     // import. Missing edges cannot establish that any export is unused.
-    if errors.iter().any(|error| error.message == TOO_LARGE) {
+    if errors.iter().any(|error| error.message == GRAPH_TOO_LARGE) {
         mark_oversized_graph_uncertain(&mut file_verdicts);
     }
     let resolved_edges = edges
@@ -392,7 +398,7 @@ fn mark_oversized_graph_uncertain(files: &mut [OxcFileVerdicts]) {
     for file in files {
         for export in &mut file.exports {
             export.verdict = LivenessVerdict::Uncertain;
-            export.reason = TOO_LARGE.to_string();
+            export.reason = GRAPH_TOO_LARGE.to_string();
         }
     }
 }
