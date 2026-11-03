@@ -101,6 +101,102 @@ fn first_load_memory_corpus() {
     }
 }
 
+/// Times a fresh checkout's first bind when another checkout of the same
+/// repository has already filled the family's stores: the case of every new
+/// worker worktree. Copies `AFT_VIEW_FRESH_CORPUS` twice, binds the first copy
+/// to warm the stores, then binds the second and prints its wall time, CPU
+/// time and source work (walks, stats, reads, hashed bytes, attachments).
+#[test]
+#[ignore = "fresh-checkout bind measurement; requires AFT_VIEW_FRESH_CORPUS"]
+fn fresh_checkout_bind_after_a_warm_sibling() {
+    let corpus = std::path::PathBuf::from(
+        std::env::var_os("AFT_VIEW_FRESH_CORPUS").expect("AFT_VIEW_FRESH_CORPUS"),
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let storage = scratch.path().join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let checkout = |name: &str| {
+        let root = scratch.path().join(name);
+        let archive = std::process::Command::new("git")
+            .args(["archive", "HEAD"])
+            .current_dir(&corpus)
+            .output()
+            .unwrap();
+        assert!(archive.status.success());
+        std::fs::create_dir_all(&root).unwrap();
+        let mut tar = std::process::Command::new("tar")
+            .args(["-x", "-C"])
+            .arg(&root)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(tar.stdin.as_mut().unwrap(), &archive.stdout).unwrap();
+        assert!(tar.wait().unwrap().success());
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-A"],
+            &["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "c"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::canonicalize(root).unwrap()
+    };
+    let bind = |root: &std::path::Path, name: &str| {
+        let bridge = Arc::new(CallgraphBridge::default());
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let trigram = Arc::new(TrigramBridge::new(storage.clone(), policy.clone()));
+        let producers = Producers {
+            trigram: policy.fingerprint_hex(),
+            semantic: None,
+            callgraph: crate::views::callgraph::PRODUCER.into(),
+        };
+        let driver = CheckoutDriver::new_v3(
+            &storage,
+            "fresh",
+            name,
+            root,
+            producers,
+            Arc::new(ConfiguredMembershipWalker),
+            vec![trigram, bridge.clone()],
+        )
+        .unwrap();
+        let driver = Arc::new(driver.with_adapters(vec![bridge.adapter.clone()]));
+        let access = driver.access();
+        let cpu = cpu_seconds();
+        let start = std::time::Instant::now();
+        let seed = driver.installed_snapshot().generation().clone();
+        let (snapshot, revision) = driver.verified_bind(&access, seed).unwrap();
+        let bound = start.elapsed();
+        let work = driver.take_reconcile_work();
+        driver.install(&access, &snapshot, revision).unwrap();
+        eprintln!(
+            "fresh_bind checkout={name} files={} bind_s={:.3} cpu_s={:.3} work={work:?}",
+            snapshot.live_entries().count(),
+            bound.as_secs_f64(),
+            cpu_seconds() - cpu,
+        );
+    };
+    let first = checkout("first");
+    let second = checkout("second");
+    bind(&first, "first");
+    bind(&second, "second");
+}
+
+/// User plus system CPU time of this process, in seconds.
+fn cpu_seconds() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn first_load_fixed_fixture_peak_rss() {
