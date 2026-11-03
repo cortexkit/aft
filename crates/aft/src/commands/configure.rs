@@ -15563,7 +15563,7 @@ mod tests {
         concurrent.join().unwrap();
         for (thread, phase, at) in phase_rx.try_iter() {
             eprintln!(
-                "cg_timing thread={thread:?} at_us={} {phase}",
+                "cg_timing command={command} daemon={daemon} thread={thread:?} at_us={} {phase}",
                 at.duration_since(timing_origin).as_micros()
             );
         }
