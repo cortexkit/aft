@@ -8,6 +8,7 @@ import io
 import os
 import subprocess
 import sys
+import zlib
 import tempfile
 import unittest
 from contextlib import closing
@@ -49,7 +50,37 @@ def checkout_fixture_bytes(directory, files):
     return {name: (checkout / name).read_bytes() for name in files}
 
 
+def single_gzip_payload(data):
+    assert data[:8] == b'\x1f\x8b\x08\x00\x00\x00\x00\x00', 'gzip header must have zero mtime and no optional fields'
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    payload = decoder.decompress(data)
+    assert decoder.eof, 'truncated gzip capture'
+    assert not decoder.unused_data, 'capture must contain exactly one gzip member and no trailing data'
+    return payload + decoder.flush()
+
+
 class InventoryTests(unittest.TestCase):
+    def test_stored_gzip_validation_rejects_metadata_extra_members_and_corruption(self):
+        payload = b' {"rows": [1, 2]} \n'
+        valid = gzip.compress(payload, compresslevel=9, mtime=0)
+        self.assertEqual(single_gzip_payload(valid), payload)
+        for index, value in [(3, 4), (3, 8), (3, 16), (4, 1)]:
+            with self.subTest(header_index=index, value=value):
+                changed = bytearray(valid)
+                changed[index] = value
+                with self.assertRaisesRegex(AssertionError, 'gzip header'):
+                    single_gzip_payload(changed)
+        for extra in [valid, b'junk']:
+            with self.subTest(extra=extra):
+                with self.assertRaisesRegex(AssertionError, 'exactly one gzip member'):
+                    single_gzip_payload(valid + extra)
+        with self.assertRaisesRegex(AssertionError, 'truncated'):
+            single_gzip_payload(valid[:-1])
+        corrupt = bytearray(valid)
+        corrupt[-8] ^= 1
+        with self.assertRaises(zlib.error):
+            single_gzip_payload(corrupt)
+
     def test_recorder_clone_does_not_inherit_windows_line_endings(self):
         tree = pathlib.Path('baseline')
         with mock.patch.object(recorder, 'run') as run:
@@ -141,21 +172,23 @@ class InventoryTests(unittest.TestCase):
             self.assertFalse((destination / 'statements.json').exists())
             self.assertEqual((source / 'statements.json.gz').read_bytes(), (destination / 'statements.json.gz').read_bytes())
 
-    def test_committed_capture_containers_are_canonical_and_hashes_are_current(self):
+    def test_committed_capture_headers_payloads_and_hashes_are_valid(self):
         recording = capture_io.load_json(inventory.HERE / 'recording.json')
         for name, digest in recording['artifact_sha256'].items():
             path = inventory.HERE / name
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest, name)
         compressed = sorted(inventory.HERE.glob('*.json.gz'))
         self.assertTrue(compressed, 'large committed captures must use gzip')
-        with tempfile.TemporaryDirectory() as directory:
-            for path in compressed:
-                with self.subTest(path=path.name):
-                    decoded = capture_io.read_bytes(path)
-                    self.assertGreater(len(decoded), capture_io.GZIP_THRESHOLD)
-                    encoded = capture_io.write_bytes(pathlib.Path(directory) / path.name, decoded)
-                    self.assertEqual(encoded.read_bytes(), path.read_bytes())
-                    self.assertFalse(path.with_suffix('').exists())
+        # Python/zlib upgrades may encode identical payloads into different valid
+        # DEFLATE streams. Pin the committed bytes by SHA-256, validate their
+        # headers/framing, and compare decoded bytes instead of recompressing.
+        # Per-runtime writer determinism is exercised separately above.
+        for path in compressed:
+            with self.subTest(path=path.name):
+                decoded = single_gzip_payload(path.read_bytes())
+                self.assertEqual(decoded, capture_io.read_bytes(path))
+                self.assertGreater(len(decoded), capture_io.GZIP_THRESHOLD)
+                self.assertFalse(path.with_suffix('').exists())
         for path in inventory.HERE.glob('*.json'):
             if path.stat().st_size > capture_io.GZIP_THRESHOLD:
                 self.assertTrue(path.name in capture_io.PLAIN_JSON or path.name.endswith(('-counts.json', '-policy.json')), path.name)

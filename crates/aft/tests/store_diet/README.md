@@ -16,6 +16,10 @@ Generated JSON larger than 64 KiB (65,536 bytes) is stored as `*.json.gz`.
 no filename in its header. Rust recording uses that same Python writer; ordinary
 Rust checks decode gzip using dependencies already declared by the crate.
 Re-recording unchanged bytes therefore does not add clock or path differences.
+The writer is deterministic on a given runtime; Python/zlib upgrades can choose
+a different valid DEFLATE stream. Stored containers are checked by their fixed
+headers, single-member framing, decoded payload and recorded physical SHA-256,
+not by recompressing with the current host's codec.
 
 Tools accept either the physical `.json.gz` path or its logical `.json` name;
 the logical name resolves to the compressed file when present. Having both forms
