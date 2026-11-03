@@ -10163,6 +10163,15 @@ fn git_root_commit_once_real(
             .filter(|(saved, _)| saved == key)
             .map(|(_, roots)| roots.clone())
     });
+    // Tests count each Git verification of the root, whether it reuses the
+    // shared history (HEAD check only) or walks it.
+    #[cfg(test)]
+    ROOT_COMMIT_GIT_RUNS.with(|runs| {
+        *runs
+            .borrow_mut()
+            .entry(project_root.to_path_buf())
+            .or_default() += 1;
+    });
     if let Some(roots) = cached {
         let mut spawned = 0;
         let head = time_cache_key_work(&mut timings.rev_list, || {
@@ -10177,13 +10186,6 @@ fn git_root_commit_once_real(
             return RootCommitProbe::Commit(roots);
         }
     }
-    #[cfg(test)]
-    ROOT_COMMIT_GIT_RUNS.with(|runs| {
-        *runs
-            .borrow_mut()
-            .entry(project_root.to_path_buf())
-            .or_default() += 1;
-    });
     // The rev_list timing also covers the extra Git checks that verify an
     // unborn branch, since they are part of deciding this probe's answer, and
     // git_spawns counts every Git process the probe actually started.
