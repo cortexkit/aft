@@ -1298,6 +1298,7 @@ fn parity_cases() -> Vec<ParityCase> {
 }
 
 fn create_fixture_project(root: &Path, glob_mtimes: GlobMtimeProfile) {
+    fs::write(root.join("Makefile"), "").expect("declare fixture project");
     fs::create_dir_all(root.join("src")).expect("create src dir");
     fs::create_dir_all(root.join("docs")).expect("create docs dir");
     fs::write(
@@ -1361,6 +1362,25 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
         }),
     );
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    // A successful configure acknowledges the request. Compare tool replies
+    // only after its requested project is active and not in degraded mode.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = send_json(
+            aft,
+            json!({"id": format!("{id}-ready"), "command": "status"}),
+        );
+        assert_eq!(status["success"], true, "{status}");
+        if status["project_root"] == root.to_string_lossy().as_ref() && status["degraded"] == false
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture configure did not settle: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) -> Value {
