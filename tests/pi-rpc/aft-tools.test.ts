@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { withHermeticGitEnv } from "../helpers/git-env.js";
+import { markProject } from "../helpers/project.js";
 import {
   cleanupPiIsolatedEnv,
   createPiIsolatedEnv,
@@ -21,6 +22,7 @@ import {
 const ALL_TOOLS_USER_CONFIG = { disabled_tools: [] };
 
 async function enableAllToolSurface(env: PiIsolatedEnv): Promise<void> {
+  await markProject(env.workdir);
   await mkdir(join(env.workdir, ".pi"), { recursive: true });
   await writeFile(
     join(env.workdir, ".pi", "aft.jsonc"),
@@ -30,6 +32,7 @@ async function enableAllToolSurface(env: PiIsolatedEnv): Promise<void> {
 }
 
 async function enableAllToolSurfaceWithSearch(env: PiIsolatedEnv): Promise<void> {
+  await markProject(env.workdir);
   await mkdir(join(env.workdir, ".pi"), { recursive: true });
   await writeFile(join(env.workdir, ".pi", "aft.jsonc"), JSON.stringify({}), "utf8");
 }
@@ -151,6 +154,7 @@ async function withPiTool(
   const aimock = await startAimock();
   let client: RpcClient | undefined;
   try {
+    await markProject(env.workdir);
     await opts.setup?.(env);
     aimock.registerToolCallFixture({
       predicate: () => true,

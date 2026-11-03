@@ -47,6 +47,7 @@ impl Daemon {
         views: bool,
         gate: Option<&Path>,
     ) -> Self {
+        crate::test_helpers::project::mark_project(root).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

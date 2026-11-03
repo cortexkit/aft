@@ -490,6 +490,7 @@ fn pyright_edit_error_reaches_status_bar_alert_source_and_inline_diagnostics() {
         configured["success"], true,
         "configure failed: {configured:#}"
     );
+    crate::test_helpers::admission::settle(&ctx);
     assert!(
         !crate::test_helpers::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
             .ensure_server_for_file(&file, &ctx.config()))

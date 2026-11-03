@@ -151,6 +151,60 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
     });
 }
 
+#[test]
+fn folder_admission_invalidated_source_project_rearms_a_bounded_wait() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("first.rs"), "fn first() {}\n").unwrap();
+    std::fs::write(root.path().join("second.rs"), "fn second() {}\n").unwrap();
+    isolated(root.path(), || {
+        let ctx = context(storage.path());
+        assert!(configure(root.path(), storage.path(), &ctx, false, false).success);
+        let wait_for_decision = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                super::drain_deferred_configure_maintenance(&ctx);
+                let folder = admission::snapshot(&ctx).unwrap();
+                if folder["state"] == "decided" {
+                    return folder;
+                }
+                assert!(std::time::Instant::now() < deadline, "{folder}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let folder = wait_for_decision();
+        assert_eq!(folder["classification"], "project", "{folder}");
+        assert_eq!(folder["reason"], "small_source_tree", "{folder}");
+        assert!(admission::artifacts_admitted(&ctx));
+        let (started, release) = admission::gate_probe_for_test(&ctx);
+        std::fs::write(root.path().join("third.rs"), "fn third() {}\n").unwrap();
+        assert!(!admission::artifacts_admitted(&ctx));
+        assert!(
+            admission::recheck_due(&ctx),
+            "invalidated evidence must bypass the cache cooldown"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !admission::poll_wait(&ctx) {
+            super::drain_deferred_configure_maintenance(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "invalidated caller wait never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let folder = admission::snapshot(&ctx).unwrap();
+        assert_eq!(folder["classification"], Value::Null, "{folder}");
+        assert_eq!(folder["reason"], "evidence_budget_exhausted", "{folder}");
+        release.send(()).unwrap();
+        let folder = wait_for_decision();
+        assert_eq!(folder["classification"], "project", "{folder}");
+        assert_eq!(folder["reason"], "small_source_tree", "{folder}");
+        assert_eq!(folder["observed"]["source_files"], 3, "{folder}");
+        assert!(admission::artifacts_admitted(&ctx));
+    });
+}
+
 fn isolated<R>(root: &Path, body: impl FnOnce() -> R) -> R {
     crate::git_probe::with_child_env_for_test(
         &[(

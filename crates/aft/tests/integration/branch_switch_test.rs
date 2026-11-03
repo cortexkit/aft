@@ -350,7 +350,7 @@ fn configure_context_with_views(
     }));
     let configured = aft::commands::configure::handle_configure(&configure, &ctx);
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    crate::test_helpers::admission::settle(&ctx);
     wait_until_ready(&ctx);
     ctx
 }
