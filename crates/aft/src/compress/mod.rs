@@ -767,11 +767,7 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
         _ => None,
     };
 
-    toml_filter::build_registry(
-        builtin_filters::ALL,
-        user_dir.as_deref(),
-        project_dir.as_deref(),
-    )
+    toml_filter::build_standard_registry(user_dir.as_deref(), project_dir.as_deref())
 }
 
 /// Normalize a shell command for compressor dispatch by walking past

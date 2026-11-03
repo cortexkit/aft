@@ -625,6 +625,7 @@ pub(crate) struct RemoteLaunch {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub session: String,
     pub requested_vcpus: Option<u32>,
+    pub requested_memory_mib: Option<u64>,
     pub requested_network: bool,
     /// Configured `bash.env` names carried in the launch environment, with the
     /// map they came from. The remote request drops those names from the shell
@@ -697,6 +698,7 @@ pub(crate) fn remote_for_runon(
             .and_then(|policy| policy.default_demand.as_deref()),
     )?;
     launch.requested_vcpus = resolved.weight_hint;
+    launch.requested_memory_mib = resolved.memory_mib;
     launch.requested_platform = resolved.platform;
     launch.requested_network = resolved.network;
     launch.explicit_runon = true;

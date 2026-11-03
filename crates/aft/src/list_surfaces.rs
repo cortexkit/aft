@@ -643,6 +643,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
     },
     ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "make_room_for, store_literal_presence, prune_lifecycle",
+        location_or_primitive: "MAX_EXACT_MEMO_BYTES, MAX_LITERAL_PRESENCE_BYTES, MAX_RETIRED_POISONED_BYTES and obsolete-generation cache retirement",
+        reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",
