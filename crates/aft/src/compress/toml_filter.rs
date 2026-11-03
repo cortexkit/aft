@@ -166,6 +166,14 @@ pub fn build_registry(
     registry
 }
 
+/// Build the shipped filters with fresh user and project overrides.
+pub fn build_standard_registry(
+    user_dir: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> FilterRegistry {
+    build_registry(super::builtin_filters::ALL, user_dir, project_dir)
+}
+
 fn load_dir<F>(dir: &Path, registry: &mut FilterRegistry, source_for: F)
 where
     F: Fn(&Path) -> FilterSource,
@@ -1226,6 +1234,40 @@ patterns = ['^Entering']
         let f = registry.lookup("make build foo").unwrap();
         assert_eq!(f.matches, vec!["make"]);
         assert!(matches!(f.source, FilterSource::Builtin));
+    }
+
+    #[test]
+    fn standard_registry_reuses_compiled_builtins_but_reloads_local_overrides() {
+        let first = build_standard_registry(None, None);
+        let (second, allocated) =
+            crate::test_allocations::count_bytes(|| build_standard_registry(None, None));
+        assert_eq!(first.all().len(), second.all().len());
+        assert!(
+            allocated < 512 * 1024,
+            "warm builtin registry allocated {allocated} bytes; compiled regexes must be shared"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("make.toml");
+        for description in ["first override", "changed override"] {
+            fs::write(
+                &file,
+                format!("[filter]\nmatches = [\"make\"]\ndescription = \"{description}\"\n"),
+            )
+            .unwrap();
+            let overridden = build_standard_registry(Some(dir.path()), None);
+            assert_eq!(
+                overridden.lookup("make").unwrap().description.as_deref(),
+                Some(description)
+            );
+            assert!(matches!(
+                overridden.lookup("make").unwrap().source,
+                FilterSource::User { .. }
+            ));
+            assert!(matches!(
+                first.lookup("make").unwrap().source,
+                FilterSource::Builtin
+            ));
+        }
     }
 
     #[test]
