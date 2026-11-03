@@ -334,6 +334,65 @@ fn a_file_whose_bytes_no_longer_match_its_receipt_takes_the_full_check() {
     ));
 }
 
+/// A tracked `.gitattributes` means Git may store a file differently from its
+/// working-tree bytes, so blob receipts must not stand in for reading it and
+/// the base stays membership-keyed. The stats AFT recorded when it read the
+/// files describe working-tree bytes, though, so later binds still read only
+/// the files that changed, after a restart and on the same driver alike.
+#[test]
+fn attribute_rules_refuse_receipts_but_keep_read_stats() {
+    let _serial = crate::blob_store::v3::serial_for_test();
+    let root = checkout(true);
+    write_old(&root.path().join(".gitattributes"), b"*.rs text eol=lf\n");
+    git(root.path(), &["add", ".gitattributes"]);
+    git(
+        root.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "attributes",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let _attributes = known_attribute_sources_for_test(root.path());
+    let members = FILES.len() + 1;
+    let scope = bootstrap(root.path(), storage.path());
+    assert_eq!(base_kind(&scope), Some(BaseKind::Membership));
+
+    // After a restart: the worker's own evidence covers every member.
+    let (snapshot, work) = rebind(root.path(), storage.path());
+    assert_eq!(work.tree_receipts, 0, "{work:?}");
+    assert_eq!(work.reads, 0, "{work:?}");
+    assert_current_bytes(&snapshot, root.path());
+
+    // Without that evidence nothing else may vouch for the bytes.
+    remove_worker_evidence(storage.path());
+    let (_, work) = rebind(root.path(), storage.path());
+    assert_eq!(work.tree_receipts, 0, "{work:?}");
+    assert_eq!(work.reads, members, "full check: {work:?}");
+
+    // On one driver, an edit is the only file read again.
+    let same = driver(root.path(), storage.path());
+    let access = same.access();
+    let empty = same.installed_snapshot().generation().clone();
+    let (snapshot, revision) = same.verified_bind(&access, empty).unwrap();
+    same.install(&access, &snapshot, revision).unwrap();
+    same.take_reconcile_work();
+    let edited = b"pub fn changed() -> u8 { 9 }\n";
+    write_old(&root.path().join(FILES[1].0), edited);
+    let seed = same.installed_snapshot().generation().clone();
+    let (snapshot, _) = same.verified_bind(&access, seed).unwrap();
+    let work = same.take_reconcile_work();
+    assert_eq!(work.reads, 1, "{work:?}");
+    assert_eq!(
+        snapshot.disk_state(&rel(FILES[1].0)),
+        DiskState::of_bytes(edited)
+    );
+}
+
 #[test]
 fn the_tree_proof_names_the_first_check_a_checkout_fails() {
     let _serial = crate::blob_store::v3::serial_for_test();
