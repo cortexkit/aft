@@ -3526,8 +3526,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "1198137d8529e7eaf9f4f3987d2e29e7cf8a77056a0ad67e38014ace340c1efa",
-      "catalog_digest": "1198137d8529e7eaf9f4f3987d2e29e7cf8a77056a0ad67e38014ace340c1efa",
+      "generation": "b00ac63ebfae696d9d72e6db213ed875d83aa953a45972bf275aa7e7298405fc",
+      "catalog_digest": "b00ac63ebfae696d9d72e6db213ed875d83aa953a45972bf275aa7e7298405fc",
       "tools": [
         {
           "name": "status",
@@ -3631,7 +3631,7 @@
                   "type": "string"
                 },
                 "maxItems": 64,
-                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (up to 128 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
@@ -4806,8 +4806,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "0149ccb921040e407c06800853629adc1af022bbbc629eaee8841d1956a6dc76",
-      "catalog_digest": "0149ccb921040e407c06800853629adc1af022bbbc629eaee8841d1956a6dc76",
+      "generation": "6b59b57e912c8ac3c76491f2ed922c4ee128a13e059f8edf3d8f71e9b8133610",
+      "catalog_digest": "6b59b57e912c8ac3c76491f2ed922c4ee128a13e059f8edf3d8f71e9b8133610",
       "tools": [
         {
           "name": "status",
@@ -4911,7 +4911,7 @@
                   "type": "string"
                 },
                 "maxItems": 64,
-                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
+                "description": "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (up to 128 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason."
               }
             },
             "required": [
