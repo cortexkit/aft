@@ -1926,7 +1926,12 @@ impl<'a> Resolver<'a> {
         };
         for (base_file, base) in mro.into_iter().skip(1) {
             if base.starts_with("@unknown:") {
-                return self.unknown("python", member);
+                // An unindexed base is not evidence of a project receiver.
+                // Keep the call external instead of marking every project initializer live.
+                return Resolution {
+                    external: 1,
+                    ..Resolution::default()
+                };
             }
             if base_file.is_empty() {
                 continue;

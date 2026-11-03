@@ -433,16 +433,20 @@ fn python_super_uses_c3_base_order_without_subtype_fanout() {
 
 #[test]
 fn python_super_unknown_cyclic_and_inconsistent_bases_never_guess() {
-    for source in [
-        "class Known:\n def __init__(self): pass\nclass Child(External, Known):\n def __init__(self):\n  super().__init__()\n",
-        "class A(B): pass\nclass B(A):\n def __init__(self):\n  super().__init__()\n",
-        "class A: pass\nclass B: pass\nclass X(A, B): pass\nclass Y(B, A): pass\nclass Child(X, Y):\n def __init__(self):\n  super().__init__()\n",
+    for (source, external) in [
+        ("class Known:\n def __init__(self): pass\nclass Child(External, Known):\n def __init__(self):\n  super().__init__()\n", true),
+        ("class A(B): pass\nclass B(A):\n def __init__(self):\n  super().__init__()\n", false),
+        ("class A: pass\nclass B: pass\nclass X(A, B): pass\nclass Y(B, A): pass\nclass Child(X, Y):\n def __init__(self):\n  super().__init__()\n", false),
     ] {
         let parsed = parse(source, "python");
         let result = resolutions(&parsed);
         assert_eq!(result.len(), 1);
         assert!(result[0].targets.is_empty(), "{:#?}", result[0]);
-        assert_eq!(result[0].unresolved, 1);
+        assert_eq!(result[0].unresolved, usize::from(!external));
+        assert_eq!(result[0].external, usize::from(external));
+        if external {
+            assert!(result[0].protected.is_empty());
+        }
     }
 }
 
