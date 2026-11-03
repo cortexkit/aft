@@ -19,9 +19,10 @@ def function_table(source, function):
     text = (ROOT / source).read_text(encoding='utf-8')
     scope = next(s for s in rust_scopes(text) if s[2] == 'fn' and s[3] == function)
     masked = TOKEN.sub(lambda m: ''.join('\n' if c == '\n' else ' ' for c in m[0]), text)
-    match = re.search(r'\bin\s*\[', masked[scope[0]:scope[1]])
+    body = masked.index('{', scope[0]) + 1
+    match = re.search(r'^\s*\[|\bin\s*\[', masked[body:scope[1]])
     assert match, f'{source}:{function}: no literal table'
-    opening = scope[0] + match.end() - 1
+    opening = body + match.end() - 1
     depth = 1
     end = opening + 1
     while depth:

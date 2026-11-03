@@ -7,11 +7,22 @@ import unittest
 from unittest import mock
 
 import inventory
+import corpus
 import parity
 import record as recorder
 
 
 class InventoryTests(unittest.TestCase):
+    def test_corpus_tables_accept_inline_and_helper_returned_arrays(self):
+        examples = [
+            'fn fixtures() { for (path, language, source) in [("a.rs", "rust", "fn f() {} [x]")] {} }',
+            'fn fixtures() -> [(&str, &str, &str); 1] { [("a.rs", "rust", "fn f() {} [x]")] }',
+        ]
+        for text in examples:
+            with self.subTest(text=text), mock.patch.object(pathlib.Path, 'read_text', return_value=text):
+                self.assertEqual(corpus.function_table('fixtures.rs', 'fixtures'),
+                                 ['a.rs', 'rust', 'fn f() {} [x]'])
+
     def test_recorder_does_not_inherit_blush_or_trace_switches(self):
         with mock.patch.dict('os.environ', {'AFT_STORE_DIET_RECORD': '1', 'AFT_STORE_DIET_BASELINE': 'wrong', 'AFT_STORE_DIET_SQL_TRACE': 'old.log'}):
             env = recorder.clean_environment()

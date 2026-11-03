@@ -1,6 +1,6 @@
 {
   "baseline": "998c896b05753dd3a83158e30f97779b89ef28e2",
-  "smoke_table": {"source":"crates/aft/src/callgraph_store/position_identity_tests.rs","owner":"s4_one_node_per_scoped_name_for_every_supported_language"},
+  "smoke_table": {"source":"crates/aft/src/callgraph_store/position_identity_tests.rs","owner":"language_fixtures"},
   "receiver_table": {"source":"crates/aft/src/callgraph_store/dispatch/tests.rs","owner":"receiver_form_extraction_table"},
   "cases": [
     {"name":"typescript-top-level","language":"typescript","shapes":["file summary","top-level dispatch caller","constructed receiver without a function scope"],"files":[{"target":"top.ts","new_for":"Missing stored values: nodes.kind=file_summary, top id forms and dispatch caller=false","text":"class C { m() {} }\nnew C().m();\n"}]},
