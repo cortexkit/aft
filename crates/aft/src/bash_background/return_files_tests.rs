@@ -567,6 +567,80 @@ mod receiving {
         );
     }
 
+    #[test]
+    fn another_filesystem_streams_a_large_verified_file() {
+        use crate::exec_remote::types::{
+            BytePayload, ReturnChunk, ReturnManifest, ReturnManifestEntry, Uuid,
+            RETURN_LARGE_MAX_BYTES_CAP,
+        };
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let (_private_dir, private) = private_folder();
+        let mut receiver = ReturnReceiver::new(
+            vec!["dist/large.bin".into()],
+            RETURN_LARGE_MAX_BYTES_CAP,
+            &root,
+            &root,
+            None,
+            private,
+            "large-copy",
+        )
+        .unwrap();
+        let job = Uuid::now_v7();
+        let bytes = vec![42; 64 * 1024];
+        let size = 20 * 1024 * 1024;
+        let mut expected = Sha256::new();
+        for (seq, offset) in (0..size).step_by(bytes.len()).enumerate() {
+            expected.update(&bytes);
+            receiver.chunk(
+                &ReturnChunk::new(
+                    job,
+                    seq as u64,
+                    0,
+                    offset as u64,
+                    BytePayload(bytes.clone()),
+                ),
+                &mut |_| Ok(()),
+            );
+        }
+        let expected = format!("{:x}", expected.finalize());
+        let manifest = ReturnManifest::new(
+            job,
+            (size / bytes.len()) as u64,
+            vec![ReturnManifestEntry::returned(
+                "dist/large.bin",
+                size as u64,
+                &expected,
+            )],
+            size as u64,
+            RETURN_LARGE_MAX_BYTES_CAP,
+        );
+        let report = with_copy_for_test(|| receiver.manifest(&manifest, None, &mut |_| Ok(())));
+        assert_eq!(
+            report[0].outcome,
+            ReturnOutcome::Returned { bytes: size as u64 }
+        );
+        assert_eq!(
+            super::receiver::COPY_READS_FOR_TEST.with(|reads| reads.get()),
+            size / bytes.len()
+        );
+        let mut installed = fs::File::open(root.join("dist/large.bin")).unwrap();
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let n = installed.read(&mut buffer).unwrap();
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+        }
+        assert_eq!(format!("{:x}", digest.finalize()), expected);
+        assert_eq!(files_under(&root), ["dist/large.bin"]);
+    }
+
     /// Feed a vector, delivering the chunk at `repeat` twice, the second time
     /// with its bytes changed by `change`.
     fn feed_with_repeat(

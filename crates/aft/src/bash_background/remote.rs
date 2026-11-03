@@ -899,6 +899,11 @@ pub(crate) struct RemoteTask {
     /// task's workdir (`return_paths`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub return_paths: Vec<String>,
+    /// The negotiated request cap, retained across attach and process restart.
+    #[serde(default = "exec::return_max_bytes")]
+    pub return_max_bytes: u64,
+    #[serde(default)]
+    pub return_cap_retried: bool,
     /// The outcome for each of `return_paths`, saved once the runner's
     /// manifest was handled or the job ended without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1336,7 +1341,7 @@ impl TaskSink {
         let returns = if !remote.return_paths.is_empty() && remote.returned_files.is_none() {
             Some(super::return_files::ReturnReceiver::new(
                 remote.return_paths.clone(),
-                exec::return_max_bytes(),
+                remote.return_max_bytes,
                 &workdir,
                 project_root.as_deref().unwrap_or(&workdir),
                 worktree_root_containing(&workdir, exec::DirectoryKind::WorkingDirectory)
@@ -1742,6 +1747,51 @@ pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut Persi
 
 #[cfg(unix)]
 impl OutputSink for TaskSink {
+    fn return_request(&mut self, request: &RunRequest, retry: bool) -> io::Result<bool> {
+        let cap = request
+            .return_max_bytes
+            .unwrap_or_else(exec::return_max_bytes);
+        if retry {
+            let state = self
+                .task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            if state
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.return_cap_retried || r.cancel_requested)
+            {
+                return Ok(false);
+            }
+        }
+        let digest = if retry {
+            Some(
+                save_named_retry_request(&self.task, request, "remote-return-retry-request")
+                    .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
+        self.commit(|remote| {
+            remote.return_max_bytes = cap;
+            if let Some(digest) = digest {
+                remote.return_cap_retried = true;
+                if let Some(submission) = remote.submission.as_mut() {
+                    submission.request_digest = digest.clone();
+                }
+                if let Some(saved) = remote.retry.as_mut() {
+                    saved.request_digest = digest;
+                }
+            }
+        })?;
+        if let Some(receiver) = self.returns.as_mut() {
+            receiver.set_cap(cap);
+        }
+        Ok(true)
+    }
+
     fn admission_progress(&mut self, progress: &exec::types::Progress) {
         let Some(note) = admission_progress_line(progress) else {
             return;
@@ -2125,16 +2175,21 @@ impl TaskSink {
 
 #[cfg(unix)]
 fn save_retry_request(task: &BgTask, request: &RunRequest) -> Result<String, String> {
+    save_named_retry_request(task, request, "remote-retry-request")
+}
+
+#[cfg(unix)]
+fn save_named_retry_request(
+    task: &BgTask,
+    request: &RunRequest,
+    name: &str,
+) -> Result<String, String> {
     let layout =
         resolve_task_layout(&task.paths.session_dir, &task.task_id).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec(request).map_err(|e| e.to_string())?;
     // Environment values stay in a private control file, not mirrored task metadata.
-    let file = crate::bash_background::persistence::create_control_file(
-        &layout.dirs,
-        "remote-retry-request",
-        &bytes,
-    )
-    .map_err(|e| e.to_string())?;
+    let file = crate::bash_background::persistence::create_control_file(&layout.dirs, name, &bytes)
+        .map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(retry_request_digest(task, &bytes))
 }
@@ -2152,15 +2207,18 @@ fn restore_retry_request(task: &BgTask, expected: &str) -> Result<RunRequest, St
     use std::io::Read;
     let layout =
         resolve_task_layout(&task.paths.session_dir, &task.task_id).map_err(|e| e.to_string())?;
-    let mut file =
-        crate::bash_background::persistence::open_control_file(&layout, "remote-retry-request")
-            .map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if retry_request_digest(task, &bytes) != expected {
-        return Err("remote retry request digest mismatch; command not resubmitted".into());
+    for name in ["remote-return-retry-request", "remote-retry-request"] {
+        let Ok(mut file) = crate::bash_background::persistence::open_control_file(&layout, name)
+        else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if retry_request_digest(task, &bytes) == expected {
+            return serde_json::from_slice(&bytes).map_err(|e| e.to_string());
+        }
     }
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    Err("remote retry request digest mismatch; command not resubmitted".into())
 }
 
 #[derive(Clone)]
@@ -2579,6 +2637,8 @@ impl BgTaskRegistry {
             returned_files: None,
             return_first_seq: None,
             return_staging: Default::default(),
+            return_max_bytes: exec::return_max_bytes(),
+            return_cap_retried: false,
             expired_gap_unverified: Vec::new(),
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
@@ -2761,7 +2821,7 @@ impl BgTaskRegistry {
         &self,
         client: &ExecRemoteClient,
         task: &Arc<BgTask>,
-        request: RunRequest,
+        mut request: RunRequest,
         timings: &mut exec::LaunchTimings,
     ) -> Result<RunRequest, String> {
         timings.enter("supports_submission_key");
@@ -2778,6 +2838,9 @@ impl BgTaskRegistry {
             .remote
             .clone()
             .unwrap();
+        if !request.return_paths.is_empty() && previous.return_cap_retried {
+            request.return_max_bytes = Some(previous.return_max_bytes);
+        }
         let submission = if supported {
             let digest = match previous
                 .retry
@@ -2812,7 +2875,11 @@ impl BgTaskRegistry {
         };
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
-        state.metadata.remote.as_mut().unwrap().submission = submission;
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.submission = submission;
+        remote.return_max_bytes = request
+            .return_max_bytes
+            .unwrap_or_else(exec::return_max_bytes);
         self.persist_task_locked(task, &state.metadata, &mut db)
             .map_err(|e| e.to_string())?;
         Ok(request)
@@ -3404,7 +3471,7 @@ impl BgTaskRegistry {
             );
             stream
         } else if let Some((request, local)) = initial.take() {
-            let request = match request {
+            let mut request = match request {
                 Ok(r) => r,
                 Err(error) => {
                     return if remote.explicit_runon {
@@ -3414,6 +3481,10 @@ impl BgTaskRegistry {
                     }
                 }
             };
+            if !request.return_paths.is_empty() {
+                request.return_max_bytes =
+                    Some(client.return_max_bytes().await.map_err(|e| e.to_string())?);
+            }
             fallback = Some(local);
             if remote.explicit_runon {
                 let request_digest = save_retry_request(&task, &request)?;
@@ -3743,6 +3814,10 @@ impl BgTaskRegistry {
                         && tests::stop_draining_worker(&root)
                     {
                         return Ok(());
+                    }
+                    if matches!(&error, exec::Error::Transport(subc_client_rs::CallError::Module(body)) if body.code == "invalid_params")
+                    {
+                        return self.refuse_remote_before_dispatch(&task, &error.to_string());
                     }
                     let current = task
                         .state
@@ -5690,8 +5765,9 @@ pub(crate) fn remote_report(
         })
         .filter_map(|entry| entry.checkout_path.as_deref())
         .collect();
-    let returned =
-        (!returned_files.is_empty()).then(|| super::return_files::render_report(returned_files));
+    let returned = (!returned_files.is_empty()).then(|| {
+        super::return_files::render_report_with_cap(returned_files, remote.return_max_bytes)
+    });
     match (returned, render_terminal_report(terminal, &copied_back)) {
         (Some(returned), Some(report)) => Some(format!("{returned}\n{report}")),
         (returned, report) => returned.or(report),
