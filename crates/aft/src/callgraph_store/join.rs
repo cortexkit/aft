@@ -1739,7 +1739,28 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
     data: &FileCallData,
 ) -> BTreeMap<String, (String, String)> {
     let mut targets = BTreeMap::new();
-    for name in dispatch_type_names(parse) {
+    let names = if parse.language == "python" {
+        // Only super's imported bases need additional bindings. Binding every
+        // imported annotation would also broaden ordinary method dispatch.
+        let local: BTreeSet<_> = parse.dispatch.types.iter().map(|ty| &ty.name).collect();
+        let imported: BTreeSet<_> = parse
+            .imports
+            .iter()
+            .flat_map(|import| &import.names)
+            .map(|name| crate::imports::specifier_local_name(name))
+            .collect();
+        parse
+            .dispatch
+            .types
+            .iter()
+            .flat_map(|ty| &ty.bases)
+            .filter(|name| !local.contains(name) && imported.contains(name.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        dispatch_type_names(parse)
+    };
+    for name in names {
         if parse.language != "rust" && name.starts_with('@') {
             continue;
         }

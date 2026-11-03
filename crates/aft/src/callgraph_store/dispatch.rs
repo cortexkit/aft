@@ -1652,7 +1652,12 @@ impl<'a> Resolver<'a> {
         if let Some(t) = parse.dispatch.types.iter().find(|t| t.name == name) {
             return Some((file.to_string(), t));
         }
-        if let Some((target_file, symbol)) = self.type_target(file, name) {
+        // Python's extra bindings describe superclass imports for super only;
+        // ordinary receivers retain their existing type-inference boundary.
+        if let Some((target_file, symbol)) = (parse.language != "python")
+            .then(|| self.type_target(file, name))
+            .flatten()
+        {
             if let Some(ty) = self
                 .file(target_file)?
                 .dispatch
@@ -1870,7 +1875,11 @@ impl<'a> Resolver<'a> {
         let mut sequences = Vec::new();
         let mut bases = Vec::new();
         for base in &ty.bases {
-            if let Some((base_file, base_ty)) = self.project_type(file, base) {
+            let projected = self
+                .type_target(file, base)
+                .and_then(|(path, symbol)| self.project_type(path, symbol))
+                .or_else(|| self.project_type(file, base));
+            if let Some((base_file, base_ty)) = projected {
                 bases.push((base_file.clone(), base_ty.name.clone()));
                 sequences.push(self.python_mro(&base_file, base_ty, active, memo)?);
             } else {
