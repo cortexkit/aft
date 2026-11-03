@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Exact memo hits may reuse a content-bound native identity/size/mtime/change-time proof instead of rereading bytes. Unsupported, racy, changed or missing files still take strict verification. Candidate sets, evidence, ordering, paging and complete public replies remain unchanged; the frozen 108-query corpus and parity fixtures are not modified."
+}

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffset
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::search_index::ExactEvidenceScope;
+use crate::views::verification::{now_ns, NativeStat};
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 const MAX_EXACT_MEMO_BYTES: usize = 8 * 1024 * 1024;
@@ -19,6 +21,66 @@ const MAX_RETIRED_POISONED_KEYS: usize = 128;
 const MAX_LITERAL_PRESENCE_ENTRIES: usize = 128;
 const MAX_LITERAL_PRESENCE_BYTES: usize = 1024 * 1024;
 const MAX_RETIRED_POISONED_BYTES: usize = 1024 * 1024;
+const MAX_DIGEST_PROOF_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone)]
+struct DigestProof {
+    stat: NativeStat,
+    observed_ns: u128,
+    digest: String,
+}
+
+#[derive(Default)]
+struct DigestProofCache {
+    files: HashMap<PathBuf, DigestProof>,
+    payload_bytes: usize,
+}
+
+impl DigestProofCache {
+    fn insert(&mut self, path: &Path, proof: DigestProof) {
+        // Include a conservative hash-table allowance as well as owned bytes.
+        // Oversized proofs bypass retention, never content verification.
+        let weight = path.as_os_str().len()
+            + proof.digest.capacity()
+            + 4 * std::mem::size_of::<(PathBuf, DigestProof)>();
+        if weight > MAX_DIGEST_PROOF_BYTES {
+            return;
+        }
+        if self.payload_bytes + weight > MAX_DIGEST_PROOF_BYTES {
+            *self = Self::default();
+        }
+        // Replacement can overestimate retained bytes, which only evicts sooner.
+        self.payload_bytes += weight;
+        self.files.insert(path.to_path_buf(), proof);
+    }
+}
+
+fn regular_file_stat(path: &Path) -> Option<NativeStat> {
+    let stat = NativeStat::read(path).ok()?;
+    // NativeStat observes the final component without following symlinks. Its
+    // proof cannot certify the bytes of a symlink's independently changing target.
+    #[cfg(unix)]
+    if stat.mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    #[cfg(windows)]
+    if stat.mode
+        & (windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY)
+        != 0
+    {
+        return None;
+    }
+    Some(stat)
+}
+
+fn read_digest(path: &Path) -> Result<String, PathBuf> {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record_memo_file_read(path);
+    fs::read(path)
+        .map(|bytes| compute_content_digest(&bytes))
+        .map_err(|_| path.to_path_buf())
+}
 
 /// Whether some file holds a code literal's whole text, as one search settled
 /// it. `Undetermined` means the check could not finish (its read bound ran
@@ -324,6 +386,7 @@ pub struct ExactMemoStore {
     /// Presence answers for code literals, kept so every page of one query
     /// reuses the first page's answer instead of reading files again.
     literal_presence: Mutex<HashMap<LiteralPresenceKey, LiteralPresenceEntry>>,
+    digest_proofs: Mutex<DigestProofCache>,
 }
 
 struct VerificationPermit<'a> {
@@ -357,6 +420,7 @@ impl ExactMemoStore {
             next_epoch: AtomicUsize::new(0),
             verifier_counter: Arc::new(AtomicUsize::new(0)),
             literal_presence: Mutex::new(HashMap::new()),
+            digest_proofs: Mutex::new(DigestProofCache::default()),
         }
     }
 
@@ -608,6 +672,19 @@ impl ExactMemoStore {
         page: &[CandidateResult],
         file_digests: &HashMap<PathBuf, String>,
     ) -> Result<(), PathBuf> {
+        Self::check_page_digests(page, file_digests, |path, expected| {
+            if read_digest(path)? != expected {
+                return Err(path.to_path_buf());
+            }
+            Ok(())
+        })
+    }
+
+    fn check_page_digests(
+        page: &[CandidateResult],
+        file_digests: &HashMap<PathBuf, String>,
+        mut check: impl FnMut(&Path, &str) -> Result<(), PathBuf>,
+    ) -> Result<(), PathBuf> {
         let mut checked = HashSet::new();
         for candidate in page {
             if !checked.insert(&candidate.path) {
@@ -616,12 +693,68 @@ impl ExactMemoStore {
             let Some(expected_digest) = file_digests.get(&candidate.path) else {
                 continue;
             };
-            #[cfg(test)]
-            crate::search_hot_path_measurements::record_memo_file_read(&candidate.path);
-            let live_bytes = fs::read(&candidate.path).map_err(|_| candidate.path.clone())?;
-            let live_digest = compute_content_digest(&live_bytes);
-            if &live_digest != expected_digest {
-                return Err(candidate.path.clone());
+            check(&candidate.path, expected_digest)?;
+        }
+        Ok(())
+    }
+
+    fn check_file_digest(&self, path: &Path, expected: &str) -> Result<(), PathBuf> {
+        self.check_file_digest_with_read_hooks(path, expected, || {}, || {})
+    }
+
+    fn check_file_digest_with_read_hooks(
+        &self,
+        path: &Path,
+        expected: &str,
+        before_read: impl FnOnce(),
+        after_read: impl FnOnce(),
+    ) -> Result<(), PathBuf> {
+        let observed_ns = now_ns();
+        let before = regular_file_stat(path);
+        if let Some(current) = &before {
+            let proofs = self.digest_proofs.lock();
+            if let Some(proof) = proofs
+                .files
+                .get(path)
+                .filter(|proof| proof.stat.reusable(current, proof.observed_ns))
+            {
+                return if proof.digest == expected {
+                    Ok(())
+                } else {
+                    Err(path.to_path_buf())
+                };
+            }
+        }
+
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record_memo_file_read(path);
+        before_read();
+        let mut file = fs::File::open(path).map_err(|_| path.to_path_buf())?;
+        let opened = NativeStat::read_open_file(&file, path).ok();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| path.to_path_buf())?;
+        let digest = compute_content_digest(&bytes);
+        after_read();
+        if digest != expected {
+            return Err(path.to_path_buf());
+        }
+        if let (Some(before), Some(after)) = (before, regular_file_stat(path)) {
+            // The content hash and both stamps belong to this read, not a later
+            // sweep. Preserve that observation boundary on hits; recent/coarse
+            // timestamps always reread bytes.
+            if before.reusable(&after, observed_ns)
+                && opened.as_ref() == Some(&before)
+                && NativeStat::read_open_file(&file, path).ok().as_ref() == Some(&after)
+            {
+                self.digest_proofs.lock().insert(
+                    path,
+                    DigestProof {
+                        stat: before,
+                        observed_ns,
+                        digest,
+                    },
+                );
             }
         }
         Ok(())
@@ -675,7 +808,9 @@ impl ExactMemoStore {
 
             // Re-check digests of exactly the files backing the served page
             if let Err(_mismatched_file) =
-                Self::check_served_page_digests(page, &entry.file_digests)
+                Self::check_page_digests(page, &entry.file_digests, |path, expected| {
+                    self.check_file_digest(path, expected)
+                })
             {
                 // Digest mismatch!
                 // Drops the entry and poisons K without re-verifying (counter still unchanged).
@@ -820,6 +955,7 @@ impl ExactMemoStore {
 
     /// Drop entries and poison history without reusing publication epochs.
     pub fn clear(&self) {
+        *self.digest_proofs.lock() = DigestProofCache::default();
         let _admission = self.in_flight.lock();
         *self.entries.write() = HashMap::new();
         *self.lifecycle.write() = HashMap::new();
@@ -851,6 +987,7 @@ impl ExactMemoStore {
         drop((presence, lifecycle, entries, admission));
         drop(retired);
         true
+
     }
 }
 
@@ -880,6 +1017,214 @@ mod tests {
         memo.get_or_verify(key, 0, 1, audit01_empty_set).unwrap();
         let observed = memo.entries.read().get(key).unwrap().clone();
         memo.invalidate_observed_entry(key, &observed);
+    }
+
+    fn write_old_file(path: &Path, bytes: &[u8]) {
+        fs::write(path, bytes).unwrap();
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_700_000_000, 123))
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_memo_warm_full_set_reuses_content_proofs() {
+        let root = tempfile::tempdir().unwrap();
+        let memo = ExactMemoStore::new();
+        let mut results = Vec::new();
+        let mut digests = HashMap::new();
+        let mut reusable = true;
+        for index in 0..200 {
+            let path = root.path().join(format!("file-{index}.rs"));
+            write_old_file(&path, b"fn marker() {}\n");
+            reusable &= regular_file_stat(&path).unwrap().reuse_supported;
+            digests.insert(path.clone(), compute_content_digest(b"fn marker() {}\n"));
+            for _ in 0..40 {
+                results.push(CandidateResult::new_exact(
+                    path.clone(),
+                    None,
+                    EvidenceDescriptor::for_e1(1, true, false),
+                ));
+            }
+        }
+        let key = MemoKey::new(
+            root.path(),
+            GenerationToken::new_with_str("fixed"),
+            "marker",
+            true,
+        );
+        let first = memo
+            .get_or_verify(&key, 0, usize::MAX, || {
+                Ok(VerifiedExactSet {
+                    results,
+                    file_digests: digests,
+                    bound_disclosure: None,
+                    stability_void: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(first.results.len(), 8_000);
+        crate::search_hot_path_measurements::reset();
+        let warm = memo
+            .get_or_verify(&key, 0, usize::MAX, || panic!("memo hit"))
+            .unwrap();
+        assert!(!warm.served_page_digest_mismatch);
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().memo_digest_reads,
+            200
+        );
+        crate::search_hot_path_measurements::reset();
+        let hot = memo
+            .get_or_verify(&key, 0, usize::MAX, || panic!("memo hit"))
+            .unwrap();
+        let reads = crate::search_hot_path_measurements::counts().memo_digest_reads;
+        assert_eq!(hot.results.len(), 8_000);
+        assert!(!hot.served_page_digest_mismatch);
+        assert_eq!(reads, if reusable { 0 } else { 200 });
+        assert_eq!(memo.verifier_call_count(), 1);
+        eprintln!("full exact memo set: 8000 rows / 200 files; first hit=200 reads; proof hit={reads} reads");
+        memo.clear();
+        assert!(memo.digest_proofs.lock().files.is_empty());
+    }
+
+    #[test]
+    fn exact_memo_proofs_reject_restored_mtime_edits_replacements_and_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.rs");
+        let digest = compute_content_digest(b"old");
+        let memo = ExactMemoStore::new();
+        write_old_file(&path, b"old");
+        memo.check_file_digest(&path, &digest).unwrap();
+        let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(&path).unwrap());
+        fs::write(&path, b"new").unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        assert_eq!(memo.check_file_digest(&path, &digest), Err(path.clone()));
+
+        write_old_file(&path, b"old");
+        memo.check_file_digest(&path, &digest).unwrap();
+        crate::file_identity::replace_keeping_times(&path, b"new");
+        assert_eq!(memo.check_file_digest(&path, &digest), Err(path.clone()));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(memo.check_file_digest(&path, &digest), Err(path));
+    }
+
+    #[test]
+    fn exact_memo_proofs_keep_observation_fence_and_fall_back_when_unsupported() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.rs");
+        write_old_file(&path, b"old");
+        let digest = compute_content_digest(b"old");
+        let stat = regular_file_stat(&path).unwrap();
+        let memo = ExactMemoStore::new();
+        for unsupported in [false, true] {
+            let mut proof_stat = stat.clone();
+            proof_stat.reuse_supported &= !unsupported;
+            let observed_ns = stat.modified_ns as u128;
+            memo.digest_proofs.lock().insert(
+                &path,
+                DigestProof {
+                    stat: proof_stat,
+                    observed_ns,
+                    digest: digest.clone(),
+                },
+            );
+            crate::search_hot_path_measurements::reset();
+            memo.check_file_digest(&path, &digest).unwrap();
+            assert_eq!(
+                crate::search_hot_path_measurements::counts().memo_digest_reads,
+                1
+            );
+        }
+        memo.check_file_digest(&path, &digest).unwrap();
+        let observed = memo
+            .digest_proofs
+            .lock()
+            .files
+            .get(&path)
+            .map(|p| p.observed_ns);
+        memo.check_file_digest(&path, &digest).unwrap();
+        assert_eq!(
+            memo.digest_proofs
+                .lock()
+                .files
+                .get(&path)
+                .map(|p| p.observed_ns),
+            observed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_memo_proofs_do_not_follow_symlinks_or_rebind_raced_reads() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        write_old_file(&a.join("file.rs"), b"old");
+        write_old_file(&b.join("file.rs"), b"new");
+        let link = root.path().join("link.rs");
+        symlink(a.join("file.rs"), &link).unwrap();
+        let memo = ExactMemoStore::new();
+        memo.check_file_digest(&link, &compute_content_digest(b"old"))
+            .unwrap();
+        assert!(!memo.digest_proofs.lock().files.contains_key(&link));
+        write_old_file(&a.join("file.rs"), b"new");
+        assert!(memo
+            .check_file_digest(&link, &compute_content_digest(b"old"))
+            .is_err());
+
+        write_old_file(&a.join("file.rs"), b"old");
+        let directory = root.path().join("directory");
+        symlink(&a, &directory).unwrap();
+        let path = directory.join("file.rs");
+        let digest = compute_content_digest(b"new");
+        memo.check_file_digest_with_read_hooks(
+            &path,
+            &digest,
+            || {
+                fs::remove_file(&directory).unwrap();
+                symlink(&b, &directory).unwrap();
+            },
+            || {
+                fs::remove_file(&directory).unwrap();
+                symlink(&a, &directory).unwrap();
+            },
+        )
+        .unwrap();
+        assert!(!memo.digest_proofs.lock().files.contains_key(&path));
+        assert!(memo.check_file_digest(&path, &digest).is_err());
+    }
+
+    #[test]
+    fn exact_memo_digest_proof_retention_is_bounded_without_skipping_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.rs");
+        write_old_file(&path, b"old");
+        let memo = ExactMemoStore::new();
+        let proof = DigestProof {
+            stat: regular_file_stat(&path).unwrap(),
+            observed_ns: now_ns(),
+            digest: compute_content_digest(b"old"),
+        };
+        for index in 0..10_000 {
+            memo.digest_proofs
+                .lock()
+                .insert(&root.path().join(format!("{index}.rs")), proof.clone());
+        }
+        assert!(memo.digest_proofs.lock().payload_bytes <= MAX_DIGEST_PROOF_BYTES);
+        assert!(memo.digest_proofs.lock().files.len() < 10_000);
+        let oversized = DigestProof {
+            digest: "x".repeat(MAX_DIGEST_PROOF_BYTES + 1),
+            ..proof
+        };
+        memo.digest_proofs.lock().insert(&path, oversized);
+        crate::search_hot_path_measurements::reset();
+        memo.check_file_digest(&path, &compute_content_digest(b"old"))
+            .unwrap();
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().memo_digest_reads,
+            1
+        );
     }
 
     #[test]

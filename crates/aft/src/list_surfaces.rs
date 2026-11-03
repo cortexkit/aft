@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "DigestProofCache::insert",
+        location_or_primitive: "MAX_DIGEST_PROOF_BYTES",
+        reason: "Internal verified-content proof retention budget; eviction or bypass always falls back to reading and hashing the complete served page, never truncates search candidates or output.",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/records.rs",
         enclosing_item: "cut_detail",
         location_or_primitive: "canonical byte limit, files.pop, UTF-8 stream prefix",
