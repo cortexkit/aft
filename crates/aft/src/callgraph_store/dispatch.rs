@@ -9,6 +9,170 @@ use tree_sitter::Node;
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
+#[path = "dispatch/typescript.rs"]
+mod typescript;
+
+/// Complete the graph builder's owned symbols without changing navigation or
+/// semantic-search symbol tables supplied by the shared parser.
+pub(crate) fn complete_typescript_symbols<'tree>(
+    source: &str,
+    lang: LangId,
+    root: Node<'tree>,
+    symbols: &mut Vec<crate::symbols::Symbol>,
+) -> Vec<Node<'tree>> {
+    if matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        let nodes = descendants(root);
+        typescript::complete_symbols(&nodes, source, symbols);
+        nodes
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build compact, temporary TypeScript object facts from the supplied syntax
+/// tree and attributed call sites, avoiding a second graph extraction.
+pub(crate) fn typescript_objects_from_data(
+    source: &str,
+    lang: LangId,
+    nodes: &[Node<'_>],
+    data: &crate::callgraph::FileCallData,
+) -> Option<ParseBlob> {
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        return None;
+    }
+    let mut profile = crate::views::materialization::profile::StageTimer::new("typescript_facts");
+    let mut refs = Vec::new();
+    for (caller, calls) in &data.calls_by_symbol {
+        for call in calls.iter().filter(|call| {
+            call.kind == crate::callgraph::CallSiteKind::Call && call.full_callee.contains('.')
+        }) {
+            refs.push(BlobRef {
+                ordinal: refs.len() as u32,
+                kind: BlobRefKind::Call,
+                caller_symbol: Some(caller.clone()),
+                short_name: Some(call.callee_name.clone()),
+                full_ref: Some(call.full_callee.clone()),
+                module_path: None,
+                line: call.line,
+                byte_start: call.byte_start,
+                byte_end: call.byte_end,
+                path_override: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                import_kind: None,
+            });
+        }
+    }
+    let mut parse = ParseBlob {
+        entry_point_symbols: Vec::new(),
+        dispatch: DispatchFacts::default(),
+        extractor_version: String::new(),
+        language: if lang == LangId::Tsx {
+            "tsx"
+        } else {
+            "typescript"
+        }
+        .into(),
+        ast_nodes: Vec::new(),
+        symbols: super::blob_symbols(data),
+        default_export_symbol: data.default_export_symbol.clone(),
+        exported_symbols: data.exported_symbols.clone(),
+        callable_symbols: Vec::new(),
+        imports: super::blob_imports(data),
+        python_bindings: Vec::new(),
+        refs,
+    };
+    profile.finish(
+        "inputs",
+        format_args!("nodes={} refs={}", nodes.len(), parse.refs.len()),
+    );
+    // This pass links calls only to methods of object literals and single
+    // object-literal returns. Class and parameter types cannot supply those
+    // bindings, so do not compute and discard them.
+    let objects = typescript::Objects::new_objects_only(nodes, source, &parse);
+    profile.finish("index", format_args!("nodes={}", nodes.len()));
+    let mut facts = DispatchFacts::default();
+    objects.extract(&mut facts);
+    facts.methods.extend_from_slice(objects.methods());
+    profile.finish(
+        "facts",
+        format_args!(
+            "methods={} types={}",
+            facts.methods.len(),
+            facts.types.len()
+        ),
+    );
+    let call_kinds = crate::calls::call_node_kinds(lang);
+    let calls = nodes
+        .iter()
+        .filter(|node| call_kinds.contains(&node.kind()))
+        .map(|node| ((node.start_byte(), node.end_byte()), *node))
+        .collect::<HashMap<_, _>>();
+    profile.finish("calls", format_args!("calls={}", calls.len()));
+    for reference in &parse.refs {
+        let Some(&call) = calls.get(&(reference.byte_start, reference.byte_end)) else {
+            continue;
+        };
+        let Some(callee) = field(call, &["function", "name"]) else {
+            continue;
+        };
+        if field(callee, &["property"]).is_none() {
+            continue;
+        }
+        let Some(receiver) = field(callee, &["object"]) else {
+            continue;
+        };
+        let ty = if text(receiver, source) == "this" {
+            enclosing(call, FUNCTIONS)
+                .filter(|function| function.kind() == "method_definition")
+                .and_then(|function| typescript::object_member(function, source))
+                .map(|(object, _)| typescript::object_identity(object))
+        } else {
+            objects.object_receiver(receiver, call)
+        };
+        if !ty.as_ref().is_some_and(|ty| {
+            ty.starts_with("@object:") || ty.starts_with("@return:") || ty.starts_with("@field:")
+        }) {
+            continue;
+        }
+        facts.sites.push(SiteHint {
+            ordinal: reference.ordinal,
+            caller: reference.caller_symbol.clone(),
+            line: reference.line,
+            member: field(callee, &["property"]).map(|member| text(member, source).to_string()),
+            receiver: ty,
+            dynamic: false,
+        });
+    }
+    if facts.methods.is_empty() && facts.sites.is_empty() && facts.returns.is_empty() {
+        profile.finish("sites", format_args!("sites=0"));
+        return None;
+    }
+    profile.finish("sites", format_args!("sites={}", facts.sites.len()));
+    let site_ordinals = facts
+        .sites
+        .iter()
+        .map(|site| site.ordinal)
+        .collect::<HashSet<_>>();
+    parse
+        .refs
+        .retain(|reference| site_ordinals.contains(&reference.ordinal));
+    // Site hints already own the binding information. The retained join data
+    // needs symbol positions and ref offsets, not signatures or caller copies.
+    for symbol in &mut parse.symbols {
+        symbol.signature = None;
+    }
+    for reference in &mut parse.refs {
+        reference.caller_symbol = None;
+        reference.short_name = None;
+        reference.full_ref = None;
+    }
+    parse.dispatch = facts;
+    Some(parse)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
     /// The package clause distinguishes co-located external test packages.
@@ -163,9 +327,14 @@ const FUNCTIONS: &[&str] = &[
     "method_declaration",
     "function_signature_item",
     "arrow_function",
+    "function_expression",
+    "generator_function",
     "lambda_expression",
 ];
 fn named(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some((_, name)) = typescript::object_member(node, source) {
+        return Some(name);
+    }
     field(node, &["name"])
         .or_else(|| {
             node.named_children(&mut node.walk()).find(|n| {
@@ -175,6 +344,14 @@ fn named(node: Node<'_>, source: &str) -> Option<String> {
         .map(|name| text(name, source).to_string())
 }
 fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option<String>)> {
+    if typescript::supported(language) {
+        if let Some((object, _)) = typescript::object_member(node, source) {
+            return Some((typescript::object_identity(object), None));
+        }
+        if matches!(node.kind(), "function_expression" | "generator_function") {
+            return None;
+        }
+    }
     if language == "rust" {
         if let Some(implementation) = enclosing(node, &["impl_item"]) {
             return Some((
@@ -286,9 +463,10 @@ pub fn complete_members(
     let mut call_ordinals = parse
         .refs
         .iter()
-        .filter(|r| r.kind == BlobRefKind::Call)
-        .map(|r| r.ordinal)
-        .collect::<HashSet<_>>();
+        .enumerate()
+        .filter(|(_, r)| r.kind == BlobRefKind::Call)
+        .map(|(index, r)| (r.ordinal, index))
+        .collect::<HashMap<_, _>>();
     for call in all
         .into_iter()
         .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
@@ -306,7 +484,19 @@ pub fn complete_members(
         let Some(&ordinal) = spans.get(&(call.start_byte(), call.end_byte())) else {
             continue;
         };
-        if call_ordinals.contains(&ordinal) {
+        if let Some(&index) = call_ordinals.get(&ordinal) {
+            if typescript::supported(&parse.language) {
+                if let Some(function) = enclosing(call, FUNCTIONS) {
+                    if typescript::object_member(function, source).is_some() {
+                        if let Some(caller) = callers.get(&(
+                            function.start_position().row as u32,
+                            function.start_position().column as u32,
+                        )) {
+                            parse.refs[index].caller_symbol = Some(caller.clone());
+                        }
+                    }
+                }
+            }
             continue;
         }
         let caller = enclosing(call, FUNCTIONS).and_then(|function| {
@@ -320,7 +510,7 @@ pub fn complete_members(
         if caller.is_none() {
             continue;
         }
-        call_ordinals.insert(ordinal);
+        call_ordinals.insert(ordinal, parse.refs.len());
         let full = text(callee, source).to_string();
         let short = full
             .rsplit(['.', ':'])
@@ -393,6 +583,11 @@ pub fn extract(
     }
     let mut facts = DispatchFacts::default();
     facts.go_package = go_index.as_ref().and_then(|index| index.package.clone());
+    let ts_objects =
+        typescript::supported(language).then(|| typescript::Objects::new(&all, source, parse));
+    if let Some(objects) = &ts_objects {
+        objects.extract(&mut facts);
+    }
     if language == "rust" {
         for node in &all {
             if node.kind() == "field_declaration" {
@@ -508,13 +703,26 @@ pub fn extract(
         let Some((owner, trait_name)) = owner(node, source, language) else {
             continue;
         };
+        if ts_objects.as_ref().is_some_and(|objects| {
+            typescript::object_member(node, source).is_some_and(|(object, name)| {
+                name != symbol.name || !objects.unambiguous_member(object, &name)
+            })
+        }) {
+            continue;
+        }
+        // TypeScript dispatch uses declaration owners, not structural method
+        // signatures (the latter are compared only for Go interface matching).
         facts.methods.push(MethodHint {
             owner,
             trait_name,
             name: symbol.name.clone(),
             symbol: symbol.scoped_name.clone(),
             has_body: field(node, &["body"]).is_some(),
-            shape: method_shape(node, source),
+            shape: if typescript::supported(language) {
+                String::new()
+            } else {
+                method_shape(node, source)
+            },
             private: text(node, source)
                 .split('{')
                 .next()
@@ -561,7 +769,11 @@ pub fn extract(
                 name,
                 symbol,
                 has_body: field(*node, &["body"]).is_some(),
-                shape: method_shape(*node, source),
+                shape: if typescript::supported(language) {
+                    String::new()
+                } else {
+                    method_shape(*node, source)
+                },
                 private: text(*node, source)
                     .split('{')
                     .next()
@@ -687,6 +899,11 @@ pub fn extract(
                 .map(str::to_string)
         } else {
             receiver_node.and_then(|receiver| {
+                if let Some(objects) = &ts_objects {
+                    if !matches!(text(receiver, source), "this" | "super") {
+                        return objects.receiver(receiver, call);
+                    }
+                }
                 receiver_type(
                     receiver,
                     call,
@@ -963,7 +1180,14 @@ fn receiver_type<'tree>(
     }
     match language {
         "typescript" | "tsx" | "javascript" | "java" | "csharp" | "kotlin" if value == "this" => {
-            return current_owner
+            if current_owner
+                .as_ref()
+                .is_some_and(|name| name.starts_with("@object:"))
+                && function.kind() != "method_definition"
+            {
+                return None;
+            }
+            return current_owner;
         }
         "python" if value == "self" => return current_owner,
         "python" if value == "cls" => {

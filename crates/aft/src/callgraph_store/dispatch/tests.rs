@@ -106,6 +106,213 @@ fn resolutions(parse: &ParseBlob) -> Vec<Resolution> {
         .collect()
 }
 
+fn ts_object_target(parse: &ParseBlob, line: u32) -> BTreeSet<String> {
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), parse)]));
+    let site = parse
+        .dispatch
+        .sites
+        .iter()
+        .find(|s| s.line == line)
+        .unwrap();
+    resolver
+        .resolve("fixture", site)
+        .targets
+        .into_iter()
+        .map(|t| t.symbol)
+        .collect()
+}
+
+#[test]
+fn typescript_object_wrappers_bind_the_literal_not_a_homonym() {
+    let parse = parse("interface Resolver { handler(): void }\nconst actual = ({ handler: () => {} } satisfies Resolver);\nconst other = { handler: () => {} } as Resolver;\nactual.handler();\nother.handler();", "typescript");
+    let first = ts_object_target(&parse, 4);
+    let second = ts_object_target(&parse, 5);
+    assert_eq!(first.len(), 1, "{parse:#?}");
+    assert_eq!(second.len(), 1);
+    assert!(first.is_disjoint(&second));
+    assert!(first
+        .iter()
+        .chain(&second)
+        .all(|s| s.starts_with("@object:")));
+}
+
+#[test]
+fn typescript_object_definitions_are_graph_only() {
+    let source = "function factory() { return { run() { helper(); } }; }\nfunction helper() {}\nregister({ work() {} });\nconst wrapped = { wrappedWork() {} } satisfies Contract;";
+    let tree = crate::parser::FileParser::parse_source(
+        std::path::Path::new("fixture.ts"),
+        source,
+        LangId::TypeScript,
+    )
+    .unwrap();
+    let before =
+        crate::parser::extract_symbols_from_tree(source, &tree, LangId::TypeScript).unwrap();
+    let data = crate::callgraph::build_file_data_from_tree(
+        std::path::Path::new("fixture.ts"),
+        source,
+        LangId::TypeScript,
+        &tree,
+        &crate::callgraph_store::LineIndex::new(source),
+    )
+    .unwrap();
+    let after =
+        crate::parser::extract_symbols_from_tree(source, &tree, LangId::TypeScript).unwrap();
+    assert_eq!(before, after);
+    let mut names = before
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["factory", "helper", "wrapped"]);
+    for name in ["run", "work", "wrappedWork"] {
+        assert!(
+            data.symbol_metadata
+                .keys()
+                .any(|symbol| symbol.ends_with(&format!("::{name}"))),
+            "{name}"
+        );
+    }
+    let run = data
+        .symbol_metadata
+        .iter()
+        .find(|(name, _)| name.ends_with("::run"))
+        .unwrap()
+        .1;
+    assert_eq!(run.signature.as_deref(), Some("run()"));
+    assert!(data
+        .calls_by_symbol
+        .iter()
+        .any(|(symbol, calls)| symbol.ends_with("::run")
+            && calls.iter().any(|call| call.callee_name == "helper")));
+}
+
+#[test]
+fn typescript_object_argument_definitions_have_distinct_identities() {
+    let parse = parse("register({ run: () => helper() });\nregister({ run() { helper(); } });\n({ run: function() {} }).run();\nfunction helper() {}", "typescript");
+    let definitions = parse
+        .symbols
+        .iter()
+        .filter(|s| s.name == "run")
+        .collect::<Vec<_>>();
+    assert_eq!(definitions.len(), 3, "{parse:#?}");
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|s| &s.scoped_name)
+            .collect::<HashSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(ts_object_target(&parse, 3).len(), 1);
+    assert_eq!(
+        parse
+            .refs
+            .iter()
+            .filter(|r| r.short_name.as_deref() == Some("helper")
+                && r.caller_symbol.as_ref().is_some_and(|s| s.contains("run")))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn typescript_object_factory_returns_are_lexically_bound() {
+    let parse = parse("function make() { return { run: () => {} }; }\nfunction other() { return { run() {} }; }\nfunction caller() {\n const adapter = make();\n adapter.run();\n const nested = () => ({ child: { run: () => {} } });\n nested().child.run();\n}\nfunction shadow(make: unknown) { const adapter = make(); adapter.run(); }", "typescript");
+    let target = ts_object_target(&parse, 5);
+    assert_eq!(target.len(), 1, "{parse:#?}");
+    assert!(target.iter().all(|s| s.starts_with("@object:0:")));
+    assert_eq!(ts_object_target(&parse, 7).len(), 1, "{parse:#?}");
+    assert!(ts_object_target(&parse, 9).is_empty());
+}
+
+#[test]
+fn typescript_object_same_named_local_bindings_do_not_share_a_method() {
+    let parse = parse("function first() { const value = { run() {} }; value.run(); }\nfunction second() { const value = { run() {} }; value.run(); }", "typescript");
+    let first = ts_object_target(&parse, 1);
+    let second = ts_object_target(&parse, 2);
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert!(first.is_disjoint(&second));
+}
+
+#[test]
+fn typescript_object_unique_existing_selectors_are_preserved() {
+    let parse = parse(
+        "function owner() { const local = { run() {} }; local.run(); }",
+        "typescript",
+    );
+    assert_eq!(
+        parse
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .unwrap()
+            .scoped_name,
+        "local::run"
+    );
+    assert_eq!(
+        ts_object_target(&parse, 1),
+        BTreeSet::from(["local::run".to_string()])
+    );
+}
+
+#[test]
+fn typescript_object_factory_import_uses_the_export_binding() {
+    let producer = parse(
+        "export function make() { return { run: () => {} }; }",
+        "typescript",
+    );
+    let consumer = parse("import { make as build } from './producer';\nfunction caller() { const adapter = build(); adapter.run(); }", "typescript");
+    let mut resolver = Resolver::new(BTreeMap::from([
+        ("producer.ts".into(), &producer),
+        ("consumer.ts".into(), &consumer),
+    ]));
+    resolver.type_targets.insert(
+        ("consumer.ts".into(), "build".into()),
+        ("producer.ts".into(), "make".into()),
+    );
+    let result = resolver.resolve("consumer.ts", &consumer.dispatch.sites[0]);
+    assert_eq!(result.targets.len(), 1, "{consumer:#?}");
+    assert!(result
+        .targets
+        .iter()
+        .all(|t| t.file == "producer.ts" && t.provenance == "exact"));
+}
+
+#[test]
+fn typescript_object_ambiguous_or_mutated_values_do_not_gain_edges() {
+    for source in [
+        "const value = { run() {}, ...unknown }; value.run();",
+        "const value = { run() {}, run: () => {} }; value.run();",
+        "const value = { run() {}, [key]: () => {} }; value.run();",
+        "let value = { run() {} }; value = unknown; value.run();",
+        "const value = { run() {} }; value.run = unknown; value.run();",
+        "function make(flag) { if(flag) return {run(){}}; return {run(){}}; } const value = make(); value.run();",
+        "function make() { function inner() { return { run() {} }; } } const value = make(); value.run();",
+        "async function make() { return { run() {} }; } const value = make(); value.run();",
+        "const value = { run() {} }; function caller(value) { value.run(); }",
+        "register({ run() {} }); function callback(value) { value.run(); }",
+        "const value = { run() {} }; const alias = value; alias.run = unknown; value.run();",
+        "import {make} from './producer'; function caller() { const {make} = unknown; make().run(); }",
+        "import {make} from './producer'; const callback = make => make().run();",
+        "import {make} from './producer'; function caller() { try {} catch(make) { make().run(); } }",
+        "const make = function*() { return { run() {} }; }; make().run();",
+        "const value = { run: function internal() {} }; value.internal();",
+        "const value = { run: () => this.other(), other() {} };",
+        "class Target { run() {} } function make(): Target { make.run(); return new Target(); }",
+        "const value = { run() {} }; function caller(values) { for(const value of values) { value.run(); } }",
+        "import {make} from './producer'; function caller(values) { for(const make of values) { make().run(); } }",
+        "import {make} from './producer'; function caller(values) { for(var make of values) {} make().run(); }",
+        "import {make} from './producer'; function caller() { make = unknown; make().run(); }",
+    ] {
+        let parse = parse(source, "typescript");
+        let producer = self::parse("export function make() { return { run() {} }; }", "typescript");
+        let mut resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parse), ("producer.ts".into(), &producer)]));
+        resolver.type_targets.insert(("fixture".into(), "make".into()), ("producer.ts".into(), "make".into()));
+        assert!(parse.dispatch.sites.iter().all(|site| resolver.resolve("fixture", site).targets.is_empty()), "{source}\n{parse:#?}");
+    }
+}
+
 #[test]
 fn interface_two_implementations_are_possible_targets() {
     let parse = parse("interface I { m(): void; }\nclass A implements I { m() {} }\nclass B implements I { m() {} }\nfunction caller(x: I) { x.m(); }", "typescript");

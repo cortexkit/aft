@@ -387,6 +387,168 @@ struct Fixture {
     store: CallGraphStore,
 }
 
+#[test]
+fn typescript_object_store_records_wrapped_returned_and_argument_methods() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => {} });"),
+        ("caller.ts", "import { make as build } from './producer';\nexport function caller() { const adapter = build(); adapter.run(); }\nconst direct = { wrapped: () => {} } satisfies Contract;\ndirect.wrapped();\nfunction unknown(value) { value.argument(); }\nargument();"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM nodes WHERE name IN ('run','argument','wrapped') AND kind='method'"), 3);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 2);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::argument'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn typescript_object_store_factory_edits_match_a_cold_build() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export function make() { return { run() {} }; }"),
+        ("caller.ts", "import { make } from './producer';\nexport function caller() { const adapter = make(); adapter.run(); }"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 1);
+    let changed = edit(
+        &fixture.root,
+        "producer.ts",
+        "return { run() {} };",
+        "const unused = { run() {} }; return unknown;",
+    );
+    fixture.refresh_and_compare("typescript-object-return-removed", &[changed]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn typescript_object_store_var_definitions_are_not_bare_name_bindings() {
+    let fixture = Fixture::from_files(&[
+        ("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }"),
+    ]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM nodes WHERE name='unique' AND kind='method'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique'"
+        ),
+        1
+    );
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique' AND provenance='type_match'"), 1);
+}
+
+#[test]
+fn typescript_object_cold_cache_avoids_reextraction() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run() {} });"),
+        ("caller.ts", "import {make} from './producer'; function caller() { const adapter=make(); adapter.run(); }"),
+    ]);
+    let mut retained = RetainedCallerData::new(1024 * 1024);
+    for path in source_files(&fixture.root) {
+        let extract = build_file_extract(&fixture.root, &path).unwrap();
+        retained.retain_objects(&extract);
+    }
+    let connection = fixture.store.conn.lock().unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    let references = load_name_match_refs(&transaction, None).unwrap();
+    assert!(references
+        .iter()
+        .any(|reference| reference.method_name == "run"));
+    let mut objects = typescript_objects::ObjectDispatch::new(
+        &transaction,
+        &fixture.root,
+        Some(&retained.objects),
+    );
+    objects.prepare(&references).unwrap();
+    assert_eq!(objects.source_extracts(), 0);
+    assert!(references
+        .iter()
+        .any(|reference| objects.resolve(&transaction, reference).unwrap().is_some()));
+}
+
+#[test]
+fn typescript_object_views_and_legacy_answers_are_identical() {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    fn answers(connection: &Connection) -> Vec<(String, String, String, String, u32, bool)> {
+        connection.prepare("SELECT src.file_path,src.scoped_name,e.target_file,e.target_symbol,e.line,e.provenance != 'name_match' FROM edges e JOIN nodes src ON src.id=e.source_node WHERE e.kind='call' ORDER BY 1,2,3,4,5,6")
+            .unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+    let cases: &[(&[(&str, &str)], usize)] = &[
+        (&[("caller.ts", "interface T { handler(): void }\nconst actual = ({ handler: () => {} } satisfies T);\nconst other = { handler: () => {} } as T;\nactual.handler();\nother.handler();")], 2),
+        (&[
+            ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => helper() });\nfunction helper() {}"),
+            ("caller.ts", "import { make as build } from './producer';\nfunction caller() { const adapter = build(); adapter.run(); }\nfunction nestedCaller() { const nested = () => ({ child: { run() {} } }); nested().child.run(); }\nfunction unknown(value) { value.argument(); }\nargument();"),
+        ], 5),
+        (&[("caller.ts", "register({ run: () => helper() });\nregister({ run() { helper(); } });\nfunction helper() {}\nfunction first() { const value = { unique() {} }; value.unique(); }\nfunction second() { const value = { unique() {} }; value.unique(); }\nfunction inline() { ({run: function() {}}).run(); }")], 5),
+        (&[("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }")], 1),
+    ];
+    for &(files, expected) in cases {
+        let fixture = Fixture::from_files(files);
+        let blob_path = fixture.temp.path().join("blobs.sqlite");
+        let blobs = Connection::open(&blob_path).unwrap();
+        blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY,payload BLOB NOT NULL,payload_digest BLOB NOT NULL,payload_schema INTEGER NOT NULL)").unwrap();
+        let manifest = Manifest::new(files.iter().map(|(path, source)| {
+            let payload =
+                join::CallgraphBlob::extract(source, "typescript", "typescript-object-parity")
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+            let digest = blake3::hash(&payload);
+            let key = digest.to_hex().to_string();
+            blobs
+                .execute(
+                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1,?2,?3,1)",
+                    params![
+                        digest.as_bytes().as_slice(),
+                        payload,
+                        digest.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            (
+                RelPath::new(path.as_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key),
+                        semantic: None,
+                    },
+                    resolution_input: false,
+                },
+            )
+        }))
+        .unwrap();
+        drop(blobs);
+        let view_path = fixture.temp.path().join("view.sqlite");
+        crate::views::materialization::materialize_manifest_view_database(
+            &view_path, &blob_path, &manifest,
+        )
+        .unwrap();
+        let view = Connection::open(view_path).unwrap();
+        let legacy = fixture.store.conn.lock().unwrap();
+        let legacy_answers = answers(&legacy);
+        assert_eq!(
+            legacy_answers.len(),
+            expected,
+            "{files:?}: {legacy_answers:?}"
+        );
+        assert_eq!(answers(&view), legacy_answers, "{files:?}");
+    }
+}
+
 impl Fixture {
     fn new(matching: usize, unrelated: usize) -> Self {
         let temp = tempfile::tempdir().unwrap();

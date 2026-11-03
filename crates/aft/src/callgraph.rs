@@ -1403,6 +1403,28 @@ pub(crate) fn build_file_data_from_source(
     build_file_data_from_source_with_lang(path, source, lang)
 }
 
+pub(crate) fn build_file_data_with_typescript_objects(
+    path: &Path,
+    source: &str,
+) -> Result<
+    (
+        FileCallData,
+        Option<crate::callgraph_store::join::ParseBlob>,
+    ),
+    AftError,
+> {
+    let lang =
+        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
+            message: format!("unsupported file for call graph: {}", path.display()),
+        })?;
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        return build_file_data_from_source_with_lang(path, source, lang).map(|data| (data, None));
+    }
+    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
+    let lines = SourceLineIndex::new(source);
+    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true)
+}
+
 #[derive(Debug)]
 struct SymbolCallRange {
     symbol_index: usize,
@@ -1735,6 +1757,24 @@ pub(crate) fn build_file_data_from_tree(
     tree: &tree_sitter::Tree,
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false)
+        .map(|(data, _)| data)
+}
+
+fn build_file_data_from_tree_observed(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    tree: &tree_sitter::Tree,
+    line_index: &SourceLineIndex,
+    collect_objects: bool,
+) -> Result<
+    (
+        FileCallData,
+        Option<crate::callgraph_store::join::ParseBlob>,
+    ),
+    AftError,
+> {
     // Parse imports
     let python = (lang == LangId::Python).then(|| python::extract(source, tree.root_node()));
     let (import_block, python_bindings) = if let Some(python) = &python {
@@ -1744,7 +1784,13 @@ pub(crate) fn build_file_data_from_tree(
     };
 
     // Get symbols (for call site extraction and export detection)
-    let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let mut symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
+        source,
+        lang,
+        tree.root_node(),
+        &mut symbols,
+    );
 
     let root = tree.root_node();
     let mut macro_body_calls_by_macro = HashMap::new();
@@ -1966,7 +2012,7 @@ pub(crate) fn build_file_data_from_tree(
         );
     }
 
-    Ok(FileCallData {
+    let data = FileCallData {
         calls_by_symbol,
         value_refs_by_symbol,
         macro_body_calls_by_macro,
@@ -1977,7 +2023,18 @@ pub(crate) fn build_file_data_from_tree(
         import_block,
         python_bindings,
         lang,
-    })
+    };
+    let objects = if collect_objects {
+        crate::callgraph_store::join::dispatch::typescript_objects_from_data(
+            source,
+            lang,
+            &object_nodes,
+            &data,
+        )
+    } else {
+        None
+    };
+    Ok((data, objects))
 }
 
 #[derive(Debug, Clone)]

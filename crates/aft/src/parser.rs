@@ -2575,7 +2575,7 @@ pub fn extract_symbols_from_tree(
 
 /// Cut a signature to [`MAX_SIGNATURE_BYTES`] on a character boundary and mark
 /// the cut with an ellipsis so readers can tell it was shortened.
-fn truncate_signature(signature: &mut String) {
+pub(crate) fn truncate_signature(signature: &mut String) {
     if signature.len() <= MAX_SIGNATURE_BYTES {
         return;
     }
