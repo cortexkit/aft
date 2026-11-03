@@ -35,13 +35,13 @@
       "dispatch_node_kind": "class",
       "ambiguity_candidates": [
         {
-          "id": "pos:symbol:227ce43cf7199dbd8b5218c388da7fb30b3396fd6482be54dd117e749e9931d2",
+          "id": "pos:symbol:227ce43cf7199dbd",
           "kind": "class",
           "name": "f",
           "line": 1
         },
         {
-          "id": "pos:symbol:73c5f1d7de9bbb01006c2adf5c30794d989e5b8a632ca0615b573e7c0338be09",
+          "id": "pos:symbol:73c5f1d7de9bbb01",
           "kind": "function",
           "name": "f",
           "line": 1
@@ -53,13 +53,13 @@
       "dispatch_node_kind": "function",
       "ambiguity_candidates": [
         {
-          "id": "pos:symbol:73c5f1d7de9bbb01006c2adf5c30794d989e5b8a632ca0615b573e7c0338be09",
+          "id": "pos:symbol:73c5f1d7de9bbb01",
           "kind": "function",
           "name": "f",
           "line": 1
         },
         {
-          "id": "pos:symbol:227ce43cf7199dbd8b5218c388da7fb30b3396fd6482be54dd117e749e9931d2",
+          "id": "pos:symbol:227ce43cf7199dbd",
           "kind": "class",
           "name": "f",
           "line": 1
