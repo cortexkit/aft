@@ -46,10 +46,14 @@ fn typescript_object_unknown_liveness_stream_matches_reference_and_refresh() {
             })
             .unwrap()
     };
-    assert_eq!(count(&streamed), 4);
+    // One row per caller file and protected target: both `x.run()` sites of
+    // caller.ts protect A.run and B.run, so two rows, not one per site.
+    assert_eq!(count(&streamed), 2);
     apply_manifest_diff(&streamed, &base, &next, &blob_path).unwrap();
     let cold = dir.path().join("cold-next.sqlite");
     materialize_manifest_view_database(&cold, &blob_path, &next).unwrap();
+    // Removing one of the two sites keeps both rows: the remaining site still
+    // protects the same targets.
     assert_eq!(count(&streamed), 2);
     parity::assert_logical_parity(&streamed, &cold);
 }
