@@ -202,7 +202,10 @@ impl From<serde_json::Error> for InspectCacheError {
 /// undecodable dead-code rows remain explicit coverage gaps.
 /// v43: source-size admission excludes oversized complexity/duplicate inputs
 /// and reports their coverage gaps instead of reusing unbounded scan results.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 43;
+/// v44: dead-code and unused-export readers admit at most 4 MiB of source,
+/// omit generated/minified JS/TS, and invalidate graph-wide deadness claims
+/// when a source file exceeds the limit.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 44;
 // Reserved metadata category: its integer is an epoch, never a scan timestamp.
 const CACHE_VERSION_CATEGORY: &str = "__cache_version__";
 
@@ -3998,7 +4001,7 @@ pub(crate) mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 43);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 44);
     }
 
     #[test]
