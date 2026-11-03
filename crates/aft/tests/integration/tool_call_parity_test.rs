@@ -51,8 +51,8 @@ fn tool_call_glob_matches_direct_spine_with_equal_mtimes() {
 }
 
 fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
-    let direct_project = crate::test_helpers::tempdir();
-    let tool_call_project = crate::test_helpers::tempdir();
+    let direct_project = tempfile::tempdir().expect("direct temp project");
+    let tool_call_project = tempfile::tempdir().expect("tool_call temp project");
     create_fixture_project(direct_project.path(), glob_mtimes);
     create_fixture_project(tool_call_project.path(), glob_mtimes);
 
@@ -368,9 +368,9 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
     use std::sync::Arc;
 
     crate::helpers::disable_in_process_file_watcher();
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
-    let storage = crate::test_helpers::tempdir();
+    let storage = tempfile::tempdir().unwrap();
     let path = root.join("todos.rs");
     fs::write(&path, "// TODO: maintenance parity\nfn main() {}\n").unwrap();
     let mut config = aft::config::Config {
@@ -391,7 +391,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
     let configure: aft::protocol::RawRequest = serde_json::from_value(json!({
         "id": "configure-forced-pair", "command": "configure", "harness": "opencode",
         "project_root": root, "storage_dir": storage.path(),
-        "config": crate::test_helpers::project_detection_user_config(json!({
+        "config": crate::helpers::user_config(json!({
             "indexes": {"trigram": false, "semantic": false, "callgraph": false},
             "views": {"enabled": false}
         }))
@@ -613,7 +613,7 @@ fn watcher_quiet_window_requires_an_uninterrupted_clear_interval() {
 
 #[test]
 fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("hashline carrier temp project");
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("hashline-carrier.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write hashline carrier fixture");
@@ -701,7 +701,7 @@ fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
 
 #[test]
 fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("hashline temp project");
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("hashline.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write hashline fixture");
@@ -839,7 +839,7 @@ fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
 
 #[test]
 fn plugin_harness_without_edit_registration_fails_safe_to_default_once() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("unregistered plugin temp project");
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("default.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write default fixture");
@@ -1024,7 +1024,7 @@ fn edit_contract_translation_preserves_exact_code_then_message() {
 
 #[test]
 fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("tool_call edit temp project");
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     fs::write(&target, "const value = old;\n").expect("write edit fixture");
@@ -1058,7 +1058,7 @@ fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
 
 #[test]
 fn edit_tool_call_applies_find_replace_with_empty_line_range_sentinels() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("tool_call find/replace sentinel temp project");
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     fs::write(&target, "const value = before;\n").expect("write edit fixture");
@@ -1095,7 +1095,7 @@ fn edit_tool_call_applies_find_replace_with_empty_line_range_sentinels() {
 
 #[test]
 fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("tool_call line-range sentinel temp project");
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     let original = (1..14)
@@ -1141,7 +1141,7 @@ fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
 
 #[test]
 fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
-    let project = crate::test_helpers::tempdir();
+    let project = tempfile::tempdir().expect("tool_call configure temp project");
     let mut aft = AftProcess::spawn();
     let response = send_json(
         &mut aft,
@@ -1153,7 +1153,7 @@ fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
             "arguments": {
                 "project_root": project.path().to_string_lossy(),
                 "harness": "opencode",
-                "config": crate::test_helpers::project_detection_user_config(json!({
+                "config": crate::helpers::user_config(json!({
                     "indexes": { "trigram": false, "semantic": false, "callgraph": false }
                 }))
             }
@@ -1298,8 +1298,8 @@ fn parity_cases() -> Vec<ParityCase> {
 }
 
 fn create_fixture_project(root: &Path, glob_mtimes: GlobMtimeProfile) {
+    fs::write(root.join("Makefile"), "").expect("declare fixture project");
     fs::create_dir_all(root.join("src")).expect("create src dir");
-    crate::test_helpers::project::mark_project(root).unwrap();
     fs::create_dir_all(root.join("docs")).expect("create docs dir");
     fs::write(
         root.join("src/read.txt"),
@@ -1356,13 +1356,31 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root.to_string_lossy(),
-            "config": crate::test_helpers::project_detection_user_config(json!({
+            "config": crate::helpers::user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false }
             })),
         }),
     );
     assert_eq!(response["success"], true, "configure failed: {response:#}");
-    aft.wait_for_project_ready();
+    // A successful configure acknowledges the request. Compare tool replies
+    // only after its requested project is active and not in degraded mode.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = send_json(
+            aft,
+            json!({"id": format!("{id}-ready"), "command": "status"}),
+        );
+        assert_eq!(status["success"], true, "{status}");
+        if status["project_root"] == root.to_string_lossy().as_ref() && status["degraded"] == false
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture configure did not settle: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) -> Value {
@@ -1431,36 +1449,6 @@ fn normalized_envelope(mut value: Value, project_root: &Path, cache_dir: &Path) 
     value
 }
 
-#[test]
-fn folder_admission_parity_normalizes_only_probe_clocks() {
-    let original = json!({"folder": {
-        "classification": "project", "reason": "root_marker", "observed_at_ms": 100,
-        "observed": {"eligible_source_files": 2},
-        "coverage": {"complete": false, "time_budget_ms": 100, "elapsed_ms": 1}
-    }});
-    let normalize = |value| normalized_envelope(value, Path::new("project"), Path::new("cache"));
-    let expected = normalize(original.clone());
-    let mut clocks = original.clone();
-    clocks["folder"]["observed_at_ms"] = json!(200);
-    clocks["folder"]["coverage"]["elapsed_ms"] = json!(5);
-    assert_eq!(normalize(clocks), expected);
-    let mut classification = original.clone();
-    classification["folder"]["classification"] = json!("not_project");
-    assert_ne!(normalize(classification), expected);
-    let mut count = original.clone();
-    count["folder"]["observed"]["eligible_source_files"] = json!(3);
-    assert_ne!(normalize(count), expected);
-    let mut budget = original.clone();
-    budget["folder"]["coverage"]["time_budget_ms"] = json!(200);
-    assert_ne!(normalize(budget), expected);
-    let mut missing_clock = original;
-    missing_clock["folder"]
-        .as_object_mut()
-        .unwrap()
-        .remove("observed_at_ms");
-    assert_ne!(normalize(missing_clock), expected);
-}
-
 fn assert_lifecycle_census_presence(response: &Value) {
     for (section, fields) in [
         (
@@ -1505,20 +1493,6 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             }
         }
         Value::Object(map) => {
-            // Each process probes its own fixture. Keep every admission field
-            // and coverage count, but not the independent wall-clock samples.
-            if let Some(folder) = map.get_mut("folder").and_then(Value::as_object_mut) {
-                if let Some(stamp) = folder.get_mut("observed_at_ms") {
-                    *stamp = json!("<observed_at_ms>");
-                }
-                if let Some(elapsed) = folder
-                    .get_mut("coverage")
-                    .and_then(Value::as_object_mut)
-                    .and_then(|coverage| coverage.get_mut("elapsed_ms"))
-                {
-                    *elapsed = json!("<elapsed_ms>");
-                }
-            }
             // Memory attribution is sampled independently in the direct and
             // tool_call processes. Preserve its schema and platform support
             // while masking volatile counts and allocator sampling readiness.
