@@ -9507,13 +9507,13 @@ export function bannerUnused() {}
             let small = root.join(format!("target.{extension}"));
             fs::write(
                 &small,
-                format!(
-                    "export function used() {{}}\n{}",
-                    "// handwritten source\n".repeat(75_000)
+                super::super::scanners::source_text::handwritten_graph_source_for_test(
+                    1_572_864,
+                    "export function used() {}\n",
                 ),
             )
             .unwrap();
-            fs::write(&large, format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n{}", "// handwritten source\n".repeat(250_000))).unwrap();
+            fs::write(&large, super::super::scanners::source_text::handwritten_graph_source_for_test(5_242_880, &format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n"))).unwrap();
             let paths = vec![large.clone(), small];
             let job = unused_exports_job(root, paths.clone());
             let probe = crate::project_content::Probe::new(root);

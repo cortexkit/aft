@@ -9200,9 +9200,9 @@ mod tests {
         for extension in ["js", "ts"] {
             let importer = format!("src/importer.{extension}");
             let target = format!("src/target.{extension}");
-            let handwritten = format!(
-                "export function inLarge() {{}}\n{}",
-                "// handwritten source\n".repeat(75_000)
+            let handwritten = super::super::source_text::handwritten_graph_source_for_test(
+                1_572_864,
+                "export function inLarge() {}\n",
             );
             let (_temp, root, files) = fixture_project(&[
                 (&importer, &handwritten),
@@ -9247,7 +9247,7 @@ mod tests {
                 let source_reads =
                     super::super::source_text::source_read_count_for_debug(&files[0]);
                 let head_bytes = crate::file_kind::read_probe::bytes_read(&files[0]);
-                fs::write(&files[0], format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n{}", "// handwritten source\n".repeat(250_000))).unwrap();
+                fs::write(&files[0], super::super::source_text::handwritten_graph_source_for_test(5_242_880, &format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n"))).unwrap();
                 let probe = crate::project_content::Probe::new(&root);
                 let skipped = scan();
                 let expected = json!([{"file": importer, "reason": "over the 4 MiB size limit"}]);

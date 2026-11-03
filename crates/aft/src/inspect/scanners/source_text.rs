@@ -309,6 +309,18 @@ pub fn source_read_count_for_debug(path: &Path) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn handwritten_graph_source_for_test(bytes: usize, header: &str) -> String {
+    assert!(header.ends_with('\n') && header.len() <= bytes);
+    let line = "// handwritten source\n";
+    let mut source = format!(
+        "{header}{}",
+        line.repeat((bytes - header.len()) / line.len())
+    );
+    source.push_str(&" ".repeat(bytes - source.len()));
+    source
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -443,13 +455,17 @@ mod tests {
         assert_eq!(GRAPH_TOO_LARGE, "over the 4 MiB size limit");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("handwritten.ts");
-        std::fs::write(&path, "// handwritten source\n".repeat(75_000)).unwrap();
+        std::fs::write(
+            &path,
+            handwritten_graph_source_for_test(1_572_864, "// handwritten source\n"),
+        )
+        .unwrap();
         assert!(matches!(
             read_source_text(&path).unwrap(),
             SourceText::TooLarge
         ));
         assert!(
-            matches!(read_graph_source_text(&path).unwrap(), SourceText::Text(source) if source.len() > 1_572_864)
+            matches!(read_graph_source_text(&path).unwrap(), SourceText::Text(source) if source.len() == 1_572_864)
         );
         let budget = SourceScanBudget::new(SOURCE_SCAN_BUDGET_BYTES);
         let permit = budget.reserve_with_limit(3 * 1024 * 1024, MAX_GRAPH_SOURCE_BYTES);
