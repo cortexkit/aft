@@ -97,7 +97,17 @@ fn golden(name: &str, bytes: &[u8]) {
         });
         write_capture(&path, bytes);
     } else {
-        assert_eq!(read_capture(&path), bytes, "{} differs", path.display());
+        let recorded = read_capture(&path);
+        // A candidate's differing capture can be kept for review (never as a
+        // golden): AFT_STORE_DIET_CANDIDATE_DIR names a folder to write it to.
+        if recorded != bytes {
+            if let Some(directory) = std::env::var_os("AFT_STORE_DIET_CANDIDATE_DIR") {
+                let directory = PathBuf::from(directory);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(directory.join(name.trim_end_matches(".gz")), bytes).unwrap();
+            }
+        }
+        assert_eq!(recorded, bytes, "{} differs", path.display());
     }
 }
 
@@ -1263,9 +1273,17 @@ fn stored_json_facts(store: &CallGraphStore) -> Value {
                     "SELECT {key}, {column} FROM {name} WHERE {column} IS NOT NULL"
                 ))
                 .unwrap();
+            // Payload columns hold JSON text, or the views store's compressed
+            // form of it; either way the facts compared are the decoded JSON.
             let rows = statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    let payload = match row.get_ref(1)? {
+                        rusqlite::types::ValueRef::Blob(bytes) => {
+                            crate::views::materialization::payload::unpack(bytes).unwrap()
+                        }
+                        other => other.as_str()?.to_string(),
+                    };
+                    Ok((row.get::<_, String>(0)?, payload))
                 })
                 .unwrap();
             for row in rows {

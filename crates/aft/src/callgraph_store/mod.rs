@@ -13406,7 +13406,26 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS staging_ref_context (
             ref_id        TEXT PRIMARY KEY,
             caller_symbol TEXT
-        );",
+        );
+
+        -- Node ids hold 64 bits of a digest of file, kind and scoped name
+        -- (`node_id`). Two different symbols with the same id fail the write
+        -- instead of one silently replacing the other.
+        CREATE TRIGGER IF NOT EXISTS nodes_id_collision_on_insert BEFORE INSERT ON nodes
+        WHEN EXISTS (
+            SELECT 1 FROM nodes WHERE id = NEW.id AND (
+                file_path IS NOT NEW.file_path
+                OR scoped_name IS NOT NEW.scoped_name
+                OR kind IS NOT NEW.kind
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'call-graph node id collision'); END;
+        CREATE TRIGGER IF NOT EXISTS nodes_id_collision_on_update
+        BEFORE UPDATE OF file_path, scoped_name, kind ON nodes
+        WHEN OLD.file_path IS NOT NEW.file_path
+            OR OLD.scoped_name IS NOT NEW.scoped_name
+            OR OLD.kind IS NOT NEW.kind
+        BEGIN SELECT RAISE(ABORT, 'call-graph node id collision'); END;",
     )?;
     // CREATE TABLE IF NOT EXISTS leaves older tables untouched. Upgrade the
     // column before creating indexes that reference it; readiness still forces
@@ -13684,7 +13703,10 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   `super()`, TypeScript object and factory members, and Rust trait and
 ///   associated calls resolve to their real targets; Go, Python and TypeScript
 ///   no longer guess callers by method name alone.
-const BUILD_OUTPUT_VERSION: &str = "v23-resolver-precision";
+/// - v24: node ids carry 64 bits of their digest instead of 256, views stores
+///   spell them `vp`/`vt` plus the digest, and two indexes no statement used
+///   (edges by target node, dispatch hints by method name) are gone.
+const BUILD_OUTPUT_VERSION: &str = "v24-short-node-ids";
 
 const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
 
@@ -13694,7 +13716,7 @@ mod h_header_invalidation_tests {
 
     #[test]
     fn h_header_legacy_migration_is_targeted_atomic_and_once() {
-        assert_eq!(BUILD_OUTPUT_VERSION, "v23-resolver-precision");
+        assert_eq!(BUILD_OUTPUT_VERSION, "v24-short-node-ids");
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("root")).unwrap();
         // Parse counters key files by the canonical path the store reads them
@@ -14206,13 +14228,11 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
         "file_dependencies(dep_file)",
     ),
     ("idx_edges_source_kind", "edges(source_node, kind)"),
-    ("idx_edges_target_kind", "edges(target_node, kind)"),
     (
         "idx_edges_target_file_symbol",
         "edges(target_file, target_symbol, kind)",
     ),
     ("idx_edges_ref_id", "edges(ref_id, kind)"),
-    ("idx_dispatch_hints_method", "dispatch_hints(method_name)"),
     ("idx_dispatch_hints_file", "dispatch_hints(file)"),
     (
         "idx_backend_file_state_file",
@@ -14224,10 +14244,20 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Indexes older builds created that no statement uses any more: no query
+/// filters edges by target node or dispatch hints by method name. Dropping
+/// them keeps a store opened by this build from carrying their pages.
+const RETIRED_SECONDARY_INDEXES: &[&str] = &["idx_edges_target_kind", "idx_dispatch_hints_method"];
+
 fn create_secondary_indexes_sql() -> String {
-    SECONDARY_INDEXES
+    RETIRED_SECONDARY_INDEXES
         .iter()
-        .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};"))
+        .map(|name| format!("DROP INDEX IF EXISTS {name};"))
+        .chain(
+            SECONDARY_INDEXES
+                .iter()
+                .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};")),
+        )
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -15993,9 +16023,18 @@ fn selection_range(source: &str, scoped_name: &str, name: &str, fallback: &Range
     }
 }
 
+/// A node's id: its class prefix and the first 64 bits of a BLAKE3 digest of
+/// its file, kind and scoped name, as 16 hex digits.
+///
+/// Node ids are repeated in every ref, edge and index that names a caller or a
+/// target, so their length is a large share of the store. 64 bits keep them
+/// unique in practice; the store's insert and update triggers refuse two
+/// different symbols with the same id (`initialize_schema`) rather than merging
+/// them. Hex digits of a prefix sort as the full digest does, so ordering by id
+/// is unchanged.
 fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
     if scoped_name == TOP_LEVEL_SYMBOL {
-        return format!("top:{}", hash_to_hex(blake3::hash(rel_path.as_bytes())));
+        return format!("top:{}", short_hash_hex(blake3::hash(rel_path.as_bytes())));
     }
     // Length-delimited fields avoid aliasing paths or names containing colons.
     let mut hash = blake3::Hasher::new();
@@ -16003,11 +16042,23 @@ fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
         hash.update(&(field.len() as u64).to_le_bytes());
         hash.update(field.as_bytes());
     }
-    format!("pos:symbol:{}", hash_to_hex(hash.finalize()))
+    format!("pos:symbol:{}", short_hash_hex(hash.finalize()))
 }
 
+/// A views store's node id: `vp` plus 16 hex digits for a symbol, `vt` plus
+/// 16 hex digits for a file's top level.
+///
+/// The digests are `node_id`'s. Views stores never hold `node_id`'s longer
+/// spellings, so the short class letters only have to keep the two classes
+/// apart and in the same order: symbol ids still sort before top-level ids, and
+/// ids of one class still sort by digest.
 pub(crate) fn view_node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
-    format!("view:symbol:{}", node_id(rel_path, kind, scoped_name))
+    let id = node_id(rel_path, kind, scoped_name);
+    match (id.strip_prefix("pos:symbol:"), id.strip_prefix("top:")) {
+        (Some(digest), _) => format!("vp{digest}"),
+        (_, Some(digest)) => format!("vt{digest}"),
+        _ => unreachable!("node_id returns a symbol or top-level id"),
+    }
 }
 
 fn build_call_refs(
@@ -26180,6 +26231,11 @@ pub(crate) fn callgraph_corpus_fingerprint_for_test(
 
 fn hash_to_hex(hash: blake3::Hash) -> String {
     hash.to_hex().to_string()
+}
+
+/// The first 64 bits of a digest as 16 hex digits.
+fn short_hash_hex(hash: blake3::Hash) -> String {
+    hash.to_hex()[..16].to_string()
 }
 
 fn hash_from_hex(value: &str) -> Option<blake3::Hash> {

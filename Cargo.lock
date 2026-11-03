@@ -69,6 +69,7 @@ dependencies = [
  "dekobon-tree-sitter-groovy",
  "env_logger",
  "filetime",
+ "flate2",
  "fsevent-sys",
  "futures-util",
  "getrandom 0.3.4",

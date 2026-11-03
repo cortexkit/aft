@@ -16,8 +16,8 @@
   {
     "table": "dispatch_hints",
     "column": "method_name",
-    "index": "idx_dispatch_hints_method",
-    "new_index": false,
+    "index": "diet_sweep_dispatch_hints_method_name",
+    "new_index": true,
     "probe": "SELECT 1 FROM dispatch_hints WHERE method_name = ?1 LIMIT 1"
   },
   {

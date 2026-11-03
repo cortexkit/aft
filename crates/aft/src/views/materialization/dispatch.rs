@@ -22,6 +22,8 @@ use crate::callgraph_store::join::{
     BlobImport, ManifestBlobReader, ParseBlob,
 };
 use crate::callgraph_store::{CallGraphStoreError, Result};
+
+use super::payload;
 use crate::views::{Manifest, ManifestEntry};
 
 /// What the method-call pass may assume about this transaction.
@@ -221,16 +223,24 @@ fn type_target_key(dependency: &str) -> String {
     format!("t:{dependency}")
 }
 
+// The two site tables are read only by their keys or in full into sets, so
+// they keep no separate rowid copy of their primary key (`WITHOUT ROWID`).
+// `view_unknown_live` holds, per caller file, the targets its unknown-receiver
+// sites keep alive. Its only reader asks which targets are alive at all, and
+// the writers replace a file's rows as a whole, so it keeps no site ordinal: a
+// common call such as `.clone()` would otherwise store every `clone` target
+// once per call site. The JSON columns of `view_dispatch_files` are stored
+// compressed (see `payload`); the digests stay those of the JSON text.
 const CREATE_TABLES: &str = "CREATE TABLE IF NOT EXISTS view_dispatch_sites (
         caller_file TEXT NOT NULL, ordinal INTEGER NOT NULL, language TEXT NOT NULL,
         unresolved_receiver_sites INTEGER NOT NULL, dynamic_member_sites INTEGER NOT NULL,
-        external INTEGER NOT NULL, PRIMARY KEY(caller_file, ordinal));
+        external INTEGER NOT NULL, PRIMARY KEY(caller_file, ordinal)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS view_unknown_live (
-        caller_file TEXT NOT NULL, ordinal INTEGER NOT NULL, target_file TEXT NOT NULL,
-        target_symbol TEXT NOT NULL, PRIMARY KEY(caller_file, ordinal, target_file, target_symbol));
+        caller_file TEXT NOT NULL, target_file TEXT NOT NULL, target_symbol TEXT NOT NULL,
+        PRIMARY KEY(caller_file, target_file, target_symbol)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS view_dispatch_files (
         file_path TEXT PRIMARY KEY, facts_digest TEXT NOT NULL, sites_digest TEXT NOT NULL,
-        facts TEXT NOT NULL, type_target_trace TEXT, sites TEXT NOT NULL);
+        facts BLOB NOT NULL, type_target_trace BLOB, sites BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS view_dispatch_dependencies (
         file_path TEXT NOT NULL, dependency TEXT NOT NULL,
         PRIMARY KEY(file_path, dependency)) WITHOUT ROWID;
@@ -271,9 +281,10 @@ pub(super) fn type_target_traces(
         .prepare_cached("SELECT type_target_trace FROM view_dispatch_files WHERE file_path=?1")?;
     let mut traces = BTreeMap::new();
     for file in files {
-        let trace: Option<Option<String>> = read.query_row([&file], |row| row.get(0)).optional()?;
+        let trace: Option<Option<Vec<u8>>> =
+            read.query_row([&file], |row| row.get(0)).optional()?;
         if let Some(Some(trace)) = trace {
-            traces.insert(file, from_json(&trace)?);
+            traces.insert(file, from_json(&payload::unpack(&trace)?)?);
         }
     }
     Ok(traces)
@@ -412,8 +423,8 @@ fn load_sites<'p>(
         let Some(row) = rows.get_mut(file).filter(|row| row.sites.is_none()) else {
             continue;
         };
-        let sites: String = query.query_row([file], |row| row.get(0))?;
-        row.sites = Some(from_json(&sites)?);
+        let sites: Vec<u8> = query.query_row([file], |row| row.get(0))?;
+        row.sites = Some(from_json(&payload::unpack(&sites)?)?);
     }
     Ok(())
 }
@@ -496,11 +507,12 @@ pub(super) fn emit_from_decoded(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (path, facts_digest, sites_digest, facts_json) in stored {
+        for (path, facts_digest, sites_digest, facts) in stored {
+            let facts_json = payload::unpack(&facts)?;
             if changed.contains(&path) {
                 touched.insert(path.clone());
             }
@@ -859,19 +871,27 @@ fn persist(
     let mut delete_dependency = transaction
         .prepare("DELETE FROM view_dispatch_dependencies WHERE file_path=?1 AND dependency=?2")?;
     for (path, row) in rows {
-        let trace = row.trace.as_ref().map(json).transpose()?;
+        let trace = row
+            .trace
+            .as_ref()
+            .map(|trace| json(trace).map(|trace| payload::pack(&trace)))
+            .transpose()?;
         if let Some(sites) = &row.sites_json {
             replace.execute(params![
                 path,
                 row.facts_digest,
                 row.sites_digest,
-                row.facts_json,
+                payload::pack(&row.facts_json),
                 trace,
-                sites
+                payload::pack(sites)
             ])?;
         } else {
             if row.dirty {
-                update_facts.execute(params![path, row.facts_digest, row.facts_json])?;
+                update_facts.execute(params![
+                    path,
+                    row.facts_digest,
+                    payload::pack(&row.facts_json)
+                ])?;
             }
             if trace.is_some() {
                 update_trace.execute(params![path, trace])?;
@@ -965,8 +985,8 @@ fn write_row_by_row(
             )?;
             for (target_file, target_symbol) in &resolution.protected {
                 transaction.execute(
-                    "INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)",
-                    params![site.file, site.site.ordinal, target_file, target_symbol],
+                    "INSERT OR IGNORE INTO view_unknown_live VALUES (?1,?2,?3)",
+                    params![site.file, target_file, target_symbol],
                 )?;
             }
         }
@@ -1128,7 +1148,7 @@ fn write_differences(
         }
     }
 
-    // Unknown-receiver liveness: one row per site and protected target.
+    // Unknown-receiver liveness: one row per caller file and protected target.
     {
         let empty: bool = transaction.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM view_unknown_live)",
@@ -1136,38 +1156,32 @@ fn write_differences(
             |row| row.get(0),
         )?;
         if empty {
-            // A fresh graph has no old protection rows to reconcile. Sites
-            // have unique ordinals here and each protected set is deduplicated,
-            // so stream the rows without cloning the full set of string keys.
+            // A fresh graph has no old protection rows to reconcile, so stream
+            // the rows without cloning the full set of string keys. Several
+            // sites of one file can protect the same target; the table keeps
+            // one row per file and target.
             let mut insert =
-                transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)")?;
+                transaction.prepare("INSERT OR IGNORE INTO view_unknown_live VALUES (?1,?2,?3)")?;
             for site in sites {
                 for (file, symbol) in &site.resolution.protected {
                     counts.unknown_live_inserted +=
-                        insert.execute(params![site.file, site.site.ordinal, file, symbol])?;
+                        insert.execute(params![site.file, file, symbol])?;
                 }
             }
         } else {
-            let mut wanted = BTreeSet::<(String, i64, String, String)>::new();
+            let mut wanted = BTreeSet::<(String, String, String)>::new();
             for site in sites {
                 for (file, symbol) in &site.resolution.protected {
-                    wanted.insert((
-                        site.file.to_string(),
-                        i64::from(site.site.ordinal),
-                        file.clone(),
-                        symbol.clone(),
-                    ));
+                    wanted.insert((site.file.to_string(), file.clone(), symbol.clone()));
                 }
             }
             let mut stale = Vec::new();
-            let columns =
-                "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live";
+            let columns = "SELECT caller_file, target_file, target_symbol FROM view_unknown_live";
             let read_row = |row: &rusqlite::Row<'_>| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
                 ))
             };
             let mut read = transaction.prepare(&match files {
@@ -1188,17 +1202,15 @@ fn write_differences(
             }
             let mut delete = transaction.prepare(
                 "DELETE FROM view_unknown_live
-             WHERE caller_file=?1 AND ordinal=?2 AND target_file=?3 AND target_symbol=?4",
+             WHERE caller_file=?1 AND target_file=?2 AND target_symbol=?3",
             )?;
             for row in &stale {
-                counts.unknown_live_deleted +=
-                    delete.execute(params![row.0, row.1, row.2, row.3])?;
+                counts.unknown_live_deleted += delete.execute(params![row.0, row.1, row.2])?;
             }
             let mut insert =
-                transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)")?;
+                transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3)")?;
             for row in &wanted {
-                counts.unknown_live_inserted +=
-                    insert.execute(params![row.0, row.1, row.2, row.3])?;
+                counts.unknown_live_inserted += insert.execute(params![row.0, row.1, row.2])?;
             }
         }
     }

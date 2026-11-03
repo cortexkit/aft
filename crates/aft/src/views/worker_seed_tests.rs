@@ -735,8 +735,11 @@ fn bench_repository_cold_materialization() {
     use std::process::{Command, Stdio};
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
+    // The whole repository, not only this crate.
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let archive = Command::new("git")
         .args(["archive", "HEAD"])
+        .current_dir(&repository)
         .output()
         .unwrap();
     assert!(archive.status.success());
@@ -781,30 +784,110 @@ fn bench_repository_cold_materialization() {
         callgraph: true,
     };
     crate::blob_store::PAYLOAD_READ_COUNTS.with(|counts| counts.set(Default::default()));
-    let prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+    let mut prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
     let reads = crate::blob_store::PAYLOAD_READ_COUNTS.with(|counts| counts.get());
-    let (path, connection) = prepared.derived_checkpoint.as_ref().unwrap();
+    let files = prepared.report.manifest.as_ref().unwrap().entries().count();
+    let materialize_ms = prepared.profile.materialization_call_ms;
+    prepared.commit().unwrap();
+    drop(prepared);
+    // The published database's checkpoint runs shortly after publication;
+    // measure only once nothing else holds the file.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    fn derived_databases(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                derived_databases(&path, found);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("derived-") && name.ends_with(".sqlite"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    derived_databases(storage.path(), &mut found);
+    let path = found
+        .into_iter()
+        .max_by_key(|path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+        .expect("a published derived database");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     let unknown: usize = connection
         .query_row("SELECT COUNT(*) FROM view_unknown_live", [], |row| {
             row.get(0)
         })
         .unwrap();
-    println!("repository files={} materialize_ms={} derived_bytes={} unknown_live_rows={} payload_reads={} payload_bytes={}", prepared.report.manifest.as_ref().unwrap().entries().count(), prepared.profile.materialization_call_ms, fs::metadata(path).unwrap().len(), unknown, reads.blake3_calls, reads.bytes);
-    for name in [
+    println!("repository files={files} materialize_ms={materialize_ms} derived_bytes={bytes} unknown_live_rows={unknown} payload_reads={} payload_bytes={}", reads.blake3_calls, reads.bytes);
+    let mut tables = connection
+        .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC")
+        .unwrap();
+    for row in tables
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+    {
+        let (name, bytes) = row.unwrap();
+        println!("repository table={name} allocated_bytes={bytes}");
+    }
+    // Stored bytes per column of the largest tables, to choose what to
+    // encode next from measurement rather than estimates.
+    for table in [
         "refs",
         "edges",
-        "view_bindings",
-        "view_unknown_live",
-        "sqlite_autoindex_view_unknown_live_1",
+        "nodes",
+        "file_dependencies",
+        "view_dispatch_dependencies",
+        "view_dispatch_sites",
     ] {
-        let bytes: i64 = connection
-            .query_row(
-                "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name=?1",
-                [name],
-                |row| row.get(0),
-            )
+        let columns: Vec<String> = connection
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        println!("repository table={name} allocated_bytes={bytes}");
+        for column in columns {
+            let (rows, stored, distinct): (i64, i64, i64) = connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(\"{column}\" AS BLOB))), 0), COUNT(DISTINCT \"{column}\") FROM \"{table}\""
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            println!(
+                "repository column={table}.{column} rows={rows} stored_bytes={stored} distinct={distinct}"
+            );
+        }
+    }
+    let indexes: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for (name, sql) in indexes {
+        println!(
+            "repository index={name} sql={}",
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
     }
 }
 
