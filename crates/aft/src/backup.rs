@@ -8969,6 +8969,53 @@ mod tests {
     }
 
     #[test]
+    fn backup_discard_snapshot_retry_does_not_wait_for_busy_stack() {
+        let (mut store, _storage, project, path) = durability_store();
+        let session = "busy-discard-before-edit";
+        store
+            .snapshot_with_op(session, &path, "good", Some("good"))
+            .unwrap();
+        store.record_post_mutation_states();
+        store
+            .snapshot_with_op(session, &path, "rolled back", Some("bad"))
+            .unwrap();
+        store.fail_next_disk_write_for_tests();
+        store.discard_operation_entries(session, "bad");
+        assert_eq!(store.pending_discards.len(), 1);
+        let held = store
+            .acquire_stack_disk_lock(session, &canonicalize_key(&path))
+            .unwrap();
+
+        let next = project.path().join("next-edit.txt");
+        fs::write(&next, b"another edit").unwrap();
+        let started = Instant::now();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            store.snapshot("next-edit", &next, "snapshot while cleanup is busy")
+        });
+        let elapsed = started.elapsed();
+        drop(held);
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "snapshot waited for queued cleanup: {elapsed:?}"
+        );
+        assert_eq!(store.pending_discards.len(), 1);
+        assert_eq!(store.history(session, &path).len(), 2);
+        assert!(
+            !logs.iter().any(|line| line.starts_with("WARN ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("DEBUG ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert_eq!(store.restore_last_operation(session).unwrap().op_id, "good");
+        assert!(store.pending_discards.is_empty());
+    }
+
+    #[test]
     fn backup_discard_retry_waits_for_newer_undo_entries() {
         let (mut store, storage, _project, path) = durability_store();
         let session = "covered-discard";
@@ -8992,6 +9039,31 @@ mod tests {
             .unwrap();
         fs::write(&path, b"newer").unwrap();
         writer.record_post_mutation_states();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for index in 0..3 {
+                let next = path
+                    .parent()
+                    .unwrap()
+                    .join(format!("unrelated-{index}.txt"));
+                fs::write(&next, b"another edit").unwrap();
+                store
+                    .snapshot("another-session", &next, "later snapshot")
+                    .unwrap();
+            }
+        });
+        assert!(
+            !logs.iter().any(|line| line.starts_with("WARN ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.starts_with("DEBUG ")
+                    && line.contains("operation backup cleanup incomplete"))
+                .count(),
+            3,
+            "{logs:?}"
+        );
         store.record_post_mutation_states();
         assert_eq!(store.pending_discards.len(), 1);
         assert_eq!(store.history(session, &path).len(), 3);
