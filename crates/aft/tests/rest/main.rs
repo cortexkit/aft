@@ -63,6 +63,7 @@ mod standing_roots_acceptance_test;
 mod status_counts_inspect_seams;
 #[path = "../synapse_live_test.rs"]
 mod synapse_live_test;
+#[cfg(unix)]
 #[path = "../../src/test_support.rs"]
 mod test_support;
 #[path = "../tool_provider_conformance.rs"]
