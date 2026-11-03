@@ -45,6 +45,30 @@ let sql = format!("{columns} WHERE caller_file=?1");
         row = {'candidate': 'SELECT revision FROM {PROJECTION_DELTA_SPILL_TABLE}'}
         self.assertEqual(inventory.variants(row, [])[0]['sql'], 'SELECT revision FROM projection_delta_spill')
 
+    def test_order_inventory_uses_executable_variants_not_unordered_prefixes(self):
+        row = {'id': 'stable', 'baseline': 'SELECT r.ref_id FROM refs r',
+               'candidate': 'SELECT r.ref_id FROM refs r',
+               'sites': [{'path': 'crates/aft/src/callgraph_store/mod.rs', 'owner': 'load_name_match_refs'}]}
+        orders = inventory.order_inventory([row])
+        self.assertEqual([entry['variant'] for entry in orders], ['all/0', 'caller-file/0'])
+        self.assertTrue(all(entry['statement'] == 'stable' for entry in orders))
+        self.assertTrue(all(entry['keys'] == ['r.caller_file, r.byte_start, r.ref_id'] for entry in orders))
+        self.assertTrue(all(not entry['implicit_order'] for entry in orders))
+
+    def test_stale_plan_variants_cannot_hide_changed_candidate_sql(self):
+        row = {'candidate': 'SELECT 1', 'variants': [{'variant': 'literal/0', 'sql': 'SELECT 2'}]}
+        with self.assertRaisesRegex(AssertionError, 'variants are stale'):
+            inventory.checked_variants(row, [])
+        row['variants'] = [{'variant': 'literal/0', 'sql': 'SELECT 1'}]
+        self.assertEqual(inventory.checked_variants(row, []), [{'variant': 'literal/0', 'sql': 'SELECT 1'}])
+
+    def test_view_token_exemptions_do_not_claim_a_legacy_registry_connection(self):
+        row = {'id': 'sql-token', 'sites': [{'path': 'crates/aft/src/views/registry.rs', 'owner': 'mint_view_token', 'line': 1, 'test_only': False}]}
+        missing = [{'id': 'sql-token:literal/0', 'sql': 'SELECT token FROM view_tokens'}]
+        reason = inventory.draft_exemptions(missing, [row])['sql-token:literal/0']
+        self.assertIn('v3 view-token', reason)
+        self.assertNotIn('Legacy SQLite', reason)
+
     def test_recorder_uses_short_cache_prefix_for_sqlite_paths(self):
         root = pathlib.Path('/' + 'w' * 177)
         work = root / 'target/scratch' / ('store-diet-record-' + 'a' * 40)

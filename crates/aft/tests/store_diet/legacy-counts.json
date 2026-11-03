@@ -6,6 +6,7 @@
   "file_dependencies": 123,
   "files": 29,
   "nodes": 46,
+  "projection_delta_spill": null,
   "refs": 59,
   "resolution_config_fields": 0,
   "staging_file_inventory": 0,

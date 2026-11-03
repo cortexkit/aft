@@ -73,10 +73,17 @@
     "sql-031cc7c590f8a85f70c7:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
-    "sql-0330bdb9d112831e5127:literal/0": [
+    "sql-0330bdb9d112831e5127:all/0": [
       "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=?)",
       "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)"
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY"
+    ],
+    "sql-0330bdb9d112831e5127:caller-file/0": [
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=? AND caller_file=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY"
     ],
     "sql-0344df0dfcf3390bf236:literal/0": [],
     "sql-034cd878e6b7bd739400:literal/0": [
@@ -841,9 +848,9 @@
     "sql-21c2d21fb2cc84079d82:literal/0": [
       "SEARCH store_meta USING INTEGER PRIMARY KEY (rowid=?)"
     ],
-    "sql-21cc25a3152819c08c9b:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN DELETE FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision <= ?1 at offset 31"
-    },
+    "sql-21cc25a3152819c08c9b:literal/0": [
+      "SEARCH projection_delta_spill USING INTEGER PRIMARY KEY (rowid<?)"
+    ],
     "sql-21f8c38fca4b9794f246:literal/0": [
       "SCAN payloads"
     ],
@@ -932,9 +939,6 @@
     "sql-285d131106488649d19c:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
-    "sql-285d28faffc09858a5df:literal/0": {
-      "unprepared": "near \"WHERE\": syntax error in EXPLAIN QUERY PLAN DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1 at offset 111"
-    },
     "sql-286f90985e96b9e4b6f6:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
@@ -1269,6 +1273,9 @@
     "sql-37b2e15aa9e260e2859c:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM nodes WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
+    "sql-37b2e15aa9e260e2859c:projection_delta_spill/0": {
+      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM projection_delta_spill WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 69"
+    },
     "sql-37b2e15aa9e260e2859c:refs/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM refs WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 51"
     },
@@ -1512,9 +1519,9 @@
     "sql-4272622f6098cd9a772a:literal/7": [],
     "sql-4272622f6098cd9a772a:literal/8": [],
     "sql-4272622f6098cd9a772a:literal/9": [],
-    "sql-42894fe1dd69999dfb56:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT payload FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision = ?1 at offset 39"
-    },
+    "sql-42894fe1dd69999dfb56:literal/0": [
+      "SEARCH projection_delta_spill USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
     "sql-429e85c8549ca1a7edb4:literal/0": [
       "SEARCH standing_root_freshness USING INDEX sqlite_autoindex_standing_root_freshness_1 (literal_path=? AND index_kind=?)"
     ],
@@ -1924,6 +1931,7 @@
     "sql-582225072411852f66b4:file_dependencies/0": [],
     "sql-582225072411852f66b4:files/0": [],
     "sql-582225072411852f66b4:nodes/0": [],
+    "sql-582225072411852f66b4:projection_delta_spill/0": [],
     "sql-582225072411852f66b4:refs/0": [],
     "sql-582225072411852f66b4:resolution_config_fields/0": [],
     "sql-582225072411852f66b4:staging_file_inventory/0": [],
@@ -2182,9 +2190,16 @@
       "SEARCH github_read_cache USING INDEX sqlite_autoindex_github_read_cache_1 (resource_kind=? AND repository=? AND resource_number=? AND authentication_identity_hash=?)"
     ],
     "sql-65e2a2513c468506ff65:literal/0": [],
-    "sql-65e982fce9a93f73f163:literal/0": {
-      "unprepared": "no such function: aft_is_test_file in EXPLAIN QUERY PLAN \n    SELECT COUNT(*) FROM (\n        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end\n        FROM refs r\n        JOIN files f ON f.path = r.caller_file\n        LEFT JOIN nodes n ON n.id = r.caller_node\n        WHERE r.status = 'unresolved'\n          AND r.kind IN ('call', 'construction')\n          AND f.lang = ?1\n          AND (?4 IS NULL OR r.short_name = ?4)\n          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))\n          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')\n        LIMIT ?3\n    ) at offset 446"
-    },
+    "sql-65e982fce9a93f73f163:literal/0": [
+      "CO-ROUTINE (subquery-2)",
+      "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "CORRELATED SCALAR SUBQUERY 1",
+      "SEARCH e USING COVERING INDEX idx_edges_ref_id (ref_id=? AND kind=?)",
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR DISTINCT",
+      "SCAN (subquery-2)"
+    ],
     "sql-6600a63567686f521838:literal/0": [
       "SEARCH bash_tasks USING INTEGER PRIMARY KEY (rowid=?)",
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
@@ -2407,6 +2422,7 @@
     "sql-72bf5d4b84c150a353f5:file_dependencies/0": [],
     "sql-72bf5d4b84c150a353f5:files/0": [],
     "sql-72bf5d4b84c150a353f5:nodes/0": [],
+    "sql-72bf5d4b84c150a353f5:projection_delta_spill/0": [],
     "sql-72bf5d4b84c150a353f5:refs/0": [],
     "sql-72bf5d4b84c150a353f5:resolution_config_fields/0": [],
     "sql-72bf5d4b84c150a353f5:staging_file_inventory/0": [],
@@ -2722,9 +2738,16 @@
       "SCALAR SUBQUERY 1",
       "SEARCH reservations"
     ],
-    "sql-802c033f5981378ec46a:literal/0": {
-      "unprepared": "no such function: aft_is_test_file in EXPLAIN QUERY PLAN \n    SELECT COUNT(*) FROM (\n        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end\n        FROM refs r\n        JOIN files f ON f.path = r.caller_file\n        LEFT JOIN nodes n ON n.id = r.caller_node\n        WHERE r.status = 'unresolved'\n          AND r.kind IN ('call', 'construction')\n          AND f.lang = ?1\n          AND r.short_name = ?4\n          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))\n          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')\n        LIMIT ?3\n    ) at offset 430"
-    },
+    "sql-802c033f5981378ec46a:literal/0": [
+      "CO-ROUTINE (subquery-2)",
+      "SEARCH r USING INDEX idx_refs_short_name (short_name=?)",
+      "CORRELATED SCALAR SUBQUERY 1",
+      "SEARCH e USING COVERING INDEX idx_edges_ref_id (ref_id=? AND kind=?)",
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR DISTINCT",
+      "SCAN (subquery-2)"
+    ],
     "sql-805dad27a4a07fcce186:literal/0": [
       "SEARCH view_dispatch_sites USING COVERING INDEX sqlite_autoindex_view_dispatch_sites_1 (caller_file=?)"
     ],
@@ -3036,9 +3059,7 @@
     "sql-908900aa5c589a577680:literal/0": [
       "SEARCH oid_aliases USING PRIMARY KEY (git_oid=?)"
     ],
-    "sql-90ad3e4e4676f61ca79a:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN INSERT OR REPLACE INTO {PROJECTION_DELTA_SPILL_TABLE}(revision, payload)\n                 VALUES(?1, ?2) at offset 42"
-    },
+    "sql-90ad3e4e4676f61ca79a:literal/0": [],
     "sql-90dfd8a29aa7043c30a3:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
@@ -3313,6 +3334,9 @@
     "sql-9d6e45ffd0e9cf1223c5:nodes/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
+    "sql-9d6e45ffd0e9cf1223c5:projection_delta_spill/0": [
+      "SCAN projection_delta_spill"
+    ],
     "sql-9d6e45ffd0e9cf1223c5:refs/0": [
       "SCAN refs USING COVERING INDEX idx_refs_target_file"
     ],
@@ -3413,6 +3437,9 @@
     "sql-a0038b3dde96b6f9dd4c:nodes/0": [
       "SCAN nodes",
       "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-a0038b3dde96b6f9dd4c:projection_delta_spill/0": [
+      "SCAN projection_delta_spill"
     ],
     "sql-a0038b3dde96b6f9dd4c:refs/0": [
       "SCAN refs",
@@ -3759,69 +3786,33 @@
       "SCAN refs USING COVERING INDEX idx_refs_caller_file",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-ab1235c6ce8a3b5a2417:backend_file_state/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM backend_file_state WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:dispatch_hints/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM dispatch_hints WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:edges/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM edges WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:emitted_view_rows/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM emitted_view_rows WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:file_dependencies/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM file_dependencies WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:files/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:nodes/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM nodes WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:refs/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM refs WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:resolution_config_fields/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM resolution_config_fields WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:staging_file_inventory/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM staging_file_inventory WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:staging_ref_context/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM staging_ref_context WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:type_ref_names/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM type_ref_names WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_bindings/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_bindings WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_dependencies/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_dependencies WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_files/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_sites/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_sites WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_file_surfaces/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_file_surfaces WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_module_digest_inputs/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_digest_inputs WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_module_path_targets/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_tokens/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_unknown_live/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
+    "sql-ab1235c6ce8a3b5a2417:files-path/0": [
+      "SEARCH files USING COVERING INDEX sqlite_autoindex_files_1 (path>?)"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:nodes-file_path/0": [
+      "SCAN nodes USING COVERING INDEX idx_nodes_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:refs-caller_file/0": [
+      "SCAN refs USING COVERING INDEX idx_refs_caller_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:refs-target_file/0": [
+      "SEARCH refs USING COVERING INDEX idx_refs_target_file (target_file>?)"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:file_dependencies-file_path/0": [
+      "SCAN file_dependencies USING COVERING INDEX sqlite_autoindex_file_dependencies_1"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:file_dependencies-dep_file/0": [
+      "SCAN file_dependencies USING COVERING INDEX idx_file_dependencies_dep_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:edges-target_file/0": [
+      "SCAN edges USING COVERING INDEX idx_edges_target_file_symbol"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:dispatch_hints-file/0": [
+      "SCAN dispatch_hints USING COVERING INDEX idx_dispatch_hints_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:backend_file_state-file_path/0": [
+      "SCAN backend_file_state USING COVERING INDEX idx_backend_file_state_file"
+    ],
     "sql-ab1491124f8de3f3353e:literal/0": [
       "SEARCH nodes USING INDEX idx_nodes_file (file_path=?)"
     ],
@@ -4162,6 +4153,9 @@
     },
     "sql-bba43d776710d0eec33c:literal/0": [
       "SCAN pragma_table_info VIRTUAL TABLE INDEX 0:"
+    ],
+    "sql-bbd38b2df21fbf534022:literal/0": [
+      "SEARCH view_dispatch_sites USING INDEX sqlite_autoindex_view_dispatch_sites_1 (caller_file=?)"
     ],
     "sql-bbea7e226df937dde2b4:literal/0": [
       "USE TEMP B-TREE FOR count(DISTINCT)",
@@ -4569,6 +4563,9 @@
       "SCAN view_unknown_live",
       "USE TEMP B-TREE FOR DISTINCT"
     ],
+    "sql-d25b7634d98d82f60a26:literal/0": [
+      "SEARCH view_unknown_live USING COVERING INDEX sqlite_autoindex_view_unknown_live_1 (caller_file=?)"
+    ],
     "sql-d2a1822caac055ab95c3:literal/0": [],
     "sql-d2a87eb604a4b54af578:literal/0": [
       "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
@@ -4666,27 +4663,13 @@
     "sql-d67e5608e7b210b16ec3:literal/0": [
       "SCAN task items"
     ],
-    "sql-d682d1eaf2d7e9020aca:backend_file_state/0": [],
     "sql-d682d1eaf2d7e9020aca:dispatch_hints/0": [],
     "sql-d682d1eaf2d7e9020aca:edges/0": [],
-    "sql-d682d1eaf2d7e9020aca:emitted_view_rows/0": [],
     "sql-d682d1eaf2d7e9020aca:file_dependencies/0": [],
     "sql-d682d1eaf2d7e9020aca:files/0": [],
     "sql-d682d1eaf2d7e9020aca:nodes/0": [],
     "sql-d682d1eaf2d7e9020aca:refs/0": [],
-    "sql-d682d1eaf2d7e9020aca:resolution_config_fields/0": [],
-    "sql-d682d1eaf2d7e9020aca:staging_file_inventory/0": [],
-    "sql-d682d1eaf2d7e9020aca:staging_ref_context/0": [],
-    "sql-d682d1eaf2d7e9020aca:type_ref_names/0": [],
     "sql-d682d1eaf2d7e9020aca:view_bindings/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_dependencies/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_files/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_sites/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_file_surfaces/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_module_digest_inputs/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_module_path_targets/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_tokens/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_unknown_live/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/1": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN \n             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{task_rows})\n             INSERT INTO bash_tasks\n               (harness, session_id, task_id, project_key, command, cwd, status,\n                started_at, completed_at, completion_delivered, metadata)\n             SELECT 'opencode', 's' || (i % 1000), 't' || i, 'p' || (i % 100),\n                    'echo history', '.', 'completed', 0,\n                    CASE WHEN i<=64 THEN 0 ELSE {NOW}-1 END, 1, '{{}}' FROM n; at offset 103"
@@ -4881,6 +4864,9 @@
     },
     "sql-ddf8d5d50e827e5e7b58:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM nodes at offset 26"
+    },
+    "sql-ddf8d5d50e827e5e7b58:projection_delta_spill/0": {
+      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM projection_delta_spill at offset 26"
     },
     "sql-ddf8d5d50e827e5e7b58:refs/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM refs at offset 26"
@@ -5375,9 +5361,7 @@
     "sql-f8569505dab98ea905cb:literal/0": [
       "SCAN call_ledger USING COVERING INDEX sqlite_autoindex_call_ledger_1"
     ],
-    "sql-f8765b3058ea7a425ef9:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN CREATE TABLE IF NOT EXISTS {PROJECTION_DELTA_SPILL_TABLE} (\n                 revision INTEGER PRIMARY KEY,\n                 payload TEXT NOT NULL\n             ) at offset 46"
-    },
+    "sql-f8765b3058ea7a425ef9:literal/0": [],
     "sql-f8c1f0cc647c422ddd0b:literal/0": [],
     "sql-f8e327138d4218cb2973:literal/0": [
       "SCAN tier2_contributions USING COVERING INDEX sqlite_autoindex_tier2_contributions_1"
@@ -5622,10 +5606,17 @@
     "sql-031cc7c590f8a85f70c7:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
-    "sql-0330bdb9d112831e5127:literal/0": [
+    "sql-0330bdb9d112831e5127:all/0": [
       "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=?)",
       "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)"
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY"
+    ],
+    "sql-0330bdb9d112831e5127:caller-file/0": [
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=? AND caller_file=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY"
     ],
     "sql-0344df0dfcf3390bf236:literal/0": [],
     "sql-034cd878e6b7bd739400:literal/0": [
@@ -6390,9 +6381,9 @@
     "sql-21c2d21fb2cc84079d82:literal/0": [
       "SEARCH store_meta USING INTEGER PRIMARY KEY (rowid=?)"
     ],
-    "sql-21cc25a3152819c08c9b:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN DELETE FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision <= ?1 at offset 31"
-    },
+    "sql-21cc25a3152819c08c9b:literal/0": [
+      "SEARCH projection_delta_spill USING INTEGER PRIMARY KEY (rowid<?)"
+    ],
     "sql-21f8c38fca4b9794f246:literal/0": [
       "SCAN payloads"
     ],
@@ -6481,9 +6472,6 @@
     "sql-285d131106488649d19c:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
-    "sql-285d28faffc09858a5df:literal/0": {
-      "unprepared": "near \"WHERE\": syntax error in EXPLAIN QUERY PLAN DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1 at offset 111"
-    },
     "sql-286f90985e96b9e4b6f6:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
@@ -6818,6 +6806,9 @@
     "sql-37b2e15aa9e260e2859c:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM nodes WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 52"
     },
+    "sql-37b2e15aa9e260e2859c:projection_delta_spill/0": {
+      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM projection_delta_spill WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 69"
+    },
     "sql-37b2e15aa9e260e2859c:refs/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT count(*) FROM refs WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%' at offset 51"
     },
@@ -7061,9 +7052,9 @@
     "sql-4272622f6098cd9a772a:literal/7": [],
     "sql-4272622f6098cd9a772a:literal/8": [],
     "sql-4272622f6098cd9a772a:literal/9": [],
-    "sql-42894fe1dd69999dfb56:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT payload FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision = ?1 at offset 39"
-    },
+    "sql-42894fe1dd69999dfb56:literal/0": [
+      "SEARCH projection_delta_spill USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
     "sql-429e85c8549ca1a7edb4:literal/0": [
       "SEARCH standing_root_freshness USING INDEX sqlite_autoindex_standing_root_freshness_1 (literal_path=? AND index_kind=?)"
     ],
@@ -7473,6 +7464,7 @@
     "sql-582225072411852f66b4:file_dependencies/0": [],
     "sql-582225072411852f66b4:files/0": [],
     "sql-582225072411852f66b4:nodes/0": [],
+    "sql-582225072411852f66b4:projection_delta_spill/0": [],
     "sql-582225072411852f66b4:refs/0": [],
     "sql-582225072411852f66b4:resolution_config_fields/0": [],
     "sql-582225072411852f66b4:staging_file_inventory/0": [],
@@ -7731,9 +7723,16 @@
       "SEARCH github_read_cache USING INDEX sqlite_autoindex_github_read_cache_1 (resource_kind=? AND repository=? AND resource_number=? AND authentication_identity_hash=?)"
     ],
     "sql-65e2a2513c468506ff65:literal/0": [],
-    "sql-65e982fce9a93f73f163:literal/0": {
-      "unprepared": "no such function: aft_is_test_file in EXPLAIN QUERY PLAN \n    SELECT COUNT(*) FROM (\n        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end\n        FROM refs r\n        JOIN files f ON f.path = r.caller_file\n        LEFT JOIN nodes n ON n.id = r.caller_node\n        WHERE r.status = 'unresolved'\n          AND r.kind IN ('call', 'construction')\n          AND f.lang = ?1\n          AND (?4 IS NULL OR r.short_name = ?4)\n          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))\n          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')\n        LIMIT ?3\n    ) at offset 446"
-    },
+    "sql-65e982fce9a93f73f163:literal/0": [
+      "CO-ROUTINE (subquery-2)",
+      "SEARCH r USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "CORRELATED SCALAR SUBQUERY 1",
+      "SEARCH e USING COVERING INDEX idx_edges_ref_id (ref_id=? AND kind=?)",
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR DISTINCT",
+      "SCAN (subquery-2)"
+    ],
     "sql-6600a63567686f521838:literal/0": [
       "SEARCH bash_tasks USING INTEGER PRIMARY KEY (rowid=?)",
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
@@ -7956,6 +7955,7 @@
     "sql-72bf5d4b84c150a353f5:file_dependencies/0": [],
     "sql-72bf5d4b84c150a353f5:files/0": [],
     "sql-72bf5d4b84c150a353f5:nodes/0": [],
+    "sql-72bf5d4b84c150a353f5:projection_delta_spill/0": [],
     "sql-72bf5d4b84c150a353f5:refs/0": [],
     "sql-72bf5d4b84c150a353f5:resolution_config_fields/0": [],
     "sql-72bf5d4b84c150a353f5:staging_file_inventory/0": [],
@@ -8271,9 +8271,16 @@
       "SCALAR SUBQUERY 1",
       "SEARCH reservations"
     ],
-    "sql-802c033f5981378ec46a:literal/0": {
-      "unprepared": "no such function: aft_is_test_file in EXPLAIN QUERY PLAN \n    SELECT COUNT(*) FROM (\n        SELECT DISTINCT r.caller_file, r.byte_start, r.byte_end\n        FROM refs r\n        JOIN files f ON f.path = r.caller_file\n        LEFT JOIN nodes n ON n.id = r.caller_node\n        WHERE r.status = 'unresolved'\n          AND r.kind IN ('call', 'construction')\n          AND f.lang = ?1\n          AND r.short_name = ?4\n          AND (?2 OR (COALESCE(n.is_test, 0) = 0 AND NOT aft_is_test_file(r.caller_file)))\n          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call')\n        LIMIT ?3\n    ) at offset 430"
-    },
+    "sql-802c033f5981378ec46a:literal/0": [
+      "CO-ROUTINE (subquery-2)",
+      "SEARCH r USING INDEX idx_refs_short_name (short_name=?)",
+      "CORRELATED SCALAR SUBQUERY 1",
+      "SEARCH e USING COVERING INDEX idx_edges_ref_id (ref_id=? AND kind=?)",
+      "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH n USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR DISTINCT",
+      "SCAN (subquery-2)"
+    ],
     "sql-805dad27a4a07fcce186:literal/0": [
       "SEARCH view_dispatch_sites USING COVERING INDEX sqlite_autoindex_view_dispatch_sites_1 (caller_file=?)"
     ],
@@ -8585,9 +8592,7 @@
     "sql-908900aa5c589a577680:literal/0": [
       "SEARCH oid_aliases USING PRIMARY KEY (git_oid=?)"
     ],
-    "sql-90ad3e4e4676f61ca79a:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN INSERT OR REPLACE INTO {PROJECTION_DELTA_SPILL_TABLE}(revision, payload)\n                 VALUES(?1, ?2) at offset 42"
-    },
+    "sql-90ad3e4e4676f61ca79a:literal/0": [],
     "sql-90dfd8a29aa7043c30a3:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
@@ -8862,6 +8867,9 @@
     "sql-9d6e45ffd0e9cf1223c5:nodes/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
+    "sql-9d6e45ffd0e9cf1223c5:projection_delta_spill/0": [
+      "SCAN projection_delta_spill"
+    ],
     "sql-9d6e45ffd0e9cf1223c5:refs/0": [
       "SCAN refs USING COVERING INDEX idx_refs_target_file"
     ],
@@ -8962,6 +8970,9 @@
     "sql-a0038b3dde96b6f9dd4c:nodes/0": [
       "SCAN nodes",
       "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-a0038b3dde96b6f9dd4c:projection_delta_spill/0": [
+      "SCAN projection_delta_spill"
     ],
     "sql-a0038b3dde96b6f9dd4c:refs/0": [
       "SCAN refs",
@@ -9308,69 +9319,33 @@
       "SCAN refs USING COVERING INDEX idx_refs_caller_file",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-ab1235c6ce8a3b5a2417:backend_file_state/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM backend_file_state WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:dispatch_hints/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM dispatch_hints WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:edges/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM edges WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:emitted_view_rows/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM emitted_view_rows WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:file_dependencies/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM file_dependencies WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:files/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:nodes/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM nodes WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:refs/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM refs WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:resolution_config_fields/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM resolution_config_fields WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:staging_file_inventory/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM staging_file_inventory WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:staging_ref_context/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM staging_ref_context WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:type_ref_names/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM type_ref_names WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_bindings/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_bindings WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_dependencies/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_dependencies WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_files/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_files WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_dispatch_sites/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_dispatch_sites WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_file_surfaces/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_file_surfaces WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_module_digest_inputs/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_digest_inputs WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_module_path_targets/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_tokens/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
-    "sql-ab1235c6ce8a3b5a2417:view_unknown_live/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> '' at offset 35"
-    },
+    "sql-ab1235c6ce8a3b5a2417:files-path/0": [
+      "SEARCH files USING COVERING INDEX sqlite_autoindex_files_1 (path>?)"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:nodes-file_path/0": [
+      "SCAN nodes USING COVERING INDEX idx_nodes_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:refs-caller_file/0": [
+      "SCAN refs USING COVERING INDEX idx_refs_caller_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:refs-target_file/0": [
+      "SEARCH refs USING COVERING INDEX idx_refs_target_file (target_file>?)"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:file_dependencies-file_path/0": [
+      "SCAN file_dependencies USING COVERING INDEX sqlite_autoindex_file_dependencies_1"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:file_dependencies-dep_file/0": [
+      "SCAN file_dependencies USING COVERING INDEX idx_file_dependencies_dep_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:edges-target_file/0": [
+      "SCAN edges USING COVERING INDEX idx_edges_target_file_symbol"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:dispatch_hints-file/0": [
+      "SCAN dispatch_hints USING COVERING INDEX idx_dispatch_hints_file"
+    ],
+    "sql-ab1235c6ce8a3b5a2417:backend_file_state-file_path/0": [
+      "SCAN backend_file_state USING COVERING INDEX idx_backend_file_state_file"
+    ],
     "sql-ab1491124f8de3f3353e:literal/0": [
       "SEARCH nodes USING INDEX idx_nodes_file (file_path=?)"
     ],
@@ -9711,6 +9686,9 @@
     },
     "sql-bba43d776710d0eec33c:literal/0": [
       "SCAN pragma_table_info VIRTUAL TABLE INDEX 0:"
+    ],
+    "sql-bbd38b2df21fbf534022:literal/0": [
+      "SEARCH view_dispatch_sites USING INDEX sqlite_autoindex_view_dispatch_sites_1 (caller_file=?)"
     ],
     "sql-bbea7e226df937dde2b4:literal/0": [
       "USE TEMP B-TREE FOR count(DISTINCT)",
@@ -10118,6 +10096,9 @@
       "SCAN view_unknown_live",
       "USE TEMP B-TREE FOR DISTINCT"
     ],
+    "sql-d25b7634d98d82f60a26:literal/0": [
+      "SEARCH view_unknown_live USING COVERING INDEX sqlite_autoindex_view_unknown_live_1 (caller_file=?)"
+    ],
     "sql-d2a1822caac055ab95c3:literal/0": [],
     "sql-d2a87eb604a4b54af578:literal/0": [
       "SEARCH f USING INDEX sqlite_autoindex_files_1 (path=?)",
@@ -10215,27 +10196,13 @@
     "sql-d67e5608e7b210b16ec3:literal/0": [
       "SCAN task items"
     ],
-    "sql-d682d1eaf2d7e9020aca:backend_file_state/0": [],
     "sql-d682d1eaf2d7e9020aca:dispatch_hints/0": [],
     "sql-d682d1eaf2d7e9020aca:edges/0": [],
-    "sql-d682d1eaf2d7e9020aca:emitted_view_rows/0": [],
     "sql-d682d1eaf2d7e9020aca:file_dependencies/0": [],
     "sql-d682d1eaf2d7e9020aca:files/0": [],
     "sql-d682d1eaf2d7e9020aca:nodes/0": [],
     "sql-d682d1eaf2d7e9020aca:refs/0": [],
-    "sql-d682d1eaf2d7e9020aca:resolution_config_fields/0": [],
-    "sql-d682d1eaf2d7e9020aca:staging_file_inventory/0": [],
-    "sql-d682d1eaf2d7e9020aca:staging_ref_context/0": [],
-    "sql-d682d1eaf2d7e9020aca:type_ref_names/0": [],
     "sql-d682d1eaf2d7e9020aca:view_bindings/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_dependencies/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_files/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_dispatch_sites/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_file_surfaces/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_module_digest_inputs/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_module_path_targets/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_tokens/0": [],
-    "sql-d682d1eaf2d7e9020aca:view_unknown_live/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/0": [],
     "sql-d6adb99cf5eb910ade7b:literal/1": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN \n             WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<{task_rows})\n             INSERT INTO bash_tasks\n               (harness, session_id, task_id, project_key, command, cwd, status,\n                started_at, completed_at, completion_delivered, metadata)\n             SELECT 'opencode', 's' || (i % 1000), 't' || i, 'p' || (i % 100),\n                    'echo history', '.', 'completed', 0,\n                    CASE WHEN i<=64 THEN 0 ELSE {NOW}-1 END, 1, '{{}}' FROM n; at offset 103"
@@ -10430,6 +10397,9 @@
     },
     "sql-ddf8d5d50e827e5e7b58:nodes/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM nodes at offset 26"
+    },
+    "sql-ddf8d5d50e827e5e7b58:projection_delta_spill/0": {
+      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM projection_delta_spill at offset 26"
     },
     "sql-ddf8d5d50e827e5e7b58:refs/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT {columns} FROM refs at offset 26"
@@ -10924,9 +10894,7 @@
     "sql-f8569505dab98ea905cb:literal/0": [
       "SCAN call_ledger USING COVERING INDEX sqlite_autoindex_call_ledger_1"
     ],
-    "sql-f8765b3058ea7a425ef9:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN CREATE TABLE IF NOT EXISTS {PROJECTION_DELTA_SPILL_TABLE} (\n                 revision INTEGER PRIMARY KEY,\n                 payload TEXT NOT NULL\n             ) at offset 46"
-    },
+    "sql-f8765b3058ea7a425ef9:literal/0": [],
     "sql-f8c1f0cc647c422ddd0b:literal/0": [],
     "sql-f8e327138d4218cb2973:literal/0": [
       "SCAN tier2_contributions USING COVERING INDEX sqlite_autoindex_tier2_contributions_1"

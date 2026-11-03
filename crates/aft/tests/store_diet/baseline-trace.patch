@@ -3389,10 +3389,10 @@
      // Actual graph plans always use the real fixture's schema first.
 -    let auxiliary = Connection::open_in_memory().unwrap();
 +    let auxiliary = crate::db::store_diet_trace::open_in_memory().unwrap();
-     let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
-     for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
-         let _ = auxiliary.execute_batch(&sql.unwrap());
-@@ -959,9 +959,9 @@
+     for connection in [&*conn, &auxiliary] {
+         connection
+             .create_scalar_function(
+@@ -988,9 +988,9 @@
      for reverse in [false, true] {
          let copy = directory.join(format!("copy-{reverse}.sqlite"));
          let source_connection =
@@ -3404,7 +3404,7 @@
          rusqlite::backup::Backup::new(&source_connection, &mut destination)
              .unwrap()
              .run_to_completion(64, std::time::Duration::from_millis(0), None)
-@@ -984,7 +984,7 @@
+@@ -1013,7 +1013,7 @@
              "{error}"
          );
          let connection =
@@ -3413,7 +3413,7 @@
          assert_eq!(
              dispatch_rows(&connection),
              after["rows"],
-@@ -1006,7 +1006,7 @@
+@@ -1035,7 +1035,7 @@
      Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
  ) {
      use crate::views::{Manifest, ManifestEntry};

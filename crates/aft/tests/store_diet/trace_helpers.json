@@ -1928,19 +1928,19 @@
         "helper": "plans"
       },
       {
-        "line": 962,
+        "line": 991,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 964,
+        "line": 993,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 987,
+        "line": 1016,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 1009,
+        "line": 1038,
         "helper": "reordered_site_manifest"
       }
     ]

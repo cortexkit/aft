@@ -3,8 +3,10 @@
 The baseline is the named main commit in `baseline.json`. The original source
 line references below were inventoried at `998c896`; statement text and owner
 names in the generated inventories are authoritative after re-recording.
-`order_sql.json` identifies each graph/views SELECT, including unordered reads,
-by the stable id in `statements.json`. `source_inventory.json:rust_order` lists
+`order_sql.json` identifies each executable graph/views SELECT variant, including
+unordered reads, by the stable statement id and variant label in `statements.json`.
+Composed suffixes are included, so a prefix without ORDER BY cannot hide the
+ordering in its all-files or per-caller executable query. `source_inventory.json:rust_order` lists
 Rust sorts, BTreeMap/BTreeSet and dedup sites, including test-only consumers.
 These machine-readable lists are conservative supersets: a count-only query or
 a set used solely for membership is still listed rather than silently excluded.

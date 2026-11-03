@@ -208,15 +208,19 @@ def schemas(rows):
 
 def order_inventory(rows):
     result = []
+    tables = schemas(rows)
     for row in rows:
-        if not graph_statement(row) or not re.match(r'\s*(SELECT|WITH)\b', row['baseline'], re.I):
+        if not graph_statement(row):
             continue
-        sql = row['baseline']
-        orders = re.findall(r'\b(?:ORDER BY|GROUP BY)\s+(.+?)(?=\b(?:LIMIT|HAVING|UNION|ORDER BY)\b|$)', sql, re.S | re.I)
-        result.append({'statement': row['id'], 'keys': orders, 'implicit_order': not orders,
-                       'legacy_replacement': 'decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid',
-                       'views_replacement': 'same, except reconstruct complete former view/dispatch id text before ordering',
-                       'selection': 'Preserve every preceding tie key; only the first salted identity key permits within-group reorder.'})
+        for variant in variants(row, tables):
+            sql = variant['sql']
+            if not re.match(r'\s*(SELECT|WITH)\b', sql, re.I):
+                continue
+            orders = re.findall(r'\b(?:ORDER BY|GROUP BY)\s+(.+?)(?=\b(?:LIMIT|HAVING|UNION|ORDER BY)\b|$)', sql, re.S | re.I)
+            result.append({'statement': row['id'], 'variant': variant['variant'], 'keys': orders, 'implicit_order': not orders,
+                           'legacy_replacement': 'decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid',
+                           'views_replacement': 'same, except reconstruct complete former view/dispatch id text before ordering',
+                           'selection': 'Preserve every preceding tie key; only the first salted identity key permits within-group reorder.'})
     return result
 
 
@@ -291,6 +295,12 @@ def stable_write_shapes():
     source = (ROOT / 'crates/aft/src/views/materialization.rs').read_text(encoding='utf-8')
     return {table: [text for _, text in strings(columns)] for table, columns in
             re.findall(r'stable_rows::write\(\s*[^,]+,\s*"(\w+)",\s*&\[(.*?)\]', source, re.S)}
+
+
+def checked_variants(row, tables):
+    current = variants(row, tables)
+    assert row['variants'] == current, 'executable SQL variants are stale; derive reviewed candidate SQL'
+    return current
 
 
 def source_inventory():
@@ -393,6 +403,8 @@ def draft_exemptions(missing, rows):
             reason = 'Test-only per-reference lookup control is disabled; ordinary materialization uses the batched production lookup.'
         elif '/views/materialization/' in path or path.endswith('/views/materialization.rs'):
             reason = 'This exact retained-row, dispatch-data or resolution-input SQL variant is not emitted by the selected cold and changed-manifest cases. Other variants in the owner may be traced; this exemption is not a claim that no diff workload ran.'
+        elif path.endswith('/views/registry.rs') and 'view_tokens' in entry['sql']:
+            reason = 'The v3 view-token mint, consume and expiry APIs are not requested by the six callgraph wire operations or the direct materialization fixtures.'
         elif path.endswith('/views/registry.rs'):
             reason = 'Legacy SQLite registry operation is not emitted by the v3 wire workload. V3 publication uses the blob-store registry rather than this legacy connection.'
         elif '/views/' in path:
@@ -497,10 +509,13 @@ def main():
         actual = census()
         expected = json.loads(path.read_text(encoding='utf-8'))
         mapped = mapped_census(expected, actual)
-        assert json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8')) == schemas(mapped), 'table encoding census is stale'
+        tables = schemas(mapped)
+        for row in expected:
+            checked_variants(row, tables)
+        assert json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8')) == tables, 'table encoding census is stale'
         assert json.loads((HERE / 'order_sql.json').read_text(encoding='utf-8')) == order_inventory(mapped), 'SQL ordering census is stale'
         assert json.loads((HERE / 'source_inventory.json').read_text(encoding='utf-8')) == source_inventory(), 'Rust source census is stale'
-        assert json.loads((HERE / 'sweep_references.json').read_text(encoding='utf-8')) == sweep_references(schemas(mapped), mapped), 'sweep reference census is stale'
+        assert json.loads((HERE / 'sweep_references.json').read_text(encoding='utf-8')) == sweep_references(tables, mapped), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
         coverage(json.loads(path.read_text(encoding='utf-8')), args.paths, args.report)

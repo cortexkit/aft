@@ -3503,7 +3503,7 @@
         "encoding": "unchanged"
       }
     ],
-    "graph_data": false
+    "graph_data": true
   },
   {
     "table": "proof_meta",

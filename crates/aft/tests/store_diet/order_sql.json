@@ -1,6 +1,7 @@
 [
   {
     "statement": "sql-003bedce3391172dd6bc",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -9,6 +10,7 @@
   },
   {
     "statement": "sql-0055f06a93134b617ebe",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -17,6 +19,7 @@
   },
   {
     "statement": "sql-013ef0139c32a782f77f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -25,6 +28,7 @@
   },
   {
     "statement": "sql-02808dbb8f8343fae476",
+    "variant": "literal/0",
     "keys": [
       "ref_id"
     ],
@@ -35,6 +39,7 @@
   },
   {
     "statement": "sql-02c95d12eec746f6f650",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -43,6 +48,7 @@
   },
   {
     "statement": "sql-030ee69fe8189ac16736",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -51,14 +57,29 @@
   },
   {
     "statement": "sql-0330bdb9d112831e5127",
-    "keys": [],
-    "implicit_order": true,
+    "variant": "all/0",
+    "keys": [
+      "r.caller_file, r.byte_start, r.ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-0330bdb9d112831e5127",
+    "variant": "caller-file/0",
+    "keys": [
+      "r.caller_file, r.byte_start, r.ref_id"
+    ],
+    "implicit_order": false,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
     "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
     "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
   },
   {
     "statement": "sql-045b546a7277ad3f3e93",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -67,6 +88,7 @@
   },
   {
     "statement": "sql-054f46f7f4ba92ad0988",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name\n         ",
       "in_degree, n.file_path, n.scoped_name"
@@ -78,6 +100,7 @@
   },
   {
     "statement": "sql-055e353edacba49dcc3f",
+    "variant": "literal/0",
     "keys": [
       "1,2,3,4)"
     ],
@@ -88,6 +111,7 @@
   },
   {
     "statement": "sql-05c9517ddcef4e8f03df",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -96,6 +120,7 @@
   },
   {
     "statement": "sql-06937fba8f2072aa53f6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -104,6 +129,7 @@
   },
   {
     "statement": "sql-070b638c4070ae75318b",
+    "variant": "literal/0",
     "keys": [
       "byte_start, byte_end, ref_id"
     ],
@@ -114,6 +140,7 @@
   },
   {
     "statement": "sql-071fab6138d2c8676c96",
+    "variant": "literal/0",
     "keys": [
       "n.scoped_name, n.start_line, n.start_col"
     ],
@@ -124,6 +151,7 @@
   },
   {
     "statement": "sql-073a876d566fc0ee3d7d",
+    "variant": "literal/0",
     "keys": [
       "worker_scope,base_scope,nonce"
     ],
@@ -134,6 +162,7 @@
   },
   {
     "statement": "sql-07404d746204e2a41dfb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -142,6 +171,7 @@
   },
   {
     "statement": "sql-076e51da195afc444843",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -150,6 +180,7 @@
   },
   {
     "statement": "sql-08787f6bece24b1d826a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -158,6 +189,7 @@
   },
   {
     "statement": "sql-0a64e902d42ae5e8897f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -166,6 +198,7 @@
   },
   {
     "statement": "sql-0ac4f4a5c8ea1785fba8",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -174,6 +207,7 @@
   },
   {
     "statement": "sql-0bba9dc7d015ff125cab",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -182,6 +216,7 @@
   },
   {
     "statement": "sql-0caf99bd7e95891cd220",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -190,6 +225,7 @@
   },
   {
     "statement": "sql-0d5b84d559384dca733a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -198,6 +234,7 @@
   },
   {
     "statement": "sql-0e2ba75cb70f7f394952",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -206,6 +243,7 @@
   },
   {
     "statement": "sql-0fdc73cada0826bd2233",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -214,6 +252,7 @@
   },
   {
     "statement": "sql-10b1ccc34f3ff6990774",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -222,6 +261,7 @@
   },
   {
     "statement": "sql-110d97b9205ec9200d87",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -230,6 +270,7 @@
   },
   {
     "statement": "sql-1208505ade5b909dbcad",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -238,6 +279,18 @@
   },
   {
     "statement": "sql-12fe373feda133cc9d2f",
+    "variant": "batch-1/0",
+    "keys": [
+      "e.source_node, r.byte_start, r.line, r.ref_id,\n                      e.target_file, e.target_symbol, e.target_node, e.provenance"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-12fe373feda133cc9d2f",
+    "variant": "batch-999/0",
     "keys": [
       "e.source_node, r.byte_start, r.line, r.ref_id,\n                      e.target_file, e.target_symbol, e.target_node, e.provenance"
     ],
@@ -248,6 +301,7 @@
   },
   {
     "statement": "sql-14ecee612b2d9a9217ac",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -256,6 +310,7 @@
   },
   {
     "statement": "sql-1618ac32c2139b1c6823",
+    "variant": "literal/0",
     "keys": [
       "caller_file, module_path"
     ],
@@ -266,6 +321,7 @@
   },
   {
     "statement": "sql-163eec7b4fb8c863b4b1",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -274,6 +330,194 @@
   },
   {
     "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-0-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-0-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-1-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-1-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-2-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-0-rust-2-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-0-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-0-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-1-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-1-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-2-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-1-rust-2-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-0-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-0-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-1-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-1-crate-1/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-2-crate-0/0",
+    "keys": [
+      "caller_file, byte_start, ref_id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1834f24a56c6a3617973",
+    "variant": "js-2-rust-2-crate-1/0",
     "keys": [
       "caller_file, byte_start, ref_id"
     ],
@@ -284,6 +528,7 @@
   },
   {
     "statement": "sql-184733d24b8a233f3e67",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -292,6 +537,7 @@
   },
   {
     "statement": "sql-18547cdc58ddd627d1e3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -300,6 +546,7 @@
   },
   {
     "statement": "sql-1859b1c5611471aaa5e6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -308,6 +555,7 @@
   },
   {
     "statement": "sql-18bcc68205f1a0f8e35f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -316,6 +564,7 @@
   },
   {
     "statement": "sql-1937e9d08fada8590dd2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -324,6 +573,34 @@
   },
   {
     "statement": "sql-1a2c223d4d688108c820",
+    "variant": "edges/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1a2c223d4d688108c820",
+    "variant": "files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1a2c223d4d688108c820",
+    "variant": "nodes/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1a2c223d4d688108c820",
+    "variant": "refs/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -332,6 +609,7 @@
   },
   {
     "statement": "sql-1a3f7e9beae612274c2c",
+    "variant": "literal/0",
     "keys": [
       "name"
     ],
@@ -342,6 +620,7 @@
   },
   {
     "statement": "sql-1bfdcdf66a8987db1729",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -350,6 +629,7 @@
   },
   {
     "statement": "sql-1d19cf3bbccbdd3b3f55",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -358,6 +638,7 @@
   },
   {
     "statement": "sql-1df60cb16186d4bd1a74",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -366,6 +647,7 @@
   },
   {
     "statement": "sql-1e47e51142f6f4faf701",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -374,6 +656,7 @@
   },
   {
     "statement": "sql-1e6e0a470d6585541dbf",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name, n.start_line, n.start_col"
     ],
@@ -384,6 +667,16 @@
   },
   {
     "statement": "sql-1f0da60c4f0ffc8c93d8",
+    "variant": "view_bindings/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-1f0da60c4f0ffc8c93d8",
+    "variant": "view_file_surfaces/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -392,6 +685,7 @@
   },
   {
     "statement": "sql-1f2e6148cf24bc320671",
+    "variant": "literal/0",
     "keys": [
       "backend, workspace_root, file_path, content_hash, status"
     ],
@@ -402,6 +696,7 @@
   },
   {
     "statement": "sql-1f3298e11f5c5a869b3c",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -410,6 +705,7 @@
   },
   {
     "statement": "sql-1fa1db6cefb2854a0cc6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -418,6 +714,7 @@
   },
   {
     "statement": "sql-1ff0647dc695c8d97c3d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -426,6 +723,7 @@
   },
   {
     "statement": "sql-203bf06100ba1b2fc0e4",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -434,6 +732,7 @@
   },
   {
     "statement": "sql-205af6a07c92cea282b6",
+    "variant": "literal/0",
     "keys": [
       "byte_start, line, ref_id "
     ],
@@ -444,6 +743,7 @@
   },
   {
     "statement": "sql-20d7d0ca53feb63e6092",
+    "variant": "literal/0",
     "keys": [
       "file_path"
     ],
@@ -454,6 +754,7 @@
   },
   {
     "statement": "sql-20e0ddf56199f9e18a5f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -462,6 +763,7 @@
   },
   {
     "statement": "sql-211645dd7b7ec8e3a859",
+    "variant": "literal/0",
     "keys": [
       "name"
     ],
@@ -472,6 +774,7 @@
   },
   {
     "statement": "sql-212c13de73d24e919bae",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -480,6 +783,7 @@
   },
   {
     "statement": "sql-21630051938bcf5102fe",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -488,6 +792,7 @@
   },
   {
     "statement": "sql-23324c264ec71bf47e8a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -496,6 +801,7 @@
   },
   {
     "statement": "sql-2359193a8195ca84c4d6",
+    "variant": "literal/0",
     "keys": [
       "r.caller_file, r.line, r.ref_id\n         "
     ],
@@ -506,6 +812,7 @@
   },
   {
     "statement": "sql-23e284bf30548ff9a548",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -514,6 +821,7 @@
   },
   {
     "statement": "sql-23edb201598072526903",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -522,6 +830,7 @@
   },
   {
     "statement": "sql-241f2bb7dece196d7e16",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -530,6 +839,7 @@
   },
   {
     "statement": "sql-247b757cb72c673d28c0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -538,6 +848,7 @@
   },
   {
     "statement": "sql-271e12b430ff09d01bf0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -546,6 +857,7 @@
   },
   {
     "statement": "sql-2746f423740d66a4a545",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -554,6 +866,7 @@
   },
   {
     "statement": "sql-2951daf6d4f9fc5271da",
+    "variant": "literal/0",
     "keys": [
       "caller_file, byte_start, ref_id"
     ],
@@ -564,6 +877,7 @@
   },
   {
     "statement": "sql-298d3f34315e64cf05c0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -572,6 +886,7 @@
   },
   {
     "statement": "sql-2a1b6fa256a5d3c05df2",
+    "variant": "literal/0",
     "keys": [
       "byte_start, byte_end, ref_id"
     ],
@@ -582,6 +897,7 @@
   },
   {
     "statement": "sql-2ab4fc1c7976e8e9d7fb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -590,6 +906,7 @@
   },
   {
     "statement": "sql-2ada0ba235560c3a9dca",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -598,6 +915,7 @@
   },
   {
     "statement": "sql-2aeacf59f189918a5c4a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -606,6 +924,7 @@
   },
   {
     "statement": "sql-2d6d2119a5c2efb30050",
+    "variant": "literal/0",
     "keys": [
       "session_id"
     ],
@@ -616,6 +935,7 @@
   },
   {
     "statement": "sql-2d7f7b66814b140e8007",
+    "variant": "literal/0",
     "keys": [
       "k, v"
     ],
@@ -626,6 +946,7 @@
   },
   {
     "statement": "sql-2e1988a8fe1379b7c814",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -634,6 +955,7 @@
   },
   {
     "statement": "sql-2f083cec3f033c80758b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -642,6 +964,7 @@
   },
   {
     "statement": "sql-2f2cbedee2c1c96912b7",
+    "variant": "literal/0",
     "keys": [
       "scope"
     ],
@@ -652,6 +975,7 @@
   },
   {
     "statement": "sql-2fb79561ae7fa05680c3",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name, n.start_line, n.start_col"
     ],
@@ -662,6 +986,7 @@
   },
   {
     "statement": "sql-3038b1efd9a133ffa3b8",
+    "variant": "literal/0",
     "keys": [
       "r.ref_id"
     ],
@@ -672,6 +997,7 @@
   },
   {
     "statement": "sql-30e70be66a6ba9a04419",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -680,6 +1006,7 @@
   },
   {
     "statement": "sql-3111be660ab72bad6471",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -688,6 +1015,7 @@
   },
   {
     "statement": "sql-313239321522c295337b",
+    "variant": "literal/0",
     "keys": [
       "rowid DESC "
     ],
@@ -698,6 +1026,7 @@
   },
   {
     "statement": "sql-324113338ae26f2c7658",
+    "variant": "literal/0",
     "keys": [
       "1, 2, 3, 4, 5"
     ],
@@ -708,6 +1037,7 @@
   },
   {
     "statement": "sql-338c1ade0f2296078f43",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -716,6 +1046,7 @@
   },
   {
     "statement": "sql-3390e2c9899bdbe252c8",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -724,6 +1055,7 @@
   },
   {
     "statement": "sql-33aa9efd116b01a0f780",
+    "variant": "literal/0",
     "keys": [
       "r.byte_start, r.line, r.ref_id"
     ],
@@ -734,6 +1066,7 @@
   },
   {
     "statement": "sql-33f346c2583925c177a7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -742,6 +1075,7 @@
   },
   {
     "statement": "sql-347c577225146bdbd739",
+    "variant": "literal/0",
     "keys": [
       "path\n                 "
     ],
@@ -752,6 +1086,7 @@
   },
   {
     "statement": "sql-34b2798f5a1eb0fa1d37",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -760,6 +1095,7 @@
   },
   {
     "statement": "sql-3585f1458e4a0560a288",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -768,6 +1104,7 @@
   },
   {
     "statement": "sql-361b2b22237e8657a081",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -776,6 +1113,7 @@
   },
   {
     "statement": "sql-37015e86ab9329e75458",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -784,6 +1122,196 @@
   },
   {
     "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "backend_file_state/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "dispatch_hints/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "edges/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "emitted_view_rows/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "file_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "nodes/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "projection_delta_spill/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "refs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "resolution_config_fields/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "staging_file_inventory/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "staging_ref_context/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "type_ref_names/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_bindings/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_dispatch_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_dispatch_files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_dispatch_sites/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_file_surfaces/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_module_digest_inputs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_module_path_targets/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_tokens/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-37b2e15aa9e260e2859c",
+    "variant": "view_unknown_live/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -792,6 +1320,7 @@
   },
   {
     "statement": "sql-3856deb6c6d206f2719d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -800,6 +1329,7 @@
   },
   {
     "statement": "sql-38d2b991cec04f85d575",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -808,6 +1338,7 @@
   },
   {
     "statement": "sql-3b1832ea99e455845dbe",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -816,6 +1347,7 @@
   },
   {
     "statement": "sql-3c4d4121989dfffaf058",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -824,6 +1356,7 @@
   },
   {
     "statement": "sql-3d7226194790d3ddbcd2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -832,6 +1365,7 @@
   },
   {
     "statement": "sql-3dde393ba9c8bb882ca7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -840,6 +1374,7 @@
   },
   {
     "statement": "sql-3ea66eabcd916b9b65ce",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -848,6 +1383,7 @@
   },
   {
     "statement": "sql-3efb49d9e94e79d8035f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -856,6 +1392,7 @@
   },
   {
     "statement": "sql-409916e0fd570da2ee65",
+    "variant": "literal/0",
     "keys": [
       "(base_scope||char(31)||worker_scope||char(31)||nonce) "
     ],
@@ -866,6 +1403,7 @@
   },
   {
     "statement": "sql-4168241aeb249c2a43a5",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -874,6 +1412,7 @@
   },
   {
     "statement": "sql-41e0e85076f914e0f424",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -882,6 +1421,7 @@
   },
   {
     "statement": "sql-42894fe1dd69999dfb56",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -890,6 +1430,7 @@
   },
   {
     "statement": "sql-441c80c7c6ba68eebaee",
+    "variant": "literal/0",
     "keys": [
       "name ",
       "2 DESC"
@@ -901,6 +1442,7 @@
   },
   {
     "statement": "sql-44b426fb6e7ae4dcb39f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -909,6 +1451,7 @@
   },
   {
     "statement": "sql-46e4402ffcc1bf42d0b9",
+    "variant": "literal/0",
     "keys": [
       "path\n         "
     ],
@@ -919,6 +1462,7 @@
   },
   {
     "statement": "sql-472d1a781c6f864aa7ed",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -927,6 +1471,7 @@
   },
   {
     "statement": "sql-47851bf3af5b2c0e597d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -935,6 +1480,7 @@
   },
   {
     "statement": "sql-47db596c4bada8862047",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -943,6 +1489,7 @@
   },
   {
     "statement": "sql-47fe15177b355630e422",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -951,6 +1498,7 @@
   },
   {
     "statement": "sql-483904f45f9801e4805c",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -959,6 +1507,7 @@
   },
   {
     "statement": "sql-494a4760cf57cc54a71c",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -967,6 +1516,7 @@
   },
   {
     "statement": "sql-49e4a1db28964dfaec10",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -975,6 +1525,7 @@
   },
   {
     "statement": "sql-4a97539f99d9aeb39ebb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -983,6 +1534,16 @@
   },
   {
     "statement": "sql-4aa01d29ae49a1e24e55",
+    "variant": "identity/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-4aa01d29ae49a1e24e55",
+    "variant": "old-shape/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -991,6 +1552,7 @@
   },
   {
     "statement": "sql-4b712e7e55dd2c09d62b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -999,6 +1561,7 @@
   },
   {
     "statement": "sql-4c91bb695ec60f045d3f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1007,6 +1570,18 @@
   },
   {
     "statement": "sql-4c9367fa114250bd558f",
+    "variant": "all/0",
+    "keys": [
+      "n.file_path, n.start_line, n.name, n.kind, n.id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-4c9367fa114250bd558f",
+    "variant": "non-test/0",
     "keys": [
       "n.file_path, n.start_line, n.name, n.kind, n.id"
     ],
@@ -1017,6 +1592,7 @@
   },
   {
     "statement": "sql-4e1ab503793ecfe94bb6",
+    "variant": "literal/0",
     "keys": [
       "ref_id"
     ],
@@ -1027,6 +1603,7 @@
   },
   {
     "statement": "sql-4e59a7001a090d05560f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1035,6 +1612,7 @@
   },
   {
     "statement": "sql-4e634008992cad008046",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1043,6 +1621,7 @@
   },
   {
     "statement": "sql-500f388795228ca85baa",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1051,6 +1630,7 @@
   },
   {
     "statement": "sql-517f4653aa8366cae0b2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1059,6 +1639,7 @@
   },
   {
     "statement": "sql-51935aeb662337ecfa3d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1067,6 +1648,7 @@
   },
   {
     "statement": "sql-52a1b1b75463ad30f3ae",
+    "variant": "literal/0",
     "keys": [
       "caller_file\n                 "
     ],
@@ -1077,6 +1659,7 @@
   },
   {
     "statement": "sql-54d189ce8bb781ea7b55",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1085,6 +1668,7 @@
   },
   {
     "statement": "sql-54eedf8e5baba7aad5cd",
+    "variant": "literal/0",
     "keys": [
       "source.file_path, source.scoped_name, edges.target_file,\n                  edges.target_symbol, edges.kind, edges.line"
     ],
@@ -1095,6 +1679,7 @@
   },
   {
     "statement": "sql-56c7b098c9fddd4b2915",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1103,6 +1688,7 @@
   },
   {
     "statement": "sql-56da4a396af5be16788d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1111,6 +1697,7 @@
   },
   {
     "statement": "sql-57266dcc9838967e5125",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1119,6 +1706,7 @@
   },
   {
     "statement": "sql-586c60b0ee0686c4344f",
+    "variant": "literal/0",
     "keys": [
       "caller_file, module_path, target_file"
     ],
@@ -1129,6 +1717,18 @@
   },
   {
     "statement": "sql-58b022318abf365cff0e",
+    "variant": "all/0",
+    "keys": [
+      "file_path"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-58b022318abf365cff0e",
+    "variant": "distinct/0",
     "keys": [
       "file_path"
     ],
@@ -1139,6 +1739,7 @@
   },
   {
     "statement": "sql-594029dee21d4763bdde",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1147,6 +1748,7 @@
   },
   {
     "statement": "sql-59f583967086bd7626f8",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1155,6 +1757,7 @@
   },
   {
     "statement": "sql-5ab17311e37b68c3adbc",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name"
     ],
@@ -1165,6 +1768,7 @@
   },
   {
     "statement": "sql-5b662e8b3dbed1449764",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name, n.start_line, n.start_col, n.id"
     ],
@@ -1175,6 +1779,16 @@
   },
   {
     "statement": "sql-5b84487e6c7eacae62d4",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-5b9bfa75c9cd75d1a99e",
+    "variant": "literal/1",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1183,6 +1797,7 @@
   },
   {
     "statement": "sql-5e17d96c7a7bb7238128",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1191,6 +1806,7 @@
   },
   {
     "statement": "sql-603cdc79e2c63dd90670",
+    "variant": "literal/0",
     "keys": [
       "n.file_path, n.scoped_name"
     ],
@@ -1201,6 +1817,7 @@
   },
   {
     "statement": "sql-62704aed53503eb3bd48",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1209,6 +1826,7 @@
   },
   {
     "statement": "sql-6375e8b0545afc0b35b0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1217,6 +1835,7 @@
   },
   {
     "statement": "sql-64191ead457f03deea8e",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1225,6 +1844,7 @@
   },
   {
     "statement": "sql-6424dc0eabc6ee1f0b4a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1233,6 +1853,7 @@
   },
   {
     "statement": "sql-646e581d21db7cc623b1",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1241,6 +1862,7 @@
   },
   {
     "statement": "sql-64c924ce02ac3687cba7",
+    "variant": "literal/0",
     "keys": [
       "module_path, target_file"
     ],
@@ -1251,6 +1873,7 @@
   },
   {
     "statement": "sql-65e982fce9a93f73f163",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1259,6 +1882,7 @@
   },
   {
     "statement": "sql-68ab76694d85aa9b5da0",
+    "variant": "literal/0",
     "keys": [
       "e.source_node, r.byte_start, r.line, r.ref_id,\n                  e.target_file, e.target_symbol, e.target_node, e.provenance, e.kind"
     ],
@@ -1269,6 +1893,16 @@
   },
   {
     "statement": "sql-69d494061d167a5be336",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-6b079e132411235f3511",
+    "variant": "literal/1",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1277,6 +1911,7 @@
   },
   {
     "statement": "sql-6b4be4d7e795904f70f4",
+    "variant": "literal/0",
     "keys": [
       "dep_file"
     ],
@@ -1287,6 +1922,7 @@
   },
   {
     "statement": "sql-6bb4fb3a4acd8823a23d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1295,6 +1931,16 @@
   },
   {
     "statement": "sql-6c55d6bd475ca75c82ed",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-6cca368324ec8a60f00e",
+    "variant": "literal/1",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1303,6 +1949,7 @@
   },
   {
     "statement": "sql-6ec619d17f38ec925e51",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1311,6 +1958,7 @@
   },
   {
     "statement": "sql-7018e1433653172d9be9",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1319,6 +1967,7 @@
   },
   {
     "statement": "sql-70edf152eec7ecd54241",
+    "variant": "literal/0",
     "keys": [
       "reader_id"
     ],
@@ -1329,6 +1978,7 @@
   },
   {
     "statement": "sql-7133186499c10c3fab2e",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1337,6 +1987,7 @@
   },
   {
     "statement": "sql-72971fc9df0814370b3a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1345,6 +1996,7 @@
   },
   {
     "statement": "sql-7473ab403f2a8e906735",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1353,6 +2005,7 @@
   },
   {
     "statement": "sql-75138694a49b600b64f6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1361,6 +2014,7 @@
   },
   {
     "statement": "sql-7600920ffc024629e890",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1369,6 +2023,7 @@
   },
   {
     "statement": "sql-776cd548c09e02f2e3e2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1377,6 +2032,7 @@
   },
   {
     "statement": "sql-77df35fc95ca0c0d4429",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1385,6 +2041,7 @@
   },
   {
     "statement": "sql-77ff099aa72b66823fe0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1393,6 +2050,18 @@
   },
   {
     "statement": "sql-7a8c0c034c250beef833",
+    "variant": "batch-1/0",
+    "keys": [
+      "e.target_file, e.target_symbol, e.source_node,\n                  r.byte_start, r.line, r.ref_id,\n                  e.target_node, e.provenance, e.kind"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-7a8c0c034c250beef833",
+    "variant": "batch-499/0",
     "keys": [
       "e.target_file, e.target_symbol, e.source_node,\n                  r.byte_start, r.line, r.ref_id,\n                  e.target_node, e.provenance, e.kind"
     ],
@@ -1403,6 +2072,7 @@
   },
   {
     "statement": "sql-7aa54d24f6072e3e74ab",
+    "variant": "literal/0",
     "keys": [
       "workspace_root"
     ],
@@ -1413,6 +2083,7 @@
   },
   {
     "statement": "sql-7ac18bbe50b4525031cf",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1421,6 +2092,7 @@
   },
   {
     "statement": "sql-7c844317c463360bdcac",
+    "variant": "literal/0",
     "keys": [
       "scoped_name"
     ],
@@ -1431,6 +2103,7 @@
   },
   {
     "statement": "sql-7d034945c6d54cd3b5f4",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1439,6 +2112,7 @@
   },
   {
     "statement": "sql-7d505a268462b769e15f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1447,6 +2121,7 @@
   },
   {
     "statement": "sql-7dcf97380be26601f81a",
+    "variant": "literal/0",
     "keys": [
       "file ",
       "COUNT(*) DESC, file "
@@ -1458,6 +2133,7 @@
   },
   {
     "statement": "sql-7eca30f1c01fb4c8b6c7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1466,6 +2142,7 @@
   },
   {
     "statement": "sql-7fa21c6cb27daccd4b83",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1474,6 +2151,7 @@
   },
   {
     "statement": "sql-802c033f5981378ec46a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1482,6 +2160,7 @@
   },
   {
     "statement": "sql-805dad27a4a07fcce186",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1490,6 +2169,7 @@
   },
   {
     "statement": "sql-813d6bdf3cfc64d3fa3b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1498,6 +2178,7 @@
   },
   {
     "statement": "sql-820c116079d08da3cbcb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1506,6 +2187,7 @@
   },
   {
     "statement": "sql-821148b6dae541b1df8f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1514,6 +2196,7 @@
   },
   {
     "statement": "sql-8317b5847ed53efe4521",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1522,6 +2205,7 @@
   },
   {
     "statement": "sql-83617f6a953affda8205",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1530,6 +2214,7 @@
   },
   {
     "statement": "sql-83cd2d2863abd1dfa70d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1538,6 +2223,7 @@
   },
   {
     "statement": "sql-85c14a7212faf93a97a7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1546,6 +2232,7 @@
   },
   {
     "statement": "sql-86298a3cf91ef769532d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1554,6 +2241,7 @@
   },
   {
     "statement": "sql-867d715849b1201df792",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1562,6 +2250,7 @@
   },
   {
     "statement": "sql-86927ca3594ad76df1e8",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1570,6 +2259,7 @@
   },
   {
     "statement": "sql-8716489301eeb1061051",
+    "variant": "literal/0",
     "keys": [
       "name"
     ],
@@ -1580,6 +2270,7 @@
   },
   {
     "statement": "sql-87a8398721df753cc025",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1588,6 +2279,7 @@
   },
   {
     "statement": "sql-880f1dfd6d13a02c1a58",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1596,6 +2288,7 @@
   },
   {
     "statement": "sql-88215b19e354d64c765a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1604,6 +2297,7 @@
   },
   {
     "statement": "sql-8ac191d72051557d7034",
+    "variant": "literal/0",
     "keys": [
       "published_at DESC, scope "
     ],
@@ -1613,7 +2307,17 @@
     "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
   },
   {
+    "statement": "sql-8d4f12334a8a80e31a66",
+    "variant": "literal/1",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
     "statement": "sql-8e0770def84bb18ab18f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1622,6 +2326,7 @@
   },
   {
     "statement": "sql-8e94bbdf5da28584a60d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1630,6 +2335,7 @@
   },
   {
     "statement": "sql-8ec23ff6d66574f0cc69",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1638,6 +2344,7 @@
   },
   {
     "statement": "sql-8ef74511934fbf0f41ec",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1646,6 +2353,7 @@
   },
   {
     "statement": "sql-90dfd8a29aa7043c30a3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1654,6 +2362,7 @@
   },
   {
     "statement": "sql-90ea20ab28fe13dfce53",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1662,6 +2371,7 @@
   },
   {
     "statement": "sql-90fd15f496724ac7ebdb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1670,6 +2380,7 @@
   },
   {
     "statement": "sql-92f6b90be96ee7fddcb8",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1678,6 +2389,7 @@
   },
   {
     "statement": "sql-930b4e0982d0f97d2f40",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1686,6 +2398,7 @@
   },
   {
     "statement": "sql-931c083160eaedd719e7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1694,6 +2407,7 @@
   },
   {
     "statement": "sql-9389d8fd6025539868a2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1702,6 +2416,7 @@
   },
   {
     "statement": "sql-9532f27ee76f9779fe9a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1710,6 +2425,7 @@
   },
   {
     "statement": "sql-956b8c1644da2d4917f0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1718,6 +2434,7 @@
   },
   {
     "statement": "sql-9594101fbf28775d84b6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1726,6 +2443,7 @@
   },
   {
     "statement": "sql-95c282f1eba375b9e14f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1734,6 +2452,7 @@
   },
   {
     "statement": "sql-96473e52aba4acf7a19a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1742,6 +2461,7 @@
   },
   {
     "statement": "sql-968d0e97062a214e74d3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1750,6 +2470,7 @@
   },
   {
     "statement": "sql-9727ed2debc838918559",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1758,6 +2479,7 @@
   },
   {
     "statement": "sql-97901aa9c8d34c832e9d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1766,6 +2488,7 @@
   },
   {
     "statement": "sql-99bcfb5fe0fde8d6aaf9",
+    "variant": "literal/0",
     "keys": [
       "name"
     ],
@@ -1776,6 +2499,7 @@
   },
   {
     "statement": "sql-9a5e6da9b7b28ec77a95",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1784,6 +2508,7 @@
   },
   {
     "statement": "sql-9c4b21e9f67dd1ec99df",
+    "variant": "literal/0",
     "keys": [
       "published_at DESC, scope "
     ],
@@ -1794,6 +2519,7 @@
   },
   {
     "statement": "sql-9c611e311ab12f18bc2f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1802,6 +2528,7 @@
   },
   {
     "statement": "sql-9d1713a8870821beab47",
+    "variant": "literal/0",
     "keys": [
       "language"
     ],
@@ -1812,6 +2539,196 @@
   },
   {
     "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "backend_file_state/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "dispatch_hints/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "edges/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "emitted_view_rows/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "file_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "nodes/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "projection_delta_spill/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "refs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "resolution_config_fields/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "staging_file_inventory/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "staging_ref_context/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "type_ref_names/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_bindings/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_dispatch_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_dispatch_files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_dispatch_sites/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_file_surfaces/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_module_digest_inputs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_module_path_targets/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_tokens/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-9d6e45ffd0e9cf1223c5",
+    "variant": "view_unknown_live/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1820,6 +2737,7 @@
   },
   {
     "statement": "sql-9db18f9cba581583f0f5",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1828,6 +2746,7 @@
   },
   {
     "statement": "sql-9f6da2c7f988f5d2d40b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1836,6 +2755,7 @@
   },
   {
     "statement": "sql-9fe32dddcb8126c89ec2",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -1846,8 +2766,240 @@
   },
   {
     "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "backend_file_state/0",
     "keys": [
-      "{}"
+      "backend,workspace_root,file_path,content_hash,status,updated_at"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "dispatch_hints/0",
+    "keys": [
+      "id,method_name,caller_node,file,line,byte_start,byte_end,provenance"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "edges/0",
+    "keys": [
+      "edge_id,ref_id,source_node,target_node,target_file,target_symbol,kind,line,provenance"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "emitted_view_rows/0",
+    "keys": [
+      "table_name,row_key"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "file_dependencies/0",
+    "keys": [
+      "file_path,dep_file"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "files/0",
+    "keys": [
+      "path,content_hash,mtime_ns,size,lang,is_dead_code_root,is_public_api,surface_fingerprint,indexed_at,source_identity"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "nodes/0",
+    "keys": [
+      "id,file_path,name,scoped_name,kind,start_line,start_col,end_line,end_col,range_ordinal,signature,exported,is_default_export,is_type_like,is_callgraph_entry_point,provenance,is_test"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "projection_delta_spill/0",
+    "keys": [
+      "revision,payload"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "refs/0",
+    "keys": [
+      "ref_id,caller_node,caller_file,kind,short_name,callee_last_segment,full_ref,module_path,import_kind,local_name,requested_name,namespace_alias,wildcard,line,byte_start,byte_end,status,target_node,target_file,target_symbol,provenance"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "resolution_config_fields/0",
+    "keys": [
+      "path,fields"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "staging_file_inventory/0",
+    "keys": [
+      "path,size"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "staging_ref_context/0",
+    "keys": [
+      "ref_id,caller_symbol"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "type_ref_names/0",
+    "keys": [
+      "name"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_bindings/0",
+    "keys": [
+      "file_path,payload"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_dispatch_dependencies/0",
+    "keys": [
+      "file_path,dependency"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_dispatch_files/0",
+    "keys": [
+      "file_path,facts_digest,sites_digest,facts,type_target_trace,sites"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_dispatch_sites/0",
+    "keys": [
+      "caller_file,ordinal,language,unresolved_receiver_sites,dynamic_member_sites,external"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_file_surfaces/0",
+    "keys": [
+      "file_path,payload"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_module_digest_inputs/0",
+    "keys": [
+      "input,digest"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_module_path_targets/0",
+    "keys": [
+      "target,source,declared,present,indirect"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_tokens/0",
+    "keys": [
+      "nonce,root,expected_tree,minted_ms,expires_ms,bound_root,bound_gitdir,consumed_ms"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a0038b3dde96b6f9dd4c",
+    "variant": "view_unknown_live/0",
+    "keys": [
+      "caller_file,ordinal,target_file,target_symbol"
     ],
     "implicit_order": false,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1856,6 +3008,7 @@
   },
   {
     "statement": "sql-a0cbcfab3c8de703fb29",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1864,6 +3017,7 @@
   },
   {
     "statement": "sql-a2e7f3d31b7b8dd60709",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1872,6 +3026,7 @@
   },
   {
     "statement": "sql-a40ead4e2735cd1ffc10",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1880,6 +3035,7 @@
   },
   {
     "statement": "sql-a4b5f46aeec40b26cf80",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -1890,6 +3046,7 @@
   },
   {
     "statement": "sql-a4b6633bcb24300219d6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1898,6 +3055,7 @@
   },
   {
     "statement": "sql-a4d4d60eaea1b11e4db2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1906,6 +3064,7 @@
   },
   {
     "statement": "sql-a565dc622576453a0975",
+    "variant": "literal/0",
     "keys": [
       "scope"
     ],
@@ -1916,6 +3075,7 @@
   },
   {
     "statement": "sql-a5eb21150b88bd2e2690",
+    "variant": "literal/0",
     "keys": [
       "scoped_name, id"
     ],
@@ -1926,6 +3086,7 @@
   },
   {
     "statement": "sql-a5f0049d264ba24e4e6d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1934,6 +3095,7 @@
   },
   {
     "statement": "sql-a6c3b258c483b7e9d696",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1942,6 +3104,7 @@
   },
   {
     "statement": "sql-a7f9d0a89602c92c28dd",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1950,6 +3113,7 @@
   },
   {
     "statement": "sql-a819e0775f0cc523f9b8",
+    "variant": "literal/0",
     "keys": [
       "r.byte_start, r.line, r.ref_id,\n                   e.target_file, e.target_symbol, e.target_node, e.provenance "
     ],
@@ -1960,6 +3124,7 @@
   },
   {
     "statement": "sql-a81aff5ee1cfc444b604",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1968,6 +3133,18 @@
   },
   {
     "statement": "sql-a81c5b7a7f6f4285ae3c",
+    "variant": "batch-1/0",
+    "keys": [
+      "e.target_file, e.target_symbol, src.file_path, e.line, e.kind\n             )\n             SELECT target_file, target_symbol, COUNT(*)\n             FROM deduped\n             GROUP BY target_file, target_symbol"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-a81c5b7a7f6f4285ae3c",
+    "variant": "batch-499/0",
     "keys": [
       "e.target_file, e.target_symbol, src.file_path, e.line, e.kind\n             )\n             SELECT target_file, target_symbol, COUNT(*)\n             FROM deduped\n             GROUP BY target_file, target_symbol"
     ],
@@ -1978,6 +3155,7 @@
   },
   {
     "statement": "sql-a8ce466cf262bcf4934f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1986,6 +3164,7 @@
   },
   {
     "statement": "sql-a99f1b59ae0030528cad",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -1994,6 +3173,79 @@
   },
   {
     "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "files-path/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "nodes-file_path/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "refs-caller_file/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "refs-target_file/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "file_dependencies-file_path/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "file_dependencies-dep_file/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "edges-target_file/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "dispatch_hints-file/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ab1235c6ce8a3b5a2417",
+    "variant": "backend_file_state-file_path/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2002,6 +3254,16 @@
   },
   {
     "statement": "sql-ab1491124f8de3f3353e",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ac5cc2726193dcc7e06c",
+    "variant": "literal/1",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2010,6 +3272,7 @@
   },
   {
     "statement": "sql-ad3cf7024ec119aea06c",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2018,6 +3281,7 @@
   },
   {
     "statement": "sql-adde485abefe13173abc",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2026,6 +3290,7 @@
   },
   {
     "statement": "sql-aed2322a66a485ee2651",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2034,6 +3299,7 @@
   },
   {
     "statement": "sql-aef8a278d49cd148999b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2042,6 +3308,7 @@
   },
   {
     "statement": "sql-b02845c2a21639b51954",
+    "variant": "literal/0",
     "keys": [
       "file_path"
     ],
@@ -2052,6 +3319,16 @@
   },
   {
     "statement": "sql-b02e9b556aa43d05db52",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-b0406bca2cfbf8dde19f",
+    "variant": "literal/1",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2060,6 +3337,7 @@
   },
   {
     "statement": "sql-b16d8ec431b3e4fed5f6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2068,6 +3346,18 @@
   },
   {
     "statement": "sql-b344e94ce4c4b4766303",
+    "variant": "batch-1/0",
+    "keys": [
+      "requested.file, requested.symbol,\n                      node.scoped_name, node.start_line, node.end_line,\n                      node.start_col, node.range_ordinal"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-b344e94ce4c4b4766303",
+    "variant": "batch-499/0",
     "keys": [
       "requested.file, requested.symbol,\n                      node.scoped_name, node.start_line, node.end_line,\n                      node.start_col, node.range_ordinal"
     ],
@@ -2078,6 +3368,7 @@
   },
   {
     "statement": "sql-b569e7a04e650cbd08e5",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2086,6 +3377,7 @@
   },
   {
     "statement": "sql-b578ccebca0f779c8920",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2094,6 +3386,7 @@
   },
   {
     "statement": "sql-b5daf1a1b34d5b8bf3f3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2102,6 +3395,7 @@
   },
   {
     "statement": "sql-b69a4333e70175828e13",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2110,6 +3404,7 @@
   },
   {
     "statement": "sql-b69e0a3b667cb83589a4",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2118,6 +3413,7 @@
   },
   {
     "statement": "sql-b821f0b5623e33d328e8",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -2128,6 +3424,7 @@
   },
   {
     "statement": "sql-b8699f1f3be9533c1d15",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2136,6 +3433,7 @@
   },
   {
     "statement": "sql-b894c81e1367beb9e3fa",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2144,6 +3442,7 @@
   },
   {
     "statement": "sql-b89a116e888cd8b4d338",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2152,6 +3451,7 @@
   },
   {
     "statement": "sql-b953c81166f1bcb4ab35",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2160,6 +3460,7 @@
   },
   {
     "statement": "sql-bab388617bcf5029f569",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2168,6 +3469,16 @@
   },
   {
     "statement": "sql-bb1fd706221d9187ffc6",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-bbd38b2df21fbf534022",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2176,6 +3487,7 @@
   },
   {
     "statement": "sql-bbea7e226df937dde2b4",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2184,6 +3496,7 @@
   },
   {
     "statement": "sql-bd9c6bd21ffad8ecda98",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2192,6 +3505,7 @@
   },
   {
     "statement": "sql-bde17d3a52734072941a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2200,6 +3514,7 @@
   },
   {
     "statement": "sql-be0f85afeac06ac87347",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2208,6 +3523,7 @@
   },
   {
     "statement": "sql-be1be05c32eeaebe70a7",
+    "variant": "literal/0",
     "keys": [
       "updated_at DESC "
     ],
@@ -2218,6 +3534,7 @@
   },
   {
     "statement": "sql-be3a932786d12df3782d",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2226,6 +3543,7 @@
   },
   {
     "statement": "sql-bed7e3d005db6d51bd65",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2234,6 +3552,7 @@
   },
   {
     "statement": "sql-bf0b9d584e0fd897f704",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2242,6 +3561,7 @@
   },
   {
     "statement": "sql-bff1a84b7ae9151259d3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2250,6 +3570,7 @@
   },
   {
     "statement": "sql-c00fc27d1659246ce059",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2258,6 +3579,7 @@
   },
   {
     "statement": "sql-c0c79658b25c3e4b2a76",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2266,6 +3588,7 @@
   },
   {
     "statement": "sql-c1cd669d05392210cf57",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2274,6 +3597,7 @@
   },
   {
     "statement": "sql-c2996b772556ae036d09",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2282,6 +3606,7 @@
   },
   {
     "statement": "sql-c2c42165a647377949e3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2290,6 +3615,7 @@
   },
   {
     "statement": "sql-c38b9f83ba71b4629f0b",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2298,6 +3624,7 @@
   },
   {
     "statement": "sql-c38d94fe716e689fb3e7",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2306,6 +3633,7 @@
   },
   {
     "statement": "sql-c44f5b1461b3380be211",
+    "variant": "literal/0",
     "keys": [
       "workspace_root"
     ],
@@ -2316,6 +3644,7 @@
   },
   {
     "statement": "sql-c4dec4a1eaa528c65365",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2324,6 +3653,7 @@
   },
   {
     "statement": "sql-c5a8b968f0064debee52",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2332,6 +3662,7 @@
   },
   {
     "statement": "sql-c77b0b2f4210c8934643",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2340,6 +3671,7 @@
   },
   {
     "statement": "sql-c82bc2032ddd92b244e0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2348,6 +3680,7 @@
   },
   {
     "statement": "sql-c9e746b62794046823b6",
+    "variant": "literal/0",
     "keys": [
       "{}"
     ],
@@ -2358,6 +3691,7 @@
   },
   {
     "statement": "sql-cb29390175d4e6576db6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2366,6 +3700,7 @@
   },
   {
     "statement": "sql-cb7444a6e773a26a6fab",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2374,6 +3709,7 @@
   },
   {
     "statement": "sql-cd7c1039eaca88ec94ce",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2382,6 +3718,7 @@
   },
   {
     "statement": "sql-cd903663861759bd2f03",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2390,6 +3727,7 @@
   },
   {
     "statement": "sql-cdd12d610269b6e66950",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2398,6 +3736,7 @@
   },
   {
     "statement": "sql-cdd58ad84bf29f1d6334",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -2408,6 +3747,7 @@
   },
   {
     "statement": "sql-cec62426a27f12a4acc8",
+    "variant": "literal/0",
     "keys": [
       "scoped_name, id"
     ],
@@ -2418,6 +3758,7 @@
   },
   {
     "statement": "sql-cfb5af3035f89043ee7f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2426,6 +3767,7 @@
   },
   {
     "statement": "sql-d06b8290333c7825ead3",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2434,6 +3776,7 @@
   },
   {
     "statement": "sql-d0d96cddf69e2f93c178",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2442,6 +3785,7 @@
   },
   {
     "statement": "sql-d15ee92218d434a801c7",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -2452,6 +3796,7 @@
   },
   {
     "statement": "sql-d201f7eaf8cdfb91a780",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2460,6 +3805,16 @@
   },
   {
     "statement": "sql-d22e49e33f27876eb678",
+    "variant": "literal/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-d25b7634d98d82f60a26",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2468,6 +3823,7 @@
   },
   {
     "statement": "sql-d2a87eb604a4b54af578",
+    "variant": "literal/0",
     "keys": [
       "n.scoped_name, n.start_line, n.start_col"
     ],
@@ -2478,6 +3834,7 @@
   },
   {
     "statement": "sql-d3acf6f0286481557dcb",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2486,6 +3843,7 @@
   },
   {
     "statement": "sql-d3d02def72c78708c17e",
+    "variant": "literal/0",
     "keys": [
       "scope "
     ],
@@ -2496,6 +3854,7 @@
   },
   {
     "statement": "sql-d3ded63ccb4d2568e8f6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2504,6 +3863,7 @@
   },
   {
     "statement": "sql-d3fad01113c5a2d2cfd0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2512,6 +3872,7 @@
   },
   {
     "statement": "sql-d494d636c730636117c6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2520,6 +3881,7 @@
   },
   {
     "statement": "sql-d52d64a03cd6cad9cfe5",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2528,6 +3890,7 @@
   },
   {
     "statement": "sql-d5947cdac65848214299",
+    "variant": "literal/0",
     "keys": [
       "file_path, scoped_name"
     ],
@@ -2538,6 +3901,7 @@
   },
   {
     "statement": "sql-d6719b52c068d51075e0",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2546,6 +3910,7 @@
   },
   {
     "statement": "sql-d6e2a253a9b0cde5ba70",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2554,6 +3919,7 @@
   },
   {
     "statement": "sql-db855baa9e15ffb55838",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2562,6 +3928,7 @@
   },
   {
     "statement": "sql-dc1047533d4132ad46ac",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2570,6 +3937,7 @@
   },
   {
     "statement": "sql-dc4c4b3fd3d9919bdf9a",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2578,6 +3946,7 @@
   },
   {
     "statement": "sql-ddd599efffe692c32ce1",
+    "variant": "literal/0",
     "keys": [
       "refs.rowid\n         "
     ],
@@ -2588,6 +3957,196 @@
   },
   {
     "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "backend_file_state/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "dispatch_hints/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "edges/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "emitted_view_rows/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "file_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "nodes/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "projection_delta_spill/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "refs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "resolution_config_fields/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "staging_file_inventory/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "staging_ref_context/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "type_ref_names/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_bindings/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_dispatch_dependencies/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_dispatch_files/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_dispatch_sites/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_file_surfaces/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_module_digest_inputs/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_module_path_targets/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_tokens/0",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-ddf8d5d50e827e5e7b58",
+    "variant": "view_unknown_live/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2596,6 +4155,7 @@
   },
   {
     "statement": "sql-de16060e23234ee5a5c2",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2604,6 +4164,7 @@
   },
   {
     "statement": "sql-de921cbdef6e8df89a59",
+    "variant": "literal/0",
     "keys": [
       "scope"
     ],
@@ -2614,6 +4175,7 @@
   },
   {
     "statement": "sql-e202a73d239952ed8ba7",
+    "variant": "literal/0",
     "keys": [
       "target_file, target_symbol ",
       "COUNT(*) DESC "
@@ -2625,6 +4187,7 @@
   },
   {
     "statement": "sql-e2bb007c2ebec64bc608",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2633,6 +4196,7 @@
   },
   {
     "statement": "sql-e42f20853c1792787aee",
+    "variant": "literal/0",
     "keys": [
       "scope"
     ],
@@ -2643,6 +4207,7 @@
   },
   {
     "statement": "sql-e4521c7e4857a4d79154",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2651,6 +4216,7 @@
   },
   {
     "statement": "sql-e5aee28773313230ff17",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2659,6 +4225,7 @@
   },
   {
     "statement": "sql-e6694ee11e08d151cc08",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2667,6 +4234,7 @@
   },
   {
     "statement": "sql-e69c6c477f4e0236bdf6",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2675,6 +4243,7 @@
   },
   {
     "statement": "sql-e6cd16f7d00d1743270f",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2683,6 +4252,18 @@
   },
   {
     "statement": "sql-e8c7f14b04458ecdb5fa",
+    "variant": "all/0",
+    "keys": [
+      "file_path, start_line, name, kind, id"
+    ],
+    "implicit_order": false,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
+    "statement": "sql-e8c7f14b04458ecdb5fa",
+    "variant": "non-test/0",
     "keys": [
       "file_path, start_line, name, kind, id"
     ],
@@ -2693,6 +4274,7 @@
   },
   {
     "statement": "sql-e92a55bde9dfe898ea19",
+    "variant": "literal/0",
     "keys": [
       "ref_epoch ASC, full_key ASC "
     ],
@@ -2703,6 +4285,7 @@
   },
   {
     "statement": "sql-ea4002c0e35b372a2f1c",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2711,6 +4294,7 @@
   },
   {
     "statement": "sql-ec78d03c9d2aa5e1c505",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2719,6 +4303,7 @@
   },
   {
     "statement": "sql-ec9079603f01c3787411",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2727,6 +4312,7 @@
   },
   {
     "statement": "sql-ecd20d0e06fceeaba562",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2735,6 +4321,7 @@
   },
   {
     "statement": "sql-ed3d3a3e2633e7877c00",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2743,6 +4330,7 @@
   },
   {
     "statement": "sql-ed52cd55615f118a8162",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2751,6 +4339,7 @@
   },
   {
     "statement": "sql-ee4fac83b26582821a9e",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2759,6 +4348,7 @@
   },
   {
     "statement": "sql-ee9fc071e6e5b1195e69",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2767,6 +4357,7 @@
   },
   {
     "statement": "sql-f21efade6de18e9c1762",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2775,6 +4366,7 @@
   },
   {
     "statement": "sql-f2f7be266eb35cc4e57e",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -2785,6 +4377,7 @@
   },
   {
     "statement": "sql-f4f0ab06fff0a010c371",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2793,6 +4386,7 @@
   },
   {
     "statement": "sql-f84188d3cc2f878c0bfe",
+    "variant": "literal/0",
     "keys": [
       "r.caller_file, r.byte_start, r.byte_end ",
       "r.caller_file, r.byte_start"
@@ -2804,6 +4398,7 @@
   },
   {
     "statement": "sql-f847be34c4515dff0cc8",
+    "variant": "literal/0",
     "keys": [
       "file_path"
     ],
@@ -2813,7 +4408,17 @@
     "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
   },
   {
+    "statement": "sql-f91cc55559909539180e",
+    "variant": "literal/1",
+    "keys": [],
+    "implicit_order": true,
+    "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
+    "views_replacement": "same, except reconstruct complete former view/dispatch id text before ordering",
+    "selection": "Preserve every preceding tie key; only the first salted identity key permits within-group reorder."
+  },
+  {
     "statement": "sql-f9cb2d4d9bbb0fd997bc",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2822,6 +4427,7 @@
   },
   {
     "statement": "sql-fa82de8024d029a264bf",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2830,6 +4436,7 @@
   },
   {
     "statement": "sql-fb00a2535cde2dfce8c4",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2838,6 +4445,7 @@
   },
   {
     "statement": "sql-fc1a3ac7c0e7acfe4fa9",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2846,6 +4454,7 @@
   },
   {
     "statement": "sql-fcf17edfcd835fd932da",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2854,6 +4463,7 @@
   },
   {
     "statement": "sql-fd4c2f1e68a5d2a6c845",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2862,6 +4472,7 @@
   },
   {
     "statement": "sql-fdf131a588966c855fe1",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2870,6 +4481,7 @@
   },
   {
     "statement": "sql-fe4baaaa0d75db0d2be3",
+    "variant": "literal/0",
     "keys": [
       "file_path,scoped_name "
     ],
@@ -2880,6 +4492,7 @@
   },
   {
     "statement": "sql-fe5988c826dce706d1fa",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2888,6 +4501,7 @@
   },
   {
     "statement": "sql-ff73a1dde09996358f13",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",
@@ -2896,6 +4510,7 @@
   },
   {
     "statement": "sql-ffc10964c7afa6fbc9aa",
+    "variant": "literal/0",
     "keys": [
       "path"
     ],
@@ -2906,6 +4521,7 @@
   },
   {
     "statement": "sql-fff877a548a6cf3bd250",
+    "variant": "literal/0",
     "keys": [],
     "implicit_order": true,
     "legacy_replacement": "decoded text for interned/vocabulary columns; order-preserving digest integer for digest ids; preserve rowid",

@@ -537,8 +537,12 @@
     ],
     "variants": [
       {
-        "variant": "literal/0",
-        "sql": "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,\n                           n.signature, r.short_name, r.full_ref, r.line, f.lang\n                    FROM refs r\n                    JOIN files f ON f.path = r.caller_file\n                    JOIN nodes n ON n.id = r.caller_node\n                    WHERE r.kind = 'call'\n                      AND r.status = 'unresolved'\n                      AND r.caller_node IS NOT NULL\n                      AND r.full_ref IS NOT NULL\n                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%')"
+        "variant": "all/0",
+        "sql": "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,\n                           n.signature, r.short_name, r.full_ref, r.line, f.lang\n                    FROM refs r\n                    JOIN files f ON f.path = r.caller_file\n                    JOIN nodes n ON n.id = r.caller_node\n                    WHERE r.kind = 'call'\n                      AND r.status = 'unresolved'\n                      AND r.caller_node IS NOT NULL\n                      AND r.full_ref IS NOT NULL\n                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%') ORDER BY r.caller_file, r.byte_start, r.ref_id"
+      },
+      {
+        "variant": "caller-file/0",
+        "sql": "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,\n                           n.signature, r.short_name, r.full_ref, r.line, f.lang\n                    FROM refs r\n                    JOIN files f ON f.path = r.caller_file\n                    JOIN nodes n ON n.id = r.caller_node\n                    WHERE r.kind = 'call'\n                      AND r.status = 'unresolved'\n                      AND r.caller_node IS NOT NULL\n                      AND r.full_ref IS NOT NULL\n                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%') AND r.caller_file = ?1 ORDER BY r.caller_file, r.byte_start, r.ref_id"
       }
     ]
   },
@@ -748,7 +752,7 @@
         "path": "crates/aft/src/blob_store/v3/layout_gate.rs",
         "line": 8,
         "owner": "<module>",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -3284,7 +3288,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 289,
         "owner": "refresh_one_file",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -3586,7 +3590,7 @@
         "path": "crates/aft/src/views/materialization/parity.rs",
         "line": 46,
         "owner": "logical_snapshot",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -3624,7 +3628,7 @@
         "path": "crates/aft/src/views/materialization/parity.rs",
         "line": 75,
         "owner": "logical_snapshot",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -3785,7 +3789,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 34,
         "owner": "logical_rows",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -5003,7 +5007,7 @@
     "variants": [
       {
         "variant": "literal/0",
-        "sql": "DELETE FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision <= ?1"
+        "sql": "DELETE FROM projection_delta_spill WHERE revision <= ?1"
       }
     ]
   },
@@ -5751,31 +5755,6 @@
     ]
   },
   {
-    "id": "sql-285d28faffc09858a5df",
-    "baseline": "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1",
-    "candidate": "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1",
-    "sites": [
-      {
-        "path": "crates/aft/src/views/materialization/dispatch.rs",
-        "line": 1025,
-        "owner": "write_differences",
-        "test_only": false
-      },
-      {
-        "path": "crates/aft/src/views/materialization/dispatch.rs",
-        "line": 1094,
-        "owner": "write_differences",
-        "test_only": false
-      }
-    ],
-    "variants": [
-      {
-        "variant": "literal/0",
-        "sql": "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match') WHERE caller_file=?1"
-      }
-    ]
-  },
-  {
     "id": "sql-286f90985e96b9e4b6f6",
     "baseline": "SELECT (SELECT COUNT(*)\n         FROM bash_pattern_watches\n         WHERE harness = ?1 AND pending_match = 1) + (SELECT COUNT(*) FROM bash_watch_delivery_gaps WHERE harness=?1)",
     "candidate": "SELECT (SELECT COUNT(*)\n         FROM bash_pattern_watches\n         WHERE harness = ?1 AND pending_match = 1) + (SELECT COUNT(*) FROM bash_watch_delivery_gaps WHERE harness=?1)",
@@ -5891,7 +5870,7 @@
         "path": "crates/aft/src/blob_store/v3/layout_gate.rs",
         "line": 35,
         "owner": "measure",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -7967,6 +7946,10 @@
         "sql": "SELECT count(*) FROM nodes WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"
       },
       {
+        "variant": "projection_delta_spill/0",
+        "sql": "SELECT count(*) FROM projection_delta_spill WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"
+      },
+      {
         "variant": "refs/0",
         "sql": "SELECT count(*) FROM refs WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"
       },
@@ -8386,7 +8369,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 423,
         "owner": "run_cycle",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -9581,7 +9564,7 @@
     "variants": [
       {
         "variant": "literal/0",
-        "sql": "SELECT payload FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision = ?1"
+        "sql": "SELECT payload FROM projection_delta_spill WHERE revision = ?1"
       }
     ]
   },
@@ -10093,7 +10076,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 165,
         "owner": "validate_delta",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -10571,7 +10554,7 @@
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
         "line": 439,
         "owner": "emit_without_caller_node",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -12642,7 +12625,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 294,
         "owner": "refresh_one_file",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -12761,6 +12744,10 @@
       {
         "variant": "nodes/0",
         "sql": "PRAGMA table_info(nodes)"
+      },
+      {
+        "variant": "projection_delta_spill/0",
+        "sql": "PRAGMA table_info(projection_delta_spill)"
       },
       {
         "variant": "refs/0",
@@ -16324,7 +16311,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 104,
         "owner": "compare",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -16588,6 +16575,10 @@
       {
         "variant": "nodes/0",
         "sql": "PRAGMA index_list(nodes)"
+      },
+      {
+        "variant": "projection_delta_spill/0",
+        "sql": "PRAGMA index_list(projection_delta_spill)"
       },
       {
         "variant": "refs/0",
@@ -21072,7 +21063,7 @@
     "variants": [
       {
         "variant": "literal/0",
-        "sql": "INSERT OR REPLACE INTO {PROJECTION_DELTA_SPILL_TABLE}(revision, payload)\n                 VALUES(?1, ?2)"
+        "sql": "INSERT OR REPLACE INTO projection_delta_spill(revision, payload)\n                 VALUES(?1, ?2)"
       }
     ]
   },
@@ -21142,7 +21133,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 154,
         "owner": "validate_delta",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
@@ -23423,7 +23414,7 @@
         "path": "crates/aft/src/blob_store/v3/layout_gate.rs",
         "line": 32,
         "owner": "measure",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -23556,7 +23547,7 @@
         "path": "crates/aft/src/views/materialization/parity.rs",
         "line": 65,
         "owner": "logical_snapshot",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -24230,6 +24221,10 @@
         "sql": "SELECT COUNT(*) FROM nodes"
       },
       {
+        "variant": "projection_delta_spill/0",
+        "sql": "SELECT COUNT(*) FROM projection_delta_spill"
+      },
+      {
         "variant": "refs/0",
         "sql": "SELECT COUNT(*) FROM refs"
       },
@@ -24763,6 +24758,10 @@
       {
         "variant": "nodes/0",
         "sql": "SELECT id,file_path,name,scoped_name,kind,start_line,start_col,end_line,end_col,range_ordinal,signature,exported,is_default_export,is_type_like,is_callgraph_entry_point,provenance,is_test FROM nodes ORDER BY id,file_path,name,scoped_name,kind,start_line,start_col,end_line,end_col,range_ordinal,signature,exported,is_default_export,is_type_like,is_callgraph_entry_point,provenance,is_test"
+      },
+      {
+        "variant": "projection_delta_spill/0",
+        "sql": "SELECT revision,payload FROM projection_delta_spill ORDER BY revision,payload"
       },
       {
         "variant": "refs/0",
@@ -25849,7 +25848,7 @@
         "path": "crates/aft/src/blob_store/v3/layout_gate.rs",
         "line": 69,
         "owner": "measure",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/blob_store/v3/layout_tests.rs",
@@ -26258,7 +26257,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 421,
         "owner": "run_cycle",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/gc/family_read_tests.rs",
@@ -26461,7 +26460,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 298,
         "owner": "refresh_one_file",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -26851,7 +26850,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 259,
         "owner": "busiest_files",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -26875,88 +26874,40 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state/0",
-        "sql": "SELECT DISTINCT {column} FROM backend_file_state WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "files-path/0",
+        "sql": "SELECT DISTINCT path FROM files WHERE path IS NOT NULL AND path <> ''"
       },
       {
-        "variant": "dispatch_hints/0",
-        "sql": "SELECT DISTINCT {column} FROM dispatch_hints WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "nodes-file_path/0",
+        "sql": "SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL AND file_path <> ''"
       },
       {
-        "variant": "edges/0",
-        "sql": "SELECT DISTINCT {column} FROM edges WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "refs-caller_file/0",
+        "sql": "SELECT DISTINCT caller_file FROM refs WHERE caller_file IS NOT NULL AND caller_file <> ''"
       },
       {
-        "variant": "emitted_view_rows/0",
-        "sql": "SELECT DISTINCT {column} FROM emitted_view_rows WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "refs-target_file/0",
+        "sql": "SELECT DISTINCT target_file FROM refs WHERE target_file IS NOT NULL AND target_file <> ''"
       },
       {
-        "variant": "file_dependencies/0",
-        "sql": "SELECT DISTINCT {column} FROM file_dependencies WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "file_dependencies-file_path/0",
+        "sql": "SELECT DISTINCT file_path FROM file_dependencies WHERE file_path IS NOT NULL AND file_path <> ''"
       },
       {
-        "variant": "files/0",
-        "sql": "SELECT DISTINCT {column} FROM files WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "file_dependencies-dep_file/0",
+        "sql": "SELECT DISTINCT dep_file FROM file_dependencies WHERE dep_file IS NOT NULL AND dep_file <> ''"
       },
       {
-        "variant": "nodes/0",
-        "sql": "SELECT DISTINCT {column} FROM nodes WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "edges-target_file/0",
+        "sql": "SELECT DISTINCT target_file FROM edges WHERE target_file IS NOT NULL AND target_file <> ''"
       },
       {
-        "variant": "refs/0",
-        "sql": "SELECT DISTINCT {column} FROM refs WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "dispatch_hints-file/0",
+        "sql": "SELECT DISTINCT file FROM dispatch_hints WHERE file IS NOT NULL AND file <> ''"
       },
       {
-        "variant": "resolution_config_fields/0",
-        "sql": "SELECT DISTINCT {column} FROM resolution_config_fields WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "staging_file_inventory/0",
-        "sql": "SELECT DISTINCT {column} FROM staging_file_inventory WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "staging_ref_context/0",
-        "sql": "SELECT DISTINCT {column} FROM staging_ref_context WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "type_ref_names/0",
-        "sql": "SELECT DISTINCT {column} FROM type_ref_names WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_bindings/0",
-        "sql": "SELECT DISTINCT {column} FROM view_bindings WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_dispatch_dependencies/0",
-        "sql": "SELECT DISTINCT {column} FROM view_dispatch_dependencies WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_dispatch_files/0",
-        "sql": "SELECT DISTINCT {column} FROM view_dispatch_files WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_dispatch_sites/0",
-        "sql": "SELECT DISTINCT {column} FROM view_dispatch_sites WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_file_surfaces/0",
-        "sql": "SELECT DISTINCT {column} FROM view_file_surfaces WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_module_digest_inputs/0",
-        "sql": "SELECT DISTINCT {column} FROM view_module_digest_inputs WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_module_path_targets/0",
-        "sql": "SELECT DISTINCT {column} FROM view_module_path_targets WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_tokens/0",
-        "sql": "SELECT DISTINCT {column} FROM view_tokens WHERE {column} IS NOT NULL AND {column} <> ''"
-      },
-      {
-        "variant": "view_unknown_live/0",
-        "sql": "SELECT DISTINCT {column} FROM view_unknown_live WHERE {column} IS NOT NULL AND {column} <> ''"
+        "variant": "backend_file_state-file_path/0",
+        "sql": "SELECT DISTINCT file_path FROM backend_file_state WHERE file_path IS NOT NULL AND file_path <> ''"
       }
     ]
   },
@@ -27064,7 +27015,7 @@
         "path": "crates/aft/src/db/wal_credit_probe.rs",
         "line": 283,
         "owner": "refresh_one_file",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -27483,7 +27434,7 @@
         "path": "crates/aft/src/blob_store/v3/layout_gate.rs",
         "line": 70,
         "owner": "measure",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -27571,13 +27522,13 @@
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
         "line": 16,
         "owner": "manifest",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
         "line": 269,
         "owner": "manifest_of",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/views/materialization/fact_tests.rs",
@@ -29144,6 +29095,25 @@
       {
         "variant": "literal/0",
         "sql": "SELECT type FROM pragma_table_info('call_ledger') WHERE name = 'tool_result_source'"
+      }
+    ]
+  },
+  {
+    "id": "sql-bbd38b2df21fbf534022",
+    "baseline": "SELECT caller_file, ordinal, language, unresolved_receiver_sites,\n                    dynamic_member_sites, external FROM view_dispatch_sites WHERE caller_file=?1",
+    "candidate": "SELECT caller_file, ordinal, language, unresolved_receiver_sites,\n                    dynamic_member_sites, external FROM view_dispatch_sites WHERE caller_file=?1",
+    "sites": [
+      {
+        "path": "crates/aft/src/views/materialization/dispatch.rs",
+        "line": 1025,
+        "owner": "write_differences",
+        "test_only": false
+      }
+    ],
+    "variants": [
+      {
+        "variant": "literal/0",
+        "sql": "SELECT caller_file, ordinal, language, unresolved_receiver_sites,\n                    dynamic_member_sites, external FROM view_dispatch_sites WHERE caller_file=?1"
       }
     ]
   },
@@ -31132,7 +31102,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 76,
         "owner": "logical_rows",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -32010,6 +31980,25 @@
     ]
   },
   {
+    "id": "sql-d25b7634d98d82f60a26",
+    "baseline": "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live WHERE caller_file=?1",
+    "candidate": "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live WHERE caller_file=?1",
+    "sites": [
+      {
+        "path": "crates/aft/src/views/materialization/dispatch.rs",
+        "line": 1094,
+        "owner": "write_differences",
+        "test_only": false
+      }
+    ],
+    "variants": [
+      {
+        "variant": "literal/0",
+        "sql": "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live WHERE caller_file=?1"
+      }
+    ]
+  },
+  {
     "id": "sql-d2a1822caac055ab95c3",
     "baseline": "INSERT INTO view_sessions VALUES('session','d-session',?1,?2,0)",
     "candidate": "INSERT INTO view_sessions VALUES('session','d-session',?1,?2,0)",
@@ -32194,7 +32183,7 @@
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
         "line": 448,
         "owner": "emit_without_caller_node",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
@@ -32709,20 +32698,12 @@
     ],
     "variants": [
       {
-        "variant": "backend_file_state/0",
-        "sql": "DELETE FROM backend_file_state"
-      },
-      {
         "variant": "dispatch_hints/0",
         "sql": "DELETE FROM dispatch_hints"
       },
       {
         "variant": "edges/0",
         "sql": "DELETE FROM edges"
-      },
-      {
-        "variant": "emitted_view_rows/0",
-        "sql": "DELETE FROM emitted_view_rows"
       },
       {
         "variant": "file_dependencies/0",
@@ -32741,56 +32722,8 @@
         "sql": "DELETE FROM refs"
       },
       {
-        "variant": "resolution_config_fields/0",
-        "sql": "DELETE FROM resolution_config_fields"
-      },
-      {
-        "variant": "staging_file_inventory/0",
-        "sql": "DELETE FROM staging_file_inventory"
-      },
-      {
-        "variant": "staging_ref_context/0",
-        "sql": "DELETE FROM staging_ref_context"
-      },
-      {
-        "variant": "type_ref_names/0",
-        "sql": "DELETE FROM type_ref_names"
-      },
-      {
         "variant": "view_bindings/0",
         "sql": "DELETE FROM view_bindings"
-      },
-      {
-        "variant": "view_dispatch_dependencies/0",
-        "sql": "DELETE FROM view_dispatch_dependencies"
-      },
-      {
-        "variant": "view_dispatch_files/0",
-        "sql": "DELETE FROM view_dispatch_files"
-      },
-      {
-        "variant": "view_dispatch_sites/0",
-        "sql": "DELETE FROM view_dispatch_sites"
-      },
-      {
-        "variant": "view_file_surfaces/0",
-        "sql": "DELETE FROM view_file_surfaces"
-      },
-      {
-        "variant": "view_module_digest_inputs/0",
-        "sql": "DELETE FROM view_module_digest_inputs"
-      },
-      {
-        "variant": "view_module_path_targets/0",
-        "sql": "DELETE FROM view_module_path_targets"
-      },
-      {
-        "variant": "view_tokens/0",
-        "sql": "DELETE FROM view_tokens"
-      },
-      {
-        "variant": "view_unknown_live/0",
-        "sql": "DELETE FROM view_unknown_live"
       }
     ]
   },
@@ -33795,6 +33728,10 @@
       {
         "variant": "nodes/0",
         "sql": "SELECT {columns} FROM nodes"
+      },
+      {
+        "variant": "projection_delta_spill/0",
+        "sql": "SELECT {columns} FROM projection_delta_spill"
       },
       {
         "variant": "refs/0",
@@ -35747,7 +35684,7 @@
         "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
         "line": 46,
         "owner": "logical_rows",
-        "test_only": false
+        "test_only": true
       }
     ],
     "variants": [
@@ -37396,7 +37333,7 @@
     "variants": [
       {
         "variant": "literal/0",
-        "sql": "CREATE TABLE IF NOT EXISTS {PROJECTION_DELTA_SPILL_TABLE} (\n                 revision INTEGER PRIMARY KEY,\n                 payload TEXT NOT NULL\n             )"
+        "sql": "CREATE TABLE IF NOT EXISTS projection_delta_spill (\n                 revision INTEGER PRIMARY KEY,\n                 payload TEXT NOT NULL\n             )"
       }
     ]
   },
@@ -38211,7 +38148,7 @@
         "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
         "line": 48,
         "owner": "blobs",
-        "test_only": false
+        "test_only": true
       },
       {
         "path": "crates/aft/src/views/materialization/tests.rs",
