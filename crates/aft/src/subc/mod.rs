@@ -1334,9 +1334,13 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// both halves: no prefixes, no wildcards.
 ///
 /// `thalamus-harness` (binary `ck-thalamus-harness`) is CortexKit's harness
-/// module, which hosts OpenCode for Alfonso. Its Pi adapter is not ready, so
-/// only the OpenCode pair is listed.
-const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[("thalamus-harness", "opencode")];
+/// module, which hosts OpenCode for Alfonso: `opencode` for OpenCode 1 and
+/// `opencode2` for sessions on its OpenCode 2 server (a runner session; see
+/// `Harness::from_str`). Its Pi adapter is not ready, so no Pi pair is listed.
+const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[
+    ("thalamus-harness", "opencode"),
+    ("thalamus-harness", "opencode2"),
+];
 
 fn reserved_module_is_first_party_on_harness(harness: &str, principal: &Option<Principal>) -> bool {
     let Some(Principal::Reserved { module_id }) = principal else {
@@ -20179,13 +20183,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn thalamus_harness_on_opencode2_is_first_party() {
+        let principal = reserved("thalamus-harness");
+        assert_eq!(
+            trust_for_bind("opencode2", &principal),
+            BindTrust::FirstParty
+        );
+        // The pair is per module: another reserved module on the same
+        // harness name stays untrusted.
+        assert_eq!(
+            trust_for_bind("opencode2", &reserved("some-other-module")),
+            BindTrust::Untrusted
+        );
+    }
+
     /// Trust for the harness module is per harness: it hosts only OpenCode
     /// today, so the same principal binding for any other harness, including
     /// Pi whose adapter is not ready, must stay untrusted.
     #[test]
     fn thalamus_harness_stays_untrusted_on_other_harnesses() {
         let principal = reserved("thalamus-harness");
-        for harness in ["pi", "runner", "mcp:claude", "OpenCode", "opencode ", ""] {
+        for harness in [
+            "pi",
+            "runner",
+            "mcp:claude",
+            "OpenCode",
+            "opencode ",
+            "opencode2 ",
+            "",
+        ] {
             assert_eq!(
                 trust_for_bind(harness, &principal),
                 BindTrust::Untrusted,

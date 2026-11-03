@@ -1,0 +1,1 @@
+- AFT accepts sessions that Thalamus runs on an OpenCode 2 server (harness `opencode2`), handling them as runner sessions.
