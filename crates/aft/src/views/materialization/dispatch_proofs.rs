@@ -405,6 +405,27 @@ fn python_super_imported_bases_relink_in_mro_order() {
     assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_symbol='Alpha::__init__' AND provenance='exact'"), 1);
 }
 
+#[test]
+fn python_super_unbound_base_does_not_select_a_project_homonym() {
+    for child in [
+        "def unrelated():\n from bases import Zulu\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+        "from bases import Zulu\nZulu = external\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+        "from library import Zulu\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("blobs.sqlite");
+        let connection = blobs(&blob_path);
+        let manifest = manifest_of(&connection, &[
+            ("bases.py", "class Zulu:\n def __init__(self): pass\n"),
+            ("child.py", child),
+        ]);
+        drop(connection);
+        let database = dir.path().join("derived.sqlite");
+        materialize_manifest_view_database(&database, &blob_path, &manifest).unwrap();
+        assert_eq!(count(&database, "SELECT count(*) FROM edges WHERE kind='call'"), 0, "{child}");
+    }
+}
+
 const INTERFACE: &str = "export interface I { m(): void; }";
 const CALLER: &str = "import { I } from './types';\nexport function caller(x: I) { x.m(); }";
 const IMPLEMENTATION: &str = "import { I } from './types';\nexport class B implements I { m() {} }";

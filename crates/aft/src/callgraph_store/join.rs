@@ -1669,7 +1669,7 @@ fn manifest_payloads(
 }
 
 /// The receiver type names of one file that method-call resolution may
-/// look up through ordinary Rust path binding: declared types and their bases,
+/// look up through import/path binding: declared types and their bases,
 /// method owners and traits, field and return types, and each call site's
 /// receiver with any field or return-value wrapper removed.
 pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
@@ -1699,6 +1699,36 @@ pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names
 }
 
+fn resolve_python_dispatch_type<I: super::ResolverIndex>(
+    index: &I,
+    file: &str,
+    name: &str,
+) -> Option<(String, String)> {
+    let mut target = (file.to_string(), name.to_string());
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(target.clone()) {
+            return None;
+        }
+        if index.node_for_symbol(&target.0, &target.1).is_some() {
+            return Some(target);
+        }
+        // Python re-export records contain only unshadowed module-level
+        // named imports. Use those bindings, not a same-named project class or
+        // a function-local import from another scope.
+        let mut forwarded = BTreeSet::new();
+        for export in index.reexports_for(&target.0) {
+            if let (Some(symbol), Some(file)) = (export.named.get(&target.1), export.target_file) {
+                forwarded.insert((file, symbol.clone()));
+            }
+        }
+        if forwarded.len() != 1 {
+            return None;
+        }
+        target = forwarded.into_iter().next()?;
+    }
+}
+
 /// Bind receiver type names with the same import and re-export rules as
 /// ordinary paths. A name maps to its target file and
 /// symbol only when the target names a node of the index.
@@ -1714,7 +1744,10 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
             continue;
         }
         let short = name.rsplit("::").next().unwrap_or(&name);
-        let resolved = if parse.language == "rust" {
+        let resolved = if parse.language == "python" {
+            resolve_python_dispatch_type(index, file, &name)
+                .map(|(file, symbol)| ("resolved".to_string(), file, symbol))
+        } else if parse.language == "rust" {
             let raw = super::RawRef {
                 ref_id: String::new(),
                 caller_node: None,
@@ -1804,7 +1837,7 @@ impl DispatchTypeTargetTrace {
     }
 }
 
-/// One Rust file's receiver type targets, keyed by the type name as written.
+/// One file's receiver type targets, keyed by the type name as written.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DispatchTypeTargets {
     pub targets: BTreeMap<String, (String, String)>,
@@ -1818,11 +1851,11 @@ pub(crate) type DispatchTypeTargetTraces<'p> =
         &BTreeSet<String>,
     ) -> Result<BTreeMap<String, DispatchTypeTargetTrace>, ManifestJoinError>;
 
-/// Which Rust files a join resolves receiver type targets for.
+/// Which files a join resolves receiver type targets for.
 pub(crate) enum DispatchTypeTargetPlan<'p> {
-    /// Every Rust file of the manifest, as a cold build does.
+    /// Every supported file of the manifest, as a cold build does.
     All,
-    /// Resolve every file of `recompute`. Other Rust files are checked only
+    /// Resolve every file of `recompute`. Other files are checked only
     /// when their previous trace depends on a path of `recompute`, on a path
     /// of `membership_changed`, on a file whose index entry this join had to
     /// rebuild, or, when `module_domain_changed` is set, on the crate-wide
@@ -2829,7 +2862,7 @@ fn join_manifest_with_surfaces(
             };
             if !matches!(
                 blob.language.as_str(),
-                "rust" | "typescript" | "tsx" | "javascript"
+                "rust" | "typescript" | "tsx" | "javascript" | "python"
             ) {
                 continue;
             }

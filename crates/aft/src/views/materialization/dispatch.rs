@@ -93,7 +93,7 @@ struct FileFacts {
     default_export_symbol: Option<String>,
     /// Target file of each resolved import, by module path.
     import_targets: BTreeMap<String, String>,
-    /// Target file and symbol of each Rust receiver type name.
+    /// Target file and symbol of each bound receiver type name.
     type_targets: BTreeMap<String, (String, String)>,
 }
 
