@@ -478,6 +478,11 @@ fn complete_members(
             continue;
         }
         let mut scoped_name = rust_symbol
+            .or_else(|| {
+                rust_bindings
+                    .and_then(|index| index.declaration_at(node.start_byte()))
+                    .map(|declaration| declaration.symbol.as_str())
+            })
             .map(str::to_string)
             .unwrap_or_else(|| format!("{owner}::{name}"));
         let ordinal = spans
@@ -684,7 +689,7 @@ pub fn extract(
                     if ty == "Self" {
                         ty = rust_bindings
                             .as_ref()
-                            .and_then(|index| index.declaration(&symbol.scoped_name))
+                            .and_then(|index| index.declaration_at(node.start_byte()))
                             .and_then(|declaration| declaration.owner.as_ref())
                             .map(|owner| type_name(owner))
                             .or_else(|| owner(node, source, language).map(|(owner, _)| owner))
@@ -778,14 +783,18 @@ pub fn extract(
         });
     }
     for symbol in &parse.symbols {
-        let node = if language == "rust" {
-            rust_bindings
-                .as_ref()
-                .and_then(|index| index.declaration(&symbol.scoped_name))
-                .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
-        } else {
-            functions.get(&(symbol.end_line, symbol.end_col))
-        };
+        let node = functions
+            .get(&(symbol.end_line, symbol.end_col))
+            .or_else(|| {
+                (language == "rust")
+                    .then(|| {
+                        rust_bindings
+                            .as_ref()
+                            .and_then(|index| index.declaration(&symbol.scoped_name))
+                            .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
+                    })
+                    .flatten()
+            });
         let Some(&node) = node else {
             continue;
         };
@@ -805,7 +814,7 @@ pub fn extract(
         if language == "rust" {
             if let Some(declared) = rust_bindings
                 .as_ref()
-                .and_then(|index| index.declaration(&symbol.scoped_name))
+                .and_then(|index| index.declaration_at(node.start_byte()))
                 .and_then(|declaration| declaration.owner.as_ref())
             {
                 owner = type_name(declared);
@@ -866,11 +875,7 @@ pub fn extract(
         if language == "rust" {
             if let Some(declared) = rust_bindings
                 .as_ref()
-                .and_then(|index| {
-                    index
-                        .symbol_at(node.start_byte())
-                        .and_then(|symbol| index.declaration(symbol))
-                })
+                .and_then(|index| index.declaration_at(node.start_byte()))
                 .and_then(|declaration| declaration.owner.as_ref())
             {
                 owner = type_name(declared);

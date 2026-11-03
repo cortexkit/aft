@@ -18113,7 +18113,7 @@ fn rust_macro_use_target<I: ResolverIndex>(
 }
 
 fn rust_unique_file_level_function<I: ResolverIndex>(
-    index: &I,
+    _index: &I,
     caller_file: &str,
     full_ref: &str,
     short_name: &str,
@@ -18125,16 +18125,17 @@ fn rust_unique_file_level_function<I: ResolverIndex>(
     // Another free function can shadow a bare call; associated functions
     // cannot. Keep trait members behind their declaring trait or type.
     let symbol = short_name.to_string();
-    let is_file_level_function = index.node_for_symbol(caller_file, short_name).is_some()
+    // Declaration metadata proves the local binding without probing indexed
+    // nodes for primitive return types or other non-function receiver names.
+    let is_file_level_function = caller_data
+        .symbol_metadata
+        .get(short_name)
+        .is_some_and(|meta| meta.kind == SymbolKind::Function)
         && !caller_data.symbol_metadata.iter().any(|(name, meta)| {
             name != short_name
                 && last_name_segment(name) == short_name
                 && meta.kind == SymbolKind::Function
-        })
-        && caller_data
-            .symbol_metadata
-            .get(short_name)
-            .is_some_and(|meta| meta.kind == SymbolKind::Function);
+        });
     is_file_level_function.then(|| {
         (
             "resolved_local".to_string(),

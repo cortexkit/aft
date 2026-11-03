@@ -942,3 +942,30 @@ fn mixed_old_and_new_rust_shapes_do_not_guess_instance_binding() {
         && target.symbol == "Fresh::m"
         && target.provenance == "exact"));
 }
+
+#[test]
+fn rust_colliding_inline_members_retain_positional_declaration_facts() {
+    let parsed = parse(
+        "mod nested { pub struct T; impl T { fn f(&self) {} fn f(&self) {} } }",
+        "rust",
+    );
+    assert_eq!(
+        parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "f")
+            .count(),
+        2
+    );
+    let methods = parsed
+        .dispatch
+        .methods
+        .iter()
+        .filter(|method| method.name == "f")
+        .collect::<Vec<_>>();
+    assert!(
+        !methods.is_empty(),
+        "duplicate binding names must not erase declaration facts"
+    );
+    assert!(methods.iter().all(|method| method.owner == "nested::T"));
+}

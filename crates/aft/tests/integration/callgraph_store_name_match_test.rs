@@ -151,7 +151,7 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
 }
 
 #[test]
-fn rust_self_receiver_type_match_resolves_precisely() {
+fn rust_self_receiver_declaration_resolves_precisely() {
     let dir = tempdir().unwrap();
     let root = canonical_root(dir.path());
     write_file(
@@ -181,8 +181,13 @@ impl Foo {
     let entries = flattened_callers(&callers);
     assert_eq!(entries.len(), 1, "self callers output: {callers:#}");
     assert_eq!(entries[0]["symbol"], "Foo::caller");
-    assert_eq!(entries[0]["approximate"], false);
-    assert_eq!(entries[0]["resolved_by"], "type_match");
+    assert!(entries[0].get("approximate").is_none());
+    assert!(entries[0].get("resolved_by").is_none());
+    let stored = store
+        .direct_callers_of(&root.join("src/lib.rs"), "Foo::method")
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].resolved_by(), "treesitter+resolver");
 }
 
 #[test]
@@ -556,7 +561,7 @@ impl Parser {
 }
 
 pub fn entry() {
-    let service = Parser;
+    let service = unindexed_factory();
     service.bespoke_project_action();
 }
 "#,
@@ -575,6 +580,39 @@ pub fn entry() {
     assert_eq!(entries[0]["symbol"], "entry");
     assert_eq!(entries[0]["approximate"], true);
     assert_eq!(entries[0]["resolved_by"], "name_match");
+}
+
+#[test]
+fn rust_unit_struct_receiver_has_an_exact_type_binding() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("src/lib.rs"),
+        r#"pub struct Parser;
+
+impl Parser {
+    pub fn bespoke_project_action(&self) {}
+}
+
+pub fn entry() {
+    let service = Parser;
+    service.bespoke_project_action();
+}
+"#,
+    );
+    let store = build_store(&root, "rust-unit-receiver", &project_files(&root));
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Parser::bespoke_project_action",
+        1,
+        true,
+    ));
+    let entries = flattened_callers(&callers);
+    assert_eq!(entries.len(), 1, "unit receiver callers: {callers:#}");
+    assert_eq!(entries[0]["symbol"], "entry");
+    assert_eq!(entries[0]["approximate"], false);
+    assert_eq!(entries[0]["resolved_by"], "type_match");
 }
 
 #[test]
@@ -767,14 +805,14 @@ mod nested {
         true,
     ));
     let precise_tree_edge = tree["children"].as_array().unwrap().iter().any(|child| {
-        child["name"] == "Engine::start"
+        child["name"] == "nested::Engine::start"
             && child["resolved_by"] == "type_match"
             && child["approximate"] == false
     });
     let callers = json(callgraph_store_adapter::callers_result(
         &store,
         &root.join("src/lib.rs"),
-        "Engine::start",
+        "nested::Engine::start",
         1,
         true,
     ));
@@ -785,7 +823,7 @@ mod nested {
     });
     assert!(
         !precise_tree_edge && !precise_reverse_edge,
-        "root Engine field must not precisely match nested Engine::start; call_tree: {tree:#}; callers: {callers:#}"
+        "root Engine field must not precisely match nested::Engine::start; call_tree: {tree:#}; callers: {callers:#}"
     );
 
     // Stronger pin than the precise-edge checks above: the scope rejection
@@ -796,15 +834,14 @@ mod nested {
     let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
     let any_engine_edges: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM edges WHERE target_symbol = ?1 \
-             AND provenance IN ('name_match', 'type_match')",
-            params!["Engine::start"],
+            "SELECT COUNT(*) FROM edges WHERE target_symbol = ?1",
+            params!["nested::Engine::start"],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
         any_engine_edges, 0,
-        "no dispatch edge of any provenance may target nested Engine::start"
+        "no edge of any provenance may target nested::Engine::start"
     );
 }
 

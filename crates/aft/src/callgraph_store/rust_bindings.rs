@@ -48,8 +48,9 @@ pub(super) struct Binding {
 
 #[derive(Default)]
 pub(super) struct RustBindings {
-    declarations: HashMap<String, Option<Declaration>>,
-    symbols: HashMap<usize, String>,
+    declarations: HashMap<String, Option<usize>>,
+    symbols: HashMap<usize, usize>,
+    records: Vec<Declaration>,
     calls: HashMap<usize, usize>,
     bindings: HashMap<(usize, String), Vec<Binding>>,
     bounds: HashMap<(usize, String), String>,
@@ -279,12 +280,14 @@ impl RustBindings {
                             trait_name
                         },
                     };
-                    result.symbols.insert(node.start_byte(), symbol.clone());
+                    let position = result.records.len();
+                    result.symbols.insert(node.start_byte(), position);
                     result
                         .declarations
                         .entry(symbol)
                         .and_modify(|old| *old = None)
-                        .or_insert(Some(declaration));
+                        .or_insert(Some(position));
+                    result.records.push(declaration);
                 }
             }
             if let Some(callable) = callable {
@@ -376,12 +379,19 @@ impl RustBindings {
     }
 
     pub fn declaration(&self, symbol: &str) -> Option<&Declaration> {
-        self.declarations.get(symbol)?.as_ref()
+        self.records.get((*self.declarations.get(symbol)?)?)
+    }
+
+    /// Extraction retains every positional declaration, even when duplicate
+    /// names cannot supply a unique binding for a call.
+    pub fn declaration_at(&self, byte: usize) -> Option<&Declaration> {
+        self.records.get(*self.symbols.get(&byte)?)
     }
 
     pub fn symbol_at(&self, byte: usize) -> Option<&str> {
-        let symbol = self.symbols.get(&byte)?;
-        self.declaration(symbol).map(|d| d.symbol.as_str())
+        let declaration = self.declaration_at(byte)?;
+        self.declaration(&declaration.symbol)
+            .map(|d| d.symbol.as_str())
     }
 
     pub fn binding(&self, name: &str, call_byte: usize) -> Option<&Binding> {
@@ -480,9 +490,22 @@ mod tests {
 
     #[test]
     fn duplicate_owner_declarations_are_not_guessed() {
-        let index =
-            index("struct Item; impl Item { fn new() -> Self { Self } fn new() -> Self { Self } }");
+        let source =
+            "struct Item; impl Item { fn new() -> Self { Self } fn new() -> Self { Self } }";
+        let index = index(source);
         assert!(index.declaration("Item::new").is_none());
+        let positions = source
+            .match_indices("fn new")
+            .map(|(byte, _)| byte)
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 2);
+        for position in positions {
+            let declaration = index.declaration_at(position).unwrap();
+            assert_eq!(declaration.symbol, "Item::new");
+            assert_eq!(declaration.owner.as_deref(), Some("Item"));
+            assert_eq!(declaration.bytes.start, position);
+            assert!(index.symbol_at(position).is_none());
+        }
     }
 
     #[test]

@@ -1160,9 +1160,17 @@ fn check_edges_found_by_name_lookups(
 #[test]
 fn s3_every_dispatch_edge_is_found_by_the_name_lookups() {
     let fixture = Fixture::new(10, 10);
-    let (edges, path_form_only) = check_edges_found_by_name_lookups(&fixture.store).unwrap();
+    let (edges, _) = check_edges_found_by_name_lookups(&fixture.store).unwrap();
     assert!(edges >= 10, "{edges}");
-    // `Hub::build()` in path0.rs and path1.rs.
+    // Inherent constructors bind during ordinary resolution. Trait-associated
+    // functions still exercise supplemental path-form lookup through a real impl.
+    let path_forms = Fixture::from_files(&[(
+        "path.rs",
+        "pub trait PathFactory { fn build() -> Self; }\npub struct PathTarget;\nimpl PathFactory for PathTarget { fn build() -> Self { Self } }\nfn first() { PathTarget::build(); }\nfn second() { PathTarget::build(); }\n",
+    )]);
+    let (path_edges, path_form_only) =
+        check_edges_found_by_name_lookups(&path_forms.store).unwrap();
+    assert_eq!(path_edges, 2);
     assert_eq!(path_form_only, 2);
 
     // Receiver shapes across the languages with method dispatch.
