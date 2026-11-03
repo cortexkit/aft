@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 pub(crate) const NOT_VALID_UTF8: &str = "not valid UTF-8";
 
 pub(crate) const MAX_SOURCE_BYTES: u64 = crate::search_index::DEFAULT_MAX_FILE_SIZE;
-// This agent-visible reason is pending Ufuk's approval.
+// Agent-visible reason, approved by Ufuk; change it only with his approval.
 pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
 
 // Charge source bytes, not file count, so small files can use the whole Rayon
