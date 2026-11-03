@@ -322,8 +322,8 @@ fn complete_members(
         .filter(|r| r.kind == BlobRefKind::Call)
         .map(|r| r.ordinal)
         .collect::<HashSet<_>>();
-    for call in all
-        .into_iter()
+    for &call in all
+        .iter()
         .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
     {
         let callee = field(call, &["function", "name"]).or_else(|| {
