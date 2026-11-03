@@ -222,13 +222,13 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
 /// Complete member declarations omitted by the legacy callable-only extractor.
 /// Interface declarations and trait default bodies need stable node identities
 /// even when the old graph never considered them callable.
-pub fn complete_members(
+fn complete_members(
     source: &str,
     lang: LangId,
-    root: Node<'_>,
+    all: &[Node<'_>],
     parse: &mut ParseBlob,
+    rust_bindings: Option<&RustBindings>,
 ) -> Result<(), ManifestJoinError> {
-    let all = descendants(root);
     let spans = exact_ordinals(parse);
     // Symbol starts may include documentation. End positions still identify the
     // same member, and an indexed lookup avoids scanning all symbols per node.
@@ -243,9 +243,8 @@ pub fn complete_members(
         .iter()
         .map(|s| s.scoped_name.clone())
         .collect::<HashSet<_>>();
-    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new(source, root));
     let mut callers = symbol_callers(parse);
-    for &node in &all {
+    for &node in all {
         if !FUNCTIONS.contains(&node.kind()) {
             continue;
         }
@@ -264,9 +263,7 @@ pub fn complete_members(
             node.end_position().column as u32,
             name.clone(),
         );
-        let rust_symbol = rust_bindings
-            .as_ref()
-            .and_then(|index| index.symbol_at(node.start_byte()));
+        let rust_symbol = rust_bindings.and_then(|index| index.symbol_at(node.start_byte()));
         if let Some(symbol) = rust_symbol {
             if scoped_names.contains(symbol) {
                 callers
@@ -393,20 +390,20 @@ pub fn extract(
     source: &str,
     lang: LangId,
     root: Node<'_>,
-    parse: &ParseBlob,
+    parse: &mut ParseBlob,
 ) -> Result<DispatchFacts, ManifestJoinError> {
     let all = descendants(root);
+    // Member identities and receiver facts consult the same immutable source.
+    // Keep one lexical index for both passes and release it with this file.
+    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new(source, root));
+    complete_members(source, lang, &all, parse, rust_bindings.as_ref())?;
     let language = parse.language.as_str();
     let index_receivers = language == "rust";
     #[cfg(test)]
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
-    let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
-    #[cfg(test)]
-    let unindexed_bindings =
-        (language == "rust" && receiver_index.is_none()).then(|| RustBindings::new(source, root));
-    let rust_bindings = receiver_index.as_ref().map(|index| &index.bindings);
-    #[cfg(test)]
-    let rust_bindings = rust_bindings.or(unindexed_bindings.as_ref());
+    let receiver_index = index_receivers
+        .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap()));
+    let rust_bindings = rust_bindings.as_ref();
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
@@ -960,11 +957,11 @@ struct RustReceiverIndex<'nodes, 'tree> {
     nodes: &'nodes [Node<'tree>],
     functions: HashMap<usize, (usize, usize)>,
     constructors: HashSet<String>,
-    bindings: RustBindings,
+    bindings: &'nodes RustBindings,
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
-    fn new(nodes: &'nodes [Node<'tree>], source: &str) -> Self {
+    fn new(nodes: &'nodes [Node<'tree>], source: &str, bindings: &'nodes RustBindings) -> Self {
         #[cfg(test)]
         super::extraction_work::note(|work| {
             work.receiver_index_passes += 1;
@@ -974,10 +971,7 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
             nodes,
             functions: HashMap::new(),
             constructors: HashSet::new(),
-            bindings: nodes
-                .first()
-                .map(|root| RustBindings::new(source, *root))
-                .unwrap_or_default(),
+            bindings,
         };
         let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
         for (position, &node) in nodes.iter().enumerate() {
@@ -1069,7 +1063,7 @@ fn receiver_type<'tree>(
         });
         RustBindings::new(source, root)
     });
-    let rust_bindings = rust_index.map(|index| &index.bindings);
+    let rust_bindings = rust_index.map(|index| index.bindings);
     #[cfg(test)]
     let rust_bindings = rust_bindings.or(unindexed.as_ref());
     let current_owner = rust_bindings

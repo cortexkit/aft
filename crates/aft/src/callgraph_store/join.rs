@@ -430,8 +430,7 @@ impl CallgraphBlob {
             refs,
         };
         parse.entry_point_symbols.sort();
-        dispatch::complete_members(source, lang, root, &mut parse)?;
-        parse.dispatch = dispatch::extract(source, lang, root, &parse)?;
+        parse.dispatch = dispatch::extract(source, lang, root, &mut parse)?;
         Ok(Self::Parse(parse))
     }
 
