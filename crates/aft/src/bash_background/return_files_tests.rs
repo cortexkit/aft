@@ -589,7 +589,7 @@ mod receiving {
             "large-copy",
         )
         .unwrap();
-        let job = Uuid::now_v7();
+        let job: Uuid = "0192a64a-1234-7000-8000-000000000001".parse().unwrap();
         let bytes = vec![42; 64 * 1024];
         let size = 20 * 1024 * 1024;
         let mut expected = Sha256::new();

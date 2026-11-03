@@ -1774,7 +1774,12 @@ impl OutputSink for TaskSink {
         } else {
             None
         };
+        let mut allowed = true;
         self.commit(|remote| {
+            if retry && (remote.return_cap_retried || remote.cancel_requested) {
+                allowed = false;
+                return;
+            }
             remote.return_max_bytes = cap;
             if let Some(digest) = digest {
                 remote.return_cap_retried = true;
@@ -1786,6 +1791,9 @@ impl OutputSink for TaskSink {
                 }
             }
         })?;
+        if !allowed {
+            return Ok(false);
+        }
         if let Some(receiver) = self.returns.as_mut() {
             receiver.set_cap(cap);
         }
