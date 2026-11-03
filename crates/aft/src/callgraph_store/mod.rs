@@ -17749,6 +17749,22 @@ fn resolve_rust_target<I: ResolverIndex>(
     caller_data: &FileCallData,
     raw: &RawRef,
 ) -> Option<(String, String, String)> {
+    #[cfg(test)]
+    if caller_file == "src/lib.rs"
+        && matches!(full_ref, "Store::new" | "Factory::new" | "Backend::new")
+    {
+        eprintln!(
+            "RUST REF {full_ref} at {} caller {:?} imports {:?}",
+            raw.byte_start,
+            raw.caller_symbol,
+            caller_data
+                .import_block
+                .imports
+                .iter()
+                .map(|i| (&i.raw_text, &i.byte_range))
+                .collect::<Vec<_>>()
+        );
+    }
     // A self call is bound by its enclosing declaration, including trait
     // defaults and trait impls whose scope contains both trait and type names.
     if let Some(member) = full_ref.strip_prefix("self.") {
@@ -17888,7 +17904,12 @@ fn rust_associated_target<I: ResolverIndex>(
     if matches!(owner, "Self" | "self" | "super" | "crate") {
         return None;
     }
-    let binding = rust_type_binding(index, caller_file, owner, caller_data, raw)?;
+    let binding = rust_type_binding(index, caller_file, owner, caller_data, raw);
+    #[cfg(test)]
+    if caller_file == "src/lib.rs" && matches!(owner, "Store" | "Factory" | "Backend") {
+        eprintln!("ASSOCIATED {owner}: {binding:?}");
+    }
+    let binding = binding?;
     // Follow the imported type before appending its member: the module
     // re-exports `Backend`, not a free function named `new`.
     index.node_for_symbol(&binding.0, &binding.1)?;
@@ -18068,6 +18089,16 @@ fn rust_resolve_reexport_if_symbol_missing<I: ResolverIndex>(
     target_file: String,
     target_symbol: String,
 ) -> (String, String) {
+    #[cfg(test)]
+    if target_symbol == "Backend" {
+        eprintln!(
+            "REEXPORT {target_file}::{target_symbol} node {:?} exports {} aliases {:?} links {:?}",
+            index.node_for_symbol(&target_file, &target_symbol),
+            index.has_export(&target_file, &target_symbol),
+            index.export_alias(&target_file, &target_symbol),
+            index.reexports_for(&target_file)
+        );
+    }
     if index
         .node_for_symbol(&target_file, &target_symbol)
         .is_some()
