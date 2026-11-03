@@ -33,6 +33,19 @@ fn sample(label: &str, roots: &[Arc<AppContext>], start: Instant) {
     let allocations = crate::test_allocations::live_allocations();
     let details: Vec<_> = roots.iter().map(|ctx| ctx.memory_root_snapshot()).collect();
     let attributed: u64 = details.iter().map(|row| row.attributed_bytes).sum();
+    let memos: Vec<_> = roots
+        .iter()
+        .map(|ctx| ctx.search_exact_memo().estimated_memory())
+        .collect();
+    let memo_bytes: u64 = memos.iter().filter_map(|row| row.estimated_bytes).sum();
+    let memo_entries: u64 = memos
+        .iter()
+        .filter_map(|row| row.counts.get("entries"))
+        .sum();
+    let memo_candidates: u64 = memos
+        .iter()
+        .filter_map(|row| row.counts.get("candidates"))
+        .sum();
     let sqlite = crate::memory::MemorySnapshot::new_uncapped("ready", Default::default())
         .process
         .sqlite
@@ -40,7 +53,7 @@ fn sample(label: &str, roots: &[Arc<AppContext>], start: Instant) {
     let io = std::fs::read_to_string("/proc/self/io").unwrap();
     let rchar = io.lines().find(|line| line.starts_with("rchar:")).unwrap();
     eprintln!(
-        "heap_soak {label} seconds={:.3} roots={} live_bytes={live} live_allocations={allocations} root_attributed={attributed} sqlite_bytes={sqlite} {rchar}",
+        "heap_soak {label} seconds={:.3} roots={} live_bytes={live} live_allocations={allocations} root_attributed={attributed} memo_bytes={memo_bytes} memo_entries={memo_entries} memo_candidates={memo_candidates} sqlite_bytes={sqlite} {rchar}",
         start.elapsed().as_secs_f64(), roots.len(),
     );
     if let Some(row) = details.first() {
@@ -176,6 +189,10 @@ fn synthetic_bound_roots() {
                 ctx.drain_bg_completions();
             }
             ctx.forget_configure_session_binding(&root, &session);
+            ctx.hashline_bindings().teardown(&root, &session);
+            ctx.release_backup_session_in_background(session)
+                .join()
+                .unwrap();
             crate::runtime_drain::drain_watcher_events(ctx);
         }
         std::thread::sleep(Duration::from_secs(1));

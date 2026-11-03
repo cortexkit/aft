@@ -14,6 +14,7 @@ use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::search_index::ExactEvidenceScope;
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
+const MAX_EXACT_MEMO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETIRED_POISONED_KEYS: usize = 128;
 const MAX_LITERAL_PRESENCE_ENTRIES: usize = 128;
 
@@ -48,6 +49,70 @@ pub struct LiteralPresenceEntry {
 /// Key of a presence answer: the root searched, the index generation it was
 /// settled on, and the literal as the exact lane compares phrases.
 pub type LiteralPresenceKey = (PathBuf, GenerationToken, String);
+
+// HashMap capacity counts usable slots, not all allocated buckets. Estimate
+// inline keys/values, one occupancy-control byte per bucket, and a 16-byte
+// control group; nested path/string buffers are counted separately below.
+fn map_storage_bytes<K, V>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = capacity
+        .saturating_add(1)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    buckets
+        .saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1))
+        .saturating_add(16)
+}
+
+fn key_bytes(key: &MemoKey) -> usize {
+    let scope = match &key.evidence_scope {
+        ExactEvidenceScope::DefinitionsMentioning(words) => words
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(words.iter().map(String::capacity).sum::<usize>()),
+        _ => 0,
+    };
+    key.project_root
+        .capacity()
+        .saturating_add(key.snapshot_generation.as_str().len())
+        .saturating_add(key.normalized_query.capacity())
+        .saturating_add(scope)
+}
+
+fn literal_presence_bytes(key: &LiteralPresenceKey, entry: &LiteralPresenceEntry) -> usize {
+    key.0
+        .capacity()
+        .saturating_add(key.1.as_str().len())
+        .saturating_add(key.2.capacity())
+        .saturating_add(
+            entry
+                .read
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(PathBuf, FileStamp)>()),
+        )
+        .saturating_add(
+            entry
+                .read
+                .iter()
+                .map(|(path, _)| path.capacity())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            entry
+                .candidates
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PathBuf>()),
+        )
+        .saturating_add(
+            entry
+                .candidates
+                .iter()
+                .map(PathBuf::capacity)
+                .sum::<usize>(),
+        )
+}
 
 /// Normalize query for memo key comparison.
 pub fn normalize_query(query: &str) -> String {
@@ -124,6 +189,7 @@ pub struct MemoEntry {
     pub stability_void: bool,
     epoch: usize,
     poisoned: bool,
+    retained_bytes: usize,
 }
 
 impl MemoEntry {
@@ -142,6 +208,33 @@ impl MemoEntry {
                 candidate.evidence.clone(),
             );
         }
+        let retained_bytes = std::mem::size_of::<Self>()
+            .saturating_add(
+                results
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CandidateResult>()),
+            )
+            .saturating_add(results.iter().map(|row| row.path.capacity()).sum::<usize>())
+            .saturating_add(map_storage_bytes::<PathBuf, String>(
+                file_digests.capacity(),
+            ))
+            .saturating_add(
+                file_digests
+                    .iter()
+                    .map(|(path, digest)| path.capacity().saturating_add(digest.capacity()))
+                    .sum::<usize>(),
+            )
+            .saturating_add(map_storage_bytes::<
+                (PathBuf, Option<SymbolOffsetRange>),
+                EvidenceDescriptor,
+            >(descriptors.capacity()))
+            .saturating_add(
+                descriptors
+                    .keys()
+                    .map(|(path, _)| path.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(bound_disclosure.as_ref().map_or(0, String::capacity));
         Self {
             results,
             file_digests,
@@ -150,6 +243,7 @@ impl MemoEntry {
             stability_void,
             epoch,
             poisoned,
+            retained_bytes,
         }
     }
 
@@ -292,6 +386,58 @@ impl ExactMemoStore {
     #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.entries.read().len()
+    }
+
+    /// Retained cache capacity, without reading any source files or cloning payloads.
+    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let Some(entries) = self.entries.try_read() else {
+            return crate::memory::MemoryEstimate::busy();
+        };
+        let Some(lifecycle) = self.lifecycle.try_read() else {
+            return crate::memory::MemoryEstimate::busy();
+        };
+        let Some(presence) = self.literal_presence.try_lock() else {
+            return crate::memory::MemoryEstimate::busy();
+        };
+        let payload_bytes = entries.iter().fold(0usize, |bytes, (key, entry)| {
+            bytes
+                .saturating_add(key_bytes(key))
+                .saturating_add(entry.retained_bytes)
+        });
+        let lifecycle_bytes = lifecycle.keys().map(key_bytes).sum::<usize>();
+        let presence_bytes = presence
+            .iter()
+            .map(|(key, entry)| literal_presence_bytes(key, entry))
+            .sum::<usize>();
+        let bytes = payload_bytes
+            .saturating_add(map_storage_bytes::<MemoKey, Arc<MemoEntry>>(
+                entries.capacity(),
+            ))
+            .saturating_add(lifecycle_bytes)
+            .saturating_add(map_storage_bytes::<MemoKey, KeyLifecycleState>(
+                lifecycle.capacity(),
+            ))
+            .saturating_add(presence_bytes)
+            .saturating_add(
+                map_storage_bytes::<LiteralPresenceKey, LiteralPresenceEntry>(presence.capacity()),
+            );
+        crate::memory::MemoryEstimate::partial(bytes as u64)
+            .count("entries", entries.len())
+            .count(
+                "candidates",
+                entries.values().map(|entry| entry.results.len()).sum(),
+            )
+            .count(
+                "file_digests",
+                entries.values().map(|entry| entry.file_digests.len()).sum(),
+            )
+            .count(
+                "descriptors",
+                entries.values().map(|entry| entry.descriptors.len()).sum(),
+            )
+            .count("lifecycle_keys", lifecycle.len())
+            .count("literal_presence_entries", presence.len())
+            .gap("in_flight_verifiers_and_detached_readers")
     }
 
     fn allocate_epoch(&self) -> usize {
@@ -1110,4 +1256,72 @@ mod tests {
 
         assert!(memo.entry_count() <= MAX_EXACT_MEMO_ENTRIES);
     }
+}
+#[test]
+fn exact_memo_releases_old_generations_of_the_same_query() {
+    let memo = ExactMemoStore::new();
+    for revision in 0..32 {
+        let key = MemoKey::new(
+            "/project",
+            GenerationToken::new_with_str(&format!("generation-{revision}")),
+            "same query",
+            false,
+        );
+        let results = vec![CandidateResult::new_exact(
+            PathBuf::from("/project/file.rs"),
+            None,
+            EvidenceDescriptor::for_e1(revision + 1, true, false),
+        )];
+        let expected = results.clone();
+        let page = memo
+            .get_or_verify(&key, 0, 10, || {
+                Ok(VerifiedExactSet {
+                    results,
+                    file_digests: HashMap::new(),
+                    bound_disclosure: None,
+                    stability_void: false,
+                })
+            })
+            .unwrap();
+        assert_eq!(page.results, expected);
+    }
+    assert_eq!(
+        memo.entry_count(),
+        1,
+        "old index generations must not retain historical candidate sets"
+    );
+}
+
+#[test]
+fn exact_memo_oversized_entry_is_served_in_full_but_not_retained() {
+    let memo = ExactMemoStore::new();
+    let key = audit01_key("oversized");
+    let mut results =
+        Vec::with_capacity(MAX_EXACT_MEMO_BYTES / std::mem::size_of::<CandidateResult>() + 1);
+    for n in 0..20 {
+        results.push(CandidateResult::new_exact(
+            PathBuf::from(format!("/project/{n}.rs")),
+            None,
+            EvidenceDescriptor::for_e1(1, true, false),
+        ));
+    }
+    let expected = results.clone();
+    let page = memo
+        .get_or_verify(&key, 0, usize::MAX, || {
+            Ok(VerifiedExactSet {
+                results,
+                file_digests: HashMap::new(),
+                bound_disclosure: None,
+                stability_void: false,
+            })
+        })
+        .unwrap();
+    assert_eq!(
+        page.results, expected,
+        "a cache budget must never cut the exact ranking input"
+    );
+    assert!(
+        !memo.has_live_entry(&key),
+        "oversized payload remains retained"
+    );
 }
