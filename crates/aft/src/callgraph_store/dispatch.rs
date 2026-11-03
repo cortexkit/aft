@@ -644,14 +644,15 @@ pub fn extract(
             || (language == "python" && text(*node, source).contains("@abstractmethod"));
         let mut bases = Vec::new();
         for child in node.named_children(&mut node.walk()) {
-            if [
-                "class_heritage",
-                "superclasses",
-                "super_interfaces",
-                "superclass",
-                "delegation_specifiers",
-            ]
-            .contains(&child.kind())
+            if language != "python"
+                && [
+                    "class_heritage",
+                    "superclasses",
+                    "super_interfaces",
+                    "superclass",
+                    "delegation_specifiers",
+                ]
+                .contains(&child.kind())
             {
                 for base in descendants(child) {
                     if ["type_identifier", "identifier", "user_type"].contains(&base.kind()) {
@@ -665,6 +666,7 @@ pub fn extract(
                 bases.extend(
                     arguments
                         .named_children(&mut arguments.walk())
+                        .filter(|n| n.kind() != "keyword_argument")
                         .map(|n| type_name(text(n, source))),
                 );
             }
@@ -681,8 +683,10 @@ pub fn extract(
             }
         }
         bases.retain(|name| !name.is_empty());
-        bases.sort();
-        bases.dedup();
+        if language != "python" {
+            bases.sort();
+            bases.dedup();
+        }
         let header = text(*node, source).split('{').next().unwrap_or_default();
         facts.types.push(TypeHint {
             name,
@@ -1210,13 +1214,9 @@ fn receiver_type<'tree>(
                 .cloned()
         }
         "python" if value == "super()" => {
-            return facts
-                .types
-                .iter()
-                .find(|t| Some(&t.name) == current_owner.as_ref())?
-                .bases
-                .first()
-                .cloned()
+            // Preserve the lexical class: super searches its MRO after that
+            // class, rather than dispatching on an open base-class receiver.
+            return current_owner.map(|name| format!("@super:{name}"));
         }
         "go" => {
             if let Some(receiver) = field(function, &["receiver"]) {
@@ -1256,6 +1256,11 @@ fn receiver_type<'tree>(
         Some(nodes) => Cow::Borrowed(nodes),
         None => Cow::Owned(descendants(function)),
     };
+    if language == "python" {
+        nodes
+            .to_mut()
+            .retain(|node| enclosing(*node, FUNCTIONS) == Some(function));
+    }
     if ["java", "csharp", "kotlin"].contains(&language) {
         if let Some(class) = enclosing(function, TYPES) {
             nodes
@@ -1848,6 +1853,98 @@ impl<'a> Resolver<'a> {
                 (f == base_file && t.name == base) || self.subtype(&f, t, base_file, base, seen)
             })
     }
+    fn python_mro(
+        &self,
+        file: &str,
+        ty: &TypeHint,
+        active: &mut BTreeSet<(String, String)>,
+        memo: &mut BTreeMap<(String, String), Vec<(String, String)>>,
+    ) -> Option<Vec<(String, String)>> {
+        let key = (file.to_string(), ty.name.clone());
+        if let Some(mro) = memo.get(&key) {
+            return Some(mro.clone());
+        }
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        let mut sequences = Vec::new();
+        let mut bases = Vec::new();
+        for base in &ty.bases {
+            if let Some((base_file, base_ty)) = self.project_type(file, base) {
+                bases.push((base_file.clone(), base_ty.name.clone()));
+                sequences.push(self.python_mro(&base_file, base_ty, active, memo)?);
+            } else {
+                // Unknown bases are opaque barriers, not permission to search
+                // later bases by name. The built-in object is a known leaf.
+                let key = if base == "object" {
+                    (String::new(), "object".to_string())
+                } else {
+                    (file.to_string(), format!("@unknown:{base}"))
+                };
+                bases.push(key.clone());
+                sequences.push(vec![key]);
+            }
+        }
+        if bases.is_empty() {
+            bases.push((String::new(), "object".to_string()));
+            sequences.push(bases.clone());
+        }
+        sequences.push(bases);
+        let mut mro = vec![key.clone()];
+        // C3 chooses the first head absent from every tail, preserving written
+        // base order and postponing shared ancestors in a diamond hierarchy.
+        while sequences.iter().any(|sequence| !sequence.is_empty()) {
+            let head = sequences
+                .iter()
+                .filter_map(|sequence| sequence.first())
+                .find(|head| {
+                    !sequences
+                        .iter()
+                        .any(|sequence| sequence.iter().skip(1).any(|item| item == *head))
+                })?
+                .clone();
+            for sequence in &mut sequences {
+                if sequence.first() == Some(&head) {
+                    sequence.remove(0);
+                }
+            }
+            mro.push(head);
+        }
+        active.remove(&key);
+        memo.insert(key, mro.clone());
+        Some(mro)
+    }
+
+    fn python_super(&self, file: &str, owner: &str, member: &str) -> Resolution {
+        let Some((owner_file, ty)) = self.project_type(file, owner) else {
+            return self.unknown("python", member);
+        };
+        let Some(mro) =
+            self.python_mro(&owner_file, ty, &mut BTreeSet::new(), &mut BTreeMap::new())
+        else {
+            return self.unknown("python", member);
+        };
+        for (base_file, base) in mro.into_iter().skip(1) {
+            if base.starts_with("@unknown:") {
+                return self.unknown("python", member);
+            }
+            if base_file.is_empty() {
+                continue;
+            }
+            let targets = self.methods(&base_file, &base, member);
+            if !targets.is_empty() {
+                return Resolution {
+                    targets: targets.into_iter().collect(),
+                    ..Resolution::default()
+                };
+            }
+        }
+        Resolution {
+            external: 1,
+            ..Resolution::default()
+        }
+    }
+
     fn unknown(&self, language: &str, member: &str) -> Resolution {
         self.depend(dependency::method(member));
         let protected: BTreeSet<_> = self
@@ -1863,7 +1960,7 @@ impl<'a> Resolver<'a> {
                     .map(move |m| (file.clone(), m.symbol.clone()))
             })
             .collect();
-        if language == "go" {
+        if ["go", "python"].contains(&language) {
             return Resolution {
                 unresolved: usize::from(!protected.is_empty()),
                 external: usize::from(protected.is_empty()),
@@ -1942,6 +2039,11 @@ impl<'a> Resolver<'a> {
         let Some(receiver) = &site.receiver else {
             return self.unknown(&parse.language, member);
         };
+        if parse.language == "python" {
+            if let Some(owner) = receiver.strip_prefix("@super:") {
+                return self.python_super(file, owner, member);
+            }
+        }
         let Some((type_file, ty)) = self.project_type(file, receiver) else {
             return Resolution {
                 external: 1,

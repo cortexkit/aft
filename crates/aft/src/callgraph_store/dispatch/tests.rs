@@ -388,6 +388,65 @@ fn builtin_type_does_not_link_project_names() {
 }
 
 #[test]
+fn python_unknown_abstract_receivers_stay_live_without_caller_guesses() {
+    let parsed = parse("from abc import abstractmethod\nclass Contract:\n @abstractmethod\n def get_items(self): pass\nclass Other:\n def get_items(self): pass\ndef caller(x):\n x.get_items()\n self.underlying.get_items()\n", "python");
+    let result = resolutions(&parsed);
+    assert_eq!(result.len(), 2);
+    for resolution in result {
+        assert!(resolution.targets.is_empty(), "{resolution:#?}");
+        assert_eq!(resolution.unresolved, 1);
+        assert_eq!(resolution.protected.len(), 2);
+    }
+}
+
+#[test]
+fn python_receiver_evidence_is_local_to_the_calling_scope() {
+    let parsed = parse("class C:\n def m(self): pass\n def own(self):\n  self.m()\ndef caller(x: C):\n x.m()\n y: C\n y.m()\n z = C()\n z.m()\ndef unknown():\n def nested():\n  hidden = C()\n hidden.m()\n", "python");
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    assert_eq!(parsed.dispatch.sites.len(), 5);
+    for site in &parsed.dispatch.sites {
+        let resolution = resolver.resolve("fixture", site);
+        if site.caller.as_deref() == Some("unknown") {
+            assert!(resolution.targets.is_empty());
+            assert_eq!(resolution.unresolved, 1);
+        } else {
+            assert!(resolution.targets.iter().any(|t| t.symbol == "C::m"));
+            assert!(resolution.targets.iter().all(|t| t.provenance == "exact"));
+        }
+    }
+}
+
+#[test]
+fn python_super_uses_c3_base_order_without_subtype_fanout() {
+    // Zulu precedes Alpha even though lexical sorting would reverse them.
+    // Shared owns an initializer, but C3 puts Alpha before that shared ancestor.
+    let parsed = parse("class Shared:\n def __init__(self): pass\nclass Zulu(Shared): pass\nclass Alpha(Shared):\n def __init__(self): pass\nclass Child(Zulu, Alpha):\n def __init__(self):\n  super().__init__()\nclass Sibling(Shared):\n def __init__(self): pass\nclass Direct(Alpha, Zulu):\n def __init__(self):\n  super().__init__()\n", "python");
+    let result = resolutions(&parsed);
+    assert_eq!(result.len(), 2);
+    for resolution in result {
+        assert_eq!(resolution.targets.len(), 1, "{resolution:#?}");
+        let target = resolution.targets.first().unwrap();
+        assert_eq!(target.symbol, "Alpha::__init__");
+        assert_eq!(target.provenance, "exact");
+    }
+}
+
+#[test]
+fn python_super_unknown_cyclic_and_inconsistent_bases_never_guess() {
+    for source in [
+        "class Known:\n def __init__(self): pass\nclass Child(External, Known):\n def __init__(self):\n  super().__init__()\n",
+        "class A(B): pass\nclass B(A):\n def __init__(self):\n  super().__init__()\n",
+        "class A: pass\nclass B: pass\nclass X(A, B): pass\nclass Y(B, A): pass\nclass Child(X, Y):\n def __init__(self):\n  super().__init__()\n",
+    ] {
+        let parsed = parse(source, "python");
+        let result = resolutions(&parsed);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].targets.is_empty(), "{:#?}", result[0]);
+        assert_eq!(result[0].unresolved, 1);
+    }
+}
+
+#[test]
 fn concrete_inherited_and_constructor_receiver_forms() {
     let parse = parse("class A { m() {} }\nclass B extends A { f() { this.m(); super.m(); } }\nclass D extends B { m() {} }\nfunction caller() { const x = new B(); x.m(); }", "typescript");
     let result = resolutions(&parse);
