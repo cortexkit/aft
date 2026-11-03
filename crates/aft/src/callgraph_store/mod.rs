@@ -19232,14 +19232,17 @@ impl<'a> LazyDbFileIndexes<'a> {
     }
 
     fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
+        // Cached like the node and module-ref queries below: refreshes load
+        // one file index per changed file, and an uncached query here would
+        // compile once per file.
         let lang = self.note_error(
             self.conn
-                .query_row(
-                    "SELECT lang FROM files WHERE path = ?1",
-                    params![rel_path],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional(),
+                .prepare_cached("SELECT lang FROM files WHERE path = ?1")
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+                        .optional()
+                }),
         )?;
         self.add_rows(usize::from(lang.is_some()));
         let nodes = self.note_error(self.query_nodes(rel_path))?;
