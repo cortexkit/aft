@@ -4,9 +4,9 @@
   "normalised_fields": [],
   "artifact_sha256": {
     "baseline.json": "2e9f9d430a682ae20334fe8636e46577f499182e57b4fcc0c1fc5996bf35114a",
-    "statements.json.gz": "cdc721e77c15992c66f126e52f8e6ce6fbade05c36c597ea354111159c088e58",
+    "statements.json.gz": "e0f778052ac0a3c9f2dba5c483fb3167f3b1deedc0332bc310e54c10cfca85c8",
     "order_sql.json.gz": "8529f10545f6662255eaa4a7549b158e6d24d309cfcd5d7e47e3b3d635617e3c",
-    "source_inventory.json.gz": "60987bad0645cf613610d595ae7fec4f573bf6c700cbc850cd9607c7fb9acf57",
+    "source_inventory.json.gz": "9b7681df78e357583b8043c9c27ee7b2ab157163d415ed974e902c41f531631e",
     "table_encoding.json.gz": "8f833f81765b457cea2bb75ab8a98de4f09f3ea15664b6758d30c323f09afd8c",
     "sweep_references.json": "15b133501a11dd334030dfecc39adb5d27e24535a12b959bf3f8cafca1dfa995",
     "trace_helpers.json": "ff76446696c56e07052053f4e55df9460098615cef69a78c075ef28dd39786ba",
