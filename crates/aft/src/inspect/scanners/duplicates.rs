@@ -214,6 +214,7 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
         .collect::<Vec<_>>();
     let scanned_files = file_scans
         .iter()
+        .filter(|scan| scan.skipped_reason.is_none())
         .map(|scan| scan.path.clone())
         .collect::<Vec<_>>();
 
@@ -230,11 +231,24 @@ pub fn run_duplicates_scan(job: &InspectJob) -> InspectResult {
 /// a per-file skip; other read failures keep failing the scan as before.
 fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> {
     let display_path = display_path(&job.project_root, path);
-    let freshness = match cache_freshness::collect(path) {
+    let (freshness, _permit) = match super::source_text::source_freshness(path) {
         Ok(freshness) => freshness,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),
     };
+    if freshness.size > super::source_text::MAX_SOURCE_BYTES {
+        return Ok(Some(FileScan {
+            path: path.to_path_buf(),
+            display_path,
+            language_skipped: None,
+            skipped_reason: Some(super::source_text::TOO_LARGE),
+            freshness,
+            line_count: 0,
+            expected_duplicate: false,
+            generated: false,
+            fragments: Vec::new(),
+        }));
+    }
     let Some(lang) = detect_language(path) else {
         return Ok(Some(FileScan {
             path: path.to_path_buf(),
@@ -265,16 +279,24 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<Option<FileScan>, String> 
 
     let source = match read_source_text(path) {
         Ok(SourceText::Text(source)) => source,
-        Ok(SourceText::NotUtf8) => {
+        Ok(skipped @ (SourceText::NotUtf8 | SourceText::TooLarge)) => {
             return Ok(Some(FileScan {
                 path: path.to_path_buf(),
                 display_path,
                 language_skipped: None,
-                skipped_reason: Some(NOT_VALID_UTF8),
+                skipped_reason: Some(if matches!(skipped, SourceText::TooLarge) {
+                    super::source_text::TOO_LARGE
+                } else {
+                    NOT_VALID_UTF8
+                }),
                 freshness,
                 line_count: 0,
                 expected_duplicate: false,
-                generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
+                generated: if matches!(skipped, SourceText::TooLarge) {
+                    false
+                } else {
+                    crate::inspect::generated::is_generated_file(&job.project_root, path)
+                },
                 fragments: Vec::new(),
             }));
         }
@@ -631,7 +653,10 @@ pub(crate) fn aggregate_duplicate_contributions_with_limit(
         .collect();
     let mut aggregate = aggregate_duplicate_occurrences(
         by_hash,
-        parsed.len(),
+        parsed
+            .iter()
+            .filter(|scan| scan.skipped_reason.is_none())
+            .count(),
         line_counts.values().copied().map(u64::from).sum(),
         marker_files,
         languages_skipped,
@@ -796,7 +821,10 @@ fn aggregate_file_scans_with_limit(
 
     aggregate_duplicate_occurrences(
         by_hash,
-        file_scans.len(),
+        file_scans
+            .iter()
+            .filter(|scan| scan.skipped_reason.is_none())
+            .count(),
         file_scans
             .iter()
             .map(|scan| u64::from(scan.line_count))

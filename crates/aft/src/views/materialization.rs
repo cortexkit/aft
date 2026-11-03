@@ -287,12 +287,23 @@ pub(crate) fn apply_manifest_diff_from_blob_reader(
         .map(|(stats, _)| stats)
 }
 
+fn check_job_cancelled() -> Result<()> {
+    if crate::executor::current_job_cancelled() {
+        Err(CallGraphStoreError::Unavailable(
+            super::first_load::SUPERSEDED_PUBLISH.into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn materialize_reading(
     database_path: &Path,
     manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
     reader: &impl join::ManifestBlobReader,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    check_job_cancelled()?;
     let shared_reader = join::SharedBlobReader {
         inner: reader,
         decoded: Default::default(),
@@ -637,6 +648,7 @@ fn materialize_reading(
     let mut owned_nodes = Vec::new();
     let mut cold_module_facts = HashMap::new();
     for (path, entry) in manifest.entries() {
+        check_job_cancelled()?;
         if changed
             .as_ref()
             .is_some_and(|paths| !paths.contains(path.as_bytes()))
@@ -928,6 +940,7 @@ fn materialize_reading(
     let mut changed_dependencies = Vec::new();
     let mut binding_inserts = Vec::new();
     for (path, binding) in &joined.bindings {
+        check_job_cancelled()?;
         if joined.rebuilt_surface_paths.contains(path) {
             if let Some(payload) = binding
                 .surface_json()
@@ -1129,6 +1142,7 @@ fn materialize_reading(
     #[cfg(test)]
     let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
     for row in joined.result.rows {
+        check_job_cancelled()?;
         let caller_path = String::from_utf8(row.caller_path).map_err(|_| {
             CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
         })?;

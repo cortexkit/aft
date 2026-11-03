@@ -492,6 +492,14 @@ pub trait PublishFence: Send + Sync {
         -> Result<(), PlaneError>;
 }
 
+fn check_job_cancelled() -> Result<(), PlaneError> {
+    if crate::executor::current_job_cancelled() {
+        Err(SiblingLoader::error(SUPERSEDED_PUBLISH.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Derived graphs cannot be copied between checkouts until tests prove their
 /// rows contain no source-root-dependent data. Per-file blobs remain reusable.
 pub const DERIVED_CALLGRAPH_SEEDING: bool = false;
@@ -1663,6 +1671,7 @@ pub struct CheckoutDriver {
     installed: std::sync::Mutex<Arc<InstalledBundle>>,
     live: std::sync::Mutex<LiveDelta>,
     prepared_readers: std::sync::Mutex<BTreeMap<String, PreparedReaders>>,
+    prepared_reader_owner: std::sync::Mutex<Option<(u64, Arc<PlaneReaders>)>>,
     // Serialize the final identity check/CAS with the installed sequence swap,
     // without holding query locks during I/O or plane-reader retirement.
     publication_transition: std::sync::Mutex<()>,
@@ -1765,7 +1774,8 @@ impl<'a> V3PlaneReaders<'a> {
 
 struct PreparedReaders {
     seq: u64,
-    readers: Arc<PlaneReaders>,
+    generation: std::sync::Weak<ComposedGeneration>,
+    readers: std::sync::Weak<PlaneReaders>,
 }
 
 /// Source work only; publication and model counters belong to their stores.
@@ -2307,6 +2317,7 @@ impl CheckoutDriver {
             })),
             live: std::sync::Mutex::new(delta),
             prepared_readers: Default::default(),
+            prepared_reader_owner: Default::default(),
             publication_transition: Default::default(),
             retry: Default::default(),
             #[cfg(test)]
@@ -3044,9 +3055,9 @@ impl FirstLoadDriver for CheckoutDriver {
                             adapter.generation_published(access, &generation, &|| self.installed_cut().0)?;
                         }
                         let rebound = readers.rebind(access)?;
-                        let retired = self.prepared_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(generation.name().to_owned(), PreparedReaders { seq: snapshot.install_cut().map_or(0, |cut| cut.seq), readers: rebound });
-                        if let Some(retired) = retired { retired_readers.push(retired.readers); }
+                        retired_readers.push(self.replace_prepared_readers(
+                            &generation, snapshot.install_cut().map_or(0, |cut| cut.seq), rebound,
+                        ));
                         Ok(())
                     },
                     outcome @ (super::manifest_v2::PublishV2::Conflict { .. } | super::manifest_v2::PublishV2::EquivalentWinner { .. }) => {
@@ -3099,6 +3110,7 @@ impl CheckoutDriver {
         snapshot: &Snapshot,
         header: super::manifest_v2::BaseHeader,
     ) -> Result<Arc<ComposedGeneration>, PlaneError> {
+        check_job_cancelled()?;
         let failed =
             |error: super::base_refs::BaseRefError| SiblingLoader::error(error.to_string());
         let route = self.owner.v3_route();
@@ -3228,6 +3240,7 @@ impl CheckoutDriver {
             .entries
             .clone();
         for plane in &self.planes {
+            check_job_cancelled()?;
             plane.materialize_v3(
                 &self.owner,
                 &route,
@@ -3237,6 +3250,7 @@ impl CheckoutDriver {
                 &mut delta,
                 &mut live,
             )?;
+            check_job_cancelled()?;
         }
         // `Wold`: the installed v3 generation of this checkout, or the
         // durable v3 pointer when the installed bundle is not one.
@@ -3289,6 +3303,8 @@ impl CheckoutDriver {
                 Ok(())
             },
             &mut || {
+                check_job_cancelled()
+                    .map_err(|error| super::base_refs::BaseRefError::Unavailable(error.reason))?;
                 if let Some(guard) = snapshot
                     .install_cut()
                     .and_then(|cut| cut.verification.as_ref())
@@ -3307,6 +3323,7 @@ impl CheckoutDriver {
                         .publication_transition
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    check_job_cancelled()?;
                     actual =
                         Some(commit().map_err(|error| SiblingLoader::error(error.to_string()))?);
                     Ok(())
@@ -3335,17 +3352,11 @@ impl CheckoutDriver {
                 for adapter in &self.adapters {
                     adapter.generation_published(access, &composed, &|| self.installed_cut().0)?;
                 }
-                let retired = self
-                    .prepared_readers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(
-                        composed.name().to_owned(),
-                        PreparedReaders {
-                            seq: snapshot.install_cut().map_or(0, |cut| cut.seq),
-                            readers,
-                        },
-                    );
+                let retired = self.replace_prepared_readers(
+                    &composed,
+                    snapshot.install_cut().map_or(0, |cut| cut.seq),
+                    readers,
+                );
                 drop(retired);
                 super::callgraph::retire_attachments(&observed, &composed);
                 Ok(composed)
@@ -4034,6 +4045,67 @@ mod composite_tests {
     }
 
     #[test]
+    fn superseded_prepared_readers_do_not_accumulate_after_rejected_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, _, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        drop(loader.load(&access).unwrap());
+        let initial = driver.installed_snapshot();
+        let seq = driver.installed_bundle().seq;
+        let mut first = None;
+        for revision in 0..32 {
+            std::fs::write(
+                root.path().join("file.rs"),
+                format!("revision_{revision} {}", "unique content\n".repeat(100)),
+            )
+            .unwrap();
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            let (observed, version) = loader
+                .reconciled(&access, initial.generation().clone())
+                .unwrap();
+            let generation = driver
+                .build_own_generation(&access, &observed, false)
+                .unwrap();
+            let mut cut = observed.install_cut().unwrap().clone();
+            cut.seq = cut.seq.saturating_sub(1);
+            let stale = LiveDelta::new(generation.clone())
+                .snapshot()
+                .with_install_cut(cut);
+            assert!(driver.install(&access, &stale, version).is_err());
+            if revision == 0 {
+                first = Some(
+                    driver.prepared_readers.lock().unwrap()[generation.name()]
+                        .readers
+                        .clone(),
+                );
+            }
+            if revision % 8 == 7 {
+                eprintln!(
+                    "prepared_heap revisions={} bundles={} live_bytes={} live_allocations={}",
+                    revision + 1,
+                    driver.prepared_readers.lock().unwrap().len(),
+                    crate::test_allocations::live_bytes(),
+                    crate::test_allocations::live_allocations()
+                );
+            }
+        }
+        assert_eq!(driver.installed_bundle().seq, seq);
+        assert!(driver.prepared_readers.lock().unwrap().len() <= 3,
+            "metadata may retain the installed generation, latest handoff, and just-displaced caller, not all publications");
+        assert!(driver.prepared_reader_owner.lock().unwrap().is_some());
+        assert!(
+            first.unwrap().upgrade().is_none(),
+            "superseded prepared readers still own the old generation"
+        );
+        assert_eq!(
+            initial.disk_state(&RelPath::new(b"file.rs".to_vec()).unwrap()),
+            DiskState::of_bytes(b"strict content"),
+            "existing query snapshots must stay usable"
+        );
+    }
+
+    #[test]
     fn rejected_install_does_not_consume_prepared_readers() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -4057,7 +4129,8 @@ mod composite_tests {
             .get(generation.name())
             .unwrap()
             .readers
-            .clone();
+            .upgrade()
+            .unwrap();
         let snapshot = super::super::snapshot::LiveDelta::new(generation.clone())
             .snapshot()
             .with_install_cut(cut);
@@ -4069,7 +4142,8 @@ mod composite_tests {
             .get(generation.name())
             .unwrap()
             .readers
-            .clone();
+            .upgrade()
+            .unwrap();
         assert!(Arc::ptr_eq(&retained, &readers));
         assert_eq!(driver.installed_bundle().seq, seq);
         assert!(driver.take_revalidated_job());
@@ -5049,6 +5123,9 @@ impl CompositePlane for CallgraphBridge {
         };
         #[cfg(test)]
         let _profile = crate::blob_store::v3::work_profile::span("callgraph_materialize");
+        #[cfg(test)]
+        crate::storage_retention::test_hook(_owner.root(), "callgraph-materialize");
+        check_job_cancelled()?;
         let mut v3_readers = V3PlaneReaders::new(route);
         let mut attachments = Vec::new();
         for (path, entry) in observed {
@@ -5120,7 +5197,15 @@ impl CompositePlane for CallgraphBridge {
                 .saturating_add(1 << 20);
             let schema = FamilyPlane::Callgraph.payload_schema();
             crate::blob_store::v3::publish(&route.storage, &route.family, request, None, |p| {
+                #[cfg(test)]
+                crate::storage_retention::test_hook(_owner.root(), "callgraph-reserved");
+                if crate::executor::current_job_cancelled() {
+                    return Err(crate::blob_store::v3::Error::Refused(SUPERSEDED_PUBLISH));
+                }
                 for (_, key, bytes) in &payloads {
+                    if crate::executor::current_job_cancelled() {
+                        return Err(crate::blob_store::v3::Error::Refused(SUPERSEDED_PUBLISH));
+                    }
                     p.put(key, bytes, schema)?;
                 }
                 Ok(())
@@ -5143,6 +5228,7 @@ impl CompositePlane for CallgraphBridge {
         }
         drop((payloads, attachments));
         // Serialization and parsing buffers no longer belong to this phase.
+        check_job_cancelled()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         crate::memory::relieve_allocator_pressure();
         // The derived graph covers the composed generation. While the base's
@@ -6026,6 +6112,37 @@ impl CheckoutDriver {
         self.install_bundle(access, snapshot, false)
     }
 
+    /// Keep one strong reader handoff, rather than every refused installation.
+    /// Older callers still own their generation and can reopen its readers;
+    /// weak metadata preserves their publication identity without retaining its
+    /// payloads. Close the displaced handoff outside the publication locks.
+    fn replace_prepared_readers(
+        &self,
+        generation: &Arc<ComposedGeneration>,
+        seq: u64,
+        readers: Arc<PlaneReaders>,
+    ) -> Option<(u64, Arc<PlaneReaders>)> {
+        let retired = self
+            .prepared_reader_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((seq, readers.clone()));
+        let mut prepared = self
+            .prepared_readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prepared.retain(|_, entry| entry.generation.strong_count() > 0);
+        prepared.insert(
+            generation.name().to_owned(),
+            PreparedReaders {
+                seq,
+                generation: Arc::downgrade(generation),
+                readers: Arc::downgrade(&readers),
+            },
+        );
+        retired
+    }
+
     fn install_bundle(
         &self,
         access: &ViewAccess,
@@ -6047,14 +6164,13 @@ impl CheckoutDriver {
         let previously_owned = old_bundle.own_installed
             && old_bundle.composed.resident_key() == snapshot.generation().resident_key();
         drop(old_bundle);
-        let prepared = self
+        let (from_prepared, prepared) = self
             .prepared_readers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(snapshot.generation().name())
-            .map(|prepared| prepared.readers.clone());
-        let from_prepared = prepared.is_some();
-        let own_installed = prepared.is_some() || previously_owned;
+            .map_or((false, None), |entry| (true, entry.readers.upgrade()));
+        let own_installed = from_prepared || previously_owned;
         let readers = match prepared {
             Some(readers) => readers,
             None => {
@@ -6195,6 +6311,21 @@ impl CheckoutDriver {
             });
         }
         drop(retired_prepared);
+        let retired_owner = {
+            let mut owner = self
+                .prepared_reader_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if owner
+                .as_ref()
+                .is_some_and(|(prepared_seq, _)| *prepared_seq < seq)
+            {
+                owner.take()
+            } else {
+                None
+            }
+        };
+        drop(retired_owner);
         Ok(())
     }
 

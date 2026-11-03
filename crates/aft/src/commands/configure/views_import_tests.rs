@@ -346,7 +346,8 @@ fn views_import_building_retries_callgraph_without_load_failures_then_answers() 
         assert!(Instant::now() < deadline, "legacy import did not finish");
         thread::sleep(Duration::from_millis(10));
     }
-    let zoom = crate::commands::zoom::handle_zoom(&zoom_request, &ctx);
+    let zoom = ctx
+        .with_ready_callgraph_for_test(|| crate::commands::zoom::handle_zoom(&zoom_request, &ctx));
     assert!(zoom.success, "{:?}", zoom.data);
     assert!(zoom.data.get("callgraph").is_none(), "{:?}", zoom.data);
     let health = ctx.try_health_snapshot(&root);

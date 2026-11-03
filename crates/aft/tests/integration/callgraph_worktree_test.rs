@@ -366,7 +366,8 @@ fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
     publish(&checkout, &storage);
     git(&checkout, &["restore", "index.ts"]);
     let ctx = configure(&checkout, &storage, true);
-    let response = query(&ctx, &checkout, "callers", "ownerCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query(&ctx, &checkout, "callers", "ownerCaller"));
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(
@@ -397,7 +398,8 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
     assert!(ctx.shared_artifacts_read_only());
     assert!(!ctx.callgraph_writer());
     assert!(!ctx.ram_overlay_active());
-    let response = query(&ctx, &checkout, "callers", "workerCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query(&ctx, &checkout, "callers", "workerCaller"));
     assert!(
         response.success,
         "worktree-only source must publish without an owner writer: {response:?}"
@@ -648,7 +650,8 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
             "{operation}: {response:?}"
         );
     }
-    let response = query_file(&ctx, &unindexed, "callers", "newCaller");
+    let response =
+        ctx.with_ready_callgraph_for_test(|| query_file(&ctx, &unindexed, "callers", "newCaller"));
     assert!(response.success, "{response:?}");
     let response = callgraph_when_ready("callers", || {
         aft::commands::callers::handle_callers(
@@ -703,14 +706,16 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
     // With views on, the first query binds this worktree's own checkout view
     // from its own source, before configure maintenance has run: it never
     // answers from the owner's graph and never reports the owner's callers.
-    match ctx.callgraph_store_for_ops() {
-        aft::context::CallgraphStoreAccess::Ready(store) => {
-            assert_eq!(store.reader_kind(), "view");
-            assert_eq!(store.project_root(), checkout);
+    let response = ctx.with_ready_callgraph_for_test(|| {
+        match ctx.callgraph_store_for_ops() {
+            aft::context::CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert_eq!(store.project_root(), checkout);
+            }
+            _ => panic!("expected this checkout's view reader"),
         }
-        _ => panic!("expected this checkout's view reader"),
-    }
-    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
+        query(&ctx, &checkout, "callers", "checkoutCaller")
+    });
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(response.data.to_string().contains("checkoutCaller"));

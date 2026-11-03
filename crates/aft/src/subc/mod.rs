@@ -9091,9 +9091,11 @@ async fn handle_control_request(
     }
 }
 
-/// Metadata is static on a project-free route. Task handles, including those
-/// used to read a bash task's status, belong to a project's registry and cannot
-/// be resolved here.
+/// Metadata is static on a project-free route. A tool's views are keyed by its
+/// tool version, not by a project, so display servers that open routes without a
+/// project folder can still fetch them. Task handles, including those used to
+/// read a bash task's status, belong to a project's registry and cannot be
+/// resolved here.
 async fn handle_project_free_request(
     tx: &WriterSender,
     frame: &Frame,
@@ -9115,6 +9117,7 @@ async fn handle_project_free_request(
     };
     let result = match operation.as_deref() {
         Some("role.describe") => Ok(tool_provider::describe()),
+        Some("tool.views") => tool_views::answer(arguments),
         Some("tool.catalog") => {
             tool_provider::validate_catalog_request(arguments).and_then(|(request, preset)| {
                 tool_provider::catalog_for_request(

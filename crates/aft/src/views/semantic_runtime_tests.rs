@@ -3134,7 +3134,7 @@ fn build_independent_callgraph(root: &Path, storage: &Path) {
         },
     )
     .unwrap();
-    let reader = graph.reader().unwrap();
+    let reader = graph.ready_reader_for_test();
     assert_eq!(
         reader
             .callers_of(Path::new("a.ts"), "target", 1)

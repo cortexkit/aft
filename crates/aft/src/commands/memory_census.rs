@@ -125,13 +125,23 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
     let callgraph_projection = detail.callgraph_projection.estimated_bytes.unwrap_or(0);
     let inspect = detail.inspect.estimated_bytes.unwrap_or(0);
     let pending_install = detail.pending_install.estimated_bytes.unwrap_or(0);
-    let planes_total = search
-        .saturating_add(semantic)
-        .saturating_add(symbols)
-        .saturating_add(callgraph)
-        .saturating_add(callgraph_projection)
-        .saturating_add(inspect)
-        .saturating_add(pending_install);
+    let planes_total = [
+        &detail.trigram,
+        &detail.semantic,
+        &detail.symbols,
+        &detail.callgraph,
+        &detail.callgraph_projection,
+        &detail.inspect,
+        &detail.pending_install,
+        &detail.exact_memo,
+        &detail.compression_filters,
+        &detail.bash,
+        &detail.lsp,
+        &detail.parser_pool,
+    ]
+    .into_iter()
+    .filter_map(|estimate| estimate.estimated_bytes)
+    .fold(0u64, u64::saturating_add);
     json!({
         "root": root,
         "root_id": root,
@@ -148,8 +158,15 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
             "callgraph_projection": callgraph_projection,
             "inspect": inspect,
             "pending_install": pending_install,
+            "exact_memo": detail.exact_memo.estimated_bytes.unwrap_or(0),
+            "compression_filters": detail.compression_filters.estimated_bytes.unwrap_or(0),
+            "bash": detail.bash.estimated_bytes.unwrap_or(0),
+            "lsp": detail.lsp.estimated_bytes.unwrap_or(0),
+            "parser_pool": detail.parser_pool.estimated_bytes.unwrap_or(0),
         },
         "attributed_bytes": planes_total,
+        "exact_memo": detail.exact_memo,
+        "compression_filters": detail.compression_filters,
         // Included in the semantic plane, not an additional plane to sum.
         "semantic_worker_bytes": detail.semantic.counts.get("worker_index_bytes").copied().unwrap_or(0),
         "semantic_overlay_bytes": detail.semantic.counts.get("checkout_overlay_bytes").copied().unwrap_or(0),
@@ -167,7 +184,9 @@ pub(crate) struct CensusRootRows {
 
 #[derive(PartialEq, Eq)]
 struct RootRowInputs {
-    planes: [u64; 7],
+    planes: [u64; 12],
+    exact_memo: crate::memory::MemoryEstimate,
+    compression_filters: crate::memory::MemoryEstimate,
     semantic_worker: u64,
     semantic_overlay: u64,
     evictable: u64,
@@ -184,8 +203,15 @@ impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
                 &detail.callgraph_projection,
                 &detail.inspect,
                 &detail.pending_install,
+                &detail.exact_memo,
+                &detail.compression_filters,
+                &detail.bash,
+                &detail.lsp,
+                &detail.parser_pool,
             ]
             .map(|plane| plane.estimated_bytes.unwrap_or(0)),
+            exact_memo: detail.exact_memo.clone(),
+            compression_filters: detail.compression_filters.clone(),
             semantic_worker: detail
                 .semantic
                 .counts
@@ -355,7 +381,7 @@ mod tests {
         let mut snapshot = row_cache_fixture();
         let mut cache = CensusRootRows::default();
         cache.render(&snapshot);
-        for plane in 0..7 {
+        for plane in 0..12 {
             let detail = snapshot.roots.get_mut("/repo").unwrap();
             let changed = match plane {
                 0 => &mut detail.trigram,
@@ -364,7 +390,12 @@ mod tests {
                 3 => &mut detail.callgraph,
                 4 => &mut detail.callgraph_projection,
                 5 => &mut detail.inspect,
-                _ => &mut detail.pending_install,
+                6 => &mut detail.pending_install,
+                7 => &mut detail.exact_memo,
+                8 => &mut detail.compression_filters,
+                9 => &mut detail.bash,
+                10 => &mut detail.lsp,
+                _ => &mut detail.parser_pool,
             };
             changed.estimated_bytes = Some(100 + plane);
             let actual = cache.render(&snapshot);
@@ -373,6 +404,32 @@ mod tests {
                 render_root_row("/repo", &snapshot.roots["/repo"])
             );
         }
+    }
+
+    #[test]
+    fn census_attributes_query_cache_bytes_and_invalidates_owner_counts() {
+        let mut snapshot = row_cache_fixture();
+        let detail = snapshot.roots.remove("/repo").unwrap().with_query_caches(
+            crate::memory::MemoryEstimate::estimated(500).count("candidates", 3),
+            crate::memory::MemoryEstimate::estimated(100).count("filters", 19),
+        );
+        snapshot.roots.insert("/repo".into(), detail);
+        let mut cache = CensusRootRows::default();
+        let first = cache.render(&snapshot);
+        assert_eq!(first["/repo"]["planes"]["exact_memo"], 500);
+        assert_eq!(first["/repo"]["planes"]["compression_filters"], 100);
+        assert_eq!(first["/repo"]["attributed_bytes"], 600);
+        assert_eq!(first["/repo"]["exact_memo"]["candidates"], 3);
+        snapshot
+            .roots
+            .get_mut("/repo")
+            .unwrap()
+            .exact_memo
+            .counts
+            .insert("candidates".into(), 4);
+        let second = cache.render(&snapshot);
+        assert_eq!(second["/repo"]["exact_memo"]["candidates"], 4);
+        assert_eq!(second["/repo"]["attributed_bytes"], 600);
     }
 
     #[test]

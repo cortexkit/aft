@@ -5972,6 +5972,7 @@ mod grant_path_tests {
             explicit_runon: false,
             requested_platform: None,
             requested_vcpus: None,
+            requested_memory_mib: None,
             requested_network: false,
             configured_env_names: Vec::new(),
             return_paths: Vec::new(),
