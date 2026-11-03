@@ -1846,7 +1846,17 @@ fn zoom_one_symbol_inner(
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    #[cfg(test)]
+    crate::storage_retention::test_hook(
+        &ctx.canonical_cache_root(),
+        "cg-timing:zoom-observe-begin",
+    );
     let observation = observe_callgraph_query(ctx);
+    #[cfg(test)]
+    crate::storage_retention::test_hook(
+        &ctx.canonical_cache_root(),
+        "cg-timing:zoom-observe-return",
+    );
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",

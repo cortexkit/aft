@@ -15469,9 +15469,18 @@ mod tests {
         let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let (published_tx, published_rx) = crossbeam_channel::unbounded();
+        let (phase_tx, phase_rx) = crossbeam_channel::unbounded();
+        let timing_origin = Instant::now();
         let _hook = crate::storage_retention::observe_test_hook(
             &root,
             Arc::new(move |step| {
+                if step.starts_with("cg-timing:") {
+                    let _ = phase_tx.send((
+                        std::thread::current().id(),
+                        step.to_owned(),
+                        Instant::now(),
+                    ));
+                }
                 if step == "callgraph-materialize" {
                     entered_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -15490,23 +15499,33 @@ mod tests {
             callers_request.clone()
         };
         let (answer_tx, answer_rx) = crossbeam_channel::unbounded();
+        let timing_ids = std::sync::atomic::AtomicUsize::new(0);
         let spawn_read = || {
             let worker_ctx = ctx.clone();
             let request = request.clone();
             let answer_tx = answer_tx.clone();
             let executor = _executor.clone();
             let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+            let timing_root = root.clone();
+            let timing_id = timing_ids.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let id = request.id.clone();
                 let zoom = request.command == "zoom";
                 let run = move |ctx: &AppContext| {
+                    crate::storage_retention::test_hook(
+                        &timing_root,
+                        &format!("cg-timing:request-{timing_id}-pin-begin"),
+                    );
                     let _pin = ctx.pin_config();
-                    if zoom {
+                    crate::storage_retention::test_hook(&timing_root, "cg-timing:pin-return");
+                    let response = if zoom {
                         crate::commands::zoom::handle_zoom(&request, ctx)
                     } else {
                         crate::commands::callers::handle_callers(&request, ctx)
-                    }
+                    };
+                    crate::storage_retention::test_hook(&timing_root, "cg-timing:handler-return");
+                    response
                 };
                 let response = if let Some(executor) = executor {
                     executor
@@ -15542,6 +15561,12 @@ mod tests {
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         concurrent.join().unwrap();
+        for (thread, phase, at) in phase_rx.try_iter() {
+            eprintln!(
+                "cg_timing thread={thread:?} at_us={} {phase}",
+                at.duration_since(timing_origin).as_micros()
+            );
+        }
         assert!(entered.is_ok(), "request never reached materialization");
         for bounded_answer in [first, second] {
             let answered_in_bound = bounded_answer.is_ok();

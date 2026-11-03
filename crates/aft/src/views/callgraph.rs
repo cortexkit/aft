@@ -966,8 +966,13 @@ impl CallgraphView {
         &self,
         now: impl Fn() -> std::time::Instant,
     ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-enter");
         let deadline = std::time::Instant::now() + super::contracts::CALLGRAPH_QUERY_WAIT;
-        self.reader_before(now, deadline)
+        let result = self.reader_before(now, deadline);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-return");
+        result
     }
 
     fn reader_before(
@@ -984,10 +989,12 @@ impl CallgraphView {
         }
         // Joining another request and receiving the acquisition share one
         // deadline; queued readers must not get a fresh window after the lock.
-        let mut retry = self
-            .query
-            .try_lock_until(deadline)
-            .ok_or_else(graph_building)?;
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-begin");
+        let retry = self.query.try_lock_until(deadline);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-return");
+        let mut retry = retry.ok_or_else(graph_building)?;
         let mut steady = self
             .steady
             .lock()
@@ -1025,10 +1032,14 @@ impl CallgraphView {
         {
             *retry = super::contracts::LoadRetry::default();
         }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:steady-update-begin");
         *steady = match &result {
             Ok((store, Some(revision))) => Some((*revision, store.clone())),
             _ => None,
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:steady-update-return");
         let result = result.map(|(store, _)| store);
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
@@ -1114,6 +1125,8 @@ impl CallgraphView {
     }
 
     fn acquire_before(&self, deadline: std::time::Instant) -> ReaderAcquisition {
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:acquire-enter");
         let mut acquisition = self
             .acquisition
             .lock()
@@ -1145,21 +1158,39 @@ impl CallgraphView {
         if acquisition.is_none() {
             let source = self.source.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
+            #[cfg(test)]
+            crate::storage_retention::test_hook(&self.root, "cg-timing:submit-begin");
             self.owner.spawn(
                 self.current.clone(),
                 move || source.acquire_with_revision(),
                 tx,
             )?;
             #[cfg(test)]
+            crate::storage_retention::test_hook(&self.root, "cg-timing:submit-return");
+            #[cfg(test)]
             self.acquisitions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *acquisition = Some(rx);
         }
-        match acquisition
-            .as_ref()
-            .unwrap()
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-        {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        #[cfg(test)]
+        crate::storage_retention::test_hook(
+            &self.root,
+            &format!(
+                "cg-timing:receive-begin budget_us={}",
+                remaining.as_micros()
+            ),
+        );
+        let received = acquisition.as_ref().unwrap().recv_timeout(remaining);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(
+            &self.root,
+            match &received {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => "cg-timing:receive-timeout",
+                _ => "cg-timing:receive-return",
+            },
+        );
+        match received {
             Ok(result) => {
                 *acquisition = None;
                 result
