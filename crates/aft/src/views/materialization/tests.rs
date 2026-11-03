@@ -516,7 +516,9 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             dispatch_decoded_blobs: 2,
             dispatch_resolved_files: 3,
             dispatch_resolved_sites: 0,
-            dispatch_type_target_files: 0,
+            // TypeScript receiver types are resolved for the changed target and
+            // the added file only; no unchanged file is decoded for them.
+            dispatch_type_target_files: 2,
             dispatch_type_target_decoded_blobs: 0,
             dispatch_full: false,
             dispatch_type_target_traces: 0,

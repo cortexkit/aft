@@ -53,7 +53,8 @@ pub struct MaterializeStats {
     pub dispatch_resolved_files: usize,
     /// Method-call sites resolved.
     pub dispatch_resolved_sites: usize,
-    /// Rust files whose receiver type targets were resolved.
+    /// Rust, TypeScript and JavaScript files whose receiver type targets
+    /// were resolved.
     pub dispatch_type_target_files: usize,
     /// Parse blobs decoded only to resolve receiver type targets.
     pub dispatch_type_target_decoded_blobs: usize,

@@ -290,16 +290,16 @@ impl<'a> ObjectDispatch<'a> {
         connection: &Connection,
         reference: &NameMatchRef,
     ) -> Result<Option<NameMatchCandidate>> {
-        let start: usize = connection.query_row(
-            "SELECT byte_start FROM refs WHERE ref_id=?1",
-            [&reference.ref_id],
-            |r| r.get(0),
-        )?;
-        let Some(target) = self
-            .resolutions
-            .get(&reference.caller_file)
-            .and_then(|sites| sites.get(&start))
-        else {
+        // Most unresolved members come from files with no object resolutions;
+        // answer those without touching the store. The statement is cached so
+        // a build prepares it once, not once per member.
+        let Some(sites) = self.resolutions.get(&reference.caller_file) else {
+            return Ok(None);
+        };
+        let start: usize = connection
+            .prepare_cached("SELECT byte_start FROM refs WHERE ref_id=?1")?
+            .query_row([&reference.ref_id], |r| r.get(0))?;
+        let Some(target) = sites.get(&start) else {
             return Ok(None);
         };
         let Some(node_id) = self.index.node_for_symbol(&target.file, &target.symbol) else {
