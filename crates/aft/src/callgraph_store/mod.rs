@@ -7,6 +7,7 @@
 
 pub(crate) mod disk_facts;
 pub(crate) mod facts;
+mod go_dispatch;
 pub mod join;
 #[cfg(target_os = "macos")]
 mod readiness_watch_macos;
@@ -1760,8 +1761,6 @@ mod dead_code_projection;
 
 #[cfg(test)]
 mod dispatch_narrowing_tests;
-
-mod go_dispatch;
 #[cfg(test)]
 mod incremental_parity;
 #[cfg(test)]
