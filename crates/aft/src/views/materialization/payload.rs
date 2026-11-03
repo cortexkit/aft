@@ -4,8 +4,10 @@
 //! method-call facts, sites and type target traces (`view_dispatch_files`)
 //! are repetitive JSON text: before compression they were about 300 MB of the
 //! 1.9 GB call-graph base built for AFT's own repository. They are stored
-//! zlib-compressed; the zlib checksum makes a damaged row fail to read rather
-//! than decode to different text. Everything in memory, including the digests
+//! zlib-compressed at the fastest level: a cold build packs every payload, and
+//! for this text the fastest level costs a few percent more bytes than the
+//! default for a fraction of the CPU. The zlib checksum makes a damaged row
+//! fail to read rather than decode to different text. Everything in memory, including the digests
 //! computed over the JSON text, stays the JSON text; only the stored bytes
 //! change.
 
@@ -21,7 +23,7 @@ use crate::callgraph_store::{CallGraphStoreError, Result};
 pub(crate) fn pack(json: &str) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(
         Vec::with_capacity(json.len() / 4 + 16),
-        Compression::default(),
+        Compression::fast(),
     );
     encoder
         .write_all(json.as_bytes())
