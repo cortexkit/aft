@@ -635,6 +635,24 @@ async fn legacy_root_case(no_project: bool, scoped_without_workdir: bool) {
     assert!(body["tools"]
         .as_array()
         .is_some_and(|tools| !tools.is_empty()));
+    // Views are per tool version, so they answer whether or not the route has a
+    // project folder.
+    let shipped: Value =
+        serde_json::from_str(include_str!("fixtures/tool_views/shipped-v1.json")).unwrap();
+    let pins: Vec<_> = shipped.as_object().unwrap().keys().cloned().collect();
+    let views = legacy_rpc(
+        &mut stream,
+        channel,
+        epoch,
+        5,
+        json!({"op":"tool.views", "pins":pins}),
+    )
+    .await;
+    let body: Value = serde_json::from_slice(&views.body).unwrap();
+    assert_eq!(views.header.ty, FrameType::Response, "{body}");
+    for pin in &pins {
+        assert!(body["views"][pin].is_object(), "{pin}: {body}");
+    }
     drop(stream);
     drop(daemon);
 }
