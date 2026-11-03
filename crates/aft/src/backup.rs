@@ -9006,8 +9006,9 @@ mod tests {
 
     #[test]
     fn backup_discard_retry_stays_in_its_namespace() {
-        let (mut store, _storage, _project, path) = durability_store();
-        with_request_harness("first", || {
+        let (mut store, storage, _project, path) = durability_store();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Runner, 72);
+        with_request_harness("opencode", || {
             store
                 .snapshot_with_op("same-session", &path, "good", Some("good"))
                 .unwrap();
@@ -9019,9 +9020,9 @@ mod tests {
             store.discard_operation_entries("same-session", "bad");
         });
         store.release_memory();
-        with_request_harness("second", || store.record_post_mutation_states());
+        with_request_harness("runner", || store.record_post_mutation_states());
         assert_eq!(store.pending_discards.len(), 1);
-        with_request_harness("first", || {
+        with_request_harness("opencode", || {
             store.record_post_mutation_states();
             assert!(store.pending_discards.is_empty());
             assert_eq!(store.history("same-session", &path).len(), 1);
