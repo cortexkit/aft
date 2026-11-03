@@ -464,18 +464,27 @@ pub fn probe(
     policy: &ProjectDetectionConfig,
     budgets: ProbeBudgets,
 ) -> FolderAdmission {
-    probe_with_read_dir(root, policy, budgets, |path| {
-        // Model a slow directory open (for example, an antivirus scan) without
-        // changing the evidence budget or delaying direct metadata lookups.
-        #[cfg(debug_assertions)]
-        if let Some(delay) = std::env::var("AFT_TEST_ADMISSION_READ_DIR_DELAY_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            std::thread::sleep(Duration::from_millis(delay));
-        }
-        std::fs::read_dir(path)
-    })
+    probe_with_read_dir(root, policy, budgets, read_dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DIRECTORY_OPENS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    DIRECTORY_OPENS_FOR_TEST.with(|opens| opens.set(opens.get() + 1));
+    // Model a slow directory open (for example, an antivirus scan) without
+    // changing the probe's time limit or delaying direct metadata lookups.
+    #[cfg(debug_assertions)]
+    if let Some(delay) = std::env::var("AFT_TEST_ADMISSION_READ_DIR_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
+    std::fs::read_dir(path)
 }
 
 fn probe_with_read_dir(

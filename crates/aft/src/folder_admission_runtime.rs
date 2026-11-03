@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::context::AppContext;
 use crate::folder_admission::{
-    FolderAdmission, FolderClassification, ProbeBudgets, POLICY_VERSION,
+    AdmissionReason, FolderAdmission, FolderClassification, ProbeBudgets, POLICY_VERSION,
 };
 use crate::protocol::{RawRequest, Response};
 
@@ -339,13 +339,25 @@ fn stamps(decision: &FolderAdmission) -> Vec<Stamp> {
     paths.into_iter().map(Stamp::read).collect()
 }
 
+fn root_accessible(decision: &FolderAdmission, root: &Path) -> bool {
+    if decision.classification != FolderClassification::Project {
+        return true;
+    }
+    // Cached strong evidence has the same direct-lookup contract as a fresh
+    // probe. Opening the directory here would put slow enumeration ahead of
+    // the known marker or Git control metadata again on reconnect.
+    root.is_dir()
+        && (matches!(
+            decision.reason,
+            AdmissionReason::RootMarker | AdmissionReason::GitCheckout
+        ) || crate::folder_admission::read_dir(root).is_ok())
+}
+
 fn valid(cache: &Cache, config: &Config, root: &Path) -> bool {
     if !cache.decision.is_determined() {
         return false;
     }
-    if cache.decision.classification == FolderClassification::Project
-        && std::fs::read_dir(root).is_err()
-    {
+    if !root_accessible(&cache.decision, root) {
         return false;
     }
     cache.decision.policy_version == POLICY_VERSION
@@ -380,9 +392,7 @@ fn intent_valid(cache: &Cache, config: &Config, root: &Path) -> bool {
     {
         return false;
     }
-    if cache.decision.classification == FolderClassification::Project
-        && std::fs::read_dir(root).is_err()
-    {
+    if !root_accessible(&cache.decision, root) {
         return false;
     }
     if valid(cache, config, root) {
@@ -1994,6 +2004,55 @@ mod tests {
             assert!(override_cache(root.path(), mode).is_some());
             assert!(override_cache(&file, mode).is_none());
             assert!(override_cache(&root.path().join("missing"), mode).is_none());
+        }
+    }
+
+    #[test]
+    fn strong_cached_evidence_does_not_open_a_directory() {
+        for git in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            if git {
+                std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+                std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+                std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+                std::fs::write(
+                    root.join(".git/config"),
+                    "[core]\nrepositoryformatversion=0\nbare=false\n",
+                )
+                .unwrap();
+            } else {
+                std::fs::write(root.join("Cargo.toml"), "").unwrap();
+            }
+            let config = Config::default();
+            let decision = crate::folder_admission::probe(
+                root,
+                &config.project_detection,
+                ProbeBudgets::default(),
+            );
+            assert_eq!(
+                decision.classification,
+                FolderClassification::Project,
+                "{decision:?}"
+            );
+            let mut cache = Cache {
+                policy: policy(&config, root),
+                checked_ms: now_ms(),
+                stamps: stamps(&decision),
+                decision,
+                relative_paths: false,
+            };
+            crate::folder_admission::DIRECTORY_OPENS_FOR_TEST.with(|opens| opens.set(0));
+            assert!(valid(&cache, &config, root));
+            assert!(intent_valid(&cache, &config, root));
+            // Ordinary directory mtime drift must still use the known marker
+            // or HEAD, not reopen the root to establish that it is a project.
+            let facts = cache.stamps[0].facts.as_mut().unwrap();
+            facts.1 = facts.1.saturating_sub(1);
+            assert!(!valid(&cache, &config, root));
+            assert!(intent_valid(&cache, &config, root));
+            crate::folder_admission::DIRECTORY_OPENS_FOR_TEST
+                .with(|opens| assert_eq!(opens.get(), 0));
         }
     }
 
