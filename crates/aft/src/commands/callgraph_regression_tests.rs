@@ -393,30 +393,29 @@ fn callgraph_python_nested_receiver_bodies_keep_enclosing_callers_in_views() {
         store.project_root(),
         &[store.project_root().join("calls.py")],
     );
-    for sites in [
-        store.direct_callers_of(Path::new("calls.py"), "Builder::make"),
-        view.direct_callers_of(Path::new("calls.py"), "Builder::make"),
-    ] {
-        let mut owners = sites
-            .unwrap()
-            .into_iter()
-            .map(|site| (site.line, site.caller.symbol))
-            .collect::<Vec<_>>();
-        owners.sort();
-        assert_eq!(
-            owners,
-            [
-                (5, "outer".into()),
-                (6, "inner".into()),
-                (6, "outer".into())
-            ]
-        );
-    }
-    assert_python_view_answers(
-        &store,
-        &[("calls.py", "Builder::make")],
-        &[("calls.py", "outer"), ("calls.py", "inner")],
-    );
+    // Module-level assignments do not prove a function-local receiver type.
+    // Preserve all unresolved caller evidence without inventing an exact target.
+    assert!(store
+        .direct_callers_of(Path::new("calls.py"), "Builder::make")
+        .unwrap()
+        .is_empty());
+    assert!(view
+        .direct_callers_of(Path::new("calls.py"), "Builder::make")
+        .unwrap()
+        .is_empty());
+    let snapshot = crate::callgraph_store::project_dead_code_snapshot_from_view(&view)
+        .unwrap()
+        .1;
+    let mut owners = snapshot
+        .outbound_calls
+        .iter()
+        .filter(|call| matches!(call.line, 5 | 6))
+        .map(|call| (call.line, call.caller_symbol.as_str()))
+        .collect::<Vec<_>>();
+    owners.sort();
+    assert_eq!(owners, [(5, "outer"), (6, "inner"), (6, "outer")]);
+    let counts = view.dispatch_site_counts().unwrap().unwrap();
+    assert_eq!(counts["python"].unresolved_receiver_sites, 3);
 }
 
 #[test]
