@@ -7511,7 +7511,7 @@ mod membership_admission_tests {
     #[test]
     #[ignore = "benchmark of the live checkout; prints counts only"]
     fn membership_checkout_stat_counts_benchmark() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()
@@ -8226,6 +8226,8 @@ pub(crate) struct ArtifactCacheKeyTimings {
     pub(crate) rev_list: Duration,
     /// Git processes actually started, including unborn-branch verification.
     pub(crate) git_spawns: usize,
+    /// Full history traversals, excluding cheap HEAD verification on reuse.
+    pub(crate) root_walks: usize,
     pub(crate) retry_wait: Duration,
     pub(crate) memo_wait: Duration,
     pub(crate) memo_hold: Duration,
@@ -9709,6 +9711,8 @@ pub(crate) fn repository_identity_stamp(root: &Path) -> Option<String> {
 /// root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RootCommitStamp {
+    common_dir: PathBuf,
+    common_dir_identity: RootCommitFileIdentity,
     git_marker: Option<RootCommitFileIdentity>,
     git_marker_text: Option<Vec<u8>>,
     commondir_text: Option<Vec<u8>>,
@@ -9778,6 +9782,87 @@ impl RootCommitFileIdentity {
 }
 
 impl RootCommitStamp {
+    /// Share immutable history only within one object store and one HEAD.
+    /// Special history views still use the full Git probe on every bind.
+    fn shared_history_key(&self) -> Option<(String, String)> {
+        if !self.replace_ref_contents.is_empty()
+            || std::env::var_os("GIT_NAMESPACE").is_some()
+            || std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES").is_some()
+            || std::env::var_os("GIT_REFERENCE_BACKEND").is_some()
+        {
+            return None;
+        }
+        for contents in self.config_contents.iter().flatten() {
+            for token in [b"partialclone".as_slice(), b"promisor", b"refstorage"] {
+                if contents
+                    .windows(token.len())
+                    .any(|window| window.eq_ignore_ascii_case(token))
+                {
+                    return None;
+                }
+            }
+        }
+        for path in [
+            self.common_dir.join("shallow"),
+            self.common_dir.join("info/grafts"),
+            self.common_dir.join("objects/info/alternates"),
+        ] {
+            if !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return None;
+            }
+        }
+        let packed = match fs::read(self.common_dir.join("packed-refs")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return None,
+        };
+        if packed
+            .windows(b"refs/replace/".len())
+            .any(|window| window == b"refs/replace/")
+        {
+            return None;
+        }
+        let head = std::str::from_utf8(&self.head).ok()?.trim();
+        let commit = if let Some(reference) = head.strip_prefix("ref:") {
+            match self.head_ref.as_deref() {
+                Some(bytes) => std::str::from_utf8(bytes).ok()?.trim(),
+                None => std::str::from_utf8(&packed)
+                    .ok()?
+                    .lines()
+                    .find_map(|line| {
+                        let (oid, name) = line.split_once(' ')?;
+                        (name == reference.trim()).then_some(oid)
+                    })?,
+            }
+        } else {
+            head
+        };
+        if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        // A commit's ancestry is content-addressed. New loose objects, repacks
+        // and commit-graph updates cannot change which parentless commits are
+        // reachable from the same HEAD, so storage topology must not invalidate
+        // sharing across busy worktrees.
+        // History-changing views are excluded above; each bind still asks Git
+        // to verify repository access and a readable HEAD before reusing roots.
+        let git_env: BTreeMap<_, _> = std::env::vars_os()
+            .filter(|(name, _)| name.to_str().is_some_and(|name| name.starts_with("GIT_")))
+            .collect();
+        let key = blake3::hash(
+            format!(
+                "{:?}|{commit}|{:?}|{:?}|{:?}|{git_env:?}",
+                self.common_dir, self.common_dir_identity, self.config_contents, self.watched
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        Some((key, commit.to_string()))
+    }
+
     /// Environment variables that move git's repository, work tree or
     /// history view away from the on-disk layout this stamp reads.
     const UNMODELED_ENV: &'static [&'static str] = &[
@@ -9897,6 +9982,8 @@ impl RootCommitStamp {
             watched.push(RootCommitFileIdentity::of(&path, true)?);
         }
         Some(Self {
+            common_dir: fs::canonicalize(&common_dir).ok()?,
+            common_dir_identity: RootCommitFileIdentity::of(&common_dir, false)??,
             git_marker: RootCommitFileIdentity::of(&marker, false)?,
             git_marker_text,
             commondir_text,
@@ -10058,6 +10145,26 @@ fn git_root_commit_once_real(
             crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string(),
         );
     }
+    // A fresh worktree still asks Git to verify access and HEAD: filesystem
+    // stamps alone cannot attest ownership policy or a readable commit object.
+    // Only the parent walk is shared with an earlier verified bind. Keep the
+    // per-root identity lock, legacy database pins that preserve a root's
+    // stored identity, and scoped-key derivation outside this cache.
+    type SharedHistory = HashMap<PathBuf, (String, String)>;
+    static SHARED_HISTORY: OnceLock<Mutex<SharedHistory>> = OnceLock::new();
+    let history = SHARED_HISTORY.get_or_init(|| Mutex::new(HashMap::new()));
+    let stamp = RootCommitStamp::capture(project_root);
+    let shared = stamp.as_ref().and_then(RootCommitStamp::shared_history_key);
+    let cached = shared.as_ref().and_then(|(key, _)| {
+        history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&stamp.as_ref().unwrap().common_dir)
+            .filter(|(saved, _)| saved == key)
+            .map(|(_, roots)| roots.clone())
+    });
+    // Tests count each Git verification of the root, whether it reuses the
+    // shared history (HEAD check only) or walks it.
     #[cfg(test)]
     ROOT_COMMIT_GIT_RUNS.with(|runs| {
         *runs
@@ -10065,16 +10172,46 @@ fn git_root_commit_once_real(
             .entry(project_root.to_path_buf())
             .or_default() += 1;
     });
+    if let Some(roots) = cached {
+        let mut spawned = 0;
+        let head = time_cache_key_work(&mut timings.rev_list, || {
+            crate::git_probe::head_commit(project_root, &mut spawned)
+        });
+        timings.git_spawns += spawned;
+        if head.is_ok_and(|head| {
+            std::str::from_utf8(&head).is_ok_and(|head| head.trim() == shared.as_ref().unwrap().1)
+        }) && RootCommitStamp::capture(project_root).as_ref() == stamp.as_ref()
+            && stamp.as_ref().and_then(RootCommitStamp::shared_history_key) == shared
+        {
+            return RootCommitProbe::Commit(roots);
+        }
+    }
     // The rev_list timing also covers the extra Git checks that verify an
     // unborn branch, since they are part of deciding this probe's answer, and
     // git_spawns counts every Git process the probe actually started.
     let mut spawned = 0;
+    timings.root_walks += 1;
     let result = time_cache_key_work(&mut timings.rev_list, || {
         crate::git_probe::root_commits(project_root, &mut spawned)
     });
     timings.git_spawns += spawned;
     match result {
-        Ok(stdout) => canonicalize_root_commit_output(&stdout),
+        Ok(stdout) => {
+            let result = canonicalize_root_commit_output(&stdout);
+            if let (Some(stamp), Some((key, _)), RootCommitProbe::Commit(roots)) =
+                (stamp.as_ref(), shared, &result)
+            {
+                if RootCommitStamp::capture(project_root).as_ref() == Some(stamp)
+                    && stamp.shared_history_key().as_ref().map(|(key, _)| key) == Some(&key)
+                {
+                    history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(stamp.common_dir.clone(), (key, roots.clone()));
+                }
+            }
+            result
+        }
         Err(crate::git_probe::ProbeError::Spawn(error)) => {
             RootCommitProbe::Transient(format!("spawn failed: {error}"))
         }
@@ -14288,7 +14425,7 @@ mod tests {
     #[test]
     #[ignore = "profiles real repository sources and persists temporary caches"]
     fn warm_reload_repository_canonicalization_counts() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = Path::new(crate::test_support::manifest_dir()).join("../..");
         measure_warm_reload_canonicalizations(&root);
     }
 

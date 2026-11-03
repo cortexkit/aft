@@ -138,6 +138,83 @@ fn explain(conn: &Connection, sql: &str) -> String {
 }
 
 #[test]
+fn project_replay_reads_candidates_not_delivered_history() {
+    let mut fixture = Fixture::with_sizes(TASK_HISTORY_ROWS, 1);
+    let conn = &mut fixture.conn;
+    // Model a database populated before the optional replay index was installed.
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_bash_tasks_project_replay;
+         UPDATE bash_tasks SET project_key='replay-project',
+             metadata=json_object('completion_delivered', json('true'),
+                                  'padding', printf('%08192d', 0));
+         INSERT INTO bash_tasks
+             (harness, session_id, task_id, project_key, command, cwd, status,
+              started_at, completion_delivered, metadata)
+         VALUES
+             ('opencode', 's', 'undelivered', 'replay-project', '', '.', 'failed',
+              1, 0, '{\"completion_delivered\":true}'),
+             ('opencode', 's', 'running', 'replay-project', '', '.', 'running',
+              2, 1, '{}'),
+             ('opencode', 's', 'disagreement', 'replay-project', '', '.', 'completed',
+              2, 1, '{\"completion_delivered\":false}'),
+             ('opencode', 's', 'invalid-json', 'replay-project', '', '.', 'completed',
+              0, 1, 'not-json'),
+             ('opencode', 's', 'string-false', 'replay-project', '', '.', 'completed',
+              0, 1, '{\"completion_delivered\":\"false\"}'),
+             ('opencode', 's', 'other-project', 'other-project', '', '.', 'running',
+              0, 0, '{}'),
+             ('pi', 's', 'other-harness', 'replay-project', '', '.', 'running',
+              0, 0, '{}');",
+    )
+    .unwrap();
+
+    let (before, before_executed) = record(conn, |conn| {
+        list_replayable_bash_tasks_for_project(conn, "opencode", "replay-project").unwrap()
+    });
+    assert_eq!(before_executed.len(), 1, "{before_executed:?}");
+    let before_plan = explain(conn, &before_executed[0].sql);
+    println!(
+        "project replay before index: {before_plan}; VM steps: {}",
+        before_executed[0].vm_steps
+    );
+    assert!(before_executed[0].vm_steps > TASK_HISTORY_ROWS as i32);
+    let version_before = crate::db::schema_version_without_wait(conn).unwrap();
+    crate::db::ensure_additive_indexes(conn).unwrap();
+    assert_eq!(
+        crate::db::schema_version_without_wait(conn).unwrap(),
+        version_before,
+        "installing an optional index must not change the schema version"
+    );
+
+    let (rows, executed) = record(conn, |conn| {
+        list_replayable_bash_tasks_for_project(conn, "opencode", "replay-project").unwrap()
+    });
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.task_id.as_str())
+            .collect::<Vec<_>>(),
+        ["undelivered", "disagreement", "running"]
+    );
+    assert_eq!(
+        before
+            .iter()
+            .map(|row| row.task_id.as_str())
+            .collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.task_id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(executed.len(), 1, "{executed:?}");
+    let query = &executed[0];
+    let plan = explain(conn, &query.sql);
+    println!("project replay: {plan}; VM steps: {}", query.vm_steps);
+    assert!(plan.contains("idx_bash_tasks_project_replay"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    // A project-history scan executes thousands of steps even if it returns no rows.
+    assert!(query.vm_steps > 0 && query.vm_steps < 1000, "{query:?}");
+}
+
+#[test]
 fn terminal_retention_delete_uses_primary_key_and_batch_work() {
     let mut histories = Vec::new();
     // A 16-fold history increase must not increase point-delete VM work. Even

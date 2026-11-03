@@ -200,7 +200,7 @@ fn incremental_reuse_requires_matching_path_and_content() {
 fn repository_semantic_fill_read_probe() {
     use crate::blob_store::v2::read_tests::{describe, ReadProbe};
 
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = Path::new(crate::test_support::manifest_dir()).join("../..");
     let revision = std::env::var("AFT_SEMANTIC_READ_PROBE_REV").unwrap_or_else(|_| "HEAD".into());
     let listing = std::process::Command::new("git")
         .current_dir(&source)

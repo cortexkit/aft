@@ -1,0 +1,1 @@
+program P; procedure F; begin end; begin F; end.

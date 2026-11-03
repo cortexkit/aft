@@ -308,6 +308,8 @@ def verify_split_archives(
             "list",
             "--archive-file",
             archive_path,
+            "--workspace-remap",
+            str(ROOT),
             "--profile",
             "gate",
             "-T",

@@ -20,7 +20,7 @@ use crate::parser::TreeSitterProvider;
 use crate::protocol::{RawRequest, Response};
 
 fn fixture_rows() -> Vec<Value> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = PathBuf::from(crate::test_support::manifest_dir())
         .join("../../spec/feature-config/consumer-responses.json");
     let doc: Value = serde_json::from_str(
         &std::fs::read_to_string(&path).expect("read shared consumer fixtures"),

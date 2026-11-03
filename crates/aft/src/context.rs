@@ -13373,6 +13373,8 @@ impl AppContext {
             .lock()
             .as_ref()
             .is_some_and(|view| view.matches(&root, &storage, &family, policy));
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-route-ready");
         if !own_view_bound || self.callgraph_borrow.lock().is_some() {
             if let Some(borrowed) =
                 self.borrowed_callgraph_view_reader(&root, &storage, &family, policy, false)
@@ -13394,6 +13396,8 @@ impl AppContext {
                 return Some(borrowed);
             }
         }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-select-begin");
         let view = {
             let mut slot = self.callgraph_view.lock();
             if !slot
@@ -13457,13 +13461,19 @@ impl AppContext {
             }
             slot.as_ref().unwrap().clone()
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-selected");
         self.record_checkout_pending_watcher_gap();
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-gap-recorded");
         let result = match acquire(&view) {
             Err(error) if error.reason.contains(crate::views::trigram::BASE_CAP_BUSY) => self
                 .borrowed_callgraph_view_reader(&root, &storage, &family, policy, true)
                 .unwrap_or(Err(error)),
             result => result,
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-view-read-return");
         if pinned_config_for(self.config_pin_key()).is_some() {
             CALLGRAPH_QUERY_READERS.with(|readers| {
                 readers
@@ -13479,6 +13489,8 @@ impl AppContext {
                 self.note_classified_view_load_failure("callgraph", &error.reason, false);
             }
         }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&root, "cg-timing:context-accounted");
         Some(result)
     }
 
@@ -19540,7 +19552,7 @@ mod force_restrict_tests {
     /// it is not one of the route's roots.
     #[test]
     fn standalone_main_checkout_is_read_only() {
-        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let project = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let main = project.path().join("main");
         let linked = project.path().join("linked");
         link_worktree(&main, &linked);
@@ -19562,7 +19574,7 @@ mod force_restrict_tests {
     /// exemption.
     #[test]
     fn standalone_forged_worktree_link_gets_no_main_checkout_exemption() {
-        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let project = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let other = project.path().join("other");
         let real = project.path().join("real-worktree");
         link_worktree(&other, &real);
@@ -19595,7 +19607,7 @@ mod force_restrict_tests {
     #[cfg(unix)]
     #[test]
     fn standalone_main_checkout_swapped_for_a_symlink_grants_nothing() {
-        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let project = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let main = project.path().join("main");
         let linked = project.path().join("linked");
         link_worktree(&main, &linked);
@@ -19630,7 +19642,7 @@ mod force_restrict_tests {
     #[test]
     fn standalone_linked_worktree_keeps_main_checkout_without_prompting() {
         use crate::access_policy::{ask_route_guard, AskRoute};
-        let project = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let project = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let main = project.path().join("main");
         let linked = project.path().join("linked");
         let unrelated = project.path().join("unrelated.txt");
@@ -19687,7 +19699,7 @@ mod force_restrict_tests {
     fn standalone_native_plugin_dispatch_never_uses_lowered() {
         use crate::access_policy::{current_ask_route, with_native_route, AskRoute};
         let root = TempDir::new().unwrap();
-        let outside = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let outside = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let target = outside.path().join("file.txt");
         std::fs::write(&target, "protected").unwrap();
         for harness in [
@@ -19716,7 +19728,7 @@ mod force_restrict_tests {
     fn standalone_plugin_ids_do_not_widen_operation_target_or_floor() {
         use crate::access_policy::{ask_route_guard, AskRoute};
         let root = TempDir::new().unwrap();
-        let outside = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let outside = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let target = outside.path().join("file.txt");
         std::fs::write(&target, "unchanged").unwrap();
         let ctx = test_context(Some(root.path().into()), false);

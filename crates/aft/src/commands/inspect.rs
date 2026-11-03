@@ -7972,7 +7972,7 @@ mod fresh_payload_tests {
             serde_json::json!({"name": name, "inspect_terminal": response.data["inspect_terminal"],
                 "text": crate::subc_format::format_inspect_for_test(&response)})
         }).collect::<Vec<_>>();
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = Path::new(crate::test_support::manifest_dir())
             .join("tests/fixtures/inspect/noise-renderer.json");
         let actual = serde_json::to_string_pretty(&rendered).unwrap() + "\n";
         if std::env::var_os("UPDATE_INSPECT_NOISE_GOLDEN").is_some() {
@@ -8424,7 +8424,7 @@ mod deferred_terminal_tests {
     #[test]
     #[ignore = "cold linked-worktree profile; requires AFT_INSPECT_COLD_PROFILE_OUTPUT"]
     fn inspect_cold_workspace_profile() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = Path::new(crate::test_support::manifest_dir()).join("../..");
         let scratch = source.join("target/scratch/inspect-cold-profile");
         std::fs::create_dir_all(&scratch).unwrap();
         // Build-server snapshots expose a read-only .git. Give linked worktrees
@@ -8847,7 +8847,8 @@ mod deferred_terminal_tests {
     #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
     fn live_cpu_root_stats_checkout_cost() {
         let root =
-            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+            std::fs::canonicalize(Path::new(crate::test_support::manifest_dir()).join("../.."))
+                .unwrap();
         INSPECT_STAT_CALLS.with(|count| count.set(0));
         crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.set(0));
         let started = Instant::now();

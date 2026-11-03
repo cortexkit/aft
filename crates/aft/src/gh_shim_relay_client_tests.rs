@@ -686,7 +686,7 @@ fn every_vendored_plexus_refusal_code_has_an_explanation() {
             _ => {}
         }
     }
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let dir = std::path::Path::new(crate::test_support::manifest_dir())
         .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
     let mut found = std::collections::BTreeSet::new();
     let mut files = 0;

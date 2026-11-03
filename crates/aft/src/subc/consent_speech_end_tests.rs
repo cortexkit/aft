@@ -63,7 +63,9 @@ impl ScopeEndControl {
     }
 
     async fn next(&mut self) -> WriterFrame {
-        let frame = tokio::time::timeout(Duration::from_secs(10), self.frames.recv())
+        // A frame the program never sends still fails; the generous wait only
+        // absorbs a loaded macOS runner, which missed a 10 s budget.
+        let frame = tokio::time::timeout(Duration::from_secs(30), self.frames.recv())
             .await
             .unwrap()
             .unwrap();

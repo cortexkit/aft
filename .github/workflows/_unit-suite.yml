@@ -736,11 +736,9 @@ jobs:
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: macos-26
-    # A cold compile of the crate's lib tests takes 19-28 min on these
-    # runners, and a slow runner reached 30 min in 2 of 12 recent main runs.
-    # The job then shows as cancelled and fails the whole macOS unit suite
-    # without any test having run.
+    # The library test compiler peaks near 13 GB, above the free runner's 7 GB.
+    # Only compilation needs the 24 GB runner; the five test shards stay free.
+    runs-on: blacksmith-6vcpu-macos-26
     timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -774,7 +772,12 @@ jobs:
       - name: Build nextest archive (macOS lib tests)
         # The selected integration probe makes Cargo build the real aft CLI.
         # Its tests are filtered out; only the library bucket enters this archive.
-        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
+        shell: bash
+        run: |
+          started=$SECONDS
+          trap 'printf "### macOS libtest archive\n\nRunner: blacksmith-6vcpu-macos-26 (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          # Native time reports resident-memory and paging counters for the build.
+          /usr/bin/time -l cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
@@ -1051,7 +1054,10 @@ jobs:
           verify-zstd: macos-bin-nextest.tar.zst
 
       - name: Rust libtest shard (nextest archive)
-        run: ./scripts/rust-test-gate.sh
+        run: |
+          started=$SECONDS
+          trap 'printf "### macOS libtest shard %s\n\nRunner: macos-26 (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          ./scripts/rust-test-gate.sh
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log

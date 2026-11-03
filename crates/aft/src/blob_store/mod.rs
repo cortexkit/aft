@@ -1181,7 +1181,7 @@ mod tests {
         );
         assert_eq!(
             crate::views::callgraph::PRODUCER,
-            "ruled-callgraph-v13-python-import-bindings"
+            "ruled-callgraph-v14-resolver-precision"
         );
         let c = b"int plain(void);\n";
         let cpp = b"template <typename T> class Widget { public: T value(T x) { return x; } };\n";
@@ -1245,7 +1245,7 @@ mod tests {
             );
             let attachment = crate::views::callgraph::attach(&mut entry, bytes, &language).unwrap();
             let main =
-                CallgraphKey::from_bytes(bytes, "c", "ruled-callgraph-v13-python-import-bindings")
+                CallgraphKey::from_bytes(bytes, "c", "ruled-callgraph-v14-resolver-precision")
                     .full_key();
             assert_eq!(
                 attachment.key != crate::blob_store::v2::FamilyKey::from(&main),

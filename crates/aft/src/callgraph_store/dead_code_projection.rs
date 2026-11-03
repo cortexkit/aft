@@ -1392,7 +1392,7 @@ mod tests {
         fs::write(
             &source,
             r#"mod other;
-use other::OtherType;
+use other::{OtherType, Factory};
 
 fn run() {
     let _ = OtherType::new();
@@ -1403,8 +1403,9 @@ fn run() {
         fs::write(
             &target_source,
             r#"pub struct OtherType;
-impl OtherType {
-    pub fn new() -> Self { Self }
+pub trait Factory { fn new() -> Self; }
+impl Factory for OtherType {
+    fn new() -> Self { Self }
 }
 "#,
         )

@@ -892,7 +892,7 @@ fn no_production_path_calls_copy_on_first_use() {
                     .contains("copy_on_first_use")
             {
                 found.push(
-                    path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    path.strip_prefix(crate::test_support::manifest_dir())
                         .unwrap()
                         .to_string_lossy()
                         .replace('\\', "/"),
@@ -902,7 +902,7 @@ fn no_production_path_calls_copy_on_first_use() {
     }
     let mut found = Vec::new();
     scan(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &Path::new(crate::test_support::manifest_dir()).join("src"),
         &mut found,
     );
     found.sort();

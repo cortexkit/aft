@@ -11881,14 +11881,16 @@ mod tests {
     }
 
     /// The backend probe answers on its own thread, so a test repeats the
-    /// request until the verdict arrives (a refused local connect takes
-    /// milliseconds) and returns the first reply that carries it, or the last
-    /// reply after a few seconds so the caller's assertion shows what it got.
+    /// request until the verdict arrives and returns the first reply that
+    /// carries it, or the last reply once the deadline passes so the caller's
+    /// assertion shows what it got. A refused local connect takes milliseconds
+    /// on Linux and macOS but can take seconds on a loaded Windows runner, so
+    /// the deadline is generous.
     fn poll_for_backend_verdict(
         mut request: impl FnMut() -> serde_json::Value,
         arrived: impl Fn(&serde_json::Value) -> bool,
     ) -> serde_json::Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let reply = request();
             if arrived(&reply) || std::time::Instant::now() >= deadline {

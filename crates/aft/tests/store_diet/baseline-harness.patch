@@ -1,0 +1,126 @@
+diff --git a/crates/aft/src/callgraph_store/mod.rs b/crates/aft/src/callgraph_store/mod.rs
+index a15f849fbc..8dc682ffda 100644
+--- a/crates/aft/src/callgraph_store/mod.rs
++++ b/crates/aft/src/callgraph_store/mod.rs
+@@ -1756,12 +1756,16 @@ thread_local! {
+ }
+ 
+ mod dead_code_projection;
++
+ #[cfg(test)]
+ mod dispatch_narrowing_tests;
+ #[cfg(test)]
+ mod incremental_parity;
+ #[cfg(test)]
+ mod manifest_refresh_tests;
++#[cfg(test)]
++#[path = "../../tests/store_diet/harness.rs"]
++mod store_diet;
+ 
+ #[cfg(test)]
+ pub(crate) mod perf_tests;
+diff --git a/crates/aft/src/commands/callgraph_store_adapter.rs b/crates/aft/src/commands/callgraph_store_adapter.rs
+index f7eecda722..665e697c7d 100644
+--- a/crates/aft/src/commands/callgraph_store_adapter.rs
++++ b/crates/aft/src/commands/callgraph_store_adapter.rs
+@@ -4363,3 +4363,12 @@ mod trace_to_tests {
+ #[cfg(test)]
+ #[path = "callgraph_regression_tests.rs"]
+ mod callgraph_regression_tests;
++
++#[cfg(test)]
++pub(crate) fn store_diet_trace_data_origin(
++    file: &Path,
++    symbol: &str,
++    cache: &SharedSymbolCache,
++) -> bool {
++    resolve_symbol_query_with_cache(file, symbol, cache).is_ok()
++}
+diff --git a/crates/aft/src/views/materialization/dispatch.rs b/crates/aft/src/views/materialization/dispatch.rs
+index d1cfe9eac6..46d12a7186 100644
+--- a/crates/aft/src/views/materialization/dispatch.rs
++++ b/crates/aft/src/views/materialization/dispatch.rs
+@@ -1312,3 +1312,83 @@ pub fn counts(connection: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<St
+     }
+     Ok(result)
+ }
++
++#[cfg(test)]
++pub(crate) fn store_diet_node_kind(
++    connection: &rusqlite::Connection,
++    file: &str,
++    symbol: &str,
++) -> Result<Option<String>> {
++    let transaction = connection.unchecked_transaction()?;
++    let selected = node(&transaction, file, symbol)?;
++    let kind = selected
++        .map(|id| {
++            transaction.query_row("SELECT kind FROM nodes WHERE id = ?1", [id], |row| {
++                row.get(0)
++            })
++        })
++        .transpose()?;
++    transaction.commit()?;
++    Ok(kind)
++}
++
++#[cfg(test)]
++pub(crate) fn store_diet_replacement_order(
++    connection: &rusqlite::Connection,
++    file: &str,
++    caller: &str,
++    symbol: &str,
++) -> Result<serde_json::Value> {
++    let hint = SiteHint {
++        ordinal: 1_000_000,
++        caller: Some(caller.into()),
++        line: 1,
++        member: Some("m".into()),
++        receiver: Some("C".into()),
++        dynamic: false,
++    };
++    let resolution = Resolution {
++        targets: BTreeSet::from([
++            Target {
++                file: file.into(),
++                symbol: symbol.into(),
++                provenance: "exact",
++            },
++            Target {
++                file: file.into(),
++                symbol: symbol.into(),
++                provenance: "dispatch",
++            },
++        ]),
++        ..Resolution::default()
++    };
++    let order = resolution
++        .targets
++        .iter()
++        .map(|target| target.provenance)
++        .collect::<Vec<_>>();
++    let site = ResolvedSite {
++        file,
++        language: "typescript",
++        ref_id: format!("view:{file}:{}", hint.ordinal),
++        site: &hint,
++        resolution: Rc::new(resolution),
++    };
++    let transaction = connection.unchecked_transaction()?;
++    write_row_by_row(&transaction, std::slice::from_ref(&site), false)?;
++    let edge_id = site.edge_id(site.resolution.targets.iter().next().unwrap());
++    let provenance: String = transaction.query_row(
++        "SELECT provenance FROM edges WHERE edge_id=?1",
++        [&edge_id],
++        |row| row.get(0),
++    )?;
++    let ref_row: bool = transaction.query_row(
++        "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1)",
++        [&site.ref_id],
++        |row| row.get(0),
++    )?;
++    transaction.rollback()?;
++    Ok(
++        serde_json::json!({"target_order": order, "winning_provenance": provenance, "ref_row_exists": ref_row}),
++    )
++}

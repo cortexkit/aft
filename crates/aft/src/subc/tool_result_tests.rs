@@ -174,7 +174,7 @@ fn tool_result_serialized_size_is_strictly_below_three_mib() {
 }
 
 fn scratch_project() -> tempfile::TempDir {
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+    let scratch = Path::new(crate::test_support::manifest_dir()).join("../../target/scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     tempfile::tempdir_in(scratch).unwrap()
 }
@@ -2136,7 +2136,7 @@ fn native_response(mut flat: Value) -> Response {
 fn tool_result_real_reply_validation_report() {
     REPLIES.set(0);
     CODES.with_borrow_mut(|codes| codes.clear());
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+    let scratch = Path::new(crate::test_support::manifest_dir()).join("../../target/scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let project = tempfile::tempdir_in(&scratch).unwrap();
     let root = project.path();
@@ -2148,7 +2148,7 @@ fn tool_result_real_reply_validation_report() {
 
     // Replay captured native responses at the dispatch boundary, not handwritten envelopes.
     let fixture_root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subc_parity/format");
+        Path::new(crate::test_support::manifest_dir()).join("tests/fixtures/subc_parity/format");
     let mut fixtures: Vec<_> = std::fs::read_dir(fixture_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())

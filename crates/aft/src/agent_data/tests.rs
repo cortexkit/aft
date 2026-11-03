@@ -74,8 +74,8 @@ fn ambiguous_root_and_no_matching_checkout_are_drops() {
 
 #[test]
 fn project_registry_published_vectors_decode() {
-    let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_data/project-resolve-v1");
+    let base = Path::new(crate::test_support::manifest_dir())
+        .join("tests/fixtures/agent_data/project-resolve-v1");
     let manifest = std::fs::read_to_string(base.join("SHA256SUMS")).unwrap();
     use sha2::{Digest, Sha256};
     for line in manifest.lines() {
@@ -279,8 +279,8 @@ fn session_for_ref_published_vectors_decode_without_rewriting() {
     use cortexkit_agent_identity::{AgentSessionForRefParams, AgentSessionForRefReply};
     use cortexkit_project_identity::{RefusalCode, Request};
     use sha2::{Digest, Sha256};
-    let root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent_data/agent-sessions-v1");
+    let root = Path::new(crate::test_support::manifest_dir())
+        .join("tests/fixtures/agent_data/agent-sessions-v1");
     let manifest = std::fs::read_to_string(root.join("SHA256SUMS")).unwrap();
     for line in manifest.lines() {
         let (digest, name) = line.split_once("  ").unwrap();

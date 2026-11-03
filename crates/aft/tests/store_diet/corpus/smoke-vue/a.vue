@@ -1,0 +1,1 @@
+<script>function f() {}</script><template><div/></template>

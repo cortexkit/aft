@@ -10130,7 +10130,7 @@ export function bannerUnused() {}
     #[test]
     #[ignore = "offline probe requires a normalized production graph copy below target"]
     fn profile_fresh_refresh_projection_on_store_copy() {
-        let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let project = Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()
@@ -11798,7 +11798,7 @@ pub fn unrelated() -> u32 { 2 }
     #[ignore = "offline projection/rollup benchmark copies a production generation"]
     fn profile_incremental_projection_on_store_copy() {
         use rusqlite::{backup::Backup, Connection, OpenFlags};
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace_root = Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()

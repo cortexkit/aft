@@ -1,0 +1,1 @@
+trait I { fn m(&self); } struct A; struct B; impl I for A { fn m(&self) {} } impl I for B { fn m(&self) {} } fn caller(x: &dyn I) { x.m(); }

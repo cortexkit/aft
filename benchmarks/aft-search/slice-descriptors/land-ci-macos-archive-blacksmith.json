@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Ranking-fenced changes only relocate test fixture paths and register a cfg(test) helper so archived tests use the consumer checkout. Search ranking and routing are unchanged; benchmark rows must remain byte-identical. The other changes move the macOS library archive build to Blacksmith, preserve free test runners, remap inventory paths, and report job timings."
+}

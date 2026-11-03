@@ -6,11 +6,200 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use super::super::rust_bindings::{Initializer, RustBindings};
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
+/// Named imports still bound at Python module scope, already checked during
+/// extraction for assignments, conflicting aliases and local-only imports.
+pub(crate) fn python_reexports(parse: &ParseBlob) -> Vec<(String, Vec<String>)> {
+    parse
+        .refs
+        .iter()
+        .filter(|reference| reference.kind == BlobRefKind::Reexport && !reference.wildcard)
+        .filter_map(|reference| {
+            let module = reference.module_path.clone()?;
+            let mut names =
+                crate::callgraph_store::parse_reexport_names(reference.full_ref.as_deref()?)
+                    .into_iter()
+                    .map(|(local, source)| format!("{source} as {local}"))
+                    .collect::<Vec<_>>();
+            names.sort();
+            Some((module, names))
+        })
+        .collect()
+}
+
+#[path = "dispatch/typescript.rs"]
+mod typescript;
+
+/// Complete the graph builder's owned symbols without changing navigation or
+/// semantic-search symbol tables supplied by the shared parser.
+pub(crate) fn complete_typescript_symbols<'tree>(
+    source: &str,
+    lang: LangId,
+    root: Node<'tree>,
+    symbols: &mut Vec<crate::symbols::Symbol>,
+) -> Vec<Node<'tree>> {
+    if matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        let nodes = descendants(root);
+        typescript::complete_symbols(&nodes, source, symbols);
+        nodes
+    } else {
+        Vec::new()
+    }
+}
+
+/// Build compact, temporary TypeScript object facts from the supplied syntax
+/// tree and attributed call sites, avoiding a second graph extraction.
+pub(crate) fn typescript_objects_from_data(
+    source: &str,
+    lang: LangId,
+    nodes: &[Node<'_>],
+    data: &crate::callgraph::FileCallData,
+) -> Option<ParseBlob> {
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        return None;
+    }
+    let mut profile = crate::views::materialization::profile::StageTimer::new("typescript_facts");
+    let mut refs = Vec::new();
+    for (caller, calls) in &data.calls_by_symbol {
+        for call in calls.iter().filter(|call| {
+            call.kind == crate::callgraph::CallSiteKind::Call && call.full_callee.contains('.')
+        }) {
+            refs.push(BlobRef {
+                ordinal: refs.len() as u32,
+                kind: BlobRefKind::Call,
+                caller_symbol: Some(caller.clone()),
+                short_name: Some(call.callee_name.clone()),
+                full_ref: Some(call.full_callee.clone()),
+                module_path: None,
+                line: call.line,
+                byte_start: call.byte_start,
+                byte_end: call.byte_end,
+                path_override: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                import_kind: None,
+            });
+        }
+    }
+    let mut parse = ParseBlob {
+        entry_point_symbols: Vec::new(),
+        dispatch: DispatchFacts::default(),
+        extractor_version: String::new(),
+        language: if lang == LangId::Tsx {
+            "tsx"
+        } else {
+            "typescript"
+        }
+        .into(),
+        ast_nodes: Vec::new(),
+        symbols: super::blob_symbols(data),
+        default_export_symbol: data.default_export_symbol.clone(),
+        exported_symbols: data.exported_symbols.clone(),
+        callable_symbols: Vec::new(),
+        imports: super::blob_imports(data),
+        python_bindings: Vec::new(),
+        refs,
+    };
+    profile.finish(
+        "inputs",
+        format_args!("nodes={} refs={}", nodes.len(), parse.refs.len()),
+    );
+    // This pass links calls only to methods of object literals and single
+    // object-literal returns. Class and parameter types cannot supply those
+    // bindings, so do not compute and discard them.
+    let objects = typescript::Objects::new_objects_only(nodes, source, &parse);
+    profile.finish("index", format_args!("nodes={}", nodes.len()));
+    let mut facts = DispatchFacts::default();
+    objects.extract(&mut facts);
+    facts.methods.extend_from_slice(objects.methods());
+    profile.finish(
+        "facts",
+        format_args!(
+            "methods={} types={}",
+            facts.methods.len(),
+            facts.types.len()
+        ),
+    );
+    let call_kinds = crate::calls::call_node_kinds(lang);
+    let calls = nodes
+        .iter()
+        .filter(|node| call_kinds.contains(&node.kind()))
+        .map(|node| ((node.start_byte(), node.end_byte()), *node))
+        .collect::<HashMap<_, _>>();
+    profile.finish("calls", format_args!("calls={}", calls.len()));
+    for reference in &parse.refs {
+        let Some(&call) = calls.get(&(reference.byte_start, reference.byte_end)) else {
+            continue;
+        };
+        let Some(callee) = field(call, &["function", "name"]) else {
+            continue;
+        };
+        if field(callee, &["property"]).is_none() {
+            continue;
+        }
+        let Some(receiver) = field(callee, &["object"]) else {
+            continue;
+        };
+        let ty = if text(receiver, source) == "this" {
+            enclosing(call, FUNCTIONS)
+                .filter(|function| function.kind() == "method_definition")
+                .and_then(|function| typescript::object_member(function, source))
+                .map(|(object, _)| typescript::object_identity(object))
+        } else {
+            objects.object_receiver(receiver, call)
+        };
+        if !ty.as_ref().is_some_and(|ty| {
+            ty.starts_with("@object:") || ty.starts_with("@return:") || ty.starts_with("@field:")
+        }) {
+            continue;
+        }
+        facts.sites.push(SiteHint {
+            ordinal: reference.ordinal,
+            caller: reference.caller_symbol.clone(),
+            line: reference.line,
+            member: field(callee, &["property"]).map(|member| text(member, source).to_string()),
+            receiver: ty,
+            dynamic: false,
+        });
+    }
+    if facts.methods.is_empty() && facts.sites.is_empty() && facts.returns.is_empty() {
+        profile.finish("sites", format_args!("sites=0"));
+        return None;
+    }
+    profile.finish("sites", format_args!("sites={}", facts.sites.len()));
+    let site_ordinals = facts
+        .sites
+        .iter()
+        .map(|site| site.ordinal)
+        .collect::<HashSet<_>>();
+    parse
+        .refs
+        .retain(|reference| site_ordinals.contains(&reference.ordinal));
+    // Site hints already own the binding information. The retained join data
+    // needs symbol positions and ref offsets, not signatures or caller copies.
+    for symbol in &mut parse.symbols {
+        symbol.signature = None;
+    }
+    for reference in &mut parse.refs {
+        reference.caller_symbol = None;
+        reference.short_name = None;
+        reference.full_ref = None;
+    }
+    parse.dispatch = facts;
+    Some(parse)
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
+    /// The package clause distinguishes co-located external test packages.
+    /// Older facts omit it; absence must not authorize a concrete binding.
+    #[serde(default)]
+    pub go_package: Option<String>,
     pub types: Vec<TypeHint>,
     pub methods: Vec<MethodHint>,
     pub sites: Vec<SiteHint>,
@@ -100,7 +289,7 @@ fn descendants(node: Node<'_>) -> Vec<Node<'_>> {
         }
     }
 }
-fn method_shape(node: Node<'_>, source: &str) -> String {
+fn method_shape(node: Node<'_>, source: &str, language: &str) -> String {
     let parameters = field(node, &["parameters"])
         .map(|p| {
             descendants(p)
@@ -114,7 +303,32 @@ fn method_shape(node: Node<'_>, source: &str) -> String {
     let result = field(node, &["result", "return_type"])
         .map(|n| text(n, source).split_whitespace().collect::<String>())
         .unwrap_or_default();
-    format!("{parameters}->{result}")
+    let receiver = if language == "rust" {
+        if super::super::rust_bindings::has_self_parameter(node, source) {
+            "self;"
+        } else {
+            "static;"
+        }
+    } else {
+        ""
+    };
+    format!("{receiver}{parameters}->{result}")
+}
+
+fn rust_receiver_shape(shape: &str) -> Option<bool> {
+    // Older method shapes lack receiver information. A missing prefix means
+    // unknown, not a static method.
+    if shape.starts_with("self;") {
+        Some(true)
+    } else if shape.starts_with("static;") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn associated_reference(full: &str) -> bool {
+    super::super::parse_method_dispatch(full).is_some_and(|(_, _, _, associated)| associated)
 }
 fn type_name(raw: &str) -> String {
     raw.trim()
@@ -159,9 +373,14 @@ const FUNCTIONS: &[&str] = &[
     "method_declaration",
     "function_signature_item",
     "arrow_function",
+    "function_expression",
+    "generator_function",
     "lambda_expression",
 ];
 fn named(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some((_, name)) = typescript::object_member(node, source) {
+        return Some(name);
+    }
     field(node, &["name"])
         .or_else(|| {
             node.named_children(&mut node.walk()).find(|n| {
@@ -171,6 +390,14 @@ fn named(node: Node<'_>, source: &str) -> Option<String> {
         .map(|name| text(name, source).to_string())
 }
 fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option<String>)> {
+    if typescript::supported(language) {
+        if let Some((object, _)) = typescript::object_member(node, source) {
+            return Some((typescript::object_identity(object), None));
+        }
+        if matches!(node.kind(), "function_expression" | "generator_function") {
+            return None;
+        }
+    }
     if language == "rust" {
         if let Some(implementation) = enclosing(node, &["impl_item"]) {
             return Some((
@@ -196,13 +423,13 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
 /// Complete member declarations omitted by the legacy callable-only extractor.
 /// Interface declarations and trait default bodies need stable node identities
 /// even when the old graph never considered them callable.
-pub fn complete_members(
+fn complete_members(
     source: &str,
     lang: LangId,
-    root: Node<'_>,
+    all: &[Node<'_>],
     parse: &mut ParseBlob,
+    rust_bindings: Option<&RustBindings>,
 ) -> Result<(), ManifestJoinError> {
-    let all = descendants(root);
     let spans = exact_ordinals(parse);
     // Symbol starts may include documentation. End positions still identify the
     // same member, and an indexed lookup avoids scanning all symbols per node.
@@ -218,7 +445,7 @@ pub fn complete_members(
         .map(|s| s.scoped_name.clone())
         .collect::<HashSet<_>>();
     let mut callers = symbol_callers(parse);
-    for &node in &all {
+    for &node in all {
         if !FUNCTIONS.contains(&node.kind()) {
             continue;
         }
@@ -237,11 +464,27 @@ pub fn complete_members(
             node.end_position().column as u32,
             name.clone(),
         );
+        let rust_symbol = rust_bindings.and_then(|index| index.symbol_at(node.start_byte()));
+        if let Some(symbol) = rust_symbol {
+            if scoped_names.contains(symbol) {
+                callers
+                    .entry(position)
+                    .or_insert_with(|| symbol.to_string());
+                continue;
+            }
+        }
         if let Some(symbol) = identities.get(&identity) {
             callers.entry(position).or_insert_with(|| symbol.clone());
             continue;
         }
-        let mut scoped_name = format!("{owner}::{name}");
+        let mut scoped_name = rust_symbol
+            .or_else(|| {
+                rust_bindings
+                    .and_then(|index| index.declaration_at(node.start_byte()))
+                    .map(|declaration| declaration.symbol.as_str())
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{owner}::{name}"));
         let ordinal = spans
             .get(&(node.start_byte(), node.end_byte()))
             .copied()
@@ -282,11 +525,12 @@ pub fn complete_members(
     let mut call_ordinals = parse
         .refs
         .iter()
-        .filter(|r| r.kind == BlobRefKind::Call)
-        .map(|r| r.ordinal)
-        .collect::<HashSet<_>>();
-    for call in all
-        .into_iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == BlobRefKind::Call)
+        .map(|(index, r)| (r.ordinal, index))
+        .collect::<HashMap<_, _>>();
+    for &call in all
+        .iter()
         .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
     {
         let callee = field(call, &["function", "name"]).or_else(|| {
@@ -302,7 +546,19 @@ pub fn complete_members(
         let Some(&ordinal) = spans.get(&(call.start_byte(), call.end_byte())) else {
             continue;
         };
-        if call_ordinals.contains(&ordinal) {
+        if let Some(&index) = call_ordinals.get(&ordinal) {
+            if typescript::supported(&parse.language) {
+                if let Some(function) = enclosing(call, FUNCTIONS) {
+                    if typescript::object_member(function, source).is_some() {
+                        if let Some(caller) = callers.get(&(
+                            function.start_position().row as u32,
+                            function.start_position().column as u32,
+                        )) {
+                            parse.refs[index].caller_symbol = Some(caller.clone());
+                        }
+                    }
+                }
+            }
             continue;
         }
         let caller = enclosing(call, FUNCTIONS).and_then(|function| {
@@ -316,7 +572,7 @@ pub fn complete_members(
         if caller.is_none() {
             continue;
         }
-        call_ordinals.insert(ordinal);
+        call_ordinals.insert(ordinal, parse.refs.len());
         let full = text(callee, source).to_string();
         let short = full
             .rsplit(['.', ':'])
@@ -353,14 +609,22 @@ pub fn extract(
     source: &str,
     lang: LangId,
     root: Node<'_>,
-    parse: &ParseBlob,
+    parse: &mut ParseBlob,
 ) -> Result<DispatchFacts, ManifestJoinError> {
     let all = descendants(root);
+    // Member identities and receiver facts consult the same immutable source.
+    // Keep one lexical index for both passes and release it with this file.
+    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new(source, root));
+    complete_members(source, lang, &all, parse, rust_bindings.as_ref())?;
     let language = parse.language.as_str();
     let index_receivers = language == "rust";
     #[cfg(test)]
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
-    let receiver_index = index_receivers.then(|| RustReceiverIndex::new(&all, source));
+    let receiver_index = index_receivers
+        .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap()));
+    let rust_bindings = rust_bindings.as_ref();
+    let go_index = (language == "go")
+        .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source, false));
     let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
@@ -370,7 +634,9 @@ pub fn extract(
             .or_insert(symbol);
     }
     let mut functions = HashMap::<(u32, u32), Node<'_>>::new();
+    let mut functions_by_end = HashMap::new();
     for &node in all.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
+        functions_by_end.insert(node.end_byte(), node);
         let key = (
             node.end_position().row as u32,
             node.end_position().column as u32,
@@ -386,6 +652,12 @@ pub fn extract(
             .or_insert(node);
     }
     let mut facts = DispatchFacts::default();
+    facts.go_package = go_index.as_ref().and_then(|index| index.package.clone());
+    let ts_objects =
+        typescript::supported(language).then(|| typescript::Objects::new(&all, source, parse));
+    if let Some(objects) = &ts_objects {
+        objects.extract(&mut facts);
+    }
     if language == "rust" {
         for node in &all {
             if node.kind() == "field_declaration" {
@@ -396,7 +668,9 @@ pub fn extract(
                 ) {
                     if let Some(owner) = named(container, source) {
                         facts.fields.push(FieldHint {
-                            owner,
+                            owner: crate::callgraph::rust_module_qualified_name(
+                                container, source, &owner,
+                            ),
                             name: text(name, source).to_string(),
                             ty: type_name(text(ty, source)),
                         });
@@ -405,11 +679,21 @@ pub fn extract(
             }
         }
         for symbol in &parse.symbols {
-            if let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) {
+            if let Some(&node) = rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration(&symbol.scoped_name))
+                .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
+            {
                 if let Some(ty) = field(node, &["return_type"]) {
                     let mut ty = type_name(text(ty, source));
                     if ty == "Self" {
-                        ty = owner(node, source, language).map(|(o, _)| o).unwrap_or(ty);
+                        ty = rust_bindings
+                            .as_ref()
+                            .and_then(|index| index.declaration_at(node.start_byte()))
+                            .and_then(|declaration| declaration.owner.as_ref())
+                            .map(|owner| type_name(owner))
+                            .or_else(|| owner(node, source, language).map(|(owner, _)| owner))
+                            .unwrap_or(ty);
                     }
                     facts.returns.push(ReturnHint {
                         symbol: symbol.scoped_name.clone(),
@@ -423,9 +707,15 @@ pub fn extract(
         if !TYPES.contains(&node.kind()) {
             continue;
         }
-        let Some(name) = named(*node, source) else {
+        if language == "go" && enclosing(*node, FUNCTIONS).is_some() {
+            continue;
+        }
+        let Some(mut name) = named(*node, source) else {
             continue;
         };
+        if language == "rust" {
+            name = crate::callgraph::rust_module_qualified_name(*node, source, &name);
+        }
         let body = field(*node, &["body", "type"]);
         let interface = node.kind().contains("interface")
             || node.kind() == "trait_item"
@@ -439,14 +729,15 @@ pub fn extract(
             || (language == "python" && text(*node, source).contains("@abstractmethod"));
         let mut bases = Vec::new();
         for child in node.named_children(&mut node.walk()) {
-            if [
-                "class_heritage",
-                "superclasses",
-                "super_interfaces",
-                "superclass",
-                "delegation_specifiers",
-            ]
-            .contains(&child.kind())
+            if language != "python"
+                && [
+                    "class_heritage",
+                    "superclasses",
+                    "super_interfaces",
+                    "superclass",
+                    "delegation_specifiers",
+                ]
+                .contains(&child.kind())
             {
                 for base in descendants(child) {
                     if ["type_identifier", "identifier", "user_type"].contains(&base.kind()) {
@@ -460,6 +751,7 @@ pub fn extract(
                 bases.extend(
                     arguments
                         .named_children(&mut arguments.walk())
+                        .filter(|n| n.kind() != "keyword_argument")
                         .map(|n| type_name(text(n, source))),
                 );
             }
@@ -476,8 +768,10 @@ pub fn extract(
             }
         }
         bases.retain(|name| !name.is_empty());
-        bases.sort();
-        bases.dedup();
+        if language != "python" {
+            bases.sort();
+            bases.dedup();
+        }
         let header = text(*node, source).split('{').next().unwrap_or_default();
         facts.types.push(TypeHint {
             name,
@@ -489,22 +783,66 @@ pub fn extract(
         });
     }
     for symbol in &parse.symbols {
-        let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) else {
+        let node = functions
+            .get(&(symbol.end_line, symbol.end_col))
+            .or_else(|| {
+                (language == "rust")
+                    .then(|| {
+                        rust_bindings
+                            .as_ref()
+                            .and_then(|index| index.declaration(&symbol.scoped_name))
+                            .and_then(|declaration| functions_by_end.get(&declaration.bytes.end))
+                    })
+                    .flatten()
+            });
+        let Some(&node) = node else {
             continue;
         };
         if !["method", "function"].contains(&symbol.kind.as_str()) {
             continue;
         }
-        let Some((owner, trait_name)) = owner(node, source, language) else {
+        let Some((mut owner, mut trait_name)) = owner(node, source, language) else {
             continue;
         };
+        if ts_objects.as_ref().is_some_and(|objects| {
+            typescript::object_member(node, source).is_some_and(|(object, name)| {
+                name != symbol.name || !objects.unambiguous_member(object, &name)
+            })
+        }) {
+            continue;
+        }
+        if language == "rust" {
+            if let Some(declared) = rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration_at(node.start_byte()))
+                .and_then(|declaration| declaration.owner.as_ref())
+            {
+                owner = type_name(declared);
+            }
+            if let Some(name) = &trait_name {
+                let qualified = crate::callgraph::rust_module_qualified_name(node, source, name);
+                if facts
+                    .types
+                    .iter()
+                    .any(|ty| ty.interface && ty.name == qualified)
+                {
+                    trait_name = Some(qualified);
+                }
+            }
+        }
+        // TypeScript dispatch uses declaration owners, not structural method
+        // signatures (the latter are compared only for Go interface matching).
         facts.methods.push(MethodHint {
             owner,
             trait_name,
             name: symbol.name.clone(),
             symbol: symbol.scoped_name.clone(),
             has_body: field(node, &["body"]).is_some(),
-            shape: method_shape(node, source),
+            shape: if typescript::supported(language) {
+                String::new()
+            } else {
+                method_shape(node, source, language)
+            },
             private: text(node, source)
                 .split('{')
                 .next()
@@ -531,9 +869,18 @@ pub fn extract(
         {
             continue;
         }
-        let Some((owner, trait_name)) = owner(*node, source, language) else {
+        let Some((mut owner, trait_name)) = owner(*node, source, language) else {
             continue;
         };
+        if language == "rust" {
+            if let Some(declared) = rust_bindings
+                .as_ref()
+                .and_then(|index| index.declaration_at(node.start_byte()))
+                .and_then(|declaration| declaration.owner.as_ref())
+            {
+                owner = type_name(declared);
+            }
+        }
         let Some(name) = named(*node, source) else {
             continue;
         };
@@ -551,7 +898,11 @@ pub fn extract(
                 name,
                 symbol,
                 has_body: field(*node, &["body"]).is_some(),
-                shape: method_shape(*node, source),
+                shape: if typescript::supported(language) {
+                    String::new()
+                } else {
+                    method_shape(*node, source, language)
+                },
                 private: text(*node, source)
                     .split('{')
                     .next()
@@ -573,8 +924,20 @@ pub fn extract(
                 field(*implementation, &["type"]),
                 field(*implementation, &["trait"]),
             ) {
-                let ty = type_name(text(ty, source));
-                let trait_name = type_name(text(trait_node, source));
+                let ty = crate::callgraph::rust_module_qualified_name(
+                    *implementation,
+                    source,
+                    &type_name(text(ty, source)),
+                );
+                let mut trait_name = type_name(text(trait_node, source));
+                let qualified = crate::callgraph::rust_module_qualified_name(
+                    *implementation,
+                    source,
+                    &trait_name,
+                );
+                if type_indices.contains_key(&qualified) {
+                    trait_name = qualified;
+                }
                 if let Some(t) = type_indices.get(&ty).map(|&i| &mut facts.types[i]) {
                     if !t.bases.contains(&trait_name) {
                         t.bases.push(trait_name);
@@ -612,6 +975,11 @@ pub fn extract(
         .iter()
         .filter_map(|i| i.namespace_import.as_deref())
         .collect::<HashSet<_>>();
+    let local_rust_types = facts
+        .types
+        .iter()
+        .map(|ty| ty.name.as_str())
+        .collect::<HashSet<_>>();
     for (reference, target) in references.into_iter().zip(targets) {
         let Some(call) = target.map(|i| calls[i]) else {
             continue;
@@ -625,6 +993,29 @@ pub fn extract(
         }) else {
             continue;
         };
+        let callee = if language == "rust" && callee.kind() == "generic_function" {
+            field(callee, &["function"]).unwrap_or(callee)
+        } else {
+            callee
+        };
+        let associated = language == "rust"
+            && callee.kind() == "scoped_identifier"
+            && field(callee, &["name"]).is_some_and(|name| text(name, source) == "new");
+        if associated {
+            let Some(path) = field(callee, &["path"]) else {
+                continue;
+            };
+            let owner = type_name(text(path, source));
+            if owner == "Self"
+                || local_rust_types.contains(owner.as_str())
+                || !owner
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|name| name.chars().next().is_some_and(char::is_uppercase))
+            {
+                continue;
+            }
+        }
         let dynamic = syntactic_dynamic(callee, source, language);
         let receiver_node = field(
             callee,
@@ -639,6 +1030,8 @@ pub fn extract(
         });
         // Java method invocations carry their receiver on the invocation itself.
         let receiver_node = receiver_node.or_else(|| field(call, &["object"]));
+        let receiver_node =
+            receiver_node.or_else(|| associated.then(|| field(callee, &["path"])).flatten());
         if !dynamic && receiver_node.is_none() {
             // Token-tree calls already extracted by calls.rs have no receiver
             // expression in the outer syntax tree. Retain the written member
@@ -661,33 +1054,58 @@ pub fn extract(
             }
             continue;
         }
-        if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source))) {
+        if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source)))
+            && go_index
+                .as_ref()
+                .and_then(|index| index.receiver(call.start_byte(), call.end_byte()))
+                .is_none()
+        {
             // A namespace-qualified function is a static import binding, not an
             // unknown object receiver. Preserve the ordinary manifest resolver.
             continue;
         }
-        let receiver = receiver_node.and_then(|receiver| {
-            receiver_type(
-                receiver,
-                call,
-                source,
-                language,
-                &facts,
-                receiver_index.as_ref(),
-            )
-        });
+        let receiver = if let Some(index) = &go_index {
+            index
+                .receiver(call.start_byte(), call.end_byte())
+                .map(str::to_string)
+        } else {
+            receiver_node.and_then(|receiver| {
+                if let Some(objects) = &ts_objects {
+                    if !matches!(text(receiver, source), "this" | "super") {
+                        return objects.receiver(receiver, call);
+                    }
+                }
+                if associated {
+                    return Some(text(receiver, source).to_string());
+                }
+                receiver_type(
+                    receiver,
+                    call,
+                    source,
+                    language,
+                    &facts,
+                    receiver_index.as_ref(),
+                )
+            })
+        };
         facts.sites.push(SiteHint {
             ordinal: reference.ordinal,
-            caller: enclosing(call, FUNCTIONS)
-                .and_then(|function| {
-                    callers
-                        .get(&(
-                            function.start_position().row as u32,
-                            function.start_position().column as u32,
-                        ))
-                        .cloned()
-                })
-                .or_else(|| reference.caller_symbol.clone()),
+            caller: if language == "python" {
+                // Defaults and annotations execute in the defining scope; use
+                // the caller recorded during extraction, not the enclosing function.
+                reference.caller_symbol.clone()
+            } else {
+                enclosing(call, FUNCTIONS)
+                    .and_then(|function| {
+                        callers
+                            .get(&(
+                                function.start_position().row as u32,
+                                function.start_position().column as u32,
+                            ))
+                            .cloned()
+                    })
+                    .or_else(|| reference.caller_symbol.clone())
+            },
             line: reference.line,
             member: if dynamic {
                 None
@@ -768,8 +1186,19 @@ pub fn extract(
             dynamic: true,
         });
     }
-    facts.sites.sort_by_key(|s| s.ordinal);
-    facts.sites.dedup_by_key(|s| s.ordinal);
+    if language == "python" {
+        // A nested body has one syntax ordinal but multiple containing callers.
+        // Keep each owner, including defining-scope owners of header expressions.
+        facts
+            .sites
+            .sort_by(|a, b| (a.ordinal, &a.caller).cmp(&(b.ordinal, &b.caller)));
+        facts
+            .sites
+            .dedup_by(|a, b| a.ordinal == b.ordinal && a.caller == b.caller);
+    } else {
+        facts.sites.sort_by_key(|s| s.ordinal);
+        facts.sites.dedup_by_key(|s| s.ordinal);
+    }
     facts.methods.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     facts.methods.dedup();
     Ok(facts)
@@ -812,10 +1241,11 @@ struct RustReceiverIndex<'nodes, 'tree> {
     nodes: &'nodes [Node<'tree>],
     functions: HashMap<usize, (usize, usize)>,
     constructors: HashSet<String>,
+    bindings: &'nodes RustBindings,
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
-    fn new(nodes: &'nodes [Node<'tree>], source: &str) -> Self {
+    fn new(nodes: &'nodes [Node<'tree>], source: &str, bindings: &'nodes RustBindings) -> Self {
         #[cfg(test)]
         super::extraction_work::note(|work| {
             work.receiver_index_passes += 1;
@@ -825,6 +1255,7 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
             nodes,
             functions: HashMap::new(),
             constructors: HashSet::new(),
+            bindings,
         };
         let mut ancestors = Vec::<(Node<'tree>, usize, usize)>::new();
         for (position, &node) in nodes.iter().enumerate() {
@@ -905,7 +1336,29 @@ fn receiver_type<'tree>(
     super::extraction_work::note(|work| work.receiver_type_calls += 1);
     let value = text(receiver, source);
     let function = enclosing(call, FUNCTIONS)?;
-    let current_owner = owner(function, source, language).map(|(o, _)| o);
+    #[cfg(test)]
+    let unindexed = (language == "rust" && rust_index.is_none()).then(|| {
+        let mut root = call;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        super::extraction_work::note(|work| {
+            work.receiver_function_nodes += descendants(function).len()
+        });
+        RustBindings::new(source, root)
+    });
+    let rust_bindings = rust_index.map(|index| index.bindings);
+    #[cfg(test)]
+    let rust_bindings = rust_bindings.or(unindexed.as_ref());
+    let current_owner = rust_bindings
+        .and_then(|index| {
+            index
+                .symbol_at(function.start_byte())
+                .and_then(|symbol| index.declaration(symbol))
+        })
+        .and_then(|declaration| declaration.owner.as_ref())
+        .map(|owner| type_name(owner))
+        .or_else(|| owner(function, source, language).map(|(o, _)| o));
     if language == "rust" {
         if receiver.kind() == "call_expression" {
             return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
@@ -925,7 +1378,14 @@ fn receiver_type<'tree>(
     }
     match language {
         "typescript" | "tsx" | "javascript" | "java" | "csharp" | "kotlin" if value == "this" => {
-            return current_owner
+            if current_owner
+                .as_ref()
+                .is_some_and(|name| name.starts_with("@object:"))
+                && function.kind() != "method_definition"
+            {
+                return None;
+            }
+            return current_owner;
         }
         "python" if value == "self" => return current_owner,
         "python" if value == "cls" => {
@@ -948,13 +1408,9 @@ fn receiver_type<'tree>(
                 .cloned()
         }
         "python" if value == "super()" => {
-            return facts
-                .types
-                .iter()
-                .find(|t| Some(&t.name) == current_owner.as_ref())?
-                .bases
-                .first()
-                .cloned()
+            // Preserve the lexical class: super searches its MRO after that
+            // class, rather than dispatching on an open base-class receiver.
+            return current_owner.map(|name| format!("@super:{name}"));
         }
         "go" => {
             if let Some(receiver) = field(function, &["receiver"]) {
@@ -986,6 +1442,49 @@ fn receiver_type<'tree>(
     }
     if !["identifier", "simple_identifier", "self"].contains(&receiver.kind()) {
         return None;
+    }
+    if language == "rust" {
+        let bindings = rust_bindings?;
+        let binding = bindings.binding(value, call.start_byte())?;
+        if let Some(annotation) = &binding.annotation {
+            let annotation_name = type_name(annotation);
+            if let Some(bound) = bindings.bound(&annotation_name, call.start_byte()) {
+                return Some(type_name(bound.split('+').next().unwrap_or_default()));
+            }
+            if bindings.type_parameter(&annotation_name, call.start_byte())
+                || annotation.contains('<') && bindings.generic_callable(call.start_byte())
+                || annotation_name.contains("::")
+                    && !annotation_name
+                        .split("::")
+                        .next()
+                        .is_some_and(|name| name.chars().next().is_some_and(char::is_lowercase))
+            {
+                return None;
+            }
+            return Some(annotation_name);
+        }
+        return match binding.initializer.as_ref()? {
+            Initializer::Nominal(name, _) => Some(type_name(name)),
+            Initializer::Call { callee, .. } => {
+                if let Some((ty, "new")) = callee.split_once("::") {
+                    if bindings.declaration(callee).is_some_and(|declaration| {
+                        declaration.return_type.as_deref() == Some("Self")
+                            && declaration.owner.as_deref() == Some(ty)
+                    }) {
+                        return Some(type_name(ty));
+                    }
+                }
+                let expression = if let Some(member) = callee
+                    .strip_prefix("self.")
+                    .or_else(|| callee.strip_prefix("Self::"))
+                {
+                    format!("{}::{member}", current_owner?)
+                } else {
+                    callee.clone()
+                };
+                Some(format!("@return:{expression}"))
+            }
+        };
     }
     // Only declarations in the enclosing function are evidence. Assignments
     // invalidate constructor inference; arbitrary return-value inference is absent.
@@ -1052,6 +1551,9 @@ fn receiver_type<'tree>(
         };
         let binding_text = text(binding, source).trim();
         if binding_text != value && !binding_text.strip_suffix(':').is_some_and(|s| s == value) {
+            continue;
+        }
+        if language == "python" && enclosing(*declaration, FUNCTIONS) != Some(function) {
             continue;
         }
         if let Some(annotation) = field(*declaration, &["type"])
@@ -1149,6 +1651,7 @@ fn receiver_type<'tree>(
                 .contains(&n.kind())
                     && field(**n, &["left", "argument"])
                         .is_some_and(|lhs| text(lhs, source).trim() == value)
+                    && (language != "python" || enclosing(**n, FUNCTIONS) == Some(function))
             })
             .count();
         if (language == "python" || language == "go") && assignments > 1
@@ -1250,6 +1753,7 @@ pub struct Resolver<'a> {
     pub files: BTreeMap<String, &'a ParseBlob>,
     pub import_targets: BTreeMap<(String, String), String>,
     pub type_targets: BTreeMap<(String, String), (String, String)>,
+    associated_sites: HashSet<(String, u32)>,
     /// Every method of every file, grouped by method name and in file order,
     /// built on first use. An open or interface receiver then checks only the
     /// same-named methods instead of rescanning the whole manifest per site.
@@ -1264,7 +1768,7 @@ pub struct Resolver<'a> {
 
 /// Keys naming what one resolution read. A resolution reads nothing else, so
 /// it is unchanged while every key it recorded names unchanged inputs:
-/// - [`dependency::file`]: one file's resolver facts (language, types,
+/// - [`dependency::file`]: one file's resolver facts (language, Go package, types,
 ///   methods, fields, returns, imports, default export, and its import and
 ///   receiver type targets), or that the path has no facts;
 /// - [`dependency::method`]: which files of the manifest declare a method of
@@ -1291,15 +1795,38 @@ pub mod dependency {
 }
 impl<'a> Resolver<'a> {
     pub fn new(files: BTreeMap<String, &'a ParseBlob>) -> Self {
+        let associated_sites = files
+            .iter()
+            .filter(|(_, parse)| parse.language == "rust")
+            .flat_map(|(file, parse)| {
+                parse
+                    .refs
+                    .iter()
+                    .filter(|reference| {
+                        reference
+                            .full_ref
+                            .as_deref()
+                            .is_some_and(associated_reference)
+                    })
+                    .map(move |reference| (file.clone(), reference.ordinal))
+            })
+            .collect();
         Self {
             files,
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
+            associated_sites,
             methods_by_name: std::cell::OnceCell::new(),
             dependencies: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
+    }
+    pub fn note_associated_site(&mut self, file: &str, ordinal: u32) {
+        self.associated_sites.insert((file.to_string(), ordinal));
+    }
+    fn associated_site(&self, file: &str, ordinal: u32) -> bool {
+        self.associated_sites.contains(&(file.to_string(), ordinal))
     }
     /// Every key recorded since the previous call.
     pub fn take_dependencies(&self) -> BTreeSet<String> {
@@ -1369,7 +1896,18 @@ impl<'a> Resolver<'a> {
             return self.project_type_at_depth(&base_file, &field.ty, depth + 1);
         }
         if let Some(expression) = name.strip_prefix("@return:") {
-            let (target_file, symbol) = self.type_target(file, expression)?;
+            let local;
+            let (target_file, symbol) = if let Some(target) = self.type_target(file, expression) {
+                (&target.0, &target.1)
+            } else {
+                self.file(file)?
+                    .dispatch
+                    .returns
+                    .iter()
+                    .find(|r| r.symbol == expression)?;
+                local = (file.to_string(), expression.to_string());
+                (&local.0, &local.1)
+            };
             let returned = self
                 .file(target_file)?
                 .dispatch
@@ -1379,6 +1917,9 @@ impl<'a> Resolver<'a> {
             return self.project_type_at_depth(target_file, &returned.ty, depth + 1);
         }
         let parse = self.file(file)?;
+        if parse.language == "go" && parse.dispatch.go_package.is_none() {
+            return None;
+        }
         if let Some(t) = parse.dispatch.types.iter().find(|t| t.name == name) {
             return Some((file.to_string(), t));
         }
@@ -1401,7 +1942,11 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .filter(|(f, p)| {
                     self.note_file_visit();
-                    p.language == parse.language && std::path::Path::new(f).parent() == directory
+                    p.language == parse.language
+                        && std::path::Path::new(f).parent() == directory
+                        && (parse.language != "go"
+                            || (p.dispatch.go_package == parse.dispatch.go_package
+                                && (file.ends_with("_test.go") || !f.ends_with("_test.go"))))
                 })
                 .flat_map(|(f, p)| {
                     p.dispatch
@@ -1488,6 +2033,9 @@ impl<'a> Resolver<'a> {
                 if candidate.language != parse.language {
                     continue;
                 }
+                if parse.language == "go" && candidate.dispatch.go_package.is_none() {
+                    continue;
+                }
                 if let Some(t) = candidate
                     .dispatch
                     .types
@@ -1501,12 +2049,15 @@ impl<'a> Resolver<'a> {
         }
         None
     }
-    fn methods(&self, file: &str, owner: &str, name: &str) -> Vec<Target> {
+    fn methods(&self, file: &str, owner: &str, name: &str, associated: bool) -> Vec<Target> {
         let language = &self.known_file(file).language;
         self.methods_named(name)
             .iter()
             .filter(|(method_file, p, m)| {
                 &p.language == language
+                    && (language != "rust"
+                        || associated
+                        || rust_receiver_shape(&m.shape) != Some(false))
                     && self
                         .project_type(method_file, &m.owner)
                         .is_some_and(|(f, t)| f == file && t.name == owner)
@@ -1524,11 +2075,12 @@ impl<'a> Resolver<'a> {
         ty: &TypeHint,
         name: &str,
         seen: &mut BTreeSet<(String, String)>,
+        associated: bool,
     ) -> Vec<Target> {
         if !seen.insert((file.to_string(), ty.name.clone())) {
             return Vec::new();
         }
-        let direct = self.methods(file, &ty.name, name);
+        let direct = self.methods(file, &ty.name, name, associated);
         if !direct.is_empty() {
             return direct;
         }
@@ -1544,7 +2096,7 @@ impl<'a> Resolver<'a> {
                 if !seen.insert((file.clone(), ty.name.clone())) {
                     continue;
                 }
-                hits.extend(self.methods(&file, &ty.name, name));
+                hits.extend(self.methods(&file, &ty.name, name, associated));
                 next.extend(
                     ty.bases
                         .iter()
@@ -1576,6 +2128,160 @@ impl<'a> Resolver<'a> {
                 (f == base_file && t.name == base) || self.subtype(&f, t, base_file, base, seen)
             })
     }
+    fn python_base_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+        let mut file = file.to_string();
+        let mut name = name.to_string();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert((file.clone(), name.clone())) {
+                return None;
+            }
+            let parse = self.file(&file)?;
+            if parse.language != "python" {
+                return None;
+            }
+            if let Some(ty) = parse.dispatch.types.iter().find(|ty| ty.name == name) {
+                return Some((file, ty));
+            }
+            // Materialized facts keep only the checked module imports. Direct
+            // parse-blob users derive that same subset from re-export records.
+            let imports = if parse.refs.is_empty() {
+                parse
+                    .imports
+                    .iter()
+                    .map(|import| (import.module_path.clone(), import.names.clone()))
+                    .collect()
+            } else {
+                python_reexports(parse)
+            };
+            let mut targets = BTreeSet::new();
+            for (module, names) in imports {
+                for specifier in names {
+                    if crate::imports::specifier_local_name(&specifier) != name {
+                        continue;
+                    }
+                    for candidate in crate::callgraph_store::python_module_candidates(
+                        std::path::Path::new(""),
+                        std::path::Path::new(&file),
+                        &module,
+                    ) {
+                        let path = candidate.to_string_lossy().replace('\\', "/");
+                        // Probe in Python's package-before-module order, keeping
+                        // missing higher-priority files as refresh dependencies.
+                        if self.file(&path).is_some() {
+                            targets.insert((
+                                path,
+                                crate::imports::specifier_imported_name(&specifier).to_string(),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            if targets.len() != 1 {
+                return None;
+            }
+            (file, name) = targets.into_iter().next()?;
+        }
+    }
+
+    fn python_mro(
+        &self,
+        file: &str,
+        ty: &TypeHint,
+        active: &mut BTreeSet<(String, String)>,
+        memo: &mut BTreeMap<(String, String), Vec<(String, String)>>,
+    ) -> Option<Vec<(String, String)>> {
+        let key = (file.to_string(), ty.name.clone());
+        if let Some(mro) = memo.get(&key) {
+            return Some(mro.clone());
+        }
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        let mut sequences = Vec::new();
+        let mut bases = Vec::new();
+        for base in &ty.bases {
+            if let Some((base_file, base_ty)) = self.python_base_type(file, base) {
+                bases.push((base_file.clone(), base_ty.name.clone()));
+                sequences.push(self.python_mro(&base_file, base_ty, active, memo)?);
+            } else {
+                // Unknown bases are opaque barriers, not permission to search
+                // later bases by name. The built-in object is a known leaf.
+                let key = if base == "object" {
+                    (String::new(), "object".to_string())
+                } else {
+                    (file.to_string(), format!("@unknown:{base}"))
+                };
+                bases.push(key.clone());
+                sequences.push(vec![key]);
+            }
+        }
+        if bases.is_empty() {
+            bases.push((String::new(), "object".to_string()));
+            sequences.push(bases.clone());
+        }
+        sequences.push(bases);
+        let mut mro = vec![key.clone()];
+        // C3 chooses the first head absent from every tail, preserving written
+        // base order and postponing shared ancestors in a diamond hierarchy.
+        while sequences.iter().any(|sequence| !sequence.is_empty()) {
+            let head = sequences
+                .iter()
+                .filter_map(|sequence| sequence.first())
+                .find(|head| {
+                    !sequences
+                        .iter()
+                        .any(|sequence| sequence.iter().skip(1).any(|item| item == *head))
+                })?
+                .clone();
+            for sequence in &mut sequences {
+                if sequence.first() == Some(&head) {
+                    sequence.remove(0);
+                }
+            }
+            mro.push(head);
+        }
+        active.remove(&key);
+        memo.insert(key, mro.clone());
+        Some(mro)
+    }
+
+    fn python_super(&self, file: &str, owner: &str, member: &str) -> Resolution {
+        let Some((owner_file, ty)) = self.project_type(file, owner) else {
+            return self.unknown("python", member);
+        };
+        let Some(mro) =
+            self.python_mro(&owner_file, ty, &mut BTreeSet::new(), &mut BTreeMap::new())
+        else {
+            return self.unknown("python", member);
+        };
+        for (base_file, base) in mro.into_iter().skip(1) {
+            if base.starts_with("@unknown:") {
+                // An unindexed base is not evidence of a project receiver.
+                // Keep the call external instead of marking every project initializer live.
+                return Resolution {
+                    external: 1,
+                    ..Resolution::default()
+                };
+            }
+            if base_file.is_empty() {
+                continue;
+            }
+            let targets = self.methods(&base_file, &base, member, false);
+            if !targets.is_empty() {
+                return Resolution {
+                    targets: targets.into_iter().collect(),
+                    ..Resolution::default()
+                };
+            }
+        }
+        Resolution {
+            external: 1,
+            ..Resolution::default()
+        }
+    }
+
     fn unknown(&self, language: &str, member: &str) -> Resolution {
         self.depend(dependency::method(member));
         let protected: BTreeSet<_> = self
@@ -1591,6 +2297,14 @@ impl<'a> Resolver<'a> {
                     .map(move |m| (file.clone(), m.symbol.clone()))
             })
             .collect();
+        if ["go", "python"].contains(&language) {
+            return Resolution {
+                unresolved: usize::from(!protected.is_empty()),
+                external: usize::from(protected.is_empty()),
+                protected,
+                ..Resolution::default()
+            };
+        }
         let targets = protected
             .iter()
             .filter(|(file, symbol)| {
@@ -1656,23 +2370,59 @@ impl<'a> Resolver<'a> {
         let Some(member) = &site.member else {
             return Resolution::default();
         };
+        if parse.language == "go" && parse.dispatch.go_package.is_none() {
+            return self.unknown("go", member);
+        }
         let Some(receiver) = &site.receiver else {
             return self.unknown(&parse.language, member);
         };
+        if parse.language == "python" {
+            if let Some(owner) = receiver.strip_prefix("@super:") {
+                return self.python_super(file, owner, member);
+            }
+        }
         let Some((type_file, ty)) = self.project_type(file, receiver) else {
             return Resolution {
                 external: 1,
                 ..Resolution::default()
             };
         };
-        let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new());
+        let associated = parse.language == "rust" && self.associated_site(file, site.ordinal);
+        let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new(), associated);
         if parse.language == "rust" {
+            // An older method shape may not distinguish an instance method from
+            // an associated function. Keep it live without an exact edge.
+            if !associated
+                && exact.iter().any(|target| {
+                    self.known_file(&target.file)
+                        .dispatch
+                        .methods
+                        .iter()
+                        .find(|method| method.symbol == target.symbol)
+                        .is_some_and(|method| rust_receiver_shape(&method.shape).is_none())
+                })
+            {
+                return Resolution {
+                    unresolved: 1,
+                    protected: self
+                        .methods_named(member)
+                        .iter()
+                        .filter(|(_, parse, _)| parse.language == "rust")
+                        .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
+                        .collect(),
+                    ..Resolution::default()
+                };
+            }
             let methods = self
                 .known_file(&type_file)
                 .dispatch
                 .methods
                 .iter()
-                .filter(|m| m.owner == ty.name && m.name == *member)
+                .filter(|m| {
+                    m.owner == ty.name
+                        && m.name == *member
+                        && (associated || rust_receiver_shape(&m.shape) != Some(false))
+                })
                 .collect::<Vec<_>>();
             let inherent = methods
                 .iter()
@@ -1687,18 +2437,68 @@ impl<'a> Resolver<'a> {
                         provenance: "exact",
                     })
                     .collect();
-            } else if methods.len() > 1 || exact.len() > 1 {
-                return self.unknown(&parse.language, member);
+            } else if !ty.interface {
+                exact.retain(|target| {
+                    let Some(method) = self
+                        .known_file(&target.file)
+                        .dispatch
+                        .methods
+                        .iter()
+                        .find(|m| m.symbol == target.symbol)
+                    else {
+                        return false;
+                    };
+                    let trait_name = method.trait_name.as_deref().unwrap_or(&method.owner);
+                    if site
+                        .caller
+                        .as_deref()
+                        .and_then(|name| name.rsplit_once("::"))
+                        .map(|(scope, _)| scope)
+                        == method.symbol.rsplit_once("::").map(|(scope, _)| scope)
+                    {
+                        return true;
+                    }
+                    let Some((trait_file, declaration)) =
+                        self.project_type(&target.file, trait_name)
+                    else {
+                        return false;
+                    };
+                    let caller_name = trait_name.rsplit("::").next().unwrap_or(trait_name);
+                    self.project_type(file, caller_name).is_some_and(
+                        |(caller_file, caller_trait)| {
+                            caller_file == trait_file && caller_trait.name == declaration.name
+                        },
+                    )
+                });
+                if exact.len() > 1 {
+                    return self.unknown(&parse.language, member);
+                }
             }
         }
         if parse.language == "go" && exact.len() > 1 {
             return self.unknown(&parse.language, member);
         }
-        let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
+        let mut targets = exact
+            .into_iter()
+            .filter(|target| {
+                parse.language != "go"
+                    || file.ends_with("_test.go")
+                    || !target.file.ends_with("_test.go")
+            })
+            .collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate, method) in self.methods_named(member) {
                 let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
                 if candidate.language != parse.language {
+                    continue;
+                }
+                if parse.language == "go" && candidate.dispatch.go_package.is_none() {
+                    continue;
+                }
+                if parse.language == "rust"
+                    && !associated
+                    && rust_receiver_shape(&method.shape) != Some(true)
+                {
                     continue;
                 }
                 {
@@ -1757,7 +2557,8 @@ impl<'a> Resolver<'a> {
 }
 
 /// Resolution inputs are borrowed immutably for one emission pass. Locations
-/// and caller identities are emitted by the caller, not used to choose targets.
+/// are emitted by the caller. Rust typed lookup also uses the enclosing impl
+/// scope and whether the written call is a scoped path.
 pub struct MemoizedResolver<'r, 'a> {
     resolver: &'r Resolver<'a>,
     resolved: std::cell::RefCell<BTreeMap<ResolutionKey, MemoizedResolution>>,
@@ -1773,6 +2574,8 @@ struct ResolutionKey {
     receiver: Option<String>,
     member: Option<String>,
     dynamic: bool,
+    associated: bool,
+    caller_scope: Option<String>,
 }
 
 impl<'r, 'a> MemoizedResolver<'r, 'a> {
@@ -1796,6 +2599,16 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             receiver: site.receiver.clone(),
             member: site.member.clone(),
             dynamic: site.dynamic,
+            associated: self.resolver.files[file].language == "rust"
+                && self.resolver.associated_site(file, site.ordinal),
+            caller_scope: (self.resolver.files[file].language == "rust" && site.receiver.is_some())
+                .then(|| {
+                    site.caller
+                        .as_deref()
+                        .and_then(|name| name.rsplit_once("::"))
+                        .map(|(scope, _)| scope.to_string())
+                })
+                .flatten(),
         };
         if let Some((resolved, dependencies)) = self.resolved.borrow().get(&key) {
             self.resolver

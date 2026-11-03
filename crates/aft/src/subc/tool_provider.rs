@@ -4087,7 +4087,7 @@ mod tests {
     #[ignore = "explicit fixture regeneration, not a verification gate"]
     fn regenerate_tool_provider_catalog() {
         for (relative, _) in CATALOG_FIXTURES {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+            let path = std::path::Path::new(crate::test_support::manifest_dir()).join(relative);
             let mut fixtures: Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             for fixture in fixtures.as_array_mut().unwrap() {

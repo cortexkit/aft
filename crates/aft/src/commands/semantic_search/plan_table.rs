@@ -475,7 +475,7 @@ mod tests {
     #[test]
     #[ignore = "fixture regeneration is an explicit maintainer action"]
     fn regenerate_pinned_plan_table() {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixture = Path::new(crate::test_support::manifest_dir())
             .join("../../benchmarks/aft-search/engine-fixtures/plan-table.json");
         let json = serde_json::to_string_pretty(&PlanTable::running_table())
             .expect("serialize running plan table");

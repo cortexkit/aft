@@ -1453,7 +1453,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, tempfile::TempDir, AssemblyRequest) {
         // Case-only renames exercise ordinary checkout reads, not the stricter
         // task_temp_reads admission rules for operating-system scratch files.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()

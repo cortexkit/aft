@@ -947,7 +947,7 @@ fn v20_native_json_aliases_and_jq_render_from_constrained_gets() {
         json!([{"databaseId":9,"displayTitle":"Build","headBranch":"main","workflowName":"CI"}])
     );
     assert!(
-        matches!(&requests[0], ReadRequest::Get { path, .. } if path == "/repos/cortexkit/aft/actions/runs?branch=main&status=failure&per_page=20&page=1")
+        matches!(&requests[0], ReadRequest::Get { path, .. } if path == "/repos/cortexkit/aft/actions/runs?branch=main&status=failure&per_page=10&page=1")
     );
     let (value, requests, _) = run_json(
         &[
@@ -1139,7 +1139,7 @@ fn v20_checks_render_and_preserve_failure_and_pending_exit_codes() {
 
 #[test]
 fn review_list_paging_keeps_size_and_trims_without_duplicate_rows() {
-    let plan = planned(&["run", "list", "--limit", "150", "--json", "databaseId"]);
+    let plan = planned(&["run", "list", "--limit", "155", "--json", "databaseId"]);
     let mut calls = 0;
     let mut output = Vec::new();
     render::run(&plan, &mut |request| {
@@ -1148,6 +1148,8 @@ fn review_list_paging_keeps_size_and_trims_without_duplicate_rows() {
         let WireRequest::Get { args, .. } = wire else { panic!("not a list") };
         let page: usize = args.query["page"].parse().unwrap();
         let size: usize = args.query["per_page"].parse().unwrap();
+        assert_eq!(page, calls);
+        assert_eq!(size, 10);
         let start = (page - 1) * size;
         Ok(ReadReply::Get(GetReply {
             status: 200,
@@ -1158,11 +1160,206 @@ fn review_list_paging_keeps_size_and_trims_without_duplicate_rows() {
     let rows: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(
         rows,
-        json!((0..150)
+        json!((0..155)
             .map(|id| json!({"databaseId":id}))
             .collect::<Vec<_>>())
     );
-    assert_eq!(calls, 2);
+    assert_eq!(calls, 16);
+}
+
+#[test]
+fn v20_workflow_run_list_keeps_ten_row_pages_and_trims_to_limit() {
+    let plan = planned(&[
+        "run",
+        "list",
+        "--workflow",
+        "ci.yml",
+        "--limit",
+        "12",
+        "--json",
+        "databaseId",
+    ]);
+    let mut calls = 0;
+    let mut output = Vec::new();
+    let status = render::run(
+        &plan,
+        &mut |request| {
+            calls += 1;
+            let (path, body, next_page) = match calls {
+                1 => (
+                    "/repos/cortexkit/aft/actions/workflows/ci.yml",
+                    json!({"id":7,"state":"active"}),
+                    None,
+                ),
+                2 => (
+                    "/repos/cortexkit/aft/actions/workflows/7/runs?per_page=10&page=1",
+                    json!({"workflow_runs":(0..10).map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+                    Some(2),
+                ),
+                3 => (
+                    "/repos/cortexkit/aft/actions/workflows/7/runs?per_page=10&page=2",
+                    json!({"workflow_runs":(10..20).map(|id| json!({"id":id})).collect::<Vec<_>>()}),
+                    Some(3),
+                ),
+                _ => panic!("unexpected request: {request:?}"),
+            };
+            assert_eq!(*request, ReadRequest::Get { path: path.into(), accept: None });
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(
+                &wire,
+                &json!({"isError":false,"result":{"status":200,"body":body,"next_page":next_page}}),
+            )
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(status, 0);
+    assert_eq!(calls, 3);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        json!((0..12)
+            .map(|id| json!({"databaseId":id}))
+            .collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn v20_list_oversize_page_two_restarts_at_half_size_without_duplicates() {
+    let plan = planned(&["run", "list", "--limit", "12", "--json", "databaseId"]);
+    let runs = |ids: std::ops::Range<u64>, next_page: Option<u64>| {
+        json!({"isError":false,"result":{"status":200,"body":{
+            "workflow_runs":ids.map(|id| json!({"id":id})).collect::<Vec<_>>()
+        },"next_page":next_page}})
+    };
+    let mut replies = [
+        ("/repos/cortexkit/aft/actions/runs?per_page=10&page=1", runs(0..10, Some(2))),
+        ("/repos/cortexkit/aft/actions/runs?per_page=10&page=2", json!({"isError":true,"error":{
+            "code":"response_too_large","transmission":"not_sent","message":"page exceeds relay cap"
+        }})),
+        ("/repos/cortexkit/aft/actions/runs?per_page=5&page=1", runs(0..5, Some(2))),
+        ("/repos/cortexkit/aft/actions/runs?per_page=5&page=2", runs(5..10, Some(3))),
+        ("/repos/cortexkit/aft/actions/runs?per_page=5&page=3", runs(10..15, Some(4))),
+    ].into_iter();
+    let mut output = Vec::new();
+    let status = render::run(
+        &plan,
+        &mut |request| {
+            let (path, value) = replies.next().expect("unexpected request");
+            assert_eq!(
+                *request,
+                ReadRequest::Get {
+                    path: path.into(),
+                    accept: None
+                }
+            );
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(&wire, &value)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(status, 0);
+    assert!(replies.next().is_none());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        json!((0..12)
+            .map(|id| json!({"databaseId":id}))
+            .collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn v20_non_run_list_retries_structured_oversize_refusal() {
+    let plan = planned(&["workflow", "list", "--json", "id"]);
+    let mut replies = [
+        ("/repos/cortexkit/aft/actions/workflows?per_page=100&page=1", json!({"isError":true,"error":{
+            "code":"response_too_large","transmission":"not_sent","message":"page exceeds relay cap"
+        }})),
+        ("/repos/cortexkit/aft/actions/workflows?per_page=50&page=1", json!({"isError":false,"result":{
+            "status":200,"body":{"workflows":[{"id":7,"state":"active"}]},"next_page":null
+        }})),
+    ].into_iter();
+    let mut output = Vec::new();
+    let status = render::run(
+        &plan,
+        &mut |request| {
+            let (path, value) = replies.next().expect("unexpected request");
+            assert_eq!(
+                *request,
+                ReadRequest::Get {
+                    path: path.into(),
+                    accept: None
+                }
+            );
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(&wire, &value)
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(status, 0);
+    assert!(replies.next().is_none());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        json!([{"id":7}])
+    );
+}
+
+#[test]
+fn v20_list_oversize_floor_returns_original_refusal() {
+    let plan = planned(&["run", "list", "--json", "databaseId"]);
+    let mut sizes = [10, 5, 2, 1].into_iter();
+    let mut output = Vec::new();
+    let error = render::run(
+        &plan,
+        &mut |request| {
+            let size = sizes.next().expect("must not retry below one row");
+            assert_eq!(*request, ReadRequest::Get {
+                path: format!("/repos/cortexkit/aft/actions/runs?per_page={size}&page=1"),
+                accept: None,
+            });
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(&wire, &json!({"isError":true,"error":{
+                "code":"response_too_large","transmission":"not_sent","message":format!("page size {size}")
+            }}))
+        },
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(sizes.next().is_none());
+    assert_eq!(error.status(), 86);
+    assert_eq!(
+        error.message("bot"),
+        "worker read response exceeds 1 MiB; narrow the request: page size 1"
+    );
+    assert!(output.is_empty());
+}
+
+#[test]
+fn v20_list_does_not_retry_other_refusal_codes_with_size_error_text() {
+    let plan = planned(&["run", "list"]);
+    let mut calls = 0;
+    let mut output = Vec::new();
+    let error = render::run(
+        &plan,
+        &mut |request| {
+            calls += 1;
+            assert_eq!(calls, 1, "only response_too_large is retryable");
+            let wire = executor::wire_request("cortexkit/aft", request).unwrap();
+            executor::decode_reply(&wire, &json!({"isError":true,"error":{
+                "code":"repository_not_visible","transmission":"not_sent","message":"response_too_large"
+            }}))
+        },
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(error.status(), 86);
+    assert_eq!(
+        error.message("bot"),
+        "repository is not visible to the scoped bot; the read was not sent: response_too_large"
+    );
+    assert!(output.is_empty());
 }
 
 #[test]
@@ -1368,7 +1565,7 @@ fn v20_missing_ticket_refuses_without_delegation_or_credentials() {
 
 #[test]
 fn v20_preparer_pins_test_only_fixture_and_preserves_every_v19_row() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let fixture = root.join("crates/aft/tests/fixtures/gh_shim/v19-manifest.json");
     let raw = fs::read(&fixture).unwrap();
     // This fixture digest is pinned for this test, not used as signing material.
@@ -1752,7 +1949,7 @@ fn audit_checkout_binding_cannot_be_retargeted_by_gh_repo() {
 }
 
 fn preparer_probe(mode: &str) -> std::process::Output {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let dir = tempfile::tempdir().unwrap();
     let code = r#"
 import hashlib, importlib.util, json, pathlib, sys

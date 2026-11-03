@@ -2575,7 +2575,7 @@ pub fn extract_symbols_from_tree(
 
 /// Cut a signature to [`MAX_SIGNATURE_BYTES`] on a character boundary and mark
 /// the cut with an ellipsis so readers can tell it was shortened.
-fn truncate_signature(signature: &mut String) {
+pub(crate) fn truncate_signature(signature: &mut String) {
     if signature.len() <= MAX_SIGNATURE_BYTES {
         return;
     }
@@ -9639,7 +9639,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        PathBuf::from(crate::test_support::manifest_dir())
             .join("tests")
             .join("fixtures")
             .join(name)

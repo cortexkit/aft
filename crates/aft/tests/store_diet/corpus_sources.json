@@ -1,0 +1,873 @@
+{
+  "baseline": "2b4d19a15f663e6a2d822274150eebbb84f08586",
+  "smoke_table": {
+    "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+    "owner": "language_fixtures"
+  },
+  "receiver_table": {
+    "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+    "owner": "receiver_form_extraction_table"
+  },
+  "cases": [
+    {
+      "name": "typescript-top-level",
+      "language": "typescript",
+      "shapes": [
+        "file summary",
+        "top-level dispatch caller",
+        "constructed receiver without a function scope"
+      ],
+      "files": [
+        {
+          "target": "top.ts",
+          "new_for": "Missing stored values: nodes.kind=file_summary, top id forms and dispatch caller=false",
+          "text": "class C { m() {} }\nnew C().m();\n"
+        }
+      ]
+    },
+    {
+      "name": "java-final",
+      "language": "java",
+      "shapes": [
+        "closed dispatch type"
+      ],
+      "files": [
+        {
+          "target": "Closed.java",
+          "new_for": "Missing stored dispatch shape: closed=true",
+          "text": "final class C { void m() {} }\n"
+        }
+      ]
+    },
+    {
+      "name": "typescript-dynamic",
+      "language": "typescript",
+      "shapes": [
+        "unknown receiver",
+        "computed member",
+        "unresolved protected targets"
+      ],
+      "files": [
+        {
+          "target": "dynamic.ts",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+          "contains": "function caller(x, name) { x.m(); x[name](); }"
+        }
+      ]
+    },
+    {
+      "name": "javascript-dynamic",
+      "language": "javascript",
+      "shapes": [
+        "unknown receiver",
+        "computed member",
+        "unresolved protected targets"
+      ],
+      "files": [
+        {
+          "target": "dynamic.js",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+          "contains": "function caller(x, name) { x.m(); x[name](); }"
+        }
+      ]
+    },
+    {
+      "name": "python-dynamic",
+      "language": "python",
+      "shapes": [
+        "unknown receiver",
+        "getattr dynamic call",
+        "unresolved protected targets"
+      ],
+      "files": [
+        {
+          "target": "dynamic.py",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+          "contains": "getattr(x, name)()"
+        }
+      ]
+    },
+    {
+      "name": "typescript-export-alias",
+      "language": "typescript",
+      "shapes": [
+        "source-less export alias",
+        "cross-file caller"
+      ],
+      "files": [
+        {
+          "target": "module.ts",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_source_less_export_alias_resolves_local_symbol",
+          "contains": "export { foo as bar };"
+        },
+        {
+          "target": "app.ts",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_source_less_export_alias_resolves_local_symbol",
+          "contains": "import { bar }"
+        }
+      ]
+    },
+    {
+      "name": "rust-default-dispatch",
+      "language": "rust",
+      "shapes": [
+        "trait default body",
+        "dynamic receiver",
+        "duplicate target provenance tie"
+      ],
+      "files": [
+        {
+          "target": "lib.rs",
+          "new_for": "SQLite-order contract: identical dispatch edge identity reached as both exact and dispatch",
+          "text": "trait I { fn m(&self) {} }\nstruct T;\nimpl I for T {}\nfn caller(x: &dyn I) { x.m(); }\n"
+        }
+      ]
+    },
+    {
+      "name": "csharp-overloads",
+      "language": "csharp",
+      "shapes": [
+        "same-named overloads",
+        "arity shapes",
+        "last scoped definition"
+      ],
+      "files": [
+        {
+          "target": "Overloads.cs",
+          "new_for": "SQLite-order contract: same-named overloads and dispatch node selection",
+          "text": "class C {\n public void M() {}\n public void M(int value) {}\n public void Caller() { M(); M(1); }\n}\n"
+        }
+      ]
+    },
+    {
+      "name": "javascript-objects",
+      "language": "javascript",
+      "shapes": [
+        "constructor",
+        "methods",
+        "arrow closure",
+        "callback"
+      ],
+      "files": [
+        {
+          "target": "sample.js",
+          "source": "crates/aft/tests/fixtures/sample.js"
+        }
+      ]
+    },
+    {
+      "name": "typescript-members",
+      "language": "typescript",
+      "shapes": [
+        "methods",
+        "arrow function",
+        "interface",
+        "enum",
+        "type alias"
+      ],
+      "files": [
+        {
+          "target": "sample.ts",
+          "source": "crates/aft/tests/fixtures/sample.ts"
+        }
+      ]
+    },
+    {
+      "name": "typescript-imports",
+      "language": "typescript",
+      "shapes": [
+        "value import",
+        "type-only import",
+        "external and relative unresolved imports"
+      ],
+      "files": [
+        {
+          "target": "imports.ts",
+          "source": "crates/aft/tests/fixtures/imports_ts.ts"
+        }
+      ]
+    },
+    {
+      "name": "tsx-components",
+      "language": "tsx",
+      "shapes": [
+        "JSX",
+        "class methods",
+        "callback property"
+      ],
+      "files": [
+        {
+          "target": "sample.tsx",
+          "source": "crates/aft/tests/fixtures/sample.tsx"
+        }
+      ]
+    },
+    {
+      "name": "python-members",
+      "language": "python",
+      "shapes": [
+        "functions",
+        "class methods",
+        "decorators"
+      ],
+      "files": [
+        {
+          "target": "sample.py",
+          "source": "crates/aft/tests/fixtures/sample.py"
+        }
+      ]
+    },
+    {
+      "name": "rust-members",
+      "language": "rust",
+      "shapes": [
+        "methods",
+        "struct",
+        "trait",
+        "enum"
+      ],
+      "files": [
+        {
+          "target": "sample.rs",
+          "source": "crates/aft/tests/fixtures/sample.rs"
+        }
+      ]
+    },
+    {
+      "name": "go-members",
+      "language": "go",
+      "shapes": [
+        "pointer receiver",
+        "interface",
+        "external call"
+      ],
+      "files": [
+        {
+          "target": "sample.go",
+          "source": "crates/aft/tests/fixtures/sample.go"
+        }
+      ]
+    },
+    {
+      "name": "groovy-members",
+      "language": "groovy",
+      "shapes": [
+        "trait",
+        "interface",
+        "methods",
+        "closure property",
+        "no call-node support"
+      ],
+      "files": [
+        {
+          "target": "sample.groovy",
+          "source": "crates/aft/tests/fixtures/sample.groovy"
+        }
+      ]
+    },
+    {
+      "name": "cuda-kernel",
+      "language": "cuda",
+      "shapes": [
+        "device function",
+        "kernel",
+        "kernel launch"
+      ],
+      "files": [
+        {
+          "target": "sample.cu",
+          "source": "crates/aft/tests/fixtures/sample.cu"
+        }
+      ]
+    },
+    {
+      "name": "metal-kernel",
+      "language": "metal",
+      "shapes": [
+        "kernel",
+        "helper call"
+      ],
+      "files": [
+        {
+          "target": "sample.metal",
+          "source": "crates/aft/tests/fixtures/sample.metal"
+        }
+      ]
+    },
+    {
+      "name": "typescript-reexport",
+      "language": "typescript",
+      "shapes": [
+        "aliased re-export",
+        "cross-file call"
+      ],
+      "files": [
+        {
+          "target": "real.ts",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+          "contains": "export function foo(): string"
+        },
+        {
+          "target": "barrel.ts",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+          "contains": "export { foo as bar }"
+        },
+        {
+          "target": "app.ts",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+          "contains": "import { bar }"
+        }
+      ]
+    },
+    {
+      "name": "tsx-construction",
+      "language": "tsx",
+      "shapes": [
+        "JSX call",
+        "constructorless construction"
+      ],
+      "files": [
+        {
+          "target": "component.tsx",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "callgraph_indexes_tsx_jsx_components_and_new_expressions",
+          "contains": "export function Widget(): JSX.Element"
+        }
+      ]
+    },
+    {
+      "name": "typescript-interface",
+      "language": "typescript",
+      "shapes": [
+        "interface",
+        "two implementation dispatch fanout"
+      ],
+      "files": [
+        {
+          "target": "interface.ts",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "interface_two_implementations_are_possible_targets",
+          "contains": "interface I { m(): void; }"
+        }
+      ]
+    },
+    {
+      "name": "typescript-virtual",
+      "language": "typescript",
+      "shapes": [
+        "inheritance",
+        "super",
+        "constructor receiver",
+        "virtual dispatch"
+      ],
+      "files": [
+        {
+          "target": "virtual.ts",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "concrete_inherited_and_constructor_receiver_forms",
+          "contains": "class D extends B"
+        }
+      ]
+    },
+    {
+      "name": "typescript-private",
+      "language": "typescript",
+      "shapes": [
+        "private method",
+        "unknown receiver",
+        "arity mismatch"
+      ],
+      "files": [
+        {
+          "target": "private.ts",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "unknown_arity_and_private_methods_remain_live_without_edges",
+          "contains": "private m(a: number"
+        }
+      ]
+    },
+    {
+      "name": "typescript-external",
+      "language": "typescript",
+      "shapes": [
+        "builtin receiver",
+        "external dispatch"
+      ],
+      "files": [
+        {
+          "target": "external.ts",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "builtin_type_does_not_link_project_names",
+          "contains": "function caller(x: String)"
+        }
+      ]
+    },
+    {
+      "name": "typescript-callback",
+      "language": "typescript",
+      "shapes": [
+        "explicit constructor",
+        "callback reference",
+        "method chain"
+      ],
+      "files": [
+        {
+          "target": "callback.ts",
+          "source": "crates/aft/src/callgraph.rs",
+          "owner": "call_site_kind_classification_matches_range_lookup",
+          "contains": "class Service { constructor()"
+        }
+      ]
+    },
+    {
+      "name": "javascript-callback",
+      "language": "javascript",
+      "shapes": [
+        "closure",
+        "callback reference",
+        "construction"
+      ],
+      "files": [
+        {
+          "target": "callback.js",
+          "source": "crates/aft/src/callgraph.rs",
+          "owner": "call_site_kind_classification_matches_range_lookup",
+          "contains": "export default () =>"
+        }
+      ]
+    },
+    {
+      "name": "rust-callback",
+      "language": "rust",
+      "shapes": [
+        "callback reference",
+        "value reference",
+        "qualified reference"
+      ],
+      "files": [
+        {
+          "target": "lib.rs",
+          "source": "crates/aft/src/callgraph.rs",
+          "owner": "call_site_kind_classification_matches_range_lookup",
+          "contains": "spawn(crate::callback)"
+        }
+      ]
+    },
+    {
+      "name": "go-callback",
+      "language": "go",
+      "shapes": [
+        "callback reference",
+        "function value"
+      ],
+      "files": [
+        {
+          "target": "callback.go",
+          "source": "crates/aft/src/callgraph.rs",
+          "owner": "call_site_kind_classification_matches_range_lookup",
+          "contains": "saved := callback"
+        }
+      ]
+    },
+    {
+      "name": "rust-trait",
+      "language": "rust",
+      "shapes": [
+        "trait",
+        "dynamic receiver",
+        "two implementations"
+      ],
+      "files": [
+        {
+          "target": "lib.rs",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "trait_and_go_interface_fanout_and_rust_generic_bound_forms",
+          "contains": "x: &dyn I"
+        }
+      ]
+    },
+    {
+      "name": "go-interface",
+      "language": "go",
+      "shapes": [
+        "interface",
+        "two implementations",
+        "dispatch"
+      ],
+      "files": [
+        {
+          "target": "interface.go",
+          "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+          "owner": "trait_and_go_interface_fanout_and_rust_generic_bound_forms",
+          "contains": "type I interface"
+        }
+      ]
+    },
+    {
+      "name": "java-field",
+      "language": "java",
+      "shapes": [
+        "field receiver",
+        "competing method owners",
+        "type matching"
+      ],
+      "files": [
+        {
+          "target": "EntryPoint.java",
+          "source": "crates/aft/src/callgraph_store/mod.rs",
+          "owner": "java_field_receiver_type_selects_declared_class_method",
+          "contains": "class EntryPoint"
+        }
+      ]
+    },
+    {
+      "name": "kotlin-property",
+      "language": "kotlin",
+      "shapes": [
+        "property receiver",
+        "factory construction",
+        "inferred local receiver"
+      ],
+      "files": [
+        {
+          "target": "Handler.kt",
+          "source": "crates/aft/src/callgraph_store/mod.rs",
+          "owner": "kotlin_property_and_local_value_types_are_inferred",
+          "contains": "class Handler"
+        }
+      ]
+    },
+    {
+      "name": "scala-givens",
+      "language": "scala",
+      "shapes": [
+        "enum method",
+        "given",
+        "lambda",
+        "external calls"
+      ],
+      "files": [
+        {
+          "target": "Color.scala",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_scala3_symbols_include_enums_and_named_givens",
+          "contains": "enum Color {\n  case Red"
+        }
+      ]
+    },
+    {
+      "name": "java-constructor",
+      "language": "java",
+      "shapes": [
+        "constructor",
+        "method",
+        "interface",
+        "enum",
+        "record"
+      ],
+      "files": [
+        {
+          "target": "Greeter.java",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_java_symbols_include_types_members_and_fields",
+          "contains": "public class Greeter"
+        }
+      ]
+    },
+    {
+      "name": "ruby-factory",
+      "language": "ruby",
+      "shapes": [
+        "initialize",
+        "class factory",
+        "method"
+      ],
+      "files": [
+        {
+          "target": "greeter.rb",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_ruby_symbols_include_modules_classes_methods_and_constants",
+          "contains": "module Demo\n  class Greeter"
+        }
+      ]
+    },
+    {
+      "name": "solidity-contract",
+      "language": "solidity",
+      "shapes": [
+        "constructor",
+        "interface",
+        "library",
+        "modifier",
+        "methods"
+      ],
+      "files": [
+        {
+          "target": "Vault.sol",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_solidity_symbols_include_contracts_functions_events_and_errors",
+          "contains": "pragma solidity ^0.8.20"
+        }
+      ]
+    },
+    {
+      "name": "pascal-members",
+      "language": "pascal",
+      "shapes": [
+        "constructor",
+        "virtual declaration",
+        "interface",
+        "no call-node support"
+      ],
+      "files": [
+        {
+          "target": "MyUnit.pas",
+          "source": "crates/aft/src/parser.rs",
+          "owner": "extract_pascal_symbols_test",
+          "contains": "unit MyUnit"
+        }
+      ]
+    },
+    {
+      "name": "r-functions",
+      "language": "r",
+      "shapes": [
+        "functions",
+        "anonymous function assignment",
+        "no call-node support"
+      ],
+      "files": [
+        {
+          "target": "analysis.R",
+          "source": "crates/aft/src/parser.rs",
+          "owner": "extract_r_symbols_test",
+          "contains": "summarise <- function"
+        }
+      ]
+    },
+    {
+      "name": "php-members",
+      "language": "php",
+      "shapes": [
+        "namespace",
+        "interface",
+        "trait",
+        "methods"
+      ],
+      "files": [
+        {
+          "target": "Greeter.php",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_php_symbols_include_namespaces_types_functions_methods_and_properties",
+          "contains": "namespace Demo;\n\ninterface Named"
+        }
+      ]
+    },
+    {
+      "name": "swift-members",
+      "language": "swift",
+      "shapes": [
+        "struct method",
+        "class method",
+        "protocol",
+        "type alias"
+      ],
+      "files": [
+        {
+          "target": "Greeter.swift",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_swift_symbols_include_types_protocols_functions_and_properties",
+          "contains": "struct Greeter"
+        }
+      ]
+    },
+    {
+      "name": "lua-members",
+      "language": "lua",
+      "shapes": [
+        "module table",
+        "method",
+        "local function"
+      ],
+      "files": [
+        {
+          "target": "greeter.lua",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_lua_symbols_include_module_tables_functions_and_methods",
+          "contains": "function M.greet"
+        }
+      ]
+    },
+    {
+      "name": "perl-factory",
+      "language": "perl",
+      "shapes": [
+        "package",
+        "new/bless constructor",
+        "method"
+      ],
+      "files": [
+        {
+          "target": "Greeter.pm",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "outline_perl_symbols_include_packages_subroutines_constants_and_variables",
+          "contains": "package Demo::Greeter"
+        }
+      ]
+    },
+    {
+      "name": "objc-messages",
+      "language": "objc",
+      "shapes": [
+        "class method",
+        "instance method",
+        "new message",
+        "message sends",
+        "no call-node support"
+      ],
+      "files": [
+        {
+          "target": "Greeter.m",
+          "source": "crates/aft/tests/integration/objc_test.rs",
+          "contains": "@interface CKGreeter"
+        }
+      ]
+    },
+    {
+      "name": "c-pointer",
+      "language": "c",
+      "shapes": [
+        "free call",
+        "function-pointer member call"
+      ],
+      "files": [
+        {
+          "target": "fixture.c",
+          "source": "crates/aft/src/calls.rs",
+          "owner": "extracts_c_calls_and_attributes_them_to_function_symbols",
+          "contains": "struct Obj { int (*method)"
+        }
+      ]
+    },
+    {
+      "name": "cpp-qualified",
+      "language": "cpp",
+      "shapes": [
+        "member call",
+        "pointer call",
+        "qualified template call"
+      ],
+      "files": [
+        {
+          "target": "fixture.cpp",
+          "source": "crates/aft/src/calls.rs",
+          "owner": "extracts_cpp_calls_and_attributes_them_to_function_symbols",
+          "contains": "namespace Foo { void bar(); }"
+        }
+      ]
+    },
+    {
+      "name": "cpp-header",
+      "language": "cpp",
+      "shapes": [
+        "ambiguous header detection",
+        "method",
+        "object construction"
+      ],
+      "files": [
+        {
+          "target": "widget.h",
+          "source": "crates/aft/tests/integration/outline_languages_test.rs",
+          "owner": "h_header_cpp_outline_zoom_and_method_callers",
+          "contains": "inline int use_widget()"
+        }
+      ]
+    },
+    {
+      "name": "zig-methods",
+      "language": "zig",
+      "shapes": [
+        "struct method",
+        "free call",
+        "qualified call"
+      ],
+      "files": [
+        {
+          "target": "fixture.zig",
+          "source": "crates/aft/src/calls.rs",
+          "owner": "extracts_zig_calls_and_attributes_them_to_function_symbols",
+          "contains": "const Obj = struct"
+        }
+      ]
+    },
+    {
+      "name": "vue-opaque",
+      "language": "vue",
+      "shapes": [
+        "SFC handler",
+        "computed closure",
+        "opaque script/no call-node support"
+      ],
+      "files": [
+        {
+          "target": "App.vue",
+          "source": "crates/aft/tests/integration/vue_test.rs",
+          "contains": "<div class=\"greeting\">"
+        }
+      ]
+    },
+    {
+      "name": "rust-macros",
+      "language": "rust",
+      "shapes": [
+        "macro template call",
+        "unparseable macro mention",
+        "macro-expanded methods",
+        "module imports"
+      ],
+      "files": [
+        {
+          "target": "Cargo.toml",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "write_rust_manifest",
+          "contains": "[package]",
+          "format_args": {
+            "package_name": "rust-macro-fixture"
+          }
+        },
+        {
+          "target": "src/lib.rs",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "write_rust_macro_fixture",
+          "contains": "pub mod targets;"
+        },
+        {
+          "target": "src/targets.rs",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "write_rust_macro_fixture",
+          "contains": "pub fn select_target()"
+        },
+        {
+          "target": "src/callers.rs",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "write_rust_macro_fixture",
+          "contains": "macro_rules! run_template"
+        },
+        {
+          "target": "src/methods.rs",
+          "source": "crates/aft/tests/integration/callgraph_test.rs",
+          "owner": "write_rust_macro_fixture",
+          "contains": "macro_rules! runtime_methods"
+        }
+      ]
+    }
+  ]
+}

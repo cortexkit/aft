@@ -8336,7 +8336,7 @@ async fn drive_bind_deadline_recovery_daemon(input: FakeDaemonInput) {
     state.wait_until("deadline route 30 configure started", |inner| {
         inner.slow_configure_started > slow_bind_base
     });
-    expect_route_bind_error(&mut stream, 300, "actor_not_ready").await;
+    expect_route_bind_error(&mut stream, 300, "bind_busy").await;
     // NO manual release: deadline expiry must operationally cancel the stuck
     // configure so the fresh bind below does not queue behind it.
     state.wait_for_slow_configure_finished(slow_bind_base + 1);

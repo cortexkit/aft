@@ -642,6 +642,8 @@ pub fn list_replayable_bash_tasks_for_project(
     // Another registry can acknowledge delivery without rewriting the metadata
     // snapshot. Recover that disagreement once to checkpoint the acknowledged
     // state, but continue excluding fully checkpointed terminal tasks.
+    // Keep this predicate identical to idx_bash_tasks_project_replay's WHERE:
+    // the partial index evaluates metadata at writes, not on each history scan.
     let mut stmt = conn.prepare(
         "SELECT harness, session_id, task_id, project_key, command, cwd, status,
                 exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,

@@ -548,7 +548,7 @@ mod tests {
         // directory outside it, even with a correct back-pointer in the target.
         #[cfg(unix)]
         {
-            let target_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            let target_root = std::path::Path::new(crate::test_support::manifest_dir())
                 .join("../../target/aft-trust-symlink-entry");
             let _ = fs::remove_dir_all(&target_root);
             fs::create_dir_all(&target_root).unwrap();

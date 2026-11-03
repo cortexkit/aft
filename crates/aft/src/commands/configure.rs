@@ -15641,7 +15641,11 @@ mod tests {
         );
     }
 
-    fn assert_callgraph_views_rematerialization_bounded(command: &str, daemon: bool) {
+    fn assert_callgraph_views_rematerialization_bounded(
+        command: &str,
+        daemon: bool,
+        delay_delivery: bool,
+    ) {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -15730,12 +15734,32 @@ mod tests {
         let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let (published_tx, published_rx) = crossbeam_channel::unbounded();
+        let (phase_tx, phase_rx) = crossbeam_channel::unbounded();
+        let (timed_out_tx, timed_out_rx) = crossbeam_channel::unbounded();
+        let (deliver_tx, deliver_rx) = crossbeam_channel::unbounded();
+        let timing_origin = Instant::now();
         let _hook = crate::storage_retention::observe_test_hook(
             &root,
             Arc::new(move |step| {
+                if step.starts_with("cg-timing:") {
+                    let _ = phase_tx.send((
+                        std::thread::current().id(),
+                        step.to_owned(),
+                        Instant::now(),
+                    ));
+                }
+                if matches!(
+                    step,
+                    "cg-timing:receive-timeout" | "cg-timing:query-lock-timeout"
+                ) {
+                    timed_out_tx.send(()).unwrap();
+                    if delay_delivery {
+                        deliver_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+                    }
+                }
                 if step == "callgraph-materialize" {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(120)).unwrap();
                 } else if step == "callgraph-reader-acquired" {
                     let _ = published_tx.send(());
                 }
@@ -15751,23 +15775,45 @@ mod tests {
             callers_request.clone()
         };
         let (answer_tx, answer_rx) = crossbeam_channel::unbounded();
+        let timing_ids = std::sync::atomic::AtomicUsize::new(0);
         let spawn_read = || {
             let worker_ctx = ctx.clone();
             let request = request.clone();
             let answer_tx = answer_tx.clone();
             let executor = _executor.clone();
             let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+            let timing_root = root.clone();
+            let timing_id = timing_ids.fetch_add(1, Ordering::Relaxed);
+            let (waits_tx, waits_rx) = crossbeam_channel::bounded(1);
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let id = request.id.clone();
                 let zoom = request.command == "zoom";
                 let run = move |ctx: &AppContext| {
-                    let _pin = ctx.pin_config();
-                    if zoom {
-                        crate::commands::zoom::handle_zoom(&request, ctx)
-                    } else {
-                        crate::commands::callers::handle_callers(&request, ctx)
-                    }
+                    let (response, waits) =
+                        crate::views::callgraph::capture_read_waits_for_test(|| {
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                &format!("cg-timing:request-{timing_id}-pin-begin"),
+                            );
+                            let _pin = ctx.pin_config();
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                "cg-timing:pin-return",
+                            );
+                            let response = if zoom {
+                                crate::commands::zoom::handle_zoom(&request, ctx)
+                            } else {
+                                crate::commands::callers::handle_callers(&request, ctx)
+                            };
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                "cg-timing:handler-return",
+                            );
+                            response
+                        });
+                    waits_tx.send(waits).unwrap();
+                    response
                 };
                 let response = if let Some(executor) = executor {
                     executor
@@ -15788,7 +15834,10 @@ mod tests {
                 } else {
                     run(&worker_ctx)
                 };
-                answer_tx.send((started.elapsed(), response)).unwrap();
+                let waits = waits_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+                answer_tx
+                    .send((started.elapsed(), response, waits))
+                    .unwrap();
             })
         };
         let worker = spawn_read();
@@ -15797,21 +15846,91 @@ mod tests {
         // A reader queued behind the first read gets the same total budget,
         // not another full wait after the first read releases the query lock.
         let concurrent = spawn_read();
-        let deadline = Instant::now() + bound + Duration::from_secs(1);
+        // This watchdog only releases stuck fixture threads. The assertions
+        // below check actual wait arguments and timeout outcomes, not dispatch
+        // or response-rendering wall time on a busy runner.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let first_timeout =
+            timed_out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let second_timeout =
+            timed_out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let materializer_still_gated = published_rx.is_empty();
+        let delivery_was_gated = !delay_delivery || answer_rx.is_empty();
+        if delay_delivery {
+            crossbeam_channel::after(Duration::from_millis(1250))
+                .recv()
+                .unwrap();
+            deliver_tx.send(()).unwrap();
+            deliver_tx.send(()).unwrap();
+        }
         let first = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         let second = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         concurrent.join().unwrap();
-        assert!(entered.is_ok(), "request never reached materialization");
-        for bounded_answer in [first, second] {
-            let answered_in_bound = bounded_answer.is_ok();
-            let (elapsed, answer) = bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
-            eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_in_bound}", elapsed.as_millis(), bound.as_millis());
-            assert!(
-                answered_in_bound,
-                "{command} waited {elapsed:?} for materialization past {bound:?}"
+        for (thread, phase, at) in phase_rx.try_iter() {
+            eprintln!(
+                "cg_timing command={command} daemon={daemon} thread={thread:?} at_us={} {phase}",
+                at.duration_since(timing_origin).as_micros()
             );
+        }
+        assert!(entered.is_ok(), "request never reached materialization");
+        assert!(
+            first_timeout.is_ok() && second_timeout.is_ok(),
+            "a read did not time out while materialization was gated"
+        );
+        assert!(
+            materializer_still_gated,
+            "materialization finished before the timeout observations"
+        );
+        assert!(
+            delivery_was_gated,
+            "post-timeout delivery gate did not hold the reply"
+        );
+        for bounded_answer in [first, second] {
+            let answered_while_gated = bounded_answer.is_ok();
+            let (elapsed, answer, waits) =
+                bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
+            eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_while_gated} delayed_delivery={delay_delivery}", elapsed.as_millis(), bound.as_millis());
+            assert!(
+                answered_while_gated,
+                "read did not deliver after its bounded wait"
+            );
+            assert!(
+                !waits.is_empty(),
+                "read did not observe the materialization wait policy"
+            );
+            let wait_deadline = waits[0].deadline;
+            assert_eq!(
+                waits[0].stage,
+                crate::views::callgraph::ReadWaitStage::QueryLock
+            );
+            assert!(
+                waits.iter().any(|wait| wait.timed_out),
+                "read did not observe a bounded timeout"
+            );
+            for wait in waits {
+                eprintln!("cg_wait command={command} daemon={daemon} stage={:?} requested_us={} observed_us={} timed_out={}", wait.stage, wait.requested.as_micros(), wait.finished.duration_since(wait.started).as_micros(), wait.timed_out);
+                assert_eq!(
+                    wait.deadline, wait_deadline,
+                    "a wait stage reset the request deadline"
+                );
+                assert!(
+                    wait.requested <= bound,
+                    "wait requested more than the production bound: {wait:?}"
+                );
+                assert_eq!(
+                    wait.requested,
+                    wait_deadline.saturating_duration_since(wait.started),
+                    "wait did not receive only the remaining request budget"
+                );
+            }
+            if delay_delivery {
+                assert!(
+                    elapsed > bound + Duration::from_secs(1),
+                    "controlled response delay was not exercised"
+                );
+            }
             if command == "zoom" {
                 assert!(answer.success, "{:?}", answer.data);
                 assert!(answer.data.to_string().contains("export function target"));
@@ -15840,22 +15959,27 @@ mod tests {
 
     #[test]
     fn callgraph_views_rematerialization_bounds_callers_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("callers", false);
+        assert_callgraph_views_rematerialization_bounded("callers", false, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_zoom_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("zoom", false);
+        assert_callgraph_views_rematerialization_bounded("zoom", false, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_daemon_callers_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("callers", true);
+        assert_callgraph_views_rematerialization_bounded("callers", true, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_daemon_zoom_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("zoom", true);
+        assert_callgraph_views_rematerialization_bounded("zoom", true, false);
+    }
+
+    #[test]
+    fn callgraph_views_wait_bound_excludes_controlled_post_timeout_reply_delay() {
+        assert_callgraph_views_rematerialization_bounded("zoom", false, true);
     }
 
     fn assert_callgraph_acquisition_lifecycle(
@@ -27033,11 +27157,241 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_resolve_shares_only_verified_unchanged_repository_history() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let initial = git_stdout(&main, &["rev-parse", "HEAD"]);
+        let bind = |root: &Path| {
+            let root = root.canonicalize().unwrap();
+            let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+            let key = test_context()
+                .memoized_artifact_cache_key_for_configure_profiled(
+                    &root,
+                    &root,
+                    storage.path(),
+                    None,
+                    &mut timings,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(timings.git_spawns, 1, "every fresh bind still verifies Git");
+            (key, timings.root_walks)
+        };
+        let (key, walks) = bind(&main);
+        assert_eq!(walks, 1);
+        assert_eq!(
+            key,
+            crate::search_index::artifact_key_from_git_identity(&initial)
+        );
+        for name in ["first", "second", "third"] {
+            let linked = temp.path().join(name);
+            git_ok(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            assert_eq!(bind(&linked), (key.clone(), 0));
+            let scoped = linked.join("src");
+            std::fs::create_dir(&scoped).unwrap();
+            let (scoped_key, walks) = bind(&scoped);
+            assert_ne!(
+                scoped_key, key,
+                "sharing history must not share subfolder artifacts"
+            );
+            assert_eq!(walks, 0);
+        }
+
+        // An orphan branch has a different root even in the same object store.
+        git_ok(&main, &["checkout", "--quiet", "--orphan", "unrelated"]);
+        git_ok(
+            &main,
+            &[
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "unrelated",
+            ],
+        );
+        let (unrelated, walks) = bind(&main);
+        assert_ne!(unrelated, key);
+        assert_eq!(walks, 1);
+        let other = temp.path().join("other");
+        init_git_fixture(&other);
+        assert_eq!(
+            bind(&other).1,
+            1,
+            "another repository cannot reuse the walk"
+        );
+    }
+
+    #[test]
+    fn cache_key_resolve_shared_history_survives_sibling_commits() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let initial = git_stdout(&main, &["rev-parse", "HEAD"]);
+        let first = temp.path().join("first");
+        let sibling = temp.path().join("sibling");
+        for linked in [&first, &sibling] {
+            git_ok(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                    &initial,
+                ],
+            );
+        }
+        let mut seed = crate::search_index::ArtifactCacheKeyTimings::default();
+        let key = test_context()
+            .memoized_artifact_cache_key_for_configure_profiled(
+                &first,
+                &first,
+                storage.path(),
+                None,
+                &mut seed,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(seed.root_walks, 1);
+        std::fs::write(sibling.join("tracked.rs"), "fn sibling_change() {}\n").unwrap();
+        git_ok(&sibling, &["add", "tracked.rs"]);
+        git_ok(
+            &sibling,
+            &[
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "sibling change",
+            ],
+        );
+        let committed = git_stdout(&sibling, &["rev-parse", "HEAD"]);
+        assert_ne!(committed, initial);
+        assert!(main
+            .join(".git/objects")
+            .join(&committed[..2])
+            .join(&committed[2..])
+            .is_file());
+
+        let fresh = temp.path().join("fresh");
+        git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                fresh.to_str().unwrap(),
+                &initial,
+            ],
+        );
+        let mut again = crate::search_index::ArtifactCacheKeyTimings::default();
+        let shared = test_context()
+            .memoized_artifact_cache_key_for_configure_profiled(
+                &fresh,
+                &fresh,
+                storage.path(),
+                None,
+                &mut again,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared, key);
+        assert_eq!(
+            again.root_walks, 0,
+            "unrelated new objects cannot change cached ancestry"
+        );
+        assert_eq!(
+            again.git_spawns, 1,
+            "a fresh bind must still verify HEAD with Git"
+        );
+    }
+
+    #[test]
+    fn cache_key_resolve_shared_history_requires_readable_head() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        test_context()
+            .memoized_artifact_cache_key_for_configure(&main, &main, storage.path(), None)
+            .unwrap()
+            .unwrap();
+        let linked = temp.path().join("linked");
+        git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let head = git_stdout(&main, &["rev-parse", "HEAD"]);
+        let object = main.join(".git/objects").join(&head[..2]).join(&head[2..]);
+        let mut permissions = std::fs::metadata(&object).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&object, permissions).unwrap();
+        std::fs::write(&object, b"broken").unwrap();
+        let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+        assert!(test_context()
+            .memoized_artifact_cache_key_for_configure_profiled(
+                &linked,
+                &linked,
+                storage.path(),
+                None,
+                &mut timings,
+            )
+            .is_err());
+        assert_eq!(
+            timings.root_walks, 3,
+            "failed verification must use the ordinary retry ladder"
+        );
+        assert_eq!(
+            timings.git_spawns, 6,
+            "each retry verifies HEAD then falls back to the full probe"
+        );
+        assert_eq!(
+            crate::root_identity::read(&linked, storage.path()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     #[ignore = "manual native cache-key timing probe"]
     fn cache_key_resolve_profile_native_probe() {
         let root = std::env::var_os("AFT_CACHE_KEY_PROBE_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .unwrap_or_else(|| Path::new(crate::test_support::manifest_dir()).join("../.."))
             .canonicalize()
             .unwrap();
         assert!(
@@ -27065,18 +27419,77 @@ mod tests {
         } else {
             temporary.path().to_path_buf()
         };
+        let linked_roots = tempfile::tempdir().unwrap();
+        let sibling = std::env::var_os("AFT_CACHE_KEY_PROBE_SIBLING_WRITES").map(|_| {
+            assert!(std::env::var_os("AFT_CACHE_KEY_PROBE_LINKED_ROOTS").is_some());
+            let sibling = linked_roots.path().join("writer");
+            git_ok(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    sibling.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            sibling
+        });
         let warm_context = test_context();
         for sample in 0..8 {
+            if let Some(sibling) = sibling.as_ref().filter(|_| sample > 0) {
+                std::fs::write(
+                    sibling.join("cache-key-probe.txt"),
+                    format!("sample {sample}\n"),
+                )
+                .unwrap();
+                git_ok(sibling, &["add", "--force", "cache-key-probe.txt"]);
+                git_ok(
+                    sibling,
+                    &[
+                        "-c",
+                        "gc.auto=0",
+                        "-c",
+                        "maintenance.auto=false",
+                        "-c",
+                        "user.name=AFT Tests",
+                        "-c",
+                        "user.email=aft-tests@example.com",
+                        "commit",
+                        "--quiet",
+                        "-m",
+                        "sibling probe write",
+                    ],
+                );
+            }
+            let cold_root = if std::env::var_os("AFT_CACHE_KEY_PROBE_LINKED_ROOTS").is_some() {
+                let linked = linked_roots.path().join(format!("checkout-{sample}"));
+                git_ok(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "--detach",
+                        linked.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+                linked.canonicalize().unwrap()
+            } else {
+                root.clone()
+            };
             let cold_context = test_context();
-            for (label, ctx) in [
-                ("cold_context", &cold_context),
-                ("warm_context", &warm_context),
+            for (label, ctx, root) in [
+                ("cold_context", &cold_context, &cold_root),
+                ("warm_context", &warm_context, &root),
             ] {
-                let mut profile = super::CacheKeyResolveProfile::new(&root);
+                let mut profile = super::CacheKeyResolveProfile::new(root);
                 let key = ctx
                     .memoized_artifact_cache_key_for_configure_profiled(
-                        &root,
-                        &root,
+                        root,
+                        root,
                         &storage,
                         None,
                         &mut profile.key,
@@ -27090,7 +27503,7 @@ mod tests {
                 let started = Instant::now();
                 crate::storage_retention::record_bind(
                     &crate::root_cache::StoragePaths::same(&storage),
-                    &root,
+                    root,
                     &key,
                 )
                 .unwrap();

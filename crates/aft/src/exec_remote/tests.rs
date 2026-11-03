@@ -24,7 +24,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         panic!("accepted vector must decode as acceptance")
     };
     assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
-    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::path::Path::new(crate::test_support::manifest_dir()).join("../../Cargo.lock");
     let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
     let packages: Vec<_> = lock["package"]
         .as_array()
@@ -1227,4 +1227,71 @@ fn terminal_gap_loses_each_missing_range_but_drains_later_records_in_order() {
     assert_eq!(sink.stdout, b"BE");
     assert_eq!(sink.seqs, [1, 4]);
     assert_eq!(sink.truncations, [1, 4]);
+}
+
+#[test]
+fn pending_return_chunks_are_byte_bounded_and_released_after_drain() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    let chunk = |seq| {
+        StreamRecord::ReturnChunk(ReturnChunk::new(
+            job_id(),
+            seq,
+            0,
+            0,
+            BytePayload(vec![42; RETURN_CHUNK_MAX_BYTES]),
+        ))
+    };
+    let mut refused = None;
+    for seq in 1..=32 {
+        match consumer.consume(chunk(seq), &mut sink) {
+            Ok(()) => {
+                // A duplicate must not consume the budget a second time.
+                consumer.consume(chunk(seq), &mut sink).unwrap();
+            }
+            Err(Error::RecoveryRequired { .. }) => {
+                refused = Some(seq);
+                break;
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+    let seq = refused.expect("out-of-order chunks must be bounded before the receiver sees them");
+    assert!(seq <= 16);
+    assert_eq!(consumer.resume_point().unwrap().last_seq, None);
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"first"), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(seq - 1));
+    consumer.consume(chunk(seq), &mut sink).unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(seq));
+}
+
+#[test]
+fn pending_output_and_manifest_metadata_share_the_byte_budget() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    let bytes = vec![42; super::stream::MAX_PENDING_BYTES];
+    assert!(matches!(
+        consumer.consume(output(1, OutputStream::Stdout, &bytes), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    let manifest = ReturnManifest::new(
+        job_id(),
+        1,
+        vec![ReturnManifestEntry::failed(
+            "x".repeat(super::stream::MAX_PENDING_BYTES / 8),
+            ReturnPathsFailureCause::Expired,
+        )],
+        0,
+        RETURN_LARGE_MAX_BYTES_CAP,
+    );
+    assert!(matches!(
+        consumer.consume(StreamRecord::ReturnManifest(manifest), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert_eq!(consumer.resume_point().unwrap().last_seq, None);
+    assert!(sink.stdout.is_empty());
 }

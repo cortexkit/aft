@@ -229,8 +229,8 @@ mod tests {
     #[test]
     #[ignore = "exports checker inputs without rewriting the permanent table"]
     fn export_occipital_check_inputs() {
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tool-views-check");
+        let dir = std::path::Path::new(crate::test_support::manifest_dir())
+            .join("../../target/tool-views-check");
         std::fs::create_dir_all(&dir).unwrap();
         for (index, (pin, entry)) in SHIPPED.iter().enumerate() {
             let input = match entry.tool.name.as_str() {

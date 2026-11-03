@@ -220,7 +220,7 @@ fn validate(document: &Value) {
 async fn rich_ui_samples_match_handlers() {
     let document = capture().await;
     validate(&document);
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+    let path = Path::new(crate::test_support::manifest_dir()).join(FIXTURE);
     let expected = std::fs::read(&path).expect("committed rich-UI samples must exist");
     assert_eq!(
         String::from_utf8(encoded(&document)).unwrap(),
@@ -287,7 +287,7 @@ fn rich_ui_samples_readiness_timeout_names_pending_state() {
 async fn regenerate_rich_ui_samples() {
     let document = capture().await;
     validate(&document);
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
+    let path = Path::new(crate::test_support::manifest_dir()).join(FIXTURE);
     std::fs::write(&path, encoded(&document)).unwrap();
     println!(
         "RICH_UI_SAMPLES_GENERATED {} vectors: {}",
