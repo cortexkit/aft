@@ -96,8 +96,8 @@ impl AcquisitionOwner {
         let stopped = self.stopped.clone();
         #[cfg(test)]
         let root = self.root.clone();
-        // Fixture attribute-source overrides are thread-local. Keep the same
-        // test Git policy when acquisition moves onto a worker.
+        // Fixture attribute-source overrides are thread-local. Carry the
+        // caller's overrides onto the acquisition worker.
         #[cfg(test)]
         let attribute_sources = super::verification::attribute_sources_snapshot_for_test();
         let run = move || {
