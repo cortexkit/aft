@@ -9167,8 +9167,12 @@ mod tests {
         for extension in ["js", "ts"] {
             let importer = format!("src/importer.{extension}");
             let target = format!("src/target.{extension}");
+            let handwritten = format!(
+                "export function inLarge() {{}}\n{}",
+                "// handwritten source\n".repeat(75_000)
+            );
             let (_temp, root, files) = fixture_project(&[
-                (&importer, "export function inLarge() {}\n"),
+                (&importer, &handwritten),
                 (&target, "export function used() {}\n"),
             ]);
             let snapshot = snapshot(
@@ -9207,10 +9211,13 @@ mod tests {
                 let initial = scan();
                 assert_eq!(initial.aggregate["count"], 2);
                 let (_, initial_state, _) = rollup(&initial.contributions, None);
-                fs::write(&files[0], format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n//{}", "x".repeat(MAX_SOURCE_BYTES as usize))).unwrap();
+                let source_reads =
+                    super::super::source_text::source_read_count_for_debug(&files[0]);
+                let head_bytes = crate::file_kind::read_probe::bytes_read(&files[0]);
+                fs::write(&files[0], format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n{}", "// handwritten source\n".repeat(250_000))).unwrap();
                 let probe = crate::project_content::Probe::new(&root);
                 let skipped = scan();
-                let expected = json!([{"file": importer, "reason": "over the 1 MiB size limit"}]);
+                let expected = json!([{"file": importer, "reason": "over the 4 MiB size limit"}]);
                 assert_eq!(
                     skipped.aggregate["count"], 0,
                     "{extension}, oxc={oxc}: {}",
@@ -9222,17 +9229,62 @@ mod tests {
                 assert_eq!(cached, skipped.aggregate);
                 let (warm, _, _) = rollup(&skipped.contributions, Some(&state));
                 assert_eq!(warm, cached);
+                assert_eq!(
+                    super::super::source_text::source_read_count_for_debug(&files[0]),
+                    source_reads
+                );
                 assert!(
-                    !probe.paths().contains(&files[0]),
-                    "oversized source was opened"
+                    crate::file_kind::read_probe::bytes_read(&files[0]) - head_bytes
+                        <= crate::file_kind::HEAD_BYTES * 2
                 );
                 drop(probe);
-                fs::write(&files[0], "export function inLarge() {}\n").unwrap();
+                fs::write(&files[0], &handwritten).unwrap();
                 let repaired = scan();
                 let (cached_repair, _, _) = rollup(&repaired.contributions, Some(&state));
                 assert_eq!(cached_repair, initial.aggregate);
             }
         }
+    }
+
+    #[test]
+    fn generated_and_minified_js_ts_are_unopened_deliberate_graph_exclusions() {
+        let (_temp, root, files) = fixture_project(&[
+            (
+                "src/api.generated.ts",
+                "import { used } from './target'; used(); export function generatedUnused() {}\n",
+            ),
+            ("src/bundle.min.js", "export function minifiedUnused() {}\n"),
+            ("src/target.ts", "export function used() {}\n"),
+        ]);
+        let snapshot = snapshot(
+            files.clone(),
+            vec![
+                export(&root, "src/api.generated.ts", "generatedUnused", "function"),
+                export(&root, "src/bundle.min.js", "minifiedUnused", "function"),
+                export(&root, "src/target.ts", "used", "function"),
+            ],
+            vec![],
+        );
+        let scan_job = job(&root, files.clone(), snapshot);
+        let probe = crate::project_content::Probe::new(&root);
+        for oxc in [false, true] {
+            let success = if oxc {
+                scan_success_with_oxc(scan_job.clone())
+            } else {
+                run_dead_code_scan(&scan_job).outcome.unwrap()
+            };
+            assert_eq!(success.aggregate["count"], 1, "{}", success.aggregate);
+            assert_eq!(success.aggregate["generated_count"], 0);
+            assert_eq!(success.aggregate["complete"], true);
+            assert!(success.aggregate.get("skipped_files").is_none());
+            assert!(aggregate_has_item(
+                &success.aggregate,
+                "src/target.ts",
+                "used"
+            ));
+        }
+        assert!(!probe.paths().contains(&files[0]));
+        assert!(!probe.paths().contains(&files[1]));
     }
 
     fn job(root: &Path, scope_files: Vec<PathBuf>, snapshot: CallgraphSnapshot) -> InspectJob {

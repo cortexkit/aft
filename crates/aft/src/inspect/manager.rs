@@ -9491,7 +9491,6 @@ export function bannerUnused() {}
     fn unused_exports_oversized_js_ts_sources_are_unopened_and_cached_as_graph_wide_gaps() {
         use std::fs;
 
-        use super::super::scanners::source_text::MAX_SOURCE_BYTES;
         use super::super::scanners::unused_exports::{
             run_unused_exports_scan, run_unused_exports_scan_with_oxc,
         };
@@ -9500,8 +9499,15 @@ export function bannerUnused() {}
             let root = dir.path();
             let large = root.join(format!("importer.{extension}"));
             let small = root.join(format!("target.{extension}"));
-            fs::write(&small, "export function used() {}\n").unwrap();
-            fs::write(&large, format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n//{}", "x".repeat(MAX_SOURCE_BYTES as usize))).unwrap();
+            fs::write(
+                &small,
+                format!(
+                    "export function used() {{}}\n{}",
+                    "// handwritten source\n".repeat(75_000)
+                ),
+            )
+            .unwrap();
+            fs::write(&large, format!("import {{ used }} from './target.{extension}'; used();\nexport function inLarge() {{}}\n{}", "// handwritten source\n".repeat(250_000))).unwrap();
             let paths = vec![large.clone(), small];
             let job = unused_exports_job(root, paths.clone());
             let probe = crate::project_content::Probe::new(root);
@@ -9533,7 +9539,7 @@ export function bannerUnused() {}
                 assert_eq!(aggregate["skipped_files_count"], 1);
                 assert_eq!(
                     aggregate["skipped_files"],
-                    json!([{"file": format!("importer.{extension}"), "reason": "over the 1 MiB size limit"}])
+                    json!([{"file": format!("importer.{extension}"), "reason": "over the 4 MiB size limit"}])
                 );
                 let cached =
                     roll_up_unused_exports_contributions(&job, &success.contributions, None);
@@ -9548,9 +9554,13 @@ export function bannerUnused() {}
                     assert_eq!(cached[key], aggregate[key], "{key}, oxc={oxc}");
                 }
             }
+            assert_eq!(
+                super::super::scanners::source_text::source_read_count_for_debug(&large),
+                0
+            );
             assert!(
-                !probe.paths().contains(&large),
-                "oversized source was opened"
+                crate::file_kind::read_probe::bytes_read(&large)
+                    <= crate::file_kind::HEAD_BYTES * 4
             );
             drop(probe);
             fs::write(&large, "export function nowSmall() {}\n").unwrap();
@@ -9569,6 +9579,52 @@ export function bannerUnused() {}
             assert_eq!(repaired.aggregate["complete"], true);
             assert!(repaired.aggregate.get("skipped_files").is_none());
         }
+    }
+
+    #[test]
+    fn unused_exports_generated_and_minified_inputs_are_unopened_deliberate_exclusions() {
+        use super::super::scanners::unused_exports::{
+            run_unused_exports_scan, run_unused_exports_scan_with_oxc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let generated = root.join("api.generated.ts");
+        let minified = root.join("bundle.min.js");
+        let target = root.join("target.ts");
+        std::fs::write(
+            &generated,
+            "import { used } from './target'; used(); export function generatedUnused() {}\n",
+        )
+        .unwrap();
+        std::fs::write(&minified, "export function minifiedUnused() {}\n").unwrap();
+        std::fs::write(&target, "export function used() {}\n").unwrap();
+        let paths = vec![generated.clone(), minified.clone(), target];
+        let job = unused_exports_job(root, paths.clone());
+        let probe = crate::project_content::Probe::new(root);
+        for oxc in [false, true] {
+            let success = if oxc {
+                let result = super::super::oxc_engine::analyze_files(
+                    root,
+                    &paths,
+                    AnalyzeOptions::default(),
+                )
+                .unwrap();
+                run_unused_exports_scan_with_oxc(&job, Some(&result))
+            } else {
+                run_unused_exports_scan(&job)
+            }
+            .outcome
+            .unwrap();
+            assert_eq!(success.aggregate["count"], 1, "{}", success.aggregate);
+            assert_eq!(success.aggregate["generated_count"], 0);
+            assert_eq!(success.aggregate["complete"], true);
+            assert!(success.aggregate.get("skipped_files").is_none());
+            let cached = roll_up_unused_exports_contributions(&job, &success.contributions, None);
+            assert_eq!(cached["count"], 1);
+            assert_eq!(cached["complete"], true);
+        }
+        assert!(!probe.paths().contains(&generated));
+        assert!(!probe.paths().contains(&minified));
     }
 
     #[test]
