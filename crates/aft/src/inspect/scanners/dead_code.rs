@@ -7795,7 +7795,7 @@ mod tests {
     #[ignore = "opt-in CPU measurement using a cold callgraph of this checkout"]
     fn live_cpu_test_origins_checkout_cost() {
         let root = fs::canonicalize(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/aft-bridge"),
+            Path::new(crate::test_support::manifest_dir()).join("../../packages/aft-bridge"),
         )
         .unwrap();
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
@@ -7998,7 +7998,8 @@ mod tests {
     #[test]
     #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
     fn live_cpu_relative_paths_checkout_cost() {
-        let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let root =
+            fs::canonicalize(Path::new(crate::test_support::manifest_dir()).join("../..")).unwrap();
         let mut parser = crate::parser::FileParser::new();
         let mut requests: Vec<PathBuf> = Vec::new();
         let mut files = 0;

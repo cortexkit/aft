@@ -44,7 +44,7 @@ impl Fixture {
         // Under the crate directory, not the system temp directory, so the
         // standalone temp exemption only reaches the directory this fixture
         // names as temp.
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap();
         let base = dir.path().canonicalize().unwrap();
         let root = base.join("root");
         let outside = base.join("outside");

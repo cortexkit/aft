@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn deployed_legacy_policy_vectors_match_and_verify_digests() {
         use sha2::{Digest, Sha256};
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::path::Path::new(crate::test_support::manifest_dir())
             .join("src/exec_remote/fixtures/policy");
         let mut count = 0;
         for entry in std::fs::read_dir(root).unwrap() {

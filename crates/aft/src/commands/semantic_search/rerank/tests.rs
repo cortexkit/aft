@@ -1721,7 +1721,7 @@ fn onnx_cost_profile_when_available() {
         .expect("load test model");
     let rss_loaded = process_rss_mb();
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(crate::test_support::manifest_dir());
     let mut sources = std::fs::read_dir(root.join("src"))
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
