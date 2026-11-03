@@ -19,6 +19,9 @@ use crate::protocol::{RawRequest, Response};
 
 pub const OFF_TEXT: &str = "Indexing is off: this folder does not look like a project. grep and glob still work, with limits. To index it, set project_detection in your AFT user config.";
 pub const INCOMPLETE_TEXT: &str = "Indexing is paused: AFT could not check this folder in time and will check again shortly. grep and glob still work, with limits.";
+const BROAD_ROOT_TEXT: &str =
+    "Watching and indexing are off for this broad root; explicit-path tools remain available.";
+const BROAD_ROOT_UNKNOWN_HOME_TEXT: &str = "The account home could not be determined, so only the filesystem or volume root is protected by the home rule. Watching and indexing are off for this broad root; explicit-path tools remain available.";
 const RECHECK_MS: u64 = 60_000;
 const CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -44,6 +47,71 @@ fn incomplete_message(decision: &FolderAdmission) -> String {
                     .unwrap()
             )
         })
+}
+
+fn broad_root_warning(root: &Path) -> Value {
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+    let home_root = home.as_deref() == Some(root);
+    let account_home_known = crate::commands::configure::resolve_account_home_dir().is_some();
+    let reason = if home_root {
+        "home_root"
+    } else if account_home_known {
+        "root_too_broad"
+    } else {
+        "account_home_unknown"
+    };
+    json!({"code": "root_too_broad", "reason": reason, "message":
+        if home_root || account_home_known { BROAD_ROOT_TEXT } else { BROAD_ROOT_UNKNOWN_HOME_TEXT }})
+}
+
+fn structural_binding(binding: &Binding) -> bool {
+    // Root identity can prove an unsafe anchor before a worker publishes.
+    // Do not infer an ordinary missing-project verdict from pending work.
+    binding.decision.as_ref().map_or_else(
+        || {
+            crate::folder_admission::boundary_decision(&binding.root, binding.mode)
+                .is_some_and(|decision| decision.is_structural_refusal())
+        },
+        |cache| cache.decision.is_structural_refusal(),
+    )
+}
+
+pub(crate) fn structural_root_warning(ctx: &AppContext) -> Option<Value> {
+    let root = ctx
+        .folder_admission()
+        .binding
+        .lock()
+        .as_ref()
+        .and_then(|binding| structural_binding(binding).then(|| binding.root.clone()))?;
+    Some(broad_root_warning(&root))
+}
+
+pub(crate) fn public_degraded_reasons(ctx: &AppContext, reasons: Vec<String>) -> Vec<String> {
+    let Some(warning) = structural_root_warning(ctx) else {
+        return reasons;
+    };
+    // Keep the root reason in its original position and retain every unrelated
+    // degradation. Only the public presentation changes, not cached evidence.
+    let mut result = Vec::new();
+    for reason in reasons {
+        if matches!(
+            reason.as_str(),
+            "folder_not_admitted" | "folder_admission_pending"
+        ) {
+            if warning["reason"] == "home_root" && !result.iter().any(|r| r == "home_root") {
+                result.push("home_root".to_owned());
+            }
+            if !result.iter().any(|r| r == "root_too_broad") {
+                result.push("root_too_broad".to_owned());
+            }
+        } else {
+            result.push(reason);
+        }
+    }
+    result
 }
 
 pub(crate) struct State {
@@ -918,7 +986,10 @@ fn snapshot_binding(binding: &Binding, watcher_active: bool) -> Value {
             value["recursive_watcher"] = json!(if watcher_active { "on" } else { "off" });
         }
     }
-    if binding
+    if structural_binding(binding) {
+        value["reason"] = json!("root_too_broad");
+        value["message"] = broad_root_warning(&binding.root)["message"].clone();
+    } else if binding
         .decision
         .as_ref()
         .is_some_and(|cache| cache.decision.classification == FolderClassification::NotProject)
@@ -978,6 +1049,11 @@ pub(crate) fn reason(ctx: &AppContext) -> Option<String> {
         return Some("folder_admission_pending".into());
     };
     let binding = binding.as_ref()?;
+    // Structural anchors keep the existing broad-root command/status paths.
+    // A known filesystem or volume anchor is not a missing-project refusal.
+    if structural_binding(binding) {
+        return None;
+    }
     if binding.pending || binding.needs_apply || binding.force || binding.invalidated {
         return Some("folder_admission_pending".into());
     }
@@ -1576,10 +1652,11 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
             ctx.add_degraded_reason("folder_not_admitted");
         }
         for session in sessions {
-            if let Some(message) = notice(ctx, true, &session) {
+            if let Some(warning) = structural_root_warning(ctx).or_else(|| notice(ctx, true, &session)
+                .map(|message| json!({"code": "folder_not_admitted", "message": message, "folder": reply_snapshot(ctx)}))) {
                 let _ = ctx.configure_warnings_sender().send((ctx.configure_generation(), crate::protocol::ConfigureWarningsFrame {
                     frame_type: "configure_warnings", session_id: Some(session), project_root: root.display().to_string(),
-                    warnings: vec![json!({"code": "folder_not_admitted", "message": message, "folder": reply_snapshot(ctx)})],
+                    warnings: vec![warning],
                 }));
             }
         }
@@ -1740,6 +1817,9 @@ pub fn refusal(ctx: &AppContext, id: &str, session: &str) -> Option<Response> {
 fn notice(ctx: &AppContext, configure: bool, session: &str) -> Option<String> {
     let mut slot = ctx.folder_admission().binding.lock();
     let binding = slot.as_mut()?;
+    if structural_binding(binding) {
+        return None;
+    }
     let text = binding
         .decision
         .as_ref()
@@ -1765,10 +1845,37 @@ pub fn decorate(ctx: &AppContext, response: &mut Response, configure: bool, sess
     if !response.data.is_object() {
         return;
     }
-    let Some(folder) = reply_snapshot(ctx) else {
+    let Some(mut folder) = reply_snapshot(ctx) else {
         return;
     };
-    response.data["folder"] = folder;
+    if response.success {
+        // Admission timings belong in status/health diagnostics, not otherwise
+        // identical successful replies or cached agent prompts.
+        if let Some(object) = folder.as_object_mut() {
+            object.remove("observed_at_ms");
+        }
+        if let Some(coverage) = folder.get_mut("coverage").and_then(Value::as_object_mut) {
+            coverage.remove("elapsed_ms");
+        }
+    }
+    if !configure && response.success {
+        if bounded_query(ctx) {
+            response.data["folder"] = json!({"state": folder["state"], "reason": folder["reason"]});
+        }
+    } else {
+        response.data["folder"] = folder;
+    }
+    if let Some(warning) = structural_root_warning(ctx) {
+        if configure {
+            if response.data.get("warnings").is_none() {
+                response.data["warnings"] = json!([]);
+            }
+            if let Some(warnings) = response.data["warnings"].as_array_mut() {
+                warnings.push(warning);
+            }
+        }
+        return;
+    }
     if let Some(message) = notice(ctx, configure, session) {
         response.data["folder_notice"] = json!(message);
         if configure {

@@ -3967,9 +3967,10 @@ pub(crate) fn handle_folder_admission_replay(req: &RawRequest, ctx: &AppContext)
     crate::provisional_identity_retry::note_configure_outcome(ctx, req, response.success);
     crate::folder_admission_runtime::decorate(ctx, &mut response, true, req.session());
     if response.success {
-        let warnings = response.data.get("folder_notice").and_then(Value::as_str).map(|message| vec![json!({
+        let warnings = crate::folder_admission_runtime::structural_root_warning(ctx).map(|warning| vec![warning])
+            .or_else(|| response.data.get("folder_notice").and_then(Value::as_str).map(|message| vec![json!({
             "code": "folder_not_admitted", "message": message, "folder": response.data["folder"]
-        })]).unwrap_or_default();
+        })])).unwrap_or_default();
         for session in crate::folder_admission_runtime::take_waiting_sessions(ctx) {
             if session == req.session()
                 && response.data["warnings_pending"].as_bool().unwrap_or(false)
@@ -25592,7 +25593,10 @@ mod tests {
         assert_no_workers();
         let status = ctx.build_status_snapshot();
         for lane in ["search_index", "semantic_index"] {
-            assert_eq!(status[lane]["status"], "off");
+            assert_eq!(
+                status[lane]["status"],
+                if structural { "disabled" } else { "off" }
+            );
             assert_eq!(status[lane]["reason"], folder["reason"]);
         }
         for plane in crate::feature_status::IndexPlane::ALL {
@@ -25610,8 +25614,13 @@ mod tests {
         };
         let response = crate::commands::inspect::handle_inspect(&inspect, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "folder_not_admitted");
-        assert_eq!(response.data["reason"], folder["reason"]);
+        if structural {
+            assert_eq!(response.data["code"], "root_too_broad");
+            assert_eq!(response.data["message"], "inspect: project-wide analysis is off for this broad root; open a project subdirectory");
+        } else {
+            assert_eq!(response.data["code"], "folder_not_admitted");
+            assert_eq!(response.data["reason"], folder["reason"]);
+        }
         let search = RawRequest {
             id: "search-broad".into(),
             command: "semantic_search".into(),
@@ -25621,9 +25630,16 @@ mod tests {
         };
         let response = crate::commands::semantic_search::handle_semantic_search(&search, &ctx);
         assert!(!response.success);
-        assert_eq!(response.data["code"], "folder_not_admitted");
-        assert_eq!(response.data["reason"], folder["reason"]);
-        assert_eq!(response.data["folder"]["classification"], "not_project");
+        if structural {
+            assert_eq!(response.data["code"], "no_search_lanes_enabled");
+            assert!(response.data["message"].as_str().unwrap().starts_with(
+                "aft_search indexing is off: root_too_broad. Open a project subdirectory, or use grep with an explicit path."
+            ));
+        } else {
+            assert_eq!(response.data["code"], "folder_not_admitted");
+            assert_eq!(response.data["reason"], folder["reason"]);
+            assert_eq!(response.data["folder"]["classification"], "not_project");
+        }
         // A backend left by an older bind must be removed even on the same root.
         install_project_watcher_with(&ctx, root, Vec::new(), |_, _, tx| Ok::<_, &'static str>(tx));
         assert!(ctx.watcher_runtime_active());
@@ -25705,6 +25721,44 @@ mod tests {
     fn configure_filesystem_root_disables_root_work() {
         let _env = home_env_mutex();
         assert_unadmitted_configure_root(std::path::Path::new("/"), true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_cargo_container_fixture_keeps_index_and_real_watcher_enabled() {
+        let _env = home_env_mutex();
+        let _watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "0");
+        let _sync = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(project.path().join("Cargo.toml"),
+            "[package]\nname = \"bind-root-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"bind-root-check\"\npath = \"main.rs\"\n").unwrap();
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": project.path(), "harness": "runner", "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": {"trigram": true, "semantic": false, "callgraph": false},
+                "views": {"enabled": false}
+            }))]
+        }));
+        assert!(handle_folder_configure_for_test(&req, &ctx).success);
+        settle_configure_for_test(&ctx);
+        assert!(ctx.watcher_runtime_active());
+        assert!(!ctx.root_too_broad());
+        assert!(ctx.config().indexes.trigram);
+        let status = ctx.build_status_snapshot();
+        assert_eq!(status["folder"]["classification"], "project", "{status}");
+        assert!(
+            !matches!(
+                status["search_index"]["status"].as_str(),
+                Some("disabled" | "off")
+            ),
+            "{status}"
+        );
+        assert_ne!(
+            status["search_index"]["reason"], "root_too_broad",
+            "{status}"
+        );
     }
 
     #[test]

@@ -265,6 +265,62 @@ fn folder_admission_incomplete_notice_is_pinned_byte_for_byte() {
 }
 
 #[test]
+fn folder_admission_success_envelopes_keep_only_needed_stable_facts() {
+    for admitted in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        if admitted {
+            crate::test_project::mark_project(root.path()).unwrap();
+        }
+        std::fs::write(root.path().join("notes.txt"), "needle\n").unwrap();
+        isolated(root.path(), || {
+            let ctx = context(storage.path());
+            let configured = configure(root.path(), storage.path(), &ctx, false, false);
+            assert!(configured.success);
+            assert!(configured.data["folder"].get("observed_at_ms").is_none());
+            assert!(configured.data["folder"]["coverage"]
+                .get("elapsed_ms")
+                .is_none());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                super::drain_deferred_configure_maintenance(&ctx);
+                if admission::snapshot(&ctx).unwrap()["state"] == "decided" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "folder did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let status = ctx.build_status_snapshot();
+            assert!(status["folder"]["observed_at_ms"].is_number(), "{status}");
+            assert!(
+                status["folder"]["coverage"]["elapsed_ms"].is_number(),
+                "{status}"
+            );
+            let grep = crate::commands::grep::handle_grep(
+                &request("grep", json!({"pattern": "needle", "path": "notes.txt"})),
+                &ctx,
+            );
+            assert!(grep.success, "{:?}", grep.data);
+            if admitted {
+                assert!(grep.data.get("folder").is_none(), "{:?}", grep.data);
+            } else {
+                assert_eq!(
+                    grep.data["folder"],
+                    json!({"state": "decided", "reason": "no_project_evidence"})
+                );
+                assert!(grep.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(admission::OFF_TEXT));
+            }
+        });
+    }
+}
+
+#[test]
 fn folder_admission_definite_refusal_announces_once_per_session() {
     // A definite refusal uses the full notice once per session, then its code.
     let root = tempfile::tempdir().unwrap();

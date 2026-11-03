@@ -502,7 +502,8 @@ impl AppContext {
         // subsystems are auto-disabled in that mode; the plugin / TUI sidebar
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
-        let mut degraded_reasons = self.degraded_reasons();
+        let mut degraded_reasons =
+            crate::folder_admission_runtime::public_degraded_reasons(self, self.degraded_reasons());
         if let Some(reason) = self.cache_unavailable_reason() {
             let code = crate::root_cache::cache_status_code(&reason);
             if !degraded_reasons.iter().any(|reason| reason == code) {
