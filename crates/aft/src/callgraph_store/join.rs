@@ -2640,10 +2640,24 @@ fn join_manifest_with_surfaces(
             })
             .collect::<Vec<_>>();
         caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        // Scoped and self calls can already have declaration-proven bindings.
+        // Let dispatch refine those bindings instead of skipping them in advance.
+        let associated_ordinals = blob
+            .refs
+            .iter()
+            .filter(|reference| {
+                blob.language == "rust"
+                    && reference.full_ref.as_deref().is_some_and(|name| {
+                        dispatch::associated_reference(name) || name.starts_with("self.")
+                    })
+            })
+            .map(|reference| reference.ordinal)
+            .collect::<BTreeSet<_>>();
         let receiver_ordinals = blob
             .dispatch
             .sites
             .iter()
+            .filter(|site| !associated_ordinals.contains(&site.ordinal))
             .map(|s| s.ordinal)
             .collect::<BTreeSet<_>>();
         let caller_data = &extract.data;
