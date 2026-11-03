@@ -1,0 +1,1 @@
+struct C; impl C { fn m(&self) {} fn new() -> Self { C } fn f(&self, x: C, y: &C, z: &mut C) { self.m(); x.m(); y.m(); z.m(); let a: C = C; a.m(); let b = C::new(); b.m(); let c = C {}; c.m(); } }

@@ -1,0 +1,1 @@
+fn callback() {} fn entry() { spawn(callback); let saved = callback; spawn(crate::callback); }

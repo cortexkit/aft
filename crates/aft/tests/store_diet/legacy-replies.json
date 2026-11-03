@@ -1,0 +1,369 @@
+{
+  "callers": {
+    "symbol": "validate",
+    "file": "helpers.ts",
+    "callers": [
+      {
+        "file": "aliased.ts",
+        "callers": [
+          {
+            "symbol": "runCheck",
+            "line": 4
+          }
+        ]
+      },
+      {
+        "file": "main.ts",
+        "callers": [
+          {
+            "symbol": "main",
+            "line": 4
+          }
+        ]
+      },
+      {
+        "file": "service.ts",
+        "callers": [
+          {
+            "symbol": "handleRequest",
+            "line": 4
+          }
+        ]
+      },
+      {
+        "file": "test_helpers.ts",
+        "callers": [
+          {
+            "symbol": "testValidation",
+            "line": 4
+          }
+        ]
+      },
+      {
+        "file": "utils.ts",
+        "callers": [
+          {
+            "symbol": "processData",
+            "line": 4
+          }
+        ]
+      }
+    ],
+    "total_callers": 5,
+    "scanned_files": 29,
+    "depth_limited": false,
+    "truncated": 0
+  },
+  "call_tree": {
+    "name": "main",
+    "file": "main.ts",
+    "line": 3,
+    "signature": "function main()",
+    "resolved": true,
+    "children": [
+      {
+        "name": "processData",
+        "file": "utils.ts",
+        "line": 3,
+        "signature": "function processData(input: string): string",
+        "resolved": true,
+        "children": [
+          {
+            "name": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "resolved": true,
+            "children": [
+              {
+                "name": "checkFormat",
+                "file": "helpers.ts",
+                "line": 5,
+                "signature": "function checkFormat(input: string): boolean",
+                "resolved": true,
+                "children": [
+                  {
+                    "name": "test",
+                    "file": "helpers.ts",
+                    "line": 6,
+                    "resolved": false,
+                    "children": [],
+                    "depth_limited": false,
+                    "truncated": 0
+                  }
+                ],
+                "depth_limited": false,
+                "truncated": 0
+              }
+            ],
+            "depth_limited": false,
+            "truncated": 0
+          },
+          {
+            "name": "toUpperCase",
+            "file": "utils.ts",
+            "line": 8,
+            "resolved": false,
+            "children": [],
+            "depth_limited": false,
+            "truncated": 0
+          }
+        ],
+        "depth_limited": false,
+        "truncated": 0
+      }
+    ],
+    "depth_limited": false,
+    "truncated": 0
+  },
+  "impact": {
+    "symbol": "validate",
+    "file": "helpers.ts",
+    "signature": "function validate(input: string): boolean",
+    "parameters": [
+      "input"
+    ],
+    "total_affected": 5,
+    "affected_files": 5,
+    "callers": [
+      {
+        "caller_symbol": "runCheck",
+        "caller_file": "aliased.ts",
+        "line": 4,
+        "signature": "function runCheck(data: string): boolean",
+        "is_entry_point": true,
+        "call_expression": "return checker(data);",
+        "parameters": [
+          "data"
+        ]
+      },
+      {
+        "caller_symbol": "main",
+        "caller_file": "main.ts",
+        "line": 4,
+        "signature": "function main()",
+        "is_entry_point": true,
+        "call_expression": "const result = processData(\"hello\");",
+        "parameters": []
+      },
+      {
+        "caller_symbol": "handleRequest",
+        "caller_file": "service.ts",
+        "line": 4,
+        "signature": "function handleRequest(input: string): string",
+        "is_entry_point": true,
+        "call_expression": "return processData(input);",
+        "parameters": [
+          "input"
+        ]
+      },
+      {
+        "caller_symbol": "testValidation",
+        "caller_file": "test_helpers.ts",
+        "line": 4,
+        "signature": "function testValidation()",
+        "is_entry_point": true,
+        "call_expression": "const result = validate(\"hello\");",
+        "parameters": []
+      },
+      {
+        "caller_symbol": "processData",
+        "caller_file": "utils.ts",
+        "line": 4,
+        "signature": "function processData(input: string): string",
+        "is_entry_point": true,
+        "call_expression": "const valid = validate(input);",
+        "parameters": [
+          "input"
+        ]
+      }
+    ],
+    "depth_limited": false,
+    "truncated": 0
+  },
+  "trace_to": {
+    "target_symbol": "validate",
+    "target_file": "helpers.ts",
+    "paths": [
+      {
+        "hops": [
+          {
+            "symbol": "handleRequest",
+            "file": "service.ts",
+            "line": 3,
+            "signature": "function handleRequest(input: string): string",
+            "is_entry_point": true
+          },
+          {
+            "symbol": "processData",
+            "file": "utils.ts",
+            "line": 3,
+            "signature": "function processData(input: string): string",
+            "is_entry_point": false
+          },
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": false
+          }
+        ]
+      },
+      {
+        "hops": [
+          {
+            "symbol": "main",
+            "file": "main.ts",
+            "line": 3,
+            "signature": "function main()",
+            "is_entry_point": true
+          },
+          {
+            "symbol": "processData",
+            "file": "utils.ts",
+            "line": 3,
+            "signature": "function processData(input: string): string",
+            "is_entry_point": false
+          },
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": false
+          }
+        ]
+      },
+      {
+        "hops": [
+          {
+            "symbol": "processData",
+            "file": "utils.ts",
+            "line": 3,
+            "signature": "function processData(input: string): string",
+            "is_entry_point": true
+          },
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": false
+          }
+        ]
+      },
+      {
+        "hops": [
+          {
+            "symbol": "runCheck",
+            "file": "aliased.ts",
+            "line": 3,
+            "signature": "function runCheck(data: string): boolean",
+            "is_entry_point": true
+          },
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": false
+          }
+        ]
+      },
+      {
+        "hops": [
+          {
+            "symbol": "testValidation",
+            "file": "test_helpers.ts",
+            "line": 3,
+            "signature": "function testValidation()",
+            "is_entry_point": true
+          },
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": false
+          }
+        ]
+      },
+      {
+        "hops": [
+          {
+            "symbol": "validate",
+            "file": "helpers.ts",
+            "line": 1,
+            "signature": "function validate(input: string): boolean",
+            "is_entry_point": true
+          }
+        ]
+      }
+    ],
+    "total_paths": 6,
+    "entry_points_found": 6,
+    "max_depth_reached": false,
+    "truncated_paths": 4
+  },
+  "trace_to_symbol": {
+    "path": [
+      {
+        "symbol": "main",
+        "file": "main.ts",
+        "line": 3
+      },
+      {
+        "symbol": "processData",
+        "file": "utils.ts",
+        "line": 3
+      },
+      {
+        "symbol": "validate",
+        "file": "helpers.ts",
+        "line": 1
+      }
+    ],
+    "complete": true
+  },
+  "trace_data": {
+    "expression": "rawInput",
+    "origin_file": "data_flow.ts",
+    "origin_symbol": "transformData",
+    "hops": [
+      {
+        "file": "data_flow.ts",
+        "symbol": "transformData",
+        "variable": "cleaned",
+        "line": 4,
+        "flow_type": "assignment",
+        "approximate": false
+      },
+      {
+        "file": "data_flow.ts",
+        "symbol": "transformData",
+        "variable": "result",
+        "line": 5,
+        "flow_type": "assignment",
+        "approximate": false
+      },
+      {
+        "file": "data_processor.ts",
+        "symbol": "processInput",
+        "variable": "input",
+        "line": 1,
+        "flow_type": "parameter",
+        "approximate": false
+      },
+      {
+        "file": "data_processor.ts",
+        "symbol": "processInput",
+        "variable": "normalized",
+        "line": 2,
+        "flow_type": "assignment",
+        "approximate": false
+      }
+    ],
+    "depth_limited": false
+  }
+}

@@ -219,11 +219,10 @@ pub fn build_request(
     Ok(request)
 }
 
-/// Most bytes one job may copy back across all its `return_paths`: 10 MiB,
-/// and never more than the chunked-return capability allows.
+/// Legacy return allowance for a runner without the large-return capability.
 pub const RETURN_TOTAL_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
-/// The `return_max_bytes` every request with `return_paths` sends.
+/// The default cap before the selected runner's catalog claims are known.
 pub fn return_max_bytes() -> u64 {
     RETURN_TOTAL_CAP_BYTES.min(super::types::RETURN_CHUNKED_MAX_BYTES_CAP)
 }

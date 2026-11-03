@@ -1,0 +1,466 @@
+{
+  "target_replacement": {
+    "target_order": [
+      "dispatch",
+      "exact"
+    ],
+    "winning_provenance": "exact",
+    "ref_row_exists": false
+  },
+  "cold_duplicate": [
+    {
+      "reverse": false,
+      "error": "sqlite error: UNIQUE constraint failed: view_dispatch_sites.caller_file, view_dispatch_sites.ordinal",
+      "published": false
+    },
+    {
+      "reverse": true,
+      "error": "sqlite error: UNIQUE constraint failed: view_dispatch_sites.caller_file, view_dispatch_sites.ordinal",
+      "published": false
+    }
+  ],
+  "before": {
+    "rows": {
+      "refs": [
+        [
+          "view:a.ts:27",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:27",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:37",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:37",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:55",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:55",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:69",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:69",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:77",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:77",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:91",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:91",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:99",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:99",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ]
+      ],
+      "edges": [
+        [
+          "edge:view:a.ts:69",
+          "view:a.ts:69",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts.more.ts:69",
+          "view:a.ts.more.ts:69",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts:91",
+          "view:a.ts:91",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts.more.ts:91",
+          "view:a.ts.more.ts:91",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "dispatch:a.ts:27:a.ts:C::m",
+          "view:a.ts:27",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:37:a.ts:C::m",
+          "view:a.ts:37",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:55:a.ts:C::m",
+          "view:a.ts:55",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:77:a.ts:C::m",
+          "view:a.ts:77",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:99:a.ts:C::m",
+          "view:a.ts:99",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:27:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:27",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:37:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:37",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:55:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:55",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:77:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:77",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:99:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:99",
+          "C::m",
+          "exact"
+        ]
+      ]
+    },
+    "tree": {
+      "name": "C::f",
+      "file": "a.ts",
+      "line": 1,
+      "signature": "f(x: C) { this.m(); x.m(); let y: C; y.m(); const z = new C(); z.m(); let w = new C(); w.m(); }",
+      "resolved": true,
+      "children": [
+        {
+          "name": "C::m",
+          "file": "a.ts",
+          "line": 1,
+          "signature": "m() {}",
+          "resolved": true,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  "after": {
+    "rows": {
+      "refs": [
+        [
+          "view:a.ts:27",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:27",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:37",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:37",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:55",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:55",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:69",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:69",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:77",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:77",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:91",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:91",
+          "construction",
+          "resolved",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts:99",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ],
+        [
+          "view:a.ts.more.ts:99",
+          "call",
+          "resolved",
+          null,
+          "treesitter+resolver"
+        ]
+      ],
+      "edges": [
+        [
+          "edge:view:a.ts:69",
+          "view:a.ts:69",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts.more.ts:69",
+          "view:a.ts.more.ts:69",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts:91",
+          "view:a.ts:91",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "edge:view:a.ts.more.ts:91",
+          "view:a.ts.more.ts:91",
+          "C",
+          "treesitter+resolver"
+        ],
+        [
+          "dispatch:a.ts.more.ts:27:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:27",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:37:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:37",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:55:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:55",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:77:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:77",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts.more.ts:99:a.ts.more.ts:C::m",
+          "view:a.ts.more.ts:99",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:37:a.ts:C::m",
+          "view:a.ts:37",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:27:a.ts:C::f",
+          "view:a.ts:27",
+          "C::f",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:55:a.ts:C::m",
+          "view:a.ts:55",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:77:a.ts:C::m",
+          "view:a.ts:77",
+          "C::m",
+          "exact"
+        ],
+        [
+          "dispatch:a.ts:99:a.ts:C::m",
+          "view:a.ts:99",
+          "C::m",
+          "exact"
+        ]
+      ]
+    },
+    "tree": {
+      "name": "C::f",
+      "file": "a.ts",
+      "line": 1,
+      "signature": "f(x: C) { this.m(); x.m(); let y: C; y.m(); const z = new C(); z.m(); let w = new C(); w.m(); }",
+      "resolved": true,
+      "children": [
+        {
+          "name": "C::f",
+          "file": "a.ts",
+          "line": 1,
+          "signature": "f(x: C) { this.m(); x.m(); let y: C; y.m(); const z = new C(); z.m(); let w = new C(); w.m(); }",
+          "resolved": true,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        },
+        {
+          "name": "C::m",
+          "file": "a.ts",
+          "line": 1,
+          "signature": "m() {}",
+          "resolved": true,
+          "children": [],
+          "depth_limited": false,
+          "truncated": 0
+        }
+      ],
+      "depth_limited": false,
+      "truncated": 0
+    }
+  },
+  "incremental_duplicate": [
+    {
+      "reverse": false,
+      "error": "sqlite error: UNIQUE constraint failed: view_dispatch_sites.caller_file, view_dispatch_sites.ordinal",
+      "rolled_back": true
+    },
+    {
+      "reverse": true,
+      "error": "sqlite error: UNIQUE constraint failed: view_dispatch_sites.caller_file, view_dispatch_sites.ordinal",
+      "rolled_back": true
+    }
+  ]
+}

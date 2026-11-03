@@ -1,0 +1,19 @@
+{
+  "baseline": "a2f2cddb98e5f0748b6bb95e41a91500b1c01062",
+  "binary_sha256": "51209efde9efba7322b63dde46ac5af13615a685046189ad1dc41cd3e794a19f",
+  "manifest_sha256": "da37f2c73b97176730e9218b855141293230986f3594f62775cbaa3b20fa3cd6",
+  "normalised_fields": [],
+  "requests": 6,
+  "views": true,
+  "successful_queries": {
+    "callers": 1,
+    "call_tree": 1,
+    "impact": 1,
+    "trace_to": 1,
+    "trace_to_symbol": 1,
+    "trace_data": 1
+  },
+  "config_sha256": "a44a13763bc36a8b001cbb97cce568dec7aca19c45e93c713bcd0a9a9fa309cb",
+  "prepared_cache": false,
+  "required_borrowed": false
+}

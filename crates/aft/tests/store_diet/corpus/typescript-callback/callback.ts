@@ -1,0 +1,1 @@
+function callback() {} class Service { constructor() {} method() {} } export default function entry() { register(callback); new Service().method(); }
