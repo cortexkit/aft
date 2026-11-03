@@ -26762,6 +26762,143 @@ mod tests {
     }
 
     #[test]
+    fn cache_key_resolve_shares_only_verified_unchanged_repository_history() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let initial = git_stdout(&main, &["rev-parse", "HEAD"]);
+        let bind = |root: &Path| {
+            let root = root.canonicalize().unwrap();
+            let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+            let key = test_context()
+                .memoized_artifact_cache_key_for_configure_profiled(
+                    &root,
+                    &root,
+                    storage.path(),
+                    None,
+                    &mut timings,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(timings.git_spawns, 1, "every fresh bind still verifies Git");
+            (key, timings.root_walks)
+        };
+        let (key, walks) = bind(&main);
+        assert_eq!(walks, 1);
+        assert_eq!(
+            key,
+            crate::search_index::artifact_key_from_git_identity(&initial)
+        );
+        for name in ["first", "second", "third"] {
+            let linked = temp.path().join(name);
+            git_ok(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            assert_eq!(bind(&linked), (key.clone(), 0));
+            let scoped = linked.join("src");
+            std::fs::create_dir(&scoped).unwrap();
+            let (scoped_key, walks) = bind(&scoped);
+            assert_ne!(
+                scoped_key, key,
+                "sharing history must not share subfolder artifacts"
+            );
+            assert_eq!(walks, 0);
+        }
+
+        // An orphan branch has a different root even in the same object store.
+        git_ok(&main, &["checkout", "--quiet", "--orphan", "unrelated"]);
+        git_ok(
+            &main,
+            &[
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "unrelated",
+            ],
+        );
+        let (unrelated, walks) = bind(&main);
+        assert_ne!(unrelated, key);
+        assert_eq!(walks, 1);
+        let other = temp.path().join("other");
+        init_git_fixture(&other);
+        assert_eq!(
+            bind(&other).1,
+            1,
+            "another repository cannot reuse the walk"
+        );
+    }
+
+    #[test]
+    fn cache_key_resolve_shared_history_requires_readable_head() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        test_context()
+            .memoized_artifact_cache_key_for_configure(&main, &main, storage.path(), None)
+            .unwrap()
+            .unwrap();
+        let linked = temp.path().join("linked");
+        git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let head = git_stdout(&main, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            main.join(".git/objects").join(&head[..2]).join(&head[2..]),
+            b"broken",
+        )
+        .unwrap();
+        let mut timings = crate::search_index::ArtifactCacheKeyTimings::default();
+        assert!(test_context()
+            .memoized_artifact_cache_key_for_configure_profiled(
+                &linked,
+                &linked,
+                storage.path(),
+                None,
+                &mut timings,
+            )
+            .is_err());
+        assert_eq!(
+            timings.root_walks, 3,
+            "failed verification must use the ordinary retry ladder"
+        );
+        assert_eq!(
+            timings.git_spawns, 6,
+            "each retry verifies HEAD then falls back to the full probe"
+        );
+        assert_eq!(
+            crate::root_identity::read(&linked, storage.path()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     #[ignore = "manual native cache-key timing probe"]
     fn cache_key_resolve_profile_native_probe() {
         let root = std::env::var_os("AFT_CACHE_KEY_PROBE_ROOT")
@@ -26794,18 +26931,36 @@ mod tests {
         } else {
             temporary.path().to_path_buf()
         };
+        let linked_roots = tempfile::tempdir().unwrap();
         let warm_context = test_context();
         for sample in 0..8 {
+            let cold_root = if std::env::var_os("AFT_CACHE_KEY_PROBE_LINKED_ROOTS").is_some() {
+                let linked = linked_roots.path().join(format!("checkout-{sample}"));
+                git_ok(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        "--detach",
+                        linked.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+                linked.canonicalize().unwrap()
+            } else {
+                root.clone()
+            };
             let cold_context = test_context();
-            for (label, ctx) in [
-                ("cold_context", &cold_context),
-                ("warm_context", &warm_context),
+            for (label, ctx, root) in [
+                ("cold_context", &cold_context, &cold_root),
+                ("warm_context", &warm_context, &root),
             ] {
-                let mut profile = super::CacheKeyResolveProfile::new(&root);
+                let mut profile = super::CacheKeyResolveProfile::new(root);
                 let key = ctx
                     .memoized_artifact_cache_key_for_configure_profiled(
-                        &root,
-                        &root,
+                        root,
+                        root,
                         &storage,
                         None,
                         &mut profile.key,
@@ -26819,7 +26974,7 @@ mod tests {
                 let started = Instant::now();
                 crate::storage_retention::record_bind(
                     &crate::root_cache::StoragePaths::same(&storage),
-                    &root,
+                    root,
                     &key,
                 )
                 .unwrap();
