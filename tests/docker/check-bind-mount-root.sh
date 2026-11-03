@@ -35,6 +35,7 @@ work="$(cd "$work" && pwd)"
 # subdirectory of the host filesystem, exactly like `-v "$PWD":/workspace`.
 mkdir -p "$work/host/project" "$work/out"
 printf 'fn main() {}\n' > "$work/host/project/main.rs"
+printf '[package]\nname = "bind-root-check"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "bind-root-check"\npath = "main.rs"\n' > "$work/host/project/Cargo.toml"
 
 # For each root: configure, ask for status, and keep stdin open briefly so the
 # watcher has started (or been refused) before AFT sees end of input and exits.

@@ -25635,6 +25635,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn configure_filesystem_root_preserves_main_refusal_fields() {
+        let _env = home_env_mutex();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path().to_str().unwrap());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path().to_str().unwrap());
+        let ctx = test_context();
+        let req = configure_request_with_params(json!({
+            "project_root": "/", "harness": "runner", "storage_dir": ctx._storage.path(),
+            "config": [user_tier(json!({
+                "indexes": {"trigram": true, "semantic": true, "callgraph": true},
+                "views": {"enabled": true}
+            }))]
+        }));
+        let response = handle_folder_configure_for_test(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        let expected_warning = if super::resolve_account_home_dir().is_some() {
+            json!({"code": "root_too_broad", "reason": "root_too_broad", "message":
+                "Watching and indexing are off for this broad root; explicit-path tools remain available."})
+        } else {
+            json!({"code": "root_too_broad", "reason": "account_home_unknown", "message":
+                "The account home could not be determined, so only the filesystem or volume root is protected by the home rule. Watching and indexing are off for this broad root; explicit-path tools remain available."})
+        };
+        assert!(
+            response.data["warnings"]
+                .as_array()
+                .unwrap()
+                .contains(&expected_warning),
+            "{:?}",
+            response.data
+        );
+        settle_configure_for_test(&ctx);
+        let status = ctx.build_status_snapshot();
+        assert_eq!(status["degraded"], true, "{status}");
+        let root_reasons: Vec<_> = status["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|reason| {
+                matches!(
+                    reason.as_str(),
+                    Some(
+                        "root_too_broad"
+                            | "home_root"
+                            | "folder_not_admitted"
+                            | "folder_admission_pending"
+                    )
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(root_reasons, vec![json!("root_too_broad")], "{status}");
+        assert_eq!(
+            status["search_index"],
+            json!({
+                "status": "disabled", "state": "disabled", "reason": "root_too_broad"
+            }),
+            "{status}"
+        );
+        assert!(!ctx.watcher_runtime_active());
+        assert_eq!(
+            crate::folder_admission_runtime::probe_counts_for_test(&ctx),
+            (0, 0)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn configure_filesystem_root_disables_root_work() {
         let _env = home_env_mutex();
         assert_unadmitted_configure_root(std::path::Path::new("/"), true);
