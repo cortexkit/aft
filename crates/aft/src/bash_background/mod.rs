@@ -2475,7 +2475,7 @@ mod legacy_root_task_repair_tests {
     fn legacy_root_tasks_populated_harness_measurement() {
         use super::persistence::*;
         let storage = tempfile::tempdir().unwrap();
-        let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let project = std::path::Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()

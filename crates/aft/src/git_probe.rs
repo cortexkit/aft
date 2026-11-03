@@ -134,6 +134,14 @@ pub(crate) fn root_commits(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, 
     result
 }
 
+/// Verify repository access and the current commit without walking its parents.
+pub(crate) fn head_commit(root: &Path, spawned: &mut usize) -> Result<Vec<u8>, ProbeError> {
+    let mut probe = Probe::new(root, ChildDirectory::Inherited);
+    let result = probe.run(&["rev-parse", "--verify", "HEAD^{commit}"]);
+    *spawned += probe.spawned;
+    result
+}
+
 /// Where a probe's Git child starts. The working directory decides how a
 /// relative PATH entry resolves, so each caller keeps the choice it made
 /// before these probes were shared.

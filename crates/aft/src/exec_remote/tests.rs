@@ -24,7 +24,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         panic!("accepted vector must decode as acceptance")
     };
     assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
-    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::path::Path::new(crate::test_support::manifest_dir()).join("../../Cargo.lock");
     let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
     let packages: Vec<_> = lock["package"]
         .as_array()

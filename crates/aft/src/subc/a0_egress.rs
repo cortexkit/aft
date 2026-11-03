@@ -1007,7 +1007,16 @@ mod fixup_tests {
                 assert!(ack.begin_ack_write());
                 assert_eq!(ack.header.ty, FrameType::Error);
                 let body: Value = serde_json::from_slice(&ack.body).unwrap();
-                assert_eq!(body["code"], "actor_not_ready");
+                if stage == RESERVED {
+                    assert_eq!(body["code"], "bind_busy");
+                    assert_eq!(body["detail"], json!({ "reason": "configure" }));
+                    assert!(subc_protocol::error_codes::is_retryable_route_open(
+                        body["code"].as_str().unwrap()
+                    ));
+                } else {
+                    assert_eq!(body["code"], "actor_not_ready");
+                    assert!(body.get("detail").is_none());
+                }
                 assert!(body["message"]
                     .as_str()
                     .unwrap()

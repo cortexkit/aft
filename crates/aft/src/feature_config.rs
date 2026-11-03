@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn policy_constants_match_the_shared_artifact() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = std::path::Path::new(crate::test_support::manifest_dir())
             .join("../../spec/feature-config/migration-policy.json");
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn notice_digests_match_the_shared_fixtures() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let path = std::path::Path::new(crate::test_support::manifest_dir())
             .join("tests/fixtures/feature_config/notice_projection.json");
         let fixtures: Value =
             serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).unwrap();

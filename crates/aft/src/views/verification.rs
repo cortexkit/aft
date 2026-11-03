@@ -114,27 +114,54 @@ pub(crate) struct NativeStat {
 }
 
 impl NativeStat {
+    /// Observe the handle that supplies content bytes, so a path replacement
+    /// during a read cannot attach those bytes to a different file's proof.
+    pub(crate) fn read_open_file(file: &fs::File, path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::from_unix_metadata(&file.metadata()?, path)
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            windows_file_stat(file)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, path);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stable file identity unavailable",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    fn from_unix_metadata(m: &fs::Metadata, path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            identity: FileIdentity::Unix {
+                dev: m.dev(),
+                ino: m.ino(),
+                birth: m
+                    .created()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos()),
+            },
+            size: m.len(),
+            modified_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
+            changed_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
+            mode: m.mode(),
+            reuse_supported: local_precise_filesystem(path),
+        })
+    }
+
     pub fn read(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
             let m = fs::symlink_metadata(path).map_err(|e| at("reading metadata", path, e))?;
-            Ok(Self {
-                identity: FileIdentity::Unix {
-                    dev: m.dev(),
-                    ino: m.ino(),
-                    birth: m
-                        .created()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos()),
-                },
-                size: m.len(),
-                modified_ns: i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec()),
-                changed_ns: i128::from(m.ctime()) * 1_000_000_000 + i128::from(m.ctime_nsec()),
-                mode: m.mode(),
-                reuse_supported: local_precise_filesystem(path),
-            })
+            Self::from_unix_metadata(&m, path)
         }
         #[cfg(windows)]
         {
@@ -219,11 +246,9 @@ fn local_precise_filesystem(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_stat(path: &Path) -> io::Result<NativeStat> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-        FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
     };
     let file = fs::OpenOptions::new()
         .read(true)
@@ -231,6 +256,16 @@ fn windows_stat(path: &Path) -> io::Result<NativeStat> {
         .share_mode(7)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
+    windows_file_stat(&file)
+}
+
+#[cfg(windows)]
+fn windows_file_stat(file: &fs::File) -> io::Result<NativeStat> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        FILE_BASIC_INFO, FILE_ID_INFO,
+    };
     let handle = file.as_raw_handle();
     let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
     let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };

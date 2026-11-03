@@ -266,14 +266,8 @@ fn perf_sweep_reads_recent_entries_from_bounded_log_tail() {
 #[test]
 fn perf_sweep_parser_matches_script_python_on_shared_fixture() {
     let output = std::process::Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/perf_sweep_oracle.py"
-        ))
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/perf_sweep.txt"
-        ))
+        .arg(crate::test_support::manifest_dir().join("tests/fixtures/perf_sweep_oracle.py"))
+        .arg(crate::test_support::manifest_dir().join("tests/fixtures/perf_sweep.txt"))
         .arg(iso_seconds(SINCE))
         .output()
         .expect("python3 required for parser parity");
@@ -410,7 +404,7 @@ fn host_executable() -> PathBuf {
             // cargo test normally starts in the member crate, but the documented
             // relative target path is rooted at the workspace that built the CLI.
             std::fs::canonicalize(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
+                Path::new(crate::test_support::manifest_dir())
                     .join("../..")
                     .join(&supplied),
             )

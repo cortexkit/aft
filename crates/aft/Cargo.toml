@@ -262,7 +262,7 @@ cortexkit-role-agent-data = "=0.2.4"
 cortexkit-project-identity = "=0.1.4"
 cortexkit-agent-identity = "=0.1.1"
 jsonschema = { version = "0.33", default-features = false }
-subc-protocol = "=0.34.2"
+subc-protocol = "=0.34.3"
 subc-transport = "=0.15.0"
 subc-client-rs = "=0.33.1"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
