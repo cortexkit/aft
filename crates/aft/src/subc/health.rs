@@ -1785,24 +1785,23 @@ pub(super) fn pending_bind_breadcrumb(
     )
 }
 
-/// Refusal code for a route bind whose deadline passed while it waited
-/// behind a reader on its root. Retryable like `actor_not_ready`: the reader
-/// ends eventually, and a later bind can then be admitted.
-pub(super) const BIND_BLOCKED_BY_READER: &str = "bind_blocked_by_reader";
-pub(super) const BIND_BLOCKED_BY_WRITER: &str = "bind_blocked_by_writer";
-
-/// The code and message an overdue route bind is refused with. A bind still
+/// The wire refusal for an overdue route bind. A bind still
 /// queued while readers run on its root waited for them (a bind that needs
 /// exclusive use of the root cannot start beside readers), so the refusal
 /// names the oldest of them: its job, its tool and how long it has run.
 /// A running writer can hold the same slot even when there are no readers;
 /// name it rather than suggesting that configure itself is necessarily stuck.
+/// These waits have no known completion time, so no retry delay is advertised.
 pub(super) fn route_bind_deadline_refusal(
     age: Duration,
     deadline: Duration,
     relay: Duration,
     snapshot: &BindBlockerSnapshot,
-) -> (&'static str, String) {
+) -> subc_protocol::ErrorBody {
+    let busy = |reason: &str, message: String| {
+        subc_protocol::ErrorBody::new(subc_protocol::error_codes::BIND_BUSY, message)
+            .with_detail(json!({ "reason": reason }))
+    };
     let age_ms = duration_millis_u64(age);
     let deadline_ms = duration_millis_u64(deadline);
     if let Some(writer) = snapshot.in_flight_writer.as_ref().filter(|_| {
@@ -1811,7 +1810,7 @@ pub(super) fn route_bind_deadline_refusal(
             "queued" | "running" | "blocked_by_other_mutating"
         )
     }) {
-        return (BIND_BLOCKED_BY_WRITER, format!(
+        return busy("writer", format!(
             "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): a mutating job held this root (job={} tool={} age_ms={}); retry once it finishes or is cancelled",
             writer.request_id, writer.command, writer.started_age_ms,
         ));
@@ -1832,16 +1831,16 @@ pub(super) fn route_bind_deadline_refusal(
             } else {
                 format!(" and {others} other reader(s)")
             };
-            (
-                BIND_BLOCKED_BY_READER,
+            busy(
+                "reader",
                 format!(
                     "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the bind waited behind a reader on this root that has not finished (job={} tool={} age_ms={}){others}; retry once it finishes or is cancelled",
                     reader.request_id, reader.command, reader.started_age_ms,
                 ),
             )
         }
-        None => (
-            "actor_not_ready",
+        None => busy(
+            "configure",
             format!(
                 "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the root's configure did not finish, so AFT refuses the bind before the daemon's {}ms bind relay times out",
                 relay.as_millis()
@@ -8560,9 +8559,10 @@ mod tests {
         let deadline = Duration::from_millis(10_500);
         let relay = Duration::from_secs(12);
 
-        let (code, message) =
-            route_bind_deadline_refusal(age, deadline, relay, &snapshot("queued"));
-        assert_eq!(code, BIND_BLOCKED_BY_READER);
+        let refusal = route_bind_deadline_refusal(age, deadline, relay, &snapshot("queued"));
+        assert_eq!(refusal.code, "bind_busy");
+        assert_eq!(refusal.detail.as_ref().unwrap()["reason"], "reader");
+        let message = refusal.message;
         assert!(
             message.contains("job=subc-1-789 tool=grep age_ms=840000")
                 && message.contains("and 1 other reader(s)"),
@@ -8570,10 +8570,11 @@ mod tests {
         );
 
         // A bind whose configure is still running when the deadline passes was
-        // not held back by readers, so it keeps the generic code.
-        let (code, message) =
-            route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
-        assert_eq!(code, "actor_not_ready");
+        // not held back by readers, so it names configure as the cause.
+        let refusal = route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
+        assert_eq!(refusal.code, "bind_busy");
+        assert_eq!(refusal.detail.as_ref().unwrap()["reason"], "configure");
+        let message = refusal.message;
         assert!(message.contains("configure did not finish"), "{message}");
     }
 
