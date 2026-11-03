@@ -1,0 +1,5946 @@
+{
+  "view_bindings.payload:aliased.ts": {
+    "semantic_json_hash": "00426abe9624e8b0b624084c902bcde6a100bbbc632b1b7ae627d5c450221e33",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:data_flow.ts": {
+    "semantic_json_hash": "3a9055f9bdeaea36ffe572af0c1adc22c8dcbd13382eb924986dc1c951e0711f",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.references.3": [
+        "array"
+      ],
+      "$.references.4": [
+        "array"
+      ],
+      "$.references.5": [
+        "array"
+      ],
+      "$.references.6": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:data_flow_kills.ts": {
+    "semantic_json_hash": "0889ec40adc1a388944721520b37a8dc6d977a7a8566f65e204793720833924e",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.references.3": [
+        "array"
+      ],
+      "$.references.4": [
+        "array"
+      ],
+      "$.references.5": [
+        "array"
+      ],
+      "$.references.6": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.resolved_dependencies[]": [
+        "string"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:data_processor.ts": {
+    "semantic_json_hash": "8c7d8c74fc9f752ffe2883039d5431807a16fb2987139e78f51b91010e0a2aeb",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:helpers.ts": {
+    "semantic_json_hash": "26f5c2e558b75032bad36b1182f83eabb386c02d3fbd06598a03660e07e5bb54",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.resolved_dependencies[]": [
+        "string"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:index.ts": {
+    "semantic_json_hash": "f9834c30f1adfd8c024f1d84775dd19de3bed1cfc96be0ec97ca70451a63d9d9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:main.ts": {
+    "semantic_json_hash": "0805f2d643bba863f13e0d2d6e9b4dc43d11d4293a31dbfee5341a8b0baa4d12",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/benches/bench_support.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/benches/perf.rs": {
+    "semantic_json_hash": "0888fd5e23daaee5c5ea1ee843eb021cf2d72f320bbc2988436b9ce9af5c824a",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/examples/demo.rs": {
+    "semantic_json_hash": "c974fc7738b00c945a65fc740a0201cc30f3d2be61fce0c9697204278c25ee96",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/examples/demo_support.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/other/main.rs": {
+    "semantic_json_hash": "f40036b19282cba1635ea913784cfae91c752ed6e612d8630fa2967002e43f44",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/other/nested.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/support/admin_client.rs": {
+    "semantic_json_hash": "abfd1a82f5729db4da89a7832c8c892e38c9a37996ff081e76d32b13398fa942",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.facts[]": [
+        "array"
+      ],
+      "$.binding_facts.facts[][]": [
+        "string"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.references.3": [
+        "array"
+      ],
+      "$.references.4": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Parent": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/support/mod.rs": {
+    "semantic_json_hash": "f449b95b34265efae7de530dde233a60f2554e69f041ccbab406e8272ef9e759",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.1[]": [
+        "string"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Parent": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/support/route_client.rs": {
+    "semantic_json_hash": "2f131a0f77f3fbf45c1062298931caaa7fbcb0cd05f75f8c11508f1dd4c71aaa",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.resolved_dependencies[]": [
+        "string"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/bin/tool.rs": {
+    "semantic_json_hash": "df2fe27869f63f9040ef13944014317118867f76670acf8785d62dac598d02f2",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/binx/caller.rs": {
+    "semantic_json_hash": "0f9a4b70d77ec978f958fafe1e1be2b44422560730aff9ebac3cf78e30ffb146",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.resolved_dependencies[]": [
+        "string"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Contains": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Parent": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/lib.rs": {
+    "semantic_json_hash": "030b258a52b259bf43bf13bb7a4cb1f740b2d8b8f9a52e444df5934a98a9362b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/main.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/src/route_client.rs": {
+    "semantic_json_hash": "da187e6b17afcb34eca7da2d46369e7514c9f79086c1813c80d12b79e319b0d1",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/tests/standalone.rs": {
+    "semantic_json_hash": "d88c0e151284d0aae613581f33e2b87b418b876205b3becbb7240b238bf282c3",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/tests/test_support.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/tools/custom.rs": {
+    "semantic_json_hash": "38e012227618f7f5b597497e471039f3e4c1fa08302b91a518f81cad81f36fbd",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.consulted_facts[]": [
+        "array"
+      ],
+      "$.consulted_facts[][]": [
+        "string"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.facts[]": [
+        "array"
+      ],
+      "$.resolution_facts.facts[][]": [
+        "string"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Crate": [
+        "string"
+      ],
+      "$.surface_queries[][].CrateRoot": [
+        "string"
+      ],
+      "$.surface_queries[][].Inline": [
+        "array"
+      ],
+      "$.surface_queries[][].Inline[]": [
+        "array",
+        "string"
+      ],
+      "$.surface_queries[][].Inline[][]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:rust_bin_targets/tools/custom_support.rs": {
+    "semantic_json_hash": "bc88d701a27d775e78b8bbb692857e37bb9c260b0bd67d1cd69c2bc68357f79b",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:service.ts": {
+    "semantic_json_hash": "51dc305dd3fe9950ca9e8598454ed5a8aedd7a74237ceb16b4aeda48e76e118a",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:test_helpers.ts": {
+    "semantic_json_hash": "88ebb72954c63f584207ec1ee58a68c46649db4cff9c5cc5bff8e19438758b7f",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_bindings.payload:utils.ts": {
+    "semantic_json_hash": "421bd8d5b9003c5bf17225243a55e0917920f10874f80514ee11fbfb7d7f9b1c",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.binding_facts": [
+        "object"
+      ],
+      "$.binding_facts.facts": [
+        "array"
+      ],
+      "$.binding_facts.reads": [
+        "array"
+      ],
+      "$.binding_facts.unattributed": [
+        "boolean"
+      ],
+      "$.binding_probes": [
+        "array"
+      ],
+      "$.binding_probes[]": [
+        "string"
+      ],
+      "$.consulted_facts": [
+        "array"
+      ],
+      "$.dependencies": [
+        "array"
+      ],
+      "$.dependencies[]": [
+        "string"
+      ],
+      "$.references": [
+        "object"
+      ],
+      "$.references.0": [
+        "array"
+      ],
+      "$.references.0[]": [
+        "string"
+      ],
+      "$.references.1": [
+        "array"
+      ],
+      "$.references.2": [
+        "array"
+      ],
+      "$.references.3": [
+        "array"
+      ],
+      "$.resolution_facts": [
+        "object"
+      ],
+      "$.resolution_facts.facts": [
+        "array"
+      ],
+      "$.resolution_facts.reads": [
+        "array"
+      ],
+      "$.resolution_facts.unattributed": [
+        "boolean"
+      ],
+      "$.resolved_dependencies": [
+        "array"
+      ],
+      "$.surface_queries": [
+        "array"
+      ],
+      "$.surface_queries[]": [
+        "array"
+      ],
+      "$.surface_queries[][]": [
+        "object",
+        "string"
+      ],
+      "$.surface_queries[][].Alias": [
+        "array"
+      ],
+      "$.surface_queries[][].Alias[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Export": [
+        "array"
+      ],
+      "$.surface_queries[][].Export[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Language": [
+        "string"
+      ],
+      "$.surface_queries[][].Module": [
+        "array"
+      ],
+      "$.surface_queries[][].Module[]": [
+        "string"
+      ],
+      "$.surface_queries[][].Node": [
+        "array"
+      ],
+      "$.surface_queries[][].Node[]": [
+        "string"
+      ],
+      "$.unattributed": [
+        "boolean"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:aliased.ts": {
+    "semantic_json_hash": "35f34091861834a7be35e6f07410dfd993c7e1a57517a48a12b1330b613824fb",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:data_flow.ts": {
+    "semantic_json_hash": "7d4b38dcd7bb94bab84808691c07dac1491fdf6f01526bf387ea901334b0c225",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:data_flow_kills.ts": {
+    "semantic_json_hash": "705a620cc5120a2a1289f22c7950724feb051d75b456adb35312670b986ef8e9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:data_processor.ts": {
+    "semantic_json_hash": "705a620cc5120a2a1289f22c7950724feb051d75b456adb35312670b986ef8e9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:helpers.ts": {
+    "semantic_json_hash": "705a620cc5120a2a1289f22c7950724feb051d75b456adb35312670b986ef8e9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:index.ts": {
+    "semantic_json_hash": "705a620cc5120a2a1289f22c7950724feb051d75b456adb35312670b986ef8e9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:main.ts": {
+    "semantic_json_hash": "dc72345b3cee02937293e5b3c6ff1db72dd0b59179660bfac5044b51a1d75fb4",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/benches/bench_support.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/benches/perf.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/examples/demo.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/examples/demo_support.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/other/main.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/other/nested.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/support/admin_client.rs": {
+    "semantic_json_hash": "379e05a4dd38fd8e2123637d4aa6e88767379ded7b4cc7391682b7be2ebbcdc1",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.returns[]": [
+        "object"
+      ],
+      "$.returns[].symbol": [
+        "string"
+      ],
+      "$.returns[].ty": [
+        "string"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/support/mod.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/support/route_client.rs": {
+    "semantic_json_hash": "4a4fedafaf297ddb60668f40c38dbdd17b647f975f65ebdb044a04de0c3af462",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.returns[]": [
+        "object"
+      ],
+      "$.returns[].symbol": [
+        "string"
+      ],
+      "$.returns[].ty": [
+        "string"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/bin/tool.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/binx/caller.rs": {
+    "semantic_json_hash": "d82d1d0d64b2a560966bf36adf71f08da09605a78488934c1a2b3006ad34f755",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.returns[]": [
+        "object"
+      ],
+      "$.returns[].symbol": [
+        "string"
+      ],
+      "$.returns[].ty": [
+        "string"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/lib.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/main.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/src/route_client.rs": {
+    "semantic_json_hash": "7ed4988a7b2dc58ec03f526f1fa901f8b889c01df9181cc854c16d64ed67c9dc",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.returns[]": [
+        "object"
+      ],
+      "$.returns[].symbol": [
+        "string"
+      ],
+      "$.returns[].ty": [
+        "string"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/tests/standalone.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/tests/test_support.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/tools/custom.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:rust_bin_targets/tools/custom_support.rs": {
+    "semantic_json_hash": "feaf18a77aa0843fe8a7efc2581ae0483fba0190880d9397bcb27cbb0ff23ad9",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:service.ts": {
+    "semantic_json_hash": "dc72345b3cee02937293e5b3c6ff1db72dd0b59179660bfac5044b51a1d75fb4",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:test_helpers.ts": {
+    "semantic_json_hash": "9a05ec28e6d925f27d04f1e6a3dcdf4d1adebd229ab47e09de94dd23a72be2d8",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.facts:utils.ts": {
+    "semantic_json_hash": "9a05ec28e6d925f27d04f1e6a3dcdf4d1adebd229ab47e09de94dd23a72be2d8",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.default_export_symbol": [
+        "null"
+      ],
+      "$.fields": [
+        "array"
+      ],
+      "$.import_targets": [
+        "object"
+      ],
+      "$.imports": [
+        "array"
+      ],
+      "$.imports[]": [
+        "object"
+      ],
+      "$.imports[].default_import": [
+        "null"
+      ],
+      "$.imports[].module_path": [
+        "string"
+      ],
+      "$.imports[].names": [
+        "array"
+      ],
+      "$.imports[].names[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.methods": [
+        "array"
+      ],
+      "$.returns": [
+        "array"
+      ],
+      "$.type_targets": [
+        "object"
+      ],
+      "$.types": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/benches/bench_support.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/benches/perf.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/examples/demo.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/examples/demo_support.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/other/main.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/other/nested.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/support/admin_client.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/support/mod.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/support/route_client.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/bin/tool.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/binx/caller.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/lib.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/main.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/src/route_client.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/tests/standalone.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/tests/test_support.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/tools/custom.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.type_target_trace:rust_bin_targets/tools/custom_support.rs": {
+    "semantic_json_hash": "09e0970b5e27d03c52b4711d7a7e6897ecc5b6b0e073022af17c256b85e5ca40",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.probes": [
+        "array"
+      ],
+      "$.queries": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:aliased.ts": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:data_flow.ts": {
+    "semantic_json_hash": "92d1552bff971b4cd9bdeea0032eb5a8414b39931ecd440bfcc810421ce480ef",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:data_flow_kills.ts": {
+    "semantic_json_hash": "be62cdd181ae18dfce1eacd2bf2b939c8bd47c2217cb5457dbd7dc261c64e064",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:data_processor.ts": {
+    "semantic_json_hash": "cd40b9d7d958bdfaffc3141e2dab47d0010a3f867193f1cc791b2a7af9973f1a",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null",
+        "string"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:helpers.ts": {
+    "semantic_json_hash": "d834a30e7d78c0a5c07bede114b396fadac1a5a29c356974e0b61c48368d4d52",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:index.ts": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:main.ts": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/benches/bench_support.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/benches/perf.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/examples/demo.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/examples/demo_support.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/other/main.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/other/nested.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/support/admin_client.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/support/mod.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/support/route_client.rs": {
+    "semantic_json_hash": "5f5e0f89926095a2b93eb8397e3a88902b0b1615f03e2ec69651998a59934a89",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/bin/tool.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/binx/caller.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/lib.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/main.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/src/route_client.rs": {
+    "semantic_json_hash": "5f5e0f89926095a2b93eb8397e3a88902b0b1615f03e2ec69651998a59934a89",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/tests/standalone.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/tests/test_support.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/tools/custom.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:rust_bin_targets/tools/custom_support.rs": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:service.ts": {
+    "semantic_json_hash": "d53d18c23212ea7b6300594bb89bce60218f6eff2b9d628b8cc42d3e79bbd5ab",
+    "schema": {
+      "$": [
+        "array"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:test_helpers.ts": {
+    "semantic_json_hash": "d26837fbd9cd140693a5af5154a1f030976f1647646739004de15daabd6ca9f8",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "null"
+      ]
+    }
+  },
+  "view_dispatch_files.sites:utils.ts": {
+    "semantic_json_hash": "e955a0f9e2e42769ad94218ae7d65e20f04363813fdc978076cf7661adb1ed9c",
+    "schema": {
+      "$": [
+        "array"
+      ],
+      "$[]": [
+        "object"
+      ],
+      "$[].caller": [
+        "string"
+      ],
+      "$[].dynamic": [
+        "boolean"
+      ],
+      "$[].line": [
+        "number"
+      ],
+      "$[].member": [
+        "string"
+      ],
+      "$[].ordinal": [
+        "number"
+      ],
+      "$[].receiver": [
+        "string"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:aliased.ts": {
+    "semantic_json_hash": "fb109c90d710f0887142a3264cdfe33367c167148ce5b4c6c90a8ed0234e2dd0",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../helpers": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.runCheck": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.runCheck": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.aliased.ts:17:runCheck": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:data_flow.ts": {
+    "semantic_json_hash": "5378b13c35e5e2e1b5f07a3df829c1b52dd0265c1477e21e88307ee2e7bc1f5d",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.export_aliases.const { name": [
+        "string"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../data_processor": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.complexFlow": [
+        "string"
+      ],
+      "$.node_by_bare.transformData": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.complexFlow": [
+        "string"
+      ],
+      "$.node_by_scoped.transformData": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.data_flow.ts:15:transformData": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow.ts:59:complexFlow": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:data_flow_kills.ts": {
+    "semantic_json_hash": "6905c4ae84cae7949dd92e37b37cdc6e433119630df6be14a54ca14e7a290622",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.export_aliases.field: string": [
+        "string"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.augmented": [
+        "string"
+      ],
+      "$.node_by_bare.conditionallyOverwritten": [
+        "string"
+      ],
+      "$.node_by_bare.derived": [
+        "string"
+      ],
+      "$.node_by_bare.overwritten": [
+        "string"
+      ],
+      "$.node_by_bare.sink": [
+        "string"
+      ],
+      "$.node_by_bare.usedBeforeOverwrite": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.augmented": [
+        "string"
+      ],
+      "$.node_by_scoped.conditionallyOverwritten": [
+        "string"
+      ],
+      "$.node_by_scoped.derived": [
+        "string"
+      ],
+      "$.node_by_scoped.overwritten": [
+        "string"
+      ],
+      "$.node_by_scoped.sink": [
+        "string"
+      ],
+      "$.node_by_scoped.usedBeforeOverwrite": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:131:usedBeforeOverwrite": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:176:conditionallyOverwritten": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:1:sink": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:237:augmented": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:31:overwritten": [
+        "string"
+      ],
+      "$.node_kind_by_id.data_flow_kills.ts:76:derived": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:data_processor.ts": {
+    "semantic_json_hash": "6c0996d715fff35fe8547abb832a26970a1e10420f049af9e1c3f4d52bc81dc6",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.processInput": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.processInput": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.data_processor.ts:1:processInput": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:helpers.ts": {
+    "semantic_json_hash": "1e255c5f7d4ec70973c516fa50bf63a8810529f7201f61c08f4fb13c3c177f44",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.checkFormat": [
+        "string"
+      ],
+      "$.node_by_bare.validate": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.checkFormat": [
+        "string"
+      ],
+      "$.node_by_scoped.validate": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.helpers.ts:1:validate": [
+        "string"
+      ],
+      "$.node_kind_by_id.helpers.ts:31:checkFormat": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:index.ts": {
+    "semantic_json_hash": "6901f0265d33898a3e6447867d6959c9d836cded2a60583d8cd95390efc61dcb",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../utils": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.reexports": [
+        "array"
+      ],
+      "$.reexports[]": [
+        "array"
+      ],
+      "$.reexports[][]": [
+        "boolean",
+        "object",
+        "string"
+      ],
+      "$.reexports[][].processData": [
+        "string"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:main.ts": {
+    "semantic_json_hash": "36175a3c636871bdb5b7d36cd54a91b5207e8ba087a085be24d9df13403a0bc5",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../utils": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.main.ts:15:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/benches/bench_support.rs": {
+    "semantic_json_hash": "44ec3f848540c8f8e869bafbe9825dfb7e124b557c547a87532b885803f418c1",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.bench_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.bench_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/benches/bench_support.rs:1:bench_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/benches/perf.rs": {
+    "semantic_json_hash": "625578ea6036575a1594c518507ebcf81bedc6cfd58d5e0a101e61267898e7c6",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.bench_support": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.bench_support": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/benches/perf.rs:5:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/examples/demo.rs": {
+    "semantic_json_hash": "dcea8656e9e25edfa4e10094b9ca394009cf2d6283555304832801ce41dba013",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.demo_support": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.demo_support": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/examples/demo.rs:5:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/examples/demo_support.rs": {
+    "semantic_json_hash": "256e3e269a70cecff0fba14e00dccf572bea11eb261d71b87c7bc9813b2ca8d5",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.example_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.example_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/examples/demo_support.rs:1:example_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/other/main.rs": {
+    "semantic_json_hash": "b9ab3dbbd3dcb1bbcd57ae2f46f76166dae6e42ec66dd88026074f13465fa3a4",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.nested": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.nested": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/other/main.rs:5:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/other/nested.rs": {
+    "semantic_json_hash": "b457d8a07cb6890fddb75afa6ff776b8c37b9c577305609871939bf966ad9f64",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.nested_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.nested_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/other/nested.rs:1:nested_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/support/admin_client.rs": {
+    "semantic_json_hash": "be0be70fe61c4f560cb5eab72795bb985395626cfb6da16dff40eaa460d17106",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.super::route_client": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.first": [
+        "string"
+      ],
+      "$.node_by_bare.second": [
+        "string"
+      ],
+      "$.node_by_bare.via_crate": [
+        "string"
+      ],
+      "$.node_by_bare.via_super": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.first": [
+        "string"
+      ],
+      "$.node_by_scoped.second": [
+        "string"
+      ],
+      "$.node_by_scoped.via_crate": [
+        "string"
+      ],
+      "$.node_by_scoped.via_super": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/admin_client.rs:104:via_crate": [
+        "string"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/admin_client.rs:39:second": [
+        "string"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/admin_client.rs:70:via_super": [
+        "string"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/admin_client.rs:8:first": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/support/mod.rs": {
+    "semantic_json_hash": "5f646310805138c3a72cdf86d7bcd7129716e2be1f7c6180a02f432ec3ffb117",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.admin_client": [
+        "string"
+      ],
+      "$.declared_module_targets.route_client": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.admin_client": [
+        "string"
+      ],
+      "$.module_targets.route_client": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.run": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.run": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/mod.rs:13:run": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/support/route_client.rs": {
+    "semantic_json_hash": "82922d9b46d0c1190fb0be79338a20998552d5ab431a31fcf5b1ff78230f31fd",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.error_reason": [
+        "string"
+      ],
+      "$.node_by_bare.local": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.error_reason": [
+        "string"
+      ],
+      "$.node_by_scoped.local": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/route_client.rs:1:error_reason": [
+        "string"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/support/route_client.rs:34:local": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/bin/tool.rs": {
+    "semantic_json_hash": "33f5bda4b917216b5dab9b6a764baccaa733598e45007e651321b492fd823801",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.support": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.support": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/bin/tool.rs:5:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/binx/caller.rs": {
+    "semantic_json_hash": "c15a9c32c3e7627de6452a7ec3c05c0f274392bde14d1b066b8c6579e6d631bd",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.must_not_cross_bin_boundary": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.must_not_cross_bin_boundary": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/binx/caller.rs:1:must_not_cross_bin_boundary": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/lib.rs": {
+    "semantic_json_hash": "3313953884371586a307e97b9bbad6871f2ed733218b14d5f2b14e818cfb306c",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.route_client": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.route_client": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.calls_lib_target": [
+        "string"
+      ],
+      "$.node_by_bare.lib_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.lib_target": [
+        "string"
+      ],
+      "$.node_by_scoped.tests::calls_lib_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/lib.rs:31:tests::calls_lib_target": [
+        "string"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/lib.rs:7:lib_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/main.rs": {
+    "semantic_json_hash": "1bd592156f69e02e02a3b9b0a2e1bed6164b07ad35332d2228ce6a29bdb11d64",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/main.rs:1:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/src/route_client.rs": {
+    "semantic_json_hash": "cac68b04dfe6d0fd4048ca938c5401ebd05124f0631394308996ad7d0178e05c",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.error_reason": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.error_reason": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/src/route_client.rs:1:error_reason": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/tests/standalone.rs": {
+    "semantic_json_hash": "4290986b32275bc50dacb2f1e17759429517899d314416dd1e8e19be0e255876",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.test_support": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.test_support": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.integration_caller": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.integration_caller": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/tests/standalone.rs:0:integration_caller": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/tests/test_support.rs": {
+    "semantic_json_hash": "2af5b71131f6f65932aa906d05195a45d71842858222876bfbc36cc27af29df3",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.integration_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.integration_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/tests/test_support.rs:1:integration_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/tools/custom.rs": {
+    "semantic_json_hash": "7434d28c9b95042189307fa8c24ed92cb44cc9089bc9a4943dc5e44a3ada9337",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.declared_module_targets.custom_support": [
+        "string"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets.custom_support": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.main": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.main": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/tools/custom.rs:5:main": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:rust_bin_targets/tools/custom_support.rs": {
+    "semantic_json_hash": "d2464e23a959a800047e90f1301bca697d11ece1fc88c3dca72c7073fc2e7e44",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.custom_target": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.custom_target": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.rust_bin_targets/tools/custom_support.rs:1:custom_target": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:service.ts": {
+    "semantic_json_hash": "b1470d793f98e9bbb10002eac9187f2dddabf8b2f0f0b0bd1799f2383a1b1d17",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../utils": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.handleRequest": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.handleRequest": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.service.ts:15:handleRequest": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:test_helpers.ts": {
+    "semantic_json_hash": "3af79bede6128b8e18772da61228f843a486d5d89720310ea0fa357bb413f5b5",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../helpers": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.testValidation": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.testValidation": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.test_helpers.ts:15:testValidation": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  },
+  "view_file_surfaces.payload:utils.ts": {
+    "semantic_json_hash": "f5824a45b2e8166ed41a1dbb8dced9ddbb1ae4a15bf885b5e7c60bc896306b8f",
+    "schema": {
+      "$": [
+        "object"
+      ],
+      "$.declared_module_targets": [
+        "object"
+      ],
+      "$.default_export": [
+        "null"
+      ],
+      "$.export_aliases": [
+        "object"
+      ],
+      "$.exports": [
+        "array"
+      ],
+      "$.exports[]": [
+        "string"
+      ],
+      "$.language": [
+        "string"
+      ],
+      "$.macro_use_module_targets": [
+        "array"
+      ],
+      "$.module_targets": [
+        "object"
+      ],
+      "$.module_targets../helpers": [
+        "string"
+      ],
+      "$.node_by_bare": [
+        "object"
+      ],
+      "$.node_by_bare.processData": [
+        "string"
+      ],
+      "$.node_by_scoped": [
+        "object"
+      ],
+      "$.node_by_scoped.processData": [
+        "string"
+      ],
+      "$.node_kind_by_id": [
+        "object"
+      ],
+      "$.node_kind_by_id.utils.ts:15:processData": [
+        "string"
+      ],
+      "$.reexports": [
+        "array"
+      ]
+    }
+  }
+}

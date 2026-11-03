@@ -522,57 +522,57 @@
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 2404,
+      "line": 2409,
       "text": "roots.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 2405,
+      "line": 2410,
       "text": "roots.dedup();"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 2413,
+      "line": 2418,
       "text": "storage_roots.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 2414,
+      "line": 2419,
       "text": "storage_roots.dedup();"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 2589,
+      "line": 2594,
       "text": "let mut ids = std::collections::BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 3344,
+      "line": 3349,
       "text": "names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 3603,
+      "line": 3608,
       "text": "control_names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 3643,
+      "line": 3648,
       "text": "names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 3707,
+      "line": 3712,
       "text": ".max_by_key(|root| root.configured.components().count())"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 4382,
+      "line": 4387,
       "text": "names.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/bash_background/persistence.rs",
-      "line": 8249,
+      "line": 8254,
       "text": ".collect::<std::collections::BTreeSet<_>>();"
     },
     {
@@ -622,122 +622,122 @@
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 7005,
+      "line": 7121,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 9613,
+      "line": 9729,
       "text": "let mut requested = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 10219,
+      "line": 10336,
       "text": "ids.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 10545,
+      "line": 10662,
       "text": "task_ids.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 12036,
+      "line": 12153,
       "text": ".min_by_key(|task| task.age)"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 12318,
+      "line": 12435,
       "text": "running.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 12355,
+      "line": 12472,
       "text": "harness_dirs.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 14978,
+      "line": 15103,
       "text": "failures.sort_by(|a, b| a.session_dir.cmp(&b.session_dir));"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 15102,
+      "line": 15227,
       "text": ".sort_by_key(|holder| std::cmp::Reverse(holder.age));"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 15832,
+      "line": 15966,
       "text": "dropped_by_class: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 16150,
+      "line": 16284,
       "text": "let mut counts = BTreeMap::<&str, usize>::new();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 16248,
+      "line": 16382,
       "text": "session_dirs.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 20089,
+      "line": 20223,
       "text": "merged.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 20090,
+      "line": 20224,
       "text": "live.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 20554,
+      "line": 20688,
       "text": "dropped_by_class: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 22031,
+      "line": 22165,
       "text": "let mut dropped = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 22064,
+      "line": 22198,
       "text": "let mut dropped = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 27014,
+      "line": 27148,
       "text": "sessions.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 2268,
+      "line": 2390,
       "text": "let known_directories = std::cell::RefCell::new(BTreeMap::<PathBuf, bool>::new());"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 2279,
+      "line": 2401,
       "text": ".max_by_key(|root| root.components().count())"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 2562,
+      "line": 2684,
       "text": ".collect::<Result<BTreeMap<_, _>, exec::Error>>();"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 4991,
+      "line": 5190,
       "text": "harness_indexes.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 5003,
+      "line": 5202,
       "text": "entries.sort();"
     },
     {
       "path": "crates/aft/src/bash_background/remote.rs",
-      "line": 5293,
+      "line": 5492,
       "text": "environment: BTreeMap<String, String>,"
     },
     {
@@ -752,42 +752,42 @@
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 5374,
+      "line": 5405,
       "text": "let environment = BTreeMap::from([("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 6017,
+      "line": 6048,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7401,
+      "line": 7513,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7424,
+      "line": 7536,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7449,
+      "line": 7561,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7472,
+      "line": 7584,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7503,
+      "line": 7615,
       "text": "BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 12191,
+      "line": 12353,
       "text": "BTreeMap::new(),"
     },
     {
@@ -1067,37 +1067,47 @@
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 279,
+      "line": 38,
+      "text": "static FLOOR_REFUSALS: Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>> ="
+    },
+    {
+      "path": "crates/aft/src/blob_store/v3.rs",
+      "line": 39,
+      "text": "Mutex::new(std::collections::BTreeMap::new());"
+    },
+    {
+      "path": "crates/aft/src/blob_store/v3.rs",
+      "line": 320,
       "text": "storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 287,
+      "line": 328,
       "text": "storage: std::collections::BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 397,
+      "line": 447,
       "text": ".max_by_key(|(depth, _)| *depth)"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 1862,
+      "line": 1994,
       "text": "pub after: std::collections::BTreeMap<String, String>,"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 2355,
+      "line": 2487,
       "text": "use std::collections::BTreeMap;"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 2359,
+      "line": 2491,
       "text": "static WORK: RefCell<BTreeMap<&'static str, (usize, Duration)>> = const { RefCell::new(BTreeMap::new()) };"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 2378,
+      "line": 2510,
       "text": "pub(crate) fn take() -> BTreeMap<&'static str, (usize, Duration)> {"
     },
     {
@@ -2517,892 +2527,892 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 11488,
+      "line": 11492,
       "text": "let unique_targets = targets.iter().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 11532,
+      "line": 11536,
       "text": "let unique_sources = sources.iter().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 11640,
+      "line": 11645,
       "text": "let unique_symbols = symbols.iter().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 11874,
+      "line": 11880,
       "text": "calls.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12043,
+      "line": 12049,
       "text": ") -> Result<BTreeSet<StoredEdge>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12053,
+      "line": 12059,
       "text": "let mut edges = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12450,
+      "line": 12456,
       "text": "partitions.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12470,
+      "line": 12476,
       "text": "configured_keys: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12482,
+      "line": 12488,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12531,
+      "line": 12537,
       "text": "candidates.sort_by(|left, right| right.0.cmp(&left.0));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13735,
+      "line": 13741,
       "text": "stats.changed_files.into_iter().collect::<BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13736,
+      "line": 13742,
       "text": "BTreeSet::from([\"plain.h\".to_string(), \"widget.h\".to_string()])"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 14080,
+      "line": 14086,
       "text": "dependencies: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 14087,
+      "line": 14093,
       "text": "let mut dependencies = HashMap::<String, BTreeSet<String>>::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 14095,
+      "line": 14101,
       "text": "let values = rows.collect::<std::result::Result<BTreeSet<_>, _>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 14877,
+      "line": 14883,
       "text": "entries.sort_by(|left, right| left.0.cmp(&right.0));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 15802,
+      "line": 15808,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 15851,
+      "line": 15857,
       "text": "let mut ordinal_by_range: BTreeMap<(u32, u32, u32, u32), u32> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 15853,
+      "line": 15859,
       "text": "metadata.sort_by(|(left, _), (right, _)| left.cmp(right));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 15965,
+      "line": 15971,
       "text": "import_dependencies: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 15988,
+      "line": 15994,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16001,
-      "text": "import_dependencies: &BTreeSet<String>,"
-    },
-    {
-      "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16016,
+      "line": 16007,
       "text": "import_dependencies: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 16022,
+      "text": "import_dependencies: &BTreeSet<String>,"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 16028,
       "text": "symbols.sort_by(|(left, _), (right, _)| left.cmp(right));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16149,
+      "line": 16155,
       "text": "let mut dependencies = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16194,
+      "line": 16200,
       "text": "refs.sort_by_key(|raw| (raw.byte_start, raw.byte_end));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16371,
+      "line": 16377,
       "text": ".sort_by_key(|import| import.byte_range.start);"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16896,
+      "line": 16902,
       "text": "specs.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16951,
+      "line": 16957,
       "text": "aliases.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16982,
+      "line": 16988,
       "text": "dependencies: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17000,
+      "line": 17006,
       "text": "calls_by_symbol.sort_unstable_by(|left, right| left.0.cmp(right.0));"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17037,
+      "line": 17043,
       "text": "nodes.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17058,
+      "line": 17064,
       "text": "exports.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17076,
+      "line": 17082,
       "text": "imports.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17492,
+      "line": 17498,
       "text": ".max_by_key(|(prefix, _)| prefix.len())"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17522,
+      "line": 17528,
       "text": "files.sort();"
-    },
-    {
-      "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17817,
-      "text": "let mut visited_scopes = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 17823,
+      "text": "let mut visited_scopes = BTreeSet::new();"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 17829,
       "text": "let mut visited_modules = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 17824,
+      "line": 17830,
       "text": "let mut targets = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19086,
+      "line": 19092,
       "text": "macro_use_module_targets: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19118,
+      "line": 19124,
       "text": "let mut macro_use_module_targets = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19190,
+      "line": 19196,
       "text": "nodes.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19213,
+      "line": 19219,
       "text": "refs.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19355,
+      "line": 19361,
       "text": "dependencies: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19586,
+      "line": 19592,
       "text": "let mut dependencies = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19730,
+      "line": 19736,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19759,
+      "line": 19765,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19783,
+      "line": 19789,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19788,
+      "line": 19794,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19810,
+      "line": 19816,
       "text": "expected: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19880,
+      "line": 19886,
       "text": "selected: Option<&BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19892,
+      "line": 19898,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19898,
+      "line": 19904,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19903,
+      "line": 19909,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19988,
+      "line": 19994,
       "text": "let mut dependencies = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20025,
+      "line": 20031,
       "text": "dependencies: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20112,
+      "line": 20118,
       "text": "caller_files: Option<&BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20113,
+      "line": 20119,
       "text": ") -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20120,
+      "line": 20126,
       "text": "caller_files: Option<&BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20122,
+      "line": 20128,
       "text": ") -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20125,
+      "line": 20131,
       "text": "return Ok(BTreeSet::new());"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20132,
+      "line": 20138,
       "text": "let mut edge_ids = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20231,
+      "line": 20237,
       "text": "rows.collect::<std::result::Result<BTreeSet<_>, _>>()?"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20301,
+      "line": 20307,
       "text": "all: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20302,
+      "line": 20308,
       "text": "path_form: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20306,
+      "line": 20312,
       "text": "fn extend(&mut self, rel_path: &str, names: BTreeSet<String>) {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20331,
+      "line": 20337,
       "text": ") -> Result<BTreeSet<String>> {"
-    },
-    {
-      "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20335,
-      "text": ") -> BTreeMap<String, Vec<Candidate>> {"
-    },
-    {
-      "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20336,
-      "text": "let mut grouped: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
       "line": 20341,
+      "text": ") -> BTreeMap<String, Vec<Candidate>> {"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 20342,
+      "text": "let mut grouped: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();"
+    },
+    {
+      "path": "crates/aft/src/callgraph_store/mod.rs",
+      "line": 20347,
       "text": "candidates.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20386,
+      "line": 20392,
       "text": "fn unresolved_call_ref_ids(tx: &Transaction<'_>, rel_path: &str) -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20392,
+      "line": 20398,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20400,
+      "line": 20406,
       "text": "callers: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20414,
+      "line": 20420,
       "text": "roots: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20443,
+      "line": 20449,
       "text": "let mut present = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20474,
+      "line": 20480,
       "text": "caller_files: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20479,
+      "line": 20485,
       "text": "let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20489,
+      "line": 20495,
       "text": "caller_files: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20490,
+      "line": 20496,
       "text": "expected_edge_ids: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20520,
+      "line": 20526,
       "text": "caller_files: Option<&BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 20674,
+      "line": 20680,
       "text": ".max_by_key(|(index, _, _)| *index)?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22522,
+      "line": 22528,
       "text": "let mut stored = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22530,
+      "line": 22536,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22616,
+      "line": 22622,
       "text": "stored_nodes.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22617,
+      "line": 22623,
       "text": "expected_nodes.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22693,
+      "line": 22699,
       "text": "stored_refs.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22694,
+      "line": 22700,
       "text": "expected_refs.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22742,
+      "line": 22748,
       "text": "stored_edges.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22743,
+      "line": 22749,
       "text": "expected_edges.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22752,
+      "line": 22758,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22757,
+      "line": 22763,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22800,
+      "line": 22806,
       "text": "stored_hints.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22801,
+      "line": 22807,
       "text": "expected_hints.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22851,
+      "line": 22857,
       "text": "names: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22894,
+      "line": 22900,
       "text": "let mut bound_by_caller: HashMap<String, BTreeSet<String>> = HashMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22952,
+      "line": 22958,
       "text": "names: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22953,
+      "line": 22959,
       "text": ") -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 22963,
+      "line": 22969,
       "text": "let mut bound = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23026,
+      "line": 23032,
       "text": "stored_refs.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23027,
+      "line": 23033,
       "text": "new_refs.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23046,
+      "line": 23052,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23059,
+      "line": 23065,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23060,
+      "line": 23066,
       "text": "let mut names = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23081,
+      "line": 23087,
       "text": "names: BTreeSet<(String, String)>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23082,
+      "line": 23088,
       "text": "reexports: BTreeSet<(Option<String>, Option<String>, bool)>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23203,
+      "line": 23209,
       "text": "fn changed_names(&self, next: &Self) -> Option<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23266,
+      "line": 23272,
       "text": "names: Option<&BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23267,
+      "line": 23273,
       "text": ") -> Option<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23301,
+      "line": 23307,
       "text": "changed: Option<BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23302,
+      "line": 23308,
       "text": "created_reexporters: &BTreeMap<String, Vec<ReexportRow>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23305,
+      "line": 23311,
       "text": "if changed.as_ref().is_some_and(BTreeSet::is_empty) {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23310,
+      "line": 23316,
       "text": "let mut barrels: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23319,
+      "line": 23325,
       "text": "if forwarded.as_ref().is_some_and(BTreeSet::is_empty)"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23400,
+      "line": 23406,
       "text": "let mut bound = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23466,
+      "line": 23472,
       "text": "names: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23500,
+      "line": 23506,
       "text": "created: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23502,
+      "line": 23508,
       "text": "BTreeMap<String, BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23503,
+      "line": 23509,
       "text": "BTreeMap<String, Vec<ReexportRow>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23505,
+      "line": 23511,
       "text": "let mut importers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23506,
+      "line": 23512,
       "text": "let mut reexporters: BTreeMap<String, Vec<ReexportRow>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23587,
+      "line": 23593,
       "text": "created: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23588,
+      "line": 23594,
       "text": ") -> Result<BTreeSet<PathBuf>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23589,
+      "line": 23595,
       "text": "let mut dirs = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23616,
+      "line": 23622,
       "text": "js: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23617,
+      "line": 23623,
       "text": "rust: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23626,
+      "line": 23632,
       "text": "let any_of = |patterns: &BTreeSet<String>, values: &mut Vec<String>| {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23691,
+      "line": 23697,
       "text": "tsconfig_dirs: &BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23973,
+      "line": 23979,
       "text": "selected_ref_ids: &mut BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23974,
+      "line": 23980,
       "text": "selected_refs_by_caller: &mut BTreeMap<String, BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23993,
+      "line": 23999,
       "text": "ref_ids: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23994,
+      "line": 24000,
       "text": ") -> Result<BTreeMap<String, BTreeSet<String>>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 23995,
+      "line": 24001,
       "text": "let mut by_caller: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24026,
+      "line": 24032,
       "text": "let mut seen = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24062,
+      "line": 24068,
       "text": ") -> Result<(BTreeSet<String>, BTreeSet<String>)> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24063,
+      "line": 24069,
       "text": "let mut importers = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24064,
+      "line": 24070,
       "text": "let mut barrels = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24161,
+      "line": 24167,
       "text": "let mut ids = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24168,
+      "line": 24174,
       "text": "fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24178,
+      "line": 24184,
       "text": "fn edge_snapshot_with_conn(conn: &Connection) -> Result<BTreeSet<StoredEdge>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24197,
+      "line": 24203,
       "text": "let mut edges = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24291,
+      "line": 24297,
       "text": "dependencies: &BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24417,
+      "line": 24423,
       "text": ") -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24418,
+      "line": 24424,
       "text": "let mut deps = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24436,
+      "line": 24442,
       "text": ") -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24452,
+      "line": 24458,
       "text": ") -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24519,
+      "line": 24525,
       "text": ") -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24813,
+      "line": 24819,
       "text": "normalized.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 24814,
+      "line": 24820,
       "text": "normalized.dedup();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25486,
+      "line": 25492,
       "text": ".collect::<rusqlite::Result<BTreeSet<_>>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25492,
+      "line": 25498,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25875,
+      "line": 25881,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25913,
+      "line": 25919,
       "text": "Arc::new(parking_lot::Mutex::new(BTreeSet::new()))"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29427,
+      "line": 29433,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 30867,
+      "line": 30873,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 30870,
+      "line": 30876,
       "text": "cached_parses.keys().cloned().collect::<BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31172,
+      "line": 31178,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31173,
+      "line": 31179,
       "text": "let mut threaded_ref_ids = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31174,
+      "line": 31180,
       "text": "let mut threaded_by_caller = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31341,
+      "line": 31347,
       "text": "let mut dependencies = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31689,
+      "line": 31695,
       "text": "let excluded_columns = excluded_columns.iter().copied().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31722,
+      "line": 31728,
       "text": "actual.failed_files.iter().cloned().collect::<BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31727,
+      "line": 31733,
       "text": ".collect::<BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31770,
+      "line": 31776,
       "text": "indexes.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 32385,
+      "line": 32391,
       "text": ") -> Option<&'a BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 32891,
+      "line": 32897,
       "text": "assert_eq!(keys.len(), keys.iter().collect::<BTreeSet<_>>().len());"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 32892,
+      "line": 32898,
       "text": "let mut counts = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 33137,
+      "line": 33143,
       "text": "files.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 33138,
+      "line": 33144,
       "text": "files.dedup();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 33498,
+      "line": 33504,
       "text": "let batch = |paths: BTreeSet<PathBuf>| RefreshBatch {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 33907,
+      "line": 33913,
       "text": "rows.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 33996,
+      "line": 34002,
       "text": "files.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 34120,
+      "line": 34126,
       "text": "entries.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 34226,
+      "line": 34232,
       "text": "callers.sort();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 34501,
+      "line": 34507,
       "text": "macro_use_module_targets: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35311,
+      "line": 35317,
       "text": "let names = |sql: &str| -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35319,
+      "line": 35325,
       "text": "let expected_nodes: BTreeSet<String> = new_extract"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35329,
+      "line": 35335,
       "text": "let expected_refs: BTreeSet<String> = new_extract"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35801,
+      "line": 35807,
       "text": "fn exported(store: &CallGraphStore) -> BTreeSet<String> {"
     },
     {
@@ -3492,27 +3502,27 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
-      "line": 542,
+      "line": 546,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
-      "line": 556,
+      "line": 560,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
-      "line": 565,
+      "line": 569,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
-      "line": 573,
+      "line": 577,
       "text": "static SHARED_RANGE_PROJECTS: std::sync::Mutex<BTreeSet<PathBuf>> ="
     },
     {
       "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
-      "line": 574,
+      "line": 578,
       "text": "std::sync::Mutex::new(BTreeSet::new());"
     },
     {
@@ -4202,77 +4212,77 @@
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2738,
+      "line": 2743,
       "text": "let mut by_symbol: BTreeMap<String, Vec<StoreNode>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2759,
+      "line": 2764,
       "text": "nodes.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2779,
+      "line": 2784,
       "text": "let mut frontier = BTreeSet::from([(file.to_string(), symbol.to_string())]);"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2790,
+      "line": 2795,
       "text": "let mut next_frontier = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2807,
+      "line": 2812,
       "text": "mut boundary: BTreeSet<(String, String)>,"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 2831,
+      "line": 2836,
       "text": "boundary: &mut BTreeSet<(String, String)>,"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3073,
+      "line": 3078,
       "text": "calls.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3078,
+      "line": 3083,
       "text": "let mut seen = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3085,
+      "line": 3090,
       "text": "calls.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3224,
+      "line": 3229,
       "text": "fn read_source_lines_at(path: &Path, wanted: &BTreeSet<usize>) -> Option<HashMap<usize, String>> {"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3417,
+      "line": 3422,
       "text": "fn edge_snapshot(&self) -> CallGraphResult<BTreeSet<StoredEdge>> {"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3877,
+      "line": 3882,
       "text": "let lines = read_source_lines_at(&path, &BTreeSet::from([1])).unwrap();"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 3879,
+      "line": 3884,
       "text": "assert_eq!(read_source_lines_at(&path, &BTreeSet::from([3])), None);"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 4004,
+      "line": 4009,
       "text": "let actual: BTreeSet<_> = identities.iter().cloned().collect();"
     },
     {
       "path": "crates/aft/src/commands/callgraph_store_adapter.rs",
-      "line": 4005,
+      "line": 4010,
       "text": "let expected: BTreeSet<_> = (0..width)"
     },
     {
@@ -4392,117 +4402,117 @@
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 10290,
+      "line": 10292,
       "text": "use std::collections::BTreeSet;"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12307,
+      "line": 12309,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12354,
+      "line": 12356,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12447,
+      "line": 12449,
       "text": "use std::collections::BTreeMap;"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12490,
+      "line": 12492,
       "text": ".collect::<BTreeMap<_, _>>()"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12492,
+      "line": 12494,
       "text": "let request = |changed: BTreeSet<Vec<u8>>, semantic: BTreeMap<Vec<u8>, String>| {"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12513,
+      "line": 12515,
       "text": "crate::views::assembly::publish_checkout(&request(BTreeSet::new(), all_keys.clone()))"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12561,
+      "line": 12563,
       "text": "warm.sort();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12587,
+      "line": 12589,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12593,
+      "line": 12595,
       "text": "BTreeSet::from([rel.into_bytes()]),"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12607,
+      "line": 12609,
       "text": "sorted.sort_by_key(|(total, _, _)| *total);"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12887,
+      "line": 12889,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 12921,
+      "line": 12923,
       "text": "BTreeSet::from([b\"tracked.rs\".to_vec()])"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 13081,
+      "line": 13083,
       "text": "BTreeSet::from([b\"a.ts\".to_vec(), b\"b.ts\".to_vec()])"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 13358,
+      "line": 13380,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 15617,
+      "line": 15639,
       "text": "found.sort();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 15681,
+      "line": 15703,
       "text": "BTreeSet::from([b\"b.ts\".to_vec()]),"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 15684,
+      "line": 15706,
       "text": "let _ = crate::executor::view_publication::schedule(&ctx, BTreeSet::new(), true);"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 15690,
+      "line": 15712,
       "text": "let direct = ctx.publish_view_paths(BTreeSet::new(), true);"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 22077,
+      "line": 22099,
       "text": "let found: std::collections::BTreeSet<_> = result"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 26288,
+      "line": 26310,
       "text": "samples.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 26347,
+      "line": 26369,
       "text": "samples.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 26674,
+      "line": 26696,
       "text": "pending_paths: BTreeSet::new(),"
     },
     {
@@ -4537,7 +4547,7 @@
     },
     {
       "path": "crates/aft/src/commands/glob.rs",
-      "line": 879,
+      "line": 915,
       "text": "let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();"
     },
     {
@@ -4557,57 +4567,57 @@
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1104,
+      "line": 1121,
       "text": "by_file.sort_by_key(|(file, _)| shown.iter().position(|index| index == file));"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1109,
+      "line": 1126,
       "text": "rounds.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1138,
+      "line": 1155,
       "text": "ranked.sort_by_key(|&index| std::cmp::Reverse(files[index].matches.len()));"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1160,
+      "line": 1177,
       "text": "folders.sort_by_key(|(_, _, lines)| std::cmp::Reverse(*lines));"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1301,
+      "line": 1318,
       "text": "entries.sort_by(|a, b| {"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1619,
+      "line": 1636,
       "text": "wanted.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 1620,
+      "line": 1637,
       "text": "wanted.dedup();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 2009,
+      "line": 2058,
       "text": "kept.sort();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 2061,
+      "line": 2110,
       "text": "kept.sort();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 2603,
+      "line": 2652,
       "text": "legacy_ns.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/grep.rs",
-      "line": 2604,
+      "line": 2653,
       "text": "optimized_ns.sort_unstable();"
     },
     {
@@ -4662,88 +4672,83 @@
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 954,
+      "line": 960,
       "text": "let mut outcomes = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 995,
+      "line": 1001,
       "text": "let mut tier2_receivers = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 1722,
+      "line": 1733,
       "text": "let mut payloads = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 1809,
+      "line": 1820,
       "text": "fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 2572,
+      "line": 2583,
       "text": "parts.sort_by_key(|part| {"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 2808,
+      "line": 2819,
       "text": "parts.sort_by_key(|part| part.text.len());"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 2818,
+      "line": 2829,
       "text": "parts.sort_by_key(|part| !part.requested);"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3148,
+      "line": 3159,
       "text": "detail_categories: BTreeSet<InspectCategory>,"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3154,
+      "line": 3165,
       "text": "detail_categories: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3339,
+      "line": 3350,
       "text": "outcomes: &BTreeMap<InspectCategory, JobOutcome>,"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3340,
+      "line": 3351,
       "text": ") -> Result<BTreeMap<InspectCategory, Value>, String> {"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3341,
+      "line": 3352,
       "text": "let mut payloads = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3402,
+      "line": 3413,
       "text": "let mut categories = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3440,
+      "line": 3451,
       "text": "fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Result<(), String> {"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3564,
+      "line": 3575,
       "text": "roots.sort();"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3565,
+      "line": 3576,
       "text": "roots.dedup();"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 3597,
-      "text": "payloads: &BTreeMap<InspectCategory, Value>,"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
@@ -4752,62 +4757,67 @@
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 4605,
-      "text": "pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 4626,
-      "text": "languages.sort_unstable();"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 4627,
-      "text": "languages.dedup();"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 4879,
-      "text": ".collect::<std::collections::BTreeSet<_>>()"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 4936,
-      "text": "pairs.sort_by(|a, b| a.0.cmp(b.0));"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 5306,
-      "text": "let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 5347,
-      "text": "files.sort_unstable();"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 5358,
-      "text": "groups.sort_by(|left, right| right.files.len().cmp(&left.files.len()));"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 5795,
-      "text": ") -> BTreeMap<InspectCategory, JobOutcome> {"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 6726,
-      "text": "pub(super) fn fresh_payloads_for_all_categories() -> BTreeMap<InspectCategory, Value> {"
-    },
-    {
-      "path": "crates/aft/src/commands/inspect.rs",
-      "line": 6767,
+      "line": 3619,
       "text": "payloads: &BTreeMap<InspectCategory, Value>,"
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 9370,
+      "line": 4616,
+      "text": "pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 4637,
+      "text": "languages.sort_unstable();"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 4638,
+      "text": "languages.dedup();"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 4890,
+      "text": ".collect::<std::collections::BTreeSet<_>>()"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 4947,
+      "text": "pairs.sort_by(|a, b| a.0.cmp(b.0));"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 5317,
+      "text": "let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 5358,
+      "text": "files.sort_unstable();"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 5369,
+      "text": "groups.sort_by(|left, right| right.files.len().cmp(&left.files.len()));"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 5806,
+      "text": ") -> BTreeMap<InspectCategory, JobOutcome> {"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 6737,
+      "text": "pub(super) fn fresh_payloads_for_all_categories() -> BTreeMap<InspectCategory, Value> {"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 6778,
+      "text": "payloads: &BTreeMap<InspectCategory, Value>,"
+    },
+    {
+      "path": "crates/aft/src/commands/inspect.rs",
+      "line": 9381,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
@@ -5137,117 +5147,117 @@
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1167,
+      "line": 1168,
       "text": "summaries.sort_by_key(|summary| (summary.range.start_line, summary.range.start_col));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1767,
+      "line": 1768,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1768,
+      "line": 1769,
       "text": "file_entries.sort_by(|a, b| a.path.cmp(&b.path));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1880,
+      "line": 1881,
       "text": "discovery.directories.sort_by(|a, b| {"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1996,
+      "line": 1997,
       "text": "code_files.sort_by(|a, b| file_entries[*a].path.cmp(&file_entries[*b].path));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1997,
+      "line": 1998,
       "text": "data_files.sort_by(|a, b| file_entries[*a].path.cmp(&file_entries[*b].path));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 1998,
+      "line": 1999,
       "text": "directories.sort_by(|a, b| directory_nodes[*a].path.cmp(&directory_nodes[*b].path));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2115,
+      "line": 2116,
       "text": "candidates.sort_by(|a, b| {"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2677,
+      "line": 2678,
       "text": "ordered.sort_by(|a, b| a.3.cmp(&b.3));"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2781,
+      "line": 2782,
       "text": "skipped_files.sort_by_key(|(index, _)| *index);"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2939,
+      "line": 2940,
       "text": "discovery.files.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2940,
+      "line": 2941,
       "text": "discovery.directories.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3001,
+      "line": 3002,
       "text": "files.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3002,
+      "line": 3003,
       "text": "directories.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3258,
+      "line": 3259,
       "text": "child_directories.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3540,
+      "line": 3541,
       "text": "members.sort_by_key(|member| {"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3686,
+      "line": 3687,
       "text": "content_files: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3722,
+      "line": 3723,
       "text": "content_files: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 3756,
+      "line": 3757,
       "text": "content_files: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 4202,
+      "line": 4203,
       "text": ".collect::<std::collections::BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 4979,
+      "line": 4980,
       "text": "times.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 5029,
+      "line": 5030,
       "text": "timings.sort();"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 7688,
+      "line": 7689,
       "text": "micros_per_operation.sort_unstable();"
     },
     {
@@ -5272,12 +5282,12 @@
     },
     {
       "path": "crates/aft/src/commands/read.rs",
-      "line": 2606,
+      "line": 2661,
       "text": "entries.sort();"
     },
     {
       "path": "crates/aft/src/commands/read.rs",
-      "line": 3561,
+      "line": 3616,
       "text": "snapshots.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.tag.cmp(&b.1.tag)));"
     },
     {
@@ -5507,67 +5517,77 @@
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 4902,
+      "line": 4911,
       "text": "trigrams.sort_unstable();"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 4903,
+      "line": 4912,
       "text": "trigrams.dedup();"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 4952,
+      "line": 4961,
       "text": ".min_by_key(|(_, entry)| entry.used)"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 5397,
+      "line": 5406,
       "text": ".max_by(|a, b| a.score.total_cmp(&b.score))"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 5485,
+      "line": 5494,
       "text": "exact_candidates.sort_by(score_free_r3_cmp);"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 6120,
+      "line": 6129,
       "text": "metadata.sort_by_key(|(path, _)| *path);"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 6122,
+      "line": 6131,
       "text": "symbols.sort_by_key(|(path, _)| *path);"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 7527,
+      "line": 7110,
+      "text": ".sort_by_key(|reason| std::cmp::Reverse(reason.precedence()));"
+    },
+    {
+      "path": "crates/aft/src/commands/semantic_search/mod.rs",
+      "line": 7111,
+      "text": "envelope.causes.dedup();"
+    },
+    {
+      "path": "crates/aft/src/commands/semantic_search/mod.rs",
+      "line": 7621,
       "text": "readable_files.sort_by_key(|(index, _, _)| *index);"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 9474,
+      "line": 9633,
       "text": "// A BTreeMap would re-sort groups alphabetically by path and scramble the"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 10148,
+      "line": 10307,
       "text": "timings.sort_by(f64::total_cmp);"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 10676,
+      "line": 10835,
       "text": ".apply_refused_rows_update(std::collections::BTreeMap::from([("
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 14161,
+      "line": 14320,
       "text": ".max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))"
     },
     {
       "path": "crates/aft/src/commands/semantic_search/mod.rs",
-      "line": 15636,
+      "line": 15852,
       "text": "// (the old BTreeMap bug) would put aaa.rs first; rank order keeps zzz."
     },
     {
@@ -6147,542 +6167,572 @@
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1206,
+      "line": 1210,
+      "text": "disk_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1211,
       "text": "by_cause: BTreeMap<(String, String), u64>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1210,
+      "line": 1215,
       "text": "log_state: BTreeMap<String, (Option<Instant>, u64)>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1323,
+      "line": 1328,
       "text": "#[serde(skip_serializing_if = \"BTreeMap::is_empty\")]"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1324,
+      "line": 1329,
       "text": "pub view_load_failures: BTreeMap<String, u64>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1344,
+      "line": 1334,
+      "text": "#[serde(skip_serializing_if = \"BTreeMap::is_empty\")]"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1335,
+      "text": "pub view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1352,
       "text": "view_load_failures: BTreeMap<String, u64>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1365,
+      "line": 1354,
+      "text": "view_storage_reserve: BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1374,
       "text": "view_load_failures: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1468,
+      "line": 1376,
+      "text": "view_storage_reserve: BTreeMap::new(),"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1480,
       "text": "view_load_failures: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 1933,
+      "line": 1482,
+      "text": "view_storage_reserve: BTreeMap::new(),"
+    },
+    {
+      "path": "crates/aft/src/context.rs",
+      "line": 1947,
       "text": "unflushed_source_paths: Mutex<BTreeSet<PathBuf>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2067,
+      "line": 2081,
       "text": "pub(crate) fn unflushed_paths(&self) -> BTreeSet<PathBuf> {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2342,
+      "line": 2356,
       "text": "Mutex<BTreeMap<PathBuf, Arc<WatcherCounters>>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2347,
+      "line": 2361,
       "text": "let registry = WATCHER_COUNTERS_BY_ROOT.get_or_init(|| Mutex::new(BTreeMap::new()));"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2409,
+      "line": 2423,
       "text": "pub(crate) view_publication_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2423,
+      "line": 2437,
       "text": "pub store_paths: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2428,
+      "line": 2442,
       "text": "pub view_paths: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2543,
+      "line": 2557,
       "text": "search: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2544,
+      "line": 2558,
       "text": "callgraph: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2545,
+      "line": 2559,
       "text": "tier2: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2546,
+      "line": 2560,
       "text": "semantic: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2559,
+      "line": 2573,
       "text": "fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<PathBuf>) {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2740,
+      "line": 2754,
       "text": "view_publication_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2872,
+      "line": 2886,
       "text": "pub(crate) pending_paths: BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 2873,
+      "line": 2887,
       "text": "pub(crate) pending_inputs: BTreeMap<Vec<u8>, crate::views::assembly::PendingInput>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 3299,
+      "line": 3313,
       "text": "refreshing.sort();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 3325,
+      "line": 3339,
       "text": "accounting: BTreeMap<PathBuf, SemanticRefreshAccounting>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 3334,
+      "line": 3348,
       "text": "accounting: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 3506,
+      "line": 3520,
       "text": "refused_rows: std::collections::BTreeMap<PathBuf, usize>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 3507,
+      "line": 3521,
       "text": "context_skipped: std::collections::BTreeMap<PathBuf, usize>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4109,
+      "line": 4123,
       "text": "memory_contexts: parking_lot::Mutex<BTreeMap<PathBuf, Weak<AppContext>>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4132,
+      "line": 4146,
       "text": "memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4748,
+      "line": 4762,
       "text": "force_restrict_requests: parking_lot::Mutex<BTreeMap<String, usize>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4832,
+      "line": 4846,
       "text": "parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4873,
+      "line": 4887,
       "text": "pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4877,
+      "line": 4891,
       "text": "pending_tier2_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4905,
+      "line": 4919,
       "text": "pending_semantic_index_paths: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4916,
+      "line": 4930,
       "text": "semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 4987,
+      "line": 5001,
       "text": "configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5018,
+      "line": 5032,
       "text": "artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5025,
+      "line": 5039,
       "text": "configure_artifact_cache_keys: parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), String>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5027,
+      "line": 5041,
       "text": "parking_lot::Mutex<BTreeMap<(PathBuf, PathBuf), ReadonlyArtifactCacheKey>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5032,
+      "line": 5046,
       "text": "worktree_bridge_cache: parking_lot::Mutex<BTreeMap<PathBuf, WorktreeBridgeCacheEntry>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5258,
+      "line": 5276,
       "text": "parking_lot::Mutex<BTreeMap<PathBuf, CallgraphViewInstallTestGate>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5326,
+      "line": 5344,
       "text": "parking_lot::Mutex<BTreeMap<PathBuf, CallgraphBuildStartGate>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5339,
+      "line": 5357,
       "text": ".get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5496,
+      "line": 5514,
       "text": ".get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5509,
+      "line": 5527,
       "text": "static CALLGRAPH_POINTER_REMOVAL_ARMS: std::sync::OnceLock<parking_lot::Mutex<BTreeSet<PathBuf>>> ="
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5521,
+      "line": 5539,
       "text": ".get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5532,
+      "line": 5550,
       "text": ".get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5542,
+      "line": 5560,
       "text": ".get_or_init(|| parking_lot::Mutex::new(BTreeSet::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5706,
+      "line": 5724,
       "text": "force_restrict_requests: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5768,
+      "line": 5786,
       "text": "pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5782,
+      "line": 5800,
       "text": "pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5786,
+      "line": 5804,
       "text": "pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5802,
+      "line": 5820,
       "text": "pending_semantic_index_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5811,
+      "line": 5829,
       "text": "semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5843,
+      "line": 5861,
       "text": "configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5858,
+      "line": 5876,
       "text": "artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5859,
+      "line": 5877,
       "text": "configure_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5860,
+      "line": 5878,
       "text": "readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 5863,
+      "line": 5881,
       "text": "worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 6138,
-      "text": "let (mut view_load_failures, mut view_load_failure_last): (BTreeMap<String, u64>, _) ="
+      "line": 6158,
+      "text": "BTreeMap<String, u64>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 6645,
+      "line": 6670,
       "text": "let retire = |pending: &mut BTreeSet<PathBuf>| {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 7425,
+      "line": 7450,
       "text": "BTreeSet::new()"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 7449,
+      "line": 7474,
       "text": "let mut store_paths: BTreeSet<PathBuf> = self.pending_callgraph_store_paths.lock().clone();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10328,
+      "line": 10384,
       "text": "pub(crate) fn refresh_view_head_for_watcher(&self, paths: &[PathBuf]) -> BTreeSet<PathBuf> {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10330,
+      "line": 10386,
       "text": "return BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10333,
+      "line": 10389,
       "text": "return BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10336,
+      "line": 10392,
       "text": "return BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10342,
+      "line": 10398,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10395,
+      "line": 10451,
       "text": "changed_paths: BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10408,
+      "line": 10464,
       "text": "pub(crate) fn can_skip_irrelevant_view_paths(&self, paths: &BTreeSet<Vec<u8>>) -> bool {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10429,
+      "line": 10485,
       "text": "semantic_keys: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10440,
+      "line": 10496,
       "text": "changed_paths: BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10504,
+      "line": 10560,
       "text": "(BTreeMap::new(), None)"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10659,
+      "line": 10715,
       "text": "manifests: BTreeMap<PathBuf, Option<String>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10673,
+      "line": 10729,
       "text": "paths.sort();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 10674,
+      "line": 10730,
       "text": "paths.dedup();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 11428,
+      "line": 11484,
       "text": "BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12117,
+      "line": 12173,
       "text": "fn configured_callgraph_keys(&self, current_root: &Path) -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12123,
+      "line": 12179,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12577,
+      "line": 12633,
       "text": ") -> (Vec<PathBuf>, BTreeSet<PathBuf>) {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12597,
+      "line": 12653,
       "text": "parked: &BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12600,
+      "line": 12656,
       "text": "let replayed: BTreeSet<&PathBuf> = replayed.iter().collect();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 12609,
+      "line": 12665,
       "text": "fn replayable_pending_callgraph_store_paths(&self, parked: BTreeSet<PathBuf>) -> Vec<PathBuf> {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 13381,
+      "line": 13450,
       "text": "BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 13382,
+      "line": 13451,
       "text": "BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 13383,
+      "line": 13452,
       "text": "BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 13384,
+      "line": 13453,
       "text": "BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 14480,
+      "line": 14549,
       "text": "Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 14496,
+      "line": 14565,
       "text": "f: impl FnOnce(&mut BTreeMap<PathBuf, usize>) -> R,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 18065,
+      "line": 18197,
       "text": "let mut roots = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 18219,
+      "line": 18351,
       "text": "pending_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 18362,
+      "line": 18494,
       "text": ") -> &'static parking_lot::Mutex<BTreeMap<(PathBuf, String), (usize, usize)>> {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 18364,
+      "line": 18496,
       "text": "parking_lot::Mutex<BTreeMap<(PathBuf, String), (usize, usize)>>,"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 18366,
+      "line": 18498,
       "text": "EFFECTS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 20089,
+      "line": 20221,
       "text": "read_us.sort_unstable();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21623,
+      "line": 21755,
       "text": "pending_paths: BTreeSet::from([b\"lib.rs\".to_vec()]),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21624,
+      "line": 21756,
       "text": "pending_inputs: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21739,
+      "line": 21871,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21740,
+      "line": 21872,
       "text": "semantic_keys: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 22231,
+      "line": 22363,
       "text": "let paths = BTreeSet::from([scratch.clone(), sibling.clone()]);"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 22269,
+      "line": 22401,
       "text": "BTreeSet::from([sibling.clone()])"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 22431,
+      "line": 22563,
       "text": "taken.sort();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 22433,
+      "line": 22565,
       "text": "expected.sort();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25489,
+      "line": 25621,
       "text": "fn collect_fixture_files(root: &Path, directory: &Path, files: &mut BTreeSet<PathBuf>) {"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25517,
+      "line": 25649,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25519,
+      "line": 25651,
       "text": "let mut all_files = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25524,
+      "line": 25656,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25728,
+      "line": 25860,
       "text": "assert_eq!(filtered.changed, BTreeSet::from([visible]));"
     },
     {
@@ -6799,16 +6849,6 @@
       "path": "crates/aft/src/db/retention_query_plan_tests.rs",
       "line": 314,
       "text": "let mut unique = std::collections::BTreeMap::new();"
-    },
-    {
-      "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 862,
-      "text": ".collect::<std::collections::BTreeSet<_>>(),"
-    },
-    {
-      "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 876,
-      "text": ".collect::<std::collections::BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/db/wal_credit_probe.rs",
@@ -7017,7 +7057,7 @@
     },
     {
       "path": "crates/aft/src/exec_remote/request.rs",
-      "line": 119,
+      "line": 156,
       "text": "env: BTreeMap<String, String>,"
     },
     {
@@ -8467,28 +8507,18 @@
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 981,
+      "line": 986,
       "text": "let mut rendered_lines = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 982,
+      "line": 987,
       "text": "let mut display_truncated_lines = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1033,
+      "line": 1044,
       "text": "let mut rendered_lines = BTreeSet::new();"
-    },
-    {
-      "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1247,
-      "text": "rendered_lines: BTreeSet::new(),"
-    },
-    {
-      "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1259,
-      "text": "rendered_lines: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
@@ -8497,62 +8527,72 @@
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1286,
+      "line": 1287,
       "text": "rendered_lines: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1472,
+      "line": 1303,
+      "text": "rendered_lines: BTreeSet::new(),"
+    },
+    {
+      "path": "crates/aft/src/hashline/snapshot/mod.rs",
+      "line": 1314,
+      "text": "rendered_lines: BTreeSet::new(),"
+    },
+    {
+      "path": "crates/aft/src/hashline/snapshot/mod.rs",
+      "line": 1560,
       "text": "fn snapshot_for_lines(snapshot: &Snapshot, lines: &BTreeSet<usize>) -> Snapshot {"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1473,
+      "line": 1561,
       "text": "let records: BTreeMap<usize, RawLineRecord> = snapshot"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1507,
+      "line": 1595,
       "text": "fn affected_output_lines(snapshot: &Snapshot, affected: &AffectedRegion) -> BTreeSet<usize> {"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1510,
+      "line": 1598,
       "text": "return BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1513,
+      "line": 1601,
       "text": "let mut selected = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1539,
+      "line": 1627,
       "text": "ranges.sort_by_key(|range| (range.start, range.end));"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1716,
+      "line": 1804,
       "text": "assert_eq!(resolved.coverage.seen_lines, BTreeSet::from([1, 2]));"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1728,
+      "line": 1816,
       "text": "assert_eq!(rendered.rendered_lines, BTreeSet::from([1, 2, 3]));"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1776,
+      "line": 1865,
       "text": "assert_eq!(snapshot.coverage.seen_lines, BTreeSet::from([2, 3]));"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1790,
+      "line": 1879,
       "text": "assert_eq!(snapshot.coverage.seen_lines, BTreeSet::from([3, 4]));"
     },
     {
       "path": "crates/aft/src/hashline/snapshot/mod.rs",
-      "line": 1920,
+      "line": 2009,
       "text": "BTreeSet::from([1, 2, 3, 4, 5, 6])"
     },
     {
@@ -9172,282 +9212,282 @@
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 959,
+      "line": 981,
       "text": "files: BTreeMap<PathBuf, crate::views::read::VerifiedCallgraphFile>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 1041,
+      "line": 1063,
       "text": "dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 1205,
+      "line": 1227,
       "text": "dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 1882,
+      "line": 1904,
       "text": "files: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 3743,
+      "line": 3765,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4044,
+      "line": 4066,
       "text": "expected_files: &BTreeMap<String, PathBuf>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4173,
+      "line": 4195,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4178,
+      "line": 4200,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4185,
+      "line": 4207,
       "text": "let mut scan_by_relative = BTreeMap::<String, PathBuf>::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4205,
+      "line": 4227,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 4662,
+      "line": 4684,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5257,
+      "line": 5279,
       "text": "files.sort();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5261,
+      "line": 5283,
       "text": "fn forced_relative_paths(job: &InspectJob, paths: &BTreeSet<PathBuf>) -> BTreeSet<String> {"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5262,
+      "line": 5284,
       "text": "let mut keys = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5290,
+      "line": 5312,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5395,
+      "line": 5417,
       "text": "fn current_project_files(project_root: &Path, files: &[PathBuf]) -> BTreeMap<String, PathBuf> {"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 5402,
+      "line": 5424,
       "text": "fn insert_callgraph_refresh_path(paths: &mut BTreeSet<PathBuf>, path: PathBuf) {"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6281,
+      "line": 6303,
       "text": "let mut interned_files = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6282,
+      "line": 6304,
       "text": "let mut interned_symbols = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6347,
+      "line": 6369,
       "text": ".saturating_add(std::mem::size_of::<(PathBuf, BTreeSet<String>)>() as u64)"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6433,
+      "line": 6455,
       "text": "expected_files: &BTreeMap<String, PathBuf>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6439,
+      "line": 6461,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6666,
+      "line": 6688,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6756,
+      "line": 6778,
       "text": "let mut imported_by: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6757,
+      "line": 6779,
       "text": "let mut uncertain_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 6970,
+      "line": 6992,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7198,
+      "line": 7220,
       "text": "let mut parse_error_keys = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7200,
+      "line": 7222,
       "text": "let mut skipped_file_keys = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7315,
+      "line": 7337,
       "text": "same_file_value_references: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7316,
+      "line": 7338,
       "text": "used_import_bindings: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7317,
+      "line": 7339,
       "text": "type_referenced_import_bindings: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7318,
+      "line": 7340,
       "text": "value_referenced_import_bindings: BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7341,
+      "line": 7363,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7436,
+      "line": 7458,
       "text": "fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<String>) {"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7651,
+      "line": 7673,
       "text": ".max_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7756,
+      "line": 7778,
       "text": "let mut by_file = BTreeMap::<String, Vec<(u64, u64)>>::new();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 7783,
+      "line": 7805,
       "text": "intervals.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 10731,
+      "line": 10753,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 10781,
+      "line": 10803,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 10790,
+      "line": 10812,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11408,
+      "line": 11430,
       "text": "files: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11409,
+      "line": 11431,
       "text": "exported_symbols: BTreeSet<(PathBuf, String, String, u32)>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11410,
+      "line": 11432,
       "text": "outbound_calls: BTreeSet<(PathBuf, String, String, u32)>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11411,
+      "line": 11433,
       "text": "entry_points: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11412,
+      "line": 11434,
       "text": "entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11871,
+      "line": 11893,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11903,
+      "line": 11925,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12021,
+      "line": 12043,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12034,
+      "line": 12056,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12544,
+      "line": 12566,
       "text": "entry_points: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12545,
+      "line": 12567,
       "text": "entry_point_symbols: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12596,
+      "line": 12618,
       "text": "entry_points: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12597,
+      "line": 12619,
       "text": "entry_point_symbols: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12707,
+      "line": 12729,
       "text": "entry_points: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12708,
+      "line": 12730,
       "text": "entry_point_symbols: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12866,
+      "line": 12888,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
@@ -12647,77 +12687,77 @@
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1129,
+      "line": 1133,
       "text": "retained.sort_unstable_by(|a, b| b.cmp(a));"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1164,
+      "line": 1168,
       "text": "pub(crate) reports: BTreeMap<PathBuf, Vec<StoredDiagnostic>>,"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1189,
+      "line": 1193,
       "text": "reports: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1442,
+      "line": 1446,
       "text": "reports: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1552,
+      "line": 1556,
       "text": "current.extra_env_keys.sort();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1553,
+      "line": 1557,
       "text": "current.extra_env_keys.dedup();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1554,
+      "line": 1558,
       "text": "current.extra_inputs.sort();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1555,
+      "line": 1559,
       "text": "current.extra_inputs.dedup();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1706,
+      "line": 1710,
       "text": ") -> Result<(BTreeMap<PathBuf, Vec<StoredDiagnostic>>, bool), String> {"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1715,
+      "line": 1719,
       "text": "let mut reports = BTreeMap::<PathBuf, Vec<StoredDiagnostic>>::new();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1816,
+      "line": 1820,
       "text": "diagnostics: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 1964,
+      "line": 1968,
       "text": "let legacy_files: BTreeMap<_, _> = record"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 2014,
+      "line": 2018,
       "text": "inputs.sort();"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 2044,
+      "line": 2048,
       "text": "diagnostics: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/lsp/completed_rust_check.rs",
-      "line": 2503,
+      "line": 2507,
       "text": "diagnostics: BTreeMap::new(),"
     },
     {
@@ -12802,37 +12842,37 @@
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 4964,
+      "line": 5006,
       "text": "expected.sort_by(|(left, _), (right, _)| server_key_sort(left, right));"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 4984,
+      "line": 5026,
       "text": "diagnostics.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 6136,
+      "line": 6178,
       "text": "notes.sort();"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 6137,
+      "line": 6179,
       "text": "notes.dedup();"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 6407,
+      "line": 6449,
       "text": ".collect::<std::collections::BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 7449,
+      "line": 7491,
       "text": ".max_by_key(|(modified, _)| *modified)"
     },
     {
       "path": "crates/aft/src/lsp/manager.rs",
-      "line": 8961,
+      "line": 9003,
       "text": "oldest: std::collections::BTreeMap<(Instant, u64), PathBuf>,"
     },
     {
@@ -15497,12 +15537,12 @@
     },
     {
       "path": "crates/aft/src/subc/diagnostics_findings.rs",
-      "line": 498,
+      "line": 510,
       "text": "result.findings.sort_by(|a, b| {"
     },
     {
       "path": "crates/aft/src/subc/diagnostics_findings.rs",
-      "line": 633,
+      "line": 681,
       "text": "Some(std::collections::BTreeMap::from([("
     },
     {
@@ -15547,37 +15587,37 @@
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3376,
+      "line": 3380,
       "text": "steps: std::collections::BTreeMap<&'static str, (Duration, u64)>,"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3480,
+      "line": 3484,
       "text": ") -> std::collections::BTreeMap<std::path::PathBuf, &'static str> {"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3526,
+      "line": 3530,
       "text": "let mut memory_roots = std::collections::BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3527,
+      "line": 3531,
       "text": "let mut census_roots = std::collections::BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3528,
+      "line": 3532,
       "text": "let mut census_ages = std::collections::BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3728,
+      "line": 3737,
       "text": "candidates.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 3866,
+      "line": 3875,
       "text": "let mut cache_roots = std::collections::BTreeSet::new();"
     },
     {
@@ -15592,37 +15632,37 @@
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 4523,
+      "line": 4550,
       "text": ".collect::<std::collections::BTreeMap<_, _>>(),"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 6395,
+      "line": 6465,
       "text": "samples.sort_unstable();"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 7455,
+      "line": 7525,
       "text": "std::collections::BTreeMap::from([(\"/rollup-shape\".to_string(), rollup)]),"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 8987,
+      "line": 9057,
       "text": "kept_by_reason: std::collections::BTreeMap::from([("
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 8997,
+      "line": 9067,
       "text": ".collect::<std::collections::BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 9971,
+      "line": 10041,
       "text": "snapshots.sort_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()));"
     },
     {
       "path": "crates/aft/src/subc/health.rs",
-      "line": 9983,
+      "line": 10053,
       "text": "let mut entries = std::collections::BTreeMap::new();"
     },
     {
@@ -15712,42 +15752,42 @@
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "line": 1677,
+      "line": 1680,
       "text": "missing.sort();"
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "line": 1678,
+      "line": 1681,
       "text": "missing.dedup();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 1922,
+      "line": 1923,
       "text": "roots.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 17409,
+      "line": 17378,
       "text": "ended.sort_by_key(|(_, corr)| *corr);"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 21567,
+      "line": 21538,
       "text": "watcher_offsets.sort();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 23212,
+      "line": 23183,
       "text": "ready_after.sort();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 23246,
+      "line": 23217,
       "text": "busy.sort();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 24733,
+      "line": 24704,
       "text": "body.find(\".min_by(\").unwrap() < body.find(\"ctx.config().as_ref().clone()\").unwrap()"
     },
     {
@@ -15792,7 +15832,7 @@
     },
     {
       "path": "crates/aft/src/subc/persistence.rs",
-      "line": 1200,
+      "line": 1201,
       "text": "resumed.sort_unstable();"
     },
     {
@@ -15812,7 +15852,7 @@
     },
     {
       "path": "crates/aft/src/subc/push.rs",
-      "line": 2432,
+      "line": 2433,
       "text": "batch.sort_by_key(|(order, _, _)| *order);"
     },
     {
@@ -15826,74 +15866,34 @@
       "text": "let Ok(image) = serde_json::from_str::<std::collections::BTreeMap<String, &RawValue>>("
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/builder/tests.rs",
-      "line": 80,
-      "text": "pins.sort();"
+      "path": "crates/aft/src/subc/rich_ui/display.rs",
+      "line": 293,
+      "text": "changes.sort_by(|a, b| a.path.cmp(&b.path));"
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/builder/tests.rs",
-      "line": 81,
-      "text": "pins.dedup();"
+      "path": "crates/aft/src/subc/rich_ui/display.rs",
+      "line": 1009,
+      "text": "claimants.sort();"
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/builder/tests.rs",
-      "line": 486,
-      "text": "actual.sort_by(|a, b| a[\"key\"].as_str().cmp(&b[\"key\"].as_str()));"
+      "path": "crates/aft/src/subc/rich_ui/display.rs",
+      "line": 1010,
+      "text": "claimants.dedup();"
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/builder/tests.rs",
-      "line": 487,
-      "text": "expected.sort_by(|a, b| a[\"key\"].as_str().cmp(&b[\"key\"].as_str()));"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 94,
-      "text": "pins.sort_by(|a, b| a.as_str().cmp(&b.as_str()));"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 95,
-      "text": "pins.dedup();"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 103,
-      "text": "operations.sort_by(|a, b| {"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 109,
-      "text": "views.sort_by(|a, b| a[\"tool\"].as_str().cmp(&b[\"tool\"].as_str()));"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 110,
-      "text": "templates.sort_by(|a, b| a.digest.cmp(&b.digest));"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder.rs",
-      "line": 139,
-      "text": "reads.sort_by(|a, b| {"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/canonical.rs",
-      "line": 170,
-      "text": "names.sort_by(|left, right| compare_utf16(left, right));"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/chunks/route_tests.rs",
-      "line": 5,
+      "path": "crates/aft/src/subc/rich_ui/records.rs",
+      "line": 3,
       "text": "use std::collections::BTreeMap;"
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/chunks/route_tests.rs",
-      "line": 156,
-      "text": ".then(|| BTreeMap::from([(\"tool-provider\".to_string(), \"v1\".to_string())])),"
+      "path": "crates/aft/src/subc/rich_ui/records.rs",
+      "line": 15,
+      "text": "BTreeMap::from(["
     },
     {
-      "path": "crates/aft/src/subc/rich_ui/chunks/tests.rs",
-      "line": 80,
-      "text": "fields.sort_unstable();"
+      "path": "crates/aft/src/subc/rich_ui/records.rs",
+      "line": 30,
+      "text": "let mut fields = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc/rich_ui/schema.rs",
@@ -15962,157 +15962,177 @@
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 891,
+      "line": 896,
       "text": "found.sort_by_key(|reference| reference.start);"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 1395,
+      "line": 1400,
       "text": ".min_by_key(|(_, state)| state.last_logged_at)"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3637,
+      "line": 3674,
       "text": "use std::collections::BTreeSet;"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3791,
+      "line": 3851,
       "text": "served.sort();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3792,
+      "line": 3852,
       "text": "served.dedup();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3807,
+      "line": 3867,
       "text": "let mut names: BTreeSet<String> = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3841,
+      "line": 3901,
       "text": "route_role(Some(&BTreeMap::from([(\"other-role\".into(), \"v2\".into())]))).unwrap(),"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3845,
+      "line": 3905,
       "text": "let versions = BTreeMap::from([(\"tool-provider\".into(), version.into())]);"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3856,
+      "line": 3916,
       "text": "serde_json::from_value::<BTreeMap<String, String>>(json!({\"tool-provider\": 1}))"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3863,
+      "line": 3923,
       "text": "let expected: BTreeSet<_> = METADATA.iter().map(|(name, _, _)| *name).collect();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 3897,
+      "line": 3957,
       "text": ".collect::<BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4055,
+      "line": 4115,
       "text": "let mut presets_seen = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4068,
+      "line": 4128,
       "text": "let every: BTreeSet<String> = CatalogPreset::ALL"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4384,
+      "line": 4444,
       "text": "served.sort();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4401,
+      "line": 4461,
       "text": "let served: BTreeSet<String> = names(&reader).into_iter().collect();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4402,
+      "line": 4462,
       "text": "let expected: BTreeSet<String> ="
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 4639,
+      "line": 4699,
       "text": "let mut seen = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 5963,
+      "line": 6057,
       "text": "let names: std::collections::BTreeSet<_> = catalog[\"tools\"]"
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 5969,
+      "line": 6063,
       "text": "let expected: std::collections::BTreeSet<_> = ["
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
-      "line": 5983,
+      "line": 6077,
       "text": "let text_names: std::collections::BTreeSet<_> = catalog[\"system_text\"][\"tool_names\"]"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1083,
+      "line": 1316,
       "text": "std::collections::BTreeSet::from([first.header.corr, attached.header.corr]),"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1084,
+      "line": 1317,
       "text": "std::collections::BTreeSet::from([7, 10])"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1241,
+      "line": 1474,
       "text": "std::collections::BTreeSet::from([first.header.corr, attached.header.corr]),"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1242,
+      "line": 1475,
       "text": "std::collections::BTreeSet::from([7, 10])"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1598,
+      "line": 1832,
       "text": "fn fixture_descriptor_targets() -> std::collections::BTreeMap<String, usize> {"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1599,
+      "line": 1833,
       "text": "let mut targets = std::collections::BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1740,
+      "line": 1974,
       "text": "threads.sort();"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1753,
+      "line": 1987,
       "text": "static CODES: std::cell::RefCell<std::collections::BTreeSet<String>> = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1922,
+      "line": 2156,
       "text": "fixtures.sort();"
     },
     {
       "path": "crates/aft/src/subc/tool_result_tests.rs",
-      "line": 1923,
+      "line": 2157,
       "text": "let mut covered = std::collections::BTreeSet::new();"
     },
     {
+      "path": "crates/aft/src/subc/tool_views.rs",
+      "line": 5,
+      "text": "use std::collections::BTreeMap;"
+    },
+    {
+      "path": "crates/aft/src/subc/tool_views.rs",
+      "line": 25,
+      "text": "pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|| {"
+    },
+    {
+      "path": "crates/aft/src/subc/tool_views.rs",
+      "line": 26,
+      "text": "let shipped: BTreeMap<String, Shipped> ="
+    },
+    {
+      "path": "crates/aft/src/subc/tool_views.rs",
+      "line": 91,
+      "text": "let baseline: BTreeMap<String, Shipped> = serde_json::from_str(include_str!("
+    },
+    {
       "path": "crates/aft/src/subc/wire.rs",
-      "line": 2258,
+      "line": 2437,
       "text": "samples.sort_unstable();"
     },
     {
@@ -16127,22 +16147,22 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 1465,
+      "line": 1463,
       "text": ".collect::<std::collections::BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 1946,
+      "line": 1944,
       "text": ".collect::<std::collections::BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 3739,
+      "line": 3742,
       "text": "let mut by_symbol_provenance: BTreeMap<String, Vec<i64>> = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 3761,
+      "line": 3764,
       "text": "line_nums.sort_unstable();"
     },
     {
@@ -16239,6 +16259,21 @@
       "path": "crates/aft/src/test_allocations.rs",
       "line": 141,
       "text": "pub(crate) static STEPS: RefCell<Option<BTreeMap<&'static str, (u64, usize, usize)>>> = const { RefCell::new(None) };"
+    },
+    {
+      "path": "crates/aft/src/tool_output.rs",
+      "line": 758,
+      "text": ".max_by_key(|(start, _)| *start)"
+    },
+    {
+      "path": "crates/aft/src/tool_output.rs",
+      "line": 1465,
+      "text": "let shown: std::collections::BTreeSet<usize> = text"
+    },
+    {
+      "path": "crates/aft/src/tool_output.rs",
+      "line": 1494,
+      "text": ".collect::<std::collections::BTreeSet<_>>(),"
     },
     {
       "path": "crates/aft/src/url_fetch.rs",
@@ -16562,12 +16597,12 @@
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1617,
+      "line": 1684,
       "text": "_: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1629,
+      "line": 1696,
       "text": "_: &BTreeMap<RelPath, super::super::snapshot::LiveEntry>,"
     },
     {
@@ -16797,152 +16832,152 @@
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2292,
+      "line": 2293,
       "text": "coverage: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2296,
+      "line": 2297,
       "text": "uncertain_paths: std::collections::BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2525,
+      "line": 2526,
       "text": "let pending: std::collections::BTreeSet<_> = installed.pending_intent().cloned().collect();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2599,
+      "line": 2600,
       "text": "let mut candidates = std::collections::BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2639,
+      "line": 2640,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2644,
+      "line": 2645,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2649,
+      "line": 2650,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 2820,
+      "line": 2821,
       "text": "let mut keys = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 3136,
+      "line": 3137,
       "text": "let mut changed = std::collections::BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 3384,
+      "line": 3389,
       "text": "let mut gaps = std::collections::BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 3445,
+      "line": 3450,
       "text": "paths.sort();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 3446,
+      "line": 3451,
       "text": "paths.dedup();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 3495,
+      "line": 3500,
       "text": "_observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 4714,
+      "line": 4719,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 4892,
+      "line": 4897,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5029,
+      "line": 5034,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5391,
+      "line": 5396,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5487,
+      "line": 5492,
       "text": "let observed = BTreeMap::from([(file.clone(), other)]);"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5761,
+      "line": 5766,
       "text": "candidates: &std::collections::BTreeSet<std::path::PathBuf>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5897,
+      "line": 5902,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5927,
+      "line": 5932,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 6573,
+      "line": 6578,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 6674,
+      "line": 6679,
       "text": "_: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7018,
+      "line": 7023,
       "text": "BTreeMap::from(["
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7025,
+      "line": 7030,
       "text": "std::collections::BTreeSet::from([std::fs::canonicalize(root.path())"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7193,
+      "line": 7198,
       "text": "&BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7287,
+      "line": 7292,
       "text": "&BTreeMap::from([(path.clone(), entry)]),"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7301,
+      "line": 7306,
       "text": "fn legacy_inventory(storage: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7305,
+      "line": 7310,
       "text": "files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7325,
+      "line": 7330,
       "text": "let mut files = BTreeMap::new();"
     },
     {
@@ -17817,148 +17852,153 @@
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 365,
+      "line": 371,
       "text": "reads: RefCell<BTreeMap<String, usize>>,"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 397,
+      "line": 403,
       "text": "let empty = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 398,
+      "line": 404,
       "text": "let cached = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 731,
+      "line": 735,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 868,
+      "line": 872,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 940,
+      "line": 944,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 993,
+      "line": 997,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1008,
+      "line": 1012,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1097,
+      "line": 1101,
       "text": "let cold = join::join_selected_manifest(&f.base, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1108,
+      "line": 1112,
       "text": "let selected = BTreeSet::from(["
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1369,
+      "line": 1373,
       "text": "let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1519,
+      "line": 1523,
       "text": "let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1520,
+      "line": 1524,
       "text": "let selected = BTreeSet::from([\"caller.ts\".to_string()]);"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1558,
+      "line": 1562,
       "text": ".collect::<rusqlite::Result<BTreeMap<_, _>>>()"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1561,
+      "line": 1565,
       "text": "let mut frames = BTreeMap::<String, usize>::new();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1580,
+      "line": 1584,
       "text": ".collect::<BTreeMap<_, _>>()"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1629,
+      "line": 1633,
       "text": "let selected = BTreeSet::from([\"caller.ts\".into(), \"target.ts\".into()]);"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1630,
+      "line": 1634,
       "text": "let changed = BTreeSet::from([\"target.ts\".into()]);"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1637,
+      "line": 1641,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1638,
+      "line": 1642,
       "text": "&BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1678,
+      "line": 1682,
       "text": "let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1702,
+      "line": 1706,
       "text": "let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1723,
+      "line": 1727,
       "text": "let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1757,
+      "line": 1761,
       "text": "files: BTreeMap<String, String>,"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1764,
+      "line": 1768,
       "text": "let mut files = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 34,
+      "line": 36,
       "text": "use std::collections::BTreeSet;"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 118,
+      "line": 120,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 150,
+      "line": 151,
       "text": "changed_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 204,
+      "line": 215,
       "text": "let mut replaced = std::collections::BTreeMap::new();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/update_bench.rs",
+      "line": 445,
+      "text": "let mut expected_by_manifest = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
@@ -17967,98 +18007,113 @@
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 449,
+      "line": 436,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 470,
+      "line": 457,
       "text": "let mut fact_invalidated = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 511,
+      "line": 491,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 553,
+      "line": 533,
       "text": "BTreeMap::new()"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 581,
+      "line": 561,
       "text": "let mut existing_binding_paths = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 582,
+      "line": 562,
       "text": "let mut existing_surface_paths = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 653,
+      "line": 633,
       "text": "let mut parsed = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 655,
+      "line": 635,
       "text": "let mut loaded_paths = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 864,
+      "line": 844,
       "text": "let changed_strings = changed.as_ref().map_or_else(BTreeSet::new, |paths| {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 870,
+      "line": 850,
       "text": "let mut membership_changed = base.map_or_else(BTreeSet::new, |base| {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 897,
+      "line": 877,
       "text": "let type_target_traces = |seeds: &BTreeSet<String>| {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 967,
+      "line": 947,
       "text": "let empty = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 999,
+      "line": 979,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1008,
+      "line": 988,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1147,
+      "line": 1127,
       "text": "let mut rewritten_ref_files = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1746,
+      "line": 1726,
       "text": "fn existing_changed_paths(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1753,
+      "line": 1733,
       "text": ".collect::<std::result::Result<BTreeSet<_>, _>>()?;"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1759,
+      "line": 1739,
       "text": ") -> Result<BTreeMap<String, join::ViewBindingDependencies>> {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1773,
+      "line": 1753,
       "text": ".collect::<Result<BTreeMap<_, _>>>()?;"
+    },
+    {
+      "path": "crates/aft/src/views/materialization.rs",
+      "line": 1764,
+      "text": ") -> Result<BTreeMap<String, join::ViewBindingDependencies>> {"
+    },
+    {
+      "path": "crates/aft/src/views/materialization.rs",
+      "line": 1782,
+      "text": "selected: &BTreeSet<String>,"
+    },
+    {
+      "path": "crates/aft/src/views/materialization.rs",
+      "line": 1783,
+      "text": "changed: &BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
@@ -18067,52 +18122,37 @@
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1802,
-      "text": "selected: &BTreeSet<String>,"
-    },
-    {
-      "path": "crates/aft/src/views/materialization.rs",
-      "line": 1803,
+      "line": 1841,
       "text": "changed: &BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1804,
-      "text": ") -> Result<BTreeMap<String, join::ViewBindingDependencies>> {"
-    },
-    {
-      "path": "crates/aft/src/views/materialization.rs",
-      "line": 1861,
-      "text": "changed: &BTreeSet<Vec<u8>>,"
-    },
-    {
-      "path": "crates/aft/src/views/materialization.rs",
-      "line": 1863,
+      "line": 1843,
       "text": ") -> Result<(BTreeSet<String>, usize)> {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1878,
+      "line": 1858,
       "text": "let closure = || -> Result<BTreeSet<String>> {"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1891,
+      "line": 1871,
       "text": "rows.collect::<std::result::Result<BTreeSet<_>, _>>()"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1919,
+      "line": 1899,
       "text": "changed: &BTreeSet<Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 2164,
+      "line": 2148,
       "text": "loaded: &mut BTreeSet<String>,"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 2165,
+      "line": 2149,
       "text": "parsed: &mut BTreeMap<String, EmissionParse>,"
     },
     {
@@ -18172,17 +18212,17 @@
     },
     {
       "path": "crates/aft/src/views/parent/worker.rs",
-      "line": 394,
+      "line": 395,
       "text": "fn apply_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {"
     },
     {
       "path": "crates/aft/src/views/parent/worker.rs",
-      "line": 444,
+      "line": 445,
       "text": "let mut changed = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/parent/worker.rs",
-      "line": 472,
+      "line": 473,
       "text": "fn apply_walked_paths(child: &Arc<Child>, paths: BTreeSet<PathBuf>) {"
     },
     {
@@ -18213,26 +18253,36 @@
     {
       "path": "crates/aft/src/views/parent.rs",
       "line": 592,
+      "text": "std::collections::BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,"
+    },
+    {
+      "path": "crates/aft/src/views/parent.rs",
+      "line": 594,
       "text": "by_cause: std::collections::BTreeMap<String, u64>,"
     },
     {
       "path": "crates/aft/src/views/parent.rs",
-      "line": 607,
+      "line": 609,
       "text": "std::collections::BTreeMap<String, u64>,"
     },
     {
       "path": "crates/aft/src/views/parent.rs",
-      "line": 903,
+      "line": 611,
+      "text": "std::collections::BTreeMap<String, crate::view_storage_reserve::DiskReserveCondition>,"
+    },
+    {
+      "path": "crates/aft/src/views/parent.rs",
+      "line": 926,
       "text": "pending: Mutex<BTreeSet<PathBuf>>,"
     },
     {
       "path": "crates/aft/src/views/parent.rs",
-      "line": 928,
+      "line": 951,
       "text": "pending: Mutex::new(BTreeSet::new()),"
     },
     {
       "path": "crates/aft/src/views/parent.rs",
-      "line": 1188,
+      "line": 1230,
       "text": ".max_by_key(|child| child.root.components().count())"
     },
     {
@@ -18502,77 +18552,77 @@
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 1641,
+      "line": 1642,
       "text": "let mut by_path = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2106,
+      "line": 2107,
       "text": "&BTreeMap::from([("
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2342,
+      "line": 2343,
       "text": "let mut indices = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2668,
+      "line": 2669,
       "text": "members: &BTreeMap<RelPath, DiskState>,"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2709,
+      "line": 2710,
       "text": "fn walked_members(root: &Path) -> BTreeSet<RelPath> {"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2786,
+      "line": 2787,
       "text": "let mut pending = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2787,
+      "line": 2788,
       "text": "let mut failed = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2798,
+      "line": 2799,
       "text": "let intent = snapshot.pending_intent().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 2858,
+      "line": 2859,
       "text": "sorted_tombstones.sort();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 3266,
+      "line": 3267,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 3287,
+      "line": 3288,
       "text": "observed: &BTreeMap<RelPath, LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 4165,
+      "line": 4166,
       "text": ".collect::<BTreeMap<_, _>>()"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 5877,
+      "line": 5878,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 5880,
+      "line": 5881,
       "text": "BTreeSet::from(["
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 5983,
+      "line": 6037,
       "text": "let mut payloads = BTreeMap::new();"
     },
     {
@@ -18612,22 +18662,22 @@
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 2526,
+      "line": 2533,
       "text": "assert_eq!(source_reads, BTreeMap::from([(canonical_path, 1)]));"
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 3492,
+      "line": 3499,
       "text": "waits.sort();"
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 3545,
+      "line": 3552,
       "text": "BTreeMap::from([(canonical_path, 1)]),"
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 5101,
+      "line": 5116,
       "text": "found.sort();"
     },
     {
@@ -18847,17 +18897,17 @@
     },
     {
       "path": "crates/aft/src/views/tree_base.rs",
-      "line": 389,
+      "line": 397,
       "text": "mut evidence: BTreeMap<RelPath, Evidence>,"
     },
     {
       "path": "crates/aft/src/views/tree_base.rs",
-      "line": 393,
+      "line": 401,
       "text": ") -> (BTreeMap<RelPath, Evidence>, BTreeSet<RelPath>) {"
     },
     {
       "path": "crates/aft/src/views/tree_base.rs",
-      "line": 394,
+      "line": 402,
       "text": "let mut from_receipts = BTreeSet::new();"
     },
     {
@@ -18867,142 +18917,142 @@
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 611,
+      "line": 613,
       "text": "snapshots: std::sync::Mutex<BTreeMap<[u8; 32], (Snapshot, super::base_builder::BuildClaim)>>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 707,
+      "line": 709,
       "text": "overlay: BTreeMap<RelPath, Option<Arc<Attachment>>>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 725,
+      "line": 727,
       "text": "let mut payloads = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 730,
+      "line": 732,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 760,
+      "line": 762,
       "text": "payloads: &BTreeMap<ContentHash, TrigramPayload>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 768,
+      "line": 770,
       "text": "let mut overlay = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 773,
+      "line": 775,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 814,
+      "line": 816,
       "text": "members: &BTreeSet<RelPath>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 820,
+      "line": 822,
       "text": "let intents = snapshot.pending_intent().cloned().collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 824,
+      "line": 826,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 833,
+      "line": 835,
       "text": ".collect::<BTreeSet<_>>()"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 914,
+      "line": 916,
       "text": "(walk.entries.into_keys().collect::<BTreeSet<_>>(), walk.gaps)"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 920,
+      "line": 922,
       "text": "indexed: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 958,
+      "line": 960,
       "text": "result.gaps.sort();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 959,
+      "line": 961,
       "text": "result.gaps.dedup();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1009,
+      "line": 1011,
       "text": "pub indexed: BTreeSet<RelPath>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1010,
+      "line": 1012,
       "text": "pub direct: BTreeSet<RelPath>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1022,
+      "line": 1024,
       "text": "pub membership: BTreeSet<RelPath>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1249,
+      "line": 1251,
       "text": "gaps.sort();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1250,
+      "line": 1252,
       "text": "gaps.dedup();"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1270,
+      "line": 1272,
       "text": "observed: &BTreeMap<RelPath, super::snapshot::LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1386,
+      "line": 1388,
       "text": "bytes: &BTreeMap<RelPath, Vec<u8>>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1450,
+      "line": 1452,
       "text": "observed: &BTreeMap<RelPath, super::snapshot::LiveEntry>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1524,
+      "line": 1526,
       "text": "type Residents = BTreeMap<(String, String), Arc<GenerationIndex>>;"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1546,
+      "line": 1548,
       "text": "segments: std::sync::Mutex<BTreeMap<(String, [u8; 32]), std::sync::Weak<SegmentReader>>>,"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1587,
+      "line": 1589,
       "text": "residents: std::sync::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 1588,
+      "line": 1590,
       "text": "segments: std::sync::Mutex::new(BTreeMap::new()),"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 2234,
+      "line": 2236,
       "text": "membership: BTreeSet::new(),"
     },
     {
@@ -19037,72 +19087,77 @@
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 548,
+      "line": 607,
       "text": "let mut located = BTreeMap::<Vec<u8>, Vec<u8>>::new();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 777,
+      "line": 859,
       "text": "paths.sort();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 938,
+      "line": 1020,
       "text": "records: &BTreeMap<RelPath, Evidence>,"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1008,
+      "line": 1090,
       "text": ") -> Option<BTreeMap<RelPath, Evidence>> {"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1044,
+      "line": 1126,
       "text": "let mut result = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1090,
+      "line": 1172,
       "text": "pub receipts: BTreeMap<RelPath, BlobReceipt>,"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1125,
+      "line": 1207,
       "text": "let mut encoded = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1268,
+      "line": 1350,
       "text": "let mut receipts = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1302,
+      "line": 1384,
       "text": ") -> Option<BTreeMap<RelPath, Evidence>> {"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1337,
+      "line": 1419,
       "text": "let index: BTreeMap<&[u8], &crate::git_index_reader::IndexEntry> = snapshot"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1342,
+      "line": 1424,
       "text": "let mut candidates = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1381,
+      "line": 1463,
       "text": "keys: BTreeMap::new(),"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1661,
+      "line": 1719,
+      "text": "let mut fingerprints = std::collections::BTreeSet::new();"
+    },
+    {
+      "path": "crates/aft/src/views/verification.rs",
+      "line": 1868,
       "text": "keys: BTreeMap::from([(\"Trigram\".into(), \"ab\".repeat(32))]),"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1667,
+      "line": 1874,
       "text": "&BTreeMap::from([(path.clone(), record.clone())]),"
     },
     {
@@ -19427,227 +19482,227 @@
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 356,
+      "line": 362,
       "text": "head_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 357,
+      "line": 363,
       "text": "external_ignore_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 362,
+      "line": 368,
       "text": "fn add_spellings(paths: &mut BTreeSet<PathBuf>, path: &Path) {"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 368,
+      "line": 374,
       "text": "let mut external_ignore_paths = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 375,
+      "line": 381,
       "text": "let mut head_paths = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 638,
+      "line": 644,
       "text": "external: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 647,
+      "line": 653,
       "text": "external: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 760,
+      "line": 766,
       "text": "let mut cache = BTreeMap::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 767,
+      "line": 773,
       "text": "let mut seen = BTreeSet::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 779,
+      "line": 785,
       "text": ".min_by_key(|excluded| excluded.components().count())"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 992,
+      "line": 998,
       "text": "cache: &mut BTreeMap<PathBuf, ExclusionPathKind>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1583,
+      "line": 1589,
       "text": "fn admit(candidates: &mut BTreeMap<PathBuf, Candidate>, candidate: Candidate) {"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1632,
+      "line": 1638,
       "text": ".collect::<BTreeMap<_, _>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1634,
+      "line": 1640,
       "text": "let mut candidates = BTreeMap::<PathBuf, Candidate>::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1893,
+      "line": 1899,
       "text": "let mut ecosystem_representatives = BTreeMap::<usize, usize>::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1943,
+      "line": 1949,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1947,
+      "line": 1953,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 1963,
+      "line": 1969,
       "text": "candidates.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2199,
+      "line": 2205,
       "text": "pub changed: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2201,
+      "line": 2207,
       "text": "pub ignore_file_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2207,
+      "line": 2213,
       "text": "raw_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2229,
+      "line": 2235,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2279,
+      "line": 2285,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2341,
+      "line": 2347,
       "text": "raw_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2342,
+      "line": 2348,
       "text": "content_only_paths: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2380,
+      "line": 2386,
       "text": "raw_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2381,
+      "line": 2387,
       "text": "content_only_paths: BTreeSet::new(),"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2610,
+      "line": 2653,
       "text": "let mut counts = BTreeMap::<String, u64>::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2635,
+      "line": 2678,
       "text": "prefixes.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2651,
+      "line": 2694,
       "text": "let mut counts = BTreeMap::<String, u64>::new();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 2693,
+      "line": 2736,
       "text": "prefixes.sort_by(|left, right| {"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 3169,
+      "line": 3214,
       "text": "held.sort_unstable();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 3170,
+      "line": 3215,
       "text": "held.dedup();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 4563,
+      "line": 4761,
       "text": "let mut watched = BTreeSet::from([root.path().to_path_buf()]);"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 4670,
+      "line": 4868,
       "text": "let mut watched = BTreeSet::from([root.path().to_path_buf()]);"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 4733,
+      "line": 4931,
       "text": "watch_set: BTreeSet<PathBuf>,"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 5210,
+      "line": 5408,
       "text": ".collect::<BTreeSet<_>>();"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 6692,
+      "line": 6890,
       "text": "assert_eq!(filtered.changed, BTreeSet::from([head, resolved_ref]));"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 6782,
+      "line": 6980,
       "text": "BTreeSet::from([source.clone()]),"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 6879,
+      "line": 7077,
       "text": "assert_eq!(filtered.changed, BTreeSet::from([source.clone()]));"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 7126,
+      "line": 7324,
       "text": "BTreeSet::from([visible_path, root.join(\"src/.aftignore\")])"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 7133,
+      "line": 7331,
       "text": "BTreeSet::from([root.join(\".gitignore\")])"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 7143,
+      "line": 7341,
       "text": "assert_eq!(unknown.ignore_file_paths, BTreeSet::from([unknown_path]));"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 7173,
+      "line": 7371,
       "text": "BTreeSet::from([ignore_path.clone()])"
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 7193,
+      "line": 7391,
       "text": "assert_eq!(filtered.ignore_file_paths, BTreeSet::from([exclude]));"
     },
     {
@@ -19874,137 +19929,137 @@
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 7195,
+      "line": 7311,
       "text": "&& id.starts_with(b\"bash-\")"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 20013,
+      "line": 20147,
       "text": "let id = match name.split_once('.') {"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 21500,
+      "line": 21634,
       "text": "assert!(preview.contains(\"TAIL-SIGNAL\"), \"preview was {preview:?}\");"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 21501,
+      "line": 21635,
       "text": "assert!(!preview.contains(\"HEAD-SIGNAL\"), \"preview was {preview:?}\");"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 21541,
+      "line": 21675,
       "text": "assert!(preview.contains(\"HEAD-SIGNAL\"), \"preview was {preview:?}\");"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 21542,
+      "line": 21676,
       "text": "assert!(preview.contains(\"TAIL-SIGNAL\"), \"preview was {preview:?}\");"
     },
     {
       "path": "crates/aft/src/bash_background/registry.rs",
-      "line": 21587,
+      "line": 21721,
       "text": "assert!(refusal.contains(&id), \"{refusal}\");"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2206,
+      "line": 2235,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2210,
+      "line": 2239,
       "text": "assert!(!done.output_preview.contains(\"local-proof\"));"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2428,
+      "line": 2457,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2432,
+      "line": 2461,
       "text": "assert!(!done.output_preview.contains(\"local-proof\"));"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2465,
+      "line": 2494,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2625,
+      "line": 2654,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2671,
+      "line": 2700,
       "text": ".starts_with(&format!(\"remote outcome unknown (job {})\", id())));"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2746,
+      "line": 2775,
       "text": "done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2755,
+      "line": 2784,
       "text": "reason.contains(&format!(\"job {} may still be running on ck-motor\", id())),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2879,
+      "line": 2909,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 2917,
+      "line": 2947,
       "text": "assert!(done.output_preview.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 3944,
+      "line": 3974,
       "text": "warning.contains(&format!(\"task_id={task_id} job_id={}\", id())),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 3963,
+      "line": 3993,
       "text": "successes[0].contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 6799,
+      "line": 6903,
       "text": "text.contains(&format!(\"remote outcome unknown (job {})\", id())),"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7010,
+      "line": 7114,
       "text": "accepted.contains(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 7575,
+      "line": 7687,
       "text": "assert!(!changed.contains(\"not reported by the runner\"), \"{changed}\");"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 8260,
+      "line": 8372,
       "text": "status.starts_with(&format!("
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 8275,
+      "line": 8387,
       "text": "assert!(status.starts_with(&header), \"{status}\");"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 14518,
+      "line": 15156,
       "text": "assert!(output.contains(report), \"{output}\");"
     },
     {
       "path": "crates/aft/src/bash_background/remote_tests.rs",
-      "line": 14521,
+      "line": 15159,
       "text": "assert!(header.contains(&format!(\"job {}\", id())), \"{output}\");"
     },
     {
@@ -20139,12 +20194,12 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 16633,
+      "line": 16639,
       "text": "let wildcard = statement.contains('*');"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 19885,
+      "line": 19891,
       "text": ".filter(|raw| selected.map_or(true, |ids| ids.contains(&raw.ref_id)))"
     },
     {
@@ -20164,7 +20219,7 @@
     },
     {
       "path": "crates/aft/src/commands/bash.rs",
-      "line": 2202,
+      "line": 2209,
       "text": ".contains(\"tasks: id TEXT, kind TEXT\"),"
     },
     {
@@ -20214,7 +20269,7 @@
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 1932,
+      "line": 1943,
       "text": "Err(detail) if detail.contains(\"inspect_request_timeout\") => {"
     },
     {
@@ -20224,12 +20279,12 @@
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2090,
+      "line": 2091,
       "text": "if !considered.contains(node_id)"
     },
     {
       "path": "crates/aft/src/commands/outline.rs",
-      "line": 2107,
+      "line": 2108,
       "text": "&& !considered.contains(node_id)"
     },
     {
@@ -20474,12 +20529,12 @@
     },
     {
       "path": "crates/aft/src/subc/bash.rs",
-      "line": 5160,
+      "line": 5077,
       "text": "assert!(!line.contains('\\n'), \"warning must fit one line: {line:?}\");"
     },
     {
       "path": "crates/aft/src/subc/bash.rs",
-      "line": 7281,
+      "line": 7198,
       "text": ".any(|notice| notice.contains(&task_id)),"
     },
     {
@@ -20514,23 +20569,18 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 19569,
+      "line": 19538,
       "text": "assert!(first.response.id.contains(\"configure-tail\"));"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 19570,
+      "line": 19539,
       "text": "assert!(second.response.id.contains(\"completion-drains\"));"
     },
     {
       "path": "crates/aft/src/subc/rich_ui/admission.rs",
-      "line": 134,
+      "line": 133,
       "text": "let (id, version) = encoded.split_once('@')?;"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/builder/tests.rs",
-      "line": 551,
-      "text": "|| (id == \"read\" && (form.starts_with(\"issue://\") || form.starts_with(\"pr://\"))));"
     },
     {
       "path": "crates/aft/src/subc/secret_consent.rs",
@@ -20539,7 +20589,7 @@
     },
     {
       "path": "crates/aft/src/subc/wire.rs",
-      "line": 1144,
+      "line": 1217,
       "text": "if LLM_RUNNER_PRINCIPALS.contains(&id.as_str())"
     },
     {
@@ -20554,7 +20604,7 @@
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1544,
+      "line": 1611,
       "text": ".contains(&format!(\"owner_pid: {}\", std::process::id())),"
     },
     {
@@ -20584,22 +20634,22 @@
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 896,
+      "line": 876,
       "text": "&& !membership_changed.contains(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN);"
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 1402,
+      "line": 1382,
       "text": "if !dispatch_reuse || changed_strings.contains(path) {"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 838,
+      "line": 840,
       "text": "if !members.contains(path)"
     },
     {
       "path": "crates/aft/src/views/trigram.rs",
-      "line": 857,
+      "line": 859,
       "text": ".is_none_or(|ids| ids.contains(&(id as u32)))"
     },
     {
@@ -20609,7 +20659,7 @@
     },
     {
       "path": "crates/aft/src/watcher_filter.rs",
-      "line": 6789,
+      "line": 6987,
       "text": "WatcherDispatchEvent::Paths(paths) => assert!(paths.contains(&source), \"{paths:?}\"),"
     }
   ],
@@ -20796,97 +20846,97 @@
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 457,
+      "line": 474,
       "text": "let derived = IdentityConnection::open("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 523,
+      "line": 540,
       "text": "let reader = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 566,
+      "line": 583,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 613,
+      "line": 630,
       "text": "let derived = IdentityConnection::open("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1067,
+      "line": 1084,
       "text": "let c = Connection::open(&path).unwrap();"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1119,
+      "line": 1136,
       "text": "Connection::open(&path)"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1154,
+      "line": 1171,
       "text": "Connection::open(&path)"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1621,
+      "line": 1671,
       "text": "Connection::open(&path)"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1658,
+      "line": 1708,
       "text": "Connection::open(&path).unwrap().execute_batch(sql).unwrap();"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1699,
+      "line": 1749,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 1765,
+      "line": 1815,
       "text": "Connection::open(&original)"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 2082,
+      "line": 2132,
       "text": "let connection = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 2157,
+      "line": 2207,
       "text": "let c = IdentityConnection::open(&path, \"v3-bootstrap-fixture\").unwrap();"
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 2246,
+      "line": 2296,
       "text": "let c = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/blob_store/v3/tests.rs",
-      "line": 2306,
+      "line": 2356,
       "text": "Connection::open(&path)"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 854,
+      "line": 984,
       "text": "let expected = Connection::open_in_memory()?;"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 926,
+      "line": 1058,
       "text": "IdentityConnection::open_with_flags(path, flags, \"views-v3\")?"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 929,
+      "line": 1061,
       "text": "let mut c = IdentityConnection::open_with_flags(path, flags, \"views-v3\")?;"
     },
     {
       "path": "crates/aft/src/blob_store/v3.rs",
-      "line": 1328,
+      "line": 1460,
       "text": "Self::open(storage, family, lock, false)"
     },
     {
@@ -21041,142 +21091,142 @@
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 12657,
+      "line": 12663,
       "text": "TrackedConnection::open(&temp_path, SqliteStore::CallgraphColdGeneration)?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13073,
+      "line": 13079,
       "text": "let conn = TrackedConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13085,
+      "line": 13091,
       "text": "let conn = TrackedConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13202,
+      "line": 13208,
       "text": "let conn = TrackedConnection::open(path, SqliteStore::CallgraphGeneration)?;"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 13225,
+      "line": 13231,
       "text": "let Ok(conn) = crate::db::lifecycle::TrackedConnection::open("
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25477,
+      "line": 25483,
       "text": "let mut conn = rusqlite::Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 25507,
+      "line": 25513,
       "text": "let conn = rusqlite::Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 27543,
+      "line": 27549,
       "text": "let conn = Connection::open(&sqlite_path).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 28150,
+      "line": 28156,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 28178,
+      "line": 28184,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 28301,
+      "line": 28307,
       "text": "Connection::open(&path)"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 28365,
+      "line": 28371,
       "text": "Connection::open(crate::db::lifecycle::sqlite_open_path(&path))"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 28993,
+      "line": 28999,
       "text": "let conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29180,
+      "line": 29186,
       "text": "let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29590,
+      "line": 29596,
       "text": "let staged = Connection::open(&staging).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29627,
+      "line": 29633,
       "text": "let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29666,
+      "line": 29672,
       "text": "let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29680,
+      "line": 29686,
       "text": "let next = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29697,
+      "line": 29703,
       "text": "TrackedConnection::open(&path, SqliteStore::CallgraphColdGeneration).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29752,
+      "line": 29758,
       "text": "let connection = TrackedConnection::open("
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 29841,
+      "line": 29847,
       "text": "let staged = Connection::open(&staging).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 30172,
+      "line": 30178,
       "text": "let staged = Connection::open(staging_path_for_test(&store_dir, &root)).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31269,
+      "line": 31275,
       "text": "let mut conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration)"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 31292,
+      "line": 31298,
       "text": "let mut conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration)"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 32460,
+      "line": 32466,
       "text": "let blobs = Connection::open(&blobs_path).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 32923,
+      "line": 32929,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35397,
+      "line": 35403,
       "text": "let conn = Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/callgraph_store/mod.rs",
-      "line": 35516,
+      "line": 35522,
       "text": "let attempt_id = Connection::open(&breaker_path)"
     },
     {
@@ -21256,27 +21306,27 @@
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 14635,
+      "line": 14657,
       "text": "let blocker = crate::db::file_identity::IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 17915,
+      "line": 17937,
       "text": "let lock = rusqlite::Connection::open(storage.join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 18012,
+      "line": 18034,
       "text": "let blocker = rusqlite::Connection::open(ledger).unwrap();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 23391,
+      "line": 23413,
       "text": "let conn = rusqlite::Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/commands/configure.rs",
-      "line": 23439,
+      "line": 23461,
       "text": "let conn = rusqlite::Connection::open(&database).unwrap();"
     },
     {
@@ -21286,7 +21336,7 @@
     },
     {
       "path": "crates/aft/src/commands/inspect.rs",
-      "line": 6134,
+      "line": 6145,
       "text": "let conn = rusqlite::Connection::open(database).unwrap();"
     },
     {
@@ -21321,47 +21371,47 @@
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 19570,
+      "line": 19702,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 20170,
+      "line": 20302,
       "text": "let conn = rusqlite::Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 20188,
+      "line": 20320,
       "text": "let conn = rusqlite::Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 20228,
+      "line": 20360,
       "text": "let conn = rusqlite::Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21204,
+      "line": 21336,
       "text": "rusqlite::Connection::open(ctx.callgraph_store_dir().join(\"build-breaker.sqlite\"))"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 21843,
+      "line": 21975,
       "text": "let holder = rusqlite::Connection::open(&path).expect(\"derived writer\");"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 24588,
+      "line": 24720,
       "text": "let conn = rusqlite::Connection::open(storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 24819,
+      "line": 24951,
       "text": "let conn = rusqlite::Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/context.rs",
-      "line": 25036,
+      "line": 25168,
       "text": "let conn = rusqlite::Connection::open(storage.path().join(\"aft.db\")).unwrap();"
     },
     {
@@ -21596,42 +21646,37 @@
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 549,
+      "line": 141,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 564,
+      "line": 156,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 583,
+      "line": 175,
       "text": "let mut conn = Connection::open(&path).unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 619,
+      "line": 211,
       "text": "let mut fresh = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 630,
+      "line": 222,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 696,
+      "line": 288,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
       "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 735,
-      "text": "let mut conn = Connection::open_in_memory().unwrap();"
-    },
-    {
-      "path": "crates/aft/src/db/rich_ui.rs",
-      "line": 760,
+      "line": 324,
       "text": "let mut conn = Connection::open_in_memory().unwrap();"
     },
     {
@@ -21751,57 +21796,57 @@
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 9527,
+      "line": 9549,
       "text": "let blocker = rusqlite::Connection::open(&sqlite_path).expect(\"open blocking connection\");"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 9719,
+      "line": 9741,
       "text": "let conn = rusqlite::Connection::open(&sqlite_path).expect(\"open store sqlite\");"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 9732,
+      "line": 9754,
       "text": "let conn = rusqlite::Connection::open(&sqlite_path).expect(\"reopen store sqlite\");"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 10550,
+      "line": 10572,
       "text": "let conn = rusqlite::Connection::open(cache.sqlite_path()).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11813,
+      "line": 11835,
       "text": "Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11814,
+      "line": 11836,
       "text": "let mut destination = Connection::open(&db).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11873,
+      "line": 11895,
       "text": "let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11905,
+      "line": 11927,
       "text": "let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11982,
+      "line": 12004,
       "text": "Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 11984,
+      "line": 12006,
       "text": "let mut destination = Connection::open(&inspect_db).unwrap();"
     },
     {
       "path": "crates/aft/src/inspect/manager.rs",
-      "line": 12873,
+      "line": 12895,
       "text": "let conn = rusqlite::Connection::open(store.sqlite_path()).expect(\"open write conn\");"
     },
     {
@@ -21946,43 +21991,33 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 21808,
+      "line": 21779,
       "text": "let lock = rusqlite::Connection::open(configured.storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 22038,
+      "line": 22009,
       "text": "let lock = rusqlite::Connection::open(configured.storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 22236,
+      "line": 22207,
       "text": "let lock = rusqlite::Connection::open(configured.storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 22404,
+      "line": 22375,
       "text": "let lock = rusqlite::Connection::open(configured.storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 23505,
+      "line": 23476,
       "text": "let lock = rusqlite::Connection::open(fixture.storage.path().join(\"aft.db\")).unwrap();"
     },
     {
       "path": "crates/aft/src/subc/remote_policy_tests.rs",
-      "line": 913,
+      "line": 914,
       "text": "let writer = rusqlite::Connection::open(storage.path().join(\"aft.db\")).unwrap();"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/chunks/tests.rs",
-      "line": 17,
-      "text": "let mut conn = Connection::open_in_memory().unwrap();"
-    },
-    {
-      "path": "crates/aft/src/subc/rich_ui/chunks/tests.rs",
-      "line": 245,
-      "text": "let unmigrated = Mutex::new(Box::new(Connection::open_in_memory().unwrap()));"
     },
     {
       "path": "crates/aft/src/views/assembly.rs",
@@ -22021,17 +22056,17 @@
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1340,
+      "line": 1407,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1388,
+      "line": 1455,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/views/callgraph.rs",
-      "line": 1443,
+      "line": 1510,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
@@ -22176,17 +22211,17 @@
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 5292,
+      "line": 5297,
       "text": "let deleted = rusqlite::Connection::open(store.path())"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 6642,
+      "line": 6647,
       "text": "rusqlite::Connection::open(path)"
     },
     {
       "path": "crates/aft/src/views/first_load.rs",
-      "line": 7475,
+      "line": 7480,
       "text": "let evidence = rusqlite::Connection::open(super::super::verification::evidence_path("
     },
     {
@@ -22511,57 +22546,57 @@
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 149,
+      "line": 160,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 164,
+      "line": 175,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 177,
+      "line": 188,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 190,
+      "line": 201,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 209,
+      "line": 220,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 262,
+      "line": 273,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 286,
+      "line": 297,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 294,
+      "line": 305,
       "text": "let db = Connection::open(&copy).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 336,
+      "line": 347,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 392,
+      "line": 403,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/fact_tests.rs",
-      "line": 406,
+      "line": 417,
       "text": "let bindings = load_bindings(&Connection::open(base).unwrap()).unwrap();"
     },
     {
@@ -22630,283 +22665,323 @@
       "text": "Connection::open(&actual)"
     },
     {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 142,
+      "text": "let connection = Connection::open(&f.blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 193,
+      "text": "let connection = Connection::open(&f.blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 216,
+      "text": "let connection = Connection::open(&f.blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 294,
+      "text": "let connection = Connection::open(&f.blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 351,
+      "text": "let connection = Connection::open(&f.blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 366,
+      "text": "let connection = Connection::open(&forward).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/reader_tests.rs",
+      "line": 372,
+      "text": "let connection = Connection::open(&reverse).unwrap();"
+    },
+    {
       "path": "crates/aft/src/views/materialization/tests.rs",
       "line": 24,
       "text": "let connection = Connection::open(store.path()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 117,
+      "line": 123,
       "text": "let conn = Connection::open(&blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 205,
+      "line": 211,
       "text": "let blobs = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 244,
+      "line": 250,
       "text": "let connection = Connection::open(&private).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 288,
+      "line": 294,
       "text": "crate::db::file_identity::IdentityConnection::open(&path, \"private-finish-policy-test\")"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 337,
+      "line": 343,
       "text": "let connection = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 377,
+      "line": 383,
       "text": "let connection = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 395,
+      "line": 401,
       "text": "let connection = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 416,
+      "line": 422,
       "text": "let connection = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 426,
+      "line": 432,
       "text": "drop(Connection::open(&unbatched).unwrap());"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 446,
+      "line": 450,
       "text": "Connection::open(&incremental)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 539,
+      "line": 543,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 603,
+      "line": 607,
       "text": "Connection::open(&copy)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 622,
+      "line": 626,
       "text": "Connection::open(&f.blobs)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 754,
+      "line": 758,
       "text": "let keeper = Connection::open(&db).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 959,
+      "line": 963,
       "text": "crate::db::file_identity::IdentityConnection::open(path, \"cutoff calibration keeper\")"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1068,
+      "line": 1072,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1094,
+      "line": 1098,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1128,
+      "line": 1132,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1202,
+      "line": 1206,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1247,
+      "line": 1251,
       "text": "let keeper = Connection::open(&db).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1268,
+      "line": 1272,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1288,
+      "line": 1292,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1341,
+      "line": 1345,
       "text": "let target: String = Connection::open(&db)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1357,
+      "line": 1361,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1380,
+      "line": 1384,
       "text": "Connection::open(&copy).unwrap().execute_batch("
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1394,
+      "line": 1398,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1429,
+      "line": 1433,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1459,
+      "line": 1463,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1533,
+      "line": 1537,
       "text": "let module: String = Connection::open(&db)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1546,
+      "line": 1550,
       "text": "let connection = Connection::open(db).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1587,
+      "line": 1591,
       "text": "let connection = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1611,
+      "line": 1615,
       "text": "let cache = load_bindings(&Connection::open(&db).unwrap()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1665,
+      "line": 1669,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1695,
+      "line": 1699,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 1713,
+      "line": 1717,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2172,
+      "line": 2176,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2311,
+      "line": 2315,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2429,
+      "line": 2433,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2477,
+      "line": 2481,
       "text": "let connection = Connection::open(&copy).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2519,
+      "line": 2523,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2597,
+      "line": 2601,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2619,
+      "line": 2623,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2635,
+      "line": 2639,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2658,
+      "line": 2662,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2675,
+      "line": 2679,
       "text": "let baseline: (usize, usize) = Connection::open(&legacy)"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2684,
+      "line": 2688,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2713,
+      "line": 2717,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2720,
+      "line": 2724,
       "text": "&Connection::open(&database).unwrap(),"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2727,
+      "line": 2731,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2772,
+      "line": 2776,
       "text": "let conn = Connection::open(&database).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/tests.rs",
-      "line": 2794,
+      "line": 2798,
       "text": "let conn = Connection::open(&f.blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 178,
+      "line": 189,
       "text": "let connection = Connection::open(&blobs).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 253,
+      "line": 330,
+      "text": "let connection = Connection::open(&blobs).unwrap();"
+    },
+    {
+      "path": "crates/aft/src/views/materialization/update_bench.rs",
+      "line": 335,
       "text": "let keeper = Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 323,
+      "line": 405,
       "text": "let connection = Connection::open(path).unwrap();"
     },
     {
       "path": "crates/aft/src/views/materialization/update_bench.rs",
-      "line": 423,
+      "line": 543,
       "text": "let mut connection = Connection::open(&db).unwrap();"
     },
     {
@@ -22916,7 +22991,7 @@
     },
     {
       "path": "crates/aft/src/views/materialization.rs",
-      "line": 331,
+      "line": 318,
       "text": "let mut connection = crate::db::file_identity::IdentityConnection::open_with_flags("
     },
     {
@@ -22946,17 +23021,17 @@
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 3726,
+      "line": 3727,
       "text": "rusqlite::Connection::open(store_path)"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 5096,
+      "line": 5097,
       "text": "let connection = rusqlite::Connection::open(store.path()).unwrap();"
     },
     {
       "path": "crates/aft/src/views/semantic.rs",
-      "line": 5965,
+      "line": 6019,
       "text": "let connection = rusqlite::Connection::open(path).unwrap();"
     },
     {
@@ -22996,12 +23071,12 @@
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 4660,
+      "line": 4675,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
       "path": "crates/aft/src/views/semantic_runtime_tests.rs",
-      "line": 4845,
+      "line": 4860,
       "text": "let blocker = IdentityConnection::open_with_flags("
     },
     {
@@ -23021,32 +23096,32 @@
     },
     {
       "path": "crates/aft/src/views/tree_base_tests.rs",
-      "line": 440,
+      "line": 478,
       "text": "let db = rusqlite::Connection::open(dir.join(TREE_PROOF_FILE)).unwrap();"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 956,
+      "line": 1038,
       "text": "let mut db = rusqlite::Connection::open(crate::db::lifecycle::sqlite_open_path(&staging))?;"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1009,
+      "line": 1091,
       "text": "let db = rusqlite::Connection::open_with_flags("
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1141,
+      "line": 1223,
       "text": "let mut db = rusqlite::Connection::open(crate::db::lifecycle::sqlite_open_path(&staging))?;"
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1196,
+      "line": 1278,
       "text": "let db = rusqlite::Connection::open_with_flags("
     },
     {
       "path": "crates/aft/src/views/verification.rs",
-      "line": 1700,
+      "line": 1907,
       "text": "let db = rusqlite::Connection::open(evidence_path(&route.member_dir(), \"g-one\")).unwrap();"
     },
     {

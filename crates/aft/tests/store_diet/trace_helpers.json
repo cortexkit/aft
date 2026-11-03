@@ -164,31 +164,31 @@
     "raw_open_calls": 7,
     "helpers": [
       {
-        "line": 1067,
+        "line": 1084,
         "helper": "check_drift"
       },
       {
-        "line": 1119,
+        "line": 1136,
         "helper": "drift_refusal_is_cleared_after_valid_replacement_and_never_becomes_floor"
       },
       {
-        "line": 1154,
+        "line": 1171,
         "helper": "drift_refusal_covers_an_unresolved_symlinked_storage_parent"
       },
       {
-        "line": 1621,
+        "line": 1671,
         "helper": "newer_format_keeps_artifact_refusal_and_malformed_file_reports_found_zero"
       },
       {
-        "line": 1658,
+        "line": 1708,
         "helper": "plane_open_enforces_the_same_schema_application_and_pragma_contract"
       },
       {
-        "line": 1765,
+        "line": 1815,
         "helper": "failed_upgrade_reader_rejects_a_replaced_database"
       },
       {
-        "line": 2306,
+        "line": 2356,
         "helper": "relocated_v3_database_keeps_the_storage_route_for_floor_and_refusal_scope"
       }
     ]
@@ -198,7 +198,7 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 854,
+        "line": 984,
         "helper": "validate"
       }
     ]
@@ -342,63 +342,63 @@
         "helper": "lock_readiness_for_test"
       },
       {
-        "line": 25477,
+        "line": 25483,
         "helper": "schema_and_cold_build_share_one_secondary_index_list"
       },
       {
-        "line": 25507,
+        "line": 25513,
         "helper": "disk_index_lookup_failure_fails_the_resolution_window"
       },
       {
-        "line": 27543,
+        "line": 27549,
         "helper": "owner_and_linked_worktree_alternation_rebuilds_storm_generation_once"
       },
       {
-        "line": 28150,
+        "line": 28156,
         "helper": "nonrepairing_open_policy_leaves_moved_root_metadata_for_maintenance"
       },
       {
-        "line": 28178,
+        "line": 28184,
         "helper": "assert_respelled_root_is_rerooted_in_place"
       },
       {
-        "line": 28301,
+        "line": 28307,
         "helper": "readonly_store_opens_through_its_uri_under_plain_and_resolved_temp_paths"
       },
       {
-        "line": 28365,
+        "line": 28371,
         "helper": "readonly_store_opens_past_the_windows_path_limit_under_a_cache_root"
       },
       {
-        "line": 29180,
+        "line": 29186,
         "helper": "direct_callers_real_store_query_plan"
       },
       {
-        "line": 29590,
+        "line": 29596,
         "helper": "completed_marker"
       },
       {
-        "line": 29841,
+        "line": 29847,
         "helper": "superseded_slice_preserves_staging_and_same_corpus_successor_resumes"
       },
       {
-        "line": 30172,
+        "line": 30178,
         "helper": "cold_build_rejects_bytes_changed_after_admission_and_retries_changed_corpus"
       },
       {
-        "line": 32460,
+        "line": 32466,
         "helper": "callgraph_fixture_view"
       },
       {
-        "line": 32923,
+        "line": 32929,
         "helper": "anchor"
       },
       {
-        "line": 35397,
+        "line": 35403,
         "helper": "durable_staging_state"
       },
       {
-        "line": 35516,
+        "line": 35522,
         "helper": "issue_250_respawn_loop_converges_or_trips_without_false_readiness"
       }
     ]
@@ -470,19 +470,19 @@
     "raw_open_calls": 4,
     "helpers": [
       {
-        "line": 17915,
+        "line": 17937,
         "helper": "hold_aft_db_exclusively"
       },
       {
-        "line": 18012,
+        "line": 18034,
         "helper": "busy_lexical_bind_retries_until_parent_can_read_child_trigram"
       },
       {
-        "line": 23391,
+        "line": 23413,
         "helper": "marker"
       },
       {
-        "line": 23439,
+        "line": 23461,
         "helper": "marker"
       }
     ]
@@ -492,7 +492,7 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 6134,
+        "line": 6145,
         "helper": "non_git_obsolete_store_discloses_unknown_dead_code_and_preserves_unused_exports"
       }
     ]
@@ -528,35 +528,35 @@
     "raw_open_calls": 8,
     "helpers": [
       {
-        "line": 20170,
+        "line": 20302,
         "helper": "callgraph_cold_build_logs_schema_stale"
       },
       {
-        "line": 20188,
+        "line": 20320,
         "helper": "callgraph_cold_build_logs_fingerprint_stale"
       },
       {
-        "line": 20228,
+        "line": 20360,
         "helper": "callgraph_cold_build_logs_root_mismatch"
       },
       {
-        "line": 21204,
+        "line": 21336,
         "helper": "assert_callgraph_churn_was_not_charged"
       },
       {
-        "line": 21843,
+        "line": 21975,
         "helper": "hold_checkout_view_derived_busy"
       },
       {
-        "line": 24588,
+        "line": 24720,
         "helper": "failed_database_open_recovers_after_backoff_without_rebind"
       },
       {
-        "line": 24819,
+        "line": 24951,
         "helper": "repaired_resident_database_rechecks_schema_and_pushes_recovered_status"
       },
       {
-        "line": 25036,
+        "line": 25168,
         "helper": "permanent_database_error_is_rechecked_with_doubling_capped_backoff"
       }
     ]
@@ -733,38 +733,34 @@
   },
   {
     "path": "crates/aft/src/db/rich_ui.rs",
-    "raw_open_calls": 8,
+    "raw_open_calls": 7,
     "helpers": [
       {
-        "line": 549,
+        "line": 141,
         "helper": "rich_ui_migration_fresh_database_has_four_tables"
       },
       {
-        "line": 564,
+        "line": 156,
         "helper": "rich_ui_migration_reapplication_keeps_cursor_key"
       },
       {
-        "line": 583,
+        "line": 175,
         "helper": "rich_ui_migration_upgrade_reopen_and_downgrade_fence"
       },
       {
-        "line": 619,
+        "line": 211,
         "helper": "rich_ui_migration_upgrade_reopen_and_downgrade_fence"
       },
       {
-        "line": 630,
+        "line": 222,
         "helper": "rich_ui_migration_upgrades_schema_18_without_losing_ledger_migration"
       },
       {
-        "line": 696,
+        "line": 288,
         "helper": "rich_ui_presets_exact_identity_and_distinct_presets_are_read_only"
       },
       {
-        "line": 735,
-        "helper": "migrated_memory_conn"
-      },
-      {
-        "line": 760,
+        "line": 324,
         "helper": "rich_ui_presets_retention_tick_removes_only_older_than_thirty_days"
       }
     ]
@@ -880,47 +876,47 @@
     "raw_open_calls": 11,
     "helpers": [
       {
-        "line": 9527,
+        "line": 9549,
         "helper": "inspect_callgraph_open_waits_out_transient_sqlite_writer_lock"
       },
       {
-        "line": 9719,
+        "line": 9741,
         "helper": "direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild"
       },
       {
-        "line": 9732,
+        "line": 9754,
         "helper": "direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild"
       },
       {
-        "line": 10550,
+        "line": 10572,
         "helper": "corrupt_cached_dead_code_exports"
       },
       {
-        "line": 11813,
+        "line": 11835,
         "helper": "profile_incremental_projection_on_store_copy"
       },
       {
-        "line": 11814,
+        "line": 11836,
         "helper": "profile_incremental_projection_on_store_copy"
       },
       {
-        "line": 11873,
+        "line": 11895,
         "helper": "projection_probe"
       },
       {
-        "line": 11905,
+        "line": 11927,
         "helper": "projection_probe_target"
       },
       {
-        "line": 11982,
+        "line": 12004,
         "helper": "projection_probe_target"
       },
       {
-        "line": 11984,
+        "line": 12006,
         "helper": "projection_probe_target"
       },
       {
-        "line": 12873,
+        "line": 12895,
         "helper": "spill_backed_171_file_delta_splices_where_old_bound_was_full"
       }
     ]
@@ -1032,23 +1028,23 @@
     "raw_open_calls": 5,
     "helpers": [
       {
-        "line": 21808,
+        "line": 21779,
         "helper": "identity_retry_replay_is_admitted_as_a_bind_so_reads_never_see_a_torn_root"
       },
       {
-        "line": 22038,
+        "line": 22009,
         "helper": "standing"
       },
       {
-        "line": 22236,
+        "line": 22207,
         "helper": "identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds"
       },
       {
-        "line": 22404,
+        "line": 22375,
         "helper": "quiescing_the_root_cancels_an_admitted_identity_retry_bind"
       },
       {
-        "line": 23505,
+        "line": 23476,
         "helper": "busy_database_open_retries_through_wire_admission_without_rebind"
       }
     ]
@@ -1058,22 +1054,8 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 913,
+        "line": 914,
         "helper": "confine_lookup_takes_no_write_lock_and_copies_no_row"
-      }
-    ]
-  },
-  {
-    "path": "crates/aft/src/subc/rich_ui/chunks/tests.rs",
-    "raw_open_calls": 2,
-    "helpers": [
-      {
-        "line": 17,
-        "helper": "migrated"
-      },
-      {
-        "line": 245,
-        "helper": "template_chunk_reports_database_state_rather_than_a_miss"
       }
     ]
   },
@@ -1208,15 +1190,15 @@
     "raw_open_calls": 3,
     "helpers": [
       {
-        "line": 5292,
+        "line": 5297,
         "helper": "caller"
       },
       {
-        "line": 6642,
+        "line": 6647,
         "helper": "v3_presence_batch_validates_once_and_rechecks_rows_and_later_schema_drift"
       },
       {
-        "line": 7475,
+        "line": 7480,
         "helper": "fresh_checkout"
       }
     ]
@@ -1412,47 +1394,47 @@
         "helper": "memo_hit_callers_retain_member_name_consultations"
       },
       {
-        "line": 149,
+        "line": 160,
         "helper": "version_only_package_edit_resolves_no_unchanged_callers"
       },
       {
-        "line": 164,
+        "line": 175,
         "helper": "workspace_member_added_resolves_only_its_importers"
       },
       {
-        "line": 177,
+        "line": 188,
         "helper": "exports_change_resolves_only_package_importers"
       },
       {
-        "line": 190,
+        "line": 201,
         "helper": "tsconfig_paths_change_resolves_only_alias_importers"
       },
       {
-        "line": 209,
+        "line": 220,
         "helper": "cargo_workspace_member_added_resolves_its_dependents"
       },
       {
-        "line": 262,
+        "line": 273,
         "helper": "rust_mod_move_resolves_declaring_crate_callers"
       },
       {
-        "line": 286,
+        "line": 297,
         "helper": "unattributed_binding_forces_counted_full_fallback"
       },
       {
-        "line": 294,
+        "line": 305,
         "helper": "unattributed_binding_forces_counted_full_fallback"
       },
       {
-        "line": 336,
+        "line": 347,
         "helper": "cold_workspace_after_prior_manifest_matches_fresh_process"
       },
       {
-        "line": 392,
+        "line": 403,
         "helper": "workspace_member_name_change_invalidates_memo_hit_callers"
       },
       {
-        "line": 406,
+        "line": 417,
         "helper": "workspace_discovery_uses_one_config_membership_dependency"
       }
     ]
@@ -1522,6 +1504,40 @@
     ]
   },
   {
+    "path": "crates/aft/src/views/materialization/reader_tests.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 142,
+        "helper": "blob_reader_patch_selects_one_file_and_reuses_dispatch"
+      },
+      {
+        "line": 193,
+        "helper": "blob_reader_patch_relinks_incoming_ordinals"
+      },
+      {
+        "line": 216,
+        "helper": "blob_reader_patch_language_corpus_matches_full_through_edits_and_renames"
+      },
+      {
+        "line": 294,
+        "helper": "blob_reader_patch_all_supported_language_fixtures_match_full"
+      },
+      {
+        "line": 351,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      },
+      {
+        "line": 366,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      },
+      {
+        "line": 372,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      }
+    ]
+  },
+  {
     "path": "crates/aft/src/views/materialization/tests.rs",
     "raw_open_calls": 50,
     "helpers": [
@@ -1530,222 +1546,226 @@
         "helper": "manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption"
       },
       {
-        "line": 117,
+        "line": 123,
         "helper": "fixture"
       },
       {
-        "line": 205,
+        "line": 211,
         "helper": "cold_sqlite_full_removes_files_and_retry_succeeds"
       },
       {
-        "line": 244,
+        "line": 250,
         "helper": "private_cold_matches_legacy_every_table_and_index"
       },
       {
-        "line": 337,
+        "line": 343,
         "helper": "manifest_blob_reader_decodes_each_payload_once"
       },
       {
-        "line": 377,
+        "line": 383,
         "helper": "read_callgraph_blob"
       },
       {
-        "line": 395,
+        "line": 401,
         "helper": "materialization_join_omits_only_the_duplicate_resolution_order"
       },
       {
-        "line": 416,
+        "line": 422,
         "helper": "cold_reference_batches_match_unbatched_rows_and_dispatch"
       },
       {
-        "line": 426,
+        "line": 432,
         "helper": "caller"
       },
       {
-        "line": 446,
+        "line": 450,
         "helper": "selected_binding_load_skips_changed_payloads_and_matches_cold"
       },
       {
-        "line": 539,
+        "line": 543,
         "helper": "incremental_delete_rows_are_bounded_by_changed_manifest_paths"
       },
       {
-        "line": 603,
+        "line": 607,
         "helper": "mismatched_base_is_rejected_and_old_schema_is_cold_upgraded"
       },
       {
-        "line": 622,
+        "line": 626,
         "helper": "missing_blob_rolls_back_deletions_and_fingerprint"
       },
       {
-        "line": 754,
+        "line": 758,
         "helper": "bench_real_manifest_diff"
       },
       {
-        "line": 1068,
+        "line": 1072,
         "helper": "added_and_removed_targets_relink_previously_unresolved_callers"
       },
       {
-        "line": 1094,
+        "line": 1098,
         "helper": "selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates"
       },
       {
-        "line": 1128,
+        "line": 1132,
         "helper": "new_reexport_target_invalidates_transitive_unchanged_importer"
       },
       {
-        "line": 1202,
+        "line": 1206,
         "helper": "bench_controlled_300_path_diff"
       },
       {
-        "line": 1247,
+        "line": 1251,
         "helper": "bench_controlled_300_path_diff"
       },
       {
-        "line": 1268,
+        "line": 1272,
         "helper": "added_rust_module_invalidates_missing_candidate"
       },
       {
-        "line": 1288,
+        "line": 1292,
         "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
       },
       {
-        "line": 1341,
+        "line": 1345,
         "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
       },
       {
-        "line": 1357,
+        "line": 1361,
         "helper": "binding_dependencies_exclude_existing_workspace_directory_probes"
       },
       {
-        "line": 1380,
+        "line": 1384,
         "helper": "legacy_generation_without_diff_metadata_cold_upgrades"
       },
       {
-        "line": 1394,
+        "line": 1398,
         "helper": "unrelated_export_surface_change_skips_reresolving_unchanged_binding_caller"
       },
       {
-        "line": 1429,
+        "line": 1433,
         "helper": "used_export_surface_change_reresolves_unchanged_binding_caller"
       },
       {
-        "line": 1459,
+        "line": 1463,
         "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
       },
       {
-        "line": 1533,
+        "line": 1537,
         "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
       },
       {
-        "line": 1546,
+        "line": 1550,
         "helper": "report_wal_pages"
       },
       {
-        "line": 1587,
+        "line": 1591,
         "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
       },
       {
-        "line": 1611,
+        "line": 1615,
         "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
       },
       {
-        "line": 1665,
+        "line": 1669,
         "helper": "memoized_bindings_keep_callers_and_reference_kinds_distinct"
       },
       {
-        "line": 1695,
+        "line": 1699,
         "helper": "memoized_rust_bindings_keep_import_visibility"
       },
       {
-        "line": 1713,
+        "line": 1717,
         "helper": "memoized_bindings_keep_call_and_value_ref_results_distinct"
       },
       {
-        "line": 2172,
+        "line": 2176,
         "helper": "differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs"
       },
       {
-        "line": 2311,
+        "line": 2315,
         "helper": "colliding_relink_parity"
       },
       {
-        "line": 2429,
+        "line": 2433,
         "helper": "macro_rust_relink_ordinal_shift_matches_cold"
       },
       {
-        "line": 2477,
+        "line": 2481,
         "helper": "colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes"
       },
       {
-        "line": 2519,
+        "line": 2523,
         "helper": "incremental_dispatch_resolves_only_files_whose_inputs_changed"
       },
       {
-        "line": 2597,
+        "line": 2601,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2619,
+        "line": 2623,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2635,
+        "line": 2639,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2658,
+        "line": 2662,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2675,
+        "line": 2679,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2684,
+        "line": 2688,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2713,
+        "line": 2717,
         "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
       },
       {
-        "line": 2720,
+        "line": 2724,
         "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
       },
       {
-        "line": 2727,
+        "line": 2731,
         "helper": "s4_shared_symbol_ranges_views_on_every_table"
       },
       {
-        "line": 2772,
+        "line": 2776,
         "helper": "first"
       },
       {
-        "line": 2794,
+        "line": 2798,
         "helper": "relinking_fixture"
       }
     ]
   },
   {
     "path": "crates/aft/src/views/materialization/update_bench.rs",
-    "raw_open_calls": 4,
+    "raw_open_calls": 5,
     "helpers": [
       {
-        "line": 178,
+        "line": 189,
         "helper": "bench_repository_incremental_update"
       },
       {
-        "line": 253,
-        "helper": "bench_repository_incremental_update"
+        "line": 330,
+        "helper": "aft_view_patch_probe"
       },
       {
-        "line": 323,
-        "helper": "bench_repository_incremental_update"
+        "line": 335,
+        "helper": "aft_view_patch_probe"
       },
       {
-        "line": 423,
-        "helper": "bench_repository_incremental_update"
+        "line": 405,
+        "helper": "aft_view_patch_probe"
+      },
+      {
+        "line": 543,
+        "helper": "aft_view_patch_probe"
       }
     ]
   },
@@ -1764,15 +1784,15 @@
     "raw_open_calls": 3,
     "helpers": [
       {
-        "line": 3726,
+        "line": 3727,
         "helper": "alpha"
       },
       {
-        "line": 5096,
+        "line": 5097,
         "helper": "chunk_cache_store_refusal_is_not_an_embedding_retry"
       },
       {
-        "line": 5965,
+        "line": 6019,
         "helper": "v3_semantic_touch_skips_current_rows_and_publishes_after_epoch_advance"
       }
     ]
@@ -1832,7 +1852,7 @@
         "helper": "a_tree_base_without_a_holding_proof_falls_back_to_the_full_check"
       },
       {
-        "line": 440,
+        "line": 478,
         "helper": "a_tree_proof_round_trips_and_refuses_another_application"
       }
     ]
@@ -1842,23 +1862,23 @@
     "raw_open_calls": 5,
     "helpers": [
       {
-        "line": 956,
+        "line": 1038,
         "helper": "write_evidence"
       },
       {
-        "line": 1009,
+        "line": 1091,
         "helper": "read_evidence"
       },
       {
-        "line": 1141,
+        "line": 1223,
         "helper": "write_tree_proof"
       },
       {
-        "line": 1196,
+        "line": 1278,
         "helper": "read_tree_proof"
       },
       {
-        "line": 1700,
+        "line": 1907,
         "helper": "stat_evidence_is_generation_root_policy_and_version_paired"
       }
     ]
@@ -1900,27 +1920,27 @@
     "raw_open_calls": 6,
     "helpers": [
       {
-        "line": 170,
+        "line": 180,
         "helper": "try_view_store_custom"
       },
       {
-        "line": 334,
+        "line": 348,
         "helper": "plans"
       },
       {
-        "line": 948,
+        "line": 962,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 950,
+        "line": 964,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 973,
+        "line": 987,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 995,
+        "line": 1009,
         "helper": "reordered_site_manifest"
       }
     ]

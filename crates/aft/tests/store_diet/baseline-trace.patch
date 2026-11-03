@@ -222,7 +222,7 @@
  fn canonical_dir(path: &Path) -> PathBuf {
 --- a/crates/aft/src/blob_store/v3/tests.rs
 +++ b/crates/aft/src/blob_store/v3/tests.rs
-@@ -1064,7 +1064,7 @@
+@@ -1081,7 +1081,7 @@
      let root = tempdir().unwrap();
      seed(root.path(), A);
      let path = db(root.path(), A);
@@ -231,7 +231,7 @@
      c.execute_batch(sql).unwrap();
      drop(c);
      let error = LedgerReader::open_existing(root.path(), A)
-@@ -1116,7 +1116,7 @@
+@@ -1133,7 +1133,7 @@
      let root = tempdir().unwrap();
      seed(root.path(), A);
      let path = db(root.path(), A);
@@ -240,7 +240,7 @@
          .unwrap()
          .execute_batch("CREATE VIEW extra AS SELECT 1")
          .unwrap();
-@@ -1151,7 +1151,7 @@
+@@ -1168,7 +1168,7 @@
      let storage = alias.join("nested").join("..");
      seed(&storage, A);
      let path = db(&storage, A);
@@ -249,7 +249,7 @@
          .unwrap()
          .execute_batch("CREATE VIEW extra AS SELECT 1")
          .unwrap();
-@@ -1618,7 +1618,7 @@
+@@ -1668,7 +1668,7 @@
      seed(root.path(), A);
      let path = db(root.path(), A);
      let future = REGISTRY_VERIFICATION_VERSION + 1;
@@ -258,7 +258,7 @@
          .unwrap()
          // Keep testing a future registry, not drift within a supported version.
          .execute("UPDATE format_meta SET format_version=?1", [future])
-@@ -1655,7 +1655,7 @@
+@@ -1705,7 +1705,7 @@
          let root = tempdir().unwrap();
          seed(root.path(), A);
          let path = plane_path(root.path(), A, FamilyPlane::Semantic).unwrap();
@@ -267,7 +267,7 @@
          let error = PlaneReader::open_existing(root.path(), A, FamilyPlane::Semantic)
              .err()
              .expect("plane contract must refuse");
-@@ -1762,7 +1762,7 @@
+@@ -1812,7 +1812,7 @@
      fs::rename(&path, &original).unwrap();
      // Rebuild the file through SQLite itself: the source fence forbids copying
      // file-set bytes, and VACUUM INTO gives the same content a new identity.
@@ -276,7 +276,7 @@
          .unwrap()
          .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
          .unwrap();
-@@ -2303,7 +2303,7 @@
+@@ -2353,7 +2353,7 @@
          .expect("the owning storage floor must be checked before a relocated v3 database");
      assert!(matches!(error, Error::Incompatible(refusal) if refusal==floor));
      persisted_format::replace_floor_refusals(&storage, &[]);
@@ -287,7 +287,7 @@
          .unwrap();
 --- a/crates/aft/src/blob_store/v3.rs
 +++ b/crates/aft/src/blob_store/v3.rs
-@@ -851,7 +851,7 @@
+@@ -981,7 +981,7 @@
              IncompatibleReason::LayoutTag(layout),
          ));
      };
@@ -542,7 +542,7 @@
          blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
          blocker
      }
-@@ -25474,7 +25474,7 @@
+@@ -25480,7 +25480,7 @@
  
      #[test]
      fn schema_and_cold_build_share_one_secondary_index_list() {
@@ -551,7 +551,7 @@
          initialize_schema(&conn).unwrap();
          let index_names = |conn: &rusqlite::Connection| {
              conn.prepare(
-@@ -25504,7 +25504,7 @@
+@@ -25510,7 +25510,7 @@
      #[test]
      fn disk_index_lookup_failure_fails_the_resolution_window() {
          // No schema: every resolver lookup fails with a SQLite error.
@@ -560,7 +560,7 @@
          let memos = DiskIndexMemos::default();
          let module_memo = callgraph::ModuleResolutionMemo::default();
          let caller_data = FileCallData {
-@@ -27540,7 +27540,7 @@
+@@ -27546,7 +27546,7 @@
          let sqlite_path = store.sqlite_path().to_path_buf();
          drop(store);
  
@@ -569,7 +569,7 @@
          // Model a store written before workspace-root metadata was cached.
          conn.execute("DELETE FROM meta WHERE k = 'workspace_roots'", [])
              .unwrap();
-@@ -28147,7 +28147,7 @@
+@@ -28153,7 +28153,7 @@
          fs::create_dir_all(&previous_root).unwrap();
          fs::create_dir_all(&current_root).unwrap();
          fs::remove_dir(&previous_root).unwrap();
@@ -578,7 +578,7 @@
          initialize_schema(&conn).unwrap();
          conn.execute(
              "INSERT INTO backend_file_state(
-@@ -28175,7 +28175,7 @@
+@@ -28181,7 +28181,7 @@
              current_root.display().to_string(),
              "fixture must store a different spelling of the root"
          );
@@ -587,7 +587,7 @@
          initialize_schema(&conn).unwrap();
          conn.execute(
              "INSERT INTO backend_file_state(
-@@ -28298,7 +28298,7 @@
+@@ -28304,7 +28304,7 @@
                  .join("callgraph")
                  .join(format!("readonly-probe-{index}.sqlite"));
              std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -596,7 +596,7 @@
                  .unwrap()
                  .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
                  .unwrap();
-@@ -28362,7 +28362,7 @@
+@@ -28368,7 +28368,7 @@
          }
          std::fs::create_dir_all(&dir).unwrap();
          let path = dir.join("readonly-probe.sqlite");
@@ -605,7 +605,7 @@
              .unwrap()
              .execute_batch("CREATE TABLE probe(value INTEGER); INSERT INTO probe VALUES (7);")
              .unwrap();
-@@ -29177,7 +29177,7 @@
+@@ -29183,7 +29183,7 @@
      #[ignore = "requires AFT_CALLERS_PREFETCH_STORE from a fixed real-source export"]
      fn direct_callers_real_store_query_plan() {
          let path = std::env::var("AFT_CALLERS_PREFETCH_STORE").expect("real store path");
@@ -614,7 +614,7 @@
              .expect("open real store read-only");
          let (file, symbol, edges) = conn
              .query_row(
-@@ -29587,7 +29587,7 @@
+@@ -29593,7 +29593,7 @@
  
          let project_key = crate::search_index::artifact_cache_key(root.path());
          let staging = callgraph_dir.path().join(staging_file_name(&project_key));
@@ -623,7 +623,7 @@
          assert_eq!(
              staged_build_phase(&staged).unwrap().as_deref(),
              Some("ready")
-@@ -29838,7 +29838,7 @@
+@@ -29844,7 +29844,7 @@
          let project_key = crate::search_index::artifact_cache_key(root.path());
          let staging = callgraph_dir.path().join(staging_file_name(&project_key));
          assert!(staging.exists(), "supersession must retain durable staging");
@@ -632,7 +632,7 @@
          assert_eq!(
              staged_build_phase(&staged).unwrap().as_deref(),
              Some("extracting")
-@@ -30169,7 +30169,7 @@
+@@ -30175,7 +30175,7 @@
          set_cold_build_extract_observer(None);
          assert!(matches!(result, Err(CallGraphStoreError::StaleFiles(_))));
          assert!(CallGraphStore::needs_cold_build(&store_dir, &root).unwrap());
@@ -641,7 +641,7 @@
          assert_eq!(
              staged_string(&staged, STAGED_CORPUS_FINGERPRINT)
                  .unwrap()
-@@ -32457,7 +32457,7 @@
+@@ -32463,7 +32463,7 @@
      fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
          use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
          let blobs_path = root.join("view-blobs.sqlite");
@@ -650,7 +650,7 @@
          blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
          let mut entries = Vec::new();
          for path in inputs {
-@@ -32920,7 +32920,7 @@
+@@ -32926,7 +32926,7 @@
          );
          let views = root.join("views");
          let database = manifest_view_database_path(&views, "parity").unwrap();
@@ -659,7 +659,7 @@
          let old_ordinal = parse
              .refs
              .iter()
-@@ -35394,7 +35394,7 @@
+@@ -35400,7 +35400,7 @@
          if !path.exists() {
              return (0, 0);
          }
@@ -668,7 +668,7 @@
          (
              query_count(&conn, "SELECT COUNT(*) FROM files").unwrap(),
              staged_u64(&conn, STAGED_COMMITTED_EXTRACTED_BYTES).unwrap(),
-@@ -35513,7 +35513,7 @@
+@@ -35519,7 +35519,7 @@
          for death in 0..3 {
              let mut child = spawn_build_child(&fast_root, &fast_store, Some("enumeration"));
              wait_for_child_barrier(&fast_signal);
@@ -784,7 +784,7 @@
      edit(&store, &source, "second");
 --- a/crates/aft/src/commands/configure.rs
 +++ b/crates/aft/src/commands/configure.rs
-@@ -17912,7 +17912,7 @@
+@@ -17934,7 +17934,7 @@
      /// also blocks readers, so the bind cannot read its legacy identity pin.
      fn hold_aft_db_exclusively(storage: &std::path::Path) -> rusqlite::Connection {
          std::fs::create_dir_all(storage).unwrap();
@@ -793,7 +793,7 @@
          lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
              .unwrap();
          lock
-@@ -18009,7 +18009,7 @@
+@@ -18031,7 +18031,7 @@
          let ledger = crate::blob_store::v3::family_dir(&storage, &family)
              .unwrap()
              .join("members.sqlite");
@@ -802,7 +802,7 @@
          blocker.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; UPDATE accounting SET watermark=watermark+1;").unwrap();
          // Only the configure tail may publish the child; the parent never binds it.
          while super::drain_deferred_configure_maintenance_unit(&ctx, &mut state) {}
-@@ -23388,7 +23388,7 @@
+@@ -23410,7 +23410,7 @@
          .unwrap();
          let database = store.sqlite_path().to_path_buf();
          drop(store);
@@ -811,7 +811,7 @@
          conn.execute(
              "UPDATE meta SET v = 'old-output-fingerprint' WHERE k = 'fingerprint'",
              [],
-@@ -23436,7 +23436,7 @@
+@@ -23458,7 +23458,7 @@
              .unwrap();
              let database = store.sqlite_path().to_path_buf();
              drop(store);
@@ -822,7 +822,7 @@
                  rusqlite::params![
 --- a/crates/aft/src/commands/inspect.rs
 +++ b/crates/aft/src/commands/inspect.rs
-@@ -6131,7 +6131,7 @@
+@@ -6142,7 +6142,7 @@
          .unwrap();
          let database = store.sqlite_path().to_path_buf();
          drop(store);
@@ -880,7 +880,7 @@
          .unwrap();
 --- a/crates/aft/src/context.rs
 +++ b/crates/aft/src/context.rs
-@@ -20167,7 +20167,7 @@
+@@ -20299,7 +20299,7 @@
      fn callgraph_cold_build_logs_schema_stale() {
          let (_dirs, ctx) = cold_build_context();
          let path = published_callgraph_for_log_test(&ctx);
@@ -889,7 +889,7 @@
          conn.execute("UPDATE meta SET v = '1' WHERE k = 'schema_version'", [])
              .unwrap();
          drop(conn);
-@@ -20185,7 +20185,7 @@
+@@ -20317,7 +20317,7 @@
      fn callgraph_cold_build_logs_fingerprint_stale() {
          let (_dirs, ctx) = cold_build_context();
          let path = published_callgraph_for_log_test(&ctx);
@@ -898,7 +898,7 @@
          let current: String = conn
              .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
                  row.get(0)
-@@ -20225,7 +20225,7 @@
+@@ -20357,7 +20357,7 @@
          let (_dirs, ctx) = cold_build_context();
          let other = TempDir::new().unwrap();
          let path = published_callgraph_for_log_test(&ctx);
@@ -907,7 +907,7 @@
          conn.execute(
              "UPDATE backend_file_state SET workspace_root = ?1",
              [other.path().to_str().unwrap()],
-@@ -21201,7 +21201,7 @@
+@@ -21333,7 +21333,7 @@
  
      fn assert_callgraph_churn_was_not_charged(ctx: &AppContext, published_attempts: i64) {
          let connection =
@@ -916,7 +916,7 @@
                  .unwrap();
          let charges: i64 = connection
              .query_row(
-@@ -21840,7 +21840,7 @@
+@@ -21972,7 +21972,7 @@
                  "derived database {} missing",
                  path.display()
              );
@@ -925,7 +925,7 @@
              holder
                  .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
                  .expect("exclusive derived lock");
-@@ -24585,7 +24585,7 @@
+@@ -24717,7 +24717,7 @@
          let (storage, _root, ctx) = failed_database_context();
          // The failed open held no connection. Repair only this test's database,
          // closing the repair connection before AFT attempts to reopen it.
@@ -934,7 +934,7 @@
          conn.execute(
              "UPDATE schema_version SET version = ?1",
              [crate::db::CURRENT_SCHEMA_VERSION],
-@@ -24816,7 +24816,7 @@
+@@ -24948,7 +24948,7 @@
                  .unwrap()
                  .parse()
                  .unwrap();
@@ -943,7 +943,7 @@
              conn.execute_batch("BEGIN IMMEDIATE").unwrap();
              conn.execute("UPDATE schema_version SET version = ?1", [version])
                  .unwrap();
-@@ -25033,7 +25033,7 @@
+@@ -25165,7 +25165,7 @@
          );
          // A different unsupported version must appear in the next refusal,
          // proving that retries re-check the file rather than replaying an error.
@@ -1285,7 +1285,7 @@
              conn.execute("UPDATE schema_version SET version=?1", [previous])
 --- a/crates/aft/src/db/rich_ui.rs
 +++ b/crates/aft/src/db/rich_ui.rs
-@@ -546,7 +546,7 @@
+@@ -138,7 +138,7 @@
  
      #[test]
      fn rich_ui_migration_fresh_database_has_four_tables() {
@@ -1294,7 +1294,7 @@
          super::super::run_migrations(&mut conn).unwrap();
          assert_tables(&conn);
          assert_eq!(cursor_key(&conn).len(), 32);
-@@ -561,7 +561,7 @@
+@@ -153,7 +153,7 @@
  
      #[test]
      fn rich_ui_migration_reapplication_keeps_cursor_key() {
@@ -1303,7 +1303,7 @@
          super::super::run_migrations(&mut conn).unwrap();
          let key = cursor_key(&conn);
          conn.execute_batch(MIGRATION).unwrap();
-@@ -580,7 +580,7 @@
+@@ -172,7 +172,7 @@
          let dir = tempfile::tempdir().unwrap();
          let path = dir.path().join("aft.db");
          let previous = CURRENT_SCHEMA_VERSION - 1;
@@ -1312,7 +1312,7 @@
          run_migrations_supported(&mut conn, previous).unwrap();
          conn.execute(
              "INSERT INTO host_state(key,value,updated_at) VALUES ('upgrade-canary','preserved',1)",
-@@ -616,7 +616,7 @@
+@@ -208,7 +208,7 @@
              Err(super::super::OpenError::DowngradeRefused { db_version, supported })
                  if db_version == CURRENT_SCHEMA_VERSION && supported == previous
          ));
@@ -1321,7 +1321,7 @@
          run_migrations(&mut fresh).unwrap();
          assert_ne!(
              cursor_key(&fresh),
-@@ -627,7 +627,7 @@
+@@ -219,7 +219,7 @@
  
      #[test]
      fn rich_ui_migration_upgrades_schema_18_without_losing_ledger_migration() {
@@ -1330,7 +1330,7 @@
          super::super::run_migrations_supported(&mut conn, 18).unwrap();
          super::super::run_migrations(&mut conn).unwrap();
          assert_tables(&conn);
-@@ -693,7 +693,7 @@
+@@ -285,7 +285,7 @@
  
      #[test]
      fn rich_ui_presets_exact_identity_and_distinct_presets_are_read_only() {
@@ -1339,16 +1339,7 @@
          super::super::run_migrations(&mut conn).unwrap();
          let k = key(7);
          record_preset(&conn, &k, 10).unwrap();
-@@ -732,7 +732,7 @@
-     use crate::bash_background::BgTaskStatus;
- 
-     fn migrated_memory_conn() -> Connection {
--        let mut conn = Connection::open_in_memory().unwrap();
-+        let mut conn = crate::db::store_diet_trace::open_in_memory().unwrap();
-         // The writer test below depends on the foreign key from
-         // bash_view_records to bash_tasks; run_migrations does not set
-         // per-connection pragmas, so enable it here like open() does.
-@@ -757,7 +757,7 @@
+@@ -321,7 +321,7 @@
  
      #[test]
      fn rich_ui_presets_retention_tick_removes_only_older_than_thirty_days() {
@@ -1523,7 +1514,7 @@
              file_mtime_ns INTEGER NOT NULL, file_size INTEGER NOT NULL, file_hash TEXT NOT NULL,
 --- a/crates/aft/src/inspect/manager.rs
 +++ b/crates/aft/src/inspect/manager.rs
-@@ -9524,7 +9524,7 @@
+@@ -9546,7 +9546,7 @@
          let sqlite_path = store.sqlite_path().to_path_buf();
          drop(store);
  
@@ -1532,7 +1523,7 @@
          blocker
              .execute_batch(
                  "PRAGMA journal_mode=DELETE;
-@@ -9716,7 +9716,7 @@
+@@ -9738,7 +9738,7 @@
              .expect("canonical previous root parent")
              .join("previous-root-still-exists");
          std::fs::create_dir_all(&still_existing_previous_root).expect("create previous root");
@@ -1541,7 +1532,7 @@
          conn.execute(
              "UPDATE backend_file_state SET workspace_root = ?1",
              rusqlite::params![still_existing_previous_root.display().to_string()],
-@@ -9729,7 +9729,7 @@
+@@ -9751,7 +9751,7 @@
                  .expect("readonly snapshot should avoid cold-rebuilding the store");
  
          assert_eq!(snapshot.files.len(), 3);
@@ -1550,7 +1541,7 @@
          let stored_root: String = conn
              .query_row(
                  "SELECT workspace_root FROM backend_file_state LIMIT 1",
-@@ -10547,7 +10547,7 @@
+@@ -10569,7 +10569,7 @@
              .0
              .to_string_lossy()
              .into_owned();
@@ -1559,7 +1550,7 @@
          let blob: Vec<u8> = conn
              .query_row(
                  "SELECT contribution FROM tier2_contributions \
-@@ -11810,8 +11810,8 @@
+@@ -11832,8 +11832,8 @@
          let db = store_dir.join(format!("{key}.sqlite"));
          {
              let source =
@@ -1570,7 +1561,7 @@
              Backup::new(&source, &mut destination)
                  .unwrap()
                  .run_to_completion(256, Duration::from_millis(5), None)
-@@ -11870,7 +11870,7 @@
+@@ -11892,7 +11892,7 @@
                  })
                  .collect::<BTreeSet<_>>();
              let payload = serde_json::to_string(&(next, callers)).unwrap();
@@ -1579,7 +1570,7 @@
              conn.execute(
                  "INSERT OR REPLACE INTO meta(k, v) VALUES('projection_write_revision', ?1)",
                  [next.to_string()],
-@@ -11902,7 +11902,7 @@
+@@ -11924,7 +11924,7 @@
                      .map(str::to_owned)
                      .collect::<BTreeSet<_>>();
                  let payload = serde_json::to_string(&(current, callers)).unwrap();
@@ -1588,7 +1579,7 @@
                  conn.execute(
                      "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
                      rusqlite::params![format!("projection_delta_{}", current % 64), payload],
-@@ -11979,9 +11979,9 @@
+@@ -12001,9 +12001,9 @@
              let inspect_db = project_inspect_dir.join(format!("{project_key}.sqlite"));
              {
                  let source =
@@ -1600,7 +1591,7 @@
                  Backup::new(&source, &mut destination)
                      .unwrap()
                      .run_to_completion(256, Duration::from_millis(5), None)
-@@ -12870,7 +12870,7 @@
+@@ -12892,7 +12892,7 @@
              "fixture must exceed the former absolute journal bound"
          );
  
@@ -1737,7 +1728,7 @@
              .get::<_, u32>(0))
 --- a/crates/aft/src/subc/mod.rs
 +++ b/crates/aft/src/subc/mod.rs
-@@ -21805,7 +21805,7 @@
+@@ -21776,7 +21776,7 @@
  
          // Rollback-journal mode, so the exclusive transaction also blocks the
          // bind's read of its legacy identity pin.
@@ -1746,7 +1737,7 @@
          lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
              .unwrap();
          let bind: RawRequest = serde_json::from_value(json!({
-@@ -22035,7 +22035,7 @@
+@@ -22006,7 +22006,7 @@
  
          // Rollback-journal mode, so the exclusive transaction also blocks the
          // bind's read of its legacy identity pin.
@@ -1755,7 +1746,7 @@
          lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
              .unwrap();
          let bind: RawRequest = serde_json::from_value(json!({
-@@ -22233,7 +22233,7 @@
+@@ -22204,7 +22204,7 @@
  
          // Rollback-journal mode, so the exclusive transaction also blocks the
          // bind's read of its legacy identity pin.
@@ -1764,7 +1755,7 @@
          lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
              .unwrap();
          let bind: RawRequest = serde_json::from_value(json!({
-@@ -22401,7 +22401,7 @@
+@@ -22372,7 +22372,7 @@
          let ctx = Arc::clone(&configured.ctx);
          let mut live_roots = HashMap::from([(root_id.clone(), RootMeta::new(Instant::now()))]);
  
@@ -1773,7 +1764,7 @@
          lock.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
              .unwrap();
          let bind: RawRequest = serde_json::from_value(json!({
-@@ -23502,7 +23502,7 @@
+@@ -23473,7 +23473,7 @@
          let _git_env = crate::test_env::hermetic_git_env_guard();
          let executor = Arc::new(Executor::new());
          let fixture = ConfiguredRoot::unconfigured(&executor);
@@ -1784,7 +1775,7 @@
          let bind = fixture.submit_bind(&executor, fixture.bind_request(0, "opencode"));
 --- a/crates/aft/src/subc/remote_policy_tests.rs
 +++ b/crates/aft/src/subc/remote_policy_tests.rs
-@@ -910,7 +910,7 @@
+@@ -911,7 +911,7 @@
          .unwrap()
          .busy_timeout(Duration::ZERO)
          .unwrap();
@@ -1793,26 +1784,6 @@
      writer.execute_batch("BEGIN IMMEDIATE").unwrap();
      let rebound = identity(root.path(), "designer", 8, true);
      assert!(confined(&restarted, &rebound).unwrap());
---- a/crates/aft/src/subc/rich_ui/chunks/tests.rs
-+++ b/crates/aft/src/subc/rich_ui/chunks/tests.rs
-@@ -14,7 +14,7 @@
- }
- 
- fn migrated() -> Mutex<Box<Connection>> {
--    let mut conn = Connection::open_in_memory().unwrap();
-+    let mut conn = crate::db::store_diet_trace::open_in_memory().unwrap();
-     crate::db::run_migrations(&mut conn).unwrap();
-     Mutex::new(Box::new(conn))
- }
-@@ -242,7 +242,7 @@
-     );
- 
-     // A database whose query fails (here: no template table) is unreadable.
--    let unmigrated = Mutex::new(Box::new(Connection::open_in_memory().unwrap()));
-+    let unmigrated = Mutex::new(Box::new(crate::db::store_diet_trace::open_in_memory().unwrap()));
-     assert_eq!(
-         code(template_chunk(&request, Some(&unmigrated))),
-         "database_unavailable"
 --- a/crates/aft/src/views/assembly.rs
 +++ b/crates/aft/src/views/assembly.rs
 @@ -2809,7 +2809,7 @@
@@ -2041,7 +2012,7 @@
                      "CREATE TABLE reclaim_fixture (data BLOB);
 --- a/crates/aft/src/views/first_load.rs
 +++ b/crates/aft/src/views/first_load.rs
-@@ -5289,7 +5289,7 @@
+@@ -5294,7 +5294,7 @@
              "a durable key replaces the consumed payload"
          );
          let store = driver.owner.open_store(FamilyPlane::Callgraph).unwrap();
@@ -2050,7 +2021,7 @@
              .unwrap()
              .execute(
                  "DELETE FROM blob_payloads WHERE full_key=?1",
-@@ -6639,7 +6639,7 @@
+@@ -6644,7 +6644,7 @@
          assert!(readers.contains(&next), "a row miss must not be cached");
          drop(readers);
          let path = v3::plane_path(storage.path(), family, FamilyPlane::Semantic).unwrap();
@@ -2059,7 +2030,7 @@
              .unwrap()
              .execute_batch("CREATE TABLE unexpected(value TEXT)")
              .unwrap();
-@@ -7472,7 +7472,7 @@
+@@ -7477,7 +7477,7 @@
              Ok(())
          })
          .unwrap();
@@ -2408,7 +2379,7 @@
      for caller in ["a.ts", "b.ts"] {
          let binding = &bindings[caller];
          assert!(
-@@ -146,7 +146,7 @@
+@@ -157,7 +157,7 @@
  #[test]
  fn version_only_package_edit_resolves_no_unchanged_callers() {
      let mut f = workspace_fixture();
@@ -2417,7 +2388,7 @@
      config(
          &conn,
          &mut f.next,
-@@ -161,7 +161,7 @@
+@@ -172,7 +172,7 @@
  #[test]
  fn workspace_member_added_resolves_only_its_importers() {
      let mut f = workspace_fixture();
@@ -2426,7 +2397,7 @@
      config(
          &conn,
          &mut f.base,
-@@ -174,7 +174,7 @@
+@@ -185,7 +185,7 @@
  #[test]
  fn exports_change_resolves_only_package_importers() {
      let mut f = workspace_fixture();
@@ -2435,7 +2406,7 @@
      config(
          &conn,
          &mut f.next,
-@@ -187,7 +187,7 @@
+@@ -198,7 +198,7 @@
  #[test]
  fn tsconfig_paths_change_resolves_only_alias_importers() {
      let mut f = workspace_fixture();
@@ -2444,7 +2415,7 @@
      config(
          &conn,
          &mut f.base,
-@@ -206,7 +206,7 @@
+@@ -217,7 +217,7 @@
  #[test]
  fn cargo_workspace_member_added_resolves_its_dependents() {
      let mut f = fixture();
@@ -2453,7 +2424,7 @@
      let caller = "pub fn caller() { new_crate::target(); }";
      f.base = manifest(
          &conn,
-@@ -259,7 +259,7 @@
+@@ -270,7 +270,7 @@
  #[test]
  fn rust_mod_move_resolves_declaring_crate_callers() {
      let mut f = fixture();
@@ -2462,7 +2433,7 @@
      let caller = "mod target; pub fn caller() { target::target(); }";
      f.base = manifest(
          &conn,
-@@ -283,7 +283,7 @@
+@@ -294,7 +294,7 @@
  #[test]
  fn unattributed_binding_forces_counted_full_fallback() {
      let mut f = workspace_fixture();
@@ -2471,7 +2442,7 @@
      config(
          &conn,
          &mut f.next,
-@@ -291,7 +291,7 @@
+@@ -302,7 +302,7 @@
          r#"{"workspaces":["packages/*"],"version":"2"}"#,
      );
      let (_, copy) = prepare(&f);
@@ -2480,7 +2451,7 @@
      let mut bindings = load_bindings(&db).unwrap();
      bindings.get_mut("a.ts").unwrap().unattributed = true;
      db.execute(
-@@ -333,7 +333,7 @@
+@@ -344,7 +344,7 @@
  #[test]
  fn cold_workspace_after_prior_manifest_matches_fresh_process() {
      let mut f = workspace_fixture();
@@ -2489,7 +2460,7 @@
      let extra = manifest(
          &conn,
          &[("packages/new/one.ts", "export function target() {}")],
-@@ -389,7 +389,7 @@
+@@ -400,7 +400,7 @@
  #[test]
  fn workspace_member_name_change_invalidates_memo_hit_callers() {
      let mut f = workspace_fixture();
@@ -2498,7 +2469,7 @@
      config(
          &conn,
          &mut f.next,
-@@ -403,7 +403,7 @@
+@@ -414,7 +414,7 @@
  fn workspace_discovery_uses_one_config_membership_dependency() {
      let f = workspace_fixture();
      let (base, _) = prepare(&f);
@@ -2624,6 +2595,69 @@
              .unwrap()
              .execute_batch("DELETE FROM meta; INSERT INTO meta VALUES ('n', 1), ('n', 1);")
              .unwrap();
+--- a/crates/aft/src/views/materialization/reader_tests.rs
++++ b/crates/aft/src/views/materialization/reader_tests.rs
+@@ -139,7 +139,7 @@
+ #[test]
+ fn blob_reader_patch_selects_one_file_and_reuses_dispatch() {
+     let f = fixture();
+-    let connection = Connection::open(&f.blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&f.blobs).unwrap();
+     let files = (0..12)
+         .map(|i| {
+             (
+@@ -190,7 +190,7 @@
+ #[test]
+ fn blob_reader_patch_relinks_incoming_ordinals() {
+     let f = relinking_fixture();
+-    let connection = Connection::open(&f.blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&f.blobs).unwrap();
+     let reader = v3_reader(&connection, &f.dir.path().join("v3"));
+     let patched = f.dir.path().join("derived-relinked.sqlite");
+     let cold = f.dir.path().join("derived-cold.sqlite");
+@@ -213,7 +213,7 @@
+ #[test]
+ fn blob_reader_patch_language_corpus_matches_full_through_edits_and_renames() {
+     let f = fixture();
+-    let connection = Connection::open(&f.blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&f.blobs).unwrap();
+     let mut corpus = DifferentialCorpus::new(7).with_directory_packages();
+     let mut versions = Vec::new();
+     for choice in [
+@@ -291,7 +291,7 @@
+     use crate::callgraph_store::position_identity_tests::language_fixtures;
+     for (path, language, source) in language_fixtures() {
+         let f = fixture();
+-        let connection = Connection::open(&f.blobs).unwrap();
++        let connection = crate::db::store_diet_trace::open(&f.blobs).unwrap();
+         let versions = [source.to_string(), format!("\n{source}")].map(|source| {
+             let blob = join::CallgraphBlob::extract(&source, language, "fixture").unwrap();
+             let payload = blob.to_bytes().unwrap();
+@@ -348,7 +348,7 @@
+ #[test]
+ fn graph_answers_ignore_edge_insertion_order_at_tied_positions() {
+     let f = fixture();
+-    let connection = Connection::open(&f.blobs).unwrap();
++    let connection = crate::db::store_diet_trace::open(&f.blobs).unwrap();
+     let corpus = DifferentialCorpus::new(7);
+     let manifest = manifest(
+         &connection,
+@@ -363,13 +363,13 @@
+     let reverse = f.dir.path().join("derived-reverse.sqlite");
+     materialize_from_blob_reader(&forward, &manifest, &reader).unwrap();
+     {
+-        let connection = Connection::open(&forward).unwrap();
++        let connection = crate::db::store_diet_trace::open(&forward).unwrap();
+         let inserted = connection.execute("INSERT INTO edges SELECT edge_id || ':alternate', ref_id, source_node, target_node, target_file, target_symbol, kind, line, 'exact' FROM edges WHERE provenance='dispatch'", []).unwrap();
+         assert!(inserted > 0, "incoming ties must differ in provenance");
+     }
+     crate::views::generation::clone_derived_for_test(&forward, &reverse).unwrap();
+     {
+-        let connection = Connection::open(&reverse).unwrap();
++        let connection = crate::db::store_diet_trace::open(&reverse).unwrap();
+         connection.execute_batch("CREATE TEMP TABLE reversed_edges AS SELECT * FROM edges; DELETE FROM edges; INSERT INTO edges SELECT * FROM reversed_edges ORDER BY edge_id DESC; DROP TABLE reversed_edges").unwrap();
+     }
+     parity::assert_logical_parity(&forward, &reverse);
 --- a/crates/aft/src/views/materialization/tests.rs
 +++ b/crates/aft/src/views/materialization/tests.rs
 @@ -21,7 +21,7 @@
@@ -2635,7 +2669,7 @@
          let reader = ManifestViewBlobReader::new(&connection);
          assert_eq!(reader.read_payload(&key.to_hex()).unwrap(), Some(payload));
          let value = if column == "payload_digest" {
-@@ -114,7 +114,7 @@
+@@ -120,7 +120,7 @@
  fn fixture() -> Fixture {
      let dir = tempfile::tempdir().unwrap();
      let blobs = dir.path().join("blobs.sqlite");
@@ -2644,7 +2678,7 @@
      conn.execute_batch(
          "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)",
      )
-@@ -202,7 +202,7 @@
+@@ -208,7 +208,7 @@
  #[test]
  fn cold_sqlite_full_removes_files_and_retry_succeeds() {
      let f = fixture();
@@ -2653,7 +2687,7 @@
      let files = (0..300)
          .map(|index| {
              (
-@@ -241,7 +241,7 @@
+@@ -247,7 +247,7 @@
      let private = f.dir.path().join("private-cold.sqlite");
      materialize_manifest_view_database(&private, &f.blobs, &f.base).unwrap();
      parity::assert_logical_parity(&private, &legacy);
@@ -2662,7 +2696,7 @@
      assert_eq!(
          connection
              .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
-@@ -334,7 +334,7 @@
+@@ -340,7 +340,7 @@
  #[test]
  fn manifest_blob_reader_decodes_each_payload_once() {
      let f = fixture();
@@ -2671,7 +2705,7 @@
      let key = f
          .base
          .entries()
-@@ -374,7 +374,7 @@
+@@ -380,7 +380,7 @@
          }
      }
      let f = fixture();
@@ -2680,7 +2714,7 @@
      let reader = Reader {
          inner: ManifestViewBlobReader::new(&connection),
          reads: Default::default(),
-@@ -392,7 +392,7 @@
+@@ -398,7 +398,7 @@
  #[test]
  fn materialization_join_omits_only_the_duplicate_resolution_order() {
      let f = fixture();
@@ -2689,7 +2723,7 @@
      let reader = ManifestViewBlobReader::new(&connection);
      let empty = BTreeSet::new();
      let cached = BTreeMap::new();
-@@ -413,7 +413,7 @@
+@@ -419,7 +419,7 @@
  #[test]
  fn cold_reference_batches_match_unbatched_rows_and_dispatch() {
      let f = fixture();
@@ -2698,16 +2732,16 @@
      let mut source = String::from("struct Thing; impl Thing { fn run(&self) {} } fn target() {} fn caller() { let thing = Thing; ");
      for _ in 0..5000 {
          source.push_str("thing.run(); target(); ");
-@@ -423,7 +423,7 @@
+@@ -429,7 +429,7 @@
      let reader = ManifestViewBlobReader::new(&connection);
      let bounded = f.dir.path().join("batched.sqlite");
      let unbatched = f.dir.path().join("unbatched.sqlite");
 -    drop(Connection::open(&unbatched).unwrap());
 +    drop(crate::db::store_diet_trace::open(&unbatched).unwrap());
-     let (batched, _) =
-         materialize_reading(&bounded, &manifest, None, &reader, Some(&connection)).unwrap();
-     let (whole, _) =
-@@ -443,7 +443,7 @@
+     let (batched, _) = materialize_reading(&bounded, &manifest, None, &reader).unwrap();
+     let (whole, _) = materialize_reading(&unbatched, &manifest, None, &reader).unwrap();
+     assert!(batched.resolved_refs > 4096);
+@@ -447,7 +447,7 @@
  fn selected_binding_load_skips_changed_payloads_and_matches_cold() {
      let f = fixture();
      let (_, incremental) = prepare(&f);
@@ -2716,7 +2750,7 @@
          .unwrap()
          .execute(
              "UPDATE view_bindings SET payload = '{' WHERE file_path = 'target.ts'",
-@@ -536,7 +536,7 @@
+@@ -540,7 +540,7 @@
  #[test]
  fn incremental_delete_rows_are_bounded_by_changed_manifest_paths() {
      let f = fixture();
@@ -2725,7 +2759,7 @@
      let files = (0..32)
          .map(|i| {
              (
-@@ -600,7 +600,7 @@
+@@ -604,7 +604,7 @@
      let before = snapshot(&copy);
      assert!(apply_manifest_diff(&copy, &f.next, &f.base, &f.blobs).is_err());
      assert_eq!(snapshot(&copy), before);
@@ -2734,7 +2768,7 @@
          .unwrap()
          .execute(
              "UPDATE meta SET v='obsolete' WHERE k='view_materialization_version'",
-@@ -619,7 +619,7 @@
+@@ -623,7 +623,7 @@
      let f = fixture();
      let (_, copy) = prepare(&f);
      let before = snapshot(&copy);
@@ -2743,7 +2777,7 @@
          .unwrap()
          .execute("DELETE FROM blob_payloads", [])
          .unwrap();
-@@ -751,7 +751,7 @@
+@@ -755,7 +755,7 @@
          let clone_started = std::time::Instant::now();
          crate::views::generation::clone_derived(&original, &db).unwrap();
          let clone = profile::PhaseMeasurement::observed(clone_started.elapsed().as_nanos(), 0);
@@ -2752,7 +2786,7 @@
          keeper
              .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
              .unwrap();
-@@ -1065,7 +1065,7 @@
+@@ -1069,7 +1069,7 @@
  #[test]
  fn added_and_removed_targets_relink_previously_unresolved_callers() {
      let f = fixture();
@@ -2761,7 +2795,7 @@
      let source = "import { target } from './target'; export function caller() { return target(); }";
      let absent = manifest(&conn, &[("caller.ts", source)]);
      let present = manifest(
-@@ -1091,7 +1091,7 @@
+@@ -1095,7 +1095,7 @@
  #[test]
  fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates() {
      let f = fixture();
@@ -2770,7 +2804,7 @@
      let reader = ManifestViewBlobReader::new(&conn);
      let old = join::JoinResult::from_manifest(&f.base, &reader).unwrap();
      let cold = join::join_selected_manifest(&f.base, &reader, None, &BTreeMap::new()).unwrap();
-@@ -1125,7 +1125,7 @@
+@@ -1129,7 +1129,7 @@
  #[test]
  fn new_reexport_target_invalidates_transitive_unchanged_importer() {
      let f = fixture();
@@ -2779,7 +2813,7 @@
      let barrel = "export * from './new';";
      let facade = "export * from './barrel';";
      let caller = "import { fresh } from './facade'; export function caller() { return fresh(); }";
-@@ -1199,7 +1199,7 @@
+@@ -1203,7 +1203,7 @@
  #[ignore = "controlled 300-path offline write/CPU measurement"]
  fn bench_controlled_300_path_diff() {
      let f = fixture();
@@ -2788,7 +2822,7 @@
      let files = (0..5056).map(|i| (format!("file_{i}.ts"), format!("export function value_{i}() {{ return 1; }} export function caller_{i}() {{ return value_{i}(); }}"))).collect::<Vec<_>>();
      let next_files = files
          .iter()
-@@ -1244,7 +1244,7 @@
+@@ -1248,7 +1248,7 @@
              .path()
              .join(format!("controlled-{incremental}.sqlite"));
          crate::views::generation::clone_derived_for_test(&original, &db).unwrap();
@@ -2797,7 +2831,7 @@
          keeper
              .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
              .unwrap();
-@@ -1265,7 +1265,7 @@
+@@ -1269,7 +1269,7 @@
  #[test]
  fn added_rust_module_invalidates_missing_candidate() {
      let f = fixture();
@@ -2806,7 +2840,7 @@
      let lib = "mod future; pub fn caller() { future::fresh(); }";
      let base = manifest(&conn, &[("src/lib.rs", lib)]);
      let next = manifest(
-@@ -1285,7 +1285,7 @@
+@@ -1289,7 +1289,7 @@
  #[test]
  fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
      let f = fixture();
@@ -2815,7 +2849,7 @@
      let mut base = manifest(
          &conn,
          &[
-@@ -1338,7 +1338,7 @@
+@@ -1342,7 +1342,7 @@
      assert_eq!(snapshot(&db), snapshot(&cold));
      assert!(!stats.full_resolution);
      assert_eq!(stats.dependent_files, 1);
@@ -2824,7 +2858,7 @@
          .unwrap()
          .query_row("SELECT target_file FROM edges", [], |row| row.get(0))
          .unwrap();
-@@ -1354,7 +1354,7 @@
+@@ -1358,7 +1358,7 @@
  #[test]
  fn binding_dependencies_exclude_existing_workspace_directory_probes() {
      let f = fixture();
@@ -2833,7 +2867,7 @@
      let manifest = manifest(
          &conn,
          &[
-@@ -1377,7 +1377,7 @@
+@@ -1381,7 +1381,7 @@
  fn legacy_generation_without_diff_metadata_cold_upgrades() {
      let f = fixture();
      let (_, copy) = prepare(&f);
@@ -2842,7 +2876,7 @@
          "DELETE FROM meta WHERE k IN ('view_manifest_fingerprint', 'view_materialization_version');
           DROP TABLE view_bindings; DELETE FROM file_dependencies;"
      ).unwrap();
-@@ -1391,7 +1391,7 @@
+@@ -1395,7 +1395,7 @@
  #[test]
  fn unrelated_export_surface_change_skips_reresolving_unchanged_binding_caller() {
      let f = fixture();
@@ -2851,7 +2885,7 @@
      let caller = "import { target } from './target'; export function caller() { return target(); }";
      let base = manifest(
          &conn,
-@@ -1426,7 +1426,7 @@
+@@ -1430,7 +1430,7 @@
  #[test]
  fn used_export_surface_change_reresolves_unchanged_binding_caller() {
      let f = fixture();
@@ -2860,7 +2894,7 @@
      let caller = "import { target } from './target'; export function caller() { return target(); }";
      let base = manifest(
          &conn,
-@@ -1456,7 +1456,7 @@
+@@ -1460,7 +1460,7 @@
  #[test]
  fn colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows() {
      let f = fixture();
@@ -2869,7 +2903,7 @@
      let initial = manifest(
          &conn,
          &[
-@@ -1530,7 +1530,7 @@
+@@ -1534,7 +1534,7 @@
      );
      let db = f.dir.path().join("colliding.sqlite");
      materialize_manifest_view_database(&db, &f.blobs, &manifest).unwrap();
@@ -2878,7 +2912,7 @@
          .unwrap()
          .query_row(
              "SELECT module_path FROM refs WHERE caller_file='barrel.ts'",
-@@ -1543,7 +1543,7 @@
+@@ -1547,7 +1547,7 @@
  
  #[cfg(target_os = "macos")]
  fn report_wal_pages(db: &std::path::Path) {
@@ -2887,7 +2921,7 @@
      let page_size: usize = connection
          .query_row("PRAGMA page_size", [], |row| row.get(0))
          .unwrap();
-@@ -1584,7 +1584,7 @@
+@@ -1588,7 +1588,7 @@
  #[test]
  fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers() {
      let f = fixture();
@@ -2896,7 +2930,7 @@
      let caller = "import { target } from './target'; export function caller() { return target(); }";
      let base = manifest(
          &connection,
-@@ -1608,7 +1608,7 @@
+@@ -1612,7 +1612,7 @@
      );
      let db = f.dir.path().join("persistent-surface.sqlite");
      materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
@@ -2905,7 +2939,7 @@
      struct CountingReader<'a> {
          inner: ManifestViewBlobReader<'a>,
          reads: std::cell::RefCell<Vec<String>>,
-@@ -1662,7 +1662,7 @@
+@@ -1666,7 +1666,7 @@
  #[test]
  fn memoized_bindings_keep_callers_and_reference_kinds_distinct() {
      let f = fixture();
@@ -2914,7 +2948,7 @@
      let source = "import { target } from './target'; export function caller() { target(); target(); return target; }";
      let current = manifest(
          &conn,
-@@ -1692,7 +1692,7 @@
+@@ -1696,7 +1696,7 @@
  #[test]
  fn memoized_rust_bindings_keep_import_visibility() {
      let f = fixture();
@@ -2923,7 +2957,7 @@
      let current = manifest(&conn, &[
          ("src/lib.rs", "mod target; fn before() { alias::target(); } use crate::target as alias; fn after() { alias::target(); alias::target(); }"),
          ("src/target.rs", "pub fn target() {}"),
-@@ -1710,7 +1710,7 @@
+@@ -1714,7 +1714,7 @@
  #[test]
  fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
      let f = fixture();
@@ -2932,7 +2966,7 @@
      let current = manifest(
          &conn,
          &[(
-@@ -2169,7 +2169,7 @@
+@@ -2173,7 +2173,7 @@
  #[test]
  fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
      let f = fixture();
@@ -2941,7 +2975,7 @@
      // The random seeds collectively exercise every corpus edit with few
      // redundant all-pairs SQLite materializations. The two fixed walks then go
      // through every method-call edit, so each one is compared whatever the
-@@ -2308,7 +2308,7 @@
+@@ -2312,7 +2312,7 @@
  
  fn colliding_relink_parity(last_resolves: bool, last_kind: join::BlobRefKind) {
      let f = fixture();
@@ -2950,7 +2984,7 @@
      let caller_source = "import { target } from './target'; import { stable } from './zstable'; export function caller() { target(); stable(); }";
      let initial = manifest(
          &conn,
-@@ -2426,7 +2426,7 @@
+@@ -2430,7 +2430,7 @@
  #[test]
  fn macro_rust_relink_ordinal_shift_matches_cold() {
      let f = fixture();
@@ -2959,7 +2993,7 @@
      let caller = "use crate::target::target; use crate::zstable::stable; fn caller() { assert_eq!(target(), stable()); }";
      let base = manifest(
          &conn,
-@@ -2474,7 +2474,7 @@
+@@ -2478,7 +2478,7 @@
      let f = fixture();
      let (_, copy) = prepare(&f);
      let before = snapshot(&copy);
@@ -2968,7 +3002,7 @@
      connection.execute_batch(
          "UPDATE meta SET v='9' WHERE k='view_materialization_version';
           UPDATE refs SET status='unresolved', target_node=NULL, target_file=NULL, target_symbol=NULL;
-@@ -2516,7 +2516,7 @@
+@@ -2520,7 +2520,7 @@
  #[test]
  fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
      let f = fixture();
@@ -2977,7 +3011,7 @@
      let version = |edited: Option<&str>| {
          let files = independent_dispatch_files(edited);
          manifest(
-@@ -2594,7 +2594,7 @@
+@@ -2598,7 +2598,7 @@
  #[test]
  fn s4_shift_views_on_keeps_inbound_edges_and_matches_cold() {
      let f = fixture();
@@ -2986,7 +3020,7 @@
      let hub = crate::callgraph_store::position_identity_tests::HUB;
      let caller = crate::callgraph_store::position_identity_tests::CALLER;
      let inputs = |hub| {
-@@ -2616,7 +2616,7 @@
+@@ -2620,7 +2620,7 @@
      let database = f.dir.path().join("s4-shift.sqlite");
      materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
      {
@@ -2995,7 +3029,7 @@
          assert!(
              conn.query_row(
                  "SELECT count(DISTINCT n.file_path) FROM edges e JOIN nodes n ON n.id=e.source_node WHERE e.provenance='name_match' AND e.target_file='hub.rs' AND n.file_path!='hub.rs'",
-@@ -2632,7 +2632,7 @@
+@@ -2636,7 +2636,7 @@
      assert_eq!(stats.relinked_deleted, 0);
      assert_eq!(stats.relinked_inserted, 0);
      {
@@ -3004,7 +3038,7 @@
          assert_eq!(
              conn.query_row(
                  "SELECT count(*) FROM s4_dispatch_writes WHERE file != 'hub.rs'",
-@@ -2655,7 +2655,7 @@
+@@ -2659,7 +2659,7 @@
  fn s4_collisions_and_in_file_moves_views_on_every_table() {
      for (name, _, source) in crate::callgraph_store::position_identity_tests::COLLISIONS {
          let f = fixture();
@@ -3013,7 +3047,7 @@
          let base = manifest(&conn, &[(name, source)]);
          let lines: Vec<_> = source.lines().collect();
          let moved = format!(
-@@ -2672,7 +2672,7 @@
+@@ -2676,7 +2676,7 @@
              materialize_manifest_view_database(&legacy, &f.blobs, &base)
          })
          .unwrap();
@@ -3022,7 +3056,7 @@
              .unwrap()
              .query_row(
                  "SELECT (SELECT count(*) FROM nodes),(SELECT count(*) FROM edges)",
-@@ -2681,7 +2681,7 @@
+@@ -2685,7 +2685,7 @@
              )
              .unwrap();
          {
@@ -3031,7 +3065,7 @@
              let counts: (usize, usize) = conn
                  .query_row(
                      "SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges)",
-@@ -2710,21 +2710,21 @@
+@@ -2714,21 +2714,21 @@
      })
      .unwrap();
      {
@@ -3056,7 +3090,7 @@
      let make = |shift: u32| {
          let mut blob =
              join::CallgraphBlob::extract("fn first() {}\nfn other() {}\n", "rust", "fixture")
-@@ -2769,7 +2769,7 @@
+@@ -2773,7 +2773,7 @@
      drop(conn);
      let database = f.dir.path().join("shared-ranges.sqlite");
      materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
@@ -3065,7 +3099,7 @@
      assert_eq!(
          conn.query_row("SELECT count(*) FROM nodes", [], |r| r.get::<_, usize>(0))
              .unwrap(),
-@@ -2791,7 +2791,7 @@
+@@ -2795,7 +2795,7 @@
  // these tests still cover updating callers in another file when identity changes.
  fn relinking_fixture() -> Fixture {
      let mut f = fixture();
@@ -3076,7 +3110,7 @@
          &[
 --- a/crates/aft/src/views/materialization/update_bench.rs
 +++ b/crates/aft/src/views/materialization/update_bench.rs
-@@ -175,7 +175,7 @@
+@@ -186,7 +186,7 @@
      // Synthetic edits of the newer revision's own source files, spread across
      // the tree. The checkout is at the newer revision after its publication.
      let candidates = {
@@ -3085,8 +3119,14 @@
          let reader = ManifestViewBlobReader::new(&connection);
          new.entries()
              .filter_map(|(path, entry)| {
-@@ -250,7 +250,7 @@
+@@ -327,12 +327,12 @@
      drop(store);
+ 
+     let v3_reader = std::env::var_os("AFT_UPDATE_BENCH_READER").map(|_| {
+-        let connection = Connection::open(&blobs).unwrap();
++        let connection = crate::db::store_diet_trace::open(&blobs).unwrap();
+         tests::reader_tests::v3_reader(&connection, &out.path().join("v3"))
+     });
  
      let keeper = |path: &Path| {
 -        let keeper = Connection::open(path).unwrap();
@@ -3094,7 +3134,7 @@
          keeper.pragma_update(None, "journal_mode", "WAL").unwrap();
          keeper
              .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
-@@ -320,7 +320,7 @@
+@@ -402,7 +402,7 @@
      {
          // Space each table and index takes in the main file once the cold
          // build's WAL has been checkpointed into it.
@@ -3103,7 +3143,7 @@
          connection
              .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
              .unwrap();
-@@ -420,7 +420,7 @@
+@@ -540,7 +540,7 @@
          // connection configured like the materializer's, then the WAL frames
          // a separate PASSIVE checkpoint finds and the time it takes.
          {
@@ -3125,7 +3165,7 @@
                  .expect("schema");
 --- a/crates/aft/src/views/semantic.rs
 +++ b/crates/aft/src/views/semantic.rs
-@@ -3723,7 +3723,7 @@
+@@ -3724,7 +3724,7 @@
          let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
          let store_path = store.path().to_path_buf();
          *lock(&plane.after_conflict) = Some(Box::new(move || {
@@ -3134,7 +3174,7 @@
                  .unwrap()
                  .execute(
                      "DELETE FROM blob_payloads WHERE full_key = ?1",
-@@ -5093,7 +5093,7 @@
+@@ -5094,7 +5094,7 @@
          let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
          let snapshot = checkout.load();
          let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
@@ -3143,7 +3183,7 @@
          connection.execute_batch("CREATE TRIGGER refuse_chunk_cache BEFORE INSERT ON blob_payloads BEGIN SELECT RAISE(ABORT, 'chunk cache storage refused'); END;").unwrap();
          let report = checkout.fill(&snapshot, &Model::default(), "model-a");
          assert_eq!(report.installed, 0);
-@@ -5962,7 +5962,7 @@
+@@ -6016,7 +6016,7 @@
  
          let path = crate::blob_store::v3::plane_path(storage.path(), family, FamilyPlane::Semantic)
              .unwrap();
@@ -3232,7 +3272,7 @@
          .unwrap()
          .pragma_update(None, "user_version", 2)
          .unwrap();
-@@ -437,7 +437,7 @@
+@@ -475,7 +475,7 @@
          .file_name()
          .to_string_lossy()
          .contains(".tmp.")));
@@ -3243,7 +3283,7 @@
      drop(db);
 --- a/crates/aft/src/views/verification.rs
 +++ b/crates/aft/src/views/verification.rs
-@@ -953,7 +953,7 @@
+@@ -1035,7 +1035,7 @@
      ));
      let result = (|| -> Result<(), Box<dyn std::error::Error>> {
          // Generation names make this path pass Windows' MAX_PATH.
@@ -3252,7 +3292,7 @@
          db.pragma_update(None, "application_id", EVIDENCE_APP)?;
          db.pragma_update(None, "user_version", 1)?;
          db.pragma_update(None, "journal_mode", "DELETE")?;
-@@ -1006,7 +1006,7 @@
+@@ -1088,7 +1088,7 @@
      generation: &str,
      guard: &BindGuard,
  ) -> Option<BTreeMap<RelPath, Evidence>> {
@@ -3261,7 +3301,7 @@
          crate::db::lifecycle::sqlite_open_path(&evidence_path(dir, generation)),
          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
      )
-@@ -1138,7 +1138,7 @@
+@@ -1220,7 +1220,7 @@
          super::base_refs::fresh_nonce()
      ));
      let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -3270,7 +3310,7 @@
          db.pragma_update(None, "application_id", TREE_PROOF_APP)?;
          db.pragma_update(None, "user_version", 1)?;
          db.pragma_update(None, "journal_mode", "DELETE")?;
-@@ -1193,7 +1193,7 @@
+@@ -1275,7 +1275,7 @@
  /// Reads the proof in `dir`. `None` for a missing, foreign, newer, corrupt or
  /// internally inconsistent file: the caller then takes the full check.
  pub(crate) fn read_tree_proof(dir: &Path) -> Option<TreeProof> {
@@ -3279,7 +3319,7 @@
          crate::db::lifecycle::sqlite_open_path(&dir.join(TREE_PROOF_FILE)),
          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
      )
-@@ -1697,7 +1697,7 @@
+@@ -1904,7 +1904,7 @@
          )
          .unwrap();
          assert!(read_evidence(&route.member_dir(), "g-two", &guard).is_none());
@@ -3334,7 +3374,7 @@
  #[cfg(test)]
 --- a/crates/aft/tests/store_diet/harness.rs
 +++ b/crates/aft/tests/store_diet/harness.rs
-@@ -167,7 +167,7 @@
+@@ -177,7 +177,7 @@
  ) -> std::result::Result<TestViewBuild, String> {
      use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
      let blobs = temp.join("blobs.sqlite");
@@ -3343,7 +3383,7 @@
      connection.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
      let mut entries = Vec::new();
      let mut shapes = BTreeMap::<String, usize>::new();
-@@ -331,7 +331,7 @@
+@@ -345,7 +345,7 @@
      // Other databases and transaction-local tables do not live in a finished
      // graph fixture. Keep their schemas on a separate in-memory connection.
      // Actual graph plans always use the real fixture's schema first.
@@ -3352,7 +3392,7 @@
      let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
      for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
          let _ = auxiliary.execute_batch(&sql.unwrap());
-@@ -945,9 +945,9 @@
+@@ -959,9 +959,9 @@
      for reverse in [false, true] {
          let copy = directory.join(format!("copy-{reverse}.sqlite"));
          let source_connection =
@@ -3364,7 +3404,7 @@
          rusqlite::backup::Backup::new(&source_connection, &mut destination)
              .unwrap()
              .run_to_completion(64, std::time::Duration::from_millis(0), None)
-@@ -970,7 +970,7 @@
+@@ -984,7 +984,7 @@
              "{error}"
          );
          let connection =
@@ -3373,7 +3413,7 @@
          assert_eq!(
              dispatch_rows(&connection),
              after["rows"],
-@@ -992,7 +992,7 @@
+@@ -1006,7 +1006,7 @@
      Vec<(crate::views::RelPath, crate::views::ManifestEntry)>,
  ) {
      use crate::views::{Manifest, ManifestEntry};

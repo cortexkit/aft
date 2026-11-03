@@ -42,6 +42,15 @@
     "sql-025d55c1bb40ac0558b7:literal/0": [
       "SEARCH accounting USING INTEGER PRIMARY KEY (rowid=?)"
     ],
+    "sql-026d5e0d4beffd5e3275:literal/0": [
+      "SCAN edges"
+    ],
+    "sql-026d5e0d4beffd5e3275:literal/1": [],
+    "sql-026d5e0d4beffd5e3275:literal/2": [
+      "SCAN reversed_edges",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-026d5e0d4beffd5e3275:literal/3": [],
     "sql-026ffd05ba8e7d3f0cc0:literal/0": [
       "SEARCH standing_roots USING INDEX sqlite_autoindex_standing_roots_1 (literal_path=?)"
     ],
@@ -434,11 +443,28 @@
     "sql-1282c21b49aa4241d729:literal/0": [
       "SEARCH access_grants USING INDEX sqlite_autoindex_access_grants_1 (owner=? AND scope_ref=? AND epoch=?)"
     ],
+    "sql-12fe373feda133cc9d2f:batch-1/0": [
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR LAST 7 TERMS OF ORDER BY"
+    ],
+    "sql-12fe373feda133cc9d2f:batch-999/0": [
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR LAST 7 TERMS OF ORDER BY"
+    ],
     "sql-136ef25f7e69fb5c7715:literal/0": [],
     "sql-1403c668cc3755c37737:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
       "SEARCH gh_speech_legacy_dispatch USING COVERING INDEX sqlite_autoindex_gh_speech_legacy_dispatch_1 (request_nonce=?)"
+    ],
+    "sql-1447046fe49b0c69accb:literal/0": [
+      "SCAN edges"
     ],
     "sql-14c4096612473c9e78ea:literal/0": [
       "SCAN rich_ui_session_presets USING COVERING INDEX idx_rich_ui_session_presets_recorded"
@@ -498,9 +524,78 @@
       "SCALAR SUBQUERY 1",
       "SCAN store_meta"
     ],
-    "sql-1834f24a56c6a3617973:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT caller_file, kind, module_path, full_ref, wildcard FROM refs\n                 WHERE kind IN ('import', 'reexport', 'module') AND module_path IS NOT NULL\n                   AND ((caller_file NOT GLOB '*.rs' AND ({js}))\n                        OR (caller_file GLOB '*.rs' AND ({rust})))\n                 ORDER BY caller_file, byte_start, ref_id at offset 237"
-    },
+    "sql-1834f24a56c6a3617973:js-0-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-184733d24b8a233f3e67:literal/0": [
       "SEARCH view_module_digest_inputs USING PRIMARY KEY (input=?)"
     ],
@@ -576,9 +671,6 @@
     ],
     "sql-1acf73985026c5fc9d77:literal/0": [
       "SCAN gh_speech_authorities"
-    ],
-    "sql-1adb0b45321f515f8316:literal/0": [
-      "SEARCH rich_ui_templates USING INDEX sqlite_autoindex_rich_ui_templates_1 (digest=?)"
     ],
     "sql-1ae3c24f83a38a6f4f35:literal/0": [
       "SCAN sqlite_master"
@@ -804,15 +896,6 @@
     "sql-247b757cb72c673d28c0:literal/0": [
       "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)"
     ],
-    "sql-24cb856d1d3ef7b165ff:literal/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
     "sql-24dda11d99f131c61a05:literal/0": [],
     "sql-250e3bf2bf5727a2793f:literal/0": {
       "unprepared": "duplicate column name: tool_result_source"
@@ -841,9 +924,6 @@
     ],
     "sql-2746f423740d66a4a545:literal/0": [
       "SEARCH registry_meta USING INTEGER PRIMARY KEY (rowid=?)"
-    ],
-    "sql-274ac9426c4c6d881214:literal/0": [
-      "SEARCH bash_tasks USING INDEX idx_bash_tasks_task_owner (task_id=?)"
     ],
     "sql-27808b6f6b2170088328:literal/0": [],
     "sql-2781ef0c1bd8633191ad:literal/0": [],
@@ -1446,7 +1526,6 @@
     "sql-43692bd2c5ba3c5511a9:literal/2": [],
     "sql-43692bd2c5ba3c5511a9:literal/3": [],
     "sql-43692bd2c5ba3c5511a9:literal/4": [],
-    "sql-43a5eb6a40f2bf739c8c:literal/0": [],
     "sql-43a7e19313aeb96d14ba:literal/0": {
       "unprepared": "table blob_payloads has 6 columns but 4 values were supplied"
     },
@@ -1895,32 +1974,6 @@
     "sql-594029dee21d4763bdde:literal/0": [
       "SCAN pragma_table_info VIRTUAL TABLE INDEX 0:"
     ],
-    "sql-598179072b9bb0d815e9:batch-1/0": [
-      "CO-ROUTINE requested",
-      "SCAN CONSTANT ROW",
-      "SCAN requested",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
-    "sql-598179072b9bb0d815e9:batch-499/0": [
-      "CO-ROUTINE requested",
-      "SCAN 499 CONSTANT ROWS",
-      "SCAN requested",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-598ce758df66aa59f1c1:literal/0": [
       "SCAN schema_version"
     ],
@@ -1951,9 +2004,6 @@
       "SEARCH nodes USING INDEX sqlite_autoindex_nodes_1 (id=?)",
       "SCALAR SUBQUERY 1",
       "SCAN nodes USING COVERING INDEX sqlite_autoindex_nodes_1"
-    ],
-    "sql-5b4794c6cb9c5c973dfe:literal/0": [
-      "SCAN rich_ui_templates USING COVERING INDEX sqlite_autoindex_rich_ui_templates_1"
     ],
     "sql-5b619536858352edee0e:literal/0": [],
     "sql-5b662e8b3dbed1449764:literal/0": [
@@ -2142,9 +2192,6 @@
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
-    "sql-663c3eb947d66f54f925:literal/0": [
-      "SEARCH bash_view_records USING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)"
-    ],
     "sql-6652ad4c480c842d66ac:literal/0": [],
     "sql-667f1183cea66289298f:literal/0": [],
     "sql-667f1183cea66289298f:literal/1": [],
@@ -2183,6 +2230,17 @@
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
     "sql-68778f76bf1ac5f9a326:literal/0": [],
+    "sql-68ab76694d85aa9b5da0:literal/0": [
+      "MATERIALIZE (join-1)",
+      "SCAN tgt",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-68bf5d060338470d12c4:literal/0": [],
     "sql-693c14236a599a2c53ab:literal/0": [
       "SEARCH blob_payloads USING INDEX blob_locator (full_key=?)"
@@ -2419,15 +2477,6 @@
     ],
     "sql-7596589f6b6304ff3721:literal/0": [],
     "sql-759e020ffabc6dcfccd8:literal/0": [],
-    "sql-759e29f7d7866980d54b:literal/0": [
-      "MATERIALIZE (join-1)",
-      "SCAN tgt",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-75d1640111f33dd65b7c:literal/0": [],
     "sql-75e60e55c351ce15f41a:literal/0": [],
     "sql-75e60e55c351ce15f41a:literal/1": [],
@@ -2510,6 +2559,32 @@
     "sql-7a3e554d08724a2776e7:literal/0": {
       "unprepared": "near \"directory\": syntax error in EXPLAIN QUERY PLAN create index fixture directory at offset 40"
     },
+    "sql-7a8c0c034c250beef833:batch-1/0": [
+      "CO-ROUTINE requested",
+      "SCAN CONSTANT ROW",
+      "SCAN requested",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-7a8c0c034c250beef833:batch-499/0": [
+      "CO-ROUTINE requested",
+      "SCAN 499 CONSTANT ROWS",
+      "SCAN requested",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-7aa54d24f6072e3e74ab:literal/0": [
       "SCAN backend_file_state USING COVERING INDEX sqlite_autoindex_backend_file_state_1",
       "USE TEMP B-TREE FOR DISTINCT"
@@ -2629,7 +2704,6 @@
     "sql-7f2f2acf4cbb0bac953c:literal/0": [
       "SEARCH backups USING INDEX idx_backups_session_path_order (harness=? AND session_id=? AND path_hash=?)"
     ],
-    "sql-7f42c8977ae7a6f9a0c8:literal/0": [],
     "sql-7f44f3d12817856c7a42:literal/0": [],
     "sql-7f4cc1f58dddcde24647:literal/0": [],
     "sql-7f668cd40c688c4991d3:literal/0": [],
@@ -3570,6 +3644,15 @@
     "sql-a7f9d0a89602c92c28dd:literal/0": [
       "SEARCH refs USING INDEX idx_refs_caller_file (caller_file=?)"
     ],
+    "sql-a819e0775f0cc523f9b8:literal/0": [
+      "MATERIALIZE (join-1)",
+      "SCAN tgt",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-a81aff5ee1cfc444b604:literal/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
@@ -3608,7 +3691,6 @@
     "sql-a8a48fbf385674a18006:literal/0": [
       "SCAN store_meta"
     ],
-    "sql-a8ac741d44f307d16478:literal/0": [],
     "sql-a8ad2b46740550ca359b:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN INSERT INTO refs ({columns}) SELECT {columns} FROM probe_rows at offset 37"
     },
@@ -3625,20 +3707,6 @@
     "sql-a8e898bc69a3901cf85d:literal/0": [],
     "sql-a8f7a4ecaaa2b77e408a:literal/0": [
       "SEARCH store_meta USING INTEGER PRIMARY KEY (rowid=?)"
-    ],
-    "sql-a904f0cc16853cbf8679:batch-1/0": [
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY"
-    ],
-    "sql-a904f0cc16853cbf8679:batch-999/0": [
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY"
     ],
     "sql-a9257897ca2714a62f58:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT s.name, (SELECT json_group_array(json_object('name',p.name,'type',p.type)) FROM pragma_table_info(s.name) p) AS columns FROM ({names}) s WHERE {predicate} UNION ALL SELECT name, NULL AS columns FROM ({names}) WHERE NOT EXISTS (SELECT 1 FROM ({names}) s WHERE {predicate}) at offset 152"
@@ -3960,24 +4028,6 @@
     ],
     "sql-b4c813b648313fbde117:literal/0": [],
     "sql-b4cadd60c5734869932f:literal/0": [],
-    "sql-b4e48a22a0913d53e515:batch-1/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
-    "sql-b4e48a22a0913d53e515:batch-999/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
     "sql-b4ecb49c12ec637e0def:literal/0": [
       "SEARCH bash_pattern_watches USING INDEX idx_bash_pattern_watches_session (harness=?)",
       "USE TEMP B-TREE FOR ORDER BY"
@@ -4807,17 +4857,6 @@
     "sql-dda98f00dc53a565421d:literal/0": [
       "SEARCH format_meta USING INTEGER PRIMARY KEY (rowid=?)"
     ],
-    "sql-ddb4185f531e69efb77e:literal/0": [
-      "MATERIALIZE (join-1)",
-      "SCAN tgt",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-ddd599efffe692c32ce1:literal/0": [
       "SEARCH refs USING INTEGER PRIMARY KEY (rowid>?)",
       "SEARCH staging_ref_context USING INDEX sqlite_autoindex_staging_ref_context_1 (ref_id=?) LEFT-JOIN"
@@ -5118,9 +5157,6 @@
       "SCAN blob_payloads",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-e939bfccdaf3b3f80e07:literal/0": [
-      "SCAN bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1"
-    ],
     "sql-e99ba666b84344b231d4:literal/0": {
       "unprepared": "foreign key mismatch - \"blob_liveness\" referencing \"blob_payloads\""
     },
@@ -5255,9 +5291,6 @@
     ],
     "sql-f2a8fe59928b92027f67:literal/0": [],
     "sql-f2a8fe59928b92027f67:literal/1": [],
-    "sql-f2ad02fbd9ee33fba92c:literal/0": [
-      "SEARCH bash_view_records USING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)"
-    ],
     "sql-f2cdde7f34e67face7d6:literal/0": [
       "SEARCH call_ledger USING INDEX sqlite_autoindex_call_ledger_1 (carrier=? AND call_key=?)",
       "SEARCH call_ledger_updates USING COVERING INDEX sqlite_autoindex_call_ledger_updates_3 (carrier=? AND call_key=?)"
@@ -5295,7 +5328,6 @@
     "sql-f5bde26dba5aaf3b499a:literal/0": [
       "SCAN compression_events USING COVERING INDEX idx_compression_created"
     ],
-    "sql-f66c415f72c4d4465d6d:literal/0": [],
     "sql-f6bd5d0ed3e8b2d8abc5:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],
@@ -5559,6 +5591,15 @@
     "sql-025d55c1bb40ac0558b7:literal/0": [
       "SEARCH accounting USING INTEGER PRIMARY KEY (rowid=?)"
     ],
+    "sql-026d5e0d4beffd5e3275:literal/0": [
+      "SCAN edges"
+    ],
+    "sql-026d5e0d4beffd5e3275:literal/1": [],
+    "sql-026d5e0d4beffd5e3275:literal/2": [
+      "SCAN reversed_edges",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-026d5e0d4beffd5e3275:literal/3": [],
     "sql-026ffd05ba8e7d3f0cc0:literal/0": [
       "SEARCH standing_roots USING INDEX sqlite_autoindex_standing_roots_1 (literal_path=?)"
     ],
@@ -5951,11 +5992,28 @@
     "sql-1282c21b49aa4241d729:literal/0": [
       "SEARCH access_grants USING INDEX sqlite_autoindex_access_grants_1 (owner=? AND scope_ref=? AND epoch=?)"
     ],
+    "sql-12fe373feda133cc9d2f:batch-1/0": [
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR LAST 7 TERMS OF ORDER BY"
+    ],
+    "sql-12fe373feda133cc9d2f:batch-999/0": [
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR LAST 7 TERMS OF ORDER BY"
+    ],
     "sql-136ef25f7e69fb5c7715:literal/0": [],
     "sql-1403c668cc3755c37737:literal/0": [
       "SCAN CONSTANT ROW",
       "SCALAR SUBQUERY 1",
       "SEARCH gh_speech_legacy_dispatch USING COVERING INDEX sqlite_autoindex_gh_speech_legacy_dispatch_1 (request_nonce=?)"
+    ],
+    "sql-1447046fe49b0c69accb:literal/0": [
+      "SCAN edges"
     ],
     "sql-14c4096612473c9e78ea:literal/0": [
       "SCAN rich_ui_session_presets USING COVERING INDEX idx_rich_ui_session_presets_recorded"
@@ -6015,9 +6073,78 @@
       "SCALAR SUBQUERY 1",
       "SCAN store_meta"
     ],
-    "sql-1834f24a56c6a3617973:literal/0": {
-      "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT caller_file, kind, module_path, full_ref, wildcard FROM refs\n                 WHERE kind IN ('import', 'reexport', 'module') AND module_path IS NOT NULL\n                   AND ((caller_file NOT GLOB '*.rs' AND ({js}))\n                        OR (caller_file GLOB '*.rs' AND ({rust})))\n                 ORDER BY caller_file, byte_start, ref_id at offset 237"
-    },
+    "sql-1834f24a56c6a3617973:js-0-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-0-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-1-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-0-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-0-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-1-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-1-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-2-crate-0/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-1834f24a56c6a3617973:js-2-rust-2-crate-1/0": [
+      "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-184733d24b8a233f3e67:literal/0": [
       "SEARCH view_module_digest_inputs USING PRIMARY KEY (input=?)"
     ],
@@ -6093,9 +6220,6 @@
     ],
     "sql-1acf73985026c5fc9d77:literal/0": [
       "SCAN gh_speech_authorities"
-    ],
-    "sql-1adb0b45321f515f8316:literal/0": [
-      "SEARCH rich_ui_templates USING INDEX sqlite_autoindex_rich_ui_templates_1 (digest=?)"
     ],
     "sql-1ae3c24f83a38a6f4f35:literal/0": [
       "SCAN sqlite_master"
@@ -6321,15 +6445,6 @@
     "sql-247b757cb72c673d28c0:literal/0": [
       "SEARCH refs USING INDEX idx_refs_kind_caller_file (kind=?)"
     ],
-    "sql-24cb856d1d3ef7b165ff:literal/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
     "sql-24dda11d99f131c61a05:literal/0": [],
     "sql-250e3bf2bf5727a2793f:literal/0": {
       "unprepared": "duplicate column name: tool_result_source"
@@ -6358,9 +6473,6 @@
     ],
     "sql-2746f423740d66a4a545:literal/0": [
       "SEARCH registry_meta USING INTEGER PRIMARY KEY (rowid=?)"
-    ],
-    "sql-274ac9426c4c6d881214:literal/0": [
-      "SEARCH bash_tasks USING INDEX idx_bash_tasks_task_owner (task_id=?)"
     ],
     "sql-27808b6f6b2170088328:literal/0": [],
     "sql-2781ef0c1bd8633191ad:literal/0": [],
@@ -6963,7 +7075,6 @@
     "sql-43692bd2c5ba3c5511a9:literal/2": [],
     "sql-43692bd2c5ba3c5511a9:literal/3": [],
     "sql-43692bd2c5ba3c5511a9:literal/4": [],
-    "sql-43a5eb6a40f2bf739c8c:literal/0": [],
     "sql-43a7e19313aeb96d14ba:literal/0": {
       "unprepared": "table blob_payloads has 6 columns but 4 values were supplied"
     },
@@ -7412,32 +7523,6 @@
     "sql-594029dee21d4763bdde:literal/0": [
       "SCAN pragma_table_info VIRTUAL TABLE INDEX 0:"
     ],
-    "sql-598179072b9bb0d815e9:batch-1/0": [
-      "CO-ROUTINE requested",
-      "SCAN CONSTANT ROW",
-      "SCAN requested",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
-    "sql-598179072b9bb0d815e9:batch-499/0": [
-      "CO-ROUTINE requested",
-      "SCAN 499 CONSTANT ROWS",
-      "SCAN requested",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-598ce758df66aa59f1c1:literal/0": [
       "SCAN schema_version"
     ],
@@ -7468,9 +7553,6 @@
       "SEARCH nodes USING INDEX sqlite_autoindex_nodes_1 (id=?)",
       "SCALAR SUBQUERY 1",
       "SCAN nodes USING COVERING INDEX sqlite_autoindex_nodes_1"
-    ],
-    "sql-5b4794c6cb9c5c973dfe:literal/0": [
-      "SCAN rich_ui_templates USING COVERING INDEX sqlite_autoindex_rich_ui_templates_1"
     ],
     "sql-5b619536858352edee0e:literal/0": [],
     "sql-5b662e8b3dbed1449764:literal/0": [
@@ -7659,9 +7741,6 @@
       "SEARCH bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)",
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
-    "sql-663c3eb947d66f54f925:literal/0": [
-      "SEARCH bash_view_records USING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)"
-    ],
     "sql-6652ad4c480c842d66ac:literal/0": [],
     "sql-667f1183cea66289298f:literal/0": [],
     "sql-667f1183cea66289298f:literal/1": [],
@@ -7700,6 +7779,17 @@
       "SEARCH bash_pattern_watches USING COVERING INDEX idx_bash_pattern_watches_task (harness=? AND session_id=? AND task_id=?)"
     ],
     "sql-68778f76bf1ac5f9a326:literal/0": [],
+    "sql-68ab76694d85aa9b5da0:literal/0": [
+      "MATERIALIZE (join-1)",
+      "SCAN tgt",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-68bf5d060338470d12c4:literal/0": [],
     "sql-693c14236a599a2c53ab:literal/0": [
       "SEARCH blob_payloads USING INDEX blob_locator (full_key=?)"
@@ -7936,15 +8026,6 @@
     ],
     "sql-7596589f6b6304ff3721:literal/0": [],
     "sql-759e020ffabc6dcfccd8:literal/0": [],
-    "sql-759e29f7d7866980d54b:literal/0": [
-      "MATERIALIZE (join-1)",
-      "SCAN tgt",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-75d1640111f33dd65b7c:literal/0": [],
     "sql-75e60e55c351ce15f41a:literal/0": [],
     "sql-75e60e55c351ce15f41a:literal/1": [],
@@ -8027,6 +8108,32 @@
     "sql-7a3e554d08724a2776e7:literal/0": {
       "unprepared": "near \"directory\": syntax error in EXPLAIN QUERY PLAN create index fixture directory at offset 40"
     },
+    "sql-7a8c0c034c250beef833:batch-1/0": [
+      "CO-ROUTINE requested",
+      "SCAN CONSTANT ROW",
+      "SCAN requested",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "sql-7a8c0c034c250beef833:batch-499/0": [
+      "CO-ROUTINE requested",
+      "SCAN 499 CONSTANT ROWS",
+      "SCAN requested",
+      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
+      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
+      "USING INDEX sqlite_autoindex_files_1 FOR IN-OPERATOR",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-7aa54d24f6072e3e74ab:literal/0": [
       "SCAN backend_file_state USING COVERING INDEX sqlite_autoindex_backend_file_state_1",
       "USE TEMP B-TREE FOR DISTINCT"
@@ -8146,7 +8253,6 @@
     "sql-7f2f2acf4cbb0bac953c:literal/0": [
       "SEARCH backups USING INDEX idx_backups_session_path_order (harness=? AND session_id=? AND path_hash=?)"
     ],
-    "sql-7f42c8977ae7a6f9a0c8:literal/0": [],
     "sql-7f44f3d12817856c7a42:literal/0": [],
     "sql-7f4cc1f58dddcde24647:literal/0": [],
     "sql-7f668cd40c688c4991d3:literal/0": [],
@@ -9087,6 +9193,15 @@
     "sql-a7f9d0a89602c92c28dd:literal/0": [
       "SEARCH refs USING INDEX idx_refs_caller_file (caller_file=?)"
     ],
+    "sql-a819e0775f0cc523f9b8:literal/0": [
+      "MATERIALIZE (join-1)",
+      "SCAN tgt",
+      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
+      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
+      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
+      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
     "sql-a81aff5ee1cfc444b604:literal/0": [
       "SCAN nodes USING COVERING INDEX idx_nodes_scoped"
     ],
@@ -9125,7 +9240,6 @@
     "sql-a8a48fbf385674a18006:literal/0": [
       "SCAN store_meta"
     ],
-    "sql-a8ac741d44f307d16478:literal/0": [],
     "sql-a8ad2b46740550ca359b:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN INSERT INTO refs ({columns}) SELECT {columns} FROM probe_rows at offset 37"
     },
@@ -9142,20 +9256,6 @@
     "sql-a8e898bc69a3901cf85d:literal/0": [],
     "sql-a8f7a4ecaaa2b77e408a:literal/0": [
       "SEARCH store_meta USING INTEGER PRIMARY KEY (rowid=?)"
-    ],
-    "sql-a904f0cc16853cbf8679:batch-1/0": [
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY"
-    ],
-    "sql-a904f0cc16853cbf8679:batch-999/0": [
-      "SEARCH e USING INDEX idx_edges_source_kind (source_node=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH tgt USING INDEX sqlite_autoindex_nodes_1 (id=?) LEFT-JOIN",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY"
     ],
     "sql-a9257897ca2714a62f58:literal/0": {
       "unprepared": "unrecognized token: \"{\" in EXPLAIN QUERY PLAN SELECT s.name, (SELECT json_group_array(json_object('name',p.name,'type',p.type)) FROM pragma_table_info(s.name) p) AS columns FROM ({names}) s WHERE {predicate} UNION ALL SELECT name, NULL AS columns FROM ({names}) WHERE NOT EXISTS (SELECT 1 FROM ({names}) s WHERE {predicate}) at offset 152"
@@ -9477,24 +9577,6 @@
     ],
     "sql-b4c813b648313fbde117:literal/0": [],
     "sql-b4cadd60c5734869932f:literal/0": [],
-    "sql-b4e48a22a0913d53e515:batch-1/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
-    "sql-b4e48a22a0913d53e515:batch-999/0": [
-      "SCAN rich_ui_templates",
-      "LIST SUBQUERY 2",
-      "COMPOUND QUERY",
-      "LEFT-MOST SUBQUERY",
-      "SCAN bash_view_records",
-      "UNION USING TEMP B-TREE",
-      "SCAN bash_view_records"
-    ],
     "sql-b4ecb49c12ec637e0def:literal/0": [
       "SEARCH bash_pattern_watches USING INDEX idx_bash_pattern_watches_session (harness=?)",
       "USE TEMP B-TREE FOR ORDER BY"
@@ -10324,17 +10406,6 @@
     "sql-dda98f00dc53a565421d:literal/0": [
       "SEARCH format_meta USING INTEGER PRIMARY KEY (rowid=?)"
     ],
-    "sql-ddb4185f531e69efb77e:literal/0": [
-      "MATERIALIZE (join-1)",
-      "SCAN tgt",
-      "SEARCH tgt_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH e USING INDEX idx_edges_target_file_symbol (target_file=? AND target_symbol=? AND kind=?)",
-      "SEARCH r USING INDEX sqlite_autoindex_refs_1 (ref_id=?)",
-      "SEARCH src USING INDEX sqlite_autoindex_nodes_1 (id=?)",
-      "SEARCH src_file USING INDEX sqlite_autoindex_files_1 (path=?)",
-      "SEARCH (join-1) USING AUTOMATIC COVERING INDEX (id=?) LEFT-JOIN",
-      "USE TEMP B-TREE FOR ORDER BY"
-    ],
     "sql-ddd599efffe692c32ce1:literal/0": [
       "SEARCH refs USING INTEGER PRIMARY KEY (rowid>?)",
       "SEARCH staging_ref_context USING INDEX sqlite_autoindex_staging_ref_context_1 (ref_id=?) LEFT-JOIN"
@@ -10635,9 +10706,6 @@
       "SCAN blob_payloads",
       "USE TEMP B-TREE FOR ORDER BY"
     ],
-    "sql-e939bfccdaf3b3f80e07:literal/0": [
-      "SCAN bash_view_records USING COVERING INDEX sqlite_autoindex_bash_view_records_1"
-    ],
     "sql-e99ba666b84344b231d4:literal/0": {
       "unprepared": "foreign key mismatch - \"blob_liveness\" referencing \"blob_payloads\""
     },
@@ -10772,9 +10840,6 @@
     ],
     "sql-f2a8fe59928b92027f67:literal/0": [],
     "sql-f2a8fe59928b92027f67:literal/1": [],
-    "sql-f2ad02fbd9ee33fba92c:literal/0": [
-      "SEARCH bash_view_records USING INDEX sqlite_autoindex_bash_view_records_1 (harness=? AND session_id=? AND task_id=?)"
-    ],
     "sql-f2cdde7f34e67face7d6:literal/0": [
       "SEARCH call_ledger USING INDEX sqlite_autoindex_call_ledger_1 (carrier=? AND call_key=?)",
       "SEARCH call_ledger_updates USING COVERING INDEX sqlite_autoindex_call_ledger_updates_3 (carrier=? AND call_key=?)"
@@ -10812,7 +10877,6 @@
     "sql-f5bde26dba5aaf3b499a:literal/0": [
       "SCAN compression_events USING COVERING INDEX idx_compression_created"
     ],
-    "sql-f66c415f72c4d4465d6d:literal/0": [],
     "sql-f6bd5d0ed3e8b2d8abc5:literal/0": [
       "SEARCH members USING INDEX sqlite_autoindex_members_1 (scope=?)"
     ],

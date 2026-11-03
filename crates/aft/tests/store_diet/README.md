@@ -56,9 +56,12 @@ SQLite's Unix virtual file system limits complete filenames to 512 bytes, and de
 already consume about half of that budget. Cache contents never leave the
 checkout, and only directories marked with the selected full SHA are reset.
 
-The initial pre-fix recordings are provisional. Main's selective re-resolution
-fix adds stored target identity/provenance tie-breaks to four edge queries; any
-older tied-order drift is a known producer issue, not a diet regression. Future
+The committed recording uses main at `a2f2cddb98e5f0748b6bb95e41a91500b1c01062`,
+including selective re-resolution's stored target identity/provenance tie-breaks
+on four edge queries. The earlier `998c896` baseline omitted those keys, allowing
+refresh and cold builds to return tied edges in different orders. Its recordings
+were provisional because reply order could drift before any storage encoding
+changed. Future
 resolver changes with an intentional answer/version change require another
 named-main recording before testing the encoding candidate.
 
