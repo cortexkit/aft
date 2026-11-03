@@ -96,8 +96,15 @@ impl AcquisitionOwner {
         let stopped = self.stopped.clone();
         #[cfg(test)]
         let root = self.root.clone();
+        // Fixture attribute-source overrides are thread-local. Keep the same
+        // test Git policy when acquisition moves onto a worker.
+        #[cfg(test)]
+        let attribute_sources = super::verification::attribute_sources_snapshot_for_test();
         let run = move || {
             let _completion = completion;
+            #[cfg(test)]
+            let _attributes =
+                super::verification::install_attribute_sources_for_test(attribute_sources);
             let _cancel = crate::executor::current_job_cancellation()
                 .is_none()
                 .then(|| crate::executor::install_job_cancellation(token));

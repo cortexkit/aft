@@ -1296,6 +1296,40 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_worker_preserves_attribute_fixture_scope() {
+        struct PolicySource(Option<[PathBuf; 2]>);
+        impl CallgraphReaderSource for PolicySource {
+            fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+                assert_eq!(
+                    super::super::verification::attribute_sources_snapshot_for_test(),
+                    self.0
+                );
+                Err("fixture acquisition completed under its policy".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let _attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
+        let expected = super::super::verification::attribute_sources_snapshot_for_test();
+        assert!(expected.is_some());
+        let graph = CallgraphView::with_source(
+            root,
+            crate::root_cache::StoragePaths::same(&temp.path().join("storage")),
+            "fixture-policy".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+            Arc::new(PolicySource(expected)),
+        );
+        let error = graph.reader().unwrap_err();
+        assert_eq!(
+            error.reason,
+            "fixture acquisition completed under its policy"
+        );
+    }
+
+    #[test]
     fn fixture_reader_joins_acquisition_after_interactive_wait_expires() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();

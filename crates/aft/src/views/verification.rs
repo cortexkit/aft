@@ -31,7 +31,19 @@ pub(crate) fn known_attribute_sources_for_test(root: &Path) -> AttributeSourcesG
         root.join("absent-global-attributes"),
     ];
     assert!(sources.iter().all(|p| !p.exists()));
-    AttributeSourcesGuard(ATTRIBUTE_SOURCES.with(|paths| paths.replace(Some(sources))))
+    install_attribute_sources_for_test(Some(sources))
+}
+
+#[cfg(test)]
+pub(crate) fn attribute_sources_snapshot_for_test() -> Option<[PathBuf; 2]> {
+    ATTRIBUTE_SOURCES.with(|paths| paths.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn install_attribute_sources_for_test(
+    sources: Option<[PathBuf; 2]>,
+) -> AttributeSourcesGuard {
+    AttributeSourcesGuard(ATTRIBUTE_SOURCES.with(|paths| paths.replace(sources)))
 }
 use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane};
 
