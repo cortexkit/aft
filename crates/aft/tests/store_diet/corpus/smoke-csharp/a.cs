@@ -1,0 +1,1 @@
+class C { void F() {} void G() { F(); } }

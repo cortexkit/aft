@@ -1,0 +1,338 @@
+[
+  {
+    "table": "backend_file_state",
+    "column": "workspace_root",
+    "index": "diet_sweep_backend_file_state_workspace_root",
+    "new_index": true,
+    "probe": "SELECT 1 FROM backend_file_state WHERE workspace_root = ?1 LIMIT 1"
+  },
+  {
+    "table": "backend_file_state",
+    "column": "file_path",
+    "index": "idx_backend_file_state_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM backend_file_state WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "dispatch_hints",
+    "column": "method_name",
+    "index": "idx_dispatch_hints_method",
+    "new_index": false,
+    "probe": "SELECT 1 FROM dispatch_hints WHERE method_name = ?1 LIMIT 1"
+  },
+  {
+    "table": "dispatch_hints",
+    "column": "file",
+    "index": "idx_dispatch_hints_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM dispatch_hints WHERE file = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "target_file",
+    "index": "idx_edges_target_file_symbol",
+    "new_index": false,
+    "probe": "SELECT 1 FROM edges WHERE target_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "target_symbol",
+    "index": "diet_sweep_edges_target_symbol",
+    "new_index": true,
+    "probe": "SELECT 1 FROM edges WHERE target_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "file_dependencies",
+    "column": "file_path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM file_dependencies WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "file_dependencies",
+    "column": "dep_file",
+    "index": "idx_file_dependencies_dep_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM file_dependencies WHERE dep_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "files",
+    "column": "path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM files WHERE path = ?1 LIMIT 1"
+  },
+  {
+    "table": "nodes",
+    "column": "file_path",
+    "index": "idx_nodes_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM nodes WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "nodes",
+    "column": "name",
+    "index": "idx_nodes_name",
+    "new_index": false,
+    "probe": "SELECT 1 FROM nodes WHERE name = ?1 LIMIT 1"
+  },
+  {
+    "table": "nodes",
+    "column": "scoped_name",
+    "index": "idx_nodes_scoped",
+    "new_index": false,
+    "probe": "SELECT 1 FROM nodes WHERE scoped_name = ?1 LIMIT 1"
+  },
+  {
+    "table": "nodes",
+    "column": "signature",
+    "index": "diet_sweep_nodes_signature",
+    "new_index": true,
+    "probe": "SELECT 1 FROM nodes WHERE signature = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "caller_file",
+    "index": "idx_refs_caller_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM refs WHERE caller_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "short_name",
+    "index": "idx_refs_short_name",
+    "new_index": false,
+    "probe": "SELECT 1 FROM refs WHERE short_name = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "callee_last_segment",
+    "index": "diet_sweep_refs_callee_last_segment",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE callee_last_segment = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "full_ref",
+    "index": "diet_sweep_refs_full_ref",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE full_ref = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "module_path",
+    "index": "diet_sweep_refs_module_path",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE module_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "local_name",
+    "index": "diet_sweep_refs_local_name",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE local_name = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "requested_name",
+    "index": "diet_sweep_refs_requested_name",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE requested_name = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "namespace_alias",
+    "index": "diet_sweep_refs_namespace_alias",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE namespace_alias = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "target_file",
+    "index": "idx_refs_target_file",
+    "new_index": false,
+    "probe": "SELECT 1 FROM refs WHERE target_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "target_symbol",
+    "index": "diet_sweep_refs_target_symbol",
+    "new_index": true,
+    "probe": "SELECT 1 FROM refs WHERE target_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "resolution_config_fields",
+    "column": "path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM resolution_config_fields WHERE path = ?1 LIMIT 1"
+  },
+  {
+    "table": "staging_file_inventory",
+    "column": "path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM staging_file_inventory WHERE path = ?1 LIMIT 1"
+  },
+  {
+    "table": "staging_ref_context",
+    "column": "caller_symbol",
+    "index": "diet_sweep_staging_ref_context_caller_symbol",
+    "new_index": true,
+    "probe": "SELECT 1 FROM staging_ref_context WHERE caller_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "type_ref_names",
+    "column": "name",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM type_ref_names WHERE name = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_bindings",
+    "column": "file_path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_bindings WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_dispatch_dependencies",
+    "column": "file_path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_dispatch_dependencies WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_dispatch_dependencies",
+    "column": "dependency",
+    "index": "idx_view_dispatch_dependencies_dependency",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_dispatch_dependencies WHERE dependency = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_dispatch_files",
+    "column": "file_path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_dispatch_files WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_dispatch_sites",
+    "column": "caller_file",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_dispatch_sites WHERE caller_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_file_surfaces",
+    "column": "file_path",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_file_surfaces WHERE file_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_module_digest_inputs",
+    "column": "input",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_module_digest_inputs WHERE input = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_module_path_targets",
+    "column": "target",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_module_path_targets WHERE target = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_module_path_targets",
+    "column": "source",
+    "index": "idx_view_module_path_targets_source",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_module_path_targets WHERE source = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_module_path_targets",
+    "column": "declared",
+    "index": "diet_sweep_view_module_path_targets_declared",
+    "new_index": true,
+    "probe": "SELECT 1 FROM view_module_path_targets WHERE declared = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_unknown_live",
+    "column": "caller_file",
+    "index": "PRIMARY KEY",
+    "new_index": false,
+    "probe": "SELECT 1 FROM view_unknown_live WHERE caller_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_unknown_live",
+    "column": "target_file",
+    "index": "diet_sweep_view_unknown_live_target_file",
+    "new_index": true,
+    "probe": "SELECT 1 FROM view_unknown_live WHERE target_file = ?1 LIMIT 1"
+  },
+  {
+    "table": "view_unknown_live",
+    "column": "target_symbol",
+    "index": "diet_sweep_view_unknown_live_target_symbol",
+    "new_index": true,
+    "probe": "SELECT 1 FROM view_unknown_live WHERE target_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "refs",
+    "column": "hash_caller_symbol",
+    "index": "diet_sweep_refs_hash_caller_symbol",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM refs WHERE hash_caller_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "dispatch_hints",
+    "column": "hash_caller_symbol",
+    "index": "diet_sweep_dispatch_hints_hash_caller_symbol",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM dispatch_hints WHERE hash_caller_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "id_site_path",
+    "index": "diet_sweep_edges_id_site_path",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM edges WHERE id_site_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "id_target_path",
+    "index": "diet_sweep_edges_id_target_path",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM edges WHERE id_target_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "id_target_symbol",
+    "index": "diet_sweep_edges_id_target_symbol",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM edges WHERE id_target_symbol = ?1 LIMIT 1"
+  },
+  {
+    "table": "edges",
+    "column": "ref_identity_path",
+    "index": "diet_sweep_edges_ref_identity_path",
+    "new_index": true,
+    "new_identity_input": true,
+    "probe": "SELECT 1 FROM edges WHERE ref_identity_path = ?1 LIMIT 1"
+  },
+  {
+    "table": "emitted_view_rows",
+    "column": "row_key",
+    "index": "PRIMARY KEY(table_name,row_key)",
+    "new_index": false,
+    "probe": "SELECT 1 FROM emitted_view_rows WHERE table_name = ?1 AND row_key = ?2 LIMIT 1",
+    "condition": "only path-keyed emitted tables, not identity-keyed tables"
+  }
+]
