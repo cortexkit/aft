@@ -35,7 +35,9 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Version 10 stores the parser's corrected symbols: Go type aliases, separate
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
-pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
+/// Version 14 records the facts behind precise Go receiver, Python package and
+/// `super()`, TypeScript object-member and Rust trait and associated calls.
+pub const PRODUCER: &str = "ruled-callgraph-v14-resolver-precision";
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1639,7 +1641,7 @@ mod tests {
             .to_string();
         assert!(mismatch.starts_with("view producer mismatch: manifest was produced by Producers"));
         assert!(mismatch.contains("ruled-callgraph-v11-callback-constructor-inline-test-items"));
-        assert!(mismatch.contains("ruled-callgraph-v13-python-import-bindings"));
+        assert!(mismatch.contains("ruled-callgraph-v14-resolver-precision"));
         let stale = GenerationName::for_manifest(&manifest).unwrap();
         let prepared = store
             .prepare_v2(&stale, Some(&current), &manifest, None)
