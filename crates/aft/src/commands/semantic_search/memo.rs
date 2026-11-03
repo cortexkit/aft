@@ -563,11 +563,7 @@ impl ExactMemoStore {
                 .saturating_add(incoming)
                 > MAX_EXACT_MEMO_BYTES
         {
-            let Some(victim) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.epoch)
-                .map(|(key, _)| key.clone())
-            else {
+            let Some(victim) = entries.keys().next().cloned() else {
                 break;
             };
             retire(&mut entries, victim);
