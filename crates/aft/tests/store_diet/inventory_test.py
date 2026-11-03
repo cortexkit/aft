@@ -45,6 +45,10 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
         self.assertEqual(inventory.owner_at(scopes, text.index('SELECT {'), path), {'owner': 'setup', 'test_only': True})
         self.assertEqual(inventory.owner_at(scopes, text.index('SELECT real'), path), {'owner': 'live', 'test_only': False})
 
+    def test_array_signature_semicolons_are_not_declaration_terminators(self):
+        text = 'fn declaration(); fn fixtures() -> [[u8; 2]; 1] { [[1, 2]] }'
+        self.assertEqual([s[3] for s in inventory.rust_scopes(text)], ['fixtures'])
+
     def test_cooked_sql_strings_keep_escaped_backslashes_and_decode_rust_unicode(self):
         decoded = inventory.cooked_string(r"SELECT '\\n', '\u{e9}', '\x41'")
         self.assertEqual(decoded, "SELECT '\\n', 'é', 'A'")

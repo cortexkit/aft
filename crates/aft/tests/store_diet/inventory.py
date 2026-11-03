@@ -60,6 +60,17 @@ def strings(text):
 
 def rust_scopes(text):
     masked = TOKEN.sub(lambda match: ''.join('\n' if char == '\n' else ' ' for char in match[0]), text)
+    # Array return types contain semicolons that are not declaration terminators.
+    headers = list(masked)
+    brackets = 0
+    for i, char in enumerate(masked):
+        if char == '[':
+            brackets += 1
+        elif char == ']':
+            brackets -= 1
+        elif char == ';' and brackets:
+            headers[i] = ' '
+    headers = ''.join(headers)
     stack, closing = [], {}
     for i, char in enumerate(masked):
         if char == '{':
@@ -67,7 +78,7 @@ def rust_scopes(text):
         elif char == '}' and stack:
             closing[stack.pop()] = i
     scopes = []
-    for match in re.finditer(r'\b(fn|mod)\s+(\w+)[^{;]*\{', masked):
+    for match in re.finditer(r'\b(fn|mod)\s+(\w+)[^{;]*\{', headers):
         body = match.end() - 1
         if body not in closing:
             continue
