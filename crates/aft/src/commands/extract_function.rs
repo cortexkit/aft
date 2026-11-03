@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn extract_function_this_reference_error() {
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let fixture = std::path::PathBuf::from(crate::test_support::manifest_dir())
             .join("tests/fixtures/extract_function/sample_this.ts");
 
         let req = make_request(

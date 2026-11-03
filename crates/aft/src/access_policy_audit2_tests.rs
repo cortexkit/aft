@@ -13,10 +13,10 @@ struct Fixture {
 }
 
 fn checkout_tempdir() -> tempfile::TempDir {
-    // Cargo and nextest run tests in the package's runtime checkout. A compiled
-    // manifest path still points at the producer when nextest relocates an archive.
+    // Nextest remaps the runtime manifest directory to the consumer checkout.
+    // A compiled manifest path would still point at the archive producer.
     // Stay outside system temp so its access-policy exemption cannot mask failures.
-    tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+    tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap()
 }
 
 impl Fixture {
@@ -954,8 +954,13 @@ fn backed_up_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
 #[test]
 fn audit2_fixtures_follow_the_runtime_checkout() {
     const CHILD: &str = "AFT_AUDIT2_RELOCATED_FIXTURE_CHILD";
+    let checkout = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        crate::test_support::manifest_dir().canonicalize().unwrap(),
+        checkout,
+        "the test runner must remap CARGO_MANIFEST_DIR to the consumer package"
+    );
     if std::env::var_os(CHILD).is_some() {
-        let checkout = std::env::current_dir().unwrap().canonicalize().unwrap();
         let fixture = Fixture::new();
         let (backup_dir, _root, _ctx) = backed_up_fixture();
         for dir in [&fixture._dir, &backup_dir] {
@@ -978,6 +983,7 @@ fn audit2_fixtures_follow_the_runtime_checkout() {
             "--nocapture",
         ])
         .env(CHILD, "1")
+        .env("CARGO_MANIFEST_DIR", checkout.path())
         .current_dir(checkout.path())
         .output()
         .unwrap();

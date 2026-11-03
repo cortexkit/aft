@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     fn fresh_linked_worktree() -> LinkedWorktree {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest_dir = Path::new(crate::test_support::manifest_dir());
         let output = Command::new("git")
             .current_dir(manifest_dir)
             .args(["rev-parse", "--show-toplevel"])

@@ -237,6 +237,8 @@ pub(crate) mod search_hot_path_measurements;
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

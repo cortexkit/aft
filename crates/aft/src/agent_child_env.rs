@@ -3812,7 +3812,7 @@ mod tests {
     fn dispatcher_output_capture_does_not_wait_for_resolver_descendants() {
         use std::process::Stdio;
 
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let scratch = Path::new(crate::test_support::manifest_dir()).join("../../target");
         fs::create_dir_all(&scratch).unwrap();
         let temp = tempfile::tempdir_in(scratch).unwrap();
         let git = temp.path().join("git");

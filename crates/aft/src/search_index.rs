@@ -7511,7 +7511,7 @@ mod membership_admission_tests {
     #[test]
     #[ignore = "benchmark of the live checkout; prints counts only"]
     fn membership_checkout_stat_counts_benchmark() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = Path::new(crate::test_support::manifest_dir())
             .parent()
             .unwrap()
             .parent()
@@ -14288,7 +14288,7 @@ mod tests {
     #[test]
     #[ignore = "profiles real repository sources and persists temporary caches"]
     fn warm_reload_repository_canonicalization_counts() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = Path::new(crate::test_support::manifest_dir()).join("../..");
         measure_warm_reload_canonicalizations(&root);
     }
 

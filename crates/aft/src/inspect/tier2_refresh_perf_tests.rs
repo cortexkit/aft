@@ -9,7 +9,7 @@ fn profile_tier2_unchanged_checkout() {
         (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64 * 1000.0
             + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1000.0
     }
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let workspace = Path::new(crate::test_support::manifest_dir())
         .parent()
         .unwrap()
         .parent()

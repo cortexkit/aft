@@ -98,7 +98,7 @@ fn edited_source(source: &str, language: &str, index: usize) -> String {
 #[test]
 #[ignore = "offline measurement: publishes two revisions of this repository into scratch storage"]
 fn bench_repository_incremental_update() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = Path::new(crate::test_support::manifest_dir()).join("../..");
     let source = source.canonicalize().unwrap();
     let old_revision = std::env::var("AFT_UPDATE_BENCH_OLD").unwrap_or_else(|_| "HEAD~50".into());
     let new_revision = std::env::var("AFT_UPDATE_BENCH_NEW").unwrap_or_else(|_| "HEAD".into());

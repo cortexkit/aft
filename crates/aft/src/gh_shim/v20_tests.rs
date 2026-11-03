@@ -1368,7 +1368,7 @@ fn v20_missing_ticket_refuses_without_delegation_or_credentials() {
 
 #[test]
 fn v20_preparer_pins_test_only_fixture_and_preserves_every_v19_row() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let fixture = root.join("crates/aft/tests/fixtures/gh_shim/v19-manifest.json");
     let raw = fs::read(&fixture).unwrap();
     // This fixture digest is pinned for this test, not used as signing material.
@@ -1752,7 +1752,7 @@ fn audit_checkout_binding_cannot_be_retargeted_by_gh_repo() {
 }
 
 fn preparer_probe(mode: &str) -> std::process::Output {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let dir = tempfile::tempdir().unwrap();
     let code = r#"
 import hashlib, importlib.util, json, pathlib, sys

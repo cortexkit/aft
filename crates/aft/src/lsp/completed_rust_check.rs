@@ -2463,7 +2463,8 @@ mod tests {
     #[test]
     #[ignore = "measures the live checkout; run manually"]
     fn repository_fingerprint_completes_and_reuses_unchanged_hashes() {
-        let root = canonical(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let root =
+            canonical(&PathBuf::from(crate::test_support::manifest_dir()).join("../..")).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let runtime = Runtime {
             binary: which::which("rust-analyzer").expect("rust-analyzer version probe is required"),

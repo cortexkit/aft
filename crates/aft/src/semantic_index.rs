@@ -13546,7 +13546,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn rust_semantic_fixture_output_matches_query_baseline() {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = PathBuf::from(crate::test_support::manifest_dir());
         let (_, _, output_hash) = rust_fixture_semantic_output_fingerprint(&project_root);
         assert_eq!(output_hash, RUST_QUERY_BASELINE_OUTPUT_HASH);
     }
@@ -13554,7 +13554,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "manual single-file semantic collect phase benchmark"]
     fn profile_rust_single_file_semantic_collect() {
-        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let crate_root = PathBuf::from(crate::test_support::manifest_dir());
         let workspace_root = crate_root
             .parent()
             .and_then(Path::parent)
@@ -17152,7 +17152,7 @@ Connection: close
 
     #[test]
     fn optimized_file_chunk_collection_matches_file_parser_path() {
-        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_root = PathBuf::from(crate::test_support::manifest_dir());
         let file = project_root.join("src/semantic_index.rs");
         let source = std::fs::read_to_string(&file).unwrap();
 

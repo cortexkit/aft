@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const SAMPLES: usize = 50;
 
 fn root(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let root = PathBuf::from(crate::test_support::manifest_dir())
         .join("target")
         .join("edit-translate-probe")
         .join(name);

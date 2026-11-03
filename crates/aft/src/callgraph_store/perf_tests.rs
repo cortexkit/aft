@@ -997,7 +997,8 @@ fn report(label: &str, counts: &WorkCounts) {
 #[test]
 #[ignore = "measurement: cold-builds the AFT checkout"]
 fn cold_callgraph_snapshot_lookup_cost_on_aft_checkout() {
-    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let root =
+        fs::canonicalize(Path::new(crate::test_support::manifest_dir()).join("../..")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     work_counts::reset_under(&root);
     let started = Instant::now();
