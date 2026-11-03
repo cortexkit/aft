@@ -401,7 +401,7 @@ fn python_unknown_abstract_receivers_stay_live_without_caller_guesses() {
 
 #[test]
 fn python_receiver_evidence_is_local_to_the_calling_scope() {
-    let parsed = parse("class C:\n def m(self): pass\n def own(self):\n  self.m()\ndef caller(x: C):\n x.m()\n y: C\n y.m()\n z = C()\n z.m()\ndef unknown():\n def nested():\n  hidden = C()\n hidden.m()\n", "python");
+    let parsed = parse("class C:\n def m(self): pass\n def own(self):\n  self.m()\ndef caller(x: C):\n x.m()\n y: C\n y.m()\n z = C()\n def nested():\n  z = external\n z.m()\ndef unknown():\n def nested():\n  hidden = C()\n hidden.m()\n", "python");
     let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
     assert_eq!(parsed.dispatch.sites.len(), 5);
     for site in &parsed.dispatch.sites {

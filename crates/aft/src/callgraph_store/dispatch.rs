@@ -1276,11 +1276,6 @@ fn receiver_type<'tree>(
         Some(nodes) => Cow::Borrowed(nodes),
         None => Cow::Owned(descendants(function)),
     };
-    if language == "python" {
-        nodes
-            .to_mut()
-            .retain(|node| enclosing(*node, FUNCTIONS) == Some(function));
-    }
     if ["java", "csharp", "kotlin"].contains(&language) {
         if let Some(class) = enclosing(function, TYPES) {
             nodes
@@ -1339,6 +1334,9 @@ fn receiver_type<'tree>(
         };
         let binding_text = text(binding, source).trim();
         if binding_text != value && !binding_text.strip_suffix(':').is_some_and(|s| s == value) {
+            continue;
+        }
+        if language == "python" && enclosing(*declaration, FUNCTIONS) != Some(function) {
             continue;
         }
         if let Some(annotation) = field(*declaration, &["type"])
@@ -1436,6 +1434,7 @@ fn receiver_type<'tree>(
                 .contains(&n.kind())
                     && field(**n, &["left", "argument"])
                         .is_some_and(|lhs| text(lhs, source).trim() == value)
+                    && (language != "python" || enclosing(**n, FUNCTIONS) == Some(function))
             })
             .count();
         if (language == "python" || language == "go") && assignments > 1
