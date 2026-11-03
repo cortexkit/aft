@@ -190,6 +190,66 @@ fn s4_two_scoped_names_share_a_range_without_identity_collision() {
 }
 
 #[test]
+fn node_ids_are_short_digests_that_sort_like_the_full_digest() {
+    let id = node_id("a.rs", "function", "f");
+    let hex = id.strip_prefix("pos:symbol:").unwrap();
+    assert_eq!(hex.len(), 16);
+    assert!(hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let top = node_id("a.rs", "module", TOP_LEVEL_SYMBOL);
+    assert_eq!(top.strip_prefix("top:").unwrap().len(), 16);
+    // Ordering by the stored id must match ordering by the full digest it was
+    // cut from, since replies order nodes by id.
+    let mut ids = (0..200)
+        .map(|n| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(n.to_string().as_bytes());
+            let full = hash.finalize();
+            (short_hash_hex(full), hash_to_hex(full))
+        })
+        .collect::<Vec<_>>();
+    ids.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(ids.windows(2).all(|pair| pair[0].1 < pair[1].1));
+}
+
+#[test]
+fn two_symbols_with_one_node_id_fail_the_write_instead_of_merging() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    let insert = |scoped_name: &str| {
+        conn.execute(
+            "INSERT INTO nodes(id, file_path, name, scoped_name, kind, start_line, start_col,
+                 end_line, end_col, range_ordinal, signature, exported, is_default_export,
+                 is_type_like, is_callgraph_entry_point, provenance, is_test)
+             VALUES('pos:symbol:0123456789abcdef', 'a.rs', ?1, ?1, 'function', 1, 0, 1, 1, 0,
+                 NULL, 0, 0, 0, 0, 'treesitter', 0)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, scoped_name=excluded.scoped_name",
+            [scoped_name],
+        )
+    };
+    insert("f").unwrap();
+    // The same symbol again is an ordinary upsert.
+    insert("f").unwrap();
+    let error = insert("g").unwrap_err().to_string();
+    assert!(error.contains("call-graph node id collision"), "{error}");
+    let error = conn
+        .execute(
+            "INSERT OR REPLACE INTO nodes(id, file_path, name, scoped_name, kind, start_line,
+                 start_col, end_line, end_col, range_ordinal, signature, exported,
+                 is_default_export, is_type_like, is_callgraph_entry_point, provenance, is_test)
+             VALUES('pos:symbol:0123456789abcdef', 'b.rs', 'f', 'f', 'function', 9, 0, 9, 1, 0,
+                 NULL, 0, 0, 0, 0, 'treesitter', 0)",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("call-graph node id collision"), "{error}");
+    let scoped: String = conn
+        .query_row("SELECT scoped_name FROM nodes", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(scoped, "f");
+}
+
+#[test]
 fn s4_node_identity_uses_path_kind_and_scoped_name_only() {
     assert_ne!(
         node_id("a:b", "function", "c"),
