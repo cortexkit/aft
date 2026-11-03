@@ -43,7 +43,7 @@ The `data` payload is:
       "idle_ttl_ms": 1800000,
       "lsp_idle_ttl_ms": 600000,
       "evictable_in_ms": 1800000,
-      "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "inspect": 0, "exact_memo": 0, "compression_filters": 0, "bash": 0, "lsp": 0, "parser_pool": 0},
+      "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "callgraph_projection": 0, "inspect": 0, "pending_install": 0, "exact_memo": 0, "compression_filters": 0, "bash": 0, "lsp": 0, "parser_pool": 0},
       "exact_memo": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "entries": 0, "candidates": 0, "file_digests": 0, "descriptors": 0, "lifecycle_keys": 0, "literal_presence_entries": 0, "payload_budget_bytes": 8388608, "not_estimated": ["in_flight_verifiers_and_detached_readers"]},
       "compression_filters": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "filters": 0, "command_keywords": 0, "not_estimated": ["compiled_regex_automata"]},
       "semantic_worker_bytes": 0,
