@@ -367,7 +367,7 @@ pub(crate) fn assert_current_graph(conn: &Connection) {
         ("edges", "target_node"),
         ("dispatch_hints", "caller_node"),
     ] {
-        let old: usize = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'view:symbol:%'"), [], |r| r.get(0)).unwrap();
+        let old: usize = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE {column} IS NOT NULL AND {column} NOT LIKE 'top:%' AND {column} NOT LIKE 'pos:symbol:%' AND {column} NOT LIKE 'vp%' AND {column} NOT LIKE 'vt%'"), [], |r| r.get(0)).unwrap();
         assert_eq!(old, 0, "old identity in {table}.{column}");
     }
 }
@@ -469,7 +469,7 @@ pub(crate) fn with_pre_s4_project<T>(root: &Path, run: impl FnOnce() -> T) -> T 
 
 pub(crate) fn seed_old_dispatch_hint(conn: &Connection) {
     conn.execute("INSERT INTO dispatch_hints SELECT 'pre-s4-hint', 'unique', id, file_path, start_line, 0, 0, 'treesitter' FROM nodes ORDER BY id LIMIT 1", []).unwrap();
-    assert!(conn.query_row("SELECT count(*) FROM dispatch_hints WHERE caller_node NOT LIKE 'pos:symbol:%' AND caller_node NOT LIKE 'view:symbol:%'", [], |r| r.get::<_,usize>(0)).unwrap()>0);
+    assert!(conn.query_row("SELECT count(*) FROM dispatch_hints WHERE caller_node NOT LIKE 'pos:symbol:%' AND caller_node NOT LIKE 'vp%' AND caller_node NOT LIKE 'vt%'", [], |r| r.get::<_,usize>(0)).unwrap()>0);
 }
 
 #[test]

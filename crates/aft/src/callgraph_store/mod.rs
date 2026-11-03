@@ -13681,7 +13681,9 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-/// - v23: node ids carry 64 bits of their digest instead of 256.
+/// - v23: node ids carry 64 bits of their digest instead of 256, views stores
+///   spell them `vp`/`vt` plus the digest, and two indexes no statement used
+///   (edges by target node, dispatch hints by method name) are gone.
 const BUILD_OUTPUT_VERSION: &str = "v23-short-node-ids";
 
 const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
@@ -14204,13 +14206,11 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
         "file_dependencies(dep_file)",
     ),
     ("idx_edges_source_kind", "edges(source_node, kind)"),
-    ("idx_edges_target_kind", "edges(target_node, kind)"),
     (
         "idx_edges_target_file_symbol",
         "edges(target_file, target_symbol, kind)",
     ),
     ("idx_edges_ref_id", "edges(ref_id, kind)"),
-    ("idx_dispatch_hints_method", "dispatch_hints(method_name)"),
     ("idx_dispatch_hints_file", "dispatch_hints(file)"),
     (
         "idx_backend_file_state_file",
@@ -14222,10 +14222,20 @@ const SECONDARY_INDEXES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Indexes older builds created that no statement uses any more: no query
+/// filters edges by target node or dispatch hints by method name. Dropping
+/// them keeps a store opened by this build from carrying their pages.
+const RETIRED_SECONDARY_INDEXES: &[&str] = &["idx_edges_target_kind", "idx_dispatch_hints_method"];
+
 fn create_secondary_indexes_sql() -> String {
-    SECONDARY_INDEXES
+    RETIRED_SECONDARY_INDEXES
         .iter()
-        .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};"))
+        .map(|name| format!("DROP INDEX IF EXISTS {name};"))
+        .chain(
+            SECONDARY_INDEXES
+                .iter()
+                .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};")),
+        )
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -15985,8 +15995,20 @@ fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
     format!("pos:symbol:{}", short_hash_hex(hash.finalize()))
 }
 
+/// A views store's node id: `vp` plus 16 hex digits for a symbol, `vt` plus
+/// 16 hex digits for a file's top level.
+///
+/// The digests are `node_id`'s. Views stores never hold `node_id`'s longer
+/// spellings, so the short class letters only have to keep the two classes
+/// apart and in the same order: symbol ids still sort before top-level ids, and
+/// ids of one class still sort by digest.
 pub(crate) fn view_node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
-    format!("view:symbol:{}", node_id(rel_path, kind, scoped_name))
+    let id = node_id(rel_path, kind, scoped_name);
+    match (id.strip_prefix("pos:symbol:"), id.strip_prefix("top:")) {
+        (Some(digest), _) => format!("vp{digest}"),
+        (_, Some(digest)) => format!("vt{digest}"),
+        _ => unreachable!("node_id returns a symbol or top-level id"),
+    }
 }
 
 fn build_call_refs(
