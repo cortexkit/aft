@@ -450,7 +450,8 @@ fn selected_binding_load_skips_changed_payloads_and_matches_cold() {
     Connection::open(&incremental)
         .unwrap()
         .execute(
-            "UPDATE view_bindings SET payload = '{' WHERE file_path = 'target.ts'",
+            // An unreadable stored payload: the selected load must never read it.
+            "UPDATE view_bindings SET payload = X'7b' WHERE file_path = 'target.ts'",
             [],
         )
         .unwrap();

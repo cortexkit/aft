@@ -128,6 +128,7 @@ pub(crate) fn apply_manifest_diff_profiled(
 }
 
 mod module_digest;
+mod payload;
 #[cfg(test)]
 pub(crate) mod parity;
 pub(crate) mod profile;
@@ -138,7 +139,7 @@ mod stable_rows;
 // per-reference skip optimization when reference ordinals collide, or Go
 // bindings whose package file listings were not recorded (an added sibling
 // `.go` file would never reselect them).
-pub(crate) const MATERIALIZATION_VERSION: &str = "12";
+pub(crate) const MATERIALIZATION_VERSION: &str = "13";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
@@ -431,11 +432,11 @@ fn materialize_reading(
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS view_bindings (
              file_path TEXT PRIMARY KEY,
-             payload TEXT NOT NULL
+             payload BLOB NOT NULL
          );
          CREATE TABLE IF NOT EXISTS view_file_surfaces (
              file_path TEXT PRIMARY KEY,
-             payload TEXT NOT NULL
+             payload BLOB NOT NULL
          )",
     )?;
     transaction.execute_batch(module_digest::CREATE_TABLES)?;
@@ -946,7 +947,11 @@ fn materialize_reading(
                 .surface_json()
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                surface_rows.push((path.clone(), payload, existing_surface_paths.contains(path)));
+                surface_rows.push((
+                    path.clone(),
+                    payload::pack(&payload),
+                    existing_surface_paths.contains(path),
+                ));
             }
         }
         let old = cached.get(path).filter(|_| {
@@ -984,7 +989,7 @@ fn materialize_reading(
         let replaced = old.is_some() || existing_binding_paths.contains(path);
         let payload = serde_json::to_string(binding)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        binding_inserts.push((path.clone(), payload, replaced));
+        binding_inserts.push((path.clone(), payload::pack(&payload), replaced));
     }
     let surface_updates = surface_rows
         .iter()
@@ -1754,14 +1759,15 @@ fn load_bindings(
     let mut statement = connection.prepare("SELECT file_path, payload FROM view_bindings")?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut bindings = rows
         .into_par_iter()
         .map(|(path, payload)| {
-            let binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
-                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+            let binding: join::ViewBindingDependencies =
+                serde_json::from_str(&payload::unpack(&payload)?)
+                    .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
             Ok((path, binding))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
@@ -1779,12 +1785,14 @@ fn load_surfaces(
     let mut statement = connection.prepare("SELECT file_path, payload FROM view_file_surfaces")?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.into_par_iter()
         .map(|(path, surface)| {
-            let binding = join::ViewBindingDependencies::from_surface_json(&surface)
+            let binding = join::ViewBindingDependencies::from_surface_json(&payload::unpack(
+                &surface,
+            )?)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
             Ok((path, binding))
         })
@@ -1825,14 +1833,15 @@ fn load_bindings_for_selection(
         )?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let selected = rows
             .into_par_iter()
             .map(|(path, payload)| {
-                let binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
-                    .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+                let binding: join::ViewBindingDependencies =
+                    serde_json::from_str(&payload::unpack(&payload)?)
+                        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
                 Ok((path, binding))
             })
             .collect::<Result<Vec<_>>>()?;

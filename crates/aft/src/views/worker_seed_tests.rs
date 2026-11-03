@@ -795,7 +795,7 @@ fn bench_repository_cold_materialization() {
         "edges",
         "view_bindings",
         "view_unknown_live",
-        "sqlite_autoindex_view_unknown_live_1",
+        "view_dispatch_files",
     ] {
         let bytes: i64 = connection
             .query_row(

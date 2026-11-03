@@ -307,7 +307,9 @@ fn unattributed_binding_forces_counted_full_fallback() {
     bindings.get_mut("a.ts").unwrap().unattributed = true;
     db.execute(
         "UPDATE view_bindings SET payload=?1 WHERE file_path='a.ts'",
-        [serde_json::to_string(&bindings["a.ts"]).unwrap()],
+        [super::payload::pack(
+            &serde_json::to_string(&bindings["a.ts"]).unwrap(),
+        )],
     )
     .unwrap();
     let started = std::time::Instant::now();

@@ -22,6 +22,8 @@ use crate::callgraph_store::join::{
     BlobImport, ManifestBlobReader, ParseBlob,
 };
 use crate::callgraph_store::{CallGraphStoreError, Result};
+
+use super::payload;
 use crate::views::{Manifest, ManifestEntry};
 
 /// What the method-call pass may assume about this transaction.
@@ -206,16 +208,21 @@ fn type_target_key(dependency: &str) -> String {
     format!("t:{dependency}")
 }
 
+// The two site tables are read only by their keys or in full into sets, so
+// they keep no separate rowid copy of their primary key (`WITHOUT ROWID`).
+// The JSON columns of `view_dispatch_files` are stored compressed (see
+// `payload`); the digests stay those of the JSON text.
 const CREATE_TABLES: &str = "CREATE TABLE IF NOT EXISTS view_dispatch_sites (
         caller_file TEXT NOT NULL, ordinal INTEGER NOT NULL, language TEXT NOT NULL,
         unresolved_receiver_sites INTEGER NOT NULL, dynamic_member_sites INTEGER NOT NULL,
-        external INTEGER NOT NULL, PRIMARY KEY(caller_file, ordinal));
+        external INTEGER NOT NULL, PRIMARY KEY(caller_file, ordinal)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS view_unknown_live (
         caller_file TEXT NOT NULL, ordinal INTEGER NOT NULL, target_file TEXT NOT NULL,
-        target_symbol TEXT NOT NULL, PRIMARY KEY(caller_file, ordinal, target_file, target_symbol));
+        target_symbol TEXT NOT NULL,
+        PRIMARY KEY(caller_file, ordinal, target_file, target_symbol)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS view_dispatch_files (
         file_path TEXT PRIMARY KEY, facts_digest TEXT NOT NULL, sites_digest TEXT NOT NULL,
-        facts TEXT NOT NULL, type_target_trace TEXT, sites TEXT NOT NULL);
+        facts BLOB NOT NULL, type_target_trace BLOB, sites BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS view_dispatch_dependencies (
         file_path TEXT NOT NULL, dependency TEXT NOT NULL,
         PRIMARY KEY(file_path, dependency)) WITHOUT ROWID;
@@ -256,9 +263,10 @@ pub(super) fn type_target_traces(
         .prepare_cached("SELECT type_target_trace FROM view_dispatch_files WHERE file_path=?1")?;
     let mut traces = BTreeMap::new();
     for file in files {
-        let trace: Option<Option<String>> = read.query_row([&file], |row| row.get(0)).optional()?;
+        let trace: Option<Option<Vec<u8>>> =
+            read.query_row([&file], |row| row.get(0)).optional()?;
         if let Some(Some(trace)) = trace {
-            traces.insert(file, from_json(&trace)?);
+            traces.insert(file, from_json(&payload::unpack(&trace)?)?);
         }
     }
     Ok(traces)
@@ -396,8 +404,8 @@ fn load_sites<'p>(
         let Some(row) = rows.get_mut(file).filter(|row| row.sites.is_none()) else {
             continue;
         };
-        let sites: String = query.query_row([file], |row| row.get(0))?;
-        row.sites = Some(from_json(&sites)?);
+        let sites: Vec<u8> = query.query_row([file], |row| row.get(0))?;
+        row.sites = Some(from_json(&payload::unpack(&sites)?)?);
     }
     Ok(())
 }
@@ -480,11 +488,12 @@ pub(super) fn emit_from_decoded(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (path, facts_digest, sites_digest, facts_json) in stored {
+        for (path, facts_digest, sites_digest, facts) in stored {
+            let facts_json = payload::unpack(&facts)?;
             if changed.contains(&path) {
                 touched.insert(path.clone());
             }
@@ -797,19 +806,27 @@ fn persist(
     let mut delete_dependency = transaction
         .prepare("DELETE FROM view_dispatch_dependencies WHERE file_path=?1 AND dependency=?2")?;
     for (path, row) in rows {
-        let trace = row.trace.as_ref().map(json).transpose()?;
+        let trace = row
+            .trace
+            .as_ref()
+            .map(|trace| json(trace).map(|trace| payload::pack(&trace)))
+            .transpose()?;
         if let Some(sites) = &row.sites_json {
             replace.execute(params![
                 path,
                 row.facts_digest,
                 row.sites_digest,
-                row.facts_json,
+                payload::pack(&row.facts_json),
                 trace,
-                sites
+                payload::pack(sites)
             ])?;
         } else {
             if row.dirty {
-                update_facts.execute(params![path, row.facts_digest, row.facts_json])?;
+                update_facts.execute(params![
+                    path,
+                    row.facts_digest,
+                    payload::pack(&row.facts_json)
+                ])?;
             }
             if trace.is_some() {
                 update_trace.execute(params![path, trace])?;

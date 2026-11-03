@@ -203,6 +203,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = "0.3"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+# Deflate for the call-graph view's per-file JSON payloads. Already in the
+# build through async-compression, image and ureq; listed here to call it
+# synchronously.
+flate2 = "1.1"
 rcgen = "0.13"
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
