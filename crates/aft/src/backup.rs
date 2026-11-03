@@ -1090,6 +1090,8 @@ pub struct BackupStore {
     /// time the cleanup from its own start rather than from the caller's.
     #[cfg(test)]
     discard_started_for_tests: Option<Instant>,
+    #[cfg(test)]
+    pub(crate) discard_paths_for_tests: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1168,6 +1170,8 @@ impl BackupStore {
             discard_outcome_for_tests: None,
             #[cfg(test)]
             discard_started_for_tests: None,
+            #[cfg(test)]
+            discard_paths_for_tests: Vec::new(),
         }
     }
 
@@ -3482,6 +3486,8 @@ impl BackupStore {
         all: bool,
         budget: BackupIoBudget,
     ) -> Result<(), AftError> {
+        #[cfg(test)]
+        self.discard_paths_for_tests.push(key.to_path_buf());
         budget.check(key)?;
         let _disk_lock = self.acquire_stack_disk_lock_with_cleanup_deadline(
             session,
@@ -8831,6 +8837,57 @@ mod tests {
                 "timed-out cleanup must leave its stack intact at stage {held_stage}"
             );
         }
+    }
+
+    #[test]
+    fn backup_discard_exhaustion_warns_once_and_retries_leftovers() {
+        let (mut store, storage, project, first) = durability_store();
+        let paths = [
+            first,
+            project.path().join("second.txt"),
+            project.path().join("third.txt"),
+        ];
+        for path in &paths {
+            fs::write(path, b"original").unwrap();
+            store
+                .snapshot_with_op("retry-discard", path, "good", Some("good"))
+                .unwrap();
+        }
+        store.record_post_mutation_states();
+        for path in &paths {
+            store
+                .snapshot_with_op("retry-discard", path, "rolled back", Some("bad"))
+                .unwrap();
+        }
+        store.release_memory();
+        let namespace = backup_namespace_gate(storage.path(), None).unwrap();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            store.discard_operation_entries("retry-discard", "bad");
+        });
+        drop(namespace);
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|line| line.starts_with("WARN "))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(warnings[0].contains("deferred_paths=3"), "{logs:?}");
+        assert_eq!(
+            store.discard_paths_for_tests.len(),
+            1,
+            "stop before advancing after expiry"
+        );
+        for path in &paths {
+            assert_eq!(store.history("retry-discard", path).len(), 2);
+        }
+        store.record_post_mutation_states();
+        for path in &paths {
+            let history = store.history("retry-discard", path);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].op_id.as_deref(), Some("good"));
+        }
+        let restored = store.restore_last_operation("retry-discard").unwrap();
+        assert_eq!(restored.op_id, "good");
+        assert_eq!(restored.restored.len(), 3);
     }
 
     #[test]
