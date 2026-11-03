@@ -1,8 +1,8 @@
 use super::*;
 use std::{collections::BTreeMap, io};
 use types::{
-    Accepted, AttachRequest, Output, OutputStream, ReturnChunk, ReturnManifest, Started,
-    StreamRecord, Uuid,
+    Accepted, AttachRequest, Output, OutputStream, ReturnChunk, ReturnManifest, RunRequest,
+    Started, StreamRecord, Uuid,
 };
 
 /// Durable resume cursor. `last_seq` is the last contiguous record committed
