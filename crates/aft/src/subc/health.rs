@@ -1974,7 +1974,9 @@ fn retention_report_totals(
                     (field.clone(), number.as_u64().unwrap_or(0))
                 }
                 Value::Bool(value) => (format!("{field}_reports"), u64::from(*value)),
-                Value::Array(errors) if field == "errors" => (field.clone(), errors.len() as u64),
+                Value::Array(entries) if field == "errors" || field == "incomplete" => {
+                    (field.clone(), entries.len() as u64)
+                }
                 _ => continue,
             };
             let total = totals.get(&key).and_then(Value::as_u64).unwrap_or(0);
@@ -9035,6 +9037,34 @@ mod tests {
     }
 
     #[test]
+    fn health_retention_incomplete_is_counted_separately_from_failures() {
+        for reason in [
+            "cache: retention deadline reached",
+            "binding_history_incomplete: examined=8192 accumulated=8192 restarted=true",
+        ] {
+            let mut reports = std::collections::BTreeMap::from([(
+                "/storage".into(),
+                crate::storage_retention::SweepReport {
+                    incomplete: vec![reason.into()],
+                    ..Default::default()
+                },
+            )]);
+            let totals = retention_report_totals(&reports);
+            assert_eq!(totals["errors"], 0);
+            assert_eq!(totals["incomplete"], 1);
+
+            reports
+                .get_mut("/storage")
+                .unwrap()
+                .errors
+                .push("removal refused".into());
+            let totals = retention_report_totals(&reports);
+            assert_eq!(totals["errors"], 1);
+            assert_eq!(totals["incomplete"], 1);
+        }
+    }
+
+    #[test]
     fn health_retention_reports_fit_budget_with_exact_omissions_and_totals() {
         let reports = (0..128)
             .map(|index| {
@@ -9048,6 +9078,7 @@ mod tests {
                         removed_roots: 3,
                         removed_bytes: 4096,
                         errors: vec!["example maintenance error".repeat(8)],
+                        incomplete: vec!["retention deadline reached".into()],
                         trash: crate::storage_retention::TrashReport {
                             at_ms: crate::pins::now_ms(),
                             entries: 2,
@@ -9088,6 +9119,7 @@ mod tests {
         assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
         assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
         assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
+        assert_eq!(metrics["storage_retention_totals"]["incomplete"], 128);
         let trash = &metrics["storage_retention_totals"]["trash"];
         assert_eq!(trash["entries"], 256);
         assert_eq!(trash["bytes_estimate"], 192_000_000_000_u64);
