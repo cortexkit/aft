@@ -25,7 +25,7 @@ export const BASH_RUNON_DESCRIPTION =
  * Shared by the OpenCode and Pi tools and the module catalog.
  */
 export const BASH_RETURN_PATHS_DESCRIPTION =
-  "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (10 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason.";
+  "With runon: up to 64 files to copy back from the build server after the command, as paths relative to workdir inside the project (up to 128 MiB in total). Each verified file replaces the local file at the same path; the result lists every path as returned or not returned, with the reason.";
 
 /** Guidance served only beside an available remote-run parameter. */
 export const BASH_RUNON_GUIDANCE =
