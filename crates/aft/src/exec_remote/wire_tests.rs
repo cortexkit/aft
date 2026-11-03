@@ -2150,3 +2150,69 @@ async fn return_cap_refusal_resubmits_once_and_no_other_refusal_is_retried() {
         }
     }
 }
+
+#[tokio::test]
+async fn return_cap_refusal_preserves_memory_size_on_the_single_resubmit() {
+    let daemon = daemon_with_capabilities(
+        Script::ReturnCapRefusal {
+            code: "invalid_params",
+            field: "return_max_bytes",
+            max_bytes: Some(20 * 1024 * 1024),
+            always: false,
+            after_accepted: false,
+        },
+        &[
+            client::CAPABILITY,
+            client::MEMORY_CAPABILITY,
+            RETURN_CHUNKED_CAPABILITY,
+            RETURN_LARGE_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let client = client(&daemon).await;
+    let request = RunRequest::new(
+        "/workspace/task",
+        "/workspace/repo",
+        "/workspace/task",
+        "build",
+    )
+    .with_weight_hint(2)
+    .with_memory_mib(16_384)
+    .with_return_paths(vec!["dist/hello.txt".into(), "dist/empty.txt".into()])
+    .with_return_chunked(true)
+    .with_return_max_bytes(RETURN_LARGE_MAX_BYTES_CAP);
+    let mut stream = client.run(&request).await.unwrap();
+    let mut sink = MemorySink::default();
+    let verdict = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let client::StreamProgress::Complete(verdict) = stream.next(&mut sink).await.unwrap()
+            {
+                break verdict;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(verdict, Verdict::Exited { code: 0 });
+    let runs: Vec<_> = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .collect();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
+    assert_eq!(runs[1]["return_max_bytes"], 20_971_520);
+    for run in &runs {
+        assert_eq!(run["memory_mib"], 16_384);
+    }
+    let mut expected = runs[0].clone();
+    expected["return_max_bytes"] = json!(20_971_520);
+    assert_eq!(
+        runs[1], expected,
+        "memory and every other identity field stay unchanged"
+    );
+}

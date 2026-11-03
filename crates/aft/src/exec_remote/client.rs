@@ -515,8 +515,7 @@ fn refused_return_cap(error: &subc_client_rs::CallError, request: &RunRequest) -
 mod capability_tests {
     use super::{
         CAPABILITY, MEMORY_CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY,
-        RETURN_LARGE_CAPABILITY,
-        WINDOWS_CAPABILITY,
+        RETURN_LARGE_CAPABILITY, WINDOWS_CAPABILITY,
     };
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
