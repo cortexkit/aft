@@ -1846,17 +1846,17 @@ fn zoom_one_symbol_inner(
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    // Timing hooks for the read-bound test. Unconfigured test contexts have no
+    // cache root, so the hooks are skipped there instead of panicking.
     #[cfg(test)]
-    crate::storage_retention::test_hook(
-        &ctx.canonical_cache_root(),
-        "cg-timing:zoom-observe-begin",
-    );
+    if let Some(root) = ctx.canonical_cache_root_opt() {
+        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-begin");
+    }
     let observation = observe_callgraph_query(ctx);
     #[cfg(test)]
-    crate::storage_retention::test_hook(
-        &ctx.canonical_cache_root(),
-        "cg-timing:zoom-observe-return",
-    );
+    if let Some(root) = ctx.canonical_cache_root_opt() {
+        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-return");
+    }
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
