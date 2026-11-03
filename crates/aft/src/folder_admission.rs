@@ -639,7 +639,8 @@ fn probe_with_read_dir(
 
 impl Probe {
     fn git_project(&mut self, head: PathBuf) {
-        self.result.git_controls.push(head.clone());
+        // Replay validation and the metadata watcher use HEAD as their anchor.
+        self.result.git_controls.insert(0, head.clone());
         if let Some(directory) = head.parent() {
             self.result.git_controls.push(directory.to_path_buf());
             for name in ["index", "config", "commondir", "objects"] {
@@ -1253,6 +1254,9 @@ mod tests {
             );
             assert_eq!(result.coverage.stop, ProbeStop::StrongEvidence);
             assert_eq!(result.observed.entries, 0);
+            if name == ".git" {
+                assert_eq!(result.git_controls[0].file_name().unwrap(), "HEAD");
+            }
             super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| assert_eq!(calls.get(), 0, "{name}"));
         }
     }
@@ -1295,6 +1299,7 @@ mod tests {
         );
         assert_eq!(result.reason, AdmissionReason::GitCheckout);
         assert_eq!(result.observed.entries, 0);
+        assert_eq!(result.git_controls[0].file_name().unwrap(), "HEAD");
         super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| assert_eq!(calls.get(), 0));
     }
 

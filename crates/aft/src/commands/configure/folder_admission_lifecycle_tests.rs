@@ -95,6 +95,7 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true));
         let connect_generation = ctx.connect_generation();
+        let configure_generation = ctx.configure_generation();
         assert!(admission::wait_until_probe(&ctx) <= Duration::from_millis(250));
         let mut maintenance = crate::runtime_drain::StandaloneConfigureMaintenance::default();
         let retry_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -121,7 +122,11 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
                 "first retry never ran"
             );
         }
-        assert_eq!(admission::probe_counts_for_test(&ctx), (1, 0));
+        // The gate is before evidence collection, so the probe and cache-hit
+        // counters must still be zero. Replacing the held worker would advance
+        // the configure generation or start an ungated evidence probe.
+        assert_eq!(admission::probe_counts_for_test(&ctx), (0, 0));
+        assert_eq!(ctx.configure_generation(), configure_generation);
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
