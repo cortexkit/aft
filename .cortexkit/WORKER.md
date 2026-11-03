@@ -24,6 +24,7 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 - **Commit first, then submit, in separate steps.** The job snapshots the checkout when it is accepted. A commit sent in the same parallel step can land after the snapshot. Print `git log -1` as the job's first line so the output shows what ran.
 - **Keep gate scripts out of ignored paths.** The job copies tracked and untracked files, but not ignored ones, so a script under `.cortexkit/` or `target/` is missing on the server.
 - **Write long output to a file inside the job and print a summary.** A job that streams tens of megabytes back can lose its connection and come back with an unknown result.
+- **Build a scratch copy of the source with its own target folder.** Linux jobs share the checkout's warm build folder (`CARGO_TARGET_DIR=/run/motor/target`). A copy built there, for example a red-first proof under `$TMPDIR`, leaves its outputs where later jobs in the real checkout reuse them as current, so a gate can pass on old code. Give the copy `CARGO_TARGET_DIR=$TMPDIR/copy-target` or `--target-dir`. If it already happened, `cargo clean -p <crates>` repairs it.
 
 Mandatory when you touch them:
 - A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test -p agent-file-tools --test list_envelope`.
