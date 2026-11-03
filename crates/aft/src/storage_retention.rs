@@ -6520,6 +6520,8 @@ fn collect_v3_family_at(
     // The final measurement still settles dead reservations and never records
     // a partial total. No publication is admitted through this handle.
     let mut registry = RegistryWriter::open_for_barrier(storage, family, &lock).map_err(v3)?;
+    #[cfg(test)]
+    test_hook(storage, "v3-registry-opened");
     // Base references get the first turn, before member cleanup or accounting
     // can consume the visit. All three phases share the reservation lock.
     if !cancelled()
@@ -16555,6 +16557,19 @@ mod v3_base_reference_collector_tests {
             .unwrap(),
         );
         drop(composed);
+        // A slow registry open can exhaust a visit before the reference sweep
+        // starts, even though later visits can still reclaim the unused base.
+        let delay_first_open = std::sync::atomic::AtomicBool::new(true);
+        let _slow_open = observe_test_hook(
+            storage.path(),
+            Arc::new(move |step| {
+                if step == "v3-registry-opened"
+                    && delay_first_open.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }),
+        );
         for sweep in 0..2 {
             v3::set_walk_delay_for_test(Duration::from_millis(500));
             let mut report = SweepReport::default();
@@ -16569,6 +16584,7 @@ mod v3_base_reference_collector_tests {
             );
             v3::set_walk_delay_for_test(Duration::ZERO);
             result.unwrap();
+            eprintln!("collector visit {}: {report:?}", sweep + 1);
             assert!(report.errors.is_empty(), "{report:?}");
             assert_eq!(
                 report.skipped_families,
