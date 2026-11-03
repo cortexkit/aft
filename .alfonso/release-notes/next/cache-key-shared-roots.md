@@ -1,0 +1,1 @@
+- Binding a new worktree no longer walks the whole Git history to identify the repository: worktrees at the same commit share that answer, which removes about a second from each new bind on large repositories.
