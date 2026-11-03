@@ -11,8 +11,8 @@ pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
 
 pub const CAPABILITY: &str = "exec-remote/v1";
 
-// pending Ufuk's approval
-const MEMORY_UNSUPPORTED_REFUSAL: &str = "runon memory size is unavailable: the build server doesn't support stated memory (missing exec-remote-memory/v1)";
+// Agent-visible text, approved by Ufuk; change it only with his approval.
+const MEMORY_UNSUPPORTED_REFUSAL: &str = "This build server can't take a memory size yet; run the job without one.";
 
 /// Local, monotonic launch timings. Phase labels are static so diagnostics
 /// cannot accidentally include command text, paths, or environment values.
@@ -139,7 +139,7 @@ impl ExecRemoteClient {
                 diagnostics.timings.enter("advertises_memory");
             }
             if !self.advertises(MEMORY_CAPABILITY).await.map_err(|error| {
-                Error::Protocol(format!("{MEMORY_UNSUPPORTED_REFUSAL}: {error}"))
+                Error::Protocol(format!("{MEMORY_UNSUPPORTED_REFUSAL} ({error})"))
             })? {
                 return Err(Error::Protocol(MEMORY_UNSUPPORTED_REFUSAL.into()));
             }

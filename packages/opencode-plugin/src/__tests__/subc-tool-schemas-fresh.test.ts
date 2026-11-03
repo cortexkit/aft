@@ -43,7 +43,7 @@ describe("subc tool schemas artifact", () => {
       expect((bash.properties as Record<string, unknown>).runon).toMatchObject({ type: "string" });
       expect((bash.properties as Record<string, unknown>).runon).toMatchObject({
         description:
-          'Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). On Linux, add `,Ngb` for N GiB of memory, for example `linux,2c,16gb`.',
+          'Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). On Linux, add `,Ngb` to ask for N GiB of memory, for example `linux,2c,16gb` for a Rust build.',
       });
       expect((bash.description as string).split(REMOTE_GUIDANCE)).toHaveLength(2);
     }

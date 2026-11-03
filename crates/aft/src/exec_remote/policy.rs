@@ -89,11 +89,11 @@ pub struct ResolvedDemand {
     pub network: bool,
 }
 
-// pending Ufuk's approval
+// Agent-visible text, approved by Ufuk; change it only with his approval.
 const NON_LINUX_MEMORY_REFUSAL: &str =
-    "memory sizes are only supported on Linux; Windows and macOS jobs have fixed memory";
-// pending Ufuk's approval
-const INVALID_SIZE_REFUSAL: &str = "options are net, a vCPU count as Nc and one positive whole memory size as Ngb, for example \"linux,2c,16gb\"";
+    "only Linux jobs take a memory size; Windows and macOS jobs have fixed memory";
+// Agent-visible text, approved by Ufuk; change it only with his approval.
+const INVALID_SIZE_REFUSAL: &str = "options are net, a vCPU count like 4c and a whole number of GiB like 16gb, for example \"linux,2c,16gb\"";
 
 /// Resolve the demand a `runon` call asks for. An empty value takes the
 /// session's default demand; otherwise, AFT accepts a known runner with an
