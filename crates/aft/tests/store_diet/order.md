@@ -1,6 +1,8 @@
 # Order inventory and traversal guarantees
 
-The baseline is `998c896b05753dd3a83158e30f97779b89ef28e2`.
+The baseline is the named main commit in `baseline.json`. The original source
+line references below were inventoried at `998c896`; statement text and owner
+names in the generated inventories are authoritative after re-recording.
 `order_sql.json` identifies each graph/views SELECT, including unordered reads,
 by the stable id in `statements.json`. `source_inventory.json:rust_order` lists
 Rust sorts, BTreeMap/BTreeSet and dedup sites, including test-only consumers.
@@ -35,9 +37,9 @@ Unlimited non-traversal replies retain the same multiset.
 
 | Consumer | Baseline keys / selection | Baseline source |
 | --- | --- | --- |
-| direct callers | source node, ref byte start, line, ref id | `callgraph_store/mod.rs:11400-11429` |
-| batched callers | target file, target symbol, then direct-caller keys | `mod.rs:11449-11517` |
-| outgoing calls and target fallback | source node, byte start, line, ref id; first matching node | `mod.rs:11524-11681` |
+| direct callers | source node, ref byte start, line, ref id, target file/symbol/node, provenance, edge kind | `callgraph_store/mod.rs:11400-11429` |
+| batched callers | target file/symbol, source node, ref byte start/line/id, target node, provenance, edge kind | `mod.rs:11449-11517` |
+| outgoing calls and target fallback | source node where batched, ref byte start/line/id, target file/symbol/node, provenance; first matching node | `mod.rs:11524-11713` |
 | single-file and global node lookup | scoped-name/path/name/kind text, positions and id tie-breaks as each SQL lists | `mod.rs:11154-11264`, `11816-11847` |
 | eager/lazy resolver index | scoped name/id; ref byte start/line/ref id | `mod.rs:6568-6626`, `18946-19032`, `19173-19227` |
 | per-caller ref resolve / BlobRef join | CallerRefKey/kind; original ordinal groups and first encounter; BTreeSet DerivedRow order | `callgraph_store/join.rs:374-411`, `650-783`, `2574-2667` |
@@ -102,3 +104,11 @@ existing test's output assertion is rewritten to make a new order acceptable.
 - Recovery of the owning file via stripping `view:` and `rsplit_once(':')` is in
   the same `identities.md` reader row and the line-level reader census. It must
   use stored components or identical reconstructed text, never a split integer.
+
+The four edge-reader orders include main's selective re-resolution tie fix:
+`direct_callers_for_tuple`, `direct_callers_batch_sql`,
+`outgoing_calls_for_symbol_tuples`, and `outgoing_calls_for_node_limited` now
+finish positional/ref-id ties with stored target identity and provenance (and
+edge kind on incoming readers). Interned target paths/symbols and provenance
+must still compare as text. Pre-fix patched-versus-cold tie drift is a known
+producer nondeterminism, not an encoding regression; record only after that fix.

@@ -7,7 +7,7 @@ from inventory import HERE, dump
 
 
 def inventory():
-    locations, shapes, unresolved = {}, {}, {}
+    locations, shapes, unresolved, json_fields = {}, {}, {}, {}
     for mode in ['legacy', 'views']:
         cases = json.loads((HERE / f'corpus-{mode}.json').read_text(encoding='utf-8'))
         for case, result in cases.items():
@@ -23,6 +23,9 @@ def inventory():
             for shape, count in result.get('dispatch_shapes', {}).items():
                 if count:
                     shapes.setdefault(shape, []).append(dict(where, count=count))
+            for document, facts in result.get('json_facts', {}).items():
+                for field, types in facts['schema'].items():
+                    json_fields.setdefault(document.split(':', 1)[0] + ':' + field, []).append(dict(where, document=document, types=types))
     lifecycle = json.loads((HERE / 'lifecycle-values.json').read_text(encoding='utf-8'))
     for phase in ['after_cold', 'after_stale_mark']:
         for column, counts in lifecycle[phase].items():
@@ -60,7 +63,7 @@ def inventory():
     for value in required['dispatch_shape_values']:
         if not any(value in shape.split(':', 1)[-1].split(';') for shape in shapes):
             missing.append('dispatch_shape:' + value)
-    return {'domains': domains, 'dispatch_shapes': shapes, 'unresolved_forms': unresolved,
+    return {'domains': domains, 'dispatch_shapes': shapes, 'unresolved_forms': unresolved, 'serialized_fact_fields': json_fields,
             'per_column': locations, 'missing': missing}
 
 

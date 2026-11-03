@@ -11,14 +11,17 @@ const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/store_diet");
 fn golden(name: &str, bytes: &[u8]) {
     let path = Path::new(ASSETS).join(name);
     if std::env::var_os("AFT_STORE_DIET_RECORD").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        // A format change must compare against the old oracle, not bless its
-        // own answers by accidentally inheriting the recording switch.
-        assert_eq!(SCHEMA_VERSION, 3, "baseline recording requires schema 3");
-        assert_eq!(
-            crate::views::materialization::MATERIALIZATION_VERSION,
-            "12",
-            "baseline recording requires materialization 12"
-        );
+        // Recording is allowed only in the named main checkout prepared by the
+        // recorder, never in an encoding candidate that inherited this switch.
+        static RECORD_BASELINE: OnceLock<()> = OnceLock::new();
+        RECORD_BASELINE.get_or_init(|| {
+            let expected = std::env::var("AFT_STORE_DIET_BASELINE").expect("record.py --baseline SHA is required");
+            let metadata: Value = serde_json::from_slice(&fs::read(Path::new(ASSETS).join("baseline.json")).unwrap()).unwrap();
+            assert_eq!(metadata["code_revision"].as_str(), Some(expected.as_str()));
+            let output = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(ASSETS).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+        });
         fs::write(path, bytes).unwrap();
     } else {
         assert_eq!(
@@ -321,6 +324,7 @@ fn store_diet_views_golden() {
         "views-seeded.json",
         &serde_json::to_vec_pretty(&seeded_replies(&store.inner, &store, &root)).unwrap(),
     );
+    golden("views-json-facts.json", &serde_json::to_vec_pretty(&stored_json_facts(&store.inner)).unwrap());
 }
 
 fn plans(store: &CallGraphStore) -> Value {
@@ -637,7 +641,7 @@ fn store_diet_language_corpus_views() {
         fs::create_dir_all(&directory).unwrap();
         let (inner, shapes) = view_store_with_shapes(&directory, &root, &files);
         let store = readonly_view(inner);
-        results.insert(name.to_string(), json!({"counts": counts(&store.inner), "values": stored_values(&store.inner), "dispatch_shapes": shapes, "queries": seeded_replies(&store.inner, &store, &root)}));
+        results.insert(name.to_string(), json!({"counts": counts(&store.inner), "values": stored_values(&store.inner), "dispatch_shapes": shapes, "json_facts": stored_json_facts(&store.inner), "queries": seeded_replies(&store.inner, &store, &root)}));
     }
     golden(
         "corpus-views.json",
@@ -1101,4 +1105,54 @@ fn store_diet_stored_shape_controls() {
         )
         .unwrap(),
     );
+}
+
+fn json_fact_schema(value: &Value, path: &str, schema: &mut BTreeMap<String, BTreeSet<String>>) {
+    let kind = match value { Value::Null => "null", Value::Bool(_) => "boolean", Value::Number(_) => "number", Value::String(_) => "string", Value::Array(_) => "array", Value::Object(_) => "object" };
+    schema.entry(path.to_string()).or_default().insert(kind.to_string());
+    match value {
+        Value::Object(fields) => for (name, value) in fields { json_fact_schema(value, &format!("{path}.{name}"), schema); },
+        Value::Array(items) => for value in items { json_fact_schema(value, &format!("{path}[]"), schema); },
+        _ => {}
+    }
+}
+
+fn stored_json_facts(store: &CallGraphStore) -> Value {
+    // Discover payload columns from the table-encoding schema and walk every
+    // serialized field. Optional facts added by producers need no allowlist.
+    let tables: Vec<Value> = serde_json::from_slice(&fs::read(Path::new(ASSETS).join("table_encoding.json")).unwrap()).unwrap();
+    let connection = store.conn.lock().unwrap();
+    let mut result = serde_json::Map::new();
+    for table in tables {
+        let name = table["table"].as_str().unwrap();
+        if !name.starts_with("view_") { continue; }
+        let present: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |row| row.get(0)).unwrap();
+        if !present { continue; }
+        let key = table["columns"].as_array().unwrap().iter().find(|column| column["primary_key_position"] == 1).and_then(|column| column["column"].as_str());
+        let Some(key) = key else { continue; };
+        for column in table["columns"].as_array().unwrap() {
+            if !column["encoding"].as_str().unwrap().contains("JSON") { continue; }
+            let column = column["column"].as_str().unwrap();
+            let mut statement = connection.prepare(&format!("SELECT {key}, {column} FROM {name} WHERE {column} IS NOT NULL")).unwrap();
+            let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap();
+            for row in rows {
+                let (file, payload) = row.unwrap();
+                let value: Value = serde_json::from_str(&payload).unwrap();
+                let mut schema = BTreeMap::new();
+                json_fact_schema(&value, "$", &mut schema);
+                let digest = blake3::hash(&serde_json::to_vec(&value).unwrap()).to_hex().to_string();
+                result.insert(format!("{name}.{column}:{file}"), json!({"semantic_json_hash": digest, "schema": schema}));
+            }
+        }
+    }
+    Value::Object(result)
+}
+
+#[test]
+fn store_diet_json_fact_schema_accepts_new_optional_fields() {
+    let value = json!({"known": [], "future_optional": "package", "absent_optional": null});
+    let mut schema = BTreeMap::new();
+    json_fact_schema(&value, "$", &mut schema);
+    assert_eq!(schema["$.future_optional"], BTreeSet::from(["string".to_string()]));
+    assert_eq!(schema["$.absent_optional"], BTreeSet::from(["null".to_string()]));
 }

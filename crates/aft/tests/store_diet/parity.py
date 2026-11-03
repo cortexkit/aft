@@ -18,7 +18,6 @@ import threading
 import time
 
 HERE = pathlib.Path(__file__).resolve().parent
-BASELINE = '998c896b05753dd3a83158e30f97779b89ef28e2'
 SEED = 'callgraph-store-diet-v1'
 METADATA_FIELDS = {'search_ms', 'tier2_last_run'}
 
@@ -169,7 +168,8 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    dump(output / 'capture.json', {'baseline': BASELINE, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+    baseline = json.loads((HERE / 'baseline.json').read_text(encoding='utf-8'))['code_revision']
+    dump(output / 'capture.json', {'baseline': baseline, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                                   'manifest_sha256': hashlib.sha256(json.dumps(requests, sort_keys=True).encode()).hexdigest(),
                                   'normalised_fields': [], 'requests': len(requests), 'views': views, 'successful_queries': successes,
                                   'config_sha256': hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),

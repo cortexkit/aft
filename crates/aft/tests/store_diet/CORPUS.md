@@ -1,6 +1,6 @@
 # Corpus selection and stored-value coverage
 
-Baseline runtime: `998c896b05753dd3a83158e30f97779b89ef28e2`.
+Baseline runtime: the named main SHA in `baseline.json` and `recording.json`.
 The original on-disk `tests/fixtures/callgraph` tree remains an independent
 legacy/views golden workload. `corpus_manifest.json` is the exact additional
 project/file inventory: every input has its original repository path and owning
@@ -80,13 +80,12 @@ fixtures, not claims that a new language parser now produces those cases.
 ```
 python3 crates/aft/tests/store_diet/corpus.py generate
 python3 crates/aft/tests/store_diet/corpus.py check
-AFT_STORE_DIET_RECORD=1 cargo test -p agent-file-tools --lib -- store_diet --nocapture
-python3 crates/aft/tests/store_diet/values.py record
+python3 crates/aft/tests/store_diet/record.py --baseline MAIN_SHA
 cargo test -p agent-file-tools --lib -- store_diet
 python3 crates/aft/tests/store_diet/values.py check
 ```
 
-Recording refuses a schema or materialization-version bump. An encoding change
+Recording runs only in the recorder's explicitly named main checkout. An encoding change
 must decode rows back to these logical values and compare to the frozen oracle,
 not regenerate a new expected result. The general standalone runner remains
 available for the separately pinned AFT/reth trees and prepared borrowed graphs;
@@ -99,3 +98,12 @@ identifier-expression set, up to 100 distinct origin/expression pairs. It never
 rewrites an absolute path out of an error reply. Non-addressable graph scopes
 remain covered by callers/tree/impact/trace graph queries and stored-value
 observations; source-selector failures are not manufactured as data-flow inputs.
+
+Serialized per-file facts are inventoried generically from the table-encoding
+schema. Every JSON payload field contributes its path/type and the complete
+semantic JSON hash, without a fixed list of DispatchFacts/FileFacts members.
+Thus an optional producer fact such as `go_package: Option<String>` is included
+when the resolver batch adds it; the diet's compressed encoding must carry that
+fact unchanged. Re-record against the resolver batch's named main SHA before
+slice 3 compares answers. No old expected bytes are reused across an intentional
+producer answer/version change.

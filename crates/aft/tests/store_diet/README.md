@@ -2,8 +2,8 @@
 
 ## Frozen baseline and scope
 
-The runtime baseline is **998c896b05753dd3a83158e30f97779b89ef28e2**.
-`baseline.json` records the source hash, corpus revisions, seed, recording
+The runtime baseline is the named main commit in `baseline.json`.
+That file records the source hash, corpus revisions, seed, recording
 command and empty normalisation whitelist. Runtime storage code is unchanged;
 the only source registration is a cfg(test) module in callgraph_store.
 No existing test assertion about a tool's returned output was edited.
@@ -37,15 +37,33 @@ before a candidate capture. Each manifest supplies a stable request id.
 
 ## Reproduce adapter goldens
 
-Copy `tests/store_diet` and the cfg(test) module registration onto the baseline
-revision (test scaffolding only), then run:
+Record or re-record every baseline artifact with one command:
 
 ```
-AFT_STORE_DIET_RECORD=1 cargo test -p agent-file-tools --lib -- store_diet --nocapture
+python3 crates/aft/tests/store_diet/record.py --baseline MAIN_SHA
+```
+
+The recorder checks out that exact commit in a scratch clone, installs only the
+test-scaffolding patch, generates the schema/corpus inventories, records and
+self-replays all goldens, then applies the trace-only patch and verifies replies
+again. It publishes only after the whole run succeeds. `recording.json` names the
+commit and output hashes. Review regenerated trace exemptions before committing.
+Use `--output-dir target/scratch/oracles` on a build server; the recorder also
+writes a SHA-keyed tarball for returning the complete artifact set.
+
+The initial pre-fix recordings are provisional. Main's selective re-resolution
+fix adds stored target identity/provenance tie-breaks to four edge queries; any
+older tied-order drift is a known producer issue, not a diet regression. Future
+resolver changes with an intentional answer/version change require another
+named-main recording before testing the encoding candidate.
+
+After recording, ordinary candidate checks are read-only:
+
+```
 cargo test -p agent-file-tools --lib -- store_diet
 ```
 
-The first command explicitly records, the second compares. Ordinary test runs
+The recorder alone enables recording and validates its checkout SHA. Ordinary test runs
 never update a golden. `legacy-*.json` and `views-*.json` are separate baseline
 oracles: legacy/views need not agree with each other, but a candidate must agree
 with its own mode's baseline. The main six-operation replies use actual resolved

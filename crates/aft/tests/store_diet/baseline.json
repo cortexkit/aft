@@ -1,5 +1,7 @@
 {
   "code_revision": "998c896b05753dd3a83158e30f97779b89ef28e2",
+  "status": "provisional-before-tie-order-fix",
+  "requested_code_revision": "a2f2cddb98e5f0748b6bb95e41a91500b1c01062",
   "reference_trees": {
     "aft": "d3c176da67672a5084b2d0397f02fd58ece32a6a",
     "reth": "082c36ebee634baacacc4ca556ae77f7f60df708"
@@ -8,7 +10,7 @@
   "normalised_fields": [],
   "normalisation_policy": "No fields are currently normalised. A baseline-versus-baseline replay must justify any future field whitelist before a candidate replay. Rows, order, counts, notes and provenance must never be normalised.",
   "fixture_root": "crates/aft/tests/fixtures/callgraph",
-  "fixture_record_command": "AFT_STORE_DIET_RECORD=1 cargo test -p agent-file-tools --lib -- store_diet --nocapture",
+  "fixture_record_command": "python3 crates/aft/tests/store_diet/record.py --baseline MAIN_SHA",
   "fixture_check_command": "cargo test -p agent-file-tools --lib -- store_diet",
   "trace_patch": "crates/aft/tests/store_diet/baseline-trace.patch",
   "sql_trace_environment": "AFT_STORE_DIET_SQL_TRACE",

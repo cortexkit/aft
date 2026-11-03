@@ -8,9 +8,17 @@ from unittest import mock
 
 import inventory
 import parity
+import record as recorder
 
 
 class InventoryTests(unittest.TestCase):
+    def test_recorder_does_not_inherit_blush_or_trace_switches(self):
+        with mock.patch.dict('os.environ', {'AFT_STORE_DIET_RECORD': '1', 'AFT_STORE_DIET_BASELINE': 'wrong', 'AFT_STORE_DIET_SQL_TRACE': 'old.log'}):
+            env = recorder.clean_environment()
+        self.assertNotIn('AFT_STORE_DIET_RECORD', env)
+        self.assertNotIn('AFT_STORE_DIET_BASELINE', env)
+        self.assertNotIn('AFT_STORE_DIET_SQL_TRACE', env)
+
     def test_rust_literals_ignore_comments_lifetimes_and_characters(self):
         source = '''// "SELECT ghost"
 fn f<'a>(x: &'a str) { let c = 'x'; let q = "SELECT 1"; }
