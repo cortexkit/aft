@@ -13677,7 +13677,11 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
+/// - v23: Go concrete receivers, Python packages, decorators, defaults and
+///   `super()`, TypeScript object and factory members, and Rust trait and
+///   associated calls resolve to their real targets; Go, Python and TypeScript
+///   no longer guess callers by method name alone.
+const BUILD_OUTPUT_VERSION: &str = "v23-resolver-precision";
 
 const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
 
@@ -13687,7 +13691,7 @@ mod h_header_invalidation_tests {
 
     #[test]
     fn h_header_legacy_migration_is_targeted_atomic_and_once() {
-        assert_eq!(BUILD_OUTPUT_VERSION, "v22-python-import-bindings");
+        assert_eq!(BUILD_OUTPUT_VERSION, "v23-resolver-precision");
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("root")).unwrap();
         // Parse counters key files by the canonical path the store reads them
