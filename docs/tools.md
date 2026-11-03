@@ -384,11 +384,15 @@ Default schemas and unavailable sessions contain neither the parameter nor remot
 instructions. Standalone NDJSON sessions and Windows never advertise it, whatever the user
 setting says.
 
+On Linux, `runon` also takes a memory size in whole GiB, such as `linux,2c,16gb`, in any order with
+the other options. AFT sends it only to a build server that supports stated memory and refuses it
+before sending otherwise; Windows and macOS jobs have fixed memory and refuse a size.
+
 A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
 the project turned remote runs off (`remote runs are off for this project`), the session has no
 remote runner (`this session has no remote runner`), the demand is not one AFT knows
 (`unknown runner demand`; AFT only runs Linux, macOS, and Windows jobs), an option is malformed (for example,
-`runon "linux,4" is not valid: options are net and a vCPU count as Nc, for example "linux,4c,net"`),
+`runon "linux,4" is not valid: options are net, a vCPU count like 4c and a whole number of GiB like 16gb, for example "linux,2c,16gb"`),
 or the call also sets `pty: true`, a
 PowerShell shell, or `sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch
 needs AFT on macOS or Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before dispatch,
