@@ -128,9 +128,9 @@ pub(crate) fn apply_manifest_diff_profiled(
 }
 
 mod module_digest;
-mod payload;
 #[cfg(test)]
 pub(crate) mod parity;
+mod payload;
 pub(crate) mod profile;
 mod resolution_facts;
 mod stable_rows;
@@ -1790,10 +1790,9 @@ fn load_surfaces(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     rows.into_par_iter()
         .map(|(path, surface)| {
-            let binding = join::ViewBindingDependencies::from_surface_json(&payload::unpack(
-                &surface,
-            )?)
-                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+            let binding =
+                join::ViewBindingDependencies::from_surface_json(&payload::unpack(&surface)?)
+                    .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
             Ok((path, binding))
         })
         .collect()

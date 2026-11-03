@@ -834,7 +834,9 @@ fn bench_repository_cold_materialization() {
         .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC")
         .unwrap();
     for row in tables
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
         .unwrap()
     {
         let (name, bytes) = row.unwrap();

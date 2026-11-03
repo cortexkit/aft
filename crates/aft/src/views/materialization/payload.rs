@@ -53,7 +53,12 @@ mod tests {
         )
         .unwrap();
         let packed = pack(&json);
-        assert!(packed.len() * 4 < json.len(), "{} -> {}", json.len(), packed.len());
+        assert!(
+            packed.len() * 4 < json.len(),
+            "{} -> {}",
+            json.len(),
+            packed.len()
+        );
         assert_eq!(unpack(&packed).unwrap(), json);
         assert_eq!(unpack(&pack("")).unwrap(), "");
     }
