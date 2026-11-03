@@ -5,6 +5,7 @@ import pathlib
 import sqlite3
 import gzip
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,58 @@ import parity
 import record as recorder
 
 
+def checkout_fixture_bytes(directory, files):
+    """Export fixture blobs through Git with Windows-style checkout settings."""
+    directory = pathlib.Path(directory).resolve()
+    repository, checkout = directory / 'repository', directory / 'checkout'
+    repository.mkdir()
+    checkout.mkdir()
+    empty_config = directory / 'empty-config'
+    empty_config.write_bytes(b'')
+    (repository / '.gitattributes').write_bytes((inventory.ROOT / '.gitattributes').read_bytes())
+    for name, data in files.items():
+        path = repository / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('GIT_CONFIG_') and key not in {'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'}}
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(empty_config), GIT_ATTR_NOSYSTEM='1')
+
+    def git(*args):
+        result = subprocess.run(['git', '-c', 'core.attributesFile=' + str(empty_config), *args],
+                                cwd=repository, env=env, capture_output=True)
+        assert result.returncode == 0, result.stderr.decode('utf-8', errors='replace')
+
+    git('init', '--quiet')
+    git('-c', 'core.autocrlf=false', 'add', '--all')
+    git('-c', 'core.autocrlf=true', '-c', 'core.eol=crlf', 'checkout-index', '--all', '--force',
+        '--prefix=' + checkout.resolve().as_posix() + '/')
+    return {name: (checkout / name).read_bytes() for name in files}
+
+
 class InventoryTests(unittest.TestCase):
+    def test_git_checkout_preserves_byte_exact_parity_inputs(self):
+        root = 'crates/aft/tests/store_diet/'
+        files = {root + name: b'{\n  "fixture": true\n}\n' for name in [
+            'legacy-replies.json', 'views-replies.json', 'lifecycle-values.json',
+            'sqlite-order.json', 'dispatch-order.json', 'stored-shape-values.json',
+        ]}
+        files.update({
+            root + 'corpus/ruby-factory/greeter.rb': b'module Demo\nend\n',
+            root + 'corpus/tsx-components/sample.tsx': b'function F() {\n return <div/>;\n}\n',
+            root + 'wire-legacy/wire-callers.reply': b'{"success":true}\n',
+            root + 'baseline-trace.patch': b'--- a/file\n+++ b/file\n',
+            root + 'corpus-views.json.gz': gzip.compress(b'one\ntwo\n', compresslevel=0, mtime=0),
+            'crates/aft/tests/fixtures/callgraph/helpers.ts': b'function f() {}\n',
+            'crates/aft/tests/fixtures/sample.tsx': b'function F() {\n return <div/>;\n}\n',
+            'crates/aft/tests/fixtures/imports_ts.ts': b'import { value } from "./module";\n',
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            actual = checkout_fixture_bytes(directory, files)
+        for name, expected in files.items():
+            with self.subTest(path=name):
+                self.assertEqual(actual[name], expected)
+
     def test_capture_gzip_is_deterministic_and_compares_decoded_bytes(self):
         payload = b' {"rows": [1, 2]} \n' + b' ' * capture_io.GZIP_THRESHOLD
         with tempfile.TemporaryDirectory() as directory:
