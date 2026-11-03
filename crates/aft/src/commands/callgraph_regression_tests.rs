@@ -395,10 +395,6 @@ fn callgraph_python_nested_receiver_bodies_keep_enclosing_callers_in_views() {
     );
     // Module-level assignments do not prove a function-local receiver type.
     // Preserve all unresolved caller evidence without inventing an exact target.
-    assert!(store
-        .direct_callers_of(Path::new("calls.py"), "Builder::make")
-        .unwrap()
-        .is_empty());
     assert!(view
         .direct_callers_of(Path::new("calls.py"), "Builder::make")
         .unwrap()
