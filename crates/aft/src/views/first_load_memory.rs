@@ -102,8 +102,8 @@ fn first_load_memory_corpus() {
 }
 
 /// Times a fresh checkout's first bind when another checkout of the same
-/// repository has already filled the family's stores: the case of every new
-/// worker worktree. Copies `AFT_VIEW_FRESH_CORPUS` twice, binds the first copy
+/// repository has already filled the stores its checkouts share: the case of
+/// every new worker worktree. Copies `AFT_VIEW_FRESH_CORPUS` twice, binds the first copy
 /// to warm the stores, then binds the second, edits one of its files and binds
 /// it again on the same driver. Prints each bind's wall time, CPU time and
 /// source work (walks, stats, reads, hashed bytes, attachments).
@@ -119,9 +119,10 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
     let storage = scratch.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
     // Git before 2.42 cannot name its system and global attribute files, so
-    // the checkout's conversion policy is not reusable and tree-base receipts
-    // are refused. AFT_VIEW_FRESH_MODERN_GIT=1 models a newer Git that reports
-    // both files as absent.
+    // the checkout's conversion policy is not reusable, and the bind may not
+    // skip reading a file on the strength of Git's index naming the same blob
+    // a shared base recorded for it. AFT_VIEW_FRESH_MODERN_GIT=1 models a
+    // newer Git that reports both files as absent.
     let _modern_git = std::env::var_os("AFT_VIEW_FRESH_MODERN_GIT")
         .map(|_| crate::views::verification::known_attribute_sources_for_test(scratch.path()));
     let checkout = |name: &str| {
