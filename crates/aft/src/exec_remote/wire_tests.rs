@@ -2163,7 +2163,7 @@ async fn return_cap_refusal_preserves_memory_size_on_the_single_resubmit() {
         },
         &[
             client::CAPABILITY,
-            client::MEMORY_CAPABILITY,
+            MEMORY_CAPABILITY,
             RETURN_CHUNKED_CAPABILITY,
             RETURN_LARGE_CAPABILITY,
         ],
