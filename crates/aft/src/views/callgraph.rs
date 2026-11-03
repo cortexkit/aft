@@ -37,6 +37,64 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// HTML headings that share a row.
 pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadWaitStage {
+    QueryLock,
+    Acquisition,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadWaitObservation {
+    pub stage: ReadWaitStage,
+    pub started: std::time::Instant,
+    pub deadline: std::time::Instant,
+    pub requested: std::time::Duration,
+    pub finished: std::time::Instant,
+    pub timed_out: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static READ_WAIT_OBSERVATIONS: std::cell::RefCell<Option<Vec<ReadWaitObservation>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ReadWaitCapture(Option<Vec<ReadWaitObservation>>);
+
+#[cfg(test)]
+impl Drop for ReadWaitCapture {
+    fn drop(&mut self) {
+        let previous = std::mem::replace(&mut self.0, None);
+        READ_WAIT_OBSERVATIONS.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_read_waits_for_test<T>(
+    read: impl FnOnce() -> T,
+) -> (T, Vec<ReadWaitObservation>) {
+    let guard = ReadWaitCapture(READ_WAIT_OBSERVATIONS.with(|slot| slot.replace(Some(Vec::new()))));
+    let result = read();
+    let observations = READ_WAIT_OBSERVATIONS
+        .with(|slot| slot.replace(None))
+        .unwrap();
+    drop(guard);
+    (result, observations)
+}
+
+#[cfg(test)]
+fn record_read_wait(observation: ReadWaitObservation) {
+    READ_WAIT_OBSERVATIONS.with(|slot| {
+        if let Some(observations) = slot.borrow_mut().as_mut() {
+            observations.push(observation);
+        }
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
     payload: Arc<std::sync::Mutex<Option<Arc<[u8]>>>>,
@@ -966,9 +1024,9 @@ impl CallgraphView {
         &self,
         now: impl Fn() -> std::time::Instant,
     ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        let deadline = std::time::Instant::now() + super::contracts::CALLGRAPH_QUERY_WAIT;
         #[cfg(test)]
         crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-enter");
-        let deadline = std::time::Instant::now() + super::contracts::CALLGRAPH_QUERY_WAIT;
         let result = self.reader_before(now, deadline);
         #[cfg(test)]
         crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-return");
@@ -991,9 +1049,24 @@ impl CallgraphView {
         // deadline; queued readers must not get a fresh window after the lock.
         #[cfg(test)]
         crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-begin");
+        #[cfg(test)]
+        let query_started = std::time::Instant::now();
         let retry = self.query.try_lock_until(deadline);
         #[cfg(test)]
+        record_read_wait(ReadWaitObservation {
+            stage: ReadWaitStage::QueryLock,
+            started: query_started,
+            deadline,
+            requested: deadline.saturating_duration_since(query_started),
+            finished: std::time::Instant::now(),
+            timed_out: retry.is_none(),
+        });
+        #[cfg(test)]
         crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-return");
+        #[cfg(test)]
+        if retry.is_none() {
+            crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-timeout");
+        }
         let mut retry = retry.ok_or_else(graph_building)?;
         let mut steady = self
             .steady
@@ -1172,7 +1245,8 @@ impl CallgraphView {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *acquisition = Some(rx);
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let receive_started = std::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(receive_started);
         #[cfg(test)]
         crate::storage_retention::test_hook(
             &self.root,
@@ -1182,6 +1256,15 @@ impl CallgraphView {
             ),
         );
         let received = acquisition.as_ref().unwrap().recv_timeout(remaining);
+        #[cfg(test)]
+        record_read_wait(ReadWaitObservation {
+            stage: ReadWaitStage::Acquisition,
+            started: receive_started,
+            deadline,
+            requested: remaining,
+            finished: std::time::Instant::now(),
+            timed_out: matches!(&received, Err(crossbeam_channel::RecvTimeoutError::Timeout)),
+        });
         #[cfg(test)]
         crate::storage_retention::test_hook(
             &self.root,

@@ -15380,7 +15380,11 @@ mod tests {
         );
     }
 
-    fn assert_callgraph_views_rematerialization_bounded(command: &str, daemon: bool) {
+    fn assert_callgraph_views_rematerialization_bounded(
+        command: &str,
+        daemon: bool,
+        delay_delivery: bool,
+    ) {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -15470,6 +15474,8 @@ mod tests {
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         let (published_tx, published_rx) = crossbeam_channel::unbounded();
         let (phase_tx, phase_rx) = crossbeam_channel::unbounded();
+        let (timed_out_tx, timed_out_rx) = crossbeam_channel::unbounded();
+        let (deliver_tx, deliver_rx) = crossbeam_channel::unbounded();
         let timing_origin = Instant::now();
         let _hook = crate::storage_retention::observe_test_hook(
             &root,
@@ -15481,9 +15487,18 @@ mod tests {
                         Instant::now(),
                     ));
                 }
+                if matches!(
+                    step,
+                    "cg-timing:receive-timeout" | "cg-timing:query-lock-timeout"
+                ) {
+                    timed_out_tx.send(()).unwrap();
+                    if delay_delivery {
+                        deliver_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+                    }
+                }
                 if step == "callgraph-materialize" {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(120)).unwrap();
                 } else if step == "callgraph-reader-acquired" {
                     let _ = published_tx.send(());
                 }
@@ -15508,23 +15523,35 @@ mod tests {
             let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
             let timing_root = root.clone();
             let timing_id = timing_ids.fetch_add(1, Ordering::Relaxed);
+            let (waits_tx, waits_rx) = crossbeam_channel::bounded(1);
             std::thread::spawn(move || {
                 let started = Instant::now();
                 let id = request.id.clone();
                 let zoom = request.command == "zoom";
                 let run = move |ctx: &AppContext| {
-                    crate::storage_retention::test_hook(
-                        &timing_root,
-                        &format!("cg-timing:request-{timing_id}-pin-begin"),
-                    );
-                    let _pin = ctx.pin_config();
-                    crate::storage_retention::test_hook(&timing_root, "cg-timing:pin-return");
-                    let response = if zoom {
-                        crate::commands::zoom::handle_zoom(&request, ctx)
-                    } else {
-                        crate::commands::callers::handle_callers(&request, ctx)
-                    };
-                    crate::storage_retention::test_hook(&timing_root, "cg-timing:handler-return");
+                    let (response, waits) =
+                        crate::views::callgraph::capture_read_waits_for_test(|| {
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                &format!("cg-timing:request-{timing_id}-pin-begin"),
+                            );
+                            let _pin = ctx.pin_config();
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                "cg-timing:pin-return",
+                            );
+                            let response = if zoom {
+                                crate::commands::zoom::handle_zoom(&request, ctx)
+                            } else {
+                                crate::commands::callers::handle_callers(&request, ctx)
+                            };
+                            crate::storage_retention::test_hook(
+                                &timing_root,
+                                "cg-timing:handler-return",
+                            );
+                            response
+                        });
+                    waits_tx.send(waits).unwrap();
                     response
                 };
                 let response = if let Some(executor) = executor {
@@ -15546,7 +15573,10 @@ mod tests {
                 } else {
                     run(&worker_ctx)
                 };
-                answer_tx.send((started.elapsed(), response)).unwrap();
+                let waits = waits_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+                answer_tx
+                    .send((started.elapsed(), response, waits))
+                    .unwrap();
             })
         };
         let worker = spawn_read();
@@ -15555,7 +15585,23 @@ mod tests {
         // A reader queued behind the first read gets the same total budget,
         // not another full wait after the first read releases the query lock.
         let concurrent = spawn_read();
-        let deadline = Instant::now() + bound + Duration::from_secs(1);
+        // This watchdog only releases stuck fixture threads. The assertions
+        // below check actual wait arguments and timeout outcomes, not dispatch
+        // or response-rendering wall time on a busy runner.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let first_timeout =
+            timed_out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let second_timeout =
+            timed_out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let materializer_still_gated = published_rx.is_empty();
+        let delivery_was_gated = !delay_delivery || answer_rx.is_empty();
+        if delay_delivery {
+            crossbeam_channel::after(Duration::from_millis(1250))
+                .recv()
+                .unwrap();
+            deliver_tx.send(()).unwrap();
+            deliver_tx.send(()).unwrap();
+        }
         let first = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         let second = answer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         release_tx.send(()).unwrap();
@@ -15568,14 +15614,62 @@ mod tests {
             );
         }
         assert!(entered.is_ok(), "request never reached materialization");
+        assert!(
+            first_timeout.is_ok() && second_timeout.is_ok(),
+            "a read did not time out while materialization was gated"
+        );
+        assert!(
+            materializer_still_gated,
+            "materialization finished before the timeout observations"
+        );
+        assert!(
+            delivery_was_gated,
+            "post-timeout delivery gate did not hold the reply"
+        );
         for bounded_answer in [first, second] {
-            let answered_in_bound = bounded_answer.is_ok();
-            let (elapsed, answer) = bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
-            eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_in_bound}", elapsed.as_millis(), bound.as_millis());
+            let answered_while_gated = bounded_answer.is_ok();
+            let (elapsed, answer, waits) =
+                bounded_answer.unwrap_or_else(|_| answer_rx.recv().unwrap());
+            eprintln!("{command}: changed_files=64 read_ms={} bound_ms={} answered_before_release={answered_while_gated} delayed_delivery={delay_delivery}", elapsed.as_millis(), bound.as_millis());
             assert!(
-                answered_in_bound,
-                "{command} waited {elapsed:?} for materialization past {bound:?}"
+                answered_while_gated,
+                "read did not deliver after its bounded wait"
             );
+            assert!(
+                !waits.is_empty(),
+                "read did not observe the materialization wait policy"
+            );
+            let wait_deadline = waits[0].deadline;
+            assert_eq!(
+                waits[0].stage,
+                crate::views::callgraph::ReadWaitStage::QueryLock
+            );
+            assert!(
+                waits.iter().any(|wait| wait.timed_out),
+                "read did not observe a bounded timeout"
+            );
+            for wait in waits {
+                eprintln!("cg_wait command={command} daemon={daemon} stage={:?} requested_us={} observed_us={} timed_out={}", wait.stage, wait.requested.as_micros(), wait.finished.duration_since(wait.started).as_micros(), wait.timed_out);
+                assert_eq!(
+                    wait.deadline, wait_deadline,
+                    "a wait stage reset the request deadline"
+                );
+                assert!(
+                    wait.requested <= bound,
+                    "wait requested more than the production bound: {wait:?}"
+                );
+                assert_eq!(
+                    wait.requested,
+                    wait_deadline.saturating_duration_since(wait.started),
+                    "wait did not receive only the remaining request budget"
+                );
+            }
+            if delay_delivery {
+                assert!(
+                    elapsed > bound + Duration::from_secs(1),
+                    "controlled response delay was not exercised"
+                );
+            }
             if command == "zoom" {
                 assert!(answer.success, "{:?}", answer.data);
                 assert!(answer.data.to_string().contains("export function target"));
@@ -15604,22 +15698,27 @@ mod tests {
 
     #[test]
     fn callgraph_views_rematerialization_bounds_callers_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("callers", false);
+        assert_callgraph_views_rematerialization_bounded("callers", false, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_zoom_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("zoom", false);
+        assert_callgraph_views_rematerialization_bounded("zoom", false, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_daemon_callers_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("callers", true);
+        assert_callgraph_views_rematerialization_bounded("callers", true, false);
     }
 
     #[test]
     fn callgraph_views_rematerialization_bounds_daemon_zoom_then_serves_publication() {
-        assert_callgraph_views_rematerialization_bounded("zoom", true);
+        assert_callgraph_views_rematerialization_bounded("zoom", true, false);
+    }
+
+    #[test]
+    fn callgraph_views_wait_bound_excludes_controlled_post_timeout_reply_delay() {
+        assert_callgraph_views_rematerialization_bounded("zoom", false, true);
     }
 
     fn assert_callgraph_acquisition_lifecycle(
