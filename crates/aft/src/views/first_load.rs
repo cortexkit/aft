@@ -4048,6 +4048,75 @@ mod composite_tests {
     }
 
     #[test]
+    fn superseded_prepared_readers_do_not_accumulate_after_rejected_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (mut driver, _, _, access) = fixture(root.path(), storage.path());
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let adapter = Arc::new(super::super::trigram::TrigramAdapter::new(
+            storage.path().to_path_buf(),
+            policy,
+        ));
+        Arc::get_mut(&mut driver).unwrap().adapters = vec![adapter.clone()];
+        let loader = SiblingLoader::new(driver.clone(), vec![adapter]);
+        drop(loader.load(&access).unwrap());
+        let initial = driver.installed_snapshot();
+        let seq = driver.installed_bundle().seq;
+        let mut first = None;
+        for revision in 0..32 {
+            std::fs::write(
+                root.path().join("file.rs"),
+                format!("revision_{revision} {}", "unique content\n".repeat(100)),
+            )
+            .unwrap();
+            driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+            let (observed, version) = loader
+                .reconciled(&access, initial.generation().clone())
+                .unwrap();
+            let generation = driver
+                .build_own_generation(&access, &observed, false)
+                .unwrap();
+            let mut cut = observed.install_cut().unwrap().clone();
+            cut.seq = cut.seq.saturating_sub(1);
+            let stale = LiveDelta::new(generation.clone())
+                .snapshot()
+                .with_install_cut(cut);
+            assert!(driver.install(&access, &stale, version).is_err());
+            if revision == 0 {
+                first = Some(Arc::downgrade(
+                    &driver.prepared_readers.lock().unwrap()[generation.name()].readers,
+                ));
+            }
+            if revision % 8 == 7 {
+                eprintln!(
+                    "prepared_heap revisions={} bundles={} live_bytes={} live_allocations={}",
+                    revision + 1,
+                    driver.prepared_readers.lock().unwrap().len(),
+                    crate::test_allocations::live_bytes(),
+                    crate::test_allocations::live_allocations()
+                );
+            }
+        }
+        assert_eq!(driver.installed_bundle().seq, seq);
+        assert_eq!(
+            driver.prepared_readers.lock().unwrap().len(),
+            1,
+            "only the latest durable publication needs a parked reader bundle"
+        );
+        assert!(
+            first.unwrap().upgrade().is_none(),
+            "superseded prepared readers still own the old generation"
+        );
+        assert_eq!(
+            initial.disk_state(&RelPath::new(b"file.rs".to_vec()).unwrap()),
+            DiskState::of_bytes(b"strict content"),
+            "existing query snapshots must stay usable"
+        );
+    }
+
+    #[test]
     fn rejected_install_does_not_consume_prepared_readers() {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();

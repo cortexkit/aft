@@ -138,7 +138,8 @@ fn synthetic_bound_roots() {
                 "oldString":format!("target() -> usize {{ {round} }}"),
                 "newString":format!("target() -> usize {{ {} }}", round + 1)}),
             );
-            assert!(std::fs::read_to_string(root.join("file_0.rs")).unwrap()
+            assert!(std::fs::read_to_string(root.join("file_0.rs"))
+                .unwrap()
                 .contains(&format!("target() -> usize {{ {} }}", round + 1)));
             if n < 4 {
                 let id = ctx
@@ -175,12 +176,23 @@ fn synthetic_bound_roots() {
                 ctx.drain_bg_completions();
             }
             ctx.forget_configure_session_binding(&root, &session);
+            crate::runtime_drain::drain_watcher_events(ctx);
         }
         std::thread::sleep(Duration::from_secs(1));
         sample(&format!("round-{round}"), &roots, start);
     }
     for second in 1..=3 {
-        std::thread::sleep(Duration::from_secs(10));
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            for ctx in &roots {
+                if ctx.watcher_drain_has_work() {
+                    crate::runtime_drain::drain_watcher_events(ctx);
+                }
+                crate::runtime_drain::drain_search_index_events(ctx);
+                crate::runtime_drain::drain_callgraph_store_events(ctx);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
         sample(&format!("idle-{}", second * 10), &roots, start);
     }
     for ctx in &roots {
