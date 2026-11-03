@@ -9842,35 +9842,18 @@ impl RootCommitStamp {
         {
             return None;
         }
-        // Object contents are addressed by their hash. Watch storage topology
-        // too, so a removed loose ancestor or replaced pack cannot reuse an
-        // earlier successful walk merely because HEAD is still readable.
-        // The loose directory names have exactly 256 possible values; this
-        // reads directory metadata, never walks their object files.
-        let objects = self.common_dir.join("objects");
-        let mut object_storage = vec![RootCommitFileIdentity::of(&objects, true)??];
-        for path in [
-            objects.join("pack"),
-            objects.join("info/commit-graph"),
-            objects.join("info/commit-graphs"),
-        ] {
-            if let Some(identity) = RootCommitFileIdentity::of(&path, true)? {
-                object_storage.push(identity);
-            }
-        }
-        for prefix in 0..256 {
-            if let Some(identity) =
-                RootCommitFileIdentity::of(&objects.join(format!("{prefix:02x}")), true)?
-            {
-                object_storage.push(identity);
-            }
-        }
+        // A commit's ancestry is content-addressed. New loose objects, repacks
+        // and commit-graph updates cannot change which parentless commits are
+        // reachable from the same HEAD, so storage topology must not invalidate
+        // sharing across busy worktrees.
+        // History-changing views are excluded above; each bind still asks Git
+        // to verify repository access and a readable HEAD before reusing roots.
         let git_env: BTreeMap<_, _> = std::env::vars_os()
             .filter(|(name, _)| name.to_str().is_some_and(|name| name.starts_with("GIT_")))
             .collect();
         let key = blake3::hash(
             format!(
-                "{:?}|{commit}|{:?}|{:?}|{:?}|{object_storage:?}|{git_env:?}",
+                "{:?}|{commit}|{:?}|{:?}|{:?}|{git_env:?}",
                 self.common_dir, self.common_dir_identity, self.config_contents, self.watched
             )
             .as_bytes(),
