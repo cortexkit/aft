@@ -1007,8 +1007,13 @@ fn workspace_views_with_ready_children(busy_child: bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let session = loop {
             crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-            if let Some(session) = crate::views::parent::session_for_root(root.path()) {
-                break session;
+            // The parent session is published before the deferred watcher
+            // continuation finishes. Observe the completed configure tail
+            // before asserting that the workspace watcher is installed.
+            if ctx.configure_tail_idle() {
+                if let Some(session) = crate::views::parent::session_for_root(root.path()) {
+                    break session;
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
