@@ -373,8 +373,15 @@ pub(crate) struct Policy {
     /// them in split bases on files tools write for themselves, such as a
     /// self-ignoring `.opencode/.gitignore` that only the main checkout has.
     pub base_digest: String,
-    /// Attribute files and configured conversions forbid stat-based byte reuse
-    /// when their effects on each file's bytes have not been established.
+    /// Whether Git is proven to store this checkout's files byte for byte: no
+    /// attribute file, configured conversion or unknown attribute source can
+    /// change a file between the working tree and its blob. Only evidence
+    /// that comes from Git instead of from reading the file depends on it: a
+    /// tree-keyed base's blob receipts, which let a bind skip reading a file
+    /// whose index entry names a receipt's blob. Stats AFT recorded when it
+    /// read a file stay valid under any conversion rules, because they
+    /// describe the working-tree bytes AFT hashed; `digest` alone pairs them
+    /// with the policy they were read under.
     pub reusable: bool,
 }
 

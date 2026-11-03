@@ -2631,6 +2631,9 @@ impl FirstLoadDriver for CheckoutDriver {
                 || std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
             candidates.insert(absolute);
         }
+        // The walk can be limited to delivered changes under the same
+        // checkout policy. Git's conversions do not matter here: every entry
+        // carried over was read from this checkout's files, not from Git.
         let continuous = v3
             && subscription.is_some()
             && subscription == previous.subscription
@@ -2639,9 +2642,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 .as_ref()
                 .zip(previous.guard.as_ref())
                 .is_some_and(|(now, old)| now.root == old.root && now.policy == old.policy)
-            && guard
-                .as_ref()
-                .is_some_and(|guard| guard.policy.reusable && guard.steady_supported)
+            && guard.as_ref().is_some_and(|guard| guard.steady_supported)
             && !policy_or_directory;
         let changed_files = if continuous {
             self.walker.changed_files(self.owner.root(), &candidates)?
@@ -2718,12 +2719,15 @@ impl FirstLoadDriver for CheckoutDriver {
                         .get(&path)
                         .copied()
                         .unwrap_or(0);
+                    // An unchanged stat proves this checkout's bytes are the
+                    // ones read before, whatever Git's conversion rules are;
+                    // the policy and root must still be the ones they were
+                    // read under.
                     let policy_matches = !v3
                         || guard.as_ref().is_some_and(|guard| {
-                            guard.policy.reusable
-                                && previous.guard.as_ref().is_some_and(|old| {
-                                    old.policy == guard.policy && old.root == guard.root
-                                })
+                            previous.guard.as_ref().is_some_and(|old| {
+                                old.policy == guard.policy && old.root == guard.root
+                            })
                         });
                     let keys_present = old.attachments.values().all(|a| {
                         a.downcast_ref::<CachedAttachment>()
@@ -2756,7 +2760,11 @@ impl FirstLoadDriver for CheckoutDriver {
                     }
                 }
             }
-            if !pending.contains(&path) && guard.as_ref().is_some_and(|g| g.policy.reusable) {
+            // Persisted evidence was read under this exact policy digest
+            // (`read_evidence` checks it). Git-derived blob receipts join it
+            // only when the policy proves Git's conversions leave bytes alone
+            // (`tree_receipt_evidence`), so no extra policy check is needed.
+            if !pending.contains(&path) && guard.is_some() {
                 if let (Some(record), Some(current), Some(generation)) =
                     (persisted.get(&path), before.as_ref(), durable.as_ref())
                 {
