@@ -59,6 +59,8 @@ struct InspectRequestDeadline {
     budget: Duration,
     terminal_at: Instant,
     work_at: Instant,
+    #[cfg(test)]
+    content_read_limit: Option<usize>,
 }
 
 impl InspectRequestDeadline {
@@ -86,6 +88,8 @@ impl InspectRequestDeadline {
             budget,
             terminal_at,
             work_at,
+            #[cfg(test)]
+            content_read_limit: None,
         }
     }
 
@@ -111,6 +115,12 @@ impl InspectRequestDeadline {
     }
 
     fn has_work_budget(self) -> bool {
+        #[cfg(test)]
+        if self.content_read_limit.is_some_and(|limit| {
+            crate::lsp::document::CONTENT_HASH_READS.with(|reads| reads.get() >= limit)
+        }) {
+            return false;
+        }
         Instant::now() < self.work_at
     }
 
@@ -2162,32 +2172,22 @@ fn run_blocking_inspect_body(
             },
         );
     }
-    if let Err(terminal) =
-        verify_final_root_stats(&project_root, &initial_stats, &phase_log, deadline)
-    {
-        if response.success
-            && matches!(
-                &terminal,
-                InspectTerminal::PhaseFailed {
-                    failure_reason: "inspect_request_timeout",
-                    ..
-                }
-            )
-        {
-            response.data["complete"] = Value::Bool(false);
-            let gap = serde_json::json!({"kind": "stat_verification_incomplete",
-                "reason": "file freshness verification exceeded the request budget; retry aft_inspect"});
-            if !response.data["gaps"].is_array() {
-                response.data["gaps"] = serde_json::json!([]);
-            }
-            response.data["gaps"].as_array_mut().unwrap().push(gap);
+    match verify_response_stats(
+        &mut response,
+        &project_root,
+        &initial_stats,
+        &phase_log,
+        deadline,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
             return build_inspect_terminal(
                 &req.id,
                 &phase_log,
                 InspectTerminal::Fresh(response.data, sections),
-            );
+            )
         }
-        return build_inspect_terminal(&req.id, &phase_log, terminal);
+        Err(terminal) => return build_inspect_terminal(&req.id, &phase_log, terminal),
     }
     if let Some(inspect_snapshot) = inspect_snapshot.as_ref().filter(|_| diagnostics_requested) {
         record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
@@ -2217,6 +2217,41 @@ fn run_blocking_inspect_body(
             },
         )
     }
+}
+
+/// Preserve collected results when only the final filesystem fence times out.
+/// `false` means final root-stat verification timed out, so the incomplete
+/// response includes a freshness gap.
+fn verify_response_stats(
+    response: &mut Response,
+    project_root: &Path,
+    initial_stats: &InspectRootStatSnapshot,
+    phase_log: &InspectPhaseLog,
+    deadline: InspectRequestDeadline,
+) -> Result<bool, InspectTerminal> {
+    if let Err(terminal) = verify_final_root_stats(project_root, initial_stats, phase_log, deadline)
+    {
+        if response.success
+            && matches!(
+                &terminal,
+                InspectTerminal::PhaseFailed {
+                    failure_reason: "inspect_request_timeout",
+                    ..
+                }
+            )
+        {
+            response.data["complete"] = Value::Bool(false);
+            let gap = serde_json::json!({"kind": "stat_verification_incomplete",
+                "reason": "file freshness verification exceeded the request budget; retry aft_inspect"});
+            if !response.data["gaps"].is_array() {
+                response.data["gaps"] = serde_json::json!([]);
+            }
+            response.data["gaps"].as_array_mut().unwrap().push(gap);
+            return Ok(false);
+        }
+        return Err(terminal);
+    }
+    Ok(true)
 }
 
 /// Wait for every successfully started producer to settle before the payload
@@ -8106,6 +8141,108 @@ mod fresh_payload_tests {
             !text.contains("(cap)"),
             "uncapped must have no trailer: {text}"
         );
+    }
+}
+
+// A retry finishes here because unchanged files are proven current from stat
+// evidence alone. Windows metadata can't prove that (a same-size rewrite can
+// keep both timestamps), so Windows re-reads every file and a retry under the
+// same one-read budget is honestly partial again.
+#[cfg(all(test, not(windows)))]
+mod inspect_freshness_progress_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_freshness_progress_retry_finishes_after_verification_budget_exhaustion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let file = root.join("a.ts");
+        std::fs::write(&file, "export const n = 1;\n").unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(root.join("storage")),
+            ..Default::default()
+        };
+        config.inspect.categories = serde_json::from_value(serde_json::json!({
+            "diagnostics":true, "todos":false, "dead_code":false,
+            "unused_exports":false, "duplicates":false, "cycles":false, "complexity":false,
+        }))
+        .unwrap();
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish_with_kind(
+                crate::lsp::registry::ServerKind::TypeScript,
+                file.clone(),
+                Vec::new(),
+            );
+        ctx.lsp().certify_diagnostic_content_for_test(&file);
+
+        let inspect = || {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id":"freshness-retry", "command":"inspect",
+                "params":{"scope":"a.ts", "sections":"diagnostics"}
+            }))
+            .unwrap();
+            let phases = InspectPhaseLog::for_request(request.id.clone());
+            let initial = capture_inspect_root_stats_until(&root, None).unwrap();
+            let mut deadline = InspectRequestDeadline::for_request(&request, &ctx.config());
+            // Charge one actual content read the remaining work budget. Both
+            // attempts get the same allowance; stat-only reuse spends none.
+            deadline.content_read_limit =
+                Some(crate::lsp::document::CONTENT_HASH_READS.with(|reads| reads.get() + 1));
+            // Seeded reports isolate verification from server startup and wire
+            // timing, while exercising the normal scoped collection and fence.
+            let mut response = handle_inspect_payload(
+                &request,
+                &ctx,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                Some(&phases),
+                Some(deadline),
+                Some(&initial),
+                Vec::new(),
+            );
+            assert!(response.success, "{}", response.data);
+            let verified = verify_response_stats(&mut response, &root, &initial, &phases, deadline)
+                .unwrap_or_else(|_| panic!("verification must preserve the collected payload"));
+            let response = build_inspect_terminal(
+                &request.id,
+                &phases,
+                InspectTerminal::Fresh(response.data, Sections::all()),
+            );
+            (verified, response)
+        };
+
+        let (verified, first) = inspect();
+        assert!(
+            !verified,
+            "the first inspect must exhaust verification's budget"
+        );
+        assert_eq!(first.data["inspect_terminal"], "partial", "{}", first.data);
+        assert!(
+            first.data["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|gap| gap["kind"] == "stat_verification_incomplete"),
+            "{}",
+            first.data
+        );
+        let (verified, second) = inspect();
+        assert!(
+            verified,
+            "the retry must retain unchanged-file verification: {}",
+            second.data
+        );
+        assert_eq!(second.data["complete"], true, "{}", second.data);
+        assert_eq!(second.data["inspect_terminal"], "fresh", "{}", second.data);
     }
 }
 

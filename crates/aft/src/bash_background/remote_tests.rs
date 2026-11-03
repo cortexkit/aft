@@ -10963,9 +10963,10 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
     }
 }
 
-/// Repeated owner stops can replace metadata during every optimistic replay
-/// open. A busy writer is not a corrupt task: replay must still register it
-/// and deliver its stop, even when the bounded open retries are exhausted.
+/// A writer can replace metadata during every optimistic replay open while
+/// an owner stops the task. A busy writer is not a corrupt task: replay must
+/// still register it and deliver its stop, even when the bounded open retries
+/// are exhausted.
 #[tokio::test]
 async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion() {
     use std::os::unix::fs::MetadataExt;
@@ -10987,6 +10988,10 @@ async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion(
             BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
         assert!(errors.is_empty(), "{errors:?}");
         let recovery = recovered.into_iter().next().unwrap();
+        let metadata_dir =
+            crate::bash_background::persistence::PinnedDir::open(json.parent().unwrap()).unwrap();
+        let metadata_name = json.file_name().unwrap().to_os_string();
+        let metadata_path = json.clone();
         let project = registry();
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -11034,6 +11039,15 @@ async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion(
                 recovery
                     .record_owner_pause_intent(&recovery.task(&task_id).unwrap())
                     .unwrap();
+                // Repeated pause intents have identical bytes and can skip
+                // persistence. Force the inode replacement this race needs,
+                // without changing the task's logical cancellation state.
+                crate::bash_background::persistence::randomized_atomic_replace(
+                    &metadata_dir,
+                    &metadata_name,
+                    &fs::read(&metadata_path).unwrap(),
+                )
+                .unwrap();
             } else {
                 let members = recovery.begin_scope_pause(&scope).unwrap();
                 recovery.pause_scope(&scope, true, &members).unwrap();

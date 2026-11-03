@@ -127,6 +127,7 @@ fn disk_facts_disable_recording_hooks() {
 
 fn check_transition(
     f: &Fixture,
+    connection: &Connection,
     expected_dependents: usize,
     expected_resolved: usize,
 ) -> MaterializeStats {
@@ -135,6 +136,16 @@ fn check_transition(
     let cold = f.dir.path().join("fact-cold.sqlite");
     materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
     assert_snapshot_parity(&snapshot(&cold), &snapshot(&copy));
+    let reader = reader_tests::v3_reader(connection, &f.dir.path().join("v3"));
+    let patched = f.dir.path().join("derived-reader.sqlite");
+    materialize_from_blob_reader(&patched, &f.base, &reader).unwrap();
+    let reader_stats =
+        apply_manifest_diff_from_blob_reader(&patched, &f.base, &f.next, &reader).unwrap();
+    assert_snapshot_parity(&snapshot(&cold), &snapshot(&patched));
+    assert_eq!(
+        reader_stats, stats,
+        "v3 and legacy must select the same work"
+    );
     assert!(!stats.full_resolution, "{stats:?}");
     assert_eq!(stats.unattributed_callers, 0, "{stats:?}");
     assert_eq!(stats.dependent_files, expected_dependents, "{stats:?}");
@@ -153,7 +164,7 @@ fn version_only_package_edit_resolves_no_unchanged_callers() {
         "package.json",
         r#"{"workspaces":["packages/*"],"version":"2"}"#,
     );
-    let stats = check_transition(&f, 0, 0);
+    let stats = check_transition(&f, &conn, 0, 0);
     assert_eq!(stats.rebuilt_surface_entries, 0);
     assert_eq!(stats.decoded_caller_blobs, 0);
 }
@@ -168,7 +179,7 @@ fn workspace_member_added_resolves_only_its_importers() {
         "package.json",
         r#"{"workspaces":["packages/q"]}"#,
     );
-    check_transition(&f, 2, 2);
+    check_transition(&f, &conn, 2, 2);
 }
 
 #[test]
@@ -181,7 +192,7 @@ fn exports_change_resolves_only_package_importers() {
         "packages/pkg/package.json",
         r#"{"name":"pkg","exports":"./two.ts"}"#,
     );
-    check_transition(&f, 2, 2);
+    check_transition(&f, &conn, 2, 2);
 }
 
 #[test]
@@ -200,7 +211,7 @@ fn tsconfig_paths_change_resolves_only_alias_importers() {
         "tsconfig.json",
         r#"{"compilerOptions":{"paths":{"pkg":["packages/pkg/two.ts"]}}}"#,
     );
-    check_transition(&f, 2, 2);
+    check_transition(&f, &conn, 2, 2);
 }
 
 #[test]
@@ -253,7 +264,7 @@ fn cargo_workspace_member_added_resolves_its_dependents() {
         "new/Cargo.toml",
         "[package]\nname = \"new-crate\"",
     );
-    check_transition(&f, 1, 2);
+    check_transition(&f, &conn, 1, 2);
 }
 
 #[test]
@@ -277,7 +288,7 @@ fn rust_mod_move_resolves_declaring_crate_callers() {
             ("other/src/lib.rs", "pub fn other() {}"),
         ],
     );
-    check_transition(&f, 1, 2);
+    check_transition(&f, &conn, 1, 2);
 }
 
 #[test]
@@ -396,7 +407,7 @@ fn workspace_member_name_change_invalidates_memo_hit_callers() {
         "packages/pkg/package.json",
         r#"{"name":"retired","exports":"./one.ts"}"#,
     );
-    check_transition(&f, 2, 2);
+    check_transition(&f, &conn, 2, 2);
 }
 
 #[test]

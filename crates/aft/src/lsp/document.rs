@@ -272,6 +272,8 @@ impl DiskSnapshot {
 
 /// Stream large files rather than allocating another full document buffer.
 pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
@@ -280,6 +282,7 @@ pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Files read for a content hash on this thread.
     pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

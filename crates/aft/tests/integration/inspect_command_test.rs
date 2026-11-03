@@ -6362,7 +6362,20 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
 
-    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
+    let mut response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
+    // The cap intentionally leaves diagnostics partial. Retry only a separate
+    // freshness-budget gap, and keep the exact coverage and header assertions.
+    if response["complete"] == false
+        && response["gaps"].as_array().is_some_and(|gaps| {
+            gaps.iter().any(|gap| {
+                gap["kind"] == "stat_verification_incomplete"
+                && gap["reason"]
+                    == "file freshness verification exceeded the request budget; retry aft_inspect"
+            })
+        })
+    {
+        response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap-retry", "src");
+    }
 
     assert_eq!(
         response["summary"]["diagnostics"]["coverage"],

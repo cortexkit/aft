@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "land-inspect-freshness-progress"
+  ],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py: no changed path matches. aft_inspect keeps verified content hashes of unchanged files (bounded by the diagnostics store, invalidated by native stat changes) so freshness verification is not repeated. No search, ranking or routing code changes."
+}

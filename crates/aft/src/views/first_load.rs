@@ -26,6 +26,10 @@ mod overflow_recovery_tests;
 #[path = "first_load/publication_fence_tests.rs"]
 mod publication_fence_tests;
 
+#[cfg(test)]
+#[path = "first_load/rebind_tests.rs"]
+pub(crate) mod rebind_tests;
+
 /// A complete strict content walk under the checkout's current ignore rules.
 /// The revision must change for every delivered edit, write intent, watcher gap,
 /// or membership change; a partial walk must return an error, not this value.
@@ -586,6 +590,8 @@ impl SiblingLoader {
         access: &ViewAccess,
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
+        #[cfg(test)]
+        let _measurement = rebind_tests::measure_reconcile();
         for _ in 0..3 {
             // Read before the walk, so an ignore edit racing the walk shows up
             // as a difference from this record rather than being recorded as
@@ -1924,6 +1930,8 @@ impl CheckoutDriver {
         access: &ViewAccess,
         base: Arc<ComposedGeneration>,
     ) -> Result<(Snapshot, u64), PlaneError> {
+        #[cfg(test)]
+        let _measurement = rebind_tests::measure_bind();
         self.check_owner(access)?;
         let completion_claim = BaseCompletionClaim(&self.base_claim);
         if !self.owner.registry().is_v3_only() {
@@ -6272,6 +6280,33 @@ impl CheckoutDriver {
                 .and_then(|cut| cut.verification.as_ref())
                 .is_some_and(|guard| guard.steady_supported && guard.subscription.is_some());
         steady.then_some(installed.revision)
+    }
+
+    /// A new binding can reuse a live checkout's verification, but Git metadata
+    /// (including a linked worktree's index) need not be covered by its watcher.
+    /// Recheck the old guard without enumerating policy directories again. The
+    /// steady subscription covers new directories; known inputs already name
+    /// all policy files, including absent ones, in the verified directories.
+    pub(crate) fn prepare_steady_bind(&self) {
+        if self.steady_installed_revision().is_none() {
+            return;
+        }
+        let (snapshot, _) = self.installed_cut();
+        let Some(guard) = snapshot
+            .install_cut()
+            .and_then(|cut| cut.verification.as_ref())
+        else {
+            return;
+        };
+        let unchanged =
+            super::verification::BindGuard::capture(self.owner.root(), Some(&guard.inputs))
+                .is_ok_and(|current| current == **guard);
+        if !unchanged {
+            // A changed guard can affect membership, not just reported paths.
+            // Recording an overflow makes the next query walk the checkout
+            // before it can install and serve a fresh snapshot.
+            self.record_watcher_overflow();
+        }
     }
 
     #[cfg(test)]

@@ -41,6 +41,96 @@ fn fixture(
     (metadata, resolved.paths)
 }
 
+fn metadata_persistence_running_task(storage: &Path, registry: &BgTaskRegistry) -> Arc<BgTask> {
+    let (mut metadata, paths) = fixture(storage, "metadata-persistence", false, 0);
+    metadata.status = BgTaskStatus::Running;
+    metadata.mode = BgMode::Pty;
+    metadata.finished_at = None;
+    metadata.duration_ms = None;
+    metadata.exit_code = None;
+    metadata.notify_on_completion = false;
+    write_task_at(
+        &resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap(),
+        &metadata,
+    )
+    .unwrap();
+    registry
+        .insert_rehydrated_task(metadata, paths.clone(), false)
+        .unwrap();
+    let task = registry.task(&paths.task_id).unwrap();
+    task.lock_state().unwrap().child_exit_observed = true;
+    // Completion delivery also saves a rendered output preview. Suppress that
+    // separate write so these fixtures count only terminal-state persistence.
+    *task.terminal_notification_routed.lock().unwrap() = true;
+    task
+}
+
+#[test]
+fn metadata_persistence_watchdog_tick_writes_only_changed_task() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let task = metadata_persistence_running_task(storage.path(), &registry);
+    let mut awaiting_reader = HashMap::new();
+    work_counts::reset();
+    super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting_reader);
+    assert_eq!(work_counts::get().metadata_writes, 0);
+
+    // A persistence request with identical metadata must also be a no-op,
+    // rather than relying only on the watchdog avoiding the request.
+    {
+        let mut db = DeferredDbWrites::new(&registry, &task);
+        let state = task.lock_state().unwrap();
+        registry
+            .persist_task_locked(&task, &state.metadata, &mut db)
+            .unwrap();
+    }
+    assert_eq!(work_counts::get().metadata_writes, 0);
+    assert_eq!(work_counts::get().renames, 0);
+
+    fs::write(&task.paths.exit, b"0\n").unwrap();
+    super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting_reader);
+    assert!(task.is_terminal());
+    assert_eq!(work_counts::get().metadata_writes, 1);
+    assert_eq!(work_counts::get().renames, 1);
+    super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut awaiting_reader);
+    assert_eq!(work_counts::get().metadata_writes, 1);
+}
+
+#[test]
+fn metadata_persistence_concurrent_finalize_writes_once() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let task = metadata_persistence_running_task(storage.path(), &registry);
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let registry = registry.clone();
+            let task = Arc::clone(&task);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                work_counts::reset();
+                barrier.wait();
+                registry
+                    .finalize_from_marker(&task, ExitMarker::Code(0), None)
+                    .unwrap();
+                work_counts::get().metadata_writes
+            })
+        })
+        .collect();
+    barrier.wait();
+    let writes: usize = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .sum();
+    assert_eq!(writes, 1);
+    work_counts::reset();
+    registry
+        .finalize_from_marker(&task, ExitMarker::Code(7), None)
+        .unwrap();
+    assert_eq!(work_counts::get().metadata_writes, 0);
+    assert_eq!(task.lock_state().unwrap().metadata.exit_code, Some(0));
+}
+
 #[test]
 fn persisted_task_gc_preserves_readable_tasks_when_the_storage_floor_refuses_them() {
     let storage = tempfile::tempdir().unwrap();
@@ -536,6 +626,9 @@ fn watchdog_cost_terminal_persist_retry_does_not_rewrite_a_successful_retry() {
         .insert_rehydrated_task(metadata, paths.clone(), false)
         .unwrap();
     let task = registry.task(&paths.task_id).unwrap();
+    // A dirty flag alone no longer requires a replacement when the terminal
+    // record already matches disk. Give the successful retry a real change.
+    task.lock_state().unwrap().metadata.status_reason = Some("retry persisted this reason".into());
     task.terminal_persist_dirty.store(true, Ordering::SeqCst);
     let (checked_tx, checked_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -565,11 +658,36 @@ fn watchdog_cost_terminal_persist_retry_does_not_rewrite_a_successful_retry() {
     let sequential = work_counts::get().metadata_writes;
     eprintln!("terminal persist writes: successful retry={first}, concurrent retry={concurrent}, 20 later retries={sequential}");
     assert_eq!(first, 1);
+    assert_eq!(
+        super::super::persistence::read_task(&paths.json)
+            .unwrap()
+            .status_reason
+            .as_deref(),
+        Some("retry persisted this reason")
+    );
+    assert!(!task.terminal_persist_dirty.load(Ordering::SeqCst));
     assert_eq!(sequential, 0);
     assert_eq!(
         concurrent, 0,
         "another caller already persisted this terminal state"
     );
+}
+
+#[test]
+fn metadata_persistence_equal_terminal_retry_clears_dirty_without_replacement() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (metadata, paths) = fixture(storage.path(), "session", false, 0);
+    registry
+        .insert_rehydrated_task(metadata, paths.clone(), false)
+        .unwrap();
+    let task = registry.task(&paths.task_id).unwrap();
+    task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+    work_counts::reset();
+    registry.retry_terminal_persist(&task).unwrap();
+    assert!(!task.terminal_persist_dirty.load(Ordering::SeqCst));
+    assert_eq!(work_counts::get().metadata_writes, 0);
+    assert_eq!(work_counts::get().renames, 0);
 }
 
 #[test]
