@@ -1,0 +1,1 @@
+- AFT reduces disk and backup usage by removing finished shell tasks' retained launchers and GitHub CLI shims when it can confirm their processes have exited.

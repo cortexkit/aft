@@ -1205,6 +1205,8 @@ pub(crate) struct ScopeKillReport {
 
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
+#[path = "task_image_cleanup.rs"]
+mod task_image_cleanup;
 
 const MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK: usize = 128;
 
@@ -3276,6 +3278,7 @@ impl BgTaskRegistry {
             token_policy,
         );
         release_terminal_io_handles(task);
+        self.cleanup_terminal_task_image(task).report();
         Ok(())
     }
 
@@ -9805,6 +9808,8 @@ impl BgTaskRegistry {
 
         let mut deleted = 0usize;
 
+        let mut image_cleanup = task_image_cleanup::ImageCleanupPass::default();
+
         let root = storage_dir.join("bash-tasks");
         // Retire only confirmed missing artifacts; reader-floor refusals still
         // apply to the entire storage root.
@@ -9899,6 +9904,11 @@ impl BgTaskRegistry {
                     if !examined.insert((session_dir.clone(), task_id.clone())) {
                         continue;
                     }
+                    image_cleanup.record(self.cleanup_saved_task_image(
+                        &session_dir,
+                        task_id,
+                        || undisturbed(self) && !live_in_db(self, task_id),
+                    ));
                     // Deadline selection uses the pass clock, but a task may
                     // have been acknowledged after that clock was sampled.
                     let examined_at = clock();
@@ -10218,6 +10228,7 @@ impl BgTaskRegistry {
         }
         memo.finish_pass(pass);
         gc_quarantine(self, storage_dir);
+        image_cleanup.report();
         Ok(deleted)
     }
 
@@ -10977,10 +10988,12 @@ impl BgTaskRegistry {
             let budget = queue.len().min(super::gc_cursor::GC_ENTRY_BUDGET);
             (0..budget).filter_map(|_| queue.pop_front()).collect()
         };
+        let mut image_cleanup = task_image_cleanup::ImageCleanupPass::default();
         for task_id in candidates {
             let Some(task) = self.task(&task_id) else {
                 continue;
             };
+            image_cleanup.record(self.cleanup_terminal_task_image(&task));
             let delivered_terminal = !task.terminal_persist_dirty.load(Ordering::SeqCst)
                 && task.lock_state().is_ok_and(|state| {
                     state.metadata.status.is_terminal() && state.metadata.completion_delivered
@@ -11104,6 +11117,7 @@ impl BgTaskRegistry {
                 }
             }
         }
+        image_cleanup.report();
         self.prune_session_harnesses();
     }
 
@@ -12002,6 +12016,7 @@ impl BgTaskRegistry {
         task: &BgTask,
         now_ms: u64,
     ) -> std::io::Result<bool> {
+        self.cleanup_terminal_task_image(task).report();
         // Schema probes reuse the launch sandbox after the command exits. Its
         // scratch paths must still exist until the probe has finished, even if
         // another observer or the watchdog sees a quiescent process group.

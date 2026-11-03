@@ -27,7 +27,7 @@ thread_local! {
 }
 
 const OWNER_LOCK: &str = "owner.lock";
-const TASK_IMAGE_DIR: &str = "startup-image";
+pub(crate) const TASK_IMAGE_DIR: &str = "startup-image";
 
 #[cfg(target_os = "macos")]
 struct StartupSource {
@@ -904,7 +904,7 @@ mod tests {
             }
             let session = persistence::session_tasks_dir(&storage, "pin-lifetime");
             let task = persistence::resolve_task_layout(&session, &task_id).unwrap();
-            tasks.push((mode, task.paths.io_dir));
+            tasks.push((mode, task_id, task.paths.io_dir));
         }
         let wait_for_file = |name: &str| {
             let deadline = Instant::now() + Duration::from_secs(15);
@@ -913,13 +913,15 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        for (mode, _) in &tasks {
+        for (mode, _, task_io) in &tasks {
             wait_for_file(&format!("ready-{mode}"));
+            registry.cleanup_finished(Duration::ZERO);
+            assert!(task_io.join(TASK_IMAGE_DIR).is_dir(), "{mode}");
         }
         pin.cleanup_at_exit();
         assert!(!pin.directory.exists());
         std::fs::write(storage.join("release"), b"go").unwrap();
-        for (mode, task_io) in tasks {
+        for (mode, task_id, task_io) in tasks {
             wait_for_file(&format!("status-{mode}"));
             assert_eq!(
                 std::fs::read_to_string(storage.join(format!("status-{mode}"))).unwrap(),
@@ -951,6 +953,17 @@ mod tests {
                     .contains("1 test"),
                 "{mode} did not execute the retained hook binary"
             );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while image.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{mode} retained its startup image"
+                );
+                registry
+                    .status(&task_id, "pin-lifetime", None, None, 0)
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
