@@ -278,7 +278,7 @@ fn public_unknown_dynamic_counts_and_liveness_projection() {
     for (language, source) in [
         ("typescript", "class A { m() {} }\nclass B { private m(a: number) {} n() {} }\nfunction caller(x, name) { x.m(); x[name](); }"),
         ("javascript", "class A { m() {} }\nclass B { m(a) {} n() {} }\nfunction caller(x, name) { x.m(); x[name](); }"),
-        ("python", "class A:\n def m(self): pass\nclass B:\n def m(self, a): pass\n def n(self): pass\ndef caller(x, name):\n x.m()\n getattr(x, name)()\n"),
+        ("python", "from abc import abstractmethod\nclass A:\n @abstractmethod\n def m(self): pass\nclass B:\n def m(self, a): pass\n def n(self): pass\ndef caller(x, name):\n x.m()\n getattr(x, name)()\n"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let payload = join::CallgraphBlob::extract(source, language, "dispatch-proof").unwrap().to_bytes().unwrap();
@@ -309,6 +309,8 @@ fn manifest_of(connection: &Connection, files: &[(&str, &str)]) -> Manifest {
     Manifest::new(files.iter().map(|(path, source)| {
         let language = if path.ends_with(".rs") {
             "rust"
+        } else if path.ends_with(".py") {
+            "python"
         } else {
             "typescript"
         };
@@ -368,6 +370,36 @@ fn count(database: &Path, sql: &str) -> usize {
         .unwrap()
         .query_row(sql, [], |row| row.get(0))
         .unwrap()
+}
+
+#[test]
+fn python_super_imported_bases_relink_in_mro_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("blobs.sqlite");
+    let connection = blobs(&blob_path);
+    let bases = "class Zulu:\n def __init__(self): pass\nclass Alpha:\n def __init__(self): pass\n";
+    let before = manifest_of(&connection, &[
+        ("bases.py", bases),
+        ("child.py", "from bases import Zulu, Alpha\nclass Child(Zulu, Alpha):\n def __init__(self):\n  super().__init__()\n"),
+    ]);
+    let after = manifest_of(&connection, &[
+        ("bases.py", bases),
+        ("child.py", "from bases import Zulu, Alpha\nclass Child(Alpha, Zulu):\n def __init__(self):\n  super().__init__()\n"),
+    ]);
+    drop(connection);
+    let cold = dir.path().join("before.sqlite");
+    materialize_manifest_view_database(&cold, &blob_path, &before).unwrap();
+    assert_eq!(
+        count(&cold, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&cold, "SELECT count(*) FROM edges WHERE target_symbol='Zulu::__init__' AND provenance='exact'"), 1);
+    let updated = incremental_matches_cold(dir.path(), &blob_path, &before, &after);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_symbol='Alpha::__init__' AND provenance='exact'"), 1);
 }
 
 const INTERFACE: &str = "export interface I { m(): void; }";
