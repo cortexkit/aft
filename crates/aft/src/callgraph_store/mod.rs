@@ -20283,18 +20283,9 @@ fn insert_method_dispatch_edges_cached(
         WorkspaceCratePrefixCache::default(),
     );
     let mut rust_data = HashMap::new();
-    let mut rust_caller = None;
     let mut edge_ids = BTreeSet::new();
     for reference in references {
         if reference.lang == "rust" {
-            if rust_caller.as_deref() != Some(reference.caller_file.as_str()) {
-                // References are ordered by caller file. Receiver proofs only
-                // need the active caller and its declarations; retaining every
-                // parsed caller until the chunk ends duplicates the stored graph.
-                source_cache.retain(|(_, language), _| language != "rust");
-                rust_data.clear();
-                rust_caller = Some(reference.caller_file.clone());
-            }
             if let Some(candidate) = rust_bound_dispatch_candidate(
                 tx,
                 project_root,
