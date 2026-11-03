@@ -3,10 +3,10 @@
 The baseline is the named main commit in `baseline.json`. The original source
 line references below were inventoried at `998c896`; statement text and owner
 names in the generated inventories are authoritative after re-recording.
-`order_sql.json` identifies each executable graph/views SELECT variant, including
-unordered reads, by the stable statement id and variant label in `statements.json`.
+`order_sql.json.gz` identifies each executable graph/views SELECT variant, including
+unordered reads, by the stable statement id and variant label in `statements.json.gz`.
 Composed suffixes are included, so a prefix without ORDER BY cannot hide the
-ordering in its all-files or per-caller executable query. `source_inventory.json:rust_order` lists
+ordering in its all-files or per-caller executable query. `source_inventory.json.gz:rust_order` lists
 Rust sorts, BTreeMap/BTreeSet and dedup sites, including test-only consumers.
 These machine-readable lists are conservative supersets: a count-only query or
 a set used solely for membership is still listed rather than silently excluded.
@@ -97,8 +97,8 @@ existing test's output assertion is rewritten to make a new order acceptable.
 
 - The per-file `ref_id` range `[view:{file}:, view:{file};)` is in
   `identities.md`'s view-ref range/last-colon reader row and in
-  `source_inventory.json:id_text_readers`. Both complete SQL variants of the
-  dispatch edge reader are materialized in `statements.json`, including its
+  `source_inventory.json.gz:id_text_readers`. Both complete SQL variants of the
+  dispatch edge reader are materialized in `statements.json.gz`, including its
   `INDEXED BY idx_edges_ref_id` range variant, not just the SELECT prefix.
 - `dispatch:{file}:{ordinal}:{target_file}:{target_symbol}` is in the constructor
   table in `identities.md`, with form/target components retained independently of

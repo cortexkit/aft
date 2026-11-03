@@ -8,7 +8,6 @@ SHA and receives only the committed test scaffolding and trace-only patch.
 import argparse
 import gzip
 import hashlib
-import json
 import os
 import pathlib
 import shutil
@@ -17,6 +16,7 @@ import sys
 import tarfile
 
 from inventory import HERE, ROOT, dump
+from capture_io import capture_path, load_json
 
 OUTPUTS = [
     'baseline.json', 'statements.json', 'order_sql.json', 'source_inventory.json',
@@ -34,7 +34,7 @@ OUTPUTS = [
 
 def clean_environment():
     env = dict(os.environ)
-    for key in ['AFT_STORE_DIET_RECORD', 'AFT_STORE_DIET_BASELINE', 'AFT_STORE_DIET_SQL_TRACE']:
+    for key in ['AFT_STORE_DIET_RECORD', 'AFT_STORE_DIET_BASELINE', 'AFT_STORE_DIET_SQL_TRACE', 'AFT_STORE_DIET_PYTHON']:
         env.pop(key, None)
     return env
 
@@ -63,6 +63,21 @@ def copy_tools(destination):
             shutil.copytree(path, target)
         else:
             shutil.copy2(path, target)
+
+
+def copy_outputs(tools, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for name in OUTPUTS:
+        path = capture_path(tools / name)
+        if path.exists():
+            destination = output_dir / path.name
+            shutil.copy2(path, destination)
+            alternative = destination.with_suffix('') if path.suffix == '.gz' else destination.with_name(destination.name + '.gz')
+            if alternative.exists():
+                alternative.unlink()
+            copied.append(destination)
+    return copied
 
 
 def capture(binary, tree, tools, work, label, views, trace=None, cache_root=None):
@@ -105,7 +120,7 @@ def record(sha, include_trace, output_dir):
         run(['git', 'apply', patch], tree)
     else:
         run(['git', 'apply', '--reverse', '--check', patch], tree)
-    metadata = json.loads((tools / 'baseline.json').read_text(encoding='utf-8'))
+    metadata = load_json((tools / 'baseline.json'))
     metadata['code_revision'] = sha
     metadata['status'] = 'recorded'
     metadata.pop('requested_code_revision', None)
@@ -114,7 +129,7 @@ def record(sha, include_trace, output_dir):
     metadata['normalised_fields'] = []
     dump(tools / 'baseline.json', metadata)
     for name, key in [('corpus_sources.json', 'baseline'), ('required_values.json', 'source_revision')]:
-        data = json.loads((tools / name).read_text(encoding='utf-8'))
+        data = load_json((tools / name))
         data[key] = sha
         dump(tools / name, data)
     for name, command in [('corpus.py', 'generate'), ('inventory.py', 'capture'), ('trace_patch.py', None)]:
@@ -134,7 +149,7 @@ def record(sha, include_trace, output_dir):
         destination.mkdir()
         for path in [*first.glob('*.reply'), first / 'capture.json']:
             shutil.copy2(path, destination / path.name)
-    env = dict(clean_environment(), AFT_STORE_DIET_RECORD='1', AFT_STORE_DIET_BASELINE=sha)
+    env = dict(clean_environment(), AFT_STORE_DIET_RECORD='1', AFT_STORE_DIET_BASELINE=sha, AFT_STORE_DIET_PYTHON=sys.executable)
     run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet', '--nocapture'], tree, env)
     run([sys.executable, tools / 'values.py', 'record'], tree)
     for mode in ['legacy', 'views']:
@@ -157,16 +172,13 @@ def record(sha, include_trace, output_dir):
         run([sys.executable, tools / 'inventory.py', 'coverage', trace], tree)
         evidence = ROOT / '.cortexkit/internal-docs/investigations'
         evidence.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(trace_report, evidence / ('store-diet-uncovered-' + sha + '.json'))
+        report = capture_path(trace_report)
+        shutil.copy2(report, evidence / ('store-diet-uncovered-' + sha + ''.join(report.suffixes)))
         with trace.open('rb') as source, gzip.open(evidence / ('store-diet-trace-' + sha + '.jsonl.gz'), 'wb') as destination:
             shutil.copyfileobj(source, destination)
     # Publish only a complete, self-replayed baseline. A failure leaves the old
     # oracle untouched and the scratch workspace available for diagnosis.
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUTS:
-        path = tools / name
-        if path.exists():
-            shutil.copy2(path, output_dir / name)
+    outputs = copy_outputs(tools, output_dir)
     corpus = output_dir / 'corpus'
     if corpus.exists():
         shutil.rmtree(corpus)
@@ -177,13 +189,14 @@ def record(sha, include_trace, output_dir):
         for path in (tools / ('wire-' + mode)).iterdir():
             shutil.copy2(path, destination / path.name)
     result = {'baseline': sha, 'trace_only_replay': include_trace,
-              'normalised_fields': [], 'artifact_sha256': {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in OUTPUTS if (output_dir / name).exists()},
+              'normalised_fields': [], 'artifact_sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in outputs},
               'review_required': 'Review regenerated fixtures, statement mappings and trace exemption owner branches before committing.'}
     dump(output_dir / 'recording.json', result)
     archive = ROOT / 'target/scratch' / ('store-diet-recorded-' + sha + '.tar.gz')
+    published = {path.name for path in outputs}
     with tarfile.open(archive, 'w:gz') as package:
         for path in sorted(output_dir.iterdir()):
-            if path.name in OUTPUTS or path.name in {'corpus', 'wire-legacy', 'wire-views', 'recording.json'}:
+            if path.name in published or path.name in {'corpus', 'wire-legacy', 'wire-views', 'recording.json'}:
                 package.add(path, arcname=path.name)
     print(f'baseline recorded and replayed: {sha}', flush=True)
 

@@ -12,6 +12,8 @@ import pathlib
 import re
 import sqlite3
 
+from capture_io import load_json, read_text as read_capture_text, write_bytes
+
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 HERE = pathlib.Path(__file__).resolve().parent
 # Consume comments and character literals as well as strings, so commented-out
@@ -131,8 +133,7 @@ def census():
 
 
 def dump(path, value):
-    with path.open('w', encoding='utf-8', newline='\n') as output:
-        output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    write_bytes(path, (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode('utf-8'))
 
 
 def graph_statement(row):
@@ -362,8 +363,8 @@ def coverage(inventory, traces, report=None):
         bind = r"(?:NULL|[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|[xX]'[0-9a-fA-F]*'|'(?:''|[^'])*')"
         expression = ''.join(bind if re.fullmatch(r'\?[0-9]*|[:@$][A-Za-z_]\w*', piece) else re.escape(piece) for piece in pieces)
         return re.compile(expression)
-    seen = {canonical(json.loads(line)) for trace in traces for line in trace.read_text(encoding='utf-8').splitlines()}
-    exemptions = json.loads((HERE / 'trace_exemptions.json').read_text(encoding='utf-8'))
+    seen = {canonical(json.loads(line)) for trace in traces for line in read_capture_text(trace).splitlines()}
+    exemptions = load_json((HERE / 'trace_exemptions.json'))
     variants = {row['id'] + ':' + variant['variant']: variant['sql'] for row in inventory for variant in row['variants']}
     missing, reached = [], set()
     for key, sql in variants.items():
@@ -493,7 +494,7 @@ def main():
         dump(HERE / 'sweep_references.json', sweep_references(tables, rows))
         print(f'captured {len(rows)} SQL statements')
     elif args.command == 'derive':
-        rows = json.loads(path.read_text(encoding='utf-8'))
+        rows = load_json(path)
         mapped = mapped_census(rows, census())
         tables = schemas(mapped)
         for row, current in zip(rows, mapped):
@@ -507,26 +508,26 @@ def main():
         print(f'derived inventories for {len(rows)} stable statement ids')
     elif args.command == 'check':
         actual = census()
-        expected = json.loads(path.read_text(encoding='utf-8'))
+        expected = load_json(path)
         mapped = mapped_census(expected, actual)
         tables = schemas(mapped)
         for row in expected:
             checked_variants(row, tables)
-        assert json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8')) == tables, 'table encoding census is stale'
-        assert json.loads((HERE / 'order_sql.json').read_text(encoding='utf-8')) == order_inventory(mapped), 'SQL ordering census is stale'
-        assert json.loads((HERE / 'source_inventory.json').read_text(encoding='utf-8')) == source_inventory(), 'Rust source census is stale'
-        assert json.loads((HERE / 'sweep_references.json').read_text(encoding='utf-8')) == sweep_references(tables, mapped), 'sweep reference census is stale'
+        assert load_json((HERE / 'table_encoding.json')) == tables, 'table encoding census is stale'
+        assert load_json((HERE / 'order_sql.json')) == order_inventory(mapped), 'SQL ordering census is stale'
+        assert load_json((HERE / 'source_inventory.json')) == source_inventory(), 'Rust source census is stale'
+        assert load_json((HERE / 'sweep_references.json')) == sweep_references(tables, mapped), 'sweep reference census is stale'
         print(f'checked {len(actual)} SQL statements')
     elif args.command == 'coverage':
-        coverage(json.loads(path.read_text(encoding='utf-8')), args.paths, args.report)
+        coverage(load_json(path), args.paths, args.report)
     elif args.command == 'draft-exemptions':
         assert len(args.paths) == 2, 'draft-exemptions UNCOVERED.json OUTPUT.json'
-        result = draft_exemptions(json.loads(args.paths[0].read_text(encoding='utf-8')), json.loads(path.read_text(encoding='utf-8')))
+        result = draft_exemptions(load_json(args.paths[0]), load_json(path))
         dump(args.paths[1], result)
         print(f'wrote {len(result)} draft exemptions; review owner branches before accepting')
     else:
         assert len(args.paths) == 2, 'compare-plans BASELINE.json CANDIDATE.json'
-        compare_plans(*(json.loads(p.read_text(encoding='utf-8')) for p in args.paths))
+        compare_plans(*(load_json(p) for p in args.paths))
         print('query-plan access paths checked')
 
 

@@ -56,7 +56,10 @@ f/g call shape; stale marking uses the production `mark_files_stale` API.
 These limits do not waive stored-value coverage. `required_values.json` lists
 producer-written finite domains independently of observed output. `values.py`
 compares them with the row observations and reports the case/mode/column/count
-for each value, dispatch shape and unresolved-ref form in `value_inventory.json`.
+for each value in `value_inventory.json.gz`. That inventory also records observed
+combinations of dispatch facts, such as receiver presence and dynamic-call flags,
+and the classifications of unresolved references; `values.py::inventory` defines
+the keys used for those dimensions.
 Arbitrary poison strings a fault test inserts into a TEXT column are not enum
 values. Missing production values fail the check rather than becoming a silent
 exception. Transient `staged` refs are observed on a successful real INSERT;

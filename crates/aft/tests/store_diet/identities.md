@@ -2,9 +2,9 @@
 
 Runtime baseline: the named main commit in `baseline.json`. The source-line
 references below were first inventoried at `998c896b05753dd3a83158e30f97779b89ef28e2`;
-constructor/reader names and `source_inventory.json:id_text_readers` identify later
+constructor/reader names and `source_inventory.json.gz:id_text_readers` identify later
 locations for the text-sensitive readers.
-`table_encoding.json` lists columns individually. These are **planned encodings**;
+`table_encoding.json.gz` lists columns individually. These are **planned encodings**;
 this harness does not change a database format or discard a column.
 
 ## Constructor inputs that must survive encoding
@@ -36,7 +36,7 @@ little-endian eight-byte salt followed by the complete salt-zero digest.
 | views dispatch edge | `dispatch:` form tag, site file, original site ordinal, target file, target scoped symbol; one identity per target | `views/materialization/dispatch.rs:863-868` |
 | `staging_ref_context.ref_id` | exact referenced ref identity; its context retains caller symbol | `mod.rs:13256-13385`, resolve loop `5510-5537` |
 | `emitted_view_rows.row_key` | typed key selected by `table_name`: file path for files, node id for nodes, ref id for refs, edge id for edges, dispatch-hint id for dispatch_hints | `views/materialization/stable_rows.rs:6-95` |
-| other primary/composite keys | exact column tuples in `table_encoding.json`; not new graph identities | schema statement ids in that file |
+| other primary/composite keys | exact column tuples in `table_encoding.json.gz`; not new graph identities | schema statement ids in that file |
 
 The original hash-kind is not interchangeable with `refs.kind`: construction
 and callback-reference extraction can store a different kind. Caller symbol,
@@ -54,7 +54,7 @@ their original hash-kind inputs and their full-ref/caller information.
 
 ## Text-sensitive readers
 
-`source_inventory.json:id_text_readers` is the line-by-line census of tests,
+`source_inventory.json.gz:id_text_readers` is the line-by-line census of tests,
 prefix checks, stripping and splitting around ids. It intentionally includes
 test assertions and conservative context matches. The mappings below govern
 those sites as well as the ordinary row decoders that merely return ids.

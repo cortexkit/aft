@@ -7,6 +7,7 @@ normalised. The manifest may include configure/readiness requests before the
 measured queries. Use separate, empty cache directories for each capture.
 """
 import argparse
+from capture_io import load_json, write_bytes
 import hashlib
 import json
 import os
@@ -23,8 +24,7 @@ METADATA_FIELDS = {'search_ms', 'tier2_last_run'}
 
 
 def dump(path, value):
-    with path.open('w', encoding='utf-8', newline='\n') as output:
-        output.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    write_bytes(path, (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode('utf-8'))
 
 
 def sample(values, limit):
@@ -173,7 +173,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    baseline = json.loads((HERE / 'baseline.json').read_text(encoding='utf-8'))['code_revision']
+    baseline = load_json((HERE / 'baseline.json'))['code_revision']
     dump(output / 'capture.json', {'baseline': baseline, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                                   'manifest_sha256': hashlib.sha256(json.dumps(requests, sort_keys=True).encode()).hexdigest(),
                                   'normalised_fields': [], 'requests': len(requests), 'views': views, 'successful_queries': successes,
@@ -228,8 +228,8 @@ def compare(left, right, fields=()):
         if fields:
             before, after = normalise_metadata(before, fields), normalise_metadata(after, fields)
         assert before == after, f'reply bytes differ: {name}'
-    lmeta = json.loads((left / 'capture.json').read_text(encoding='utf-8'))
-    rmeta = json.loads((right / 'capture.json').read_text(encoding='utf-8'))
+    lmeta = load_json((left / 'capture.json'))
+    rmeta = load_json((right / 'capture.json'))
     assert lmeta['manifest_sha256'] == rmeta['manifest_sha256'], 'different query manifests'
     for field in ['views', 'config_sha256', 'prepared_cache', 'required_borrowed']:
         assert lmeta.get(field) == rmeta.get(field), f'different capture policy: {field}'
@@ -237,7 +237,7 @@ def compare(left, right, fields=()):
 
 
 def prove_normalisation(left, right, output):
-    lmeta, rmeta = (json.loads((root / 'capture.json').read_text(encoding='utf-8')) for root in [left, right])
+    lmeta, rmeta = (load_json((root / 'capture.json')) for root in [left, right])
     assert lmeta['binary_sha256'] == rmeta['binary_sha256'], 'normalisation proof requires the same baseline binary'
     fields = set()
     for path in left.glob('*.reply'):
@@ -252,7 +252,7 @@ def prove_normalisation(left, right, output):
 
 def row_counts(database):
     """Read a finished database through SQLite, never a raw database descriptor."""
-    tables = json.loads((HERE / 'table_encoding.json').read_text(encoding='utf-8'))
+    tables = load_json((HERE / 'table_encoding.json'))
     connection = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
     try:
         present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -294,19 +294,19 @@ def main():
     counts.add_argument('output', type=pathlib.Path)
     args = parser.parse_args()
     if args.command == 'manifest':
-        dump(args.output, manifest(json.loads(args.symbols.read_text(encoding='utf-8'))))
+        dump(args.output, manifest(load_json(args.symbols)))
     elif args.command == 'fixture-manifest':
-        symbols = [row['file'] + '\0' + row['symbol'] for row in json.loads(args.seeded.read_text(encoding='utf-8')) if 'to_file' not in row]
+        symbols = [row['file'] + '\0' + row['symbol'] for row in load_json(args.seeded) if 'to_file' not in row]
         dump(args.output, manifest(symbols))
     elif args.command == 'capture':
-        overrides = json.loads(args.config.read_text(encoding='utf-8')) if args.config else None
+        overrides = load_json(args.config) if args.config else None
         assert overrides is None or isinstance(overrides, dict), '--config must contain an object'
-        capture(args.binary, args.root, args.cache, json.loads(args.manifest.read_text(encoding='utf-8')), args.output, args.timeout, args.views, args.prepared_cache, overrides, args.require_borrowed)
+        capture(args.binary, args.root, args.cache, load_json(args.manifest), args.output, args.timeout, args.views, args.prepared_cache, overrides, args.require_borrowed)
     elif args.command == 'compare':
         fields = []
         if args.normalisation:
-            proof = json.loads(args.normalisation.read_text(encoding='utf-8'))
-            metadata = json.loads((args.baseline / 'capture.json').read_text(encoding='utf-8'))
+            proof = load_json(args.normalisation)
+            metadata = load_json((args.baseline / 'capture.json'))
             assert proof['baseline_binary_sha256'] == metadata['binary_sha256'] and proof['manifest_sha256'] == metadata['manifest_sha256'], 'normalisation proof is for another baseline/manifest'
             fields = proof['normalised_fields']
         compare(args.baseline, args.candidate, fields)

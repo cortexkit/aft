@@ -64,7 +64,8 @@ so a changed reply cannot be hidden by recording it again.
 To review gaps, pass `--report UNCOVERED.json` to `coverage`, then run
 `inventory.py draft-exemptions UNCOVERED.json DRAFT.json`. The draft groups
 test-only, template-boundary and absent owner workloads with source locations.
-Review those owner branches before accepting a draft as trace_exemptions.json;
+Review the named function and its workload-dependent conditions at each listed
+source location before accepting a draft as trace_exemptions.json.gz;
 an unresolved template remains an expansion gap, not a prepared-plan guarantee.
 Coverage rejects exemptions for statements that are now traced as well as stale
 ids and empty reasons. This prevents an old blanket exemption from hiding a

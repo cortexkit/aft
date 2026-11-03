@@ -3,18 +3,101 @@ import json
 import hashlib
 import pathlib
 import sqlite3
+import gzip
+import io
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from unittest import mock
 
 import inventory
+import capture_io
 import corpus
 import parity
 import record as recorder
 
 
 class InventoryTests(unittest.TestCase):
+    def test_capture_gzip_is_deterministic_and_compares_decoded_bytes(self):
+        payload = b' {"rows": [1, 2]} \n' + b' ' * capture_io.GZIP_THRESHOLD
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            first = capture_io.write_bytes(root / 'first.json', payload)
+            second = capture_io.write_bytes(root / 'second.json', payload)
+            self.assertEqual(first.suffix, '.gz')
+            self.assertFalse((root / 'first.json').exists())
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(first.read_bytes()[4:8], b'\0\0\0\0')
+            self.assertEqual(first.read_bytes()[3] & 8, 0)
+            self.assertEqual(capture_io.read_bytes(root / 'first.json'), payload)
+            subprocess.run([sys.executable, capture_io.__file__, 'write', str(root / 'cli.json')], input=payload, check=True)
+            self.assertEqual((root / 'cli.json.gz').read_bytes(), first.read_bytes())
+            alternative = io.BytesIO()
+            with gzip.GzipFile(filename='different-name', fileobj=alternative, mode='wb', mtime=123, compresslevel=1) as output:
+                output.write(payload)
+            second.write_bytes(alternative.getvalue())
+            self.assertNotEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(capture_io.read_bytes(first), capture_io.read_bytes(second))
+            capture_io.write_bytes(second, payload.replace(b'[1, 2]', b'[2, 1]'))
+            self.assertNotEqual(capture_io.read_bytes(first), capture_io.read_bytes(second))
+
+    def test_capture_threshold_and_reviewed_plain_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            logical = root / 'capture.json'
+            self.assertEqual(capture_io.write_bytes(logical, b'x' * capture_io.GZIP_THRESHOLD), logical)
+            self.assertEqual(capture_io.write_bytes(logical, b'x' * (capture_io.GZIP_THRESHOLD + 1)), root / 'capture.json.gz')
+            self.assertFalse(logical.exists())
+            self.assertEqual(capture_io.write_bytes(logical, b'small'), logical)
+            self.assertFalse((root / 'capture.json.gz').exists())
+            for name in [*capture_io.PLAIN_JSON, 'legacy-counts.json', 'custom-policy.json', 'baseline-harness.patch', 'baseline-trace.patch']:
+                with self.subTest(name=name):
+                    path = root / name
+                    self.assertEqual(capture_io.write_bytes(path, b'x' * (capture_io.GZIP_THRESHOLD + 1)), path)
+            (root / 'capture.json.gz').write_bytes(gzip.compress(b'second copy'))
+            with self.assertRaisesRegex(ValueError, 'ambiguous capture'):
+                capture_io.read_bytes(logical)
+            with self.assertRaisesRegex(ValueError, 'ambiguous capture'):
+                capture_io.read_bytes(root / 'capture.json.gz')
+
+    def test_recorder_publishes_compressed_outputs_without_plain_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, destination = root / 'source', root / 'destination'
+            payload = b' ' * (capture_io.GZIP_THRESHOLD + 1)
+            capture_io.write_bytes(source / 'statements.json', payload)
+            capture_io.write_bytes(source / 'baseline.json', b'{}\n')
+            capture_io.write_bytes(source / 'baseline-trace.patch', b'plain patch\n')
+            destination.mkdir()
+            (destination / 'statements.json').write_bytes(b'obsolete')
+            with mock.patch.object(recorder, 'OUTPUTS', ['statements.json', 'baseline.json', 'baseline-trace.patch']):
+                outputs = recorder.copy_outputs(source, destination)
+            self.assertEqual([path.name for path in outputs], ['statements.json.gz', 'baseline.json', 'baseline-trace.patch'])
+            self.assertEqual(capture_io.read_bytes(destination / 'statements.json'), payload)
+            self.assertFalse((destination / 'statements.json').exists())
+            self.assertEqual((source / 'statements.json.gz').read_bytes(), (destination / 'statements.json.gz').read_bytes())
+
+    def test_committed_capture_containers_are_canonical_and_hashes_are_current(self):
+        recording = capture_io.load_json(inventory.HERE / 'recording.json')
+        for name, digest in recording['artifact_sha256'].items():
+            path = inventory.HERE / name
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest, name)
+        compressed = sorted(inventory.HERE.glob('*.json.gz'))
+        self.assertTrue(compressed, 'large committed captures must use gzip')
+        with tempfile.TemporaryDirectory() as directory:
+            for path in compressed:
+                with self.subTest(path=path.name):
+                    decoded = capture_io.read_bytes(path)
+                    self.assertGreater(len(decoded), capture_io.GZIP_THRESHOLD)
+                    encoded = capture_io.write_bytes(pathlib.Path(directory) / path.name, decoded)
+                    self.assertEqual(encoded.read_bytes(), path.read_bytes())
+                    self.assertFalse(path.with_suffix('').exists())
+        for path in inventory.HERE.glob('*.json'):
+            if path.stat().st_size > capture_io.GZIP_THRESHOLD:
+                self.assertTrue(path.name in capture_io.PLAIN_JSON or path.name.endswith(('-counts.json', '-policy.json')), path.name)
+
     def test_dispatch_composition_uses_the_local_select_not_an_earlier_delete(self):
         path = inventory.ROOT / 'crates/aft/src/views/materialization/dispatch.rs'
         source = '''fn read() {
@@ -105,11 +188,12 @@ let sql = format!("{columns} WHERE caller_file=?1");
                                  ['a.rs', 'rust', 'fn f() {} [x]'])
 
     def test_recorder_does_not_inherit_blush_or_trace_switches(self):
-        with mock.patch.dict('os.environ', {'AFT_STORE_DIET_RECORD': '1', 'AFT_STORE_DIET_BASELINE': 'wrong', 'AFT_STORE_DIET_SQL_TRACE': 'old.log'}):
+        with mock.patch.dict('os.environ', {'AFT_STORE_DIET_RECORD': '1', 'AFT_STORE_DIET_BASELINE': 'wrong', 'AFT_STORE_DIET_SQL_TRACE': 'old.log', 'AFT_STORE_DIET_PYTHON': 'wrong-python'}):
             env = recorder.clean_environment()
         self.assertNotIn('AFT_STORE_DIET_RECORD', env)
         self.assertNotIn('AFT_STORE_DIET_BASELINE', env)
         self.assertNotIn('AFT_STORE_DIET_SQL_TRACE', env)
+        self.assertNotIn('AFT_STORE_DIET_PYTHON', env)
 
     def test_rust_literals_ignore_comments_lifetimes_and_characters(self):
         source = '''// "SELECT ghost"

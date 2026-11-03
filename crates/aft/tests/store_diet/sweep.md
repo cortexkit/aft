@@ -2,7 +2,9 @@
 
 This is an index **plan**, not a claim that the current text schema can sweep
 integer strings. Every column marked `interned string id` in
-`table_encoding.json` is a sweep reference. The list below expands that set and
+`table_encoding.json.gz` is a reference the sweep must check before deleting an
+interned string: the string stays live while any such column holds its id.
+The list below expands that set and
 adds the identity-input columns a finished baseline store does not yet have.
 An index named `diet_sweep_*` is a proposed additional index; it must be included
 in the size preflight before the related database-format change is implemented. Existing secondary indexes
@@ -35,7 +37,7 @@ are listed at `callgraph_store/mod.rs:14157-14220`.
 New per-form identity fields that duplicate an already stored text field should
 use that same interned reference, not introduce redundant ownership. Any format
 change that chooses an additional stored string field must add its sweep entry
-and plan before writing it. `table_encoding.json` is the authoritative baseline
+and plan before writing it. `table_encoding.json.gz` is the authoritative baseline
 column census; columns above described as new are obligations for the id slice.
 
 ## Write and completion boundaries
@@ -59,7 +61,7 @@ Staging references remain live until their staging tables are cleared.
 No production reader attaches a second callgraph database. The only ATTACH in
 `crates/aft/src` at the recorded baseline is the module-digest test's finished
 fixture copy (`views/materialization/module_digest_tests.rs:255-265`). The raw
-ATTACH census is retained in `source_inventory.json:attach`; the full SQL census
+ATTACH census is retained in `source_inventory.json.gz:attach`; the full SQL census
 also keeps that test statement. Borrowers open one pinned derived database via
 `ReadonlyCallGraphStore::open_pinned_derived`; legacy and view readers both use
 one CallGraphStore, with manifest_view choosing its mode. Copy/clone publication

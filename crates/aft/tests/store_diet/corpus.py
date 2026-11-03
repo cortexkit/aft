@@ -2,11 +2,11 @@
 """Copy declared baseline inputs into isolated parity projects; never execute them."""
 import argparse
 import hashlib
-import json
 import pathlib
 import re
 
 from inventory import HERE, ROOT, TOKEN, dump, owner_at, rust_scopes, strings
+from capture_io import load_json
 
 EXTENSIONS = dict(typescript='ts', tsx='tsx', javascript='js', python='py', rust='rs', go='go',
                   c='c', cpp='cpp', cuda='cu', metal='metal', zig='zig', csharp='cs', bash='sh',
@@ -53,7 +53,7 @@ def selected_bytes(selection):
 
 
 def cases():
-    config = json.loads((HERE / 'corpus_sources.json').read_text(encoding='utf-8'))
+    config = load_json((HERE / 'corpus_sources.json'))
     result = []
     smoke = config['smoke_table']
     entries = function_table(smoke['source'], smoke['owner'])
@@ -96,7 +96,7 @@ def generate(check):
         manifest.append(entry)
     path = HERE / 'corpus_manifest.json'
     if check:
-        assert json.loads(path.read_text(encoding='utf-8')) == manifest, 'corpus manifest is stale'
+        assert load_json(path) == manifest, 'corpus manifest is stale'
     else:
         dump(path, manifest)
     print(f'{len(manifest)} projects, {len(EXTENSIONS)} language labels, {sum(len(c["files"]) for c in manifest)} declared inputs')

@@ -9,6 +9,27 @@ source additions are the cfg(test) module and consumer-probe shims reproduced
 by `baseline-harness.patch`.
 No existing test assertion about a tool's returned output was edited.
 
+## Capture storage
+
+Generated JSON larger than 64 KiB (65,536 bytes) is stored as `*.json.gz`.
+`capture_io.py` writes gzip at level 9 with a fixed zero modification time and
+no filename in its header. Rust recording uses that same Python writer; ordinary
+Rust checks decode gzip using dependencies already declared by the crate.
+Re-recording unchanged bytes therefore does not add clock or path differences.
+
+Tools accept either the physical `.json.gz` path or its logical `.json` name;
+the logical name resolves to the compressed file when present. Having both forms
+is an error, not a choice of which oracle to trust. Writers automatically select
+the storage form and remove the obsolete alternative. Small reviewed metadata,
+counts, required values, recording hashes, policy files and corpus sources stay
+plain, as do both patches. `recording.json` hashes the physical stored files.
+
+Compression changes only the container: Rust golden checks still compare the
+complete decompressed bytes, including whitespace and order. Python checks load
+the same decompressed content before their existing comparisons. Raw wire reply
+lines remain unchanged. The tests cover fixed headers, byte-identical rewrites,
+changed payloads and concatenated gzip members.
+
 There are two complementary runners:
 
 1. `harness.rs` builds real legacy and views-derived fixture databases, captures
@@ -72,7 +93,7 @@ cargo test -p agent-file-tools --lib -- store_diet
 ```
 
 The recorder alone enables recording and validates its checkout SHA. Ordinary test runs
-never update a golden. `legacy-*.json` and `views-*.json` are separate baseline
+never update a golden. The `legacy-*` and `views-*` captures are separate baseline
 oracles: legacy/views need not agree with each other, but a candidate must agree
 with its own mode's baseline. The main six-operation replies use actual resolved
 symbols and a real data-flow expression. The seeded cases additionally preserve
@@ -130,8 +151,8 @@ No other field is admitted by the tool.
 For the committed fixture sample:
 
 ```
-python3 crates/aft/tests/store_diet/parity.py fixture-manifest crates/aft/tests/store_diet/legacy-seeded.json crates/aft/tests/store_diet/legacy-query-manifest.json
-python3 crates/aft/tests/store_diet/parity.py fixture-manifest crates/aft/tests/store_diet/views-seeded.json crates/aft/tests/store_diet/views-query-manifest.json
+python3 crates/aft/tests/store_diet/parity.py fixture-manifest crates/aft/tests/store_diet/legacy-seeded.json.gz crates/aft/tests/store_diet/legacy-query-manifest.json.gz
+python3 crates/aft/tests/store_diet/parity.py fixture-manifest crates/aft/tests/store_diet/views-seeded.json.gz crates/aft/tests/store_diet/views-query-manifest.json.gz
 ```
 
 After the producer has exited, table counts can be captured from its finished
@@ -152,22 +173,22 @@ pairs and summed site counts before replacing the current row-count oracle.
 
 ## Inventory and plans
 
-- `statements.json`: static SQL literal census across crates/aft/src, including
+- `statements.json.gz`: static SQL literal census across crates/aft/src, including
   test-only and incomplete-format fragments. Stable ids hash exact SQL bytes;
   source citations are not identities. Lexical owner/test-scope annotations aid
   review but do not replace Rust's compiler. Baseline/candidate text mappings are
   explicit. Supported batch templates include size 1 and maximum 499 pairs or
   999 node ids. Stable-row writes use their actual caller column arrays.
-- `order_sql.json`, `source_inventory.json`, `order.md`: ordered and unordered
+- `order_sql.json.gz`, `source_inventory.json.gz`, `order.md`: ordered and unordered
   SQL, Rust sort/set/dedup sites, replacement-key rules and traversal-state
   classification. The actual baseline call_tree is per-path visited.
-- `table_encoding.json`, `identities.md`: per-column encoding and complete
+- `table_encoding.json.gz`, `identities.md`: per-column encoding and complete
   identity-input obligations, including fields not retained in finished stores.
 - `sweep_references.json`, `sweep.md`: equality probes, current supporting
   indexes and explicitly proposed indexes for every interned reference.
 - `trace_helpers.json`, `trace.md`, `baseline-trace.patch`: open seams, trace
   patch and coverage procedure.
-- `baseline-plans.json`: actual bundled-SQLite plans for the fixture's ready
+- `baseline-plans.json.gz`: actual bundled-SQLite plans for the fixture's ready
   legacy/views schemas, with a separate in-memory schema for other databases
   and transaction-local tables. That auxiliary schema copies the graph schema
   and adds static CREATE/ADD COLUMN declarations from the census; graph queries

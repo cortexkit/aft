@@ -8,6 +8,61 @@ use std::sync::RwLock;
 
 const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/store_diet");
 
+fn read_capture(path: impl AsRef<Path>) -> Vec<u8> {
+    use futures_util::FutureExt;
+    use tokio::io::AsyncReadExt;
+
+    let path = path.as_ref();
+    let mut compressed = path.as_os_str().to_os_string();
+    compressed.push(".gz");
+    let compressed = PathBuf::from(compressed);
+    let path = if path.extension().is_some_and(|extension| extension == "gz") {
+        assert!(
+            !(path.exists() && path.with_extension("").exists()),
+            "ambiguous capture: {}",
+            path.display()
+        );
+        path
+    } else if compressed.exists() {
+        assert!(!path.exists(), "ambiguous capture: {}", path.display());
+        &compressed
+    } else {
+        path
+    };
+    let bytes = fs::read(path).unwrap();
+    if path.extension().is_some_and(|extension| extension == "gz") {
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(bytes.as_slice());
+        decoder.multiple_members(true);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .now_or_never()
+            .expect("in-memory gzip decoder must not wait for I/O")
+            .unwrap();
+        decoded
+    } else {
+        bytes
+    }
+}
+
+fn write_capture(path: &Path, bytes: &[u8]) {
+    // The recorder already runs in Python. Use its canonical gzip writer for
+    // both Rust and Python captures, so re-recording uses identical headers/codecs.
+    let python = std::env::var_os("AFT_STORE_DIET_PYTHON")
+        .expect("record.py must supply its Python interpreter");
+    let mut child = std::process::Command::new(python)
+        .arg(Path::new(ASSETS).join("capture_io.py"))
+        .arg("write")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut input, bytes).unwrap();
+    drop(input);
+    assert!(child.wait().unwrap().success());
+}
+
 fn golden(name: &str, bytes: &[u8]) {
     let path = Path::new(ASSETS).join(name);
     if std::env::var_os("AFT_STORE_DIET_RECORD").as_deref() == Some(std::ffi::OsStr::new("1")) {
@@ -29,14 +84,9 @@ fn golden(name: &str, bytes: &[u8]) {
             assert!(output.status.success());
             assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
         });
-        fs::write(path, bytes).unwrap();
+        write_capture(&path, bytes);
     } else {
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            bytes,
-            "{} differs",
-            path.display()
-        );
+        assert_eq!(read_capture(&path), bytes, "{} differs", path.display());
     }
 }
 
@@ -80,7 +130,7 @@ fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
 fn counts(store: &CallGraphStore) -> Value {
     let conn = store.conn.lock().unwrap();
     let tables: Vec<Value> =
-        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("table_encoding.json")).unwrap())
+        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
             .unwrap();
     let mut result = serde_json::Map::new();
     for table in tables.iter().filter(|table| table["graph_data"] == true) {
@@ -339,8 +389,7 @@ fn store_diet_views_golden() {
 
 fn plans(store: &CallGraphStore) -> Value {
     let rows: Vec<Value> =
-        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("statements.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("statements.json"))).unwrap();
     let conn = store.conn.lock().unwrap();
     // Other databases and transaction-local tables do not live in a finished
     // graph fixture. Keep their schemas on a separate in-memory connection.
@@ -362,7 +411,7 @@ fn plans(store: &CallGraphStore) -> Value {
         let _ = auxiliary.execute_batch(&sql.unwrap());
     }
     let tables: Vec<Value> =
-        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("table_encoding.json")).unwrap())
+        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
             .unwrap();
     for table in tables {
         let declaration = regex::Regex::new(&format!(r"(?i)^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{}\s*\(", regex::escape(table["table"].as_str().unwrap()))).unwrap();
@@ -626,8 +675,10 @@ fn stored_values(store: &CallGraphStore) -> Value {
 }
 
 fn corpus_cases() -> Vec<Value> {
-    serde_json::from_slice(&fs::read(Path::new(ASSETS).join("corpus_manifest.json")).unwrap())
-        .unwrap()
+    serde_json::from_slice(&read_capture(
+        Path::new(ASSETS).join("corpus_manifest.json"),
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -1178,7 +1229,7 @@ fn stored_json_facts(store: &CallGraphStore) -> Value {
     // Discover payload columns from the table-encoding schema and walk every
     // serialized field. Optional facts added by producers need no allowlist.
     let tables: Vec<Value> =
-        serde_json::from_slice(&fs::read(Path::new(ASSETS).join("table_encoding.json")).unwrap())
+        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
             .unwrap();
     let connection = store.conn.lock().unwrap();
     let mut result = serde_json::Map::new();
@@ -1252,4 +1303,39 @@ fn store_diet_json_fact_schema_accepts_new_optional_fields() {
         schema["$.absent_optional"],
         BTreeSet::from(["null".to_string()])
     );
+}
+
+#[test]
+fn store_diet_gzip_reader_preserves_exact_bytes_and_all_members() {
+    use futures_util::FutureExt;
+    use tokio::io::AsyncReadExt;
+
+    let encode = |bytes: &[u8]| {
+        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes);
+        let mut compressed = Vec::new();
+        encoder
+            .read_to_end(&mut compressed)
+            .now_or_never()
+            .expect("in-memory gzip encoder must not wait for I/O")
+            .unwrap();
+        compressed
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("capture.json");
+    let compressed = temp.path().join("capture.json.gz");
+    let expected = b" {\"rows\": [1, 2]} \n";
+    fs::write(&path, expected).unwrap();
+    assert_eq!(read_capture(&path), expected);
+    fs::remove_file(&path).unwrap();
+    let mut members = encode(expected);
+    fs::write(&compressed, &members).unwrap();
+    assert_eq!(read_capture(&path), expected);
+    members.extend(encode(b"trailing member"));
+    fs::write(&compressed, members).unwrap();
+    assert_eq!(
+        read_capture(&path),
+        b" {\"rows\": [1, 2]} \ntrailing member"
+    );
+    fs::write(&compressed, encode(b" {\"rows\": [2, 1]} \n")).unwrap();
+    assert_ne!(read_capture(&path), expected);
 }
