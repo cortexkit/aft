@@ -173,6 +173,12 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
     if !waiting(ctx) {
         return true;
     }
+    // Invalidating a decided folder closes its serving gate, but is not itself
+    // a running probe. Arm the fresh check before waiting for its result, while
+    // the caller still holds no executor or index lease.
+    if let Some(request) = arm_recheck(ctx) {
+        crate::provisional_identity_retry::note_configure_outcome(ctx, &request, true);
+    }
     let _ = resolve(ctx);
     if !waiting(ctx) {
         return true;
@@ -1898,6 +1904,9 @@ pub(crate) fn workspace_current(ctx: &AppContext) -> bool {
     state.dirty.store(true, Ordering::Release);
     if let Some(binding) = state.binding.lock().as_mut() {
         binding.invalidated = true;
+        // Invalid evidence must be checked again now, not after the ordinary
+        // cooldown for a still-valid cached decision.
+        binding.force = true;
     }
     false
 }
@@ -1932,6 +1941,9 @@ pub(crate) fn artifacts_admitted(ctx: &AppContext) -> bool {
     state.close();
     if let Some(binding) = state.binding.lock().as_mut() {
         binding.invalidated = true;
+        // File creation can invalidate a small source-tree snapshot without
+        // making the folder a non-project. Schedule a fresh bounded check.
+        binding.force = true;
     }
     state.dirty.store(true, Ordering::Release);
     ctx.configure_generation_flag()
