@@ -32736,7 +32736,16 @@ edition = "2021"
                 .outbound_calls
                 .iter()
                 .all(|call| matches!(call.caller_symbol.as_str(), "outer" | "inner")));
-            assert_eq!(snapshot.outbound_calls.len(), 3);
+            assert_eq!(snapshot.outbound_calls.len(), 4);
+            assert_eq!(
+                snapshot
+                    .outbound_calls
+                    .iter()
+                    .filter(|call| call.line == 4)
+                    .map(|call| call.caller_symbol.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["inner", "outer"])
+            );
             assert!(
                 snapshot
                     .outbound_calls

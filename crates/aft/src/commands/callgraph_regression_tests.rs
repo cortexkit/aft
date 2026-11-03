@@ -357,7 +357,11 @@ fn callgraph_python_nested_bodies_keep_enclosing_callers_and_lexical_headers() {
     };
     assert_eq!(
         owners("body"),
-        [(6, "inner".into()), (6, "middle".into()), (6, "outer".into())]
+        [
+            (6, "inner".into()),
+            (6, "middle".into()),
+            (6, "outer".into())
+        ]
     );
     assert_eq!(
         owners("header"),
@@ -376,6 +380,34 @@ fn callgraph_python_nested_bodies_keep_enclosing_callers_and_lexical_headers() {
             ("calls.py", "middle"),
             ("calls.py", "inner"),
         ],
+    );
+}
+
+#[test]
+fn callgraph_python_nested_receiver_bodies_keep_enclosing_callers_in_views() {
+    let (_temp, store) = fixture(&[(
+        "calls.py",
+        "class Builder:\n    def make(self): pass\nbuilder = Builder()\ndef outer():\n    def inner(value=builder.make()):\n        builder.make()\n    return inner\n",
+    )]);
+    let mut owners = store
+        .direct_callers_of(Path::new("calls.py"), "Builder::make")
+        .unwrap()
+        .into_iter()
+        .map(|site| (site.line, site.caller.symbol))
+        .collect::<Vec<_>>();
+    owners.sort();
+    assert_eq!(
+        owners,
+        [
+            (5, "outer".into()),
+            (6, "inner".into()),
+            (6, "outer".into())
+        ]
+    );
+    assert_python_view_answers(
+        &store,
+        &[("calls.py", "Builder::make")],
+        &[("calls.py", "outer"), ("calls.py", "inner")],
     );
 }
 

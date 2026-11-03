@@ -795,8 +795,19 @@ pub fn extract(
             dynamic: true,
         });
     }
-    facts.sites.sort_by_key(|s| s.ordinal);
-    facts.sites.dedup_by_key(|s| s.ordinal);
+    if language == "python" {
+        // A nested body has one syntax ordinal but multiple containing callers.
+        // Keep each owner, including defining-scope owners of header expressions.
+        facts
+            .sites
+            .sort_by(|a, b| (a.ordinal, &a.caller).cmp(&(b.ordinal, &b.caller)));
+        facts
+            .sites
+            .dedup_by(|a, b| a.ordinal == b.ordinal && a.caller == b.caller);
+    } else {
+        facts.sites.sort_by_key(|s| s.ordinal);
+        facts.sites.dedup_by_key(|s| s.ordinal);
+    }
     facts.methods.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     facts.methods.dedup();
     Ok(facts)
