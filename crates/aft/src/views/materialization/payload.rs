@@ -21,10 +21,8 @@ use crate::callgraph_store::{CallGraphStoreError, Result};
 
 /// The stored bytes of a JSON payload.
 pub(crate) fn pack(json: &str) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(
-        Vec::with_capacity(json.len() / 4 + 16),
-        Compression::fast(),
-    );
+    let mut encoder =
+        ZlibEncoder::new(Vec::with_capacity(json.len() / 4 + 16), Compression::fast());
     encoder
         .write_all(json.as_bytes())
         .expect("writing into a Vec cannot fail");
