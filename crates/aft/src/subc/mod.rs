@@ -22898,7 +22898,11 @@ mod tests {
     }
 
     fn assert_read_works_during_database_open(executor: &Arc<Executor>, fixture: &ConfiguredRoot) {
-        let body = database_wire_tool(executor, fixture, "read", Duration::from_secs(1));
+        // A read waiting on a blocked or failed database open would never
+        // finish, whatever its deadline; the generous deadline only absorbs
+        // slow admission on a loaded Windows runner, which at 1 s refused the
+        // read before it ran.
+        let body = database_wire_tool(executor, fixture, "read", Duration::from_secs(30));
         assert_eq!(body["success"], true, "{body}");
         assert!(body.to_string().contains("function_0"), "{body}");
         for name in [
