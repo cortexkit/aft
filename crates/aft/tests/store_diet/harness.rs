@@ -6,7 +6,19 @@ use serde_json::{json, Value};
 use std::fs;
 use std::sync::RwLock;
 
-const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/store_diet");
+/// The crate folder, read when the test runs. The test runner remaps
+/// `CARGO_MANIFEST_DIR` when a test binary built on one machine runs from
+/// another checkout (CI builds the macOS archive on a different host), so a
+/// path fixed at compile time would point at a folder that doesn't exist.
+fn manifest_dir() -> PathBuf {
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn assets() -> PathBuf {
+    manifest_dir().join("tests/store_diet")
+}
 
 fn read_capture(path: impl AsRef<Path>) -> Vec<u8> {
     use futures_util::FutureExt;
@@ -51,7 +63,7 @@ fn write_capture(path: &Path, bytes: &[u8]) {
     let python = std::env::var_os("AFT_STORE_DIET_PYTHON")
         .expect("record.py must supply its Python interpreter");
     let mut child = std::process::Command::new(python)
-        .arg(Path::new(ASSETS).join("capture_io.py"))
+        .arg(assets().join("capture_io.py"))
         .arg("write")
         .arg(path)
         .stdin(std::process::Stdio::piped())
@@ -64,7 +76,7 @@ fn write_capture(path: &Path, bytes: &[u8]) {
 }
 
 fn golden(name: &str, bytes: &[u8]) {
-    let path = Path::new(ASSETS).join(name);
+    let path = assets().join(name);
     if std::env::var_os("AFT_STORE_DIET_RECORD").as_deref() == Some(std::ffi::OsStr::new("1")) {
         // Recording is allowed only in the named main checkout prepared by the
         // recorder, never in an encoding candidate that inherited this switch.
@@ -73,12 +85,12 @@ fn golden(name: &str, bytes: &[u8]) {
             let expected = std::env::var("AFT_STORE_DIET_BASELINE")
                 .expect("record.py --baseline SHA is required");
             let metadata: Value =
-                serde_json::from_slice(&fs::read(Path::new(ASSETS).join("baseline.json")).unwrap())
+                serde_json::from_slice(&fs::read(assets().join("baseline.json")).unwrap())
                     .unwrap();
             assert_eq!(metadata["code_revision"].as_str(), Some(expected.as_str()));
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
-                .current_dir(ASSETS)
+                .current_dir(assets())
                 .output()
                 .unwrap();
             assert!(output.status.success());
@@ -130,7 +142,7 @@ fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
 fn counts(store: &CallGraphStore) -> Value {
     let conn = store.conn.lock().unwrap();
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
             .unwrap();
     let mut result = serde_json::Map::new();
     for table in tables.iter().filter(|table| table["graph_data"] == true) {
@@ -166,7 +178,7 @@ fn counts(store: &CallGraphStore) -> Value {
 
 fn fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
     let temp = tempfile::tempdir().unwrap();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = manifest_dir()
         .join("tests/fixtures/callgraph")
         .canonicalize()
         .unwrap();
@@ -389,7 +401,7 @@ fn store_diet_views_golden() {
 
 fn plans(store: &CallGraphStore) -> Value {
     let rows: Vec<Value> =
-        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("statements.json"))).unwrap();
+        serde_json::from_slice(&read_capture(assets().join("statements.json"))).unwrap();
     let conn = store.conn.lock().unwrap();
     // Other databases and transaction-local tables do not live in a finished
     // graph fixture. Keep their schemas on a separate in-memory connection.
@@ -411,7 +423,7 @@ fn plans(store: &CallGraphStore) -> Value {
         let _ = auxiliary.execute_batch(&sql.unwrap());
     }
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
             .unwrap();
     for table in tables {
         let declaration = regex::Regex::new(&format!(r"(?i)^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{}\s*\(", regex::escape(table["table"].as_str().unwrap()))).unwrap();
@@ -676,7 +688,7 @@ fn stored_values(store: &CallGraphStore) -> Value {
 
 fn corpus_cases() -> Vec<Value> {
     serde_json::from_slice(&read_capture(
-        Path::new(ASSETS).join("corpus_manifest.json"),
+        assets().join("corpus_manifest.json"),
     ))
     .unwrap()
 }
@@ -687,7 +699,7 @@ fn store_diet_language_corpus_legacy() {
     let mut results = serde_json::Map::new();
     for case in corpus_cases() {
         let name = case["name"].as_str().unwrap();
-        let root = Path::new(ASSETS)
+        let root = assets()
             .join("corpus")
             .join(name)
             .canonicalize()
@@ -709,7 +721,7 @@ fn store_diet_language_corpus_views() {
     let mut results = serde_json::Map::new();
     for case in corpus_cases() {
         let name = case["name"].as_str().unwrap();
-        let root = Path::new(ASSETS)
+        let root = assets()
             .join("corpus")
             .join(name)
             .canonicalize()
@@ -795,7 +807,7 @@ fn store_diet_transient_and_backend_values() {
 #[test]
 fn store_diet_sqlite_implicit_order() {
     let temp = tempfile::tempdir().unwrap();
-    let root = Path::new(ASSETS)
+    let root = assets()
         .join("corpus/smoke-typescript")
         .canonicalize()
         .unwrap();
@@ -943,7 +955,7 @@ fn store_diet_duplicate_site_order_and_prefix_paths() {
     fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
     let source =
-        fs::read(Path::new(ASSETS).join("corpus/receiver-typescript/receiver.ts")).unwrap();
+        fs::read(assets().join("corpus/receiver-typescript/receiver.ts")).unwrap();
     for file in ["a.ts", "a.ts.more.ts"] {
         fs::write(root.join(file), &source).unwrap();
     }
@@ -1142,7 +1154,7 @@ fn reordered_site_manifest(
 #[test]
 fn store_diet_stored_shape_controls() {
     let temp = tempfile::tempdir().unwrap();
-    let root = Path::new(ASSETS)
+    let root = assets()
         .join("corpus/smoke-typescript")
         .canonicalize()
         .unwrap();
@@ -1168,7 +1180,7 @@ fn store_diet_stored_shape_controls() {
         transaction.commit().unwrap();
     }
     let legacy = stored_values(&store);
-    let root = Path::new(ASSETS)
+    let root = assets()
         .join("corpus/receiver-typescript")
         .canonicalize()
         .unwrap();
@@ -1229,7 +1241,7 @@ fn stored_json_facts(store: &CallGraphStore) -> Value {
     // Discover payload columns from the table-encoding schema and walk every
     // serialized field. Optional facts added by producers need no allowlist.
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(Path::new(ASSETS).join("table_encoding.json")))
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
             .unwrap();
     let connection = store.conn.lock().unwrap();
     let mut result = serde_json::Map::new();
