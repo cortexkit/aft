@@ -16570,7 +16570,11 @@ mod v3_base_reference_collector_tests {
                 }
             }),
         );
-        for sweep in 0..2 {
+        // Only admitted reference sweeps advance the persisted unreferenced
+        // count. Keep the visit budget short and wait for reclamation instead
+        // of assuming that two collector visits always admit two sweeps.
+        const MAX_SWEEPS: usize = 16;
+        for sweep in 1..=MAX_SWEEPS {
             v3::set_walk_delay_for_test(Duration::from_millis(500));
             let mut report = SweepReport::default();
             let result = collect_one_v3_family(
@@ -16584,15 +16588,30 @@ mod v3_base_reference_collector_tests {
             );
             v3::set_walk_delay_for_test(Duration::ZERO);
             result.unwrap();
-            eprintln!("collector visit {}: {report:?}", sweep + 1);
             assert!(report.errors.is_empty(), "{report:?}");
             assert_eq!(
                 report.skipped_families,
                 [format!("blobs/v3/{FAMILY}: measurement_owed")]
             );
-            assert_eq!(registered(storage.path(), &unused.scope), sweep == 0);
-            assert!(registered(storage.path(), &held.scope));
-            assert!(registered(storage.path(), &referenced.scope));
+            assert!(
+                registered(storage.path(), &held.scope),
+                "visit {sweep}: {report:?}"
+            );
+            assert!(
+                registered(storage.path(), &referenced.scope),
+                "visit {sweep}: {report:?}"
+            );
+            if !registered(storage.path(), &unused.scope) {
+                eprintln!(
+                    "unused base reclaimed after {sweep} collector visits with accounting owed"
+                );
+                break;
+            }
+            assert!(
+                sweep < MAX_SWEEPS,
+                "unused base {} still registered after {MAX_SWEEPS} collector visits with accounting owed; last report: {report:?}",
+                unused.scope
+            );
         }
         assert!(!v3::view_dir(storage.path(), FAMILY, &unused.scope)
             .unwrap()
