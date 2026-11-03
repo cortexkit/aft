@@ -337,6 +337,49 @@ fn callgraph_python_definition_headers_use_defining_scope() {
 }
 
 #[test]
+fn callgraph_python_nested_bodies_keep_enclosing_callers_and_lexical_headers() {
+    let (_temp, store) = fixture(&[
+        ("target.py", "def header():\n    pass\ndef body():\n    pass\n"),
+        ("calls.py", "from target import header, body\ndef outer():\n    @header()\n    def middle(value=header()):\n        def inner(value=header()):\n            body()\n        return inner\n    return middle\n"),
+    ]);
+    let owners = |symbol| {
+        let mut sites = store
+            .direct_callers_of(Path::new("target.py"), symbol)
+            .unwrap()
+            .into_iter()
+            .map(|site| {
+                assert!(!site.approximate());
+                (site.line, site.caller.symbol)
+            })
+            .collect::<Vec<_>>();
+        sites.sort();
+        sites
+    };
+    assert_eq!(
+        owners("body"),
+        [(6, "inner".into()), (6, "middle".into()), (6, "outer".into())]
+    );
+    assert_eq!(
+        owners("header"),
+        [
+            (3, "outer".into()),
+            (4, "outer".into()),
+            (5, "middle".into()),
+            (5, "outer".into())
+        ]
+    );
+    assert_python_view_answers(
+        &store,
+        &[("target.py", "header"), ("target.py", "body")],
+        &[
+            ("calls.py", "outer"),
+            ("calls.py", "middle"),
+            ("calls.py", "inner"),
+        ],
+    );
+}
+
+#[test]
 fn callgraph_python_constructors_follow_class_bindings_not_names() {
     let (_temp, store) = fixture(&[
         ("pkg/source.py", "class Widget:\n    def __init__(self):\n        pass\n\nclass WithoutInit:\n    pass\n"),

@@ -51,7 +51,7 @@ struct Extractor<'a> {
 pub(crate) struct Extraction {
     pub imports: ImportBlock,
     pub bindings: Vec<CallBinding>,
-    pub owners: HashMap<usize, String>,
+    pub owners: HashMap<usize, Vec<String>>,
 }
 
 pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
@@ -112,7 +112,24 @@ pub(crate) fn extract(source: &str, root: Node<'_>) -> Extraction {
         owners: extractor
             .calls
             .iter()
-            .map(|(call, scope)| (call.start_byte(), extractor.scopes[*scope].owner.clone()))
+            .map(|(call, scope)| {
+                let mut owners = vec![extractor.scopes[*scope].owner.clone()];
+                let mut parent = extractor.scopes[*scope].parent;
+                // Like other languages, retain enclosing callable edges for nested
+                // bodies. Start from the lexical scope so declaration headers still
+                // belong to their defining scope, never the declared function.
+                while let Some(id) = parent {
+                    let enclosing = &extractor.scopes[id];
+                    if !enclosing.class
+                        && enclosing.owner != super::TOP_LEVEL_SYMBOL
+                        && !owners.contains(&enclosing.owner)
+                    {
+                        owners.push(enclosing.owner.clone());
+                    }
+                    parent = enclosing.parent;
+                }
+                (call.start_byte(), owners)
+            })
             .collect(),
     }
 }

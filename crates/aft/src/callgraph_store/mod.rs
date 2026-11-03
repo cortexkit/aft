@@ -32711,7 +32711,10 @@ edition = "2021"
             .filter(|site| site.member.as_deref() == Some("make"))
             .map(|site| (site.caller.as_deref(), site.line))
             .collect::<Vec<_>>();
-        assert_eq!(sites, [(Some("outer"), 5), (Some("inner"), 6)]);
+        assert_eq!(
+            sites,
+            [(Some("outer"), 5), (Some("inner"), 6), (Some("outer"), 6)]
+        );
     }
 
     #[test]
@@ -33166,7 +33169,8 @@ edition = "2021"
             "#[macro_use]\nmod macros;\nfn main() { outer!(); }\n",
         );
         let macros = write_file(root, "src/macros.rs", source);
-        let snapshot = callgraph_fixture_view(root, &[main, macros, root.join("Cargo.toml")]);
+        let view = callgraph_fixture_view_store(root, &[main, macros, root.join("Cargo.toml")]);
+        let snapshot = project_dead_code_snapshot_from_view(&view).unwrap().1;
         assert_eq!(
             snapshot
                 .outbound_calls
@@ -33175,8 +33179,10 @@ edition = "2021"
                 .count(),
             2
         );
-        let views = root.join("views");
-        let database = manifest_view_database_path(&views, "parity").unwrap();
+        let views = view.inner.publication_dir.clone();
+        let database = view.inner.sqlite_path().to_path_buf();
+        drop(view);
+        assert!(database.is_file());
         let conn = Connection::open(&database).unwrap();
         let old_ordinal = parse
             .refs

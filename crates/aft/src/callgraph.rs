@@ -1766,8 +1766,10 @@ pub(crate) fn build_file_data_from_tree(
         let mut seen = HashSet::new();
         for site in calls_by_symbol.into_values().flatten() {
             if seen.insert((site.byte_start, site.byte_end)) {
-                if let Some(owner) = python.owners.get(&site.byte_start) {
-                    owned.entry(owner.clone()).or_default().push(site);
+                if let Some(owners) = python.owners.get(&site.byte_start) {
+                    for owner in owners {
+                        owned.entry(owner.clone()).or_default().push(site.clone());
+                    }
                 }
             }
         }
