@@ -389,21 +389,29 @@ fn callgraph_python_nested_receiver_bodies_keep_enclosing_callers_in_views() {
         "calls.py",
         "class Builder:\n    def make(self): pass\nbuilder = Builder()\ndef outer():\n    def inner(value=builder.make()):\n        builder.make()\n    return inner\n",
     )]);
-    let mut owners = store
-        .direct_callers_of(Path::new("calls.py"), "Builder::make")
-        .unwrap()
-        .into_iter()
-        .map(|site| (site.line, site.caller.symbol))
-        .collect::<Vec<_>>();
-    owners.sort();
-    assert_eq!(
-        owners,
-        [
-            (5, "outer".into()),
-            (6, "inner".into()),
-            (6, "outer".into())
-        ]
+    let view = crate::callgraph_store::fixture_manifest_view_for_test(
+        store.project_root(),
+        &[store.project_root().join("calls.py")],
     );
+    for sites in [
+        store.direct_callers_of(Path::new("calls.py"), "Builder::make"),
+        view.direct_callers_of(Path::new("calls.py"), "Builder::make"),
+    ] {
+        let mut owners = sites
+            .unwrap()
+            .into_iter()
+            .map(|site| (site.line, site.caller.symbol))
+            .collect::<Vec<_>>();
+        owners.sort();
+        assert_eq!(
+            owners,
+            [
+                (5, "outer".into()),
+                (6, "inner".into()),
+                (6, "outer".into())
+            ]
+        );
+    }
     assert_python_view_answers(
         &store,
         &[("calls.py", "Builder::make")],

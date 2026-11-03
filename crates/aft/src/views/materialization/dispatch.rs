@@ -287,13 +287,14 @@ struct FileRow {
 impl FileRow {
     fn decoded(parse: &ParseBlob, facts: FileFacts) -> Result<Self> {
         let facts_json = json(&facts)?;
-        let sites_json = json(&parse.dispatch.sites)?;
+        let sites = parse.bound_dispatch_sites();
+        let sites_json = json(&sites)?;
         Ok(Self {
             facts_digest: digest(&facts_json),
             facts,
             facts_json,
             sites_digest: digest(&sites_json),
-            sites: Some(parse.dispatch.sites.clone()),
+            sites: Some(sites),
             sites_json: Some(sites_json),
             trace: None,
             dirty: true,

@@ -1057,6 +1057,30 @@ fn bound_name(name: &str, path: &str) -> String {
 }
 
 impl ParseBlob {
+    /// Bind Python dispatch hints to the same keys as their call references.
+    /// Nested bodies retain each enclosing caller, so their hints must use
+    /// caller-specific keys rather than the shared syntax ordinal.
+    pub(crate) fn bound_dispatch_sites(&self) -> Vec<dispatch::SiteHint> {
+        let mut sites = self.dispatch.sites.clone();
+        if self.language == "python" {
+            let keys = self
+                .refs
+                .iter()
+                .zip(self.reference_keys())
+                .filter(|(reference, _)| reference.kind == BlobRefKind::Call)
+                .map(|(reference, key)| {
+                    ((reference.ordinal, reference.caller_symbol.as_deref()), key)
+                })
+                .collect::<HashMap<_, _>>();
+            for site in &mut sites {
+                if let Some(key) = keys.get(&(site.ordinal, site.caller.as_deref())) {
+                    site.ordinal = *key;
+                }
+            }
+        }
+        sites
+    }
+
     /// AST ordinals stay intact in the blob. When several facts occupy one
     /// ordinal, their bound keys must also distinguish source span and caller.
     /// Singleton references retain their historical key; collision suffixes
@@ -1463,9 +1487,8 @@ impl JoinResult {
                 continue;
             };
             receiver_sites.extend(
-                blob.dispatch
-                    .sites
-                    .iter()
+                blob.bound_dispatch_sites()
+                    .into_iter()
                     .map(|site| (path.as_bytes().to_vec(), site.ordinal)),
             );
             let extract = blob.bind(rel, &paths)?;
