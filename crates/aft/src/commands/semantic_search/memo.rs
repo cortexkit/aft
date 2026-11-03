@@ -60,7 +60,7 @@ fn regular_file_stat(path: &Path) -> Option<NativeStat> {
     // NativeStat observes the final component without following symlinks. Its
     // proof cannot certify the bytes of a symlink's independently changing target.
     #[cfg(unix)]
-    if stat.mode & libc::S_IFMT != libc::S_IFREG {
+    if stat.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG) {
         return None;
     }
     #[cfg(windows)]
