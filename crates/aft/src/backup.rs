@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +66,12 @@ const MAX_SESSION_DISCOVERY_ENTRIES: usize = 100_000;
 /// Recovery must finish undo bookkeeping even after its caller is cancelled,
 /// but cannot hold the backup store indefinitely waiting for a scan or lease.
 const ROLLBACK_CLEANUP_ALLOWANCE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupLockWait {
+    Bounded,
+    TryOnce,
+}
 
 #[derive(Clone, Copy)]
 struct BackupIoBudget {
@@ -1061,9 +1067,14 @@ pub struct BackupStore {
     /// In-process mutation records whose undo snapshot was intentionally skipped.
     skipped_backups: HashMap<String, Vec<SkippedBackup>>,
     /// Stack entries snapshotted during the current request whose mutation has
-    /// not finished yet, as (session, key, backup_id). Once the request has
+    /// not finished yet, as (session, key, backup_id, op_id). Once the request has
     /// written, `record_post_mutation_states` stamps each with what it left.
-    pending_post_states: Vec<(String, PathBuf, String)>,
+    pending_post_states: Vec<(String, PathBuf, String, Option<String>)>,
+    /// Request-local operation membership survives resident stack eviction.
+    /// Completed requests release it instead of indexing the session's history.
+    operation_paths: HashMap<BackupOperation, BTreeSet<PathBuf>>,
+    /// Failed cleanup retains its exact paths until a later backup pass succeeds.
+    pending_discards: VecDeque<PendingOperationDiscard>,
     #[cfg(test)]
     enforce_temp_path_policy: bool,
     #[cfg(test)]
@@ -1090,6 +1101,23 @@ pub struct BackupStore {
     /// time the cleanup from its own start rather than from the caller's.
     #[cfg(test)]
     discard_started_for_tests: Option<Instant>,
+    #[cfg(test)]
+    pub(crate) discard_paths_for_tests: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BackupOperation {
+    storage_dir: Option<PathBuf>,
+    namespace: Option<String>,
+    session: String,
+    op_id: String,
+}
+
+#[derive(Debug)]
+struct PendingOperationDiscard {
+    operation: BackupOperation,
+    paths: BTreeSet<PathBuf>,
+    warned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1144,6 +1172,8 @@ impl BackupStore {
             policy: BackupPolicy::default(),
             skipped_backups: HashMap::new(),
             pending_post_states: Vec::new(),
+            operation_paths: HashMap::new(),
+            pending_discards: VecDeque::new(),
             #[cfg(test)]
             enforce_temp_path_policy: false,
             #[cfg(test)]
@@ -1168,6 +1198,8 @@ impl BackupStore {
             discard_outcome_for_tests: None,
             #[cfg(test)]
             discard_started_for_tests: None,
+            #[cfg(test)]
+            discard_paths_for_tests: Vec::new(),
         }
     }
 
@@ -1357,6 +1389,7 @@ impl BackupStore {
     /// Root-repair failures other than a busy namespace (conflicts, active
     /// sessions, I/O errors) are logged by the repair and do not stop the restore.
     fn run_restore_maintenance(&mut self) -> Result<(), AftError> {
+        self.retry_pending_operation_discard(CleanupLockWait::Bounded);
         self.run_waiting_maintenance("undo")
     }
 
@@ -1383,6 +1416,7 @@ impl BackupStore {
     /// refuses rather than create that stack in front of the entry, where the
     /// migration would later skip it because the target exists.
     fn run_snapshot_maintenance(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
+        self.retry_pending_operation_discard(CleanupLockWait::TryOnce);
         const BEFORE: &str = "recording a backup";
         if session != crate::protocol::DEFAULT_SESSION_ID {
             self.run_process_maintenance_once();
@@ -3031,6 +3065,7 @@ impl BackupStore {
 
         let mut evicted = drain_stack_to_depth(&mut stack, max_depth.saturating_sub(1));
         let new_entry_id = entry.backup_id.clone();
+        let op_id = entry.op_id.clone();
         let awaits_post_state = entry.post_state.is_none();
         if max_depth > 0 {
             stack.push(entry);
@@ -3076,8 +3111,26 @@ impl BackupStore {
             }
         }
         if awaits_post_state && max_depth > 0 {
-            self.pending_post_states
-                .push((session.to_string(), key.to_path_buf(), new_entry_id));
+            self.pending_post_states.push((
+                session.to_string(),
+                key.to_path_buf(),
+                new_entry_id,
+                op_id.clone(),
+            ));
+        }
+        if max_depth > 0 {
+            if let Some(op_id) = op_id {
+                let operation = BackupOperation {
+                    storage_dir: self.storage_dir.clone(),
+                    namespace: self.effective_storage_harness(),
+                    session: session.to_string(),
+                    op_id,
+                };
+                self.operation_paths
+                    .entry(operation)
+                    .or_default()
+                    .insert(key.to_path_buf());
+            }
         }
 
         if let Some(session_dir) = self.session_dir(session) {
@@ -3117,7 +3170,7 @@ impl BackupStore {
     ) -> Option<usize> {
         self.pending_post_states
             .iter()
-            .position(|(pending_session, pending_key, pending_id)| {
+            .position(|(pending_session, pending_key, pending_id, _)| {
                 pending_session == session && pending_key == key && pending_id == backup_id
             })
     }
@@ -3127,8 +3180,11 @@ impl BackupStore {
     /// the next undo compares the live path against this to notice changes
     /// made outside AFT.
     pub fn record_post_mutation_states(&mut self) {
+        // A failed request already spent its cleanup time budget and reported
+        // any leftovers. Retry before a later snapshot or undo, not here.
         let pending = std::mem::take(&mut self.pending_post_states);
-        for (session, key, backup_id) in pending {
+        self.operation_paths.clear();
+        for (session, key, backup_id, _) in pending {
             if let Err(error) = self.record_post_mutation_state(&session, &key, &backup_id) {
                 crate::slog_warn!(
                     "backup post-mutation state not recorded for {}: {}",
@@ -3387,6 +3443,64 @@ impl BackupStore {
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        if let Some(skips) = self.skipped_backups.get_mut(session) {
+            skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
+            if skips.is_empty() {
+                self.skipped_backups.remove(session);
+            }
+        }
+        // Rolled-back mutations have no post-state to annotate. In particular,
+        // annotation must not wait on a lease that cleanup just failed to take.
+        self.pending_post_states
+            .retain(|(pending_session, _, _, pending_op)| {
+                pending_session != session || pending_op.as_deref() != Some(op_id)
+            });
+        let operation = BackupOperation {
+            storage_dir: self.storage_dir.clone(),
+            namespace: self.effective_storage_harness(),
+            session: session.to_string(),
+            op_id: op_id.to_string(),
+        };
+        let paths = self.operation_paths.remove(&operation).unwrap_or_default();
+        let position = self
+            .pending_discards
+            .iter()
+            .position(|pending| pending.operation == operation);
+        let position = match position {
+            Some(position) => {
+                self.pending_discards[position].paths.extend(paths);
+                position
+            }
+            None if paths.is_empty() => return,
+            None => {
+                self.pending_discards.push_back(PendingOperationDiscard {
+                    operation,
+                    paths,
+                    warned: false,
+                });
+                self.pending_discards.len() - 1
+            }
+        };
+        self.run_operation_discard(position, CleanupLockWait::Bounded);
+    }
+
+    fn retry_pending_operation_discard(&mut self, lock_wait: CleanupLockWait) {
+        let namespace = self.effective_storage_harness();
+        if let Some(position) = self.pending_discards.iter().position(|pending| {
+            pending.operation.storage_dir == self.storage_dir
+                && pending.operation.namespace == namespace
+        }) {
+            // Snapshots only try each lease once; undo can wait within the
+            // cleanup budget. Neither pass walks more than one queued operation.
+            self.run_operation_discard(position, lock_wait);
+        }
+    }
+
+    fn run_operation_discard(&mut self, position: usize, lock_wait: CleanupLockWait) {
+        let mut pending = self
+            .pending_discards
+            .remove(position)
+            .expect("pending discard");
         let budget = BackupIoBudget::rollback_cleanup();
         #[cfg(test)]
         {
@@ -3394,49 +3508,60 @@ impl BackupStore {
             self.discard_started_for_tests =
                 budget.deadline.checked_sub(ROLLBACK_CLEANUP_ALLOWANCE);
         }
-        if let Some(skips) = self.skipped_backups.get_mut(session) {
-            skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
-            if skips.is_empty() {
-                self.skipped_backups.remove(session);
+        let mut failed = BTreeSet::new();
+        let mut first_error = None;
+        loop {
+            // Check before advancing the path iterator: a spent shared allowance
+            // leaves the unvisited tail queued, rather than failing each path.
+            if let Err(error) = budget.check(Path::new("operation backup cleanup")) {
+                first_error.get_or_insert(error);
+                break;
             }
-        }
-        let keys = match self.operation_candidate_keys_with_budget(session, budget) {
-            Ok(keys) => keys,
-            Err(error) => {
-                #[cfg(test)]
-                {
-                    self.discard_outcome_for_tests = Some(Err(error.to_string()));
-                }
-                crate::slog_warn!(
-                    "failed to discover backup stacks during operation discard: {error}"
-                );
-                return;
-            }
-        };
-        for key in keys {
-            let result =
-                self.discard_operation_entries_for_path(session, op_id, &key, true, budget);
+            let Some(key) = pending.paths.pop_first() else {
+                break;
+            };
+            let result = self.discard_operation_entries_for_path(
+                &pending.operation.session,
+                &pending.operation.op_id,
+                &key,
+                true,
+                budget,
+                lock_wait,
+            );
             #[cfg(test)]
+            if self
+                .discard_outcome_for_tests
+                .as_ref()
+                .is_none_or(|outcome| outcome.is_ok())
             {
-                if self
-                    .discard_outcome_for_tests
-                    .as_ref()
-                    .is_none_or(|outcome| outcome.is_ok())
-                {
-                    self.discard_outcome_for_tests = Some(
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                    );
-                }
+                self.discard_outcome_for_tests = Some(
+                    result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                );
             }
             if let Err(error) = result {
-                crate::slog_warn!(
-                    "failed to discard operation backups for {}: {error}",
-                    key.display()
-                );
+                first_error.get_or_insert(error);
+                failed.insert(key);
             }
+        }
+        pending.paths.extend(failed);
+        if !pending.paths.is_empty() {
+            let error = first_error.expect("deferred discard has an error");
+            if pending.warned {
+                crate::slog_debug!(
+                    "operation backup cleanup incomplete: deferred_paths={}; retry queued; first_error={error}",
+                    pending.paths.len(),
+                );
+            } else {
+                crate::slog_warn!(
+                    "operation backup cleanup incomplete: deferred_paths={}; retry queued; first_error={error}",
+                    pending.paths.len(),
+                );
+                pending.warned = true;
+            }
+            self.pending_discards.push_back(pending);
         }
     }
 
@@ -3471,7 +3596,14 @@ impl BackupStore {
                 self.skipped_backups.remove(session);
             }
         }
-        self.discard_operation_entries_for_path(session, op_id, &key, false, budget)
+        self.discard_operation_entries_for_path(
+            session,
+            op_id,
+            &key,
+            false,
+            budget,
+            CleanupLockWait::Bounded,
+        )
     }
 
     fn discard_operation_entries_for_path(
@@ -3481,12 +3613,16 @@ impl BackupStore {
         key: &Path,
         all: bool,
         budget: BackupIoBudget,
+        lock_wait: CleanupLockWait,
     ) -> Result<(), AftError> {
+        #[cfg(test)]
+        self.discard_paths_for_tests.push(key.to_path_buf());
         budget.check(key)?;
         let _disk_lock = self.acquire_stack_disk_lock_with_cleanup_deadline(
             session,
             key,
             Some(budget.deadline),
+            lock_wait,
         )?;
         budget.check(key)?;
         // Route-close cleanup can release the resident stack between capture
@@ -3506,6 +3642,18 @@ impl BackupStore {
             .last()
             .is_some_and(|entry| entry.op_id.as_deref() == Some(op_id))
         {
+            if all
+                && stack
+                    .iter()
+                    .any(|entry| entry.op_id.as_deref() == Some(op_id))
+            {
+                return Err(AftError::IoError {
+                    path: key.display().to_string(),
+                    message:
+                        "operation backups are covered by newer undo entries; cleanup deferred"
+                            .to_string(),
+                });
+            }
             return Ok(());
         }
         loop {
@@ -4472,7 +4620,12 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
-        self.acquire_stack_disk_lock_with_cleanup_deadline(session, key, None)
+        self.acquire_stack_disk_lock_with_cleanup_deadline(
+            session,
+            key,
+            None,
+            CleanupLockWait::Bounded,
+        )
     }
 
     fn acquire_stack_disk_lock_with_cleanup_deadline(
@@ -4480,6 +4633,7 @@ impl BackupStore {
         session: &str,
         key: &Path,
         cleanup_deadline: Option<Instant>,
+        lock_wait: CleanupLockWait,
     ) -> Result<Option<crate::fs_lock::LockGuard>, AftError> {
         let Some(namespace_root) = self.storage_dir.as_deref() else {
             return Ok(None);
@@ -4490,15 +4644,27 @@ impl BackupStore {
             message: error.to_string(),
         })?;
         let namespace = match cleanup_deadline {
-            Some(deadline) => {
-                lock_backup_namespace(namespace_root, Some(deadline), true).and_then(|guard| {
+            _ if lock_wait == CleanupLockWait::TryOnce => {
+                lock_backup_namespace_inner(namespace_root, None, true, false).and_then(|guard| {
                     guard.ok_or_else(|| {
                         std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "rollback cleanup namespace lease timed out",
+                            std::io::ErrorKind::WouldBlock,
+                            "backup cleanup namespace lease is busy",
                         )
                     })
                 })
+            }
+            Some(deadline) => {
+                lock_backup_namespace_inner(namespace_root, Some(deadline), true, false).and_then(
+                    |guard| {
+                        guard.ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "rollback cleanup namespace lease timed out",
+                            )
+                        })
+                    },
+                )
             }
             None => backup_namespace_admission(namespace_root),
         };
@@ -4525,6 +4691,7 @@ impl BackupStore {
         })?;
         let gate_path = session_gc_lock_path(&session_dir);
         let gate = match cleanup_deadline {
+            _ if lock_wait == CleanupLockWait::TryOnce => session_gc_gate(&session_dir, false),
             Some(deadline) => session_gc_gate_until(&session_dir, deadline),
             None => session_gc_gate(&session_dir, true),
         };
@@ -4547,6 +4714,7 @@ impl BackupStore {
                 session,
                 key,
                 cleanup_deadline,
+                lock_wait,
             );
         }
         create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
@@ -4570,6 +4738,16 @@ impl BackupStore {
             }
         });
         let guard = match cleanup_deadline {
+            _ if lock_wait == CleanupLockWait::TryOnce => {
+                // An expired deadline permits one attempt without the malformed
+                // lease grace period used by try_acquire_once.
+                crate::fs_lock::try_acquire_until(&lock_path, Instant::now()).map_err(|error| {
+                    AftError::IoError {
+                        path: lock_path.display().to_string(),
+                        message: error.to_string(),
+                    }
+                })?
+            }
             Some(deadline) => {
                 crate::fs_lock::try_acquire_until(&lock_path, deadline).map_err(|error| {
                     AftError::IoError {
@@ -6705,6 +6883,15 @@ fn lock_backup_namespace(
     wait_until: Option<Instant>,
     shared: bool,
 ) -> std::io::Result<Option<AdvisoryLockGuard>> {
+    lock_backup_namespace_inner(storage, wait_until, shared, true)
+}
+
+fn lock_backup_namespace_inner(
+    storage: &Path,
+    wait_until: Option<Instant>,
+    shared: bool,
+    announce_wait: bool,
+) -> std::io::Result<Option<AdvisoryLockGuard>> {
     let file = backup_namespace_file(storage)?;
     let mut pause = Duration::from_millis(2);
     let mut announced = false;
@@ -6724,18 +6911,22 @@ fn lock_backup_namespace(
         };
         let now = Instant::now();
         if now >= deadline {
-            crate::slog_warn!(
-                "backup namespace {} stayed busy past the wait deadline",
-                storage.display()
-            );
+            if announce_wait {
+                crate::slog_warn!(
+                    "backup namespace {} stayed busy past the wait deadline",
+                    storage.display()
+                );
+            }
             return Ok(None);
         }
         if !announced {
             announced = true;
-            crate::slog_warn!(
-                "backup namespace {} is busy; waiting for it to look for or move legacy backup history",
-                storage.display()
-            );
+            if announce_wait {
+                crate::slog_warn!(
+                    "backup namespace {} is busy; waiting for it to look for or move legacy backup history",
+                    storage.display()
+                );
+            }
             #[cfg(test)]
             run_before_namespace_wait_hook_for_tests(storage);
         }
@@ -8824,13 +9015,252 @@ mod tests {
                     .map_or(0, |entries| entries.len()),
                 usize::from(!released)
             );
-            assert_eq!(store.disk_index[session][&key].count, 1);
+            assert_eq!(store.disk_history_count(session, &key), 1);
             assert_eq!(
                 store.history(session, &path).len(),
                 1,
                 "timed-out cleanup must leave its stack intact at stage {held_stage}"
             );
         }
+    }
+
+    #[test]
+    fn backup_discard_snapshot_retry_does_not_wait_for_namespace_or_session_lease() {
+        for held_stage in [0, 1] {
+            let (mut store, storage, _project, path) = durability_store();
+            let session = "busy-cleanup-admission";
+            store
+                .snapshot_with_op(session, &path, "good", Some("good"))
+                .unwrap();
+            store.record_post_mutation_states();
+            store
+                .snapshot_with_op(session, &path, "bad", Some("bad"))
+                .unwrap();
+            store.fail_next_disk_write_for_tests();
+            store.discard_operation_entries(session, "bad");
+            let namespace = if held_stage == 0 {
+                backup_namespace_gate(storage.path(), None).unwrap()
+            } else {
+                None
+            };
+            let session_gate = if held_stage == 1 {
+                session_gc_gate(&store.session_dir(session).unwrap(), true).unwrap()
+            } else {
+                None
+            };
+            let started = Instant::now();
+            store.retry_pending_operation_discard(CleanupLockWait::TryOnce);
+            let elapsed = started.elapsed();
+            drop((namespace, session_gate));
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "snapshot cleanup waited at stage {held_stage}: {elapsed:?}"
+            );
+            assert_eq!(store.pending_discards.len(), 1);
+            assert_eq!(store.history(session, &path).len(), 2);
+        }
+    }
+
+    #[test]
+    fn backup_discard_snapshot_retry_does_not_wait_for_busy_stack() {
+        let (mut store, _storage, project, path) = durability_store();
+        let session = "busy-discard-before-edit";
+        store
+            .snapshot_with_op(session, &path, "good", Some("good"))
+            .unwrap();
+        store.record_post_mutation_states();
+        store
+            .snapshot_with_op(session, &path, "rolled back", Some("bad"))
+            .unwrap();
+        store.fail_next_disk_write_for_tests();
+        store.discard_operation_entries(session, "bad");
+        assert_eq!(store.pending_discards.len(), 1);
+        let held = store
+            .acquire_stack_disk_lock(session, &canonicalize_key(&path))
+            .unwrap();
+
+        let next = project.path().join("next-edit.txt");
+        fs::write(&next, b"another edit").unwrap();
+        let started = Instant::now();
+        let (result, logs) = crate::logging::capture_log_lines(|| {
+            store.snapshot("next-edit", &next, "snapshot while cleanup is busy")
+        });
+        let elapsed = started.elapsed();
+        drop(held);
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "snapshot waited for queued cleanup: {elapsed:?}"
+        );
+        assert_eq!(store.pending_discards.len(), 1);
+        assert_eq!(store.history(session, &path).len(), 2);
+        assert!(
+            !logs.iter().any(|line| line.starts_with("WARN ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("DEBUG ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert_eq!(store.restore_last_operation(session).unwrap().op_id, "good");
+        assert!(store.pending_discards.is_empty());
+    }
+
+    #[test]
+    fn backup_discard_retry_waits_for_newer_undo_entries() {
+        let (mut store, storage, _project, path) = durability_store();
+        let session = "covered-discard";
+        store
+            .snapshot_with_op(session, &path, "good", Some("good"))
+            .unwrap();
+        fs::write(&path, b"successful").unwrap();
+        store.record_post_mutation_states();
+        store
+            .snapshot_with_op(session, &path, "rolled back", Some("bad"))
+            .unwrap();
+        store.fail_next_disk_write_for_tests();
+        let (_, initial_logs) = crate::logging::capture_log_lines(|| {
+            store.discard_operation_entries(session, "bad");
+        });
+        assert_eq!(
+            initial_logs
+                .iter()
+                .filter(|line| line.starts_with("WARN ")
+                    && line.contains("operation backup cleanup incomplete"))
+                .count(),
+            1,
+            "{initial_logs:?}"
+        );
+        assert_eq!(store.pending_discards.len(), 1);
+
+        // A different process can append while the failed cleanup is queued.
+        let mut writer = BackupStore::new();
+        writer.set_storage_dir(storage.path().to_path_buf(), 24);
+        writer
+            .snapshot_with_op(session, &path, "newer", Some("newer"))
+            .unwrap();
+        fs::write(&path, b"newer").unwrap();
+        writer.record_post_mutation_states();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            for index in 0..3 {
+                let next = path
+                    .parent()
+                    .unwrap()
+                    .join(format!("unrelated-{index}.txt"));
+                fs::write(&next, b"another edit").unwrap();
+                store
+                    .snapshot("another-session", &next, "later snapshot")
+                    .unwrap();
+            }
+        });
+        assert!(
+            !logs.iter().any(|line| line.starts_with("WARN ")
+                && line.contains("operation backup cleanup incomplete")),
+            "{logs:?}"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.starts_with("DEBUG ")
+                    && line.contains("operation backup cleanup incomplete"))
+                .count(),
+            3,
+            "{logs:?}"
+        );
+        store.record_post_mutation_states();
+        assert_eq!(store.pending_discards.len(), 1);
+        assert_eq!(store.history(session, &path).len(), 3);
+        assert_eq!(
+            store.restore_last_operation(session).unwrap().op_id,
+            "newer"
+        );
+        assert_eq!(store.pending_discards.len(), 1);
+        assert_eq!(store.restore_last_operation(session).unwrap().op_id, "good");
+        assert!(store.pending_discards.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn backup_discard_retry_stays_in_its_namespace() {
+        let (mut store, storage, _project, path) = durability_store();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Runner, 72);
+        with_request_harness("opencode", || {
+            store
+                .snapshot_with_op("same-session", &path, "good", Some("good"))
+                .unwrap();
+            store.record_post_mutation_states();
+            store
+                .snapshot_with_op("same-session", &path, "bad", Some("bad"))
+                .unwrap();
+            store.fail_next_disk_write_for_tests();
+            store.discard_operation_entries("same-session", "bad");
+        });
+        store.release_memory();
+        store.record_post_mutation_states();
+        with_request_harness("runner", || store.run_restore_maintenance().unwrap());
+        assert_eq!(store.pending_discards.len(), 1);
+        with_request_harness("opencode", || {
+            store.run_restore_maintenance().unwrap();
+            assert!(store.pending_discards.is_empty());
+            assert_eq!(store.history("same-session", &path).len(), 1);
+        });
+    }
+
+    #[test]
+    fn backup_discard_exhaustion_warns_once_and_retries_leftovers() {
+        let (mut store, storage, project, first) = durability_store();
+        let paths = [
+            first,
+            project.path().join("second.txt"),
+            project.path().join("third.txt"),
+        ];
+        for path in &paths {
+            fs::write(path, b"original").unwrap();
+            store
+                .snapshot_with_op("retry-discard", path, "good", Some("good"))
+                .unwrap();
+        }
+        store.record_post_mutation_states();
+        for path in &paths {
+            store
+                .snapshot_with_op("retry-discard", path, "rolled back", Some("bad"))
+                .unwrap();
+        }
+        store.release_memory();
+        let namespace = backup_namespace_gate(storage.path(), None).unwrap();
+        let (_, logs) = crate::logging::capture_log_lines(|| {
+            store.discard_operation_entries("retry-discard", "bad");
+            store.record_post_mutation_states();
+        });
+        drop(namespace);
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|line| line.starts_with("WARN "))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(warnings[0].contains("deferred_paths=3"), "{logs:?}");
+        assert_eq!(
+            store.discard_paths_for_tests.len(),
+            1,
+            "stop before advancing after expiry"
+        );
+        for path in &paths {
+            assert_eq!(store.history("retry-discard", path).len(), 2);
+        }
+        let later = project.path().join("later.txt");
+        fs::write(&later, b"later operation").unwrap();
+        store
+            .snapshot("later-session", &later, "later backup pass")
+            .unwrap();
+        for path in &paths {
+            let history = store.history("retry-discard", path);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].op_id.as_deref(), Some("good"));
+        }
+        let restored = store.restore_last_operation("retry-discard").unwrap();
+        assert_eq!(restored.op_id, "good");
+        assert_eq!(restored.restored.len(), 3);
     }
 
     #[test]

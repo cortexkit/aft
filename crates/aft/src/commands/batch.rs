@@ -286,6 +286,62 @@ mod audit_regressions {
             .preview_last_operation_paths(req.session())
             .is_err());
     }
+
+    #[test]
+    fn batch_rollback_discard_is_scoped_to_its_operation() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let session = "batch-discard-scope";
+        let original = "export function ok() { return 1; }\n";
+        let mut paths = Vec::new();
+        {
+            let mut store = ctx.backup().lock();
+            store.set_storage_dir(storage.path().to_path_buf(), 24);
+            for checkout in ["old-one", "old-two", "current"] {
+                let dir = project.path().join(checkout);
+                std::fs::create_dir(&dir).unwrap();
+                let path = dir.join("original.ts");
+                std::fs::write(&path, original).unwrap();
+                store
+                    .snapshot_with_op(session, &path, "earlier edit", Some(checkout))
+                    .unwrap();
+                paths.push(path);
+            }
+            store.record_post_mutation_states();
+            store.release_after_next_snapshot_for_tests();
+        }
+        let path = paths.last().unwrap();
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "scoped-rollback", "session_id": session, "command": "batch",
+            "file": path, "edits": [{"match": original, "replacement": "function { broken"}]
+        }))
+        .unwrap();
+        assert_eq!(req.session(), session);
+        let (response, logs) = crate::logging::capture_log_lines(|| handle_batch(&req, &ctx));
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["rolled_back"], true);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        let store = ctx.backup().lock();
+        assert_eq!(
+            store.discard_paths_for_tests,
+            vec![path.canonicalize().unwrap()],
+            "rollback must not visit the session's other checkouts"
+        );
+        assert!(
+            logs.iter().filter(|line| line.starts_with("WARN ")).count() <= 1,
+            "{logs:?}"
+        );
+        for path in paths {
+            assert_eq!(store.history(session, &path).len(), 1);
+        }
+    }
 }
 
 fn build_batch_output(
