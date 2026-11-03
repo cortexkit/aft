@@ -113,6 +113,7 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
     trust_selected_checkout(env, root)
     frames = queue.Queue()
     successes = {operation(request): 0 for request in requests}
+    failures = {}
     borrowed = 0
     with (output / 'stderr.txt').open('wb') as stderr:
         process = subprocess.Popen([str(binary.resolve())], cwd=root,
@@ -156,13 +157,15 @@ def capture(binary, root, cache, requests, output, timeout, views=False, prepare
                                     continue
                                 (output / (request['id'] + '.reply')).write_bytes(line)
                                 successes[operation(request)] += int(value.get('success') is True)
+                                if value.get('success') is not True:
+                                    failures[request['id']] = value
                                 borrowed += int(bool(value.get('borrowed_callgraph')))
                             break
                         assert value.get('id') is None, f'unexpected reply: {line!r}'
                         pushes.write(line)
             process.stdin.close()
             assert process.wait(timeout=timeout) == 0, 'binary exited unsuccessfully'
-            assert all(successes.values()), f'no successful query for a manifest operation: {successes}'
+            assert all(successes.values()), f'no successful query for a manifest operation: {successes}; replies: {json.dumps(failures)}'
             assert not require_borrowed or borrowed > 0, 'capture never served a borrowed_callgraph reply'
         finally:
             if process.poll() is None:

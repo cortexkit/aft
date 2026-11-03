@@ -115,12 +115,6 @@ def record(sha, include_trace, output_dir):
         dump(tools / name, data)
     for name, command in [('corpus.py', 'generate'), ('inventory.py', 'capture'), ('trace_patch.py', None)]:
         run([sys.executable, tools / name] + ([command] if command else []), tree)
-    env = dict(clean_environment(), AFT_STORE_DIET_RECORD='1', AFT_STORE_DIET_BASELINE=sha)
-    run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet', '--nocapture'], tree, env)
-    run([sys.executable, tools / 'values.py', 'record'], tree)
-    for mode in ['legacy', 'views']:
-        run([sys.executable, tools / 'parity.py', 'fixture-manifest', tools / (mode + '-seeded.json'), tools / (mode + '-query-manifest.json')], tree)
-    run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet'], tree)
     run(['cargo', 'build', '-p', 'agent-file-tools', '--bin', 'aft'], tree)
     target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', tree / 'target'))
     if not target.is_absolute():
@@ -136,6 +130,12 @@ def record(sha, include_trace, output_dir):
         destination.mkdir()
         for path in [*first.glob('*.reply'), first / 'capture.json']:
             shutil.copy2(path, destination / path.name)
+    env = dict(clean_environment(), AFT_STORE_DIET_RECORD='1', AFT_STORE_DIET_BASELINE=sha)
+    run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet', '--nocapture'], tree, env)
+    run([sys.executable, tools / 'values.py', 'record'], tree)
+    for mode in ['legacy', 'views']:
+        run([sys.executable, tools / 'parity.py', 'fixture-manifest', tools / (mode + '-seeded.json'), tools / (mode + '-query-manifest.json')], tree)
+    run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet'], tree)
     trace_report = None
     if include_trace:
         trace = workspace / 'sql-trace.jsonl'

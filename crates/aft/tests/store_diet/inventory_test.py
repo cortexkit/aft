@@ -5,6 +5,7 @@ import pathlib
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest import mock
 
 import inventory
@@ -20,7 +21,7 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(variants), 18)
         query = next(v['sql'] for v in variants if v['variant'] == 'js-2-rust-1-crate-1/0')
         self.assertEqual(query, 'SELECT caller_file FROM refs WHERE (module_path GLOB ?1 OR module_path GLOB ?2) OR (module_path GLOB ?3 OR caller_file GLOB ?4)')
-        with sqlite3.connect(':memory:') as connection:
+        with closing(sqlite3.connect(':memory:')) as connection:
             connection.execute('CREATE TABLE refs(caller_file TEXT, module_path TEXT)')
             for variant in variants:
                 parameters = variant['sql'].count('?')
