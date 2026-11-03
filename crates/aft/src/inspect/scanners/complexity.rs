@@ -8,7 +8,9 @@ use serde_json::{json, Value};
 use tree_sitter::Node;
 
 use super::source_text::{read_source_text, write_skipped_files, SourceText, NOT_VALID_UTF8};
-use crate::cache_freshness::{self, FileFreshness};
+#[cfg(test)]
+use crate::cache_freshness;
+use crate::cache_freshness::FileFreshness;
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -347,7 +349,11 @@ pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {
     };
 
     let aggregate = aggregate_file_scans(&job.project_root, &scans, Some(DRILL_DOWN_LIMIT));
-    let scanned_files = scans.iter().map(|scan| scan.path.clone()).collect();
+    let scanned_files = scans
+        .iter()
+        .filter(|scan| scan.contribution.skipped_reason.is_none())
+        .map(|scan| scan.path.clone())
+        .collect();
     let contributions = scans
         .iter()
         .map(file_scan_to_contribution)
@@ -381,7 +387,7 @@ pub(crate) fn aggregate_complexity_contributions_with_limit(
 /// and this scan and is treated as deleted. A file that is not valid UTF-8 is
 /// a per-file skip; other read failures keep failing the scan as before.
 fn scan_file(project_root: &Path, path: &Path) -> Result<Option<FileComplexityScan>, String> {
-    let freshness = match cache_freshness::collect(path) {
+    let (freshness, _permit) = match super::source_text::source_freshness(path) {
         Ok(freshness) => freshness,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),
@@ -391,10 +397,15 @@ fn scan_file(project_root: &Path, path: &Path) -> Result<Option<FileComplexitySc
     // whatever their encoding, are never opened as source.
     let analyzable =
         detect_language(path).is_some_and(|language| language_spec(language).is_some());
-    let contribution = if analyzable {
+    let contribution = if freshness.size > super::source_text::MAX_SOURCE_BYTES {
+        unreadable_contribution(project_root, path, super::source_text::TOO_LARGE)
+    } else if analyzable {
         match read_source_text(path) {
             Ok(SourceText::Text(source)) => scan_source(project_root, path, &source),
             Ok(SourceText::NotUtf8) => unreadable_contribution(project_root, path, NOT_VALID_UTF8),
+            Ok(SourceText::TooLarge) => {
+                unreadable_contribution(project_root, path, super::source_text::TOO_LARGE)
+            }
             Ok(SourceText::Vanished) => return Ok(None),
             Err(error) => return Err(format!("read failed for {}: {error}", path.display())),
         }
@@ -668,7 +679,7 @@ fn aggregate_contributions(
         "worst": worst,
         "items": items,
         "drill_down_capped": count > limit,
-        "scanned_files": contributions.len(),
+        "scanned_files": contributions.iter().filter(|contribution| contribution.skipped_reason.is_none()).count(),
         "languages_skipped": languages_skipped.into_iter().collect::<Vec<_>>(),
         "complete": parse_errors.is_empty(),
     });
