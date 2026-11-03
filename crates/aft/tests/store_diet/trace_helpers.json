@@ -274,12 +274,34 @@
         "helper": "dead_code_projection_with_files_but_no_root_rows_stays_unavailable"
       },
       {
-        "line": 1464,
+        "line": 1465,
         "helper": "outbound_projection_sorts_in_rust_without_a_sqlite_temp_btree"
       },
       {
-        "line": 1653,
+        "line": 1654,
         "helper": "oversized_projection_delta_is_retained_in_spill_table"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/dispatch_narrowing_tests.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 168,
+        "helper": "go_view_answers"
+      },
+      {
+        "line": 215,
+        "helper": "go_view_answers"
+      },
+      {
+        "line": 501,
+        "helper": "answers"
+      },
+      {
+        "line": 540,
+        "helper": "answers"
       }
     ]
   },
@@ -295,110 +317,138 @@
   },
   {
     "path": "crates/aft/src/callgraph_store/mod.rs",
-    "raw_open_calls": 26,
+    "raw_open_calls": 33,
     "helpers": [
       {
-        "line": 683,
+        "line": 685,
         "helper": "callgraph_writer_waits_when_wal_setup_meets_a_write_lock"
       },
       {
-        "line": 758,
+        "line": 760,
         "helper": "callgraph_reader_setup_does_not_read_locked_schema"
       },
       {
-        "line": 792,
+        "line": 794,
         "helper": "obsolete_generation_is_removed_before_replacement_publication"
       },
       {
-        "line": 839,
+        "line": 841,
         "helper": "obsolete_generation_retirement_preserves_readers_and_interrupted_upgrade_intent"
       },
       {
-        "line": 877,
+        "line": 879,
         "helper": "obsolete_store_probe_preserves_current_missing_and_newer_formats"
       },
       {
-        "line": 939,
+        "line": 941,
         "helper": "kept"
       },
       {
-        "line": 989,
+        "line": 991,
         "helper": "callgraph_readonly_open_is_retryable_while_legacy_writer_is_locked"
       },
       {
-        "line": 1123,
+        "line": 1125,
         "helper": "published_generation_stays_readable_while_its_first_writer_opens_beside_a_held_read"
       },
       {
-        "line": 1189,
+        "line": 1191,
         "helper": "migrated_generation_is_published_in_wal_mode"
       },
       {
-        "line": 4790,
+        "line": 4793,
         "helper": "fixture"
       },
       {
-        "line": 6977,
+        "line": 6986,
         "helper": "lock_readiness_for_test"
       },
       {
-        "line": 25483,
+        "line": 26322,
         "helper": "schema_and_cold_build_share_one_secondary_index_list"
       },
       {
-        "line": 25513,
+        "line": 26352,
         "helper": "disk_index_lookup_failure_fails_the_resolution_window"
       },
       {
-        "line": 27549,
+        "line": 28388,
         "helper": "owner_and_linked_worktree_alternation_rebuilds_storm_generation_once"
       },
       {
-        "line": 28156,
+        "line": 28995,
         "helper": "nonrepairing_open_policy_leaves_moved_root_metadata_for_maintenance"
       },
       {
-        "line": 28184,
+        "line": 29023,
         "helper": "assert_respelled_root_is_rerooted_in_place"
       },
       {
-        "line": 28307,
+        "line": 29146,
         "helper": "readonly_store_opens_through_its_uri_under_plain_and_resolved_temp_paths"
       },
       {
-        "line": 28371,
+        "line": 29210,
         "helper": "readonly_store_opens_past_the_windows_path_limit_under_a_cache_root"
       },
       {
-        "line": 29186,
+        "line": 30025,
         "helper": "direct_callers_real_store_query_plan"
       },
       {
-        "line": 29596,
+        "line": 30435,
         "helper": "completed_marker"
       },
       {
-        "line": 29847,
+        "line": 30686,
         "helper": "superseded_slice_preserves_staging_and_same_corpus_successor_resumes"
       },
       {
-        "line": 30178,
+        "line": 31017,
         "helper": "cold_build_rejects_bytes_changed_after_admission_and_retries_changed_corpus"
       },
       {
-        "line": 32466,
-        "helper": "callgraph_fixture_view"
+        "line": 33323,
+        "helper": "callgraph_fixture_view_store"
       },
       {
-        "line": 32929,
+        "line": 33888,
         "helper": "anchor"
       },
       {
-        "line": 35403,
+        "line": 34708,
+        "helper": "run"
+      },
+      {
+        "line": 34745,
+        "helper": "new"
+      },
+      {
+        "line": 34796,
+        "helper": "run"
+      },
+      {
+        "line": 34866,
+        "helper": "qualified"
+      },
+      {
+        "line": 34889,
+        "helper": "assert_rust_exact_view_parity"
+      },
+      {
+        "line": 34911,
+        "helper": "assert_rust_exact_view_parity"
+      },
+      {
+        "line": 35001,
+        "helper": "create"
+      },
+      {
+        "line": 36799,
         "helper": "durable_staging_state"
       },
       {
-        "line": 35522,
+        "line": 36918,
         "helper": "issue_250_respawn_loop_converges_or_trips_without_false_readiness"
       }
     ]
@@ -428,7 +478,7 @@
         "helper": "callgraph_io_legacy_root_scan_is_cached_once_and_repair_updates_meta"
       },
       {
-        "line": 1157,
+        "line": 1158,
         "helper": "perf_audit2_real_repo_output_equivalence"
       }
     ]
@@ -470,19 +520,19 @@
     "raw_open_calls": 4,
     "helpers": [
       {
-        "line": 17937,
+        "line": 18616,
         "helper": "hold_aft_db_exclusively"
       },
       {
-        "line": 18034,
+        "line": 18713,
         "helper": "busy_lexical_bind_retries_until_parent_can_read_child_trigram"
       },
       {
-        "line": 23413,
+        "line": 24092,
         "helper": "marker"
       },
       {
-        "line": 23461,
+        "line": 24140,
         "helper": "marker"
       }
     ]
@@ -492,7 +542,7 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 6145,
+        "line": 6180,
         "helper": "non_git_obsolete_store_discloses_unknown_dead_code_and_preserves_unused_exports"
       }
     ]
@@ -528,35 +578,35 @@
     "raw_open_calls": 8,
     "helpers": [
       {
-        "line": 20302,
+        "line": 20547,
         "helper": "callgraph_cold_build_logs_schema_stale"
       },
       {
-        "line": 20320,
+        "line": 20565,
         "helper": "callgraph_cold_build_logs_fingerprint_stale"
       },
       {
-        "line": 20360,
+        "line": 20605,
         "helper": "callgraph_cold_build_logs_root_mismatch"
       },
       {
-        "line": 21336,
+        "line": 21581,
         "helper": "assert_callgraph_churn_was_not_charged"
       },
       {
-        "line": 21975,
+        "line": 22224,
         "helper": "hold_checkout_view_derived_busy"
       },
       {
-        "line": 24720,
+        "line": 24971,
         "helper": "failed_database_open_recovers_after_backoff_without_rebind"
       },
       {
-        "line": 24951,
+        "line": 25202,
         "helper": "repaired_resident_database_rechecks_schema_and_pushes_recovered_status"
       },
       {
-        "line": 25168,
+        "line": 25419,
         "helper": "permanent_database_error_is_rechecked_with_doubling_capped_backoff"
       }
     ]
@@ -858,15 +908,15 @@
     "raw_open_calls": 3,
     "helpers": [
       {
-        "line": 3100,
-        "helper": "cache_epoch_immediate_transaction_locks_before_check"
-      },
-      {
         "line": 3102,
         "helper": "cache_epoch_immediate_transaction_locks_before_check"
       },
       {
-        "line": 3397,
+        "line": 3104,
+        "helper": "cache_epoch_immediate_transaction_locks_before_check"
+      },
+      {
+        "line": 3399,
         "helper": "legacy_duplicate_schema_marks_rows_for_rebuild"
       }
     ]
@@ -1008,7 +1058,7 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 15210,
+        "line": 15349,
         "helper": "views_idle_checkout_rechecks_pin_reader_database_and_session_holds"
       }
     ]
@@ -1028,23 +1078,23 @@
     "raw_open_calls": 5,
     "helpers": [
       {
-        "line": 21779,
+        "line": 21806,
         "helper": "identity_retry_replay_is_admitted_as_a_bind_so_reads_never_see_a_torn_root"
       },
       {
-        "line": 22009,
+        "line": 22036,
         "helper": "standing"
       },
       {
-        "line": 22207,
+        "line": 22234,
         "helper": "identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds"
       },
       {
-        "line": 22375,
+        "line": 22402,
         "helper": "quiescing_the_root_cancels_an_admitted_identity_retry_bind"
       },
       {
-        "line": 23476,
+        "line": 23503,
         "helper": "busy_database_open_retries_through_wire_admission_without_rebind"
       }
     ]
@@ -1190,15 +1240,15 @@
     "raw_open_calls": 3,
     "helpers": [
       {
-        "line": 5297,
+        "line": 5391,
         "helper": "caller"
       },
       {
-        "line": 6647,
+        "line": 6813,
         "helper": "v3_presence_batch_validates_once_and_rechecks_rows_and_later_schema_drift"
       },
       {
-        "line": 7480,
+        "line": 7646,
         "helper": "fresh_checkout"
       }
     ]
@@ -1341,42 +1391,46 @@
   },
   {
     "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
-    "raw_open_calls": 9,
+    "raw_open_calls": 10,
     "helpers": [
       {
-        "line": 45,
+        "line": 42,
+        "helper": "typescript_object_unknown_liveness_stream_matches_reference_and_refresh"
+      },
+      {
+        "line": 98,
         "helper": "blobs"
       },
       {
-        "line": 94,
+        "line": 147,
         "helper": "seeded_dispatch_incremental_equals_independent_cold_through_switches"
       },
       {
-        "line": 145,
+        "line": 198,
         "helper": "derived_publication_child"
       },
       {
-        "line": 314,
+        "line": 369,
         "helper": "count"
       },
       {
-        "line": 435,
+        "line": 583,
         "helper": "emit_without_caller_node"
       },
       {
-        "line": 453,
+        "line": 601,
         "helper": "emit_without_caller_node"
       },
       {
-        "line": 537,
+        "line": 685,
         "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
       },
       {
-        "line": 555,
+        "line": 703,
         "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
       },
       {
-        "line": 575,
+        "line": 723,
         "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
       }
     ]
@@ -1539,206 +1593,214 @@
   },
   {
     "path": "crates/aft/src/views/materialization/tests.rs",
-    "raw_open_calls": 50,
+    "raw_open_calls": 52,
     "helpers": [
       {
         "line": 24,
         "helper": "manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption"
       },
       {
-        "line": 123,
+        "line": 124,
         "helper": "fixture"
       },
       {
-        "line": 211,
+        "line": 212,
         "helper": "cold_sqlite_full_removes_files_and_retry_succeeds"
       },
       {
-        "line": 250,
+        "line": 251,
         "helper": "private_cold_matches_legacy_every_table_and_index"
       },
       {
-        "line": 343,
+        "line": 344,
         "helper": "manifest_blob_reader_decodes_each_payload_once"
       },
       {
-        "line": 383,
+        "line": 384,
         "helper": "read_callgraph_blob"
       },
       {
-        "line": 401,
+        "line": 402,
         "helper": "materialization_join_omits_only_the_duplicate_resolution_order"
       },
       {
-        "line": 422,
+        "line": 423,
         "helper": "cold_reference_batches_match_unbatched_rows_and_dispatch"
       },
       {
-        "line": 432,
+        "line": 433,
         "helper": "caller"
       },
       {
-        "line": 450,
+        "line": 451,
         "helper": "selected_binding_load_skips_changed_payloads_and_matches_cold"
       },
       {
-        "line": 543,
+        "line": 546,
         "helper": "incremental_delete_rows_are_bounded_by_changed_manifest_paths"
       },
       {
-        "line": 607,
+        "line": 610,
         "helper": "mismatched_base_is_rejected_and_old_schema_is_cold_upgraded"
       },
       {
-        "line": 626,
+        "line": 629,
         "helper": "missing_blob_rolls_back_deletions_and_fingerprint"
       },
       {
-        "line": 758,
+        "line": 761,
         "helper": "bench_real_manifest_diff"
       },
       {
-        "line": 1072,
+        "line": 1075,
         "helper": "added_and_removed_targets_relink_previously_unresolved_callers"
       },
       {
-        "line": 1098,
+        "line": 1101,
         "helper": "selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates"
       },
       {
-        "line": 1132,
+        "line": 1135,
+        "helper": "callgraph_python_view_reexport_refresh_matches_cold"
+      },
+      {
+        "line": 1166,
+        "helper": "callgraph_python_view_reexport_refresh_matches_cold"
+      },
+      {
+        "line": 1181,
         "helper": "new_reexport_target_invalidates_transitive_unchanged_importer"
       },
       {
-        "line": 1206,
+        "line": 1255,
         "helper": "bench_controlled_300_path_diff"
       },
       {
-        "line": 1251,
+        "line": 1300,
         "helper": "bench_controlled_300_path_diff"
       },
       {
-        "line": 1272,
+        "line": 1321,
         "helper": "added_rust_module_invalidates_missing_candidate"
       },
       {
-        "line": 1292,
+        "line": 1341,
         "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
       },
       {
-        "line": 1345,
+        "line": 1394,
         "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
       },
       {
-        "line": 1361,
+        "line": 1410,
         "helper": "binding_dependencies_exclude_existing_workspace_directory_probes"
       },
       {
-        "line": 1384,
+        "line": 1433,
         "helper": "legacy_generation_without_diff_metadata_cold_upgrades"
       },
       {
-        "line": 1398,
+        "line": 1447,
         "helper": "unrelated_export_surface_change_skips_reresolving_unchanged_binding_caller"
       },
       {
-        "line": 1433,
+        "line": 1482,
         "helper": "used_export_surface_change_reresolves_unchanged_binding_caller"
       },
       {
-        "line": 1463,
+        "line": 1512,
         "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
       },
       {
-        "line": 1537,
+        "line": 1586,
         "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
       },
       {
-        "line": 1550,
+        "line": 1599,
         "helper": "report_wal_pages"
       },
       {
-        "line": 1591,
+        "line": 1640,
         "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
       },
       {
-        "line": 1615,
+        "line": 1664,
         "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
       },
       {
-        "line": 1669,
+        "line": 1718,
         "helper": "memoized_bindings_keep_callers_and_reference_kinds_distinct"
       },
       {
-        "line": 1699,
+        "line": 1748,
         "helper": "memoized_rust_bindings_keep_import_visibility"
       },
       {
-        "line": 1717,
+        "line": 1766,
         "helper": "memoized_bindings_keep_call_and_value_ref_results_distinct"
       },
       {
-        "line": 2176,
+        "line": 2238,
         "helper": "differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs"
       },
       {
-        "line": 2315,
+        "line": 2383,
         "helper": "colliding_relink_parity"
       },
       {
-        "line": 2433,
+        "line": 2501,
         "helper": "macro_rust_relink_ordinal_shift_matches_cold"
       },
       {
-        "line": 2481,
+        "line": 2549,
         "helper": "colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes"
       },
       {
-        "line": 2523,
+        "line": 2591,
         "helper": "incremental_dispatch_resolves_only_files_whose_inputs_changed"
       },
       {
-        "line": 2601,
+        "line": 2669,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2623,
+        "line": 2691,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2639,
+        "line": 2707,
         "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
       },
       {
-        "line": 2662,
+        "line": 2730,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2679,
+        "line": 2747,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2688,
+        "line": 2756,
         "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
       },
       {
-        "line": 2717,
+        "line": 2785,
         "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
       },
       {
-        "line": 2724,
+        "line": 2792,
         "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
       },
       {
-        "line": 2731,
+        "line": 2799,
         "helper": "s4_shared_symbol_ranges_views_on_every_table"
       },
       {
-        "line": 2776,
+        "line": 2844,
         "helper": "first"
       },
       {
-        "line": 2798,
+        "line": 2866,
         "helper": "relinking_fixture"
       }
     ]
@@ -1774,7 +1836,7 @@
     "raw_open_calls": 1,
     "helpers": [
       {
-        "line": 1608,
+        "line": 1609,
         "helper": "concurrent_artifact_checkpoints_never_see_busy"
       }
     ]
@@ -1862,23 +1924,23 @@
     "raw_open_calls": 5,
     "helpers": [
       {
-        "line": 1038,
+        "line": 1085,
         "helper": "write_evidence"
       },
       {
-        "line": 1091,
+        "line": 1138,
         "helper": "read_evidence"
       },
       {
-        "line": 1223,
+        "line": 1270,
         "helper": "write_tree_proof"
       },
       {
-        "line": 1278,
+        "line": 1325,
         "helper": "read_tree_proof"
       },
       {
-        "line": 1907,
+        "line": 1954,
         "helper": "stat_evidence_is_generation_root_policy_and_version_paired"
       }
     ]
@@ -1920,27 +1982,27 @@
     "raw_open_calls": 6,
     "helpers": [
       {
-        "line": 180,
+        "line": 240,
         "helper": "try_view_store_custom"
       },
       {
-        "line": 348,
+        "line": 407,
         "helper": "plans"
       },
       {
-        "line": 991,
+        "line": 1039,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 993,
+        "line": 1041,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 1016,
+        "line": 1064,
         "helper": "store_diet_duplicate_site_order_and_prefix_paths"
       },
       {
-        "line": 1038,
+        "line": 1086,
         "helper": "reordered_site_manifest"
       }
     ]
