@@ -108,7 +108,9 @@ fn first_load_memory_corpus() {
 /// it again on the same driver. Prints each bind's wall time, CPU time and
 /// source work (walks, stats, reads, hashed bytes, attachments).
 /// `AFT_VIEW_FRESH_DROP_ATTRIBUTES=1` deletes the corpus's `.gitattributes`
-/// files from both copies before they are committed.
+/// files from both copies before they are committed. Unix only: CPU time comes
+/// from `getrusage`.
+#[cfg(unix)]
 #[test]
 #[ignore = "fresh-checkout bind measurement; requires AFT_VIEW_FRESH_CORPUS"]
 fn fresh_checkout_bind_after_a_warm_sibling() {
@@ -229,6 +231,7 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
 }
 
 /// User plus system CPU time of this process, in seconds.
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
