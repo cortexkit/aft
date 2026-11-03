@@ -13,6 +13,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "semantic_search" => crate::commands::semantic_search::handle_semantic_search(&req, ctx),
         "outline" => crate::commands::outline::handle_outline(&req, ctx),
         "edit_match" => crate::commands::edit_match::handle_edit_match(&req, ctx),
+        "batch" => crate::commands::batch::handle_batch(&req, ctx),
         other => panic!("unexpected command {other}"),
     }
 }
@@ -137,6 +138,8 @@ fn synthetic_bound_roots() {
                 "oldString":format!("target() -> usize {{ {round} }}"),
                 "newString":format!("target() -> usize {{ {} }}", round + 1)}),
             );
+            assert!(std::fs::read_to_string(root.join("file_0.rs")).unwrap()
+                .contains(&format!("target() -> usize {{ {} }}", round + 1)));
             if n < 4 {
                 let id = ctx
                     .bash_background()
