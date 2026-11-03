@@ -130,6 +130,9 @@ pub(crate) struct State {
     #[cfg(test)]
     probe_gate:
         parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    wait_cap_gate:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Default for State {
@@ -149,6 +152,8 @@ impl Default for State {
             cache_hits: Default::default(),
             #[cfg(test)]
             probe_gate: Default::default(),
+            #[cfg(test)]
+            wait_cap_gate: Default::default(),
         }
     }
 }
@@ -250,6 +255,14 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
     let _ = resolve(ctx);
     if !waiting(ctx) {
         return true;
+    }
+    #[cfg(test)]
+    {
+        let gate = ctx.folder_admission().wait_cap_gate.lock().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
     }
     let probe = ctx.folder_admission().probe.lock();
     let mut binding = ctx.folder_admission().binding.lock();
@@ -2371,6 +2384,90 @@ mod tests {
         assert!(sender.send(ProbeResult::Complete(cache, false)).is_ok());
         assert!(matches!(resolve(&ctx), ResolveResult::Ready(_)));
         assert_eq!(snapshot(&ctx).unwrap()["classification"], "project");
+    }
+
+    #[test]
+    fn completed_decision_survives_a_late_caller_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Makefile"), "").unwrap();
+        let config = Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        ));
+        install_probe_for_test(
+            &ctx,
+            root.path(),
+            config.clone(),
+            crate::folder_admission::exhausted(
+                root.path(),
+                crate::folder_admission::DetectionMode::Auto,
+                ProbeBudgets::default(),
+            ),
+        );
+        let generation = ctx.configure_generation();
+        let deadline = Instant::now() + wait_budget();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *ctx.folder_admission().probe.lock() = Some(ProbeTask {
+            generation,
+            receiver,
+        });
+        {
+            let mut slot = ctx.folder_admission().binding.lock();
+            let binding = slot.as_mut().unwrap();
+            binding.pending = true;
+            binding.decision = None;
+            binding.wait_deadline = Some(deadline);
+        }
+        let (started, paused) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        *ctx.folder_admission().wait_cap_gate.lock() = Some((started, resume));
+        let caller_ctx = Arc::clone(&ctx);
+        let caller = std::thread::spawn(move || poll_wait(&caller_ctx));
+        paused.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        // Deliver a completed worker result while the caller is paused before
+        // its cap check, then resolve and commit the admitted configuration.
+        let decision = standalone(root.path(), &config).unwrap();
+        assert_eq!(decision.classification, FolderClassification::Project);
+        let cache = Cache {
+            policy: policy(&config, root.path()),
+            checked_ms: now_ms(),
+            stamps: stamps(&decision),
+            decision,
+            relative_paths: false,
+        };
+        assert!(sender.send(ProbeResult::Complete(cache, false)).is_ok());
+        assert!(matches!(resolve(&ctx), ResolveResult::Ready(g) if g == generation));
+        let request = ctx
+            .folder_admission()
+            .binding
+            .lock()
+            .as_ref()
+            .unwrap()
+            .request
+            .clone();
+        commit(&ctx, root.path(), config, &request, false, false);
+        let decided = snapshot(&ctx).unwrap();
+        assert_eq!(decided["state"], "decided", "{decided}");
+        assert_eq!(decided["classification"], "project", "{decided}");
+
+        // Only delay the caller. The real verdict is already recorded, so the
+        // original 350 ms deadline cannot turn it into incomplete evidence.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        release.send(()).unwrap();
+        assert!(caller.join().unwrap());
+        let after_cap = snapshot(&ctx).unwrap();
+        assert_eq!(after_cap["state"], "decided", "{after_cap}");
+        assert_eq!(after_cap["classification"], "project", "{after_cap}");
+        assert_eq!(after_cap, decided);
+        assert!(matches!(resolve(&ctx), ResolveResult::Settled));
+        assert_eq!(snapshot(&ctx).unwrap(), decided);
+        assert_eq!(ctx.configure_generation(), generation);
     }
 
     #[test]
