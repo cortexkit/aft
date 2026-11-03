@@ -3173,7 +3173,8 @@ impl BackupStore {
     /// the next undo compares the live path against this to notice changes
     /// made outside AFT.
     pub fn record_post_mutation_states(&mut self) {
-        self.retry_pending_operation_discard();
+        // A failed request already spent its cleanup time budget and reported
+        // any leftovers. Retry before a later snapshot or undo, not here.
         let pending = std::mem::take(&mut self.pending_post_states);
         self.operation_paths.clear();
         for (session, key, backup_id, _) in pending {
@@ -9020,10 +9021,11 @@ mod tests {
             store.discard_operation_entries("same-session", "bad");
         });
         store.release_memory();
-        with_request_harness("runner", || store.record_post_mutation_states());
+        store.record_post_mutation_states();
+        with_request_harness("runner", || store.run_restore_maintenance().unwrap());
         assert_eq!(store.pending_discards.len(), 1);
         with_request_harness("opencode", || {
-            store.record_post_mutation_states();
+            store.run_restore_maintenance().unwrap();
             assert!(store.pending_discards.is_empty());
             assert_eq!(store.history("same-session", &path).len(), 1);
         });
@@ -9053,6 +9055,7 @@ mod tests {
         let namespace = backup_namespace_gate(storage.path(), None).unwrap();
         let (_, logs) = crate::logging::capture_log_lines(|| {
             store.discard_operation_entries("retry-discard", "bad");
+            store.record_post_mutation_states();
         });
         drop(namespace);
         let warnings: Vec<_> = logs
@@ -9069,7 +9072,11 @@ mod tests {
         for path in &paths {
             assert_eq!(store.history("retry-discard", path).len(), 2);
         }
-        store.record_post_mutation_states();
+        let later = project.path().join("later.txt");
+        fs::write(&later, b"later operation").unwrap();
+        store
+            .snapshot("later-session", &later, "later backup pass")
+            .unwrap();
         for path in &paths {
             let history = store.history("retry-discard", path);
             assert_eq!(history.len(), 1);
