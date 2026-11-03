@@ -394,7 +394,10 @@ fn python_super_imported_bases_relink_in_mro_order() {
         1
     );
     assert_eq!(count(&cold, "SELECT count(*) FROM edges WHERE target_symbol='Zulu::__init__' AND provenance='exact'"), 1);
-    let updated = incremental_matches_cold(dir.path(), &blob_path, &before, &after);
+    apply_manifest_diff(&cold, &before, &after, &blob_path).unwrap();
+    let updated = dir.path().join("after.sqlite");
+    materialize_manifest_view_database(&updated, &blob_path, &after).unwrap();
+    parity::assert_logical_parity(&cold, &updated);
     assert_eq!(
         count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
         1
