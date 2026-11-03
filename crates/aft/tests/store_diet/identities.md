@@ -1,7 +1,9 @@
 # Identity and text-reader inventory
 
-Baseline: `998c896b05753dd3a83158e30f97779b89ef28e2`. Paths and line numbers
-below refer to that revision, not to the older reference-corpus revision.
+Runtime baseline: the named main commit in `baseline.json`. The source-line
+references below were first inventoried at `998c896b05753dd3a83158e30f97779b89ef28e2`;
+constructor/reader names and `source_inventory.json:id_text_readers` identify later
+locations for the text-sensitive readers.
 `table_encoding.json` lists columns individually. These are **planned encodings**;
 this harness does not change a database format or discard a column.
 

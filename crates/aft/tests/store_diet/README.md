@@ -5,7 +5,8 @@
 The runtime baseline is the named main commit in `baseline.json`.
 That file records the source hash, corpus revisions, seed, recording
 command and empty normalisation whitelist. Runtime storage code is unchanged;
-the only source registration is a cfg(test) module in callgraph_store.
+source additions are the cfg(test) module and consumer-probe shims reproduced
+by `baseline-harness.patch`.
 No existing test assertion about a tool's returned output was edited.
 
 There are two complementary runners:
@@ -193,6 +194,14 @@ exercise red cases (SEARCH to SCAN, fewer equality columns, new unindexed join,
 unavailable plan), and byte-comparison tests change row order to prove it is
 not ignored. The source census is a conservative static aid, not a Rust parser:
 new dynamic SQL constructors still require an explicit reviewed expansion.
+
+`CreatedFilePatterns::query` has no application maximum: package exports and
+tsconfig aliases can add arbitrarily many distinct JS patterns. Its executable
+variants cover empty, single and multiple OR terms in both language predicates,
+with and without the Rust crate-directory predicate. These are shape samples,
+not an invented maximum. Fixed-size frontier/node batches still include their
+actual maximum (499 pairs or 999 ids). SQLite's expression/parameter limits are
+not an application batch-size contract.
 
 The small six-operation wire golden uses `--config wire-policy.json` (inspection
 background work disabled). This is an input policy, not reply normalization:

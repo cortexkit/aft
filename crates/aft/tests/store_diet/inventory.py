@@ -216,7 +216,20 @@ def order_inventory(rows):
 def variants(row, tables):
     sql = row['candidate']
     expanded = [('literal', sql)]
-    if '{requested_values}' in sql:
+    if '{js}' in sql and '{rust}' in sql:
+        expanded = []
+        # Alias/package configuration is unbounded. Cover empty, single and OR
+        # predicates, with the optional crate-directory predicate numbered last.
+        for js_count in [0, 1, 2]:
+            for rust_count in [0, 1, 2]:
+                for crate_dir in [False, True]:
+                    js = ' OR '.join(f'module_path GLOB ?{i+1}' for i in range(js_count)) or '0'
+                    rust = ' OR '.join(f'module_path GLOB ?{js_count+i+1}' for i in range(rust_count)) or '0'
+                    if crate_dir:
+                        rust += f' OR caller_file GLOB ?{js_count+rust_count+1}'
+                    label = f'js-{js_count}-rust-{rust_count}-crate-{int(crate_dir)}'
+                    expanded.append((label, sql.replace('{js}', js).replace('{rust}', rust)))
+    elif '{requested_values}' in sql:
         expanded = [(f'batch-{n}', sql.replace('{requested_values}', ', '.join(['(?, ?)'] * n))) for n in [1, 499]]
     elif '{placeholders}' in sql and '{table}' not in sql:
         expanded = [(f'batch-{n}', sql.replace('{placeholders}', ', '.join(['?'] * n))) for n in [1, 999]]
