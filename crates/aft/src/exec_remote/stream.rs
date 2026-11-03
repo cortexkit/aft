@@ -1,8 +1,8 @@
 use super::*;
 use std::{collections::BTreeMap, io};
 use types::{
-    Accepted, AttachRequest, Output, OutputStream, ReturnChunk, ReturnManifest, Started,
-    StreamRecord, Uuid,
+    Accepted, AttachRequest, Output, OutputStream, ReturnChunk, ReturnManifest, RunRequest,
+    Started, StreamRecord, Uuid,
 };
 
 /// Durable resume cursor. `last_seq` is the last contiguous record committed
@@ -33,6 +33,10 @@ pub struct GapRecovery {
 // are enough to establish missing output without discarding a transient gap.
 const MAX_GAP_REATTACHES: u8 = 3;
 
+// Independent of the file-return allowance: a missing sequence must not keep
+// an entire large return in memory while later chunks wait for replay.
+pub(super) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
 impl ResumePoint {
     pub fn attach_request(&self) -> Result<AttachRequest, super::Error> {
         let from_seq = match self.last_seq {
@@ -50,6 +54,11 @@ impl ResumePoint {
 /// lengths and sequence together so restart can discard an uncheckpointed tail
 /// and replay it from ResumePoint. Terminal proof must be durable before success.
 pub trait OutputSink {
+    /// Save the effective return request before receiving files, and before a
+    /// safe cap-refusal resubmit. False withholds a retry already used earlier.
+    fn return_request(&mut self, _request: &RunRequest, _retry: bool) -> io::Result<bool> {
+        Ok(true)
+    }
     /// Display-only pre-acceptance status, with no durable cursor or timer effect.
     fn admission_progress(&mut self, _progress: &types::Progress) {}
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
@@ -105,6 +114,7 @@ pub struct StreamConsumer {
     point: Option<ResumePoint>,
     accepted: bool,
     pending: BTreeMap<u64, Pending>,
+    pending_bytes: usize,
     terminal: Option<Verdict>,
     recovering_gap: bool,
 }
@@ -118,6 +128,43 @@ enum Pending {
     Unknown,
 }
 
+impl Pending {
+    fn buffer_bytes(&self) -> usize {
+        // Charge map/enum overhead too, so zero-byte records cannot bypass the
+        // budget. Metadata is charged conservatively without building JSON.
+        let payload = match self {
+            Self::Output(output) => output
+                .bytes
+                .0
+                .capacity()
+                .saturating_add(json_bytes(&output.stream)),
+            Self::ReturnChunk(chunk) => chunk.data().len(),
+            Self::Started(started) => json_bytes(started).saturating_mul(8),
+            Self::ReturnManifest(manifest) => json_bytes(manifest).saturating_mul(8),
+            Self::Unknown => 0,
+        };
+        payload.saturating_add(std::mem::size_of::<Self>() + 128)
+    }
+}
+
+fn json_bytes(value: &impl serde::Serialize) -> usize {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return usize::MAX;
+    }
+    counter.0
+}
+
 impl StreamConsumer {
     pub fn new() -> Self {
         Self::default()
@@ -128,7 +175,18 @@ impl StreamConsumer {
             ..Self::default()
         }
     }
-    pub fn resume(point: ResumePoint) -> Self {
+    pub fn resume(mut point: ResumePoint) -> Self {
+        if let Some(gap) = point.gap_recovery.as_mut() {
+            let bytes = gap
+                .pending
+                .values()
+                .fold(0usize, |n, record| n.saturating_add(record.buffer_bytes()));
+            if bytes > MAX_PENDING_BYTES {
+                // Older checkpoints may exceed the budget. Fetch their records
+                // again from the committed cursor instead of cloning the buffer.
+                gap.pending.clear();
+            }
+        }
         let mut pending = point
             .gap_recovery
             .as_ref()
@@ -138,6 +196,7 @@ impl StreamConsumer {
         }
         Self {
             recovering_gap: point.gap_recovery.is_some(),
+            pending_bytes: pending.values().map(Pending::buffer_bytes).sum(),
             pending,
             point: Some(point),
             ..Self::default()
@@ -233,6 +292,7 @@ impl StreamConsumer {
                             point.last_seq = before.checked_sub(1);
                         }
                         self.pending.retain(|seq, _| *seq >= before);
+                        self.recount_pending();
                     }
                 }
                 let seq = output.seq;
@@ -303,7 +363,7 @@ impl StreamConsumer {
                     // duplicate stays a no-op.
                     if let Some(Pending::ReturnManifest(buffered)) = self.pending.get(&seq) {
                         if !has_expired_entry(buffered) {
-                            self.pending.insert(seq, Pending::ReturnManifest(manifest));
+                            self.insert_pending(seq, Pending::ReturnManifest(manifest))?;
                             return self.drain(sink);
                         }
                     }
@@ -404,8 +464,30 @@ impl StreamConsumer {
         if seq < self.next_seq()? {
             return Ok(());
         }
-        self.pending.entry(seq).or_insert(record);
+        if !self.pending.contains_key(&seq) {
+            self.insert_pending(seq, record)?;
+        }
         self.drain(sink)
+    }
+
+    fn recount_pending(&mut self) {
+        self.pending_bytes = self.pending.values().map(Pending::buffer_bytes).sum();
+    }
+
+    fn insert_pending(&mut self, seq: u64, record: Pending) -> Result<(), Error> {
+        let previous = self.pending.get(&seq).map_or(0, Pending::buffer_bytes);
+        let bytes = self
+            .pending_bytes
+            .saturating_sub(previous)
+            .saturating_add(record.buffer_bytes());
+        if bytes > MAX_PENDING_BYTES {
+            // Use the existing gap-recovery path, which closes this stream and
+            // reattaches from the committed cursor without installing any file.
+            return Err(self.recovery("output sequence gap before terminal"));
+        }
+        self.pending.insert(seq, record);
+        self.pending_bytes = bytes;
+        Ok(())
     }
 
     fn drain<S: OutputSink>(&mut self, sink: &mut S) -> Result<(), Error> {
@@ -432,6 +514,7 @@ impl StreamConsumer {
                 Pending::Started(started) => sink.started(started)?,
             }
             let output = matches!(record, Pending::Output(_) | Pending::Started(_));
+            self.pending_bytes -= record.buffer_bytes();
             self.pending.remove(&next);
             if let Some(point) = self.point.as_mut() {
                 point.last_seq = Some(next);

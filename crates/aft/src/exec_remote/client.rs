@@ -71,7 +71,9 @@ pub(crate) struct RunDiagnostics<'a> {
 }
 
 /// An authenticated daemon route to the catalog's sole capability provider.
-/// No module ID fallback, SSH transport, snapshotting, or automatic run retry.
+/// No module ID fallback, SSH transport, or snapshotting. Only a typed cap
+/// refusal before job creation permits one automatic return-cap resubmit.
+#[derive(Clone)]
 pub struct ExecRemoteClient {
     consumer: Arc<SubcConsumer>,
     route: subc_client_rs::RouteHandle,
@@ -79,6 +81,20 @@ pub struct ExecRemoteClient {
 }
 
 impl ExecRemoteClient {
+    pub(crate) async fn return_max_bytes(&self) -> Result<u64, Error> {
+        Ok(
+            if self
+                .advertises(RETURN_LARGE_CAPABILITY)
+                .await
+                .map_err(Error::Transport)?
+            {
+                RETURN_LARGE_MAX_BYTES_CAP
+            } else {
+                super::return_max_bytes()
+            },
+        )
+    }
+
     pub async fn connect(connection_file: &Path, identity: BindIdentity) -> Result<Self, Error> {
         let consumer =
             crate::fleet_status::connect_subc_consumer(connection_file, ConsumerOptions::default())
@@ -180,16 +196,27 @@ impl ExecRemoteClient {
         }
         // Progress is optional display data. Older executors receive no opt-in,
         // even if a saved request was created against a newer executor.
-        let request = request
+        let mut request = request
             .clone()
             .with_progress(self.advertises(PROGRESS_CAPABILITY).await.unwrap_or(false));
-        self.stream(
-            "exec.run",
-            &request,
-            StreamConsumer::keyed_run(request.resume_from_seq()),
-            diagnostics,
-        )
-        .await
+        if !request.return_paths.is_empty() {
+            let maximum = self.return_max_bytes().await?;
+            request.return_max_bytes =
+                Some(request.return_max_bytes.unwrap_or(maximum).min(maximum));
+        }
+        let mut stream = self
+            .stream(
+                "exec.run",
+                &request,
+                StreamConsumer::keyed_run(request.resume_from_seq()),
+                diagnostics,
+            )
+            .await?;
+        if !request.return_paths.is_empty() {
+            stream.return_request = Some(request.clone());
+            stream.return_retry = Some((self.clone(), request));
+        }
+        Ok(stream)
     }
 
     pub(crate) async fn supports_submission_key(&self) -> Result<bool, Error> {
@@ -269,6 +296,8 @@ impl ExecRemoteClient {
             received_frame: false,
             attached: method == "exec.attach",
             sent_at: (method == "exec.run").then_some(sent_at),
+            return_request: None,
+            return_retry: None,
         })
     }
 
@@ -369,6 +398,8 @@ pub struct RemoteStream {
     attached: bool,
     #[cfg_attr(not(unix), allow(dead_code))]
     sent_at: Option<Instant>,
+    return_request: Option<RunRequest>,
+    return_retry: Option<(ExecRemoteClient, RunRequest)>,
 }
 
 impl RemoteStream {
@@ -402,45 +433,89 @@ impl RemoteStream {
     /// There is no response deadline here: request timeout bounds remote run
     /// time only, and the executor owns queue waiting and reconnects to runner.
     pub async fn next<S: OutputSink>(&mut self, sink: &mut S) -> Result<StreamProgress, Error> {
-        if self.finished {
-            return self.consumer.finish().map(StreamProgress::Complete);
-        }
-        if let Some(bytes) = self.subscription.events().recv().await {
-            match self.consumer.consume_frame(&bytes, sink) {
-                Ok(false) => return Ok(StreamProgress::AdmissionProgress),
-                Ok(true) => self.received_frame = true,
-                Err(error) => {
-                    self.received_frame = true;
-                    return Err(self.consumer.recovery(error.to_string()));
+        loop {
+            if let Some(request) = self.return_request.take() {
+                sink.return_request(&request, false)?;
+            }
+            if self.finished {
+                return self.consumer.finish().map(StreamProgress::Complete);
+            }
+            if let Some(bytes) = self.subscription.events().recv().await {
+                match self.consumer.consume_frame(&bytes, sink) {
+                    Ok(false) => return Ok(StreamProgress::AdmissionProgress),
+                    Ok(true) => self.received_frame = true,
+                    Err(error) => {
+                        self.received_frame = true;
+                        return Err(self.consumer.recovery(error.to_string()));
+                    }
                 }
+                return Ok(StreamProgress::Record);
             }
-            return Ok(StreamProgress::Record);
-        }
-        if let Err(error) = self.subscription.closed().await {
-            if self
-                .consumer
-                .resume_point()
-                .is_some_and(|p| p.gap_recovery.is_some())
-            {
-                return self
+            if let Err(error) = self.subscription.closed().await {
+                // Only this typed submit refusal proves no job was created. A
+                // record (including acceptance) rules out resubmitting the call.
+                if !self.received_frame && self.consumer.resume_point().is_none() {
+                    if let Some((client, request)) = self.return_retry.take() {
+                        if let Some(maximum) = refused_return_cap(&error, &request) {
+                            let request = request.with_return_max_bytes(maximum);
+                            if sink.return_request(&request, true)? {
+                                self.subscription = client
+                                    .consumer
+                                    .subscribe_route(
+                                        &client.route,
+                                        envelope("exec.run", &request)?,
+                                        SubscribeOptions::default(),
+                                    )
+                                    .await
+                                    .map_err(Error::Transport)?;
+                                self.sent_at = Some(Instant::now());
+                                continue;
+                            }
+                        }
+                    }
+                    if matches!(&error, subc_client_rs::CallError::Module(body) if body.code == "invalid_params")
+                    {
+                        return Err(Error::Transport(error));
+                    }
+                }
+                if self
                     .consumer
-                    .finish_recovery(sink)
-                    .map(StreamProgress::Complete);
+                    .resume_point()
+                    .is_some_and(|p| p.gap_recovery.is_some())
+                {
+                    return self
+                        .consumer
+                        .finish_recovery(sink)
+                        .map(StreamProgress::Complete);
+                }
+                return Err(self.consumer.recovery(error.to_string()));
             }
-            return Err(self.consumer.recovery(error.to_string()));
+            self.finished = true;
+            return self
+                .consumer
+                .finish_recovery(sink)
+                .map(StreamProgress::Complete);
         }
-        self.finished = true;
-        self.consumer
-            .finish_recovery(sink)
-            .map(StreamProgress::Complete)
     }
+}
+
+fn refused_return_cap(error: &subc_client_rs::CallError, request: &RunRequest) -> Option<u64> {
+    let subc_client_rs::CallError::Module(body) = error else {
+        return None;
+    };
+    if body.code != "invalid_params" || request.return_paths.is_empty() {
+        return None;
+    }
+    let detail: ReturnCapRefusal = serde_json::from_value(body.detail.clone()?).ok()?;
+    let maximum = detail.max_bytes()?;
+    (detail.field() == "return_max_bytes" && maximum < request.return_max_bytes?).then_some(maximum)
 }
 
 #[cfg(test)]
 mod capability_tests {
     use super::{
         CAPABILITY, MEMORY_CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY,
-        WINDOWS_CAPABILITY,
+        RETURN_LARGE_CAPABILITY, WINDOWS_CAPABILITY,
     };
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
@@ -452,6 +527,7 @@ mod capability_tests {
             MEMORY_CAPABILITY,
             WINDOWS_CAPABILITY,
             RETURN_CHUNKED_CAPABILITY,
+            RETURN_LARGE_CAPABILITY,
             PROGRESS_CAPABILITY,
         ] {
             assert!(

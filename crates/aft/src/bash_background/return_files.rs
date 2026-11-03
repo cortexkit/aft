@@ -108,9 +108,13 @@ fn format_cap(bytes: u64) -> String {
 /// The block printed after a remote command's output: each requested path
 /// once, returned with its size or not returned with the reason.
 // Only the Unix remote-run path prints the report.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn render_report(paths: &[ReturnedPath]) -> String {
-    let cap = crate::exec_remote::return_max_bytes();
+    render_report_with_cap(paths, crate::exec_remote::return_max_bytes())
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn render_report_with_cap(paths: &[ReturnedPath], cap: u64) -> String {
     let mut block = String::from("Files requested back from the server (return_paths):");
     for entry in paths {
         let path = entry.path.escape_default();
@@ -460,6 +464,11 @@ mod receiver {
             self.received_chunk
         }
 
+        pub(crate) fn set_cap(&mut self, cap_bytes: u64) {
+            self.cap_bytes = cap_bytes;
+            self.reset();
+        }
+
         /// Start over for a new job, such as a resubmission after the runner
         /// refused the first one, discarding anything already staged.
         pub(crate) fn reset(&mut self) {
@@ -788,9 +797,7 @@ mod receiver {
             let published = (|| {
                 let mut source = staged.file.try_clone()?;
                 source.seek(SeekFrom::Start(0))?;
-                let mut buffer = Vec::new();
-                source.read_to_end(&mut buffer)?;
-                out.write_all(&buffer)?;
+                copy_staged(&mut source, &mut out)?;
                 out.set_permissions(fs::Permissions::from_mode(mode))?;
                 out.sync_all()?;
                 before_publish_for_test(&directory_path.join(&temp))?;
@@ -896,6 +903,42 @@ mod receiver {
         }
     }
 
+    // A fixed buffer bounds memory even when a returned file spans filesystems.
+    // Keep this loop shared with the short-read test rather than relying on a
+    // platform-specific copy implementation's allocation behavior.
+    fn copy_staged(source: &mut impl Read, out: &mut impl Write) -> io::Result<u64> {
+        let mut buffer = [0; 64 * 1024];
+        let mut copied = 0;
+        loop {
+            let count = match source.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                return Ok(copied);
+            }
+            #[cfg(test)]
+            COPY_READS_FOR_TEST.with(|reads| reads.set(reads.get() + 1));
+            out.write_all(&buffer[..count])?;
+            copied += count as u64;
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn copy_staged_large_file_uses_bounded_reads() {
+        struct BoundedReader(std::io::Take<std::io::Repeat>);
+        impl Read for BoundedReader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= 64 * 1024);
+                self.0.read(bytes)
+            }
+        }
+        let size = 20 * 1024 * 1024;
+        let mut source = BoundedReader(io::repeat(42).take(size));
+        assert_eq!(copy_staged(&mut source, &mut io::sink()).unwrap(), size);
+    }
+
     fn local(error: io::Error) -> NotReturned {
         NotReturned::LocalWrite {
             error: error.to_string(),
@@ -918,12 +961,14 @@ mod receiver {
     #[cfg(test)]
     thread_local! {
         static COPY_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(crate) static COPY_READS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Take the other-filesystem path even on one filesystem, for tests.
     #[cfg(test)]
     pub(crate) fn with_copy_for_test<T>(run: impl FnOnce() -> T) -> T {
         COPY_FOR_TEST.with(|copy| copy.set(true));
+        COPY_READS_FOR_TEST.with(|reads| reads.set(0));
         let result = run();
         COPY_FOR_TEST.with(|copy| copy.set(false));
         result
