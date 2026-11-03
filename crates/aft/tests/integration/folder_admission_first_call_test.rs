@@ -51,6 +51,26 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
         )
         .unwrap();
     }
+    let storage = dir.path().join("storage");
+    if !project_evidence && !full_validation {
+        // This case tests a queued call waiting for a negative decision, not
+        // whether a cold empty-directory scan completes inside 100 ms.
+        let mut warmup = AftProcess::spawn_with_env(&[
+            ("PATH", "".as_ref()),
+            ("AFT_TEST_ADMISSION_READ_DIR_DELAY_MS", "0".as_ref()),
+        ]);
+        let ack = warmup.send(&configure(&project, &storage, "warm-negative", false).to_string());
+        assert_eq!(ack["success"], true, "{ack}");
+        let folder = warmup.wait_for_folder_admission();
+        assert_eq!(folder["classification"], "not_project", "{folder}");
+        assert_eq!(folder["reason"], "no_project_evidence", "{folder}");
+        assert_eq!(
+            folder["coverage"]["root_listing_complete"], true,
+            "{folder}"
+        );
+        let (status, stderr) = warmup.stderr_output();
+        assert!(status.success(), "{stderr}");
+    }
     let started = dir.path().join("probe-started");
     let release = dir.path().join("probe-release");
     let release_on_drop = ReleaseOnDrop::new(&release);
@@ -64,15 +84,7 @@ fn call_while_probe_is_held(project_evidence: bool, full_validation: bool) -> Va
     ];
     let mut aft = AftProcess::spawn_with_env(&env);
     // Both frames are queued before configure's post-ACK maintenance can run.
-    aft.send_silent(
-        &configure(
-            &project,
-            &dir.path().join("storage"),
-            "bind",
-            full_validation,
-        )
-        .to_string(),
-    );
+    aft.send_silent(&configure(&project, &storage, "bind", full_validation).to_string());
     let first_tool = if full_validation {
         json!({"id":"first-tool", "command":"tool_call", "name":"write",
             "arguments":{"path":"first.txt", "content":"admitted\n"}})
