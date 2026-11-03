@@ -134,6 +134,10 @@ pub(crate) struct SweepReport {
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    /// Work deferred by a pass budget or a concurrent bind invalidating the
+    /// root-history census, not a failed cleanup. Progress flags describe what
+    /// is unfinished.
+    pub incomplete: Vec<String>,
     /// View folders larger than one generation-cleanup pass examines, each
     /// with what that pass could not prove. Cleanup still shrinks them a
     /// bounded window at a time, keeping anything it cannot prove unshared.
@@ -144,6 +148,20 @@ pub(crate) struct SweepReport {
     pub domains: BTreeMap<String, DomainReport>,
     /// Wall time by stage, including setup and blob work outside the root budget.
     pub timings_ms: BTreeMap<String, u64>,
+}
+
+impl SweepReport {
+    fn conditions(&mut self, error: &io::Error) -> &mut Vec<String> {
+        if error
+            .get_ref()
+            .is_some_and(|error| error.is::<RetentionIncomplete>())
+        {
+            self.stopped_early = true;
+            &mut self.incomplete
+        } else {
+            &mut self.errors
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -614,7 +632,7 @@ fn yield_to_bind(storage: &Path) -> io::Result<()> {
     if storage.join("retention/bind-pending.lock").exists() {
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "retention yielded to checkout binding",
+            RetentionIncomplete::BindPending,
         ))
     } else {
         Ok(())
@@ -1832,10 +1850,10 @@ pub(crate) fn bounded_dirs(directory: &Path, cap: usize) -> io::Result<Vec<fs::D
     };
     let result = entries.take(cap + 1).collect::<io::Result<Vec<_>>>()?;
     if result.len() > cap {
-        return Err(io::Error::other(format!(
-            "retention walk exceeds {cap} entries at {}",
-            directory.display()
-        )));
+        return Err(io::Error::other(RetentionIncomplete::WalkEntryLimit {
+            cap,
+            directory: directory.to_path_buf(),
+        }));
     }
     Ok(result)
 }
@@ -2020,9 +2038,8 @@ fn root_history(storage: &StoragePaths, admission: bool) -> io::Result<Vec<(Stri
         unchanged?;
     }
     if !scan.progress.complete {
-        return Err(io::Error::other(format!(
-            "binding_history_incomplete: examined={} accumulated={} restarted={}",
-            scan.progress.examined, scan.progress.accumulated, scan.progress.restarted
+        return Err(io::Error::other(RetentionIncomplete::BindingHistory(
+            scan.progress.clone(),
         )));
     }
     scan.may_advance = false;
@@ -2433,8 +2450,9 @@ fn sweep_view_generations(
                 }
                 Err(error) => {
                     report.skipped_protected += 1;
-                    if report.errors.len() < 16 {
-                        report.errors.push(format!("{}: {error}", path.display()));
+                    let conditions = report.conditions(&error);
+                    if conditions.len() < 16 {
+                        conditions.push(format!("{}: {error}", path.display()));
                     }
                 }
             }
@@ -2485,8 +2503,9 @@ fn v3_view_domains(storage: &StoragePaths, report: &mut SweepReport) -> Vec<(Pat
     let families = match bounded_dirs(&root, HISTORY_ENTRIES) {
         Ok(families) => families,
         Err(error) => {
-            if report.errors.len() < 16 {
-                report.errors.push(format!("{}: {error}", root.display()));
+            let conditions = report.conditions(&error);
+            if conditions.len() < 16 {
+                conditions.push(format!("{}: {error}", root.display()));
             }
             return Vec::new();
         }
@@ -2578,13 +2597,12 @@ fn generation_registry_errors() -> &'static Mutex<HashSet<PathBuf>> {
 }
 
 fn report_generation_registry_error(path: &Path, error: &io::Error, report: &mut SweepReport) {
-    if report.errors.len() < 16 {
-        report
-            .errors
-            .push(format!("{}: generation registry: {error}", path.display()));
+    let conditions = report.conditions(error);
+    if conditions.len() < 16 {
+        conditions.push(format!("{}: generation registry: {error}", path.display()));
     }
     // Emit once per failing family until a successful census resets it. Keep
-    // the per-pass health error even when the warning is rate-limited.
+    // the per-pass health condition even when the warning is rate-limited.
     let first = generation_registry_errors()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2813,40 +2831,64 @@ fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>
     validate_tree(cache, deadline, true)
 }
 
-#[derive(Debug)]
-struct RetentionDeadline;
+#[derive(Clone, Debug)]
+enum RetentionIncomplete {
+    Deadline,
+    TreeEntryLimit,
+    WalkEntryLimit { cap: usize, directory: PathBuf },
+    ViewEntryLimit { family: String },
+    BindingHistory(RootHistoryProgress),
+    BindPending,
+}
 
-impl std::fmt::Display for RetentionDeadline {
+impl std::fmt::Display for RetentionIncomplete {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("retention deadline reached")
+        match self {
+            Self::Deadline => f.write_str("retention deadline reached"),
+            Self::TreeEntryLimit => f.write_str("retention tree entry limit reached"),
+            Self::WalkEntryLimit { cap, directory } => write!(
+                f,
+                "retention walk exceeds {cap} entries at {}",
+                directory.display()
+            ),
+            Self::ViewEntryLimit { family } => write!(
+                f,
+                "family registry {family} lists more than {HISTORY_ENTRIES} views"
+            ),
+            Self::BindingHistory(progress) => write!(
+                f,
+                "binding_history_incomplete: examined={} accumulated={} restarted={}",
+                progress.examined, progress.accumulated, progress.restarted
+            ),
+            Self::BindPending => f.write_str("retention yielded to checkout binding"),
+        }
     }
 }
 
-impl std::error::Error for RetentionDeadline {}
+impl std::error::Error for RetentionIncomplete {}
 
-/// A validation walk met more than [`TREE_ENTRIES`] entries and stopped
-/// before it saw the whole tree.
-#[derive(Debug)]
-struct TreeEntryLimit;
-
-impl std::fmt::Display for TreeEntryLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("retention tree entry limit reached")
+fn copy_retention_error(error: &io::Error) -> io::Error {
+    match error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<RetentionIncomplete>())
+    {
+        Some(reason) => io::Error::new(error.kind(), reason.clone()),
+        None => io::Error::new(error.kind(), error.to_string()),
     }
 }
-
-impl std::error::Error for TreeEntryLimit {}
 
 fn is_tree_entry_limit(error: &io::Error) -> bool {
     error
         .get_ref()
-        .is_some_and(|error| error.is::<TreeEntryLimit>())
+        .and_then(|error| error.downcast_ref::<RetentionIncomplete>())
+        .is_some_and(|reason| matches!(reason, RetentionIncomplete::TreeEntryLimit))
 }
 
 fn is_retention_deadline(error: &io::Error) -> bool {
     error
         .get_ref()
-        .is_some_and(|error| error.is::<RetentionDeadline>())
+        .and_then(|error| error.downcast_ref::<RetentionIncomplete>())
+        .is_some_and(|reason| matches!(reason, RetentionIncomplete::Deadline))
 }
 
 /// A due root needs the filesystem safety checks, not payload sizes. Avoid a
@@ -2887,7 +2929,10 @@ fn validate_tree_observed(
     while let Some(directory) = pending.pop() {
         admission()?;
         if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                RetentionIncomplete::Deadline,
+            ));
         }
         if let Some(observation) = observation {
             observation.record(&directory)?;
@@ -2896,12 +2941,15 @@ fn validate_tree_observed(
         loop {
             admission()?;
             if Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    RetentionIncomplete::Deadline,
+                ));
             }
             let Some(entry) = entries.next() else { break };
             let entry = entry?;
             if examined >= TREE_ENTRIES {
-                return Err(io::Error::other(TreeEntryLimit));
+                return Err(io::Error::other(RetentionIncomplete::TreeEntryLimit));
             }
             examined += 1;
             let kind = entry.file_type()?;
@@ -3595,7 +3643,10 @@ fn reap_trash_with_cursor(
                 .unchanged(&mut || {
                     budget.entry()?;
                     if Instant::now() >= deadline {
-                        return Err(io::Error::new(io::ErrorKind::TimedOut, RetentionDeadline));
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            RetentionIncomplete::Deadline,
+                        ));
                     }
                     Ok(())
                 })
@@ -4102,14 +4153,9 @@ impl OwnerManifests {
     /// binding history; without it, any protected owner lacking a residency
     /// marker protects the key as well.
     fn protect(&self, storage: &StoragePaths, key: &str, known: bool) -> io::Result<bool> {
-        let owners = self
-            .0
-            .as_ref()
-            .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+        let owners = self.0.as_ref().map_err(copy_retention_error)?;
         for (name, metadata) in owners {
-            let metadata = metadata
-                .as_ref()
-                .map_err(|error| io::Error::new(error.kind(), error.to_string()))?;
+            let metadata = metadata.as_ref().map_err(copy_retention_error)?;
             if ((!known && !owner_has_residency_marker(storage, metadata))
                 || name == key
                 || metadata.project_scope_key == key)
@@ -4273,8 +4319,11 @@ impl DueBatch {
                 if let Err(error) = item.retire(storage, &current, &owners, now, cancelled, report)
                 {
                     report.skipped_protected += 1;
-                    if error.kind() != io::ErrorKind::Interrupted && report.errors.len() < 16 {
-                        report.errors.push(format!("{}: {error}", cache.display()));
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        let conditions = report.conditions(&error);
+                        if conditions.len() < 16 {
+                            conditions.push(format!("{}: {error}", cache.display()));
+                        }
                     }
                 }
             }
@@ -4336,11 +4385,14 @@ impl PreparedDue {
     /// cache path, as a lane reports any candidate whose checks failed.
     fn refuse(&self, error: &io::Error, report: &mut SweepReport) {
         report.skipped_protected += 1;
-        if error.kind() != io::ErrorKind::Interrupted && report.errors.len() < 16 {
-            report.errors.push(format!(
-                "{}: {error}",
-                self.directory.join(&self.key).display()
-            ));
+        if error.kind() != io::ErrorKind::Interrupted {
+            let conditions = report.conditions(error);
+            if conditions.len() < 16 {
+                conditions.push(format!(
+                    "{}: {error}",
+                    self.directory.join(&self.key).display()
+                ));
+            }
         }
     }
 
@@ -4553,17 +4605,17 @@ fn eligible(
 /// The view scopes every family registry lists, read at most once per pass
 /// and only when a pass meets a view folder with no binding history.
 #[derive(Default)]
-struct ViewMembers(Option<Result<HashSet<String>, String>>);
+struct ViewMembers(Option<io::Result<HashSet<String>>>);
 
 impl ViewMembers {
     /// `Err` when any family registry could not be read completely: a scope
     /// that registry might list is then unknown, never absent.
-    fn contains(&mut self, storage: &StoragePaths, scope: &str) -> Result<bool, String> {
+    fn contains(&mut self, storage: &StoragePaths, scope: &str) -> io::Result<bool> {
         self.0
-            .get_or_insert_with(|| view_member_scopes(storage).map_err(|error| error.to_string()))
+            .get_or_insert_with(|| view_member_scopes(storage))
             .as_ref()
             .map(|scopes| scopes.contains(scope))
-            .map_err(Clone::clone)
+            .map_err(copy_retention_error)
     }
 }
 
@@ -4586,9 +4638,9 @@ fn view_member_scopes(storage: &StoragePaths) -> io::Result<HashSet<String>> {
             .members_bounded(HISTORY_ENTRIES + 1)
             .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?;
         if members.len() > HISTORY_ENTRIES {
-            return Err(io::Error::other(format!(
-                "family registry {family} lists more than {HISTORY_ENTRIES} views"
-            )));
+            return Err(io::Error::other(RetentionIncomplete::ViewEntryLimit {
+                family,
+            }));
         }
         scopes.extend(members.into_iter().map(|member| member.scope));
     }
@@ -4604,8 +4656,9 @@ fn report_candidate_error(cache: &Path, error: &io::Error, report: &mut SweepRep
     } else {
         report.skipped_protected += 1;
     }
-    if report.errors.len() < 16 {
-        report.errors.push(format!("{}: {error}", cache.display()));
+    let conditions = report.conditions(error);
+    if conditions.len() < 16 {
+        conditions.push(format!("{}: {error}", cache.display()));
     }
 }
 
@@ -4784,10 +4837,9 @@ fn candidate_inner(
             Err(error) => {
                 *orphan = true;
                 report.skipped_unknown += 1;
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("{}: orphan check: {error}", cache.display()));
+                let conditions = report.conditions(&error);
+                if conditions.len() < 16 {
+                    conditions.push(format!("{}: orphan check: {error}", cache.display()));
                 }
                 return Ok(());
             }
@@ -5404,7 +5456,7 @@ fn run_pass_with_root_identities(
     })();
     if let Err(error) = result {
         if error.kind() != io::ErrorKind::Interrupted {
-            report.errors.push(error.to_string());
+            report.conditions(&error).push(error.to_string());
         }
     }
     // Trash is already detached from live caches. Its independent deadline and
@@ -5417,21 +5469,21 @@ fn run_pass_with_root_identities(
     if !report.cancelled && !cancelled() && !bind_pending(&storage.durable) {
         let phase = Instant::now();
         if let Err(error) = collect_one_family(storage, cancelled, &mut report) {
-            report.errors.push(error.to_string());
+            report.conditions(&error).push(error.to_string());
         }
         report
             .timings_ms
             .insert("blobs_v1".into(), phase.elapsed().as_millis() as u64);
         let phase = Instant::now();
         if let Err(error) = collect_one_v2_family(storage, cancelled, &mut report) {
-            report.errors.push(error.to_string());
+            report.conditions(&error).push(error.to_string());
         }
         report
             .timings_ms
             .insert("blobs_v2".into(), phase.elapsed().as_millis() as u64);
         let phase = Instant::now();
         if let Err(error) = collect_one_v3_family(storage, cancelled, &mut report, V3Bounds::PASS) {
-            report.errors.push(error.to_string());
+            report.conditions(&error).push(error.to_string());
         }
         report
             .timings_ms
@@ -6205,10 +6257,9 @@ fn report_v3_idle_unknown(
 ) {
     domain.skipped_unknown += 1;
     report.stopped_early |= is_retention_deadline(error);
-    if report.errors.len() < 16 {
-        report
-            .errors
-            .push(format!("{}: {error}", view_dir.display()));
+    let conditions = report.conditions(error);
+    if conditions.len() < 16 {
+        conditions.push(format!("{}: {error}", view_dir.display()));
     }
 }
 
@@ -6551,10 +6602,12 @@ fn collect_v3_family_at(
                 report.stopped_early |= !swept.plane_rows_complete && swept.skipped.is_none();
             }
             Err(error) => {
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("v3 base sweep of family {family}: {error}"));
+                let conditions = match &error {
+                    crate::views::base_refs::BaseRefError::Io(error) => report.conditions(error),
+                    _ => &mut report.errors,
+                };
+                if conditions.len() < 16 {
+                    conditions.push(format!("v3 base sweep of family {family}: {error}"));
                 }
             }
         }
@@ -11615,6 +11668,8 @@ mod storage_retention_tests {
         assert!(!first.binding_history.complete, "{first:?}");
         assert!(first.binding_history.examined <= HISTORY_ENTRIES);
         assert!(first.binding_history.accumulated > 0);
+        assert!(first.errors.is_empty(), "{first:?}");
+        assert_eq!(first.incomplete.len(), 1, "{first:?}");
         let incomplete_health = serde_json::to_value(snapshot(temp.path()).unwrap()).unwrap();
         assert_eq!(incomplete_health["binding_history"]["complete"], false);
         assert!(retired.exists(), "a partial census authorized deletion");
@@ -11625,6 +11680,8 @@ mod storage_retention_tests {
         let restarted = run_pass_entry_bound(temp.path());
         assert!(!restarted.binding_history.complete, "{restarted:?}");
         assert!(restarted.binding_history.restarted);
+        assert!(restarted.errors.is_empty(), "{restarted:?}");
+        assert_eq!(restarted.incomplete.len(), 1, "{restarted:?}");
         assert!(restarted.binding_history.examined <= HISTORY_ENTRIES);
         assert!(retired.exists());
         let report = run_pass_entry_bound(temp.path());
@@ -13305,8 +13362,9 @@ mod storage_retention_tests {
         assert_eq!(stopped.orphan_views.skipped_protected, 0, "{stopped:?}");
         assert_eq!(stopped.domains["views"].skipped_protected, 0, "{stopped:?}");
         assert_eq!(stopped.removed_roots, 0, "{stopped:?}");
-        assert_eq!(stopped.errors.len(), 1, "{stopped:?}");
-        assert!(stopped.errors[0].contains("retention deadline reached"));
+        assert!(stopped.errors.is_empty(), "{stopped:?}");
+        assert_eq!(stopped.incomplete.len(), 1, "{stopped:?}");
+        assert!(stopped.incomplete[0].contains("retention deadline reached"));
         assert!(view.exists());
 
         atomic_json(
@@ -13330,6 +13388,75 @@ mod storage_retention_tests {
         assert_eq!(report.skipped_protected, 1, "{report:?}");
         assert!(!report.stopped_early, "{report:?}");
         assert_eq!(report.errors, ["cache: filesystem probe timed out"]);
+        assert!(report.incomplete.is_empty());
+    }
+
+    #[test]
+    fn storage_retention_refused_delete_is_a_cleanup_failure() {
+        let (temp, root, key) = fixture();
+        fs::remove_dir(&root).unwrap();
+        let domain = temp.path().join("opencode/inspect");
+        fs::create_dir_all(&domain).unwrap();
+        let payload = domain.join(format!("{key}.payload"));
+        fs::write(&payload, "payload").unwrap();
+        let replacement = payload.clone();
+        let _hook = observe_test_hook(
+            &domain,
+            Arc::new(move |step| {
+                if step == "flat-unlink" && replacement.is_file() {
+                    // File removal must refuse a directory that arrived after
+                    // validation. That refusal is a failure, not a budget stop.
+                    fs::remove_file(&replacement).unwrap();
+                    fs::create_dir(&replacement).unwrap();
+                }
+            }),
+        );
+        let report = run_pass_entry_bound(temp.path());
+        assert!(payload.is_dir(), "the refused replacement must remain");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.incomplete.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn storage_retention_condition_classification_uses_typed_reasons() {
+        let mut report = SweepReport::default();
+        let error = io::Error::other(RetentionIncomplete::TreeEntryLimit);
+        let error = copy_retention_error(&error);
+        report_candidate_error(Path::new("cache"), &error, &mut report);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(
+            report.incomplete,
+            ["cache: retention tree entry limit reached"]
+        );
+        assert!(report.stopped_early);
+
+        let mut report = SweepReport::default();
+        let error = io::Error::other("retention deadline reached");
+        report_candidate_error(Path::new("cache"), &error, &mut report);
+        assert_eq!(report.errors, ["cache: retention deadline reached"]);
+        assert!(report.incomplete.is_empty());
+        assert!(!report.stopped_early);
+
+        let mut report = SweepReport::default();
+        let mut domain = DomainReport::default();
+        let error = io::Error::new(io::ErrorKind::TimedOut, RetentionIncomplete::Deadline);
+        report_v3_idle_unknown(Path::new("view"), &error, &mut report, &mut domain);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.incomplete, ["view: retention deadline reached"]);
+        assert!(report.stopped_early);
+    }
+
+    #[test]
+    fn storage_retention_directory_entry_budget_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("entry"), "payload").unwrap();
+        let error = bounded_dirs(temp.path(), 0).unwrap_err();
+        let error = copy_retention_error(&error);
+        let mut report = SweepReport::default();
+        report.conditions(&error).push(error.to_string());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.incomplete.len(), 1);
+        assert!(report.stopped_early);
     }
 
     #[test]
