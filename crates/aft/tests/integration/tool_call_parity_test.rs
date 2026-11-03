@@ -16,9 +16,12 @@ const SESSION_ID: &str = "tool-call-parity-session";
 const WATCHER_QUIET_WINDOW: Duration = Duration::from_millis(250);
 
 fn parity_project() -> tempfile::TempDir {
-    // Release-profile tools intentionally skip undo snapshots in the OS temp
-    // namespace. These are real mutation fixtures, not disposable-file cases.
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/parity-projects");
+    // Release-profile tools skip OS-temp undo snapshots, while the conflicts
+    // case must not discover this checkout as an ancestor Git repository.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("parity fixture home directory");
+    let scratch = std::path::PathBuf::from(home).join(".cache/aft-parity-projects");
     fs::create_dir_all(&scratch).expect("create parity scratch root");
     let project = tempfile::Builder::new()
         .prefix("project-")
