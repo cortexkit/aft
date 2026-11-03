@@ -88,9 +88,9 @@ jobs:
     name: Cancel tag run on first build failure
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # Windows ARM64 peaked at 100.5 min in v0.62.0 (84.8/50.2 in v0.63.3/4).
-    # Outlive its 210-minute build budget, with 10 minutes for polling/setup.
-    timeout-minutes: 220
+    # Outlive the longest build budget (macOS on the free runner, 350 minutes),
+    # with 10 minutes for polling/setup.
+    timeout-minutes: 360
     permissions:
       actions: write
     steps:
@@ -219,12 +219,12 @@ jobs:
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
-    # Blacksmith's M4 runner has 24 GB; the shipped-profile library compile
-    # peaks near 12 GB and swaps for hours on GitHub's 7 GB macos-26 runner.
-    # Temporary until the self-hosted release runner on our own Mac is live.
-    runs-on: blacksmith-6vcpu-macos-26
-    # v0.63.3/v0.63.4 on Blacksmith: 15.5/16.4 min; over twice the latter.
-    timeout-minutes: 45
+    # The shipped-profile library compile peaks near 12 GB and swaps on this
+    # free 7 GB runner (0.63.1's ARM64 build ran past a shorter limit twice),
+    # so the limit leaves only the tag canceller's 10 minutes below GitHub's
+    # 360-minute maximum.
+    runs-on: macos-26
+    timeout-minutes: 350
     outputs:
       rust_version: ${{ steps.bundle.outputs.rust_version }}
     permissions:
@@ -300,10 +300,9 @@ jobs:
 
   build-darwin-x64:
     name: Build macOS x64
-    # Same runner as the ARM64 build; see the note there.
-    runs-on: blacksmith-6vcpu-macos-26
-    # v0.63.3/v0.63.4 on Blacksmith: 15.7/18.3 min; over twice the latter.
-    timeout-minutes: 45
+    # Same runner and limit as the ARM64 build; see the note there.
+    runs-on: macos-26
+    timeout-minutes: 350
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
