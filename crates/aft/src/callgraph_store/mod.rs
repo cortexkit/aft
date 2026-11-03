@@ -34872,8 +34872,8 @@ impl Other { pub fn qualified(self) -> Self { self } }
     fn assert_rust_exact_view_parity(root: &Path, legacy: &CallGraphStore) {
         let mut inputs = rust_files(root);
         inputs.push(root.join("Cargo.toml"));
-        let _ = callgraph_fixture_view(root, &inputs);
-        let view = manifest_view_database_path(&root.join("views"), "parity").unwrap();
+        let view_store = callgraph_fixture_view_store(root, &inputs);
+        let view = view_store.sqlite_path();
         let rows = |database: &Path| {
             let conn = Connection::open(database).unwrap();
             let mut query = conn.prepare("SELECT e.target_file, e.target_symbol, n.file_path, n.scoped_name, e.line
@@ -34895,9 +34895,9 @@ impl Other { pub fn qualified(self) -> Self { self } }
                 .unwrap()
         };
         let legacy_rows = rows(legacy.sqlite_path());
-        let view_rows = rows(&view);
+        let view_rows = rows(view);
         if legacy_rows != view_rows {
-            let conn = Connection::open(&view).unwrap();
+            let conn = Connection::open(view).unwrap();
             let mut facts = conn
                 .prepare("SELECT file_path,facts FROM view_dispatch_files")
                 .unwrap();
