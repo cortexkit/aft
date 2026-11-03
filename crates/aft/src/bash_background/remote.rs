@@ -900,7 +900,7 @@ pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub return_paths: Vec<String>,
     /// The negotiated request cap, retained across attach and process restart.
-    #[serde(default = "exec::return_max_bytes")]
+    #[serde(default = "crate::exec_remote::return_max_bytes")]
     pub return_max_bytes: u64,
     #[serde(default)]
     pub return_cap_retried: bool,
