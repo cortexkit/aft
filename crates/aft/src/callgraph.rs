@@ -1995,19 +1995,23 @@ fn qualify_rust_impl_methods(
     root: Node<'_>,
     symbols: &mut [Symbol],
 ) -> HashMap<String, Option<String>> {
-    let types = symbols
-        .iter()
-        .filter(|symbol| {
-            matches!(
-                symbol.kind,
-                SymbolKind::Struct
-                    | SymbolKind::Enum
-                    | SymbolKind::Interface
-                    | SymbolKind::TypeAlias
-            )
-        })
-        .map(symbol_identity)
-        .collect::<HashSet<_>>();
+    let mut types = HashSet::new();
+    let mut declarations = vec![root];
+    while let Some(node) = declarations.pop() {
+        if matches!(
+            node.kind(),
+            "struct_item" | "enum_item" | "trait_item" | "type_item"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                types.insert(rust_module_qualified_name(
+                    node,
+                    source,
+                    &node_text(name, source),
+                ));
+            }
+        }
+        declarations.extend(node.named_children(&mut node.walk()));
+    }
     let mut scopes = HashMap::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

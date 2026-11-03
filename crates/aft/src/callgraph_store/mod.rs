@@ -17679,10 +17679,20 @@ fn resolve_exported_symbol_inner<I: ResolverIndex>(
     }
     if requested != "default" {
         if let Some(source_symbol) = index.export_alias(file, requested) {
-            return Some((file.to_string(), source_symbol));
+            if index.lang_for(file) != Some(LangId::Rust)
+                || index.node_for_symbol(file, &source_symbol).is_some()
+            {
+                return Some((file.to_string(), source_symbol));
+            }
         }
         if index.has_export(file, requested) {
-            return Some((file.to_string(), requested.to_string()));
+            // A Rust use can export a name without declaring it in this module.
+            // Follow the re-export rather than claiming this file defines the name.
+            if index.lang_for(file) != Some(LangId::Rust)
+                || index.node_for_symbol(file, requested).is_some()
+            {
+                return Some((file.to_string(), requested.to_string()));
+            }
         }
     } else if let Some(default) = index.default_export(file) {
         return Some((file.to_string(), default));
@@ -17799,6 +17809,20 @@ fn resolve_rust_target<I: ResolverIndex>(
             rust_associated_target(index, caller_file, full_ref, caller_data, raw)
         {
             return Some(("resolved".to_string(), file, symbol));
+        }
+        if let Some((owner, _)) = full_ref.rsplit_once("::") {
+            if !matches!(owner, "Self" | "self" | "super" | "crate") {
+                if let Some((file, symbol)) =
+                    rust_type_binding(index, caller_file, owner, caller_data, raw)
+                {
+                    if index
+                        .node_for_symbol(&file, &symbol)
+                        .is_some_and(|node| !index.node_is_callable(&file, &node))
+                    {
+                        return None;
+                    }
+                }
+            }
         }
         // Self names the enclosing impl or trait, not a module on disk. Keep
         // private associated helpers in the same graph as their public callers.
@@ -18099,8 +18123,8 @@ fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> boo
 
 /// Module names a `use` declaration binds: `use a::b;` / `use a::b as c;`
 /// bind one, and a use list binds `self` (the prefix module itself, as in
-/// `use crate::cache_freshness::{self, FileFreshness};`) plus each lowercase
-/// entry. Upper-camel names are types, not modules, and are skipped.
+/// `use crate::cache_freshness::{self, FileFreshness};`). Conservative module
+/// candidates use the imported item's spelling, not the alias's capitalization.
 fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<String>)> {
     let path = rust_use_body(&import.raw_text)
         .unwrap_or(&import.module_path)
@@ -18144,7 +18168,10 @@ fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<Stri
                 let local_name = alias
                     .map(str::to_string)
                     .or_else(|| segments.last().cloned())?;
-                is_module_name(&local_name).then_some((local_name, segments))
+                segments
+                    .last()
+                    .is_some_and(|name| is_module_name(name))
+                    .then_some((local_name, segments))
             })
             .collect();
     }
@@ -18162,7 +18189,7 @@ fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<Stri
     else {
         return Vec::new();
     };
-    if !is_module_name(&local_name) {
+    if !segments.last().is_some_and(|name| is_module_name(name)) {
         return Vec::new();
     }
     vec![(local_name, segments)]
@@ -21015,6 +21042,15 @@ fn rust_bound_dispatch_candidate(
             .declaration(&reference.caller_symbol)?
             .owner
             .clone()?;
+        let member = format!("{owner}::{}", reference.method_name);
+        if parsed
+            .rust
+            .as_ref()?
+            .declaration(&member)
+            .is_some_and(|declaration| declaration.has_self)
+        {
+            return rust_exact_dispatch_candidate(tx, &reference.caller_file, &member);
+        }
         rust_type_binding(index, &reference.caller_file, &owner, &data, &raw)?
     } else {
         if !receiver_is_bare_identifier(&reference.receiver_expression) {
