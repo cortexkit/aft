@@ -165,6 +165,24 @@ if [ "$(uname -s)" = "Darwin" ]; then
   rm -rf "$DSYM_DEST"
   mv "$DSYM_TMP" "$DSYM_DEST"
   echo "    dSYM: $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
+  # Each bundle is about 260 MB and only symbolicates crashes of a binary that
+  # can still run. Keep the six newest, plus the bundles of the placed card, the
+  # rollback images beside it and the three newest staged cards (the supervisor
+  # keeps its rollback among those). The health sentinel reports a placed card
+  # whose bundle is missing.
+  KEEP_UUIDS=" "
+  for f in "$(dirname "$DEPLOY")"/ck-aft* $(ls -t "$STAGING" | grep -E '^ck-aft\.[0-9a-f]{16}$' | head -3 | sed "s|^|$STAGING/|"); do
+    [ -f "$f" ] || continue
+    uuid="$(dwarfdump --uuid "$f" 2>/dev/null | awk '/arm64/ { gsub("-", "", $2); print $2; exit }')"
+    [ -n "$uuid" ] && KEEP_UUIDS="$KEEP_UUIDS$uuid "
+  done
+  pruned=0
+  for old in $(ls -t "$DSYM_ROOT" | grep -E '^[0-9A-F]{32}$' | tail -n +7); do
+    case "$KEEP_UUIDS" in *" $old "*) continue ;; esac
+    rm -rf "${DSYM_ROOT:?}/$old"
+    pruned=$((pruned + 1))
+  done
+  echo "    dSYM store: removed $pruned older bundles"
 fi
 # The storage-floor check runs on the signed temporary binary, the exact bytes
 # that would be staged, before the card is moved into staging or recorded in
