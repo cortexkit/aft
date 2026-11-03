@@ -13692,7 +13692,7 @@ mod h_header_invalidation_tests {
 
     #[test]
     fn h_header_legacy_migration_is_targeted_atomic_and_once() {
-        assert_eq!(BUILD_OUTPUT_VERSION, "v22-python-import-bindings");
+        assert_eq!(BUILD_OUTPUT_VERSION, "v23-short-node-ids");
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("root")).unwrap();
         // Parse counters key files by the canonical path the store reads them
