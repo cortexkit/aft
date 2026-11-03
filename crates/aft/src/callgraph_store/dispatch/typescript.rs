@@ -173,6 +173,7 @@ pub(super) struct Objects<'nodes, 'tree, 'source> {
     function_owners: HashMap<usize, Option<usize>>,
     write_scopes: HashMap<usize, (usize, usize)>,
     selected_bindings: std::cell::RefCell<HashMap<(usize, &'source str), Option<Node<'tree>>>>,
+    nominal: bool,
 }
 
 impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
@@ -180,6 +181,23 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
         nodes: &'nodes [Node<'tree>],
         source: &'source str,
         parse: &ParseBlob,
+    ) -> Self {
+        Self::with_nominal(nodes, source, parse, true)
+    }
+
+    pub(super) fn new_objects_only(
+        nodes: &'nodes [Node<'tree>],
+        source: &'source str,
+        parse: &ParseBlob,
+    ) -> Self {
+        Self::with_nominal(nodes, source, parse, false)
+    }
+
+    fn with_nominal(
+        nodes: &'nodes [Node<'tree>],
+        source: &'source str,
+        parse: &ParseBlob,
+        nominal: bool,
     ) -> Self {
         let mut profile =
             crate::views::materialization::profile::StageTimer::new("typescript_index");
@@ -203,6 +221,7 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             function_owners: HashMap::new(),
             write_scopes: HashMap::new(),
             selected_bindings: Default::default(),
+            nominal,
             imports: parse
                 .imports
                 .iter()
@@ -383,21 +402,22 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
                     self.identifier_scopes.insert(node.id(), scope.id());
                 }
             }
-            if is_function
-                || matches!(
-                    kind,
-                    "variable_declarator"
-                        | "required_parameter"
-                        | "optional_parameter"
-                        | "call_expression"
-                        | "jsx_opening_element"
-                        | "jsx_self_closing_element"
-                )
+            if self.nominal
+                && (is_function
+                    || matches!(
+                        kind,
+                        "variable_declarator"
+                            | "required_parameter"
+                            | "optional_parameter"
+                            | "call_expression"
+                            | "jsx_opening_element"
+                            | "jsx_self_closing_element"
+                    ))
             {
                 self.function_owners
                     .insert(node.id(), functions.last().map(|function| function.id()));
             }
-            if kind == "type_parameter" {
+            if self.nominal && kind == "type_parameter" {
                 if let Some(name) = field(node, &["name"]) {
                     self.generics.insert(text(name, self.source));
                 }
@@ -641,7 +661,18 @@ impl<'nodes, 'tree, 'source> Objects<'nodes, 'tree, 'source> {
             .or_else(|| self.nominal_receiver(expression, call))
     }
 
+    pub(super) fn object_receiver(
+        &self,
+        expression: Node<'tree>,
+        call: Node<'tree>,
+    ) -> Option<String> {
+        self.value(expression, call, 0)
+    }
+
     fn nominal_receiver(&self, expression: Node<'tree>, call: Node<'tree>) -> Option<String> {
+        if !self.nominal {
+            return None;
+        }
         if expression.kind() != "identifier" {
             return None;
         }

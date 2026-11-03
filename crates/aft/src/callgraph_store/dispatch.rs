@@ -88,7 +88,10 @@ pub(crate) fn typescript_objects_from_data(
         "inputs",
         format_args!("nodes={} refs={}", nodes.len(), parse.refs.len()),
     );
-    let objects = typescript::Objects::new(nodes, source, &parse);
+    // This pass links calls only to methods of object literals and single
+    // object-literal returns. Class and parameter types cannot supply those
+    // bindings, so do not compute and discard them.
+    let objects = typescript::Objects::new_objects_only(nodes, source, &parse);
     profile.finish("index", format_args!("nodes={}", nodes.len()));
     let mut facts = DispatchFacts::default();
     objects.extract(&mut facts);
@@ -127,7 +130,7 @@ pub(crate) fn typescript_objects_from_data(
                 .and_then(|function| typescript::object_member(function, source))
                 .map(|(object, _)| typescript::object_identity(object))
         } else {
-            objects.receiver(receiver, call)
+            objects.object_receiver(receiver, call)
         };
         if !ty.as_ref().is_some_and(|ty| {
             ty.starts_with("@object:") || ty.starts_with("@return:") || ty.starts_with("@field:")
