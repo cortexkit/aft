@@ -600,6 +600,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         platform: None,
         siblings: vec![worktree.to_str().unwrap().into()],
         weight_hint: Some(16),
+        memory_mib: None,
         queue_wait_limit_s: Some(0),
         network: None,
         return_paths: Vec::new(),
@@ -655,6 +656,35 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset
     )
     .is_err());
+}
+
+#[test]
+fn runon_memory_request_builder_omits_unrequested_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    for memory_mib in [None, Some(16_384)] {
+        let request = build_request(
+            &root,
+            &root,
+            &root,
+            "cargo test",
+            Default::default(),
+            Some(23),
+            &PresetParams {
+                memory_mib,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(request.memory_mib, memory_mib);
+        if memory_mib.is_some() {
+            assert_eq!(wire["memory_mib"], 16_384);
+        } else {
+            assert!(wire.get("memory_mib").is_none());
+        }
+        assert_eq!(serde_json::from_value::<RunRequest>(wire).unwrap(), request);
+    }
 }
 
 #[test]

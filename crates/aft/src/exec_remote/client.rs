@@ -11,6 +11,9 @@ pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
 
 pub const CAPABILITY: &str = "exec-remote/v1";
 
+// pending Ufuk's approval
+const MEMORY_UNSUPPORTED_REFUSAL: &str = "runon memory size is unavailable: the build server doesn't support stated memory (missing exec-remote-memory/v1)";
+
 /// Local, monotonic launch timings. Phase labels are static so diagnostics
 /// cannot accidentally include command text, paths, or environment values.
 pub(crate) struct LaunchTimings {
@@ -129,6 +132,16 @@ impl ExecRemoteClient {
                 return Err(Error::Protocol(
                     "executor does not advertise submission keys".into(),
                 ));
+            }
+        }
+        if request.memory_mib.is_some() {
+            if let Some(diagnostics) = diagnostics.as_mut() {
+                diagnostics.timings.enter("advertises_memory");
+            }
+            if !self.advertises(MEMORY_CAPABILITY).await.map_err(|error| {
+                Error::Protocol(format!("{MEMORY_UNSUPPORTED_REFUSAL}: {error}"))
+            })? {
+                return Err(Error::Protocol(MEMORY_UNSUPPORTED_REFUSAL.into()));
             }
         }
         if request.platform == Some(Platform::Windows) {
@@ -424,7 +437,10 @@ impl RemoteStream {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY, WINDOWS_CAPABILITY};
+    use super::{
+        CAPABILITY, MEMORY_CAPABILITY, PROGRESS_CAPABILITY, RETURN_CHUNKED_CAPABILITY,
+        WINDOWS_CAPABILITY,
+    };
 
     /// The daemon refuses a HELLO whose manifest names a capability outside the
     /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
@@ -432,6 +448,7 @@ mod capability_tests {
     fn checked_capabilities_pass_the_daemon_grammar() {
         for capability in [
             CAPABILITY,
+            MEMORY_CAPABILITY,
             WINDOWS_CAPABILITY,
             RETURN_CHUNKED_CAPABILITY,
             PROGRESS_CAPABILITY,
