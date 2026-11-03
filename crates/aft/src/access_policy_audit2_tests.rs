@@ -12,9 +12,16 @@ struct Fixture {
     owner: std::sync::Arc<()>,
 }
 
+fn checkout_tempdir() -> tempfile::TempDir {
+    // Cargo and nextest run tests in the package's runtime checkout. A compiled
+    // manifest path still points at the producer when nextest relocates an archive.
+    // Stay outside system temp so its access-policy exemption cannot mask failures.
+    tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+}
+
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = checkout_tempdir();
         let root = dir.path().join("root");
         let outside = dir.path().join("outside");
         std::fs::create_dir(&root).unwrap();
@@ -932,7 +939,7 @@ fn audit4_windows_delete_is_bound_to_the_authorized_entry() {
 /// A context with undo backups and checkpoints enabled, rooted outside the
 /// system temp directory.
 fn backed_up_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
-    let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let dir = checkout_tempdir();
     let root = dir.path().join("root");
     std::fs::create_dir(&root).unwrap();
     let config = Config {
@@ -942,6 +949,43 @@ fn backed_up_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
     };
     let ctx = AppContext::new(Box::new(crate::language::StubProvider), config);
     (dir, root, ctx)
+}
+
+#[test]
+fn audit2_fixtures_follow_the_runtime_checkout() {
+    const CHILD: &str = "AFT_AUDIT2_RELOCATED_FIXTURE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let checkout = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let fixture = Fixture::new();
+        let (backup_dir, _root, _ctx) = backed_up_fixture();
+        for dir in [&fixture._dir, &backup_dir] {
+            assert_eq!(
+                dir.path().parent().unwrap().canonicalize().unwrap(),
+                checkout,
+                "fixtures must use the consumer checkout, not the build-time manifest path"
+            );
+        }
+        return;
+    }
+
+    // Relocate only the child's working directory; changing this process's cwd
+    // would race every other library test that uses relative paths.
+    let checkout = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "access_policy::audit2_tests::audit2_fixtures_follow_the_runtime_checkout",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .current_dir(checkout.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "relocated fixture probe failed: {output:?}"
+    );
 }
 
 /// Implicit undo restores the stored keys themselves. A stored key that is not
