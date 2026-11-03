@@ -274,7 +274,11 @@ impl<'a> ObjectDispatch<'a> {
                     }
                 }
             }
-            self.resolutions.insert(file, resolutions);
+            // Only files with an object resolution get an entry, so `resolve`
+            // answers every other file without touching the store.
+            if !resolutions.is_empty() {
+                self.resolutions.insert(file, resolutions);
+            }
         }
         profile.finish("resolve", format_args!("files={}", self.resolutions.len()));
         Ok(())
