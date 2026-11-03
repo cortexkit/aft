@@ -9,6 +9,26 @@ use tree_sitter::Node;
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
+/// Named imports still bound at Python module scope, already checked during
+/// extraction for assignments, conflicting aliases and local-only imports.
+pub(crate) fn python_reexports(parse: &ParseBlob) -> Vec<(String, Vec<String>)> {
+    parse
+        .refs
+        .iter()
+        .filter(|reference| reference.kind == BlobRefKind::Reexport && !reference.wildcard)
+        .filter_map(|reference| {
+            let module = reference.module_path.clone()?;
+            let mut names =
+                crate::callgraph_store::parse_reexport_names(reference.full_ref.as_deref()?)
+                    .into_iter()
+                    .map(|(local, source)| format!("{source} as {local}"))
+                    .collect::<Vec<_>>();
+            names.sort();
+            Some((module, names))
+        })
+        .collect()
+}
+
 #[path = "dispatch/typescript.rs"]
 mod typescript;
 
@@ -1652,12 +1672,7 @@ impl<'a> Resolver<'a> {
         if let Some(t) = parse.dispatch.types.iter().find(|t| t.name == name) {
             return Some((file.to_string(), t));
         }
-        // Python's extra bindings describe superclass imports for super only;
-        // ordinary receivers retain their existing type-inference boundary.
-        if let Some((target_file, symbol)) = (parse.language != "python")
-            .then(|| self.type_target(file, name))
-            .flatten()
-        {
+        if let Some((target_file, symbol)) = self.type_target(file, name) {
             if let Some(ty) = self
                 .file(target_file)?
                 .dispatch
@@ -1858,6 +1873,63 @@ impl<'a> Resolver<'a> {
                 (f == base_file && t.name == base) || self.subtype(&f, t, base_file, base, seen)
             })
     }
+    fn python_base_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+        let mut file = file.to_string();
+        let mut name = name.to_string();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert((file.clone(), name.clone())) {
+                return None;
+            }
+            let parse = self.file(&file)?;
+            if parse.language != "python" {
+                return None;
+            }
+            if let Some(ty) = parse.dispatch.types.iter().find(|ty| ty.name == name) {
+                return Some((file, ty));
+            }
+            // Materialized facts keep only the checked module imports. Direct
+            // parse-blob users derive that same subset from re-export records.
+            let imports = if parse.refs.is_empty() {
+                parse
+                    .imports
+                    .iter()
+                    .map(|import| (import.module_path.clone(), import.names.clone()))
+                    .collect()
+            } else {
+                python_reexports(parse)
+            };
+            let mut targets = BTreeSet::new();
+            for (module, names) in imports {
+                for specifier in names {
+                    if crate::imports::specifier_local_name(&specifier) != name {
+                        continue;
+                    }
+                    for candidate in crate::callgraph_store::python_module_candidates(
+                        std::path::Path::new(""),
+                        std::path::Path::new(&file),
+                        &module,
+                    ) {
+                        let path = candidate.to_string_lossy().replace('\\', "/");
+                        // Probe in Python's package-before-module order, keeping
+                        // missing higher-priority files as refresh dependencies.
+                        if self.file(&path).is_some() {
+                            targets.insert((
+                                path,
+                                crate::imports::specifier_imported_name(&specifier).to_string(),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            if targets.len() != 1 {
+                return None;
+            }
+            (file, name) = targets.into_iter().next()?;
+        }
+    }
+
     fn python_mro(
         &self,
         file: &str,
@@ -1875,11 +1947,7 @@ impl<'a> Resolver<'a> {
         let mut sequences = Vec::new();
         let mut bases = Vec::new();
         for base in &ty.bases {
-            let projected = self
-                .type_target(file, base)
-                .and_then(|(path, symbol)| self.project_type(path, symbol))
-                .or_else(|| self.project_type(file, base));
-            if let Some((base_file, base_ty)) = projected {
+            if let Some((base_file, base_ty)) = self.python_base_type(file, base) {
                 bases.push((base_file.clone(), base_ty.name.clone()));
                 sequences.push(self.python_mro(&base_file, base_ty, active, memo)?);
             } else {

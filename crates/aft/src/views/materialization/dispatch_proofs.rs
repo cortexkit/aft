@@ -426,6 +426,45 @@ fn python_super_unbound_base_does_not_select_a_project_homonym() {
     }
 }
 
+#[test]
+fn python_super_forwarded_base_refreshes_an_untouched_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = [
+        ("a.py", "class Zulu:\n def __init__(self): pass\n"),
+        ("b.py", "class Alpha:\n def __init__(self): pass\n"),
+        ("forward.py", "from a import Zulu as Base\n"),
+        ("child.py", "from forward import Base\nclass Child(Base):\n def __init__(self):\n  super().__init__()\n"),
+    ];
+    let mut after = before;
+    after[2] = ("forward.py", "from b import Alpha as Base\n");
+    let (updated, _) = incremental_matches_cold(dir.path(), &before, &after);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_symbol='Alpha::__init__' AND provenance='exact'"), 1);
+}
+
+#[test]
+fn python_super_new_package_takes_precedence_over_an_existing_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = [
+        ("base.py", "class Base:\n def __init__(self): pass\n"),
+        ("child.py", "from base import Base\nclass Child(Base):\n def __init__(self):\n  super().__init__()\n"),
+    ];
+    let mut after = before.to_vec();
+    after.push((
+        "base/__init__.py",
+        "class Base:\n def __init__(self): pass\n",
+    ));
+    let (updated, _) = incremental_matches_cold(dir.path(), &before, &after);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_file='base/__init__.py' AND provenance='exact'"), 1);
+}
+
 const INTERFACE: &str = "export interface I { m(): void; }";
 const CALLER: &str = "import { I } from './types';\nexport function caller(x: I) { x.m(); }";
 const IMPLEMENTATION: &str = "import { I } from './types';\nexport class B implements I { m() {} }";

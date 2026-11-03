@@ -93,7 +93,7 @@ struct FileFacts {
     default_export_symbol: Option<String>,
     /// Target file of each resolved import, by module path.
     import_targets: BTreeMap<String, String>,
-    /// Target file and symbol of each bound receiver type name.
+    /// Target file and symbol of each Rust receiver type name.
     type_targets: BTreeMap<String, (String, String)>,
 }
 
@@ -106,15 +106,26 @@ impl FileFacts {
             methods: parse.dispatch.methods.clone(),
             fields: parse.dispatch.fields.clone(),
             returns: parse.dispatch.returns.clone(),
-            imports: parse
-                .imports
-                .iter()
-                .map(|import| ImportFact {
-                    module_path: import.module_path.clone(),
-                    names: import.names.clone(),
-                    default_import: import.default_import.clone(),
-                })
-                .collect(),
+            imports: if parse.language == "python" {
+                join::dispatch::python_reexports(parse)
+                    .into_iter()
+                    .map(|(module_path, names)| ImportFact {
+                        module_path,
+                        names,
+                        default_import: None,
+                    })
+                    .collect()
+            } else {
+                parse
+                    .imports
+                    .iter()
+                    .map(|import| ImportFact {
+                        module_path: import.module_path.clone(),
+                        names: import.names.clone(),
+                        default_import: import.default_import.clone(),
+                    })
+                    .collect()
+            },
             default_export_symbol: parse.default_export_symbol.clone(),
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
