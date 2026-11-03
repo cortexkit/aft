@@ -13388,7 +13388,26 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS staging_ref_context (
             ref_id        TEXT PRIMARY KEY,
             caller_symbol TEXT
-        );",
+        );
+
+        -- Node ids hold 64 bits of a digest of file, kind and scoped name
+        -- (`node_id`). Two different symbols with the same id fail the write
+        -- instead of one silently replacing the other.
+        CREATE TRIGGER IF NOT EXISTS nodes_id_collision_on_insert BEFORE INSERT ON nodes
+        WHEN EXISTS (
+            SELECT 1 FROM nodes WHERE id = NEW.id AND (
+                file_path IS NOT NEW.file_path
+                OR scoped_name IS NOT NEW.scoped_name
+                OR kind IS NOT NEW.kind
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'call-graph node id collision'); END;
+        CREATE TRIGGER IF NOT EXISTS nodes_id_collision_on_update
+        BEFORE UPDATE OF file_path, scoped_name, kind ON nodes
+        WHEN OLD.file_path IS NOT NEW.file_path
+            OR OLD.scoped_name IS NOT NEW.scoped_name
+            OR OLD.kind IS NOT NEW.kind
+        BEGIN SELECT RAISE(ABORT, 'call-graph node id collision'); END;",
     )?;
     // CREATE TABLE IF NOT EXISTS leaves older tables untouched. Upgrade the
     // column before creating indexes that reference it; readiness still forces
@@ -13662,7 +13681,8 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v22-python-import-bindings";
+/// - v23: node ids carry 64 bits of their digest instead of 256.
+const BUILD_OUTPUT_VERSION: &str = "v23-short-node-ids";
 
 const H_HEADER_LANGUAGE_META_KEY: &str = "h_header_language_revision";
 
@@ -15943,9 +15963,18 @@ fn selection_range(source: &str, scoped_name: &str, name: &str, fallback: &Range
     }
 }
 
+/// A node's id: its class prefix and the first 64 bits of a BLAKE3 digest of
+/// its file, kind and scoped name, as 16 hex digits.
+///
+/// Node ids are repeated in every ref, edge and index that names a caller or a
+/// target, so their length is a large share of the store. 64 bits keep them
+/// unique in practice; the store's insert and update triggers refuse two
+/// different symbols with the same id (`initialize_schema`) rather than merging
+/// them. Hex digits of a prefix sort as the full digest does, so ordering by id
+/// is unchanged.
 fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
     if scoped_name == TOP_LEVEL_SYMBOL {
-        return format!("top:{}", hash_to_hex(blake3::hash(rel_path.as_bytes())));
+        return format!("top:{}", short_hash_hex(blake3::hash(rel_path.as_bytes())));
     }
     // Length-delimited fields avoid aliasing paths or names containing colons.
     let mut hash = blake3::Hasher::new();
@@ -15953,7 +15982,7 @@ fn node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
         hash.update(&(field.len() as u64).to_le_bytes());
         hash.update(field.as_bytes());
     }
-    format!("pos:symbol:{}", hash_to_hex(hash.finalize()))
+    format!("pos:symbol:{}", short_hash_hex(hash.finalize()))
 }
 
 pub(crate) fn view_node_id(rel_path: &str, kind: &str, scoped_name: &str) -> String {
@@ -25337,6 +25366,11 @@ pub(crate) fn callgraph_corpus_fingerprint_for_test(
 
 fn hash_to_hex(hash: blake3::Hash) -> String {
     hash.to_hex().to_string()
+}
+
+/// The first 64 bits of a digest as 16 hex digits.
+fn short_hash_hex(hash: blake3::Hash) -> String {
+    hash.to_hex()[..16].to_string()
 }
 
 fn hash_from_hex(value: &str) -> Option<blake3::Hash> {
