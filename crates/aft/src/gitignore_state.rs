@@ -632,7 +632,8 @@ mod tests {
     #[ignore = "opt-in CPU measurement on the checkout containing the crate"]
     fn live_cpu_ignore_snapshot_checkout_cost() {
         let root =
-            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+            std::fs::canonicalize(Path::new(crate::test_support::manifest_dir()).join("../.."))
+                .unwrap();
         let before = std::time::Instant::now();
         let mut inputs = Vec::new();
         if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {

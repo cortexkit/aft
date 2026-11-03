@@ -737,7 +737,7 @@ mod producer_tests {
     #[ignore = "manual source-verification IO measurement on the worker checkout"]
     fn inspect_repository_source_verification_io_profile() {
         let root = std::fs::canonicalize(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            std::path::Path::new(crate::test_support::manifest_dir())
                 .parent()
                 .unwrap()
                 .parent()

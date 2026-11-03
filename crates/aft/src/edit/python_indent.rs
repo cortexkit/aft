@@ -286,7 +286,7 @@ mod tests {
     /// corpus measurement in the integration tests.
     #[test]
     fn accepts_every_python_file_in_the_repository() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::path::Path::new(crate::test_support::manifest_dir()).join("../..");
         let mut pending = vec![root];
         let mut checked = 0usize;
         let mut flagged = Vec::new();

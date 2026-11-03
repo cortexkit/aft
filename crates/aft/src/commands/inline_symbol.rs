@@ -1789,7 +1789,7 @@ mod tests {
     }
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        std::path::PathBuf::from(crate::test_support::manifest_dir())
             .join("tests")
             .join("fixtures")
             .join("inline_symbol")

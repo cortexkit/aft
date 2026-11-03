@@ -651,6 +651,34 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         proof["partition_nextest_entries"](["cargo", "nextest", "list"])
         self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
 
+    def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
+        import ast
+
+        calls: list[list[str]] = []
+        proof = self._proof_partition_functions(calls)
+        consumer = Path("/relocated/consumer-checkout")
+        proof["ROOT"] = consumer
+        builder = next(
+            node for node in ast.walk(ast.parse(PROOF_TEXT))
+            if isinstance(node, ast.FunctionDef) and node.name == "archive_command"
+        )
+        exec(compile(ast.Module(body=[builder], type_ignores=[]), "rust-test-inventory-proof.py", "exec"), proof)
+        for bucket, count in (("lib", 5), ("bin", 5), ("integration", 3)):
+            command = proof["archive_command"](f"{bucket}.tar.zst")
+            calls.append([*command])
+            if bucket == "lib":
+                command += ["--", "--skip", "platform_verifier_tls_client_subprocess"]
+            proof["partition_nextest_entries"](command, None, count)
+        self.assertEqual(len(calls), 16)
+        for command in calls:
+            with self.subTest(command=command):
+                self.assertEqual(command[:3], ["cargo", "nextest", "list"])
+                self.assertEqual(command.count("--workspace-remap"), 1)
+                remap = command.index("--workspace-remap")
+                self.assertEqual(command[remap + 1], str(consumer))
+                if "--" in command:
+                    self.assertLess(remap, command.index("--"))
+
     def test_proof_rejects_a_non_positive_partition_count(self) -> None:
         proof = self._proof_partition_functions([])
         for value in ("0", "-2", "three"):
@@ -680,16 +708,16 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
-        # 45 minutes: the split build still runs 19-28 min, and a slow
-        # macOS runner has reached 30.
+        # Preserve the existing ceiling while changing the compilation runner.
         self.assertEqual(job["timeout-minutes"], "45")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
-        build_steps = [command for command in cargo_steps if command.startswith("cargo ")]
+        build_steps = [command for command in cargo_steps if re.search(r"\bcargo (nextest|test)\b", command)]
         self.assertEqual(len(build_steps), 3)
         for command in build_steps:
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)
+        self.assertIn('/usr/bin/time -l cargo nextest archive', archive)
         upload = next(step for step in job["steps"] if step.get("with", {}).get("name") == "macos-libtest-archive")
         paths = upload["with"]["path"].splitlines()
         self.assertTrue(all(path.startswith("${{ runner.temp }}/") for path in paths))
@@ -700,6 +728,49 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         steps = job["steps"]
         archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
         self.assertEqual(steps.index(timings), archive_index + 1)
+
+    def test_only_the_macos_libtest_producer_uses_the_release_blacksmith_runner(self) -> None:
+        suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
+        release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
+        jobs = suite["jobs"]
+        producer = jobs["unit-macos-libtest-archive"]
+        self.assertEqual(producer["name"], "Cargo libtest archive (macOS)")
+        self.assertEqual(producer["runs-on"], "blacksmith-6vcpu-macos-26")
+        self.assertEqual(producer["runs-on"], release["jobs"]["build-darwin-arm64"]["runs-on"])
+        self.assertEqual(
+            [name for name, job in jobs.items() if "blacksmith" in str(job.get("runs-on", ""))],
+            ["unit-macos-libtest-archive"],
+        )
+        for name in ("unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
+            self.assertEqual(jobs[name]["runs-on"], "macos-26", name)
+        shards = jobs["unit-macos-libtest-shard"]
+        self.assertEqual(shards["name"], "Cargo libtest shard ${{ matrix.shard }}/5 (macOS)")
+        self.assertEqual(shards["strategy"]["matrix"]["shard"], ["1", "2", "3", "4", "5"])
+        for job in (producer, shards):
+            self.assertIn("github.event_name", job["if"])
+            self.assertNotIn("github.ref", job["if"])
+
+    def test_macos_libtest_timing_summaries_survive_success_and_failure(self) -> None:
+        suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
+        for job_id, invocation, heading, runner in (
+            ("unit-macos-libtest-archive", "/usr/bin/time -l cargo nextest archive", "Build duration", "blacksmith-6vcpu-macos-26"),
+            ("unit-macos-libtest-shard", "./scripts/rust-test-gate.sh", "Test duration", "macos-26"),
+        ):
+            step = next(step for step in suite["jobs"][job_id]["steps"] if invocation in step.get("run", ""))
+            self.assertEqual(step["shell"], "bash")
+            prelude = step["run"].split(invocation)[0]
+            for status in (0, 23):
+                with self.subTest(job=job_id, status=status), tempfile.TemporaryDirectory() as tmp:
+                    summary = Path(tmp) / "summary.md"
+                    result = subprocess.run(
+                        ["bash", "-e", "-o", "pipefail", "-c", prelude + f"exit {status}\n"],
+                        env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary), "RUNNER_NAME": "test-runner", "AFT_NEXTEST_PARTITION": "hash:2/5"},
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    text = summary.read_text()
+                    self.assertIn(f"Runner: {runner} (test-runner)", text)
+                    self.assertRegex(text, rf"{heading}: \d+s")
 
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
@@ -875,9 +946,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         for job in ("unit-macos-libtest-shard", "unit-macos-inventory-proof"):
             steps = suite["jobs"][job]["steps"]
-            consumer = next(index for index, step in enumerate(steps) if step.get("run") in (
+            consumer = next(index for index, step in enumerate(steps) if any(command in step.get("run", "") for command in (
                 "./scripts/rust-test-gate.sh", "python3 scripts/rust-test-inventory-proof.py",
-            ))
+            )))
             for artifact, archive in (("macos-libtest-archive", "macos-libtest-nextest.tar.zst"),
                                       ("macos-bin-archive", "macos-bin-nextest.tar.zst")):
                 download = next(step for step in steps if step.get("with", {}).get("name") == artifact)

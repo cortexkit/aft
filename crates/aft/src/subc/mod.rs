@@ -15967,7 +15967,7 @@ mod tests {
             // checkout's target directory; normal tests never open a live store.
             if let Some(copy) = std::env::var_os("AFT_CPU_HUNT_STORE_COPY") {
                 let copy = std::fs::canonicalize(copy).expect("copied store exists");
-                let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+                let project = Path::new(crate::test_support::manifest_dir())
                     .parent()
                     .expect("crates directory")
                     .parent()

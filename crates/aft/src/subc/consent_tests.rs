@@ -4596,7 +4596,7 @@ async fn standalone_plugins_receive_in_process_two_phase_ask_without_cingulate()
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     for (harness, role) in [
@@ -4642,7 +4642,7 @@ async fn standalone_plugin_exemptions_skip_outside_asks_for_both_protocol_versio
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let scratch = tempfile::tempdir().unwrap();
     let scratch_file = scratch.path().join("scratch.txt");
@@ -4703,7 +4703,7 @@ async fn standalone_plugin_tokens_reject_forgery_replay_and_different_capabiliti
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     let other = f.head_root.join("other.txt");
@@ -4821,7 +4821,7 @@ async fn standalone_deferred_bash_carries_claimed_plugin_route() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     let mut route = identity(&f.worker.project_root, None);
@@ -4867,7 +4867,7 @@ async fn standalone_untrusted_arguments_cannot_replace_a_consumer_approval() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     let mut plugin = identity(&f.worker.project_root, None);
@@ -4921,7 +4921,7 @@ async fn standalone_plugin_preview_renews_approval_once_for_apply() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     let mut route = identity(&f.worker.project_root, None);
@@ -5044,7 +5044,7 @@ async fn audit2_plugin_token_cannot_cross_routes_or_sessions() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture_in(
         FakeCingulate::up(),
-        tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        tempfile::tempdir_in(crate::test_support::manifest_dir()).unwrap(),
     );
     let target = f.head_root.join("shared.txt");
     let mut a = identity(&f.worker.project_root, None);
@@ -5652,7 +5652,7 @@ fn consent_hold_budget_is_capped_at_100_seconds() {
 
 #[cfg(unix)]
 fn vector(name: &str) -> Vec<u8> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let dir = Path::new(crate::test_support::manifest_dir())
         .join("src/subc/fixtures/cingulate-tool-permission-v1/vectors");
     let bytes = std::fs::read(dir.join(name)).unwrap();
     // Each vector must be listed in Cingulate's SHA256SUMS with this hash.

@@ -15462,7 +15462,7 @@ INHERITED FLAGS
     }
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gh_shim")
+        PathBuf::from(crate::test_support::manifest_dir()).join("tests/fixtures/gh_shim")
     }
 
     fn canonical_manifest_bytes() -> Vec<u8> {

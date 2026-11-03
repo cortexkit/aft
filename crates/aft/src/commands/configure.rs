@@ -26766,7 +26766,7 @@ mod tests {
     fn cache_key_resolve_profile_native_probe() {
         let root = std::env::var_os("AFT_CACHE_KEY_PROBE_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .unwrap_or_else(|| Path::new(crate::test_support::manifest_dir()).join("../.."))
             .canonicalize()
             .unwrap();
         assert!(

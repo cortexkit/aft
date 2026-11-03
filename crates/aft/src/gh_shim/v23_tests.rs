@@ -192,7 +192,7 @@ fn dequeue_body_free_wire_retains_captured_mutation_semantics() {
 
 #[test]
 fn v23_preparer_preserves_every_baseline_field_except_the_declared_additions() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let dir = tempfile::tempdir().unwrap();
     let script = root.join("scripts/prepare-gh-shim-v23.py");
     // The production payload is not tracked. Exercise the preparer with a

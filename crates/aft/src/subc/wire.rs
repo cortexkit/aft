@@ -2003,9 +2003,10 @@ pub(super) mod tests {
         harness: &str,
         mode: subc_protocol::call_mode::CallMode,
     ) -> crate::subc::RouteIdentity {
-        let root =
-            crate::subc::ProjectRootId::from_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-                .unwrap();
+        let root = crate::subc::ProjectRootId::from_path(std::path::Path::new(
+            crate::test_support::manifest_dir(),
+        ))
+        .unwrap();
         let mut identity = crate::subc::test_support::route_identity_with_harness(
             &root,
             "result-session",

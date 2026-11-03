@@ -76,7 +76,7 @@ pub(crate) fn return_vector_paths(name: &str) -> Vec<String> {
 
 #[test]
 fn every_vendored_return_vector_matches_its_digest_and_round_trips() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let directory = std::path::Path::new(crate::test_support::manifest_dir())
         .join("src/exec_remote/fixtures/return-chunked");
     let files = std::fs::read_dir(directory).unwrap().count();
     assert_eq!(
