@@ -15,6 +15,36 @@ import record as recorder
 
 
 class InventoryTests(unittest.TestCase):
+    def test_dispatch_composition_uses_the_local_select_not_an_earlier_delete(self):
+        path = inventory.ROOT / 'crates/aft/src/views/materialization/dispatch.rs'
+        source = '''fn read() {
+let columns = "SELECT id FROM edges";
+let sql = format!("{columns} WHERE ref_id=?1");
+let old = "DELETE FROM edges WHERE ref_id=?1";
+let columns = "SELECT caller_file FROM view_dispatch_sites";
+let sql = format!("{columns} WHERE caller_file=?1");
+}'''
+        with mock.patch.object(pathlib.Path, 'rglob', return_value=[path]), mock.patch.object(pathlib.Path, 'read_text', return_value=source):
+            sql = {row['candidate'] for row in inventory.census()}
+        self.assertIn('SELECT id FROM edges WHERE ref_id=?1', sql)
+        self.assertIn('SELECT caller_file FROM view_dispatch_sites WHERE caller_file=?1', sql)
+        self.assertNotIn('DELETE FROM edges WHERE ref_id=?1 WHERE caller_file=?1', sql)
+
+    def test_external_cfg_test_modules_are_not_production_sql(self):
+        parent = inventory.ROOT / 'crates/aft/src/views/materialization.rs'
+        child = parent.parent / 'materialization/parity.rs'
+        sources = {parent: '#[cfg(test)] mod parity;', child: 'fn snapshot() { let sql = "SELECT 1"; }'}
+        with mock.patch.object(pathlib.Path, 'rglob', return_value=list(sources)), mock.patch.object(pathlib.Path, 'read_text', new=lambda path, **kwargs: sources[path]):
+            rows = inventory.census()
+        self.assertTrue(rows[0]['sites'][0]['test_only'])
+
+    def test_composed_dispatch_and_spill_sql_variants_keep_runtime_text(self):
+        row = {'candidate': 'SELECT r.ref_id FROM refs r WHERE r.kind=\'call\'', 'sites': [{'owner': 'load_name_match_refs'}]}
+        sql = {variant['variant']: variant['sql'] for variant in inventory.variants(row, [])}
+        self.assertEqual(sql['caller-file/0'], "SELECT r.ref_id FROM refs r WHERE r.kind='call' AND r.caller_file = ?1 ORDER BY r.caller_file, r.byte_start, r.ref_id")
+        row = {'candidate': 'SELECT revision FROM {PROJECTION_DELTA_SPILL_TABLE}'}
+        self.assertEqual(inventory.variants(row, [])[0]['sql'], 'SELECT revision FROM projection_delta_spill')
+
     def test_recorder_uses_short_cache_prefix_for_sqlite_paths(self):
         root = pathlib.Path('/' + 'w' * 177)
         work = root / 'target/scratch' / ('store-diet-record-' + 'a' * 40)

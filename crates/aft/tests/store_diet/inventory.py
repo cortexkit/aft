@@ -99,8 +99,13 @@ def owner_at(scopes, pos, path):
 
 def census():
     found = {}
-    for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs')):
-        text = path.read_text(encoding='utf-8')
+    sources = {path: path.read_text(encoding='utf-8') for path in sorted((ROOT / 'crates/aft/src').rglob('*.rs'))}
+    test_files = set()
+    for path, text in sources.items():
+        directory = path.parent if path.stem in {'lib', 'mod'} else path.parent / path.stem
+        for match in re.finditer(r'#\[\s*cfg\(\s*test\s*\)\s*\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;', text):
+            test_files.update({directory / (match[1] + '.rs'), directory / match[1] / 'mod.rs'})
+    for path, text in sources.items():
         scopes = rust_scopes(text)
         literals = list(strings(text))
         composed = []
@@ -109,8 +114,8 @@ def census():
                 if not fragment.startswith('{columns} '):
                     continue
                 owner = owner_at(scopes, pos, path)['owner']
-                heads = [value for head_pos, value in literals if head_pos < pos and 'FROM edges' in value and SQL.match(value) and owner_at(scopes, head_pos, path)['owner'] == owner]
-                assert heads, 'dispatch edge-read SQL prefix is not inventoried'
+                heads = [value for head_pos, value in literals if head_pos < pos and value.lstrip().startswith('SELECT ') and owner_at(scopes, head_pos, path)['owner'] == owner]
+                assert heads, 'dispatch SELECT prefix is not inventoried'
                 composed.append((pos, fragment.replace('{columns}', heads[-1])))
         for pos, sql in literals + composed:
             if not SQL.match(re.sub(r'^\s*(?:(?:--[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*', '', sql, flags=re.S)):
@@ -119,7 +124,9 @@ def census():
             # itself is the stable identity; source lines are only citations.
             key = hashlib.sha256(sql.encode()).hexdigest()[:20]
             item = found.setdefault(key, {'id': 'sql-' + key, 'baseline': sql, 'candidate': sql, 'sites': []})
-            item['sites'].append({'path': path.relative_to(ROOT).as_posix(), 'line': text.count('\n', 0, pos) + 1, **owner_at(scopes, pos, path)})
+            site = owner_at(scopes, pos, path)
+            site['test_only'] |= path in test_files
+            item['sites'].append({'path': path.relative_to(ROOT).as_posix(), 'line': text.count('\n', 0, pos) + 1, **site})
     return sorted(found.values(), key=lambda row: row['id'])
 
 
@@ -158,7 +165,7 @@ def statements(batch):
 def schemas(rows):
     result = {}
     for row in rows:
-        for sql in statements(row['baseline']):
+        for sql in statements(row['baseline'].replace('{PROJECTION_DELTA_SPILL_TABLE}', 'projection_delta_spill')):
             sql = re.sub(r'--[^\n]*', '', sql).strip()
             match = re.match(r'CREATE (?:TEMP )?TABLE (?:IF NOT EXISTS )?(\w+)\s*\(', sql, re.I)
             if not match or '{' in sql:
@@ -178,7 +185,7 @@ def schemas(rows):
             old = result.get(table)
             if old and len(old['columns']) >= len(columns):
                 continue
-            graph = table in SHARED or table.startswith('view_') or table in {'emitted_view_rows'}
+            graph = table in SHARED or table.startswith('view_') or table in {'emitted_view_rows', 'projection_delta_spill'}
             result[table] = {'table': table, 'schema_statement': row['id'], 'columns': [],
                              'graph_data': graph and table not in {'meta', 'view_sessions', 'view_usage'}}
             for _, column, kind, _, _, primary in columns:
@@ -214,9 +221,19 @@ def order_inventory(rows):
 
 
 def variants(row, tables):
-    sql = row['candidate']
+    sql = row['candidate'].replace('{PROJECTION_DELTA_SPILL_TABLE}', 'projection_delta_spill')
     expanded = [('literal', sql)]
-    if '{js}' in sql and '{rust}' in sql:
+    owners = {site.get('owner') for site in row.get('sites', [])}
+    if 'load_name_match_refs' in owners and 'SELECT r.ref_id' in sql:
+        expanded = [(label, sql + suffix + ' ORDER BY r.caller_file, r.byte_start, r.ref_id')
+                    for label, suffix in [('all', ''), ('caller-file', ' AND r.caller_file = ?1')]]
+    elif 'sample_absolute_data_path' in owners and '{column}' in sql:
+        source = (ROOT / 'crates/aft/src/callgraph_store/mod.rs').read_text(encoding='utf-8')
+        pairs = re.search(r'const STORE_DATA_PATH_COLUMNS[^=]*=\s*&\[(.*?)\];', source, re.S)
+        assert pairs, 'stored-path column list is not inventoried'
+        expanded = [(f'{table}-{column}', sql.replace('{table}', table).replace('{column}', column))
+                    for table, column in re.findall(r'\("(\w+)",\s*"(\w+)"\)', pairs[1])]
+    elif '{js}' in sql and '{rust}' in sql:
         expanded = []
         # Alias/package configuration is unbounded. Cover empty, single and OR
         # predicates, with the optional crate-directory predicate numbered last.
@@ -249,6 +266,8 @@ def variants(row, tables):
             if stable and name not in shapes:
                 continue
             if 'FROM {table} WHERE file_path IN' in sql and name not in {'view_bindings', 'view_file_surfaces'}:
+                continue
+            if 'materialize_reading' in owners and sql == 'DELETE FROM {table}' and name not in {'edges', 'refs', 'nodes', 'files', 'dispatch_hints', 'file_dependencies', 'view_bindings'}:
                 continue
             columns = shapes.get(name, [c['column'] for c in table['columns']])
             if not table['graph_data'] or not columns:
@@ -370,14 +389,18 @@ def draft_exemptions(missing, rows):
             reason = 'Static format/template fragment, not an independently emitted runtime SQL statement. Its caller must supply the identifiers, columns or predicate before this text can be traced; retain this explicit expansion gap before changing its encoding.'
         elif re.search(r':batch-(499|999)/', entry['id']) and graph_statement(row):
             reason = 'Maximum frontier batch variant; the committed fixture has fewer nodes than this batch boundary, so none of its queries can emit this exact expansion.'
+        elif row['id'] == 'sql-931c083160eaedd719e7':
+            reason = 'Test-only per-reference lookup control is disabled; ordinary materialization uses the batched production lookup.'
         elif '/views/materialization/' in path or path.endswith('/views/materialization.rs'):
-            reason = 'Incremental/diff, retained-row, dispatch-data or resolution-input branch not reached by the fixed cold-materialization corpus; no changed manifest or receiver-language scenario invokes this owner branch.'
+            reason = 'This exact retained-row, dispatch-data or resolution-input SQL variant is not emitted by the selected cold and changed-manifest cases. Other variants in the owner may be traced; this exemption is not a claim that no diff workload ran.'
+        elif path.endswith('/views/registry.rs'):
+            reason = 'Legacy SQLite registry operation is not emitted by the v3 wire workload. V3 publication uses the blob-store registry rather than this legacy connection.'
         elif '/views/' in path:
             reason = 'Publication, borrowed/sealed generation, registry/eviction, verification or semantic-plane owner workload is absent from the direct cold graph fixture; its owner is not a graph adapter operation.'
         elif '/callgraph_store/' in path:
-            reason = 'Alternate refresh/staging-resume, read-only wrapper, backend/dispatch or data-dependent resolver branch absent from the fixed cold-store/query corpus. No edit, resumed generation, borrowed publication or matching receiver/symbol-kind workload reaches this owner branch.'
+            reason = 'This exact refresh/staging-resume, read-only, backend/dispatch or resolver variant is not emitted by the selected cold-store and query cases. Other variants in the owner may execute; the corpus does not request every legacy refresh, migration, resumed generation or receiver combination.'
         elif '/inspect/' in path or path.endswith('/commands/inspect.rs'):
-            reason = 'Inspect cache/scanner/backend branch not reached by this fixed graph corpus and its selected graph categories; no diagnostics/failure/cache-repair workload invokes this owner branch.'
+            reason = 'The direct adapter fixture does not run inspect, and the six-operation wire manifest explicitly disables inspect. No inspect cache/scanner/Tier-2 workload requests this statement.'
         else:
             reason = 'Separate state/ledger, storage maintenance, migration, blob-version or failure-path owner workload not requested by the graph query manifest; no corresponding administrative or mutation API call is present.'
         result[entry['id']] = reason + ' Owner: ' + location

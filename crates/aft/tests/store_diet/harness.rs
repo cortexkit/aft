@@ -346,6 +346,17 @@ fn plans(store: &CallGraphStore) -> Value {
     // graph fixture. Keep their schemas on a separate in-memory connection.
     // Actual graph plans always use the real fixture's schema first.
     let auxiliary = Connection::open_in_memory().unwrap();
+    for connection in [&*conn, &auxiliary] {
+        connection
+            .create_scalar_function(
+                "aft_is_test_file",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| Ok(crate::inspect::job::is_test_file(&ctx.get::<String>(0)?)),
+            )
+            .unwrap();
+    }
     let mut schema = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND type IN ('table','index') ORDER BY type DESC").unwrap();
     for sql in schema.query_map([], |row| row.get::<_, String>(0)).unwrap() {
         let _ = auxiliary.execute_batch(&sql.unwrap());
@@ -403,6 +414,12 @@ fn plans(store: &CallGraphStore) -> Value {
                 rows.collect()
             };
             let plan = explain(&conn).or_else(|_| explain(&auxiliary));
+            if sql.contains("aft_is_test_file(") {
+                assert!(
+                    plan.is_ok(),
+                    "test-file classifier query must prepare: {plan:?}"
+                );
+            }
             result.insert(
                 key,
                 match plan {
@@ -680,6 +697,18 @@ fn store_diet_transient_and_backend_values() {
         .unwrap()
         .clear();
     store.conn.lock().unwrap().trace(Some(|sql| {
+        // Installing a local observer replaces SQLite's connection callback.
+        // Forward the same bytes to the optional SQL trace log as one append.
+        if let Some(path) = std::env::var_os("AFT_STORE_DIET_SQL_TRACE") {
+            let mut bytes = serde_json::to_vec(sql).unwrap();
+            bytes.push(b'\n');
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            std::io::Write::write_all(&mut log, &bytes).unwrap();
+        }
         VALUE_PROBE_TRACE
             .get()
             .unwrap()
