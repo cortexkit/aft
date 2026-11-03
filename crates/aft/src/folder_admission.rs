@@ -463,7 +463,18 @@ pub fn probe(
     policy: &ProjectDetectionConfig,
     budgets: ProbeBudgets,
 ) -> FolderAdmission {
-    probe_with_read_dir(root, policy, budgets, |path| std::fs::read_dir(path))
+    probe_with_read_dir(root, policy, budgets, |path| {
+        // Model a slow directory open (for example, an antivirus scan) without
+        // changing the evidence budget or delaying direct metadata lookups.
+        #[cfg(debug_assertions)]
+        if let Some(delay) = std::env::var("AFT_TEST_ADMISSION_READ_DIR_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        std::fs::read_dir(path)
+    })
 }
 
 fn probe_with_read_dir(
@@ -1165,6 +1176,31 @@ mod tests {
         assert_eq!(result.observed.entries, 0);
         assert_eq!(result.observed.root_markers, ["Cargo.toml"]);
         assert!(!result.coverage.complete);
+    }
+
+    #[test]
+    fn strong_root_evidence_does_not_open_a_directory() {
+        for name in ["Cargo.toml", "package.json", "Makefile", ".git"] {
+            let root = tempfile::tempdir().unwrap();
+            if name == ".git" {
+                git(root.path(), &["init", "-q"]);
+            } else {
+                file(root.path(), name);
+            }
+            let result = probe_with_read_dir(
+                root.path(),
+                &ProjectDetectionConfig::default(),
+                ProbeBudgets::default(),
+                |_| panic!("directory enumeration preceded strong {name} evidence"),
+            );
+            assert_eq!(
+                result.classification,
+                FolderClassification::Project,
+                "{name}: {result:?}"
+            );
+            assert_eq!(result.coverage.stop, ProbeStop::StrongEvidence);
+            assert_eq!(result.observed.entries, 0);
+        }
     }
 
     #[test]
