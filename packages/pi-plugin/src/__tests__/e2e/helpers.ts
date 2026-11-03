@@ -19,6 +19,7 @@ import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
 import { hermeticGitChildEnv, withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { warmMacosExec } from "../../../../../tests/helpers/macos-exec-warm.js";
+import { markProject } from "../../../../../tests/helpers/project.js";
 import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
 
@@ -249,6 +250,7 @@ export async function createHarness(
     if (!options.noFixtures) {
       await copyFixturesToTempDir(tempDir, options.fixtureNames);
     }
+    await markProject(tempDir);
   } catch (err) {
     await rm(tempDir, { recursive: true, force: true });
     throw err;
