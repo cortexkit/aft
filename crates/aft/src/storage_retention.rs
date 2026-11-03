@@ -2450,7 +2450,13 @@ fn sweep_view_generations(
                 }
                 Err(error) => {
                     report.skipped_protected += 1;
-                    let conditions = report.conditions(&error);
+                    let conditions = match &error {
+                        crate::views::ViewError::Io(error)
+                        | crate::views::ViewError::IoAt { source: error, .. } => {
+                            report.conditions(error)
+                        }
+                        _ => &mut report.errors,
+                    };
                     if conditions.len() < 16 {
                         conditions.push(format!("{}: {error}", path.display()));
                     }
@@ -6603,7 +6609,11 @@ fn collect_v3_family_at(
             }
             Err(error) => {
                 let conditions = match &error {
-                    crate::views::base_refs::BaseRefError::Io(error) => report.conditions(error),
+                    crate::views::base_refs::BaseRefError::Io(error)
+                    | crate::views::base_refs::BaseRefError::View(
+                        crate::views::ViewError::Io(error)
+                        | crate::views::ViewError::IoAt { source: error, .. },
+                    ) => report.conditions(error),
                     _ => &mut report.errors,
                 };
                 if conditions.len() < 16 {
