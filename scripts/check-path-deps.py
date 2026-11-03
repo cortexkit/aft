@@ -175,7 +175,12 @@ def check_root(root: Path) -> tuple[list[str], list[str], list[str], int, int, i
             if error is not None:
                 relative = manifest.relative_to(root).as_posix()
                 message = f"{relative}: cargo locate-project failed: {error}"
-                if relative.startswith("crates/aft/tests/fixtures/"):
+                # Test-input crates (call-graph fixtures and the store-diet
+                # corpus) are parsed as source, never built, and sit inside
+                # the repository's workspace without being members of it.
+                if relative.startswith(
+                    ("crates/aft/tests/fixtures/", "crates/aft/tests/store_diet/corpus/")
+                ):
                     unchecked.append(message)
                 else:
                     errors.append(message)
