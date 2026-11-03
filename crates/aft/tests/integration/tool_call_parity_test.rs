@@ -15,6 +15,22 @@ const SESSION_ID: &str = "tool-call-parity-session";
 // idle maintenance drain can start after the last probe, even without OS events.
 const WATCHER_QUIET_WINDOW: Duration = Duration::from_millis(250);
 
+fn parity_project() -> tempfile::TempDir {
+    // Release-profile tools skip OS-temp undo snapshots, while the conflicts
+    // case must not discover this checkout as an ancestor Git repository.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("parity fixture home directory");
+    let scratch = std::path::PathBuf::from(home).join(".cache/aft-parity-projects");
+    fs::create_dir_all(&scratch).expect("create parity scratch root");
+    let project = tempfile::Builder::new()
+        .prefix("project-")
+        .tempdir_in(scratch)
+        .expect("create parity project");
+    fs::write(project.path().join("Makefile"), "").expect("declare fixture project");
+    project
+}
+
 struct ParityCase {
     label: &'static str,
     tool: &'static str,
@@ -51,8 +67,8 @@ fn tool_call_glob_matches_direct_spine_with_equal_mtimes() {
 }
 
 fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
-    let direct_project = tempfile::tempdir().expect("direct temp project");
-    let tool_call_project = tempfile::tempdir().expect("tool_call temp project");
+    let direct_project = parity_project();
+    let tool_call_project = parity_project();
     create_fixture_project(direct_project.path(), glob_mtimes);
     create_fixture_project(tool_call_project.path(), glob_mtimes);
 
@@ -92,7 +108,7 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
             &format!("{}-direct", case.label),
             replay_safe,
         );
-        let tool_call_response = send_quiescent_parity_request(
+        let mut tool_call_response = send_quiescent_parity_request(
             &mut tool_call_aft,
             tool_call_project.path(),
             tool_call_request,
@@ -173,6 +189,11 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
             .as_object_mut()
             .expect("direct response is object")
             .insert("text".to_string(), Value::String(expected_text));
+
+        if case.tool == "status" {
+            normalize_status_admission_clocks(&mut expected_envelope);
+            normalize_status_admission_clocks(&mut tool_call_response);
+        }
 
         let expected_envelope = normalized_envelope(
             expected_envelope,
@@ -368,7 +389,7 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
     use std::sync::Arc;
 
     crate::helpers::disable_in_process_file_watcher();
-    let project = tempfile::tempdir().unwrap();
+    let project = parity_project();
     let root = project.path().canonicalize().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let path = root.join("todos.rs");
@@ -399,6 +420,18 @@ fn parity_waits_for_real_maintenance_drain_between_calls() {
     .unwrap();
     let configured = aft::commands::configure::handle_configure(&configure, &ctx);
     assert!(configured.success, "{configured:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+        if !ctx.root_too_broad() && ctx.config().project_root.as_deref() == Some(root.as_path()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture configure did not become active"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     ctx.isolate_cold_build_limiter_for_test(2);
     ctx.set_harness(aft::harness::Harness::Opencode);
     ctx.set_heavy_root_work_allowed(true);
@@ -613,7 +646,7 @@ fn watcher_quiet_window_requires_an_uninterrupted_clear_interval() {
 
 #[test]
 fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
-    let project = tempfile::tempdir().expect("hashline carrier temp project");
+    let project = parity_project();
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("hashline-carrier.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write hashline carrier fixture");
@@ -701,7 +734,7 @@ fn standalone_tool_call_carries_hashline_registration_for_later_sessions() {
 
 #[test]
 fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
-    let project = tempfile::tempdir().expect("hashline temp project");
+    let project = parity_project();
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("hashline.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write hashline fixture");
@@ -839,7 +872,7 @@ fn hashline_tool_call_activates_read_edit_undo_and_seamless_default_rebind() {
 
 #[test]
 fn plugin_harness_without_edit_registration_fails_safe_to_default_once() {
-    let project = tempfile::tempdir().expect("unregistered plugin temp project");
+    let project = parity_project();
     let root = std::fs::canonicalize(project.path()).expect("canonical project");
     let file = root.join("default.txt");
     fs::write(&file, "alpha\nbeta\n").expect("write default fixture");
@@ -1024,7 +1057,7 @@ fn edit_contract_translation_preserves_exact_code_then_message() {
 
 #[test]
 fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
-    let project = tempfile::tempdir().expect("tool_call edit temp project");
+    let project = parity_project();
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     fs::write(&target, "const value = old;\n").expect("write edit fixture");
@@ -1058,7 +1091,7 @@ fn edit_tool_call_applies_edits_with_empty_optional_mode_sentinels() {
 
 #[test]
 fn edit_tool_call_applies_find_replace_with_empty_line_range_sentinels() {
-    let project = tempfile::tempdir().expect("tool_call find/replace sentinel temp project");
+    let project = parity_project();
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     fs::write(&target, "const value = before;\n").expect("write edit fixture");
@@ -1095,7 +1128,7 @@ fn edit_tool_call_applies_find_replace_with_empty_line_range_sentinels() {
 
 #[test]
 fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
-    let project = tempfile::tempdir().expect("tool_call line-range sentinel temp project");
+    let project = parity_project();
     let target = project.path().join("src/example.ts");
     fs::create_dir_all(target.parent().expect("example parent")).expect("create src directory");
     let original = (1..14)
@@ -1141,7 +1174,7 @@ fn edit_tool_call_applies_line_range_edit_with_find_replace_sentinels() {
 
 #[test]
 fn unsupported_translate_tools_still_raw_dispatch_native_commands() {
-    let project = tempfile::tempdir().expect("tool_call configure temp project");
+    let project = parity_project();
     let mut aft = AftProcess::spawn();
     let response = send_json(
         &mut aft,
@@ -1361,6 +1394,25 @@ fn configure_project(aft: &mut AftProcess, root: &Path, id: &str) {
         }),
     );
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    // A successful configure acknowledges the request. Compare tool replies
+    // only after its requested project is active and not in degraded mode.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = send_json(
+            aft,
+            json!({"id": format!("{id}-ready"), "command": "status"}),
+        );
+        assert_eq!(status["success"], true, "{status}");
+        if status["project_root"] == root.to_string_lossy().as_ref() && status["degraded"] == false
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture configure did not settle: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn direct_request(id: &str, tool: &str, arguments: &Value, project_root: &Path) -> Value {
@@ -1427,6 +1479,99 @@ fn response_from_wire(value: &Value) -> Response {
 fn normalized_envelope(mut value: Value, project_root: &Path, cache_dir: &Path) -> Value {
     normalize_value(&mut value, project_root, cache_dir);
     value
+}
+
+fn normalize_status_admission_clocks(value: &mut Value) {
+    // Older status replies have no folder diagnostics. When present, only
+    // the independent observation clocks differ between the two processes.
+    let Some(folder) = value.get_mut("folder") else {
+        return;
+    };
+    assert!(
+        folder.is_object(),
+        "status folder diagnostics must be an object"
+    );
+    assert!(
+        folder
+            .get("observed_at_ms")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "status folder observed_at_ms must be a present non-negative integer"
+    );
+    assert!(
+        folder
+            .get("coverage")
+            .and_then(|coverage| coverage.get("elapsed_ms"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        "status folder coverage.elapsed_ms must be a present non-negative integer"
+    );
+    folder["observed_at_ms"] = json!("<observed_at_ms>");
+    folder["coverage"]["elapsed_ms"] = json!("<elapsed_ms>");
+}
+
+#[test]
+fn status_admission_clocks_are_optional_on_old_engine_and_only_clocks_are_masked() {
+    let mut old = json!({"success": true, "state": "ready"});
+    let before = old.clone();
+    normalize_status_admission_clocks(&mut old);
+    assert_eq!(old, before);
+    let original = json!({"folder": {
+        "state": "decided", "reason": "root_marker", "observed_at_ms": 100,
+        "observed": {"eligible_source_files": 2},
+        "coverage": {"complete": false, "time_budget_ms": 100, "elapsed_ms": 1}
+    }, "other_status_fact": 7});
+    let mut expected = original.clone();
+    normalize_status_admission_clocks(&mut expected);
+    let mut clocks = original.clone();
+    clocks["folder"]["observed_at_ms"] = json!(200);
+    clocks["folder"]["coverage"]["elapsed_ms"] = json!(5);
+    normalize_status_admission_clocks(&mut clocks);
+    assert_eq!(clocks, expected);
+    for (path, replacement) in [
+        ("/folder/state", json!("pending")),
+        ("/folder/reason", json!("no_project_evidence")),
+        ("/folder/observed/eligible_source_files", json!(3)),
+        ("/folder/coverage/time_budget_ms", json!(200)),
+        ("/other_status_fact", json!(8)),
+    ] {
+        let mut changed = original.clone();
+        *changed.pointer_mut(path).unwrap() = replacement;
+        normalize_status_admission_clocks(&mut changed);
+        assert_ne!(changed, expected, "{path}");
+    }
+}
+
+#[test]
+fn status_admission_clock_normalization_rejects_missing_and_malformed_fields() {
+    let original = json!({"folder": {"observed_at_ms": 0, "coverage": {"elapsed_ms": 0}}});
+    for path in ["/folder/observed_at_ms", "/folder/coverage/elapsed_ms"] {
+        for replacement in [Value::Null, json!(-1), json!(1.5), json!("1")] {
+            let mut malformed = original.clone();
+            *malformed.pointer_mut(path).unwrap() = replacement;
+            assert!(
+                std::panic::catch_unwind(move || normalize_status_admission_clocks(&mut malformed))
+                    .is_err()
+            );
+        }
+    }
+    for key in ["observed_at_ms", "coverage"] {
+        let mut missing = original.clone();
+        missing["folder"].as_object_mut().unwrap().remove(key);
+        assert!(
+            std::panic::catch_unwind(move || normalize_status_admission_clocks(&mut missing))
+                .is_err()
+        );
+    }
+    let mut missing_elapsed = original;
+    missing_elapsed["folder"]["coverage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("elapsed_ms");
+    assert!(
+        std::panic::catch_unwind(move || normalize_status_admission_clocks(&mut missing_elapsed))
+            .is_err()
+    );
 }
 
 fn assert_lifecycle_census_presence(response: &Value) {

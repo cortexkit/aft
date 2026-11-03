@@ -1,6 +1,59 @@
 use super::*;
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
+#[test]
+fn typescript_object_unknown_liveness_stream_matches_reference_and_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("objects.sqlite");
+    let connection = blobs(&blob_path);
+    let base = manifest_of(
+        &connection,
+        &[
+            (
+                "types.ts",
+                "export class A { run() {} } export class B { run() {} }",
+            ),
+            (
+                "caller.ts",
+                "export function caller(x) { x.run(); x.run(); }",
+            ),
+        ],
+    );
+    let next = manifest_of(
+        &connection,
+        &[
+            (
+                "types.ts",
+                "export class A { run() {} } export class B { run() {} }",
+            ),
+            ("caller.ts", "export function caller(x) { x.run(); }"),
+        ],
+    );
+    drop(connection);
+    let streamed = dir.path().join("streamed.sqlite");
+    let reference = dir.path().join("reference.sqlite");
+    materialize_manifest_view_database(&streamed, &blob_path, &base).unwrap();
+    dispatch::WRITE_ROW_BY_ROW.with(|flag| flag.set(true));
+    let result = materialize_manifest_view_database(&reference, &blob_path, &base);
+    dispatch::WRITE_ROW_BY_ROW.with(|flag| flag.set(false));
+    result.unwrap();
+    parity::assert_logical_parity(&streamed, &reference);
+    let count = |path: &Path| {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM view_unknown_live", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(count(&streamed), 4);
+    apply_manifest_diff(&streamed, &base, &next, &blob_path).unwrap();
+    let cold = dir.path().join("cold-next.sqlite");
+    materialize_manifest_view_database(&cold, &blob_path, &next).unwrap();
+    assert_eq!(count(&streamed), 2);
+    parity::assert_logical_parity(&streamed, &cold);
+}
+
 fn manifest(connection: &Connection, types: &str) -> Manifest {
     // Dispatch assertions read these blobs after setup; batch fixture writes
     // rather than paying for a durable commit for each input on Windows.
@@ -225,7 +278,7 @@ fn public_unknown_dynamic_counts_and_liveness_projection() {
     for (language, source) in [
         ("typescript", "class A { m() {} }\nclass B { private m(a: number) {} n() {} }\nfunction caller(x, name) { x.m(); x[name](); }"),
         ("javascript", "class A { m() {} }\nclass B { m(a) {} n() {} }\nfunction caller(x, name) { x.m(); x[name](); }"),
-        ("python", "class A:\n def m(self): pass\nclass B:\n def m(self, a): pass\n def n(self): pass\ndef caller(x, name):\n x.m()\n getattr(x, name)()\n"),
+        ("python", "from abc import abstractmethod\nclass A:\n @abstractmethod\n def m(self): pass\nclass B:\n def m(self, a): pass\n def n(self): pass\ndef caller(x, name):\n x.m()\n getattr(x, name)()\n"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let payload = join::CallgraphBlob::extract(source, language, "dispatch-proof").unwrap().to_bytes().unwrap();
@@ -256,6 +309,8 @@ fn manifest_of(connection: &Connection, files: &[(&str, &str)]) -> Manifest {
     Manifest::new(files.iter().map(|(path, source)| {
         let language = if path.ends_with(".rs") {
             "rust"
+        } else if path.ends_with(".py") {
+            "python"
         } else {
             "typescript"
         };
@@ -315,6 +370,99 @@ fn count(database: &Path, sql: &str) -> usize {
         .unwrap()
         .query_row(sql, [], |row| row.get(0))
         .unwrap()
+}
+
+#[test]
+fn python_super_imported_bases_relink_in_mro_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("blobs.sqlite");
+    let connection = blobs(&blob_path);
+    let bases = "class Zulu:\n def __init__(self): pass\nclass Alpha:\n def __init__(self): pass\n";
+    let before = manifest_of(&connection, &[
+        ("bases.py", bases),
+        ("child.py", "from bases import Zulu, Alpha\nclass Child(Zulu, Alpha):\n def __init__(self):\n  super().__init__()\n"),
+    ]);
+    let after = manifest_of(&connection, &[
+        ("bases.py", bases),
+        ("child.py", "from bases import Zulu, Alpha\nclass Child(Alpha, Zulu):\n def __init__(self):\n  super().__init__()\n"),
+    ]);
+    drop(connection);
+    let cold = dir.path().join("before.sqlite");
+    materialize_manifest_view_database(&cold, &blob_path, &before).unwrap();
+    assert_eq!(
+        count(&cold, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&cold, "SELECT count(*) FROM edges WHERE target_symbol='Zulu::__init__' AND provenance='exact'"), 1);
+    apply_manifest_diff(&cold, &before, &after, &blob_path).unwrap();
+    let updated = dir.path().join("after.sqlite");
+    materialize_manifest_view_database(&updated, &blob_path, &after).unwrap();
+    parity::assert_logical_parity(&cold, &updated);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_symbol='Alpha::__init__' AND provenance='exact'"), 1);
+}
+
+#[test]
+fn python_super_unbound_base_does_not_select_a_project_homonym() {
+    for child in [
+        "def unrelated():\n from bases import Zulu\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+        "from bases import Zulu\nZulu = external\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+        "from library import Zulu\nclass Child(Zulu):\n def __init__(self):\n  super().__init__()\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("blobs.sqlite");
+        let connection = blobs(&blob_path);
+        let manifest = manifest_of(&connection, &[
+            ("bases.py", "class Zulu:\n def __init__(self): pass\n"),
+            ("child.py", child),
+        ]);
+        drop(connection);
+        let database = dir.path().join("derived.sqlite");
+        materialize_manifest_view_database(&database, &blob_path, &manifest).unwrap();
+        assert_eq!(count(&database, "SELECT count(*) FROM edges WHERE kind='call'"), 0, "{child}");
+    }
+}
+
+#[test]
+fn python_super_forwarded_base_refreshes_an_untouched_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = [
+        ("a.py", "class Zulu:\n def __init__(self): pass\n"),
+        ("b.py", "class Alpha:\n def __init__(self): pass\n"),
+        ("forward.py", "from a import Zulu as Base\n"),
+        ("child.py", "from forward import Base\nclass Child(Base):\n def __init__(self):\n  super().__init__()\n"),
+    ];
+    let mut after = before;
+    after[2] = ("forward.py", "from b import Alpha as Base\n");
+    let (updated, _) = incremental_matches_cold(dir.path(), &before, &after);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_symbol='Alpha::__init__' AND provenance='exact'"), 1);
+}
+
+#[test]
+fn python_super_new_package_takes_precedence_over_an_existing_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = [
+        ("base.py", "class Base:\n def __init__(self): pass\n"),
+        ("child.py", "from base import Base\nclass Child(Base):\n def __init__(self):\n  super().__init__()\n"),
+    ];
+    let mut after = before.to_vec();
+    after.push((
+        "base/__init__.py",
+        "class Base:\n def __init__(self): pass\n",
+    ));
+    let (updated, _) = incremental_matches_cold(dir.path(), &before, &after);
+    assert_eq!(
+        count(&updated, "SELECT count(*) FROM edges WHERE kind='call'"),
+        1
+    );
+    assert_eq!(count(&updated, "SELECT count(*) FROM edges WHERE target_file='base/__init__.py' AND provenance='exact'"), 1);
 }
 
 const INTERFACE: &str = "export interface I { m(): void; }";

@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/parser.rs"
+  ],
+  "note": "The only ranking fence hit is crates/aft/src/parser.rs, where truncate_signature becomes pub(crate) so the call-graph resolver can shorten signatures the same way; its body is unchanged. Everything else changes call-graph resolution (Go, Python, TypeScript and Rust callers), which search does not read, so ranked rows must remain byte-identical to the committed reference."
+}

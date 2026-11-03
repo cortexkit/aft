@@ -82,7 +82,7 @@
       "typescript": 5
     },
     "nodes.id_form": {
-      "digest": 3
+      "view:symbol:pos:symbol:": 3
     },
     "refs.id_form": {
       "view:": 6
@@ -95,7 +95,7 @@
     "edges.without_ref_row": 1
   },
   "dispatch_shapes": {
-    "method:trait=false;body=true;private=false;shape=->": 2,
+    "method:trait=false;body=true;private=false;shape=": 2,
     "site:receiver=true;member=true;caller=false;dynamic=false;blob_ref=true": 1,
     "site:receiver=true;member=true;caller=true;dynamic=false;blob_ref=false": 1,
     "site:receiver=true;member=true;caller=true;dynamic=false;blob_ref=true": 3,
