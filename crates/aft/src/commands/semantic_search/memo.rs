@@ -17,6 +17,8 @@ const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 const MAX_EXACT_MEMO_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETIRED_POISONED_KEYS: usize = 128;
 const MAX_LITERAL_PRESENCE_ENTRIES: usize = 128;
+const MAX_LITERAL_PRESENCE_BYTES: usize = 1024 * 1024;
+const MAX_RETIRED_POISONED_BYTES: usize = 1024 * 1024;
 
 /// Whether some file holds a code literal's whole text, as one search settled
 /// it. `Undetermined` means the check could not finish (its read bound ran
@@ -367,7 +369,25 @@ impl ExactMemoStore {
     /// is full it starts over, which only costs a later page one re-check.
     pub fn store_literal_presence(&self, key: LiteralPresenceKey, entry: LiteralPresenceEntry) {
         let mut cache = self.literal_presence.lock();
-        if cache.len() >= MAX_LITERAL_PRESENCE_ENTRIES && !cache.contains_key(&key) {
+        let incoming = literal_presence_bytes(&key, &entry).saturating_add(map_storage_bytes::<
+            LiteralPresenceKey,
+            LiteralPresenceEntry,
+        >(
+            MAX_LITERAL_PRESENCE_ENTRIES,
+        ));
+        cache.retain(|old, _| old.0 != key.0 || old.2 != key.2 || old.1 == key.1);
+        if incoming > MAX_LITERAL_PRESENCE_BYTES {
+            cache.remove(&key);
+            return;
+        }
+        let retained = cache
+            .iter()
+            .filter(|(old, _)| *old != &key)
+            .map(|(key, entry)| literal_presence_bytes(key, entry))
+            .sum::<usize>();
+        if (cache.len() >= MAX_LITERAL_PRESENCE_ENTRIES && !cache.contains_key(&key))
+            || retained.saturating_add(incoming) > MAX_LITERAL_PRESENCE_BYTES
+        {
             cache.clear();
         }
         cache.insert(key, entry);
@@ -437,6 +457,7 @@ impl ExactMemoStore {
             )
             .count("lifecycle_keys", lifecycle.len())
             .count("literal_presence_entries", presence.len())
+            .count("payload_budget_bytes", MAX_EXACT_MEMO_BYTES)
             .gap("in_flight_verifiers_and_detached_readers")
     }
 
@@ -482,6 +503,12 @@ impl ExactMemoStore {
             .filter(|state| state.retired_at.is_some())
             .count()
             > MAX_RETIRED_POISONED_KEYS
+            || lifecycle
+                .iter()
+                .filter(|(_, state)| state.retired_at.is_some())
+                .map(|(key, _)| key_bytes(key))
+                .sum::<usize>()
+                > MAX_RETIRED_POISONED_BYTES
         {
             let oldest = lifecycle
                 .iter()
@@ -493,23 +520,59 @@ impl ExactMemoStore {
         }
     }
 
-    fn make_room_for(&self, key: &MemoKey) {
+    // The result set is still served in full. Only cache ownership is bounded:
+    // an old index generation cannot answer this query on a newer snapshot.
+    fn make_room_for(&self, key: &MemoKey, incoming_bytes: usize) -> bool {
         let mut entries = self.entries.write();
-        if entries.len() < MAX_EXACT_MEMO_ENTRIES || entries.contains_key(key) {
-            return;
-        }
-        let victim = entries
+        let obsolete: Vec<_> = entries
             .keys()
-            .next()
+            .filter(|old| {
+                old.project_root == key.project_root
+                    && old.normalized_query == key.normalized_query
+                    && old.include_tests == key.include_tests
+                    && old.evidence_scope == key.evidence_scope
+                    && old.snapshot_generation != key.snapshot_generation
+            })
             .cloned()
-            .expect("full memo has a payload");
-        let entry = entries.remove(&victim).expect("selected payload exists");
-        if entry.poisoned {
-            let mut lifecycle = self.lifecycle.write();
-            let state = lifecycle.entry(victim).or_default();
-            state.poisoned = true;
-            state.retired_at = None;
+            .collect();
+        let retire = |entries: &mut HashMap<MemoKey, Arc<MemoEntry>>, victim: MemoKey| {
+            let entry = entries.remove(&victim).expect("selected payload exists");
+            if entry.poisoned {
+                let mut lifecycle = self.lifecycle.write();
+                let state = lifecycle.entry(victim).or_default();
+                state.poisoned = true;
+                state.retired_at = None;
+            }
+        };
+        for old in obsolete {
+            retire(&mut entries, old);
         }
+        let incoming = incoming_bytes
+            .saturating_add(key_bytes(key))
+            .saturating_add(map_storage_bytes::<MemoKey, Arc<MemoEntry>>(
+                MAX_EXACT_MEMO_ENTRIES,
+            ));
+        if incoming > MAX_EXACT_MEMO_BYTES {
+            return false;
+        }
+        while entries.len() >= MAX_EXACT_MEMO_ENTRIES
+            || entries
+                .iter()
+                .map(|(key, entry)| key_bytes(key).saturating_add(entry.retained_bytes))
+                .sum::<usize>()
+                .saturating_add(incoming)
+                > MAX_EXACT_MEMO_BYTES
+        {
+            let Some(victim) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.epoch)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            retire(&mut entries, victim);
+        }
+        true
     }
 
     fn invalidate_observed_entry(&self, key: &MemoKey, entry: &Arc<MemoEntry>) {
@@ -573,8 +636,9 @@ impl ExactMemoStore {
     /// One verifier is active per key/epoch; failed attempts remain retryable.
     /// A digest mismatch retires only the observed payload. Detached old pages
     /// report void stability without invalidating a newer replacement payload.
-    /// Poison survives rebuilds while the key is cached or among the last 128
-    /// retired poisons, because pages across changed contents are not one stable set.
+    /// Poison survives rebuilds while the key is cached or in the bounded retired
+    /// history (128 keys, at most 1 MiB of key buffers), because pages across
+    /// changed contents are not one stable set.
     pub fn get_or_verify<F>(
         &self,
         key: &MemoKey,
@@ -723,8 +787,9 @@ impl ExactMemoStore {
                     "exact verification superseded by memo lifecycle change".to_string(),
                 ));
             }
-            self.make_room_for(key);
-            self.entries.write().insert(key.clone(), entry.clone());
+            if self.make_room_for(key, entry.retained_bytes) {
+                self.entries.write().insert(key.clone(), entry.clone());
+            }
             self.prune_lifecycle(&admission);
         }
         drop(permit);
@@ -760,9 +825,36 @@ impl ExactMemoStore {
     /// Drop entries and poison history without reusing publication epochs.
     pub fn clear(&self) {
         let _admission = self.in_flight.lock();
-        self.entries.write().clear();
-        self.lifecycle.write().clear();
-        self.literal_presence.lock().clear();
+        *self.entries.write() = HashMap::new();
+        *self.lifecycle.write() = HashMap::new();
+        *self.literal_presence.lock() = HashMap::new();
+    }
+
+    /// Idle reaping never waits for a verifier or a reader holding a cache lock.
+    pub(crate) fn try_clear_idle(&self) -> bool {
+        let Some(admission) = self.in_flight.try_lock() else {
+            return false;
+        };
+        if !admission.is_empty() {
+            return false;
+        }
+        let Some(mut entries) = self.entries.try_write() else {
+            return false;
+        };
+        let Some(mut lifecycle) = self.lifecycle.try_write() else {
+            return false;
+        };
+        let Some(mut presence) = self.literal_presence.try_lock() else {
+            return false;
+        };
+        let retired = (
+            std::mem::take(&mut *entries),
+            std::mem::take(&mut *lifecycle),
+            std::mem::take(&mut *presence),
+        );
+        drop((presence, lifecycle, entries, admission));
+        drop(retired);
+        true
     }
 }
 
@@ -1323,5 +1415,57 @@ mod tests {
             !memo.has_live_entry(&key),
             "oversized payload remains retained"
         );
+    }
+
+    #[test]
+    fn exact_memo_payload_budget_counts_capacity_not_just_result_count() {
+        let memo = ExactMemoStore::new();
+        for query in 0..7 {
+            let key = audit01_key(&format!("different-{query}"));
+            let mut results =
+                Vec::with_capacity(2 * 1024 * 1024 / std::mem::size_of::<CandidateResult>());
+            results.push(CandidateResult::new_exact(
+                PathBuf::from("/project/file.rs"),
+                None,
+                EvidenceDescriptor::for_e1(1, true, false),
+            ));
+            let page = memo
+                .get_or_verify(&key, 0, 10, || {
+                    Ok(VerifiedExactSet {
+                        results,
+                        file_digests: HashMap::new(),
+                        bound_disclosure: None,
+                        stability_void: false,
+                    })
+                })
+                .unwrap();
+            assert_eq!(page.results.len(), 1);
+        }
+        assert!(memo.entry_count() <= 3, "seven two-MiB backing vectors exceed the cache budget despite containing only seven results");
+        assert!(memo.estimated_memory().estimated_bytes.unwrap() < MAX_EXACT_MEMO_BYTES as u64);
+        assert!(memo.try_clear_idle());
+        assert_eq!(memo.estimated_memory().estimated_bytes, Some(0));
+    }
+
+    #[test]
+    fn exact_memo_literal_presence_has_a_byte_budget() {
+        let memo = ExactMemoStore::new();
+        let key = (
+            PathBuf::from("/project"),
+            GenerationToken::new_with_str("generation"),
+            "literal".into(),
+        );
+        memo.store_literal_presence(
+            key.clone(),
+            LiteralPresenceEntry {
+                presence: LiteralPresence::Absent,
+                read: Vec::new(),
+                candidates: Vec::with_capacity(
+                    MAX_LITERAL_PRESENCE_BYTES / std::mem::size_of::<PathBuf>() + 1,
+                ),
+            },
+        );
+        assert!(memo.literal_presence(&key).is_none());
+        assert_eq!(memo.estimated_memory().estimated_bytes, Some(0));
     }
 }

@@ -27,6 +27,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
@@ -57,12 +58,12 @@ pub struct TomlFilter {
     pub source: FilterSource,
     pub matches: Vec<String>,
     pub description: Option<String>,
-    pub strip: Vec<Regex>,
+    pub strip: Vec<Arc<Regex>>,
     pub line_max: usize,
     pub max_lines: usize,
     pub keep: KeepMode,
     pub class_cap: Option<TomlClassCap>,
-    pub shortcircuit_when: Option<Regex>,
+    pub shortcircuit_when: Option<Arc<Regex>>,
     pub shortcircuit_replacement: Option<String>,
     pub strip_ansi: bool,
 }
@@ -87,7 +88,7 @@ pub enum KeepMode {
 pub struct TomlClassCap {
     pub class: DropClass,
     pub max: usize,
-    pub patterns: Vec<Regex>,
+    pub patterns: Vec<Arc<Regex>>,
 }
 
 /// Aggregate registry of all loaded filters across all sources.
@@ -124,6 +125,76 @@ impl FilterRegistry {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
+
+    /// Private registry buffers, excluding shared compiled regex engines.
+    pub(crate) fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        let filter_bytes = |filter: &TomlFilter| {
+            let source = match &filter.source {
+                FilterSource::Builtin => 0,
+                FilterSource::User { path } | FilterSource::Project { path } => path.capacity(),
+            };
+            source
+                .saturating_add(filter.name.capacity())
+                .saturating_add(filter.description.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    filter
+                        .matches
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(filter.matches.iter().map(String::capacity).sum::<usize>())
+                .saturating_add(
+                    filter
+                        .strip
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Arc<Regex>>()),
+                )
+                .saturating_add(filter.class_cap.as_ref().map_or(0, |cap| {
+                    cap.patterns
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Arc<Regex>>())
+                }))
+                .saturating_add(
+                    filter
+                        .shortcircuit_replacement
+                        .as_ref()
+                        .map_or(0, String::capacity),
+                )
+        };
+        let buckets = if self.by_match.capacity() == 0 {
+            0
+        } else {
+            self.by_match
+                .capacity()
+                .saturating_add(1)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX)
+        };
+        let bytes = buckets
+            .saturating_mul(std::mem::size_of::<(String, TomlFilter)>().saturating_add(1))
+            .saturating_add(
+                self.by_match
+                    .iter()
+                    .map(|(key, filter)| key.capacity().saturating_add(filter_bytes(filter)))
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.all
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TomlFilter>()),
+            )
+            .saturating_add(self.all.iter().map(filter_bytes).sum::<usize>())
+            .saturating_add(
+                self.warnings
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(self.warnings.iter().map(String::capacity).sum::<usize>());
+        crate::memory::MemoryEstimate::partial(bytes as u64)
+            .count("filters", self.all.len())
+            .count("command_keywords", self.by_match.len())
+            .gap("compiled_regex_automata")
+    }
 }
 
 /// Build a registry from sources in priority order.
@@ -147,6 +218,14 @@ pub fn build_registry(
         }
     }
 
+    load_overrides(registry, user_dir, project_dir)
+}
+
+fn load_overrides(
+    mut registry: FilterRegistry,
+    user_dir: Option<&Path>,
+    project_dir: Option<&Path>,
+) -> FilterRegistry {
     // User: loaded if dir exists.
     if let Some(dir) = user_dir {
         load_dir(dir, &mut registry, |path| FilterSource::User {
@@ -171,7 +250,11 @@ pub fn build_standard_registry(
     user_dir: Option<&Path>,
     project_dir: Option<&Path>,
 ) -> FilterRegistry {
-    build_registry(super::builtin_filters::ALL, user_dir, project_dir)
+    // Only shipped, immutable definitions are shared. User/project files are
+    // re-read on each reset so trust changes and edits remain root-specific.
+    static BUILTINS: OnceLock<FilterRegistry> = OnceLock::new();
+    let builtins = BUILTINS.get_or_init(|| build_registry(super::builtin_filters::ALL, None, None));
+    load_overrides(builtins.clone(), user_dir, project_dir)
 }
 
 fn load_dir<F>(dir: &Path, registry: &mut FilterRegistry, source_for: F)
@@ -409,11 +492,12 @@ pub fn parse_filter(name: &str, content: &str, source: FilterSource) -> Result<T
     })
 }
 
-fn build_regex(pattern: &str, multiline: bool) -> Result<Regex, String> {
+fn build_regex(pattern: &str, multiline: bool) -> Result<Arc<Regex>, String> {
     RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
         .multi_line(multiline)
         .build()
+        .map(Arc::new)
         .map_err(|e| e.to_string())
 }
 
