@@ -158,6 +158,12 @@ pub(crate) fn project_root_is_volume_root(canonical_root: &Path) -> Option<bool>
     if canonical_root.parent().is_none() {
         return Some(true);
     }
+    // Windows can name the containing volume directly. Walking every ancestor
+    // and querying its volume serial spends admission's budget before evidence
+    // is examined, especially when filesystem metadata is being scanned.
+    #[cfg(windows)]
+    let volume = windows_volume_path(canonical_root)?;
+    #[cfg(not(windows))]
     let volume = project_root_volume(canonical_root, None)?;
     let root = crate::access_policy::policy_path(canonical_root);
     let volume = crate::access_policy::policy_path(&volume);
@@ -166,6 +172,28 @@ pub(crate) fn project_root_is_volume_root(canonical_root: &Path) -> Option<bool>
     }
     // Only protect the volume identity, not HOME or root-level directories.
     protected_directory_alias(&root, &volume, &volume)
+}
+
+#[cfg(windows)]
+fn windows_volume_path(root: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(path: *const u16, volume: *mut u16, length: u32) -> i32;
+    }
+    let path = crate::windows_path::win32_call_path(root)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut volume = vec![0_u16; 32768];
+    // Both buffers are NUL-terminated/initialized and live for the call; the
+    // length is the writable capacity of the output buffer in UTF-16 units.
+    if unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0 {
+        return None;
+    }
+    let end = volume.iter().position(|unit| *unit == 0)?;
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&volume[..end])))
 }
 
 /// Testable core of [`project_root_volume`]: `read` supplies the raw bytes of

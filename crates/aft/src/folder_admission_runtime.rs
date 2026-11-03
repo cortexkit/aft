@@ -165,7 +165,10 @@ pub fn request_waits(request: &RawRequest, ctx: &AppContext) -> bool {
 }
 
 /// Poll before taking a request's executor lease or configuration snapshot.
-/// Expiry is a conservative, incomplete decision, never a pending reply.
+/// True means the caller's bounded wait ended, not necessarily that the folder
+/// was determined. An expired wait allows a tool request to be refused while
+/// admission continues in the background; callers needing a verdict must inspect
+/// the public state.
 pub fn poll_wait(ctx: &AppContext) -> bool {
     if !waiting(ctx) {
         return true;

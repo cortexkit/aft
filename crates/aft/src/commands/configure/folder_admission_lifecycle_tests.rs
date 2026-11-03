@@ -94,9 +94,36 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
         assert!(std::fs::read_dir(storage.path().join("folder-admission"))
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true));
+        let connect_generation = ctx.connect_generation();
+        assert!(admission::wait_until_probe(&ctx) <= Duration::from_millis(250));
+        let mut maintenance = crate::runtime_drain::StandaloneConfigureMaintenance::default();
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Keep the original worker held until the idle maintenance pump sees
+        // the first retry. No tool request or reconnect may trigger recovery.
+        while !admission::recheck_due(&ctx) {
+            if maintenance.has_pending(&ctx) {
+                maintenance.drain_one(&ctx);
+            }
+            assert!(
+                std::time::Instant::now() < retry_deadline,
+                "first retry was not scheduled"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            ctx.configure_tail_has_work(),
+            "the bound daemon must see the due retry"
+        );
+        while admission::recheck_due(&ctx) {
+            maintenance.drain_one(&ctx);
+            assert!(
+                std::time::Instant::now() < retry_deadline,
+                "first retry never ran"
+            );
+        }
+        assert_eq!(admission::probe_counts_for_test(&ctx), (1, 0));
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut maintenance = crate::runtime_drain::StandaloneConfigureMaintenance::default();
         loop {
             if maintenance.has_pending(&ctx) {
                 assert!(
@@ -115,6 +142,7 @@ fn folder_admission_regression_timeout_remains_pending_and_rechecks() {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(ctx.connect_generation(), connect_generation);
     });
 }
 
@@ -332,7 +360,9 @@ fn folder_admission_idle_bind_does_not_consume_the_probe_wait() {
         std::thread::sleep(admission::wait_budget() + Duration::from_millis(20));
         assert_eq!(admission::probe_counts_for_test(&ctx), (0, 0));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !admission::poll_wait(&ctx) {
+        while !admission::poll_wait(&ctx)
+            || admission::snapshot(&ctx).unwrap()["state"] != "decided"
+        {
             crate::provisional_identity_retry::drain_inline(&ctx);
             assert!(std::time::Instant::now() < deadline, "probe did not finish");
             std::thread::sleep(Duration::from_millis(1));

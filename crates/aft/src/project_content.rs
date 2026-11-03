@@ -210,13 +210,13 @@ fn canonicalized(path: &Path) -> Option<PathBuf> {
 
 /// Parse a `.git` file's `gitdir:` line into its (possibly relative) target.
 /// The read is capped: a `.git` file is one short line, never bulk data.
-fn read_gitdir_target(dot_git: &Path) -> Option<PathBuf> {
+pub(crate) fn read_gitdir_target(dot_git: &Path) -> Option<PathBuf> {
     parse_gitdir_bytes(&capped_read(dot_git, 4096)?)
 }
 
 /// The `commondir` file a linked worktree's gitdir carries, naming the shared
 /// git dir (absolute, or relative to the gitdir).
-fn read_commondir_target(gitdir: &Path) -> Option<PathBuf> {
+pub(crate) fn read_commondir_target(gitdir: &Path) -> Option<PathBuf> {
     let bytes = capped_read(&gitdir.join("commondir"), 4096)?;
     let line = bytes.split(|byte| *byte == b'\n').next()?;
     let trimmed = trim_ascii_whitespace(line);

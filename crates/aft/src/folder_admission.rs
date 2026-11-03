@@ -1,8 +1,9 @@
 //! Bounded project-intent evidence, independent of index configuration.
 //!
 //! Callers must authorize the root before probing it. This module never reads
-//! worktree file contents or follows directory symlinks. Git plumbing validates
-//! repository control metadata only; it does not inventory tracked paths.
+//! worktree file contents or follows directory symlinks. Git control metadata
+//! is checked directly. A time-limited `git rev-parse` also recognizes folders
+//! inside a parent repository and unusual Git layouts. Neither path lists tracked files.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -544,15 +545,13 @@ fn probe_with_read_dir(
     if let Some(decision) = override_decision(&root, probe.result.override_mode) {
         return decision;
     }
-    if probe.time_left() {
-        if read_dir(&root).is_err() {
+    if probe.result.override_mode == DetectionMode::Workspace {
+        if probe.time_left() && read_dir(&root).is_err() {
             probe.result.observed.errors += 1;
             probe.result.reason = AdmissionReason::ProbeIoError;
             probe.result.coverage.stop = ProbeStop::IoError;
             return probe.finish();
         }
-    }
-    if probe.result.override_mode == DetectionMode::Workspace {
         probe.workspace_override = true;
         probe.walk(&root, read_dir);
         probe.result.classification = FolderClassification::Workspace;
@@ -578,12 +577,23 @@ fn probe_with_read_dir(
         probe.result.coverage.stop = ProbeStop::StrongEvidence;
         return probe.finish();
     }
+    // Ordinary repositories and linked worktrees have enough control metadata
+    // to decide without starting Git. The time-limited `git rev-parse` fallback
+    // also recognizes subdirectories of a parent repository and unusual layouts.
+    if let Some(head) = direct_git_head(&root, &mut probe) {
+        probe.git_project(head);
+        return probe.finish();
+    }
     for name in MARKERS {
         if probe
             .metadata(&root.join(name))
             .is_some_and(|m| m.is_file())
         {
             probe.result.observed.root_markers.push((*name).to_owned());
+            probe.result.classification = FolderClassification::Project;
+            probe.result.reason = AdmissionReason::RootMarker;
+            probe.result.coverage.stop = ProbeStop::StrongEvidence;
+            return probe.finish();
         }
     }
     if let Some(head) = probe
@@ -591,22 +601,7 @@ fn probe_with_read_dir(
         .then(|| validated_git_worktree(&root, start, budgets.time))
         .flatten()
     {
-        probe.result.git_controls.push(head.clone());
-        if let Some(directory) = head.parent() {
-            probe.result.git_controls.push(directory.to_path_buf());
-            for name in ["index", "config", "commondir", "objects"] {
-                probe.result.git_controls.push(directory.join(name));
-            }
-        }
-        probe.result.classification = FolderClassification::Project;
-        probe.result.reason = AdmissionReason::GitCheckout;
-        probe.result.coverage.stop = ProbeStop::StrongEvidence;
-        return probe.finish();
-    }
-    if !probe.result.observed.root_markers.is_empty() {
-        probe.result.classification = FolderClassification::Project;
-        probe.result.reason = AdmissionReason::RootMarker;
-        probe.result.coverage.stop = ProbeStop::StrongEvidence;
+        probe.git_project(head);
         return probe.finish();
     }
 
@@ -640,6 +635,56 @@ fn probe_with_read_dir(
         probe.result.reason = AdmissionReason::EvidenceBudgetExhausted;
     }
     probe.finish()
+}
+
+impl Probe {
+    fn git_project(&mut self, head: PathBuf) {
+        self.result.git_controls.push(head.clone());
+        if let Some(directory) = head.parent() {
+            self.result.git_controls.push(directory.to_path_buf());
+            for name in ["index", "config", "commondir", "objects"] {
+                self.result.git_controls.push(directory.join(name));
+            }
+        }
+        self.result.classification = FolderClassification::Project;
+        self.result.reason = AdmissionReason::GitCheckout;
+        self.result.coverage.stop = ProbeStop::StrongEvidence;
+    }
+}
+
+fn direct_git_head(root: &Path, probe: &mut Probe) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let metadata = probe.metadata(&dot_git)?;
+    let gitdir = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() && probe.time_left() {
+        let target = crate::project_content::read_gitdir_target(&dot_git)?;
+        root.join(target)
+    } else {
+        return None;
+    };
+    let head = gitdir.join("HEAD");
+    if !probe.metadata(&head)?.is_file() {
+        return None;
+    }
+    let common = if probe.metadata(&gitdir.join("commondir")).is_some() {
+        if !probe.time_left() {
+            return None;
+        }
+        gitdir.join(crate::project_content::read_commondir_target(&gitdir)?)
+    } else {
+        gitdir
+    };
+    if !probe.metadata(&common.join("objects"))?.is_dir()
+        || !probe.metadata(&common.join("refs"))?.is_dir()
+    {
+        return None;
+    }
+    probe
+        .result
+        .git_controls
+        .extend([common.clone(), common.join("objects"), common.join("refs")]);
+    Some(head)
 }
 
 impl Probe {
@@ -950,7 +995,14 @@ fn child_git_evidence(root: &Path, marker: &Path, start: Instant, budget: Durati
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    static GIT_VALIDATION_CALLS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn git_output(root: &Path, start: Instant, budget: Duration, args: &[&str]) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| calls.set(calls.get() + 1));
     if start.elapsed() >= budget || !crate::developer_tools::git_usable() {
         return None;
     }
@@ -1187,6 +1239,7 @@ mod tests {
             } else {
                 file(root.path(), name);
             }
+            super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| calls.set(0));
             let result = probe_with_read_dir(
                 root.path(),
                 &ProjectDetectionConfig::default(),
@@ -1200,7 +1253,49 @@ mod tests {
             );
             assert_eq!(result.coverage.stop, ProbeStop::StrongEvidence);
             assert_eq!(result.observed.entries, 0);
+            super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| assert_eq!(calls.get(), 0, "{name}"));
         }
+    }
+
+    #[test]
+    fn linked_worktree_control_metadata_decides_without_git_or_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        );
+        git(
+            &main,
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| calls.set(0));
+        let result = probe_with_read_dir(
+            &linked,
+            &ProjectDetectionConfig::default(),
+            ProbeBudgets::default(),
+            |_| panic!("linked-worktree evidence must precede directory enumeration"),
+        );
+        assert_eq!(
+            result.classification,
+            FolderClassification::Project,
+            "{result:?}"
+        );
+        assert_eq!(result.reason, AdmissionReason::GitCheckout);
+        assert_eq!(result.observed.entries, 0);
+        super::GIT_VALIDATION_CALLS_FOR_TEST.with(|calls| assert_eq!(calls.get(), 0));
     }
 
     #[test]
