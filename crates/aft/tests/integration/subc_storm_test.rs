@@ -2000,10 +2000,11 @@ async fn drive_route_bind_deadline_daemon(input: FakeDaemonInput) {
         elapsed >= ROUTE_BIND_DEADLINE && elapsed <= ROUTE_BIND_DEADLINE + Duration::from_secs(2),
         "deadline surfaced at {elapsed:?}, expected about {ROUTE_BIND_DEADLINE:?}"
     );
-    assert_eq!(
-        error.get("code").and_then(Value::as_str),
-        Some("actor_not_ready")
-    );
+    assert_eq!(error.get("code").and_then(Value::as_str), Some("bind_busy"));
+    assert_eq!(error["detail"], json!({ "reason": "configure" }));
+    assert!(subc_protocol::error_codes::is_retryable_route_open(
+        error["code"].as_str().unwrap()
+    ));
 
     tokio::time::sleep(Duration::from_secs(2)).await;
     corr += 1;

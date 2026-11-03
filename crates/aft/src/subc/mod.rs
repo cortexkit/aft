@@ -7985,8 +7985,8 @@ async fn expire_overdue_route_binds(
         // Read the blockers before cancelling: once cancelled, the bind is no
         // longer queued and the snapshot can no longer say what held it.
         let blockers = executor.bind_blocker_snapshot(&root_id, &configure_request_id);
-        let (code, message) = if ack_queued {
-            ("actor_not_ready", format!("route bind deadline exceeded after {}ms (deadline {}ms): the bind waited in the ACK writer queue", age.as_millis(), ROUTE_BIND_DEADLINE.as_millis()))
+        let refusal = if ack_queued {
+            ErrorBody::new("actor_not_ready", format!("route bind deadline exceeded after {}ms (deadline {}ms): the bind waited in the ACK writer queue", age.as_millis(), ROUTE_BIND_DEADLINE.as_millis()))
         } else {
             route_bind_deadline_refusal(
                 age,
@@ -7996,7 +7996,7 @@ async fn expire_overdue_route_binds(
             )
         };
         let reserved = a0.publication(route).is_some();
-        if reserved && !a0.reject(route, ErrorBody::new(code, &message)) {
+        if reserved && !a0.reject(route, refusal.clone()) {
             continue;
         }
         if let Some(pending) = pending_binds.get_mut(&route) {
@@ -8011,7 +8011,7 @@ async fn expire_overdue_route_binds(
         metrics.record_bind_ack(age);
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
         if !reserved {
-            send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
+            send_route_bind_error_body_parts(tx, ver, corr, flags, &refusal, metrics).await?;
         }
         log::warn!(
             "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={}, code={})",
@@ -8019,7 +8019,7 @@ async fn expire_overdue_route_binds(
             root_id.as_path().display(),
             deadline_ms,
             configure_request_id,
-            code
+            refusal.code
         );
     }
 
@@ -9960,17 +9960,28 @@ async fn send_route_bind_error_body(
     refusal: &ErrorBody,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
-    let body = serde_json::to_vec(refusal).map_err(SubcError::Json)?;
-    let response = Frame::build_with_version(
+    send_route_bind_error_body_parts(
+        tx,
         frame.header.ver,
-        FrameType::Error,
-        frame.header.flags,
-        0,
-        0,
         frame.header.corr,
-        body,
+        frame.header.flags,
+        refusal,
+        metrics,
     )
-    .map_err(SubcError::FrameBuild)?;
+    .await
+}
+
+async fn send_route_bind_error_body_parts(
+    tx: &WriterSender,
+    ver: u8,
+    corr: u64,
+    flags: Flags,
+    refusal: &ErrorBody,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let body = serde_json::to_vec(refusal).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(ver, FrameType::Error, flags, 0, 0, corr, body)
+        .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
     log_route_bind_rejection(&refusal.code, &refusal.message);
     Ok(())
@@ -20614,6 +20625,11 @@ mod tests {
         assert_eq!(refusal.header.ty, FrameType::Error);
         assert_eq!(refusal.header.corr, 94);
         let body: Value = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(body["code"], "bind_busy", "{body}");
+        assert_eq!(body["detail"], json!({ "reason": "configure" }));
+        assert!(subc_protocol::error_codes::is_retryable_route_open(
+            body["code"].as_str().unwrap()
+        ));
         let message = body["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("route bind deadline exceeded")
@@ -20694,7 +20710,7 @@ mod tests {
     }
 
     /// A bind whose deadline passes while it waits behind a reader on its root
-    /// is refused with its own retryable code, and the message names the
+    /// is refused with a retryable busy code, and the message names the
     /// reader's job, its tool and how long it has run, so whoever retries the
     /// bind can see what holds the root.
     #[tokio::test]
@@ -20779,7 +20795,11 @@ mod tests {
         assert_eq!(refusal.header.ty, FrameType::Error);
         assert_eq!(refusal.header.corr, 95);
         let body: Value = serde_json::from_slice(&refusal.body).unwrap();
-        assert_eq!(body["code"], "bind_blocked_by_reader", "{body}");
+        assert_eq!(body["code"], "bind_busy", "{body}");
+        assert_eq!(body["detail"], json!({ "reason": "reader" }));
+        assert!(subc_protocol::error_codes::is_retryable_route_open(
+            body["code"].as_str().unwrap()
+        ));
         let message = body["message"].as_str().unwrap_or_default();
         assert!(
             message.contains("route bind deadline exceeded")
@@ -21215,7 +21235,11 @@ mod tests {
         assert_eq!(bind.await.unwrap().data["code"], "request_cancelled");
         let frame = writer_rx.try_recv().expect("refusal before daemon relay");
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body["code"], "bind_blocked_by_writer", "{body}");
+        assert_eq!(body["code"], "bind_busy", "{body}");
+        assert_eq!(body["detail"], json!({ "reason": "writer" }));
+        assert!(subc_protocol::error_codes::is_retryable_route_open(
+            body["code"].as_str().unwrap()
+        ));
         let message = body["message"].as_str().unwrap();
         assert!(
             message.contains("job=subc-5001-1416 tool=edit age_ms="),
