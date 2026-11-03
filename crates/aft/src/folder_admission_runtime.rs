@@ -251,7 +251,7 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
     if !waiting(ctx) {
         return true;
     }
-    let mut probe = ctx.folder_admission().probe.lock();
+    let probe = ctx.folder_admission().probe.lock();
     let mut binding = ctx.folder_admission().binding.lock();
     if let Some(binding) = binding.as_mut().filter(|b| {
         b.wait_deadline
@@ -262,7 +262,8 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
         binding.needs_apply = false;
         binding.needs_off_bind = false;
         binding.decision = None;
-        *probe = None;
+        // Expiry ends the caller's wait, not a useful worker. The resolve below
+        // owns generation checks and can accept the worker's late real verdict.
     }
     drop(binding);
     drop(probe);
