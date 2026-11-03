@@ -51,15 +51,21 @@ fn list(
     limit: Option<usize>,
     execute: &mut impl FnMut(&ReadRequest) -> Result<ReadReply, ReadError>,
 ) -> Result<Vec<Value>, ReadError> {
+    // GitHub Actions run objects are large; smaller pages help avoid Plexus's
+    // 1 MiB response limit.
+    let page_cap = if container == Some("workflow_runs") {
+        10
+    } else {
+        100
+    };
+    let mut per_page = limit.unwrap_or(page_cap).min(page_cap);
     let mut rows = Vec::new();
     let mut page = 1_u64;
-    // GitHub offsets each page by per_page, so shrinking it repeats rows.
-    let per_page = limit.unwrap_or(100).min(100);
     loop {
         if per_page == 0 {
             return Ok(rows);
         }
-        let reply = fetch(
+        let reply = match fetch(
             &ReadRequest::Get {
                 path: query(
                     &path,
@@ -71,7 +77,18 @@ fn list(
                 accept: None,
             },
             execute,
-        )?;
+        ) {
+            Ok(reply) => reply,
+            Err(ReadError::ResponseTooLarge(_)) if per_page > 1 => {
+                // GitHub offsets pages by per_page. Discard earlier pages and
+                // restart at the smaller size to avoid repeating or skipping rows.
+                per_page /= 2;
+                rows.clear();
+                page = 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let ReadReply::Get(reply) = reply else {
             return Err(failed("list returned the wrong read reply type"));
         };

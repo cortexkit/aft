@@ -1846,7 +1846,17 @@ fn zoom_one_symbol_inner(
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    // Timing hooks for the read-bound test. Unconfigured test contexts have no
+    // cache root, so the hooks are skipped there instead of panicking.
+    #[cfg(test)]
+    if let Some(root) = ctx.canonical_cache_root_opt() {
+        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-begin");
+    }
     let observation = observe_callgraph_query(ctx);
+    #[cfg(test)]
+    if let Some(root) = ctx.canonical_cache_root_opt() {
+        crate::storage_retention::test_hook(&root, "cg-timing:zoom-observe-return");
+    }
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
@@ -3045,7 +3055,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        PathBuf::from(crate::test_support::manifest_dir())
             .join("tests")
             .join("fixtures")
             .join(name)

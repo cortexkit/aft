@@ -85,12 +85,19 @@ fn valid_prefix(prefix: &str) -> bool {
 pub struct ResolvedDemand {
     pub platform: Option<super::types::Platform>,
     pub weight_hint: Option<u32>,
+    pub memory_mib: Option<u64>,
     pub network: bool,
 }
 
+// Agent-visible text, approved by Ufuk; change it only with his approval.
+const NON_LINUX_MEMORY_REFUSAL: &str =
+    "only Linux jobs take a memory size; Windows and macOS jobs have fixed memory";
+// Agent-visible text, approved by Ufuk; change it only with his approval.
+const INVALID_SIZE_REFUSAL: &str = "options are net, a vCPU count like 4c and a whole number of GiB like 16gb, for example \"linux,2c,16gb\"";
+
 /// Resolve the demand a `runon` call asks for. An empty value takes the
 /// session's default demand; otherwise, AFT accepts a known runner with an
-/// optional vCPU count and outbound access, and refuses invalid demands by name.
+/// optional vCPU count, memory size and outbound access, and refuses invalid demands by name.
 pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<ResolvedDemand, String> {
     let requested = runon.trim();
     let demand = if requested.is_empty() {
@@ -139,6 +146,24 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
             resolved.network = true;
             continue;
         }
+        if let Some(digits) = token.strip_suffix("gb") {
+            if platform != "linux" {
+                return Err(format!(
+                    "runon {demand:?} is not valid: {NON_LINUX_MEMORY_REFUSAL}"
+                ));
+            }
+            let memory_mib = (!digits.is_empty()
+                && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+            .filter(|size| *size > 0)
+            .and_then(|size| size.checked_mul(1024));
+            if memory_mib.is_none() || resolved.memory_mib.is_some() {
+                return Err(invalid_demand_options(demand));
+            }
+            resolved.memory_mib = memory_mib;
+            continue;
+        }
         let digits = token.strip_suffix('c').filter(|digits| {
             !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         });
@@ -146,7 +171,7 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
             .and_then(|digits| digits.parse::<u32>().ok())
             .filter(|count| *count > 0);
         if count.is_none() {
-            return Err(invalid_vcpu_demand(demand));
+            return Err(invalid_demand_options(demand));
         }
         if platform == "windows" {
             return Err(format!("runon {demand:?} is not valid: the Windows slot is fixed at 4 vCPUs; use plain windows without a vCPU count"));
@@ -164,14 +189,14 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
     Ok(resolved)
 }
 
-fn invalid_vcpu_demand(demand: &str) -> String {
+fn invalid_demand_options(demand: &str) -> String {
     if demand.starts_with("windows,") {
         return format!("runon {demand:?} is not valid: Windows jobs accept no options; use plain windows (fixed at 4 vCPUs, no network)");
     }
     if demand.starts_with("macos,") {
         return format!("runon {demand:?} is not valid: macOS jobs accept no options; use plain macos (fixed at 4 vCPUs, no network)");
     }
-    format!("runon {demand:?} is not valid: options are net and a vCPU count as Nc, for example \"linux,4c,net\"")
+    format!("runon {demand:?} is not valid: {INVALID_SIZE_REFUSAL}")
 }
 
 /// The refusal for a demand no runner serves.
@@ -188,6 +213,84 @@ pub fn unknown_demand(demand: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runon_memory_parses_whole_gib_in_any_token_order() {
+        for demand in [
+            "linux,2c,16gb,net",
+            "linux,2c,net,16gb",
+            "linux,16gb,2c,net",
+            "linux,16gb,net,2c",
+            "linux,net,2c,16gb",
+            "linux,net,16gb,2c",
+        ] {
+            let resolved = super::parse_demand(demand).unwrap();
+            assert_eq!(resolved.memory_mib, Some(16_384), "{demand}");
+            assert_eq!(resolved.weight_hint, Some(2), "{demand}");
+            assert!(resolved.network, "{demand}");
+        }
+        assert_eq!(
+            super::parse_demand("linux,1gb").unwrap().memory_mib,
+            Some(1024)
+        );
+        assert_eq!(super::parse_demand("linux").unwrap().memory_mib, None);
+        assert_eq!(
+            super::resolve_demand("", Some("linux,16gb"))
+                .unwrap()
+                .memory_mib,
+            Some(16_384)
+        );
+    }
+
+    #[test]
+    fn runon_memory_refuses_malformed_sizes_and_duplicate_tokens() {
+        for demand in [
+            "linux,0gb",
+            "linux,-1gb",
+            "linux,+1gb",
+            "linux,1.5gb",
+            "linux,gb",
+            "linux,16GB",
+            "linux,16gib",
+            "linux,16384mb",
+            "linux,16g",
+            "linux,16",
+            "linux, 16gb",
+            "linux,16gb,16gb",
+            "linux,16gb,32gb",
+            "linux,16gb,2c,4c",
+            "linux,16gb,net,net",
+            "linux,16gb,unknown",
+            "linux,18446744073709551616gb",
+            "linux,18014398509481984gb",
+            "linux,",
+        ] {
+            let error = super::parse_demand(demand).unwrap_err();
+            assert!(error.contains(demand), "{error}");
+            assert!(error.contains("not valid"), "{error}");
+        }
+        assert_eq!(
+            super::parse_demand("linux,1.5gb").unwrap_err(),
+            format!(
+                "runon {:?} is not valid: {}",
+                "linux,1.5gb",
+                super::INVALID_SIZE_REFUSAL
+            )
+        );
+    }
+
+    #[test]
+    fn runon_memory_refuses_non_linux_sizes() {
+        for demand in ["windows,16gb", "macos,16gb"] {
+            assert_eq!(
+                super::parse_demand(demand).unwrap_err(),
+                format!(
+                    "runon {demand:?} is not valid: {}",
+                    super::NON_LINUX_MEMORY_REFUSAL
+                )
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -274,7 +377,7 @@ mod tests {
     #[test]
     fn deployed_legacy_policy_vectors_match_and_verify_digests() {
         use sha2::{Digest, Sha256};
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::path::Path::new(crate::test_support::manifest_dir())
             .join("src/exec_remote/fixtures/policy");
         let mut count = 0;
         for entry in std::fs::read_dir(root).unwrap() {

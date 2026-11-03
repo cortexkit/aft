@@ -58,6 +58,7 @@ struct ByteRange {
 enum ReadError {
     Budget { retry_after_ms: u64 },
     Vendor { status: u16, message: String },
+    ResponseTooLarge(String),
     Refused(String),
     Failed(String),
 }
@@ -77,7 +78,7 @@ impl ReadError {
                 retry_after_ms.div_ceil(60_000).max(1)
             ),
             Self::Vendor { status, message } => format!("HTTP {status}: {message}"),
-            Self::Refused(text) | Self::Failed(text) => text.clone(),
+            Self::ResponseTooLarge(text) | Self::Refused(text) | Self::Failed(text) => text.clone(),
         }
         .replace(['\n', '\r'], " ")
     }

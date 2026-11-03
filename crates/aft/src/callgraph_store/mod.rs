@@ -31858,7 +31858,7 @@ pub fn run() {
     #[test]
     #[ignore]
     fn bench_rust_declared_module_memo_real_corpus() {
-        let project_root = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        let project_root = fs::canonicalize(crate::test_support::manifest_dir())
             .expect("canonical agent-file-tools crate root");
         let files = [
             "src/main.rs",
@@ -35529,7 +35529,11 @@ mod crate_scan_memo_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("corpus");
         let mut files = Vec::new();
-        copy_rust_corpus(Path::new(env!("CARGO_MANIFEST_DIR")), &root, &mut files);
+        copy_rust_corpus(
+            Path::new(crate::test_support::manifest_dir()),
+            &root,
+            &mut files,
+        );
         assert!(
             files.len() > 500,
             "benchmark must cover the whole Rust crate"

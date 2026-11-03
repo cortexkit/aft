@@ -51,6 +51,7 @@ const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 /// An error raised while decoding or assembling manifest-addressed callgraph data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestJoinError {
+    Cancelled,
     UnsupportedLanguage(String),
     Parse(String),
     InvalidBlob(String),
@@ -61,6 +62,7 @@ pub enum ManifestJoinError {
 impl fmt::Display for ManifestJoinError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str(crate::views::first_load::SUPERSEDED_PUBLISH),
             Self::UnsupportedLanguage(language) => {
                 write!(formatter, "unsupported callgraph blob language {language}")
             }
@@ -2498,6 +2500,9 @@ fn join_manifest_with_surfaces(
     #[cfg(test)]
     let mut heap_parts = [0isize; 5];
     for (path, entry) in manifest.entries() {
+        if crate::executor::current_job_cancelled() {
+            return Err(ManifestJoinError::Cancelled);
+        }
         let ManifestEntry::Regular { planes, .. } = entry else {
             continue;
         };
@@ -2703,6 +2708,9 @@ fn join_manifest_with_surfaces(
         .collect();
     let mut resolved_bindings = 0;
     for caller in &resolved_callers {
+        if crate::executor::current_job_cancelled() {
+            return Err(ManifestJoinError::Cancelled);
+        }
         let path = RelPath::new(caller.as_bytes().to_vec()).expect("bound manifest path");
         let Some(ManifestEntry::Regular { planes, .. }) = manifest.get(&path) else {
             continue;

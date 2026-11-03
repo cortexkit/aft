@@ -24,7 +24,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         panic!("accepted vector must decode as acceptance")
     };
     assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
-    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock = std::path::Path::new(crate::test_support::manifest_dir()).join("../../Cargo.lock");
     let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
     let packages: Vec<_> = lock["package"]
         .as_array()
@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.15"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.18"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.15"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.18"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -600,6 +600,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         platform: None,
         siblings: vec![worktree.to_str().unwrap().into()],
         weight_hint: Some(16),
+        memory_mib: None,
         queue_wait_limit_s: Some(0),
         network: None,
         return_paths: Vec::new(),
@@ -655,6 +656,35 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset
     )
     .is_err());
+}
+
+#[test]
+fn runon_memory_request_builder_omits_unrequested_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    for memory_mib in [None, Some(16_384)] {
+        let request = build_request(
+            &root,
+            &root,
+            &root,
+            "cargo test",
+            Default::default(),
+            Some(23),
+            &PresetParams {
+                memory_mib,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(request.memory_mib, memory_mib);
+        if memory_mib.is_some() {
+            assert_eq!(wire["memory_mib"], 16_384);
+        } else {
+            assert!(wire.get("memory_mib").is_none());
+        }
+        assert_eq!(serde_json::from_value::<RunRequest>(wire).unwrap(), request);
+    }
 }
 
 #[test]

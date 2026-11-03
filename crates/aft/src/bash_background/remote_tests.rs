@@ -496,6 +496,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         session: "session".into(),
         requested_platform: None,
         requested_vcpus: None,
+        requested_memory_mib: None,
         requested_network: false,
         configured_env_names: Vec::new(),
         return_paths: Vec::new(),
@@ -7149,6 +7150,99 @@ async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
 }
 
 #[tokio::test]
+async fn runon_memory_is_sent_only_when_requested_and_supported() {
+    use crate::exec_remote::wire_tests::daemon_with_capabilities;
+    for (runon, supports_memory, expected) in [
+        ("linux", false, None),
+        ("linux", true, None),
+        ("linux,16gb", true, Some(16_384)),
+        ("linux,net,16gb,2c", true, Some(16_384)),
+        ("", true, Some(16_384)),
+    ] {
+        let claims = if supports_memory {
+            vec!["exec-remote/v1", exec::types::MEMORY_CAPABILITY]
+        } else {
+            vec!["exec-remote/v1"]
+        };
+        let daemon = daemon_with_capabilities(Script::NetworkGranted, &claims, 1).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.remote_exec.as_mut().unwrap().default_demand = Some("linux,16gb".into());
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({"command": "printf memory", "runon": runon, "compressed": false}),
+        );
+        assert!(response.success, "{runon}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.exit_code, Some(0), "{done:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1, "{runon}: {runs:?}");
+        assert_eq!(
+            runs[0]
+                .get("memory_mib")
+                .and_then(serde_json::Value::as_u64),
+            expected,
+            "{runon}: {runs:?}"
+        );
+        if expected.is_none() {
+            assert!(runs[0].get("memory_mib").is_none(), "{runs:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_memory_without_capability_refuses_before_submission() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("local-spawn-proof");
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()), "runon": "linux,16gb",
+        }),
+    )
+    .await;
+    assert!(!reply.success, "{reply:?}");
+    let message = reply.data["message"].as_str().unwrap();
+    assert!(
+        message
+            .contains("This build server can't take a memory size yet; run the job without one."),
+        "{message}"
+    );
+    assert!(exec_runs(&daemon).is_empty(), "nothing may be submitted");
+    assert!(!marker.exists(), "a refused runon never runs locally");
+}
+
+#[test]
+fn runon_memory_changes_the_durable_retry_and_reattach_request_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unused-connection"),
+        "cargo test",
+    );
+    let task = registry.task(&task_id).unwrap();
+    let request = RunRequest::new("/workspace", "/repository", "/workspace", "cargo test");
+    let unrequested = serde_json::to_vec(&request).unwrap();
+    let request = request.with_memory_mib(16_384);
+    let sized = serde_json::to_vec(&request).unwrap();
+    let larger = serde_json::to_vec(&request.clone().with_memory_mib(32_768)).unwrap();
+    let digest = save_retry_request(&task, &request).unwrap();
+    assert_eq!(digest, retry_request_digest(&task, &sized));
+    assert_ne!(digest, retry_request_digest(&task, &unrequested));
+    assert_ne!(digest, retry_request_digest(&task, &larger));
+    assert_eq!(restore_retry_request(&task, &digest).unwrap(), request);
+}
+
+#[tokio::test]
 async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -7206,6 +7300,12 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "linux,4c,2c",
         "linux,net,net",
         "linux,unknown",
+        "linux,0gb",
+        "linux,1.5gb",
+        "linux,16mb",
+        "linux,16gb,16gb",
+        "windows,16gb",
+        "macos,16gb",
         "windows,4c",
         "windows,net",
         "windows,wat",
@@ -10963,9 +11063,10 @@ async fn concurrent_stop_and_registration_of_a_shared_task_never_deadlock() {
     }
 }
 
-/// Repeated owner stops can replace metadata during every optimistic replay
-/// open. A busy writer is not a corrupt task: replay must still register it
-/// and deliver its stop, even when the bounded open retries are exhausted.
+/// A writer can replace metadata during every optimistic replay open while
+/// an owner stops the task. A busy writer is not a corrupt task: replay must
+/// still register it and deliver its stop, even when the bounded open retries
+/// are exhausted.
 #[tokio::test]
 async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion() {
     use std::os::unix::fs::MetadataExt;
@@ -10987,6 +11088,10 @@ async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion(
             BgTaskRegistry::recover_saved_scope_tasks(dir.path(), &scope, &[]);
         assert!(errors.is_empty(), "{errors:?}");
         let recovery = recovered.into_iter().next().unwrap();
+        let metadata_dir =
+            crate::bash_background::persistence::PinnedDir::open(json.parent().unwrap()).unwrap();
+        let metadata_name = json.file_name().unwrap().to_os_string();
+        let metadata_path = json.clone();
         let project = registry();
         let (reached_tx, reached_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -11034,6 +11139,15 @@ async fn a_stop_racing_every_replay_metadata_open_still_delivers_one_completion(
                 recovery
                     .record_owner_pause_intent(&recovery.task(&task_id).unwrap())
                     .unwrap();
+                // Repeated pause intents have identical bytes and can skip
+                // persistence. Force the inode replacement this race needs,
+                // without changing the task's logical cancellation state.
+                crate::bash_background::persistence::randomized_atomic_replace(
+                    &metadata_dir,
+                    &metadata_name,
+                    &fs::read(&metadata_path).unwrap(),
+                )
+                .unwrap();
             } else {
                 let members = recovery.begin_scope_pause(&scope).unwrap();
                 recovery.pause_scope(&scope, true, &members).unwrap();

@@ -494,11 +494,11 @@ pub enum ContractExpect {
 /// name. Fails while the directory is empty or a file is not a vector, the
 /// way Plexus's own contract test does.
 ///
-/// The path is absolute from `CARGO_MANIFEST_DIR`, so this works both for
+/// The path uses the test runner's remapped `CARGO_MANIFEST_DIR`, so this works for
 /// the library unit tests and for the integration test that includes this
 /// file: in both cases the manifest directory is `crates/aft`.
 pub fn load_vectors() -> Vec<ContractVector> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let directory = Path::new(crate::test_support::manifest_dir())
         .join("tests/fixtures/gh_shim/plexus-contract/requests-contract");
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
         .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
@@ -578,7 +578,7 @@ pub fn load_vectors() -> Vec<ContractVector> {
 /// Load the native facade replies separately from the request-map decisions.
 /// GitHub pre-reads belong to Plexus, not to the shim's request-shape judge.
 pub fn load_reply_vectors() -> Vec<Value> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let directory = Path::new(crate::test_support::manifest_dir())
         .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
     let mut paths: Vec<_> = std::fs::read_dir(&directory)
         .expect("reply contract directory")

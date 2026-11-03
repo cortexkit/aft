@@ -14,6 +14,8 @@
 //!    QueryWait for CALLGRAPH_QUERY_WAIT (the bounded three-second wait from
 //!    `views::contracts`). Use its final installed snapshot and
 //!    disclose timeout gap paths; never substitute legacy/newer mutable state.
+//!    Checkout-local acquisition uses the same budget, leaving its single
+//!    materialization worker running after a timed-out read answers Building.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -34,6 +36,64 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
 /// HTML headings that share a row.
 pub const PRODUCER: &str = "ruled-callgraph-v13-python-import-bindings";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadWaitStage {
+    QueryLock,
+    Acquisition,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadWaitObservation {
+    pub stage: ReadWaitStage,
+    pub started: std::time::Instant,
+    pub deadline: std::time::Instant,
+    pub requested: std::time::Duration,
+    pub finished: std::time::Instant,
+    pub timed_out: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static READ_WAIT_OBSERVATIONS: std::cell::RefCell<Option<Vec<ReadWaitObservation>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ReadWaitCapture(Option<Vec<ReadWaitObservation>>);
+
+#[cfg(test)]
+impl Drop for ReadWaitCapture {
+    fn drop(&mut self) {
+        let previous = std::mem::replace(&mut self.0, None);
+        READ_WAIT_OBSERVATIONS.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_read_waits_for_test<T>(
+    read: impl FnOnce() -> T,
+) -> (T, Vec<ReadWaitObservation>) {
+    let guard = ReadWaitCapture(READ_WAIT_OBSERVATIONS.with(|slot| slot.replace(Some(Vec::new()))));
+    let result = read();
+    let observations = READ_WAIT_OBSERVATIONS
+        .with(|slot| slot.replace(None))
+        .unwrap();
+    drop(guard);
+    (result, observations)
+}
+
+#[cfg(test)]
+fn record_read_wait(observation: ReadWaitObservation) {
+    READ_WAIT_OBSERVATIONS.with(|slot| {
+        if let Some(observations) = slot.borrow_mut().as_mut() {
+            observations.push(observation);
+        }
+    });
+}
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
@@ -475,14 +535,21 @@ impl PlaneAdapter for CallgraphPlane {
 pub(crate) struct CallgraphViewError {
     pub reason: String,
     pub busy: bool,
-    pub completion_busy: bool,
+    /// A materialization is still running, either here or under another owner.
+    pub building: bool,
+}
+
+impl CallgraphViewError {
+    pub(crate) fn is_planned(&self) -> bool {
+        self.busy || self.building
+    }
 }
 
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
             busy: super::trigram::bind_is_busy(&reason),
-            completion_busy: reason.contains(&format!("{V3_BASE_COMPLETION_BUSY}: Busy {{")),
+            building: reason.contains(&format!("{V3_BASE_COMPLETION_BUSY}: Busy {{")),
             reason,
         }
     }
@@ -507,7 +574,7 @@ impl From<PlaneError> for CallgraphViewError {
                 || reason.starts_with(V3_STORE_BUSY)
                 || super::trigram::bind_is_busy(reason)
                 || completion_busy,
-            completion_busy,
+            building: completion_busy,
             reason: error.to_string(),
         }
     }
@@ -536,6 +603,7 @@ const V3_BASE_COMPLETION_BUSY: &str = "v3 base plane completion is owned elsewhe
 /// never substitute another store when acquisition fails.
 pub(crate) trait CallgraphReaderSource: Send + Sync {
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError>;
+    fn set_publish_fence(&self, _: Arc<dyn super::first_load::PublishFence>) {}
     /// `acquire`, plus the source revision the reader's cut belongs to when
     /// the source tracks one. The view keeps the reader under it.
     fn acquire_with_revision(
@@ -581,6 +649,9 @@ pub(super) fn has_unpublished_changes(snapshot: &Snapshot) -> bool {
 }
 
 impl CallgraphReaderSource for CheckoutCallgraphSource {
+    fn set_publish_fence(&self, fence: Arc<dyn super::first_load::PublishFence>) {
+        self.driver.set_publish_fence(fence);
+    }
     fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
         self.acquire_with_revision().map(|(store, _)| store)
     }
@@ -593,6 +664,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
         &self,
     ) -> Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError> {
         use super::first_load::FirstLoadDriver;
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
+        }
         let installed = self.driver.installed_snapshot();
         // After a restart, start from this checkout's own published worker
         // generation; verification still reconciles it against the disk.
@@ -609,7 +683,7 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                     return Err(CallgraphViewError {
                         reason: error.to_string(),
                         busy: true,
-                        completion_busy: false,
+                        building: false,
                     });
                 }
                 Err(error) => return Err(error.to_string().into()),
@@ -621,6 +695,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
             .driver
             .verified_bind(&self.access, seed)
             .map_err(CallgraphViewError::from)?;
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
+        }
         if has_unpublished_changes(&snapshot) {
             // Publish the edits as a new worker generation (a donor clone
             // patched with the diff) before the single install, as a fresh
@@ -652,6 +729,9 @@ impl CallgraphReaderSource for CheckoutCallgraphSource {
                 .snapshot()
                 .with_install_cut(cut.clone())
                 .with_reconciled_epoch(snapshot.reconciled_epoch().unwrap_or(cut.epoch));
+        }
+        if crate::executor::current_job_cancelled() {
+            return Err(graph_building());
         }
         self.driver
             .install(&self.access, &snapshot, revision)
@@ -726,7 +806,9 @@ pub(crate) struct CallgraphView {
     family: String,
     policy: crate::blob_store::v2::TrigramPolicy,
     source: Arc<dyn CallgraphReaderSource>,
-    query: std::sync::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
+    query: parking_lot::Mutex<super::contracts::LoadRetry<CallgraphViewError>>,
+    acquisition: std::sync::Mutex<Option<crossbeam_channel::Receiver<ReaderAcquisition>>>,
+    owner: super::callgraph_acquisition::AcquisitionOwner,
     /// The last reader with the source revision of the cut it reads. Taken
     /// only under `query`. A query whose source still reports that revision
     /// as steady reuses the reader instead of binding again.
@@ -737,6 +819,17 @@ pub(crate) struct CallgraphView {
     ready: std::sync::atomic::AtomicBool,
     legacy_import: Option<Arc<crate::migration::views_background::BackgroundImport>>,
     current: crate::migration::v3_ledger::ImportControl,
+}
+
+pub(super) type ReaderAcquisition =
+    Result<(Arc<ReadonlyCallGraphStore>, Option<u64>), CallgraphViewError>;
+
+pub(super) fn graph_building() -> CallgraphViewError {
+    CallgraphViewError {
+        reason: "callgraph_building".into(),
+        busy: true,
+        building: true,
+    }
 }
 
 /// The v3 member scope of a checkout's call-graph view.
@@ -759,6 +852,7 @@ impl CallgraphView {
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
+            && !self.owner.stopped()
             && (self.current)()
     }
 
@@ -791,7 +885,7 @@ impl CallgraphView {
             return Err(CallgraphViewError {
                 reason: "checkout is unbound".into(),
                 busy: true,
-                completion_busy: false,
+                building: false,
             });
         }
         let legacy_import = crate::migration::views_background::BackgroundImport::start(
@@ -851,12 +945,14 @@ impl CallgraphView {
         source: Arc<dyn CallgraphReaderSource>,
     ) -> Self {
         Self {
+            owner: super::callgraph_acquisition::AcquisitionOwner::new(root.clone()),
             root,
             storage,
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(super::contracts::LoadRetry::default()),
+            query: parking_lot::Mutex::new(super::contracts::LoadRetry::default()),
+            acquisition: std::sync::Mutex::new(None),
             steady: std::sync::Mutex::new(None),
             #[cfg(test)]
             acquisitions: Default::default(),
@@ -870,6 +966,25 @@ impl CallgraphView {
         self.ready
             .store(false, std::sync::atomic::Ordering::Release);
         self.source.record_change(path);
+    }
+
+    pub(crate) fn set_executor(
+        &mut self,
+        executor: Option<crate::executor::RootMaintenanceExecutor>,
+    ) {
+        self.owner.set_executor(executor);
+    }
+
+    pub(crate) fn set_publish_fence(&self, fence: Arc<dyn super::first_load::PublishFence>) {
+        self.source.set_publish_fence(fence);
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.owner.cancel();
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.owner.shutdown();
     }
 
     pub(crate) fn record_overflow(&self) {
@@ -893,7 +1008,7 @@ impl CallgraphView {
 
     #[cfg(test)]
     pub(crate) fn retry_due_for_test(&self) {
-        if let Some((deadline, _)) = &mut self.query.lock().unwrap().pending {
+        if let Some((deadline, _)) = &mut self.query.lock().pending {
             *deadline = std::time::Instant::now();
         }
     }
@@ -909,25 +1024,56 @@ impl CallgraphView {
         &self,
         now: impl Fn() -> std::time::Instant,
     ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
-        if !(self.current)() {
+        let deadline = std::time::Instant::now() + super::contracts::CALLGRAPH_QUERY_WAIT;
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-enter");
+        let result = self.reader_before(now, deadline);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:view-reader-return");
+        result
+    }
+
+    fn reader_before(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+        if self.owner.stopped() || !(self.current)() {
             return Err(CallgraphViewError {
                 reason: "checkout is no longer bound to this generation".into(),
                 busy: true,
-                completion_busy: false,
+                building: false,
             });
         }
-        let mut retry = self
-            .query
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Joining another request and receiving the acquisition share one
+        // deadline; queued readers must not get a fresh window after the lock.
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-begin");
+        #[cfg(test)]
+        let query_started = std::time::Instant::now();
+        let retry = self.query.try_lock_until(deadline);
+        #[cfg(test)]
+        record_read_wait(ReadWaitObservation {
+            stage: ReadWaitStage::QueryLock,
+            started: query_started,
+            deadline,
+            requested: deadline.saturating_duration_since(query_started),
+            finished: std::time::Instant::now(),
+            timed_out: retry.is_none(),
+        });
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-return");
+        #[cfg(test)]
+        if retry.is_none() {
+            crate::storage_retention::test_hook(&self.root, "cg-timing:query-lock-timeout");
+        }
+        let mut retry = retry.ok_or_else(graph_building)?;
         let mut steady = self
             .steady
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let (Some((revision, store)), Some(current)) =
-            (steady.as_ref(), self.source.steady_revision())
-        {
-            if *revision == current {
+        if let Some((revision, store)) = steady.as_ref() {
+            if self.source.steady_revision() == Some(*revision) {
                 self.ready.store(true, std::sync::atomic::Ordering::Release);
                 return Ok(store.clone());
             }
@@ -945,20 +1091,199 @@ impl CallgraphView {
                         "legacy text and symbol import building",
                     ));
                 }
-                #[cfg(test)]
-                self.acquisitions
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.source.acquire_with_revision()
+                self.acquire_before(deadline)
             },
         );
+        // A request timeout is not a failed load. Keep the single-flight
+        // receiver, but do not back off: the next read can consume its result
+        // as soon as publication finishes, even if the previous read timed out.
+        if self
+            .acquisition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            *retry = super::contracts::LoadRetry::default();
+        }
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:steady-update-begin");
         *steady = match &result {
             Ok((store, Some(revision))) => Some((*revision, store.clone())),
             _ => None,
         };
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:steady-update-return");
         let result = result.map(|(store, _)| store);
         self.ready
             .store(result.is_ok(), std::sync::atomic::Ordering::Release);
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_reader_for_test(&self) -> Arc<ReadonlyCallGraphStore> {
+        self.ready_reader_for_test_with_clock(std::time::Instant::now)
+    }
+
+    #[cfg(test)]
+    fn ready_reader_for_test_with_clock(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+    ) -> Arc<ReadonlyCallGraphStore> {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(120);
+        self.ready_reader_before_for_test(now, deadline)
+    }
+
+    pub(crate) fn ready_reader_before_for_test(
+        &self,
+        now: impl Fn() -> std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> Arc<ReadonlyCallGraphStore> {
+        use std::time::Instant;
+        let state = || {
+            format!(
+            "root={} family={} ready={} stopped={} current={} acquisition={:?} retry={:?} legacy_import_building={}",
+            self.root.display(), self.family, self.is_ready(), self.owner.stopped(), (self.current)(),
+            self.acquisition.try_lock().ok().map(|slot| slot.as_ref().map(crossbeam_channel::Receiver::len)),
+            self.query.try_lock().map(|retry| retry.pending.clone()),
+            self.legacy_import.as_ref().is_some_and(|job| job.is_building()),
+        )
+        };
+        if let Some(import) = &self.legacy_import {
+            assert!(
+                import.wait_until_for_test(deadline),
+                "callgraph fixture import did not finish within 120s: {}",
+                state()
+            );
+        }
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "callgraph fixture did not become ready within 120s: {}",
+                state()
+            );
+            let retry_at = self
+                .query
+                .try_lock_until(deadline)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "callgraph fixture query stayed locked for 120s: {}",
+                        state()
+                    )
+                })
+                .pending
+                .as_ref()
+                .map(|(retry_at, _)| *retry_at);
+            if let Some(retry_at) = retry_at {
+                let wait = retry_at.saturating_duration_since(now());
+                if !wait.is_zero() {
+                    let due = crossbeam_channel::after(wait);
+                    assert!(
+                        due.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                            .is_ok(),
+                        "callgraph fixture retry did not become due within 120s: {}",
+                        state()
+                    );
+                }
+            }
+            match self.reader_before(&now, deadline) {
+                Ok(reader) => return reader,
+                Err(error) if error.busy && !self.owner.stopped() && (self.current)() => {
+                    // Each attempt waits on its acquisition receiver. A completed
+                    // transient refusal may need a new verified acquisition.
+                }
+                Err(error) => panic!("callgraph fixture read failed: {error}; {}", state()),
+            }
+        }
+    }
+
+    fn acquire_before(&self, deadline: std::time::Instant) -> ReaderAcquisition {
+        #[cfg(test)]
+        crate::storage_retention::test_hook(&self.root, "cg-timing:acquire-enter");
+        let mut acquisition = self
+            .acquisition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rx) = acquisition.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok((store, revision))) => {
+                    *acquisition = None;
+                    // A result can sit between requests while the checkout
+                    // changes. Reuse it only if the source's steady revision
+                    // still matches the result's revision; otherwise bind again
+                    // against disk, reusing the published graph rather than
+                    // trusting an old verification.
+                    if revision.is_some() && self.source.steady_revision() == revision {
+                        return Ok((store, revision));
+                    }
+                }
+                Ok(Err(error)) => {
+                    *acquisition = None;
+                    return Err(error);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(_) => {
+                    *acquisition = None;
+                    return Err(graph_building());
+                }
+            }
+        }
+        if acquisition.is_none() {
+            let source = self.source.clone();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            #[cfg(test)]
+            crate::storage_retention::test_hook(&self.root, "cg-timing:submit-begin");
+            self.owner.spawn(
+                self.current.clone(),
+                move || source.acquire_with_revision(),
+                tx,
+            )?;
+            #[cfg(test)]
+            crate::storage_retention::test_hook(&self.root, "cg-timing:submit-return");
+            #[cfg(test)]
+            self.acquisitions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *acquisition = Some(rx);
+        }
+        let receive_started = std::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(receive_started);
+        #[cfg(test)]
+        crate::storage_retention::test_hook(
+            &self.root,
+            &format!(
+                "cg-timing:receive-begin budget_us={}",
+                remaining.as_micros()
+            ),
+        );
+        let received = acquisition.as_ref().unwrap().recv_timeout(remaining);
+        #[cfg(test)]
+        record_read_wait(ReadWaitObservation {
+            stage: ReadWaitStage::Acquisition,
+            started: receive_started,
+            deadline,
+            requested: remaining,
+            finished: std::time::Instant::now(),
+            timed_out: matches!(&received, Err(crossbeam_channel::RecvTimeoutError::Timeout)),
+        });
+        #[cfg(test)]
+        crate::storage_retention::test_hook(
+            &self.root,
+            match &received {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => "cg-timing:receive-timeout",
+                _ => "cg-timing:receive-return",
+            },
+        );
+        match received {
+            Ok(result) => {
+                *acquisition = None;
+                result
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(graph_building()),
+            Err(_) => {
+                *acquisition = None;
+                Err(graph_building())
+            }
+        }
     }
 }
 
@@ -1048,25 +1373,6 @@ mod tests {
         .unwrap()
     }
 
-    // A cold load may not be ready while metadata or publication is pending.
-    // Keep the production reader's backoff instead of requiring the
-    // first attempt to finish, and bound the fixture's total retry time.
-    fn ready_reader(view: &CallgraphView) -> Arc<ReadonlyCallGraphStore> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match view.reader() {
-                Ok(reader) => return reader,
-                Err(error) => {
-                    assert!(error.busy, "{error}");
-                    let now = std::time::Instant::now();
-                    assert!(now < deadline, "callgraph stayed pending: {error}");
-                    let retry_at = view.query.lock().unwrap().pending.as_ref().unwrap().0;
-                    std::thread::sleep(retry_at.min(deadline).saturating_duration_since(now));
-                }
-            }
-        }
-    }
-
     fn events(dir: &Path) -> Vec<super::super::donor::DonorEvent> {
         super::super::donor::events_under(dir)
     }
@@ -1104,6 +1410,77 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_worker_preserves_attribute_fixture_scope() {
+        struct PolicySource(Option<[PathBuf; 2]>);
+        impl CallgraphReaderSource for PolicySource {
+            fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+                assert_eq!(
+                    super::super::verification::attribute_sources_snapshot_for_test(),
+                    self.0
+                );
+                Err("fixture acquisition completed under its policy".into())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let _attributes = super::super::verification::known_attribute_sources_for_test(temp.path());
+        let expected = super::super::verification::attribute_sources_snapshot_for_test();
+        assert!(expected.is_some());
+        let graph = CallgraphView::with_source(
+            root,
+            crate::root_cache::StoragePaths::same(&temp.path().join("storage")),
+            "fixture-policy".into(),
+            crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
+            Arc::new(PolicySource(expected)),
+        );
+        let error = graph.reader().unwrap_err();
+        assert_eq!(
+            error.reason,
+            "fixture acquisition completed under its policy"
+        );
+    }
+
+    #[test]
+    fn fixture_reader_joins_acquisition_after_interactive_wait_expires() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = Arc::new(view(&root, &temp.path().join("storage")));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "callgraph-materialize" {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(120))
+                        .unwrap();
+                }
+            }),
+        );
+        let request_graph = graph.clone();
+        let request = std::thread::spawn(move || request_graph.reader());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap();
+        let fixture_graph = graph.clone();
+        let fixture = std::thread::spawn(move || fixture_graph.ready_reader_for_test());
+        let answer = request.join().unwrap();
+        release_tx.send(()).unwrap();
+        let ready = fixture.join().unwrap();
+        assert!(
+            answer.unwrap_err().building,
+            "the interactive read must retain its production bound"
+        );
+        assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
+        assert!(graph.is_ready());
+    }
+
+    #[test]
     fn policy_query_timeout_does_not_become_checkout_evidence() {
         let _serial = crate::blob_store::v3::serial_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -1134,8 +1511,28 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
         }
 
-        let graph = view(&root, &temp.path().join("storage"));
-        let _timeout = crate::git_index_reader::timeout_next_config_for_test();
+        struct PolicyTimeoutOnce {
+            inner: Arc<dyn CallgraphReaderSource>,
+            timeout: std::sync::atomic::AtomicBool,
+        }
+        impl CallgraphReaderSource for PolicyTimeoutOnce {
+            fn acquire(&self) -> Result<Arc<ReadonlyCallGraphStore>, CallgraphViewError> {
+                // The fault is thread-local; install it where acquisition runs.
+                let _timeout = self
+                    .timeout
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    .then(crate::git_index_reader::timeout_next_config_for_test);
+                self.inner.acquire()
+            }
+            fn record_change(&self, path: &Path) {
+                self.inner.record_change(path);
+            }
+        }
+        let mut graph = view(&root, &temp.path().join("storage"));
+        graph.source = Arc::new(PolicyTimeoutOnce {
+            inner: graph.source.clone(),
+            timeout: std::sync::atomic::AtomicBool::new(true),
+        });
         let pending = graph.reader().unwrap_err();
         assert!(pending.busy, "{pending}");
         assert!(!pending.reason.contains("changed"), "{pending}");
@@ -1146,7 +1543,10 @@ mod tests {
                 crate::callgraph_store::CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
             ) if error.code == rusqlite::ErrorCode::DatabaseBusy
         ));
-        assert_eq!(callers(&ready_reader(&graph), "a.ts", "target").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "a.ts", "target").len(),
+            1
+        );
         assert!(graph.is_ready());
         before.validate(&root).unwrap();
     }
@@ -1181,18 +1581,12 @@ mod tests {
         assert!(error.busy);
         for seconds in [1, 2, 4, 8, 16, 30, 30] {
             let deadline = now + std::time::Duration::from_secs(seconds);
-            assert_eq!(
-                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
-                deadline
-            );
+            assert_eq!(graph.query.lock().pending.as_ref().unwrap().0, deadline);
             let error = graph
                 .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
                 .unwrap_err();
             assert_eq!(error.reason, "legacy text and symbol import building");
-            assert_eq!(
-                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
-                deadline
-            );
+            assert_eq!(graph.query.lock().pending.as_ref().unwrap().0, deadline);
             now = deadline;
             assert!(graph.reader_with_clock(|| now).is_err());
         }
@@ -1206,11 +1600,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         now += std::time::Duration::from_secs(30);
-        let ready = graph.reader_with_clock(|| now).unwrap();
+        let ready = graph.ready_reader_for_test_with_clock(|| now);
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         assert!(graph.is_ready());
-        assert!(graph.query.lock().unwrap().pending.is_none());
-        assert!(graph.query.lock().unwrap().delay.is_zero());
+        assert!(graph.query.lock().pending.is_none());
+        assert!(graph.query.lock().delay.is_zero());
     }
 
     #[test]
@@ -1221,7 +1615,10 @@ mod tests {
         let storage = temp.path().join("storage");
         let root = checkout(&temp.path().join("checkout"));
         let graph = view(&root, &storage);
-        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "a.ts", "target").len(),
+            1
+        );
         drop(graph);
         let dir =
             crate::blob_store::v3::view_dir(&storage, "donor-reuse", &view_scope(&root)).unwrap();
@@ -1282,13 +1679,13 @@ mod tests {
         assert!(busy, "{reason}");
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(CallgraphViewError {
-                reason, busy, completion_busy: false,
+                reason, busy, building: false,
             }))),
             crate::context::CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention()
         ));
         let graph = view(&root, &storage);
         assert!(!graph.is_ready());
-        let ready = graph.reader().unwrap();
+        let ready = graph.ready_reader_for_test();
         assert!(graph.is_ready());
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         let rebuilt = store.current_generation_read_only().unwrap().unwrap();
@@ -1360,8 +1757,14 @@ mod tests {
             crate::watcher_backend::InitialCoverage::Complete,
         );
         let graph = view(&root, &storage);
-        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
-        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "a.ts", "target").len(),
+            1
+        );
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "a.ts", "target").len(),
+            1
+        );
         assert_eq!(
             graph.acquisitions.load(Relaxed),
             1,
@@ -1375,7 +1778,10 @@ mod tests {
         )
         .unwrap();
         graph.record_change(&added);
-        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "b.ts", "caller").len(),
+            1
+        );
         assert_eq!(
             graph.acquisitions.load(Relaxed),
             2,
@@ -1389,8 +1795,137 @@ mod tests {
         )
         .unwrap();
         crate::watcher_backend::subscription::gap(&root);
-        assert_eq!(callers(&graph.reader().unwrap(), "c.ts", "top").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "c.ts", "top").len(),
+            1
+        );
         assert_eq!(graph.acquisitions.load(Relaxed), 3, "a watcher gap binds");
+    }
+
+    #[test]
+    fn completed_acquisition_reverifies_an_unwatched_checkout_before_reuse() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = view(&root, &temp.path().join("storage"));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (published_tx, published_rx) = crossbeam_channel::bounded(1);
+        let hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| match step {
+                "callgraph-materialize" => {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                "callgraph-reader-acquired" => {
+                    published_tx.send(()).unwrap();
+                }
+                _ => {}
+            }),
+        );
+        // An expired receive budget starts the worker without waiting for it.
+        let result = graph.acquire_before(std::time::Instant::now());
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+        release_tx.send(()).unwrap();
+        assert!(entered.is_ok());
+        assert!(result.unwrap_err().building);
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(hook);
+
+        // No watcher reports the edit made after the earlier acquisition
+        // finished. The acquisition result waiting for the next read was verified
+        // before this edit, so it cannot be considered verified now.
+        std::fs::write(
+            root.join("c.ts"),
+            "import { caller } from './b';\nexport function latest() { return caller(); }\n",
+        )
+        .unwrap();
+        let ready = graph.ready_reader_for_test();
+        let names = callers(&ready, "b.ts", "caller");
+        assert_eq!(names.len(), 1);
+        assert!(names[0].contains("latest"), "{names:?}");
+        assert_eq!(
+            graph
+                .acquisitions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn cancel_reaches_completed_and_running_acquisition_tokens() {
+        let _serial = crate::blob_store::v3::serial_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = checkout(&temp.path().join("checkout"));
+        let graph = Arc::new(view(&root, &temp.path().join("storage")));
+        let tail_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tokens_tx, tokens_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                let hold_tail = step == "callgraph-reader-acquired"
+                    && !tail_seen.swap(true, std::sync::atomic::Ordering::AcqRel);
+                let hold_work = step == "callgraph-materialize"
+                    && tail_seen.load(std::sync::atomic::Ordering::Acquire);
+                if hold_tail || hold_work {
+                    let token = crate::executor::current_job_cancellation().unwrap();
+                    tokens_tx.send(token.clone()).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !token.cancel_already_requested() {
+                        if release_rx
+                            .recv_timeout(std::time::Duration::from_millis(10))
+                            .is_ok()
+                        {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "acquisition gate was not released"
+                        );
+                    }
+                }
+            }),
+        );
+        drop(graph.ready_reader_for_test());
+        // Positive waits: a loaded Windows runner can take seconds to schedule
+        // an acquisition. Only the cancellation check below is timing-sensitive.
+        let old = tokens_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let added = root.join("c.ts");
+        std::fs::write(
+            &added,
+            "import { caller } from './b';\nexport function latest() { return caller(); }\n",
+        )
+        .unwrap();
+        graph.record_change(&added);
+        let next_graph = graph.clone();
+        let next = std::thread::spawn(move || next_graph.reader());
+        let current = tokens_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_ne!(old.progress_key(), current.progress_key());
+        graph.cancel();
+        let old_cancelled = old.wait_for_cancellation(std::time::Duration::from_millis(250));
+        let current_cancelled = current.cancel_already_requested();
+        let _ = release_tx.send(());
+        let answer = next.join().unwrap();
+        drop(graph);
+        assert!(answer.unwrap_err().building);
+        assert!(
+            current_cancelled,
+            "running acquisition token was not cancelled"
+        );
+        assert!(
+            old_cancelled,
+            "the earlier completion tail lost its cancellation token"
+        );
     }
 
     #[test]
@@ -1402,7 +1937,10 @@ mod tests {
         let storage = temp.path().join("storage");
         let root = checkout(&temp.path().join("checkout"));
         let graph = view(&root, &storage);
-        assert_eq!(callers(&graph.reader().unwrap(), "a.ts", "target").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "a.ts", "target").len(),
+            1
+        );
         let plane = v3::plane_path(&storage, "donor-reuse", FamilyPlane::Callgraph).unwrap();
         let blocker = IdentityConnection::open_with_flags(
             &plane,
@@ -1421,9 +1959,29 @@ mod tests {
         )
         .unwrap();
         graph.record_change(&added);
+        let (failed_tx, failed_rx) = crossbeam_channel::bounded(1);
+        let _hook = crate::storage_retention::observe_test_hook(
+            &root,
+            Arc::new(move |step| {
+                if step == "callgraph-acquisition-failed" {
+                    failed_tx.send(()).unwrap();
+                }
+            }),
+        );
         let error = match graph.reader() {
             Ok(_) => panic!("a pinned WAL reader should prevent the truncating checkpoint"),
             Err(error) => error,
+        };
+        // The request can time out before SQLite's longer checkpoint wait.
+        // Keep the blocker until the worker finishes, then require the reader
+        // to preserve the checkpoint's original busy cause on the next read.
+        let error = if error.building {
+            failed_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            graph.reader().unwrap_err()
+        } else {
+            error
         };
         assert!(error.busy, "{error}");
         assert!(error.reason.contains(V3_STORE_BUSY), "{error}");
@@ -1436,7 +1994,10 @@ mod tests {
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
         graph.retry_due_for_test();
-        assert_eq!(callers(&graph.reader().unwrap(), "b.ts", "caller").len(), 1);
+        assert_eq!(
+            callers(&graph.ready_reader_for_test(), "b.ts", "caller").len(),
+            1
+        );
     }
 
     #[test]
@@ -1535,7 +2096,12 @@ mod tests {
         blocker.execute_batch("ROLLBACK").unwrap();
         drop(blocker);
         assert_eq!(
-            callers(&construct().unwrap().reader().unwrap(), "a.ts", "target").len(),
+            callers(
+                &construct().unwrap().ready_reader_for_test(),
+                "a.ts",
+                "target"
+            )
+            .len(),
             1
         );
     }
@@ -1547,7 +2113,7 @@ mod tests {
             format!("{V3_BASE_COMPLETION_BUSY}: CapReached {{ live_bases: 4 }}"),
         ));
         assert!(!error.busy);
-        assert!(!error.completion_busy);
+        assert!(!error.building);
         assert!(matches!(
             crate::context::checkout_view_callgraph_access(Some(Err(error))),
             crate::context::CallgraphStoreAccess::Error(_)
@@ -1619,17 +2185,11 @@ mod tests {
 
         for (attempt, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
             let deadline = now + std::time::Duration::from_secs(seconds);
-            assert_eq!(
-                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
-                deadline
-            );
+            assert_eq!(graph.query.lock().pending.as_ref().unwrap().0, deadline);
             assert!(graph
                 .reader_with_clock(|| deadline - std::time::Duration::from_nanos(1))
                 .is_err());
-            assert_eq!(
-                graph.query.lock().unwrap().pending.as_ref().unwrap().0,
-                deadline
-            );
+            assert_eq!(graph.query.lock().pending.as_ref().unwrap().0, deadline);
             now = deadline;
             if attempt < 6 {
                 assert!(matches!(
@@ -1643,14 +2203,16 @@ mod tests {
 
         claim.release().unwrap();
         let crate::context::CallgraphStoreAccess::Ready(ready) =
-            crate::context::checkout_view_callgraph_access(Some(graph.reader_with_clock(|| now)))
+            crate::context::checkout_view_callgraph_access(Some(Ok(
+                graph.ready_reader_for_test_with_clock(|| now)
+            )))
         else {
             panic!("the completed base must serve a ready call graph")
         };
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         assert!(graph.is_ready());
-        assert!(graph.query.lock().unwrap().pending.is_none());
-        assert!(graph.query.lock().unwrap().delay.is_zero());
+        assert!(graph.query.lock().pending.is_none());
+        assert!(graph.query.lock().delay.is_zero());
     }
 
     #[test]
@@ -1751,9 +2313,7 @@ mod tests {
         // another driver can finish the graph only if the failed bind released
         // its completion claim rather than waiting for process-death takeover.
         let graph = view(&root, &storage);
-        let ready = graph
-            .reader()
-            .expect("a failed bind must not strand a live claim");
+        let ready = graph.ready_reader_for_test();
         assert_eq!(callers(&ready, "a.ts", "target").len(), 1);
         assert_eq!(failed.installed_snapshot().generation().name(), "empty");
     }
@@ -1815,10 +2375,10 @@ mod tests {
             max_file_size: 1 << 20,
         };
         let main_view = view(&main, &storage);
-        let expected = callers(&main_view.reader().unwrap(), "a.ts", "target");
+        let expected = callers(&main_view.ready_reader_for_test(), "a.ts", "target");
         assert!(!expected.is_empty());
         let worker_view = view(&worker, &storage);
-        worker_view.reader().unwrap();
+        worker_view.ready_reader_for_test();
         let scope = view_scope(&main);
         let (borrowed, _) = super::super::callgraph_copies::open_published(
             &storage, family, policy, &scope, &worker,
@@ -1880,12 +2440,12 @@ mod tests {
             "the worker's shared commit base must survive"
         );
         assert_eq!(
-            callers(&worker_view.reader().unwrap(), "a.ts", "target"),
+            callers(&worker_view.ready_reader_for_test(), "a.ts", "target"),
             expected
         );
         let rebuilt = view(&main, &storage);
         assert_eq!(
-            callers(&rebuilt.reader().unwrap(), "a.ts", "target"),
+            callers(&rebuilt.ready_reader_for_test(), "a.ts", "target"),
             expected
         );
     }
@@ -1950,7 +2510,7 @@ mod tests {
         };
 
         let main_view = view(&main, &storage);
-        main_view.reader().unwrap();
+        main_view.ready_reader_for_test();
         assert_eq!(
             admit(&main, 0),
             Admission::Own,
@@ -1958,7 +2518,7 @@ mod tests {
         );
         assert_eq!(admit(&first, 1), Admission::Own);
         let first_view = view(&first, &storage);
-        first_view.reader().unwrap();
+        first_view.ready_reader_for_test();
         assert_eq!(
             admit(&first, 1),
             Admission::Own,
@@ -1973,7 +2533,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             callers(&borrowed, "a.ts", "target"),
-            callers(&main_view.reader().unwrap(), "a.ts", "target"),
+            callers(&main_view.ready_reader_for_test(), "a.ts", "target"),
         );
         drop(borrowed);
 
@@ -2098,7 +2658,7 @@ mod tests {
         let linked = std::fs::canonicalize(&linked).unwrap();
 
         let main_view = view(&main, &storage);
-        let main_store = main_view.reader().unwrap();
+        let main_store = main_view.ready_reader_for_test();
         assert_eq!(callers(&main_store, "a.ts", "target").len(), 1);
         assert!(
             main_view.extraction_count() > 0,
@@ -2106,7 +2666,7 @@ mod tests {
         );
 
         let linked_view = view(&linked, &storage);
-        let linked_store = linked_view.reader().unwrap();
+        let linked_store = linked_view.ready_reader_for_test();
         assert_eq!(
             callers(&linked_store, "a.ts", "target"),
             callers(&main_store, "a.ts", "target")
@@ -2232,11 +2792,11 @@ mod tests {
         let storage = temp.path().join("storage");
         let main_view = view(&main, &storage);
         assert_eq!(
-            callers(&ready_reader(&main_view), "a.ts", "target").len(),
+            callers(&main_view.ready_reader_for_test(), "a.ts", "target").len(),
             1
         );
         let linked_view = view(&linked, &storage);
-        let patched = callers(&ready_reader(&linked_view), "a.ts", "target");
+        let patched = callers(&linked_view.ready_reader_for_test(), "a.ts", "target");
         assert_eq!(patched.len(), 2, "{patched:?}");
         assert_ne!(base_dir(&storage, &linked), base_dir(&storage, &main));
         let base_events = events(&base_dir(&storage, &linked));
@@ -2256,7 +2816,7 @@ mod tests {
         let cold_storage = temp.path().join("cold-storage");
         let cold_view = view(&linked, &cold_storage);
         assert_eq!(
-            callers(&ready_reader(&cold_view), "a.ts", "target"),
+            callers(&cold_view.ready_reader_for_test(), "a.ts", "target"),
             patched
         );
         assert!(!events(&base_dir(&cold_storage, &linked))
@@ -2279,7 +2839,7 @@ mod tests {
         // A fresh checkout bootstraps the base through the base builder,
         // completes and seals its graph, then clones the donor for itself.
         let first_view = view(&first, &storage);
-        let first_store = first_view.reader().unwrap();
+        let first_store = first_view.ready_reader_for_test();
         assert_eq!(callers(&first_store, "a.ts", "target").len(), 1);
         assert_eq!(first_view.extraction_count(), 3, "a.ts, b.ts, package.json");
         let all = events(&storage);
@@ -2332,7 +2892,7 @@ mod tests {
         // A second checkout of the same bytes reuses the base's blobs and its
         // sealed donor: nothing is parsed and no graph is built cold.
         let second_view = view(&second, &storage);
-        let second_store = second_view.reader().unwrap();
+        let second_store = second_view.ready_reader_for_test();
         assert_eq!(second_view.extraction_count(), 0);
         assert_eq!(
             callers(&second_store, "a.ts", "target"),
@@ -2351,7 +2911,7 @@ mod tests {
         )
         .unwrap();
         second_view.record_change(&second.join("c.ts"));
-        let edited = second_view.reader().unwrap();
+        let edited = second_view.ready_reader_for_test();
         assert_eq!(callers(&edited, "b.ts", "caller").len(), 1);
         assert!(callers(&first_store, "b.ts", "caller").is_empty());
         assert_eq!(second_view.extraction_count(), 1);
@@ -2367,7 +2927,7 @@ mod tests {
         // base never had it.
         std::fs::remove_file(second.join("c.ts")).unwrap();
         second_view.record_change(&second.join("c.ts"));
-        let deleted = second_view.reader().unwrap();
+        let deleted = second_view.ready_reader_for_test();
         assert!(callers(&deleted, "b.ts", "caller").is_empty());
         // A reader acquired before the deletion keeps answering for its own
         // generation: publication never reclaims a generation a reader holds.
@@ -2381,7 +2941,7 @@ mod tests {
         // or rebuilding anything.
         drop((first_store, first_view));
         let restarted = view(&first, &storage);
-        let reopened = restarted.reader().unwrap();
+        let reopened = restarted.ready_reader_for_test();
         assert_eq!(callers(&reopened, "a.ts", "target").len(), 1);
         assert_eq!(restarted.extraction_count(), 0);
         assert_eq!(events(&member(&first)).len(), 1);

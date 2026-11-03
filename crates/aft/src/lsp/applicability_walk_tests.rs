@@ -1461,7 +1461,7 @@ fn applicability_walk_sibling_cost_does_not_rebuild_definitions_or_roots() {
 #[test]
 #[ignore = "copies the repository for a before/after measurement"]
 fn applicability_walk_repository_measurement() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let source = Path::new(crate::test_support::manifest_dir())
         .parent()
         .unwrap()
         .parent()

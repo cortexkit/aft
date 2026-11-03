@@ -148,7 +148,7 @@ pub(super) fn decode_reply(request: &WireRequest, value: &Value) -> Result<ReadR
                 let field = error["field"].as_str().ok_or_else(|| malformed(code, "field must be a string"))?;
                 ReadError::Refused(format!("worker read endpoint or field {field} is not allowed; the read was not sent: {message}"))
             }
-            "response_too_large" => ReadError::Refused(format!("worker read response exceeds 1 MiB; narrow the request: {message}")),
+            "response_too_large" => ReadError::ResponseTooLarge(format!("worker read response exceeds 1 MiB; narrow the request: {message}")),
             "agent_identity_required" => ReadError::Refused(format!("worker read requires a bot identity on the stamped route; restart the scoped session: {message}")),
             "vendor_error" => {
                 let status = error["status"].as_u64().filter(|status| (100..=599).contains(status) && !(200..=299).contains(status)).ok_or_else(|| malformed(code, "invalid HTTP status"))?;

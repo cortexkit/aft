@@ -118,7 +118,7 @@ pub(crate) struct LexicalView {
     /// with the source revision of the cut it was built from. A query whose
     /// source still reports that revision as steady reuses it instead of
     /// binding and rebuilding the whole index again.
-    query: std::sync::Mutex<Option<(u64, crate::search_index::SearchIndexSnapshot)>>,
+    query: Arc<std::sync::Mutex<Option<(u64, crate::search_index::SearchIndexSnapshot)>>>,
     /// Verified acquisitions made, so tests can tell reuse from a new bind.
     #[cfg(test)]
     acquisitions: std::sync::atomic::AtomicUsize,
@@ -142,6 +142,9 @@ pub(crate) trait LexicalSnapshotSource: Send + Sync {
     fn steady_revision(&self) -> Option<u64> {
         None
     }
+    /// Recheck Git and policy inputs at a binding boundary, even when no
+    /// watcher event was delivered for metadata outside the watched tree.
+    fn prepare_bind(&self) {}
     fn record_change(&self, path: &Path);
     fn record_overflow(&self) {}
     fn record_cookie(&self, _: &Path) {}
@@ -163,6 +166,10 @@ impl LexicalSnapshotSource for CheckoutLexicalSource {
 
     fn steady_revision(&self) -> Option<u64> {
         self.driver.steady_installed_revision()
+    }
+
+    fn prepare_bind(&self) {
+        self.driver.prepare_steady_bind();
     }
 
     fn acquire_with_revision(&self) -> Result<(Snapshot, Option<u64>), String> {
@@ -226,11 +233,59 @@ impl LexicalView {
         family: &str,
         policy: TrigramPolicy,
     ) -> bool {
+        self.matches_checkout(root, storage, family, policy) && (self.current)()
+    }
+
+    pub(crate) fn matches_checkout(
+        &self,
+        root: &Path,
+        storage: &crate::root_cache::StoragePaths,
+        family: &str,
+        policy: TrigramPolicy,
+    ) -> bool {
         self.root == root
             && self.storage == *storage
             && self.family == family
             && self.policy == policy
-            && (self.current)()
+    }
+
+    /// A configure generation owns permission to answer, not the checkout's
+    /// verification. Retain the source and its revision-keyed projection when
+    /// only that permission changes. The caller checks bind freshness before
+    /// serving the replacement; old handles still have their revoked control.
+    pub(crate) fn with_binding(
+        &self,
+        current: crate::migration::v3_ledger::ImportControl,
+        limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+    ) -> Result<Self, String> {
+        if !current() {
+            return Err(format!(
+                "{}checkout is unbound",
+                crate::blob_store::v3::BUSY_PREFIX
+            ));
+        }
+        let mut view = Self::with_source(
+            self.root.clone(),
+            self.storage.clone(),
+            self.family.clone(),
+            self.policy,
+            self.source.clone(),
+        );
+        view.query = self.query.clone();
+        view.legacy_import = crate::migration::views_background::BackgroundImport::start(
+            &self.storage.artifacts,
+            &self.family,
+            &self.root,
+            self.policy,
+            current.clone(),
+            limiter,
+        );
+        view.current = current;
+        Ok(view)
+    }
+
+    pub(crate) fn prepare_bind(&self) {
+        self.source.prepare_bind();
     }
 
     #[cfg(test)]
@@ -324,7 +379,7 @@ impl LexicalView {
             family,
             policy,
             source,
-            query: std::sync::Mutex::new(None),
+            query: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             acquisitions: Default::default(),
             ready: std::sync::atomic::AtomicBool::new(false),
@@ -1815,6 +1870,10 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
         super::readiness::PlaneReadiness::Ready { pending, failed }
     }
 }
+
+#[cfg(test)]
+#[path = "trigram/rebind_tests.rs"]
+mod rebind_tests;
 
 #[cfg(test)]
 mod tests {

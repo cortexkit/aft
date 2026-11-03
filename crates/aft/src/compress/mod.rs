@@ -767,11 +767,7 @@ pub fn build_registry_for_context(ctx: &AppContext) -> FilterRegistry {
         _ => None,
     };
 
-    toml_filter::build_registry(
-        builtin_filters::ALL,
-        user_dir.as_deref(),
-        project_dir.as_deref(),
-    )
+    toml_filter::build_standard_registry(user_dir.as_deref(), project_dir.as_deref())
 }
 
 /// Normalize a shell command for compressor dispatch by walking past
@@ -1802,7 +1798,7 @@ mod output_probe_tests {
     }
 
     fn repository_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        Path::new(crate::test_support::manifest_dir())
             .parent()
             .and_then(Path::parent)
             .expect("aft crate should be nested under the repository root")
@@ -1826,7 +1822,7 @@ mod output_probe_tests {
     }
 
     fn integration_filter_inputs() -> Vec<(String, String)> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = Path::new(crate::test_support::manifest_dir())
             .join("tests/integration/fixtures/compress_filters");
         let mut paths = Vec::new();
         collect_named_files(&root, "input.txt", &mut paths);

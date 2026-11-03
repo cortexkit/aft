@@ -12,6 +12,7 @@ use crate::blob_store::v2::TrigramPolicy;
 
 pub(crate) struct BackgroundImport {
     done: Arc<AtomicBool>,
+    completed: crossbeam_channel::Receiver<()>,
 }
 
 impl BackgroundImport {
@@ -30,8 +31,10 @@ impl BackgroundImport {
         {
             return None;
         }
+        let (completed_tx, completed_rx) = crossbeam_channel::bounded(1);
         let job = Arc::new(Self {
             done: Arc::new(AtomicBool::new(false)),
+            completed: completed_rx,
         });
         let weak = Arc::downgrade(&job);
         let keep_going: ImportControl = Arc::new(move || weak.upgrade().is_some() && current());
@@ -51,6 +54,7 @@ impl BackgroundImport {
                 crate::log_ctx::with_session(session, || {
                     run(&request, keep_going, limiter);
                     done.store(true, Ordering::Release);
+                    let _ = completed_tx.send(());
                 });
             });
         if let Err(error) = spawned {
@@ -62,6 +66,16 @@ impl BackgroundImport {
 
     pub(crate) fn is_building(&self) -> bool {
         !self.done.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wait_until_for_test(&self, deadline: std::time::Instant) -> bool {
+        if !self.is_building() {
+            return true;
+        }
+        let _ = self
+            .completed
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        !self.is_building()
     }
 }
 

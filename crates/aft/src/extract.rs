@@ -1817,7 +1817,7 @@ mod tests {
     use tree_sitter::Parser;
 
     fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        PathBuf::from(crate::test_support::manifest_dir())
             .join("tests")
             .join("fixtures")
             .join("extract_function")

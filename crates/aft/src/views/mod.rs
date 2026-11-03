@@ -52,6 +52,7 @@ pub mod symbol_store;
 // Plane and runtime modules of the per-checkout views. Each starts as a
 // documented empty module that its plane fills in.
 pub mod callgraph;
+mod callgraph_acquisition;
 pub(crate) mod callgraph_copies;
 
 #[cfg(test)]

@@ -43,7 +43,9 @@ The `data` payload is:
       "idle_ttl_ms": 1800000,
       "lsp_idle_ttl_ms": 600000,
       "evictable_in_ms": 1800000,
-      "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "inspect": 0},
+      "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "callgraph_projection": 0, "inspect": 0, "pending_install": 0, "exact_memo": 0, "compression_filters": 0, "bash": 0, "lsp": 0, "parser_pool": 0},
+      "exact_memo": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "entries": 0, "candidates": 0, "file_digests": 0, "descriptors": 0, "lifecycle_keys": 0, "literal_presence_entries": 0, "payload_budget_bytes": 8388608, "not_estimated": ["in_flight_verifiers_and_detached_readers"]},
+      "compression_filters": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "filters": 0, "command_keywords": 0, "not_estimated": ["compiled_regex_automata"]},
       "semantic_worker_bytes": 0,
       "semantic_overlay_bytes": 0,
       "attributed_bytes": 0,
@@ -92,6 +94,26 @@ after each refresh (including failed refreshes); transient in-flight buffers,
 allocator capacity/size-class overhead and embedding models are not included.
 The richer status semantic estimate separates `serving_index_bytes` and
 `worker_index_bytes`.
+
+`exact_memo` attributes the root's retained exact-search candidates, duplicate
+evidence descriptors, file digests, and key/presence metadata. It estimates
+backing capacities, not only live element counts, without reading source files.
+The exact-result payload budget is 8 MiB per root context; literal-presence
+answers and retired poison keys have separate 1 MiB budgets. Entry-count limits
+remain in force. A new generation retires the old generation of the same query,
+tests flag and evidence scope. An oversized result is served in full without
+being retained: these are cache limits, never ranking-input or result limits.
+Idle artifact eviction releases the memo; a busy verifier defers non-blocking
+eviction. In-flight verification and pages still held by readers after eviction
+are explicitly outside this retained-cache estimate.
+
+`compression_filters` attributes each root's private registry tables, strings
+and vectors. Shipped filters share immutable compiled regex engines across all
+roots; user/project overrides are still loaded independently on each reset.
+The regex library does not expose engine allocation sizes, so compiled engines
+remain an explicit estimation gap, not a guessed per-pattern byte count.
+The root's `attributed_bytes` includes both cache estimates, plus the bash and
+LSP estimates now also exposed in each root row's `planes` JSON object.
 
 With views enabled, a root serves semantic search from its checkout view.
 `semantic_overlay_bytes` is that view's own overlay (replacement entries not

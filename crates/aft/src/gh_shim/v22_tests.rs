@@ -1769,7 +1769,7 @@ fn v22_pr_edit_labels_keep_the_operator_row_and_speech_never_uses_operator_gh() 
 
 #[test]
 fn v22_preparer_applies_the_additions_to_a_synthetic_v21_baseline() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(crate::test_support::manifest_dir()).join("../..");
     let dir = tempfile::tempdir().unwrap();
     // The production v21 payload is not tracked, so the preparer runs on a
     // synthetic baseline in the same JSON formatting, with its pinned digest

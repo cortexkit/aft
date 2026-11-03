@@ -26,6 +26,55 @@ thread_local! {
     static TODOS_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Isolated cold-scan timing: inventory and fixture preparation stay outside
+/// the measured interval, and each invocation uses a fresh test process.
+#[cfg(all(test, target_os = "linux"))]
+mod throughput_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "repository throughput probe; requires AFT_SCAN_BENCH_ROOT on Linux"]
+    fn todos_and_metrics_throughput_probe() {
+        use crate::inspect::{InspectCategory, JobKey, JobScope};
+        use std::sync::{Arc, RwLock};
+        let root = PathBuf::from(std::env::var_os("AFT_SCAN_BENCH_ROOT").expect("corpus root"));
+        let mut files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        files.sort();
+        let input_bytes = files
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .sum::<u64>();
+        eprintln!("SCAN_CORPUS files={} bytes={input_bytes}", files.len());
+        let scope = JobScope::for_project(&root);
+        let mut job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
+            category: InspectCategory::Todos,
+            scope_files: files,
+            project_root: root.clone(),
+            inspect_dir: root.join("inspect"),
+            config: Arc::new(crate::config::Config::default()),
+            symbol_cache: Arc::new(RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let started = Instant::now();
+        let todos = run_todos_scan(&job).outcome.expect("TODO scan");
+        let todo_ms = started.elapsed().as_secs_f64() * 1000.0;
+        job.category = InspectCategory::Metrics;
+        job.key = JobKey::for_category_scope(job.category, &scope);
+        let started = Instant::now();
+        let metrics = super::super::metrics::run_metrics_scan(&job)
+            .outcome
+            .expect("metrics scan");
+        let metrics_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("SCAN_TIMING files={} todo_ms={todo_ms:.3} metrics_ms={metrics_ms:.3} total_ms={:.3} todo_count={} todo_scanned={} metrics_scanned={}", job.scope_files.len(), todo_ms + metrics_ms, todos.aggregate["count"], todos.scanned_files.len(), metrics.scanned_files.len());
+        assert!(!todos.scanned_files.is_empty());
+        assert!(!metrics.scanned_files.is_empty());
+    }
+}
+
 #[cfg(debug_assertions)]
 static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
 
@@ -41,6 +90,7 @@ struct TodoItem {
 #[derive(Debug, Clone)]
 struct FileScan {
     scanned_file: Option<PathBuf>,
+    skipped: Option<(PathBuf, &'static str)>,
     items: Vec<TodoItem>,
 }
 
@@ -99,9 +149,16 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
     }
 
     let mut scanned_files = Vec::new();
+    let mut skipped_files = Vec::new();
     let mut all_items = Vec::new();
     let mut excluded = ExcludedTestTally::default();
     for scan in per_file {
+        if let Some((path, reason)) = scan.skipped {
+            skipped_files.push((
+                display_file_path(&job.project_root, &path),
+                reason.to_string(),
+            ));
+        }
         let file = scan
             .scanned_file
             .as_ref()
@@ -156,6 +213,7 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
         "drill_down_capped": drill_down_capped,
     });
     excluded.write_into(&mut aggregate);
+    super::source_text::write_skipped_files(&mut aggregate, skipped_files, None);
     let success = InspectScanSuccess {
         scanned_files,
         contributions: Vec::new(),
@@ -169,12 +227,32 @@ fn todos_memo() -> &'static Tier1FileMemo<FileScan> {
 }
 
 fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileScan) {
-    let (freshness, source) = read_text_file(path);
+    // Plain JSON cannot contain comments. Do not open it, even to sniff for a
+    // language; JSON with comments must use a comment-capable extension.
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return (
+            None,
+            FileScan {
+                scanned_file: None,
+                skipped: None,
+                items: Vec::new(),
+            },
+        );
+    }
+    let metadata = std::fs::metadata(path).ok();
+    let _permit =
+        super::source_text::source_scan_permit(metadata.as_ref().map_or(0, std::fs::Metadata::len));
+    let (freshness, source, skipped_reason) = read_text_file(path, metadata);
     let Some(source) = source else {
         return (
             freshness,
             FileScan {
                 scanned_file: None,
+                skipped: skipped_reason.map(|reason| (path.to_path_buf(), reason)),
                 items: Vec::new(),
             },
         );
@@ -190,6 +268,7 @@ fn scan_file(path: &Path, project_root: &Path) -> (Option<FileFreshness>, FileSc
         freshness,
         FileScan {
             scanned_file: Some(path.to_path_buf()),
+            skipped: None,
             items,
         },
     )
@@ -520,22 +599,31 @@ fn next_char_len(line: &str, cursor: usize) -> usize {
         .unwrap_or_default()
 }
 
-fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>) {
-    let metadata = std::fs::metadata(path).ok();
-    #[cfg(debug_assertions)]
-    bump_file_read_count(path);
-    let bytes = crate::project_content::read(path).ok();
+fn read_text_file(
+    path: &Path,
+    metadata: Option<std::fs::Metadata>,
+) -> (Option<FileFreshness>, Option<String>, Option<&'static str>) {
+    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
+    let bytes = match read_source_bytes(path) {
+        Ok(SourceBytes::Bytes(bytes)) => {
+            #[cfg(debug_assertions)]
+            bump_file_read_count(path);
+            Some(bytes)
+        }
+        Ok(SourceBytes::TooLarge) => return (None, None, Some(TOO_LARGE)),
+        _ => None,
+    };
     let freshness = metadata
         .as_ref()
         .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
 
     let Some(bytes) = bytes else {
-        return (freshness, None);
+        return (freshness, None, None);
     };
     if bytes.contains(&0) {
-        return (freshness, None);
+        return (freshness, None, None);
     }
-    (freshness, String::from_utf8(bytes).ok())
+    (freshness, String::from_utf8(bytes).ok(), None)
 }
 
 fn freshness_from_metadata(metadata: &std::fs::Metadata, bytes: Option<&[u8]>) -> FileFreshness {
@@ -762,10 +850,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.rs");
         fs::write(&path, "// TODO: marker\n").unwrap();
-        let _ = read_text_file(&path);
+        let _ = read_text_file(&path, fs::metadata(&path).ok());
         assert_eq!(file_read_count_for_debug(dir.path()), 0);
         reset_file_read_count_for_debug(dir.path());
-        let _ = read_text_file(&path);
+        let _ = read_text_file(&path, fs::metadata(&path).ok());
         assert_eq!(file_read_count_for_debug(dir.path()), 1);
     }
     use crate::config::Config;
@@ -809,6 +897,154 @@ mod tests {
             callgraph_writer: true,
             callgraph_snapshot: None,
         }
+    }
+
+    #[test]
+    fn oversized_todo_source_is_unopened_and_is_a_named_gap() {
+        let project = tempfile::tempdir().unwrap();
+        let large = project.path().join("large.rs");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(super::super::source_text::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        let small = project.path().join("small.rs");
+        fs::write(&small, "// TODO: small source still scanned\n").unwrap();
+        let probe = crate::project_content::Probe::new(project.path());
+        let job = todos_job(project.path(), vec![large.clone(), small.clone()]);
+        let memo = Tier1FileMemo::default();
+        for _ in 0..2 {
+            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+            assert_eq!(result.scanned_files, vec![small.clone()]);
+            assert_eq!(result.aggregate["count"], 1);
+            assert_eq!(result.aggregate["complete"], false);
+            assert_eq!(
+                result.aggregate["skipped_files"],
+                serde_json::json!([
+                    {"file": "large.rs", "reason": "over the 1 MiB size limit"}
+                ])
+            );
+        }
+        assert!(!probe.paths().contains(&large));
+        fs::write(&large, "// TODO: now small enough\n").unwrap();
+        let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+        assert_eq!(result.aggregate["count"], 2);
+        assert!(result.aggregate.get("skipped_files").is_none());
+    }
+
+    #[test]
+    fn plain_json_is_unopened_but_jsonc_comments_are_scanned() {
+        let project = tempfile::tempdir().unwrap();
+        let plain = project.path().join("data.json");
+        fs::write(&plain, "{\"value\": \"TODO: not a comment\"}").unwrap();
+        let commented = project.path().join("config.jsonc");
+        fs::write(
+            &commented,
+            "{\n// TODO: keep this comment\n\"value\": 1\n}\n",
+        )
+        .unwrap();
+        let probe = crate::project_content::Probe::new(project.path());
+        let job = todos_job(project.path(), vec![plain.clone(), commented.clone()]);
+        let memo = Tier1FileMemo::default();
+        for _ in 0..2 {
+            let result = run_todos_scan_with_memo(&job, &memo).outcome.unwrap();
+            assert_eq!(result.scanned_files, vec![commented.clone()]);
+            assert_eq!(result.aggregate["count"], 1);
+            assert_eq!(result.aggregate["items"][0]["file"], "config.jsonc");
+            assert!(result.aggregate.get("skipped_files").is_none());
+            assert_ne!(result.aggregate["complete"], false);
+        }
+        assert!(!probe.paths().contains(&plain));
+        assert!(probe.paths().contains(&commented));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn several_large_todo_files_hold_source_bytes_through_parse_without_a_two_file_cap() {
+        let project = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        let fitting_files = (super::super::source_text::SOURCE_SCAN_BUDGET_BYTES
+            / super::super::source_text::MAX_SOURCE_BYTES) as usize;
+        let total_files = fitting_files + 1;
+        let paths = (0..total_files)
+            .map(|index| {
+                let path = project.path().join(format!("large-{index}.rs"));
+                let mut source = String::from("// TODO: bounded parallel parsing\n");
+                source.extend(std::iter::repeat_n(
+                    ' ',
+                    super::super::source_text::MAX_SOURCE_BYTES as usize - source.len(),
+                ));
+                fs::write(&path, source).unwrap();
+                PARSE_DELAYS
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), (entered_tx.clone(), release_rx.clone()));
+                path
+            })
+            .collect();
+        reset_file_read_count_for_debug(project.path());
+        let job = todos_job(project.path(), paths);
+        let worker = std::thread::spawn(move || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(total_files)
+                .build()
+                .unwrap()
+                .install(|| {
+                    run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
+                        .outcome
+                        .unwrap()
+                })
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        for _ in 0..fitting_files {
+            entered_rx.recv_timeout(deadline).unwrap();
+        }
+        let over_budget = entered_rx.recv_timeout(std::time::Duration::from_millis(100));
+        let reads_while_blocked = file_read_count_for_debug(project.path());
+        for _ in 0..total_files {
+            release_tx.send(()).unwrap();
+        }
+        let result = worker.join().unwrap();
+        assert!(
+            over_budget.is_err(),
+            "another parser ran while the source-byte budget was fully reserved"
+        );
+        assert_eq!(
+            reads_while_blocked, fitting_files,
+            "permits must cover reads, not only parsing"
+        );
+        assert_eq!(result.scanned_files.len(), total_files);
+        assert_eq!(result.aggregate["count"], total_files);
+    }
+
+    /// Run in its own process under `/usr/bin/time -v`; fixtures are prepared
+    /// separately so their allocation and write cost do not enter the peak
+    /// resident set size (RSS).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "large-input RSS probe; requires AFT_TODO_RSS_ROOT on Linux"]
+    fn todos_large_json_rss_probe() {
+        let root = PathBuf::from(std::env::var_os("AFT_TODO_RSS_ROOT").expect("fixture root"));
+        let paths = [
+            "data-100.json",
+            "data-125.json",
+            "data-150.json",
+            "small.rs",
+        ]
+        .map(|name| root.join(name))
+        .to_vec();
+        reset_file_read_count_for_debug(&root);
+        let result = run_todos_scan_with_memo(&todos_job(&root, paths), &Tier1FileMemo::default())
+            .outcome
+            .expect("TODO scan");
+        assert_eq!(result.aggregate["count"], 1);
+        eprintln!(
+            "TODO RSS probe: reads={}, scanned={}, aggregate={}",
+            file_read_count_for_debug(&root),
+            result.scanned_files.len(),
+            result.aggregate
+        );
     }
 
     #[test]

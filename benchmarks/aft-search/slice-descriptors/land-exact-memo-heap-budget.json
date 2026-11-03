@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs"
+  ],
+  "note": "Bounds the exact-search memo's retained payload (8 MiB) and retires obsolete generations of the same query. Cache admission never cuts the verified candidate set or the ranking input; oversized sets are served in full without being retained. Routing, candidate verification and score-free ordering are unchanged, so ranked rows must remain byte-identical. lib.rs only registers a Linux test-only heap probe."
+}

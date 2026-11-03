@@ -198,6 +198,7 @@ fn secret_bash_legacy_remote_is_refused_before_any_job() {
         session: "secret-bash".into(),
         requested_platform: None,
         requested_vcpus: None,
+        requested_memory_mib: None,
         requested_network: false,
         configured_env_names: vec![],
         return_paths: Vec::new(),

@@ -1113,7 +1113,7 @@ mod tests {
         // download against its own copy of PINNED_ORT_LIBRARIES before
         // publishing it. If the two lists drift apart, the installer publishes
         // builds AFT then refuses, or refuses builds AFT would load.
-        let installer = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let installer = Path::new(crate::test_support::manifest_dir())
             .join("../../packages/aft-bridge/src/onnx-runtime.ts");
         let Ok(source) = std::fs::read_to_string(&installer) else {
             eprintln!("skipping: {} not present", installer.display());

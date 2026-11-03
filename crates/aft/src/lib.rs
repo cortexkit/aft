@@ -229,6 +229,8 @@ pub mod windows_path;
 pub mod windows_shell;
 pub mod worker_jail_canary;
 
+#[cfg(all(test, target_os = "linux"))]
+mod daemon_heap_probe;
 #[cfg(test)]
 mod gate_hermeticity_tests;
 #[cfg(test)]
@@ -237,6 +239,8 @@ pub(crate) mod search_hot_path_measurements;
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

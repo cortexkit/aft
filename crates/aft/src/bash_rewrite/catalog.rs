@@ -5,6 +5,7 @@
 //! behavior it covers without depending on Rust type names or log messages.
 
 use std::fs;
+#[cfg(not(test))]
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +310,14 @@ pub fn baseline_source_resolves(source: &str) -> bool {
     if file.is_empty() || symbol.is_empty() || symbol.contains("::") {
         return false;
     }
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+    // Only tests comparing rewritten commands with native Bash validate source
+    // locations; shipped rewrite dispatch does not. Relocated unit tests must
+    // inspect the consumer's source files.
+    #[cfg(test)]
+    let manifest_dir = crate::test_support::manifest_dir();
+    #[cfg(not(test))]
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join(file);
     path.is_file()
         && fs::read_to_string(path)
             .ok()

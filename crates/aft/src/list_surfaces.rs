@@ -355,6 +355,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "DigestProofCache::insert",
+        location_or_primitive: "MAX_DIGEST_PROOF_BYTES",
+        reason: "Internal verified-content proof retention budget; eviction or bypass always falls back to reading and hashing the complete served page, never truncates search candidates or output.",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/records.rs",
         enclosing_item: "cut_detail",
         location_or_primitive: "canonical byte limit, files.pop, UTF-8 stream prefix",
@@ -465,7 +471,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "gh_shim/read_render.rs",
         enclosing_item: "list, search, native",
-        location_or_primitive: "per_page 100, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
+        location_or_primitive: "per_page caps of 100 (10 for Actions runs), adaptive page-size retries, items.iter().take(remaining), items.iter().take(plan.limit() - rows.len()) and native gh --limit selection",
         reason: "REST API paging and gh-compatible explicit output limits, not an AFT tool result list; over-return is a fetch error",
     },
     ExclusionEntry {
@@ -641,6 +647,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "due_batches",
         location_or_primitive: "GC_ENTRY_BUDGET ordered deadline iterator advancement",
         reason: "internal retention candidates beyond the budget remain indexed for the next maintenance request; no agent-visible records are truncated",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/memo.rs",
+        enclosing_item: "make_room_for, store_literal_presence, prune_lifecycle",
+        location_or_primitive: "MAX_EXACT_MEMO_BYTES, MAX_LITERAL_PRESENCE_BYTES, MAX_RETIRED_POISONED_BYTES and obsolete-generation cache retirement",
+        reason: "internal reconstructible cache ownership only; complete verified results still feed ranking and oversized entries are served without retention, while evicted literal-presence answers are recomputed; no agent-visible result is cut",
     },
     ExclusionEntry {
         file: "bash_background/remote.rs",

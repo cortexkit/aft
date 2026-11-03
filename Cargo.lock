@@ -763,9 +763,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-exec-remote-types"
-version = "0.2.15"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28e910ad03610999650a27ae6ab2040055b311c54f3044945e309446d7744724"
+checksum = "4baa56c0cdb208cded94a405851b93723c1cd39b5f29eb15642245df824b97b7"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4258,9 +4258,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.34.2"
+version = "0.34.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17bb57c54d8c2b12e9977b92d5c269f7e34b5a7fa07deb6d412d52938ce8c86a"
+checksum = "557d6774359962374dad67a73a52a0af8c1c48a0d2669f5b6dd84d624d87e1da"
 dependencies = [
  "serde",
  "serde_json",

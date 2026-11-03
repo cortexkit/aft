@@ -956,7 +956,8 @@ fn confine_answer_is_kept_once_confined() {
 }
 
 fn plan(name: &str) -> Value {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/exec_remote/fixtures/plans");
+    let root =
+        Path::new(crate::test_support::manifest_dir()).join("src/exec_remote/fixtures/plans");
     let jcs = std::fs::read(root.join(format!("{name}.jcs"))).unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(&jcs)),
@@ -2183,6 +2184,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     session: "session".into(),
                     requested_platform: None,
                     requested_vcpus: None,
+                    requested_memory_mib: None,
                     requested_network: false,
                     configured_env_names: Vec::new(),
                     return_paths: Vec::new(),

@@ -1,0 +1,1 @@
+- AFT's memory no longer grows with uptime from cached exact-search results: the cache has a size budget and drops results for superseded index generations.
