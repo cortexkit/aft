@@ -9489,6 +9489,8 @@ export function bannerUnused() {}
 
     #[test]
     fn unused_exports_oversized_js_ts_sources_are_unopened_and_cached_as_graph_wide_gaps() {
+        use std::fs;
+
         use super::super::scanners::source_text::MAX_SOURCE_BYTES;
         use super::super::scanners::unused_exports::{
             run_unused_exports_scan, run_unused_exports_scan_with_oxc,
