@@ -264,22 +264,9 @@ pub fn poll_wait(ctx: &AppContext) -> bool {
             release.recv_timeout(Duration::from_secs(10)).unwrap();
         }
     }
-    let probe = ctx.folder_admission().probe.lock();
-    let mut binding = ctx.folder_admission().binding.lock();
-    if let Some(binding) = binding.as_mut().filter(|b| {
-        b.wait_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-    }) {
-        binding.pending = true;
-        binding.checking = false;
-        binding.needs_apply = false;
-        binding.needs_off_bind = false;
-        binding.decision = None;
-        // Expiry ends the caller's wait, not a useful worker. The resolve below
-        // owns generation checks and can accept the worker's late real verdict.
-    }
-    drop(binding);
-    drop(probe);
+    // The admitted configuration may be applied while this caller is descheduled.
+    // Only resolve may publish expiry: it checks the current binding under the
+    // decision locks.
     let _ = resolve(ctx);
     !waiting(ctx)
 }
@@ -1592,6 +1579,16 @@ pub(crate) fn resolve(ctx: &AppContext) -> ResolveResult {
     if ctx.subc_unbound_quiesced() || ctx.configure_generation() != generation {
         return ResolveResult::Stale;
     }
+    // A resolved attempt owns its generation until a recheck explicitly arms
+    // pending/checking again. Never replace its result with a stale caller's
+    // timeout, or clear the pending configuration application of that result.
+    if !binding.pending && !binding.checking {
+        return if binding.needs_apply || binding.needs_off_bind {
+            ResolveResult::Ready(binding.generation)
+        } else {
+            ResolveResult::Settled
+        };
+    }
     let negative = cache.decision.classification == FolderClassification::NotProject;
     let incomplete = !cache.decision.is_determined();
     let closed = negative || incomplete;
@@ -2388,6 +2385,15 @@ mod tests {
 
     #[test]
     fn completed_decision_survives_a_late_caller_cap() {
+        assert_completed_decision_survives_late_cap(true);
+    }
+
+    #[test]
+    fn completed_decision_keeps_its_replay_after_a_late_caller_cap() {
+        assert_completed_decision_survives_late_cap(false);
+    }
+
+    fn assert_completed_decision_survives_late_cap(replay_before_cap: bool) {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Makefile"), "").unwrap();
@@ -2410,7 +2416,6 @@ mod tests {
             ),
         );
         let generation = ctx.configure_generation();
-        let deadline = Instant::now() + wait_budget();
         let (sender, receiver) = std::sync::mpsc::channel();
         *ctx.folder_admission().probe.lock() = Some(ProbeTask {
             generation,
@@ -2421,7 +2426,7 @@ mod tests {
             let binding = slot.as_mut().unwrap();
             binding.pending = true;
             binding.decision = None;
-            binding.wait_deadline = Some(deadline);
+            binding.wait_deadline = None;
         }
         let (started, paused) = std::sync::mpsc::channel();
         let (release, resume) = std::sync::mpsc::channel();
@@ -2429,9 +2434,17 @@ mod tests {
         let caller_ctx = Arc::clone(&ctx);
         let caller = std::thread::spawn(move || poll_wait(&caller_ctx));
         paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        let deadline = ctx
+            .folder_admission()
+            .binding
+            .lock()
+            .as_ref()
+            .unwrap()
+            .wait_deadline
+            .unwrap();
 
         // Deliver a completed worker result while the caller is paused before
-        // its cap check, then resolve and commit the admitted configuration.
+        // its cap check. Apply the admitted configuration either side of expiry.
         let decision = standalone(root.path(), &config).unwrap();
         assert_eq!(decision.classification, FolderClassification::Project);
         let cache = Cache {
@@ -2451,22 +2464,36 @@ mod tests {
             .unwrap()
             .request
             .clone();
-        commit(&ctx, root.path(), config, &request, false, false);
+        if replay_before_cap {
+            commit(&ctx, root.path(), config.clone(), &request, false, false);
+        }
         let decided = snapshot(&ctx).unwrap();
-        assert_eq!(decided["state"], "decided", "{decided}");
+        let expected_state = if replay_before_cap {
+            "decided"
+        } else {
+            "pending"
+        };
+        assert_eq!(decided["state"], expected_state, "{decided}");
         assert_eq!(decided["classification"], "project", "{decided}");
 
         // Only delay the caller. The real verdict is already recorded, so the
         // original 350 ms deadline cannot turn it into incomplete evidence.
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         release.send(()).unwrap();
-        assert!(caller.join().unwrap());
+        assert_eq!(caller.join().unwrap(), replay_before_cap);
         let after_cap = snapshot(&ctx).unwrap();
-        assert_eq!(after_cap["state"], "decided", "{after_cap}");
+        assert_eq!(after_cap["state"], expected_state, "{after_cap}");
         assert_eq!(after_cap["classification"], "project", "{after_cap}");
         assert_eq!(after_cap, decided);
+        if !replay_before_cap {
+            assert!(matches!(resolve(&ctx), ResolveResult::Ready(g) if g == generation));
+            commit(&ctx, root.path(), config, &request, false, false);
+        }
+        let applied = snapshot(&ctx).unwrap();
+        assert_eq!(applied["state"], "decided", "{applied}");
+        assert_eq!(applied["classification"], "project", "{applied}");
         assert!(matches!(resolve(&ctx), ResolveResult::Settled));
-        assert_eq!(snapshot(&ctx).unwrap(), decided);
+        assert_eq!(snapshot(&ctx).unwrap(), applied);
         assert_eq!(ctx.configure_generation(), generation);
     }
 
