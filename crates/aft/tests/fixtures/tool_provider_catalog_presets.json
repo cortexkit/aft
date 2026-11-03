@@ -3526,8 +3526,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "396b83528bbebf4118d16bd1c5c0acd4efc09a0bb4ee62e14da527b45af84892",
-      "catalog_digest": "396b83528bbebf4118d16bd1c5c0acd4efc09a0bb4ee62e14da527b45af84892",
+      "generation": "1198137d8529e7eaf9f4f3987d2e29e7cf8a77056a0ad67e38014ace340c1efa",
+      "catalog_digest": "1198137d8529e7eaf9f4f3987d2e29e7cf8a77056a0ad67e38014ace340c1efa",
       "tools": [
         {
           "name": "status",
@@ -3623,7 +3623,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). On Linux, add `,Ngb` to ask for N GiB of memory, for example `linux,2c,16gb` for a Rust build."
               },
               "return_paths": {
                 "type": "array",
@@ -4806,8 +4806,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "7f60c6a71f3251b83783ac4c535de3c94d49c17b7411096206ff2aaf0ddd212d",
-      "catalog_digest": "7f60c6a71f3251b83783ac4c535de3c94d49c17b7411096206ff2aaf0ddd212d",
+      "generation": "0149ccb921040e407c06800853629adc1af022bbbc629eaee8841d1956a6dc76",
+      "catalog_digest": "0149ccb921040e407c06800853629adc1af022bbbc629eaee8841d1956a6dc76",
       "tools": [
         {
           "name": "status",
@@ -4903,7 +4903,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options)."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). `macos` sends the command to a macOS machine for builds and tests that need macOS (no vCPU or network options). On Linux, add `,Ngb` to ask for N GiB of memory, for example `linux,2c,16gb` for a Rust build."
               },
               "return_paths": {
                 "type": "array",
