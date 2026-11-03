@@ -82,6 +82,7 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
             Some("go") => "go",
             Some("java") => "java",
             Some("cs") => "csharp",
+            Some("py") => "python",
             _ => "typescript",
         };
         let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
@@ -515,7 +516,9 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             dispatch_decoded_blobs: 2,
             dispatch_resolved_files: 3,
             dispatch_resolved_sites: 0,
-            dispatch_type_target_files: 0,
+            // TypeScript receiver types are resolved for the changed target and
+            // the added file only; no unchanged file is decoded for them.
+            dispatch_type_target_files: 2,
             dispatch_type_target_decoded_blobs: 0,
             dispatch_full: false,
             dispatch_type_target_traces: 0,
@@ -1124,6 +1127,52 @@ fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates(
             .filter(|row| selected.contains(std::str::from_utf8(&row.caller_path).unwrap()))
             .collect()
     );
+}
+
+#[test]
+fn callgraph_python_view_reexport_refresh_matches_cold() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let source = "def target():\n    pass\ndef replacement():\n    pass\n";
+    let package = "from .middle import forwarded as public\n";
+    let caller = "from pkg import public\ndef run():\n    public()\n";
+    let base = manifest(
+        &conn,
+        &[
+            ("pkg/source.py", source),
+            ("pkg/middle.py", "from .source import target as forwarded\n"),
+            ("pkg/__init__.py", package),
+            ("calls.py", caller),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("pkg/source.py", source),
+            (
+                "pkg/middle.py",
+                "from .source import replacement as forwarded\n",
+            ),
+            ("pkg/__init__.py", package),
+            ("calls.py", caller),
+        ],
+    );
+    let db = f.dir.path().join("python-reexport.sqlite");
+    let cold = f.dir.path().join("python-reexport-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_snapshot_parity(&snapshot(&cold), &snapshot(&db));
+    let conn = Connection::open(&db).unwrap();
+    let mut statement = conn
+        .prepare("SELECT target_symbol FROM edges WHERE kind='call' ORDER BY target_symbol")
+        .unwrap();
+    let targets = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(targets, ["replacement"]);
 }
 
 #[test]
@@ -1836,13 +1885,21 @@ impl DifferentialCorpus {
     fn with_directory_packages(mut self) -> Self {
         let files = &mut self.files;
         // One Go package. `Dog` lacks `Sit`, so it does not yet satisfy
-        // `Speaker`; `Loud` calls through an unknown receiver, whose name
-        // matches depend on the interfaces of every Go file; `Pet` names a
-        // type that no file of its directory declares yet.
+        // `Speaker`. `Parrot` supplies `Speak()` and `Sit()` independently of
+        // the `Dog` edits, so changing `Speaker` still moves the typed `Talk`
+        // call's implementation targets. `Loud`'s receiver type is unknown,
+        // so matching `Speak` by name does not identify any Go target; `Pet`
+        // names a type that no file of its directory declares yet.
         files.insert("gosvc/iface.go".into(), DIFFERENTIAL_GO_SPEAKER.into());
         files.insert(
             "gosvc/dog.go".into(),
             "package svc\n\ntype Dog struct{}\n\nfunc (d Dog) Speak() {}\n".into(),
+        );
+        files.insert(
+            "gosvc/parrot.go".into(),
+            "package svc\n\ntype Parrot struct{}\n\nfunc (p Parrot) Speak() {}\n\
+             func (p Parrot) Sit() {}\n"
+                .into(),
         );
         files.insert(
             "gosvc/talk.go".into(),
@@ -2116,8 +2173,9 @@ impl DifferentialCorpus {
                 }
             }
             19 => {
-                // No Go interface then requires `Speak()` as `Dog` declares
-                // it, so the unknown receiver of `Loud` stops matching it.
+                // `Parrot` no longer satisfies `Speaker` when `Speak` takes
+                // a parameter, so the unchanged typed receiver in `Talk`
+                // loses `Parrot.Speak` independently of `Dog`'s signatures.
                 let speaker = self.files.get_mut("gosvc/iface.go").unwrap();
                 if speaker.contains("Speak(loud bool)") {
                     *speaker = DIFFERENTIAL_GO_SPEAKER.into();
@@ -2144,13 +2202,17 @@ impl DifferentialCorpus {
 /// such caller is unchanged by the edit, so only a recorded dependency key can
 /// bring its rows up to date: methods and Go interfaces (14, 15, 19) or the
 /// directory of a Go, Java or C# caller (16, 17, 18).
+/// These Go interface calls resolve through declared receiver types to matching
+/// implementations, not by method name when the receiver type is unknown. Edit
+/// 19's target is independent of the `Dog` method edits, so a non-implementing
+/// `Dog` cannot hide its effect.
 const DIFFERENTIAL_WITNESSES: &[(usize, &str, &str)] = &[
     (14, "gosvc/talk.go", "gosvc/dog.go"),
     (15, "gosvc/talk.go", "gosvc/dog.go"),
     (16, "gosvc/pet.go", "gosvc/cat.go"),
     (17, "java/zoo/Keeper.java", "java/zoo/Lion.java"),
     (18, "csharp/farm/Barn.cs", "csharp/farm/Cow.cs"),
-    (19, "gosvc/loud.go", "gosvc/dog.go"),
+    (19, "gosvc/talk.go", "gosvc/parrot.go"),
 ];
 
 /// The number of method-call edges from sites of `caller` into `target`.
@@ -2242,6 +2304,12 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
                 "{context}: the corpus has {provenance} method-call edges"
             );
         }
+        assert!(
+            cold[0]["edges"].iter().any(|row| {
+                row.contains("\"TEXT dispatch:draw.ts:") && row.contains("\"TEXT name_match\"")
+            }),
+            "{context}: the unknown TypeScript receiver contributes name_match edges"
+        );
         // A scripted edit that moved no edge would compare nothing new.
         for (step, choice) in script.iter().flatten().enumerate() {
             assert_ne!(

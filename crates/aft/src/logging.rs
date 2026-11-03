@@ -2882,7 +2882,11 @@ mod tests {
                 let caller = thread::spawn(move || {
                     let _ = done.send(write_terminal_log_sync("held-terminal-stderr-probe"));
                 });
-                let result = completed.recv_timeout(Duration::from_secs(1));
+                // stderr stays held until after this wait, so a write that
+                // waited on it would time out here; the budget is generous
+                // because a loaded Windows runner can take over a second to
+                // persist the line.
+                let result = completed.recv_timeout(Duration::from_secs(30));
                 let _ = release.send(());
                 holder.join().unwrap();
                 caller.join().unwrap();

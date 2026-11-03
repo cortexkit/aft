@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Test-only: commands/semantic_search/mod.rs changes only the poll deadline of a #[cfg(test)] helper (poll_for_backend_verdict, 5 s to 30 s). No search code path, ranking input or reply changes, so ranked rows must remain byte-identical."
+}

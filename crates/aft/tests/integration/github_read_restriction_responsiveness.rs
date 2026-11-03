@@ -502,7 +502,10 @@ fn complete_deferred(start: GithubReadStart) -> GithubReadCompletion {
     let GithubReadStart::Deferred(deferred) = start else {
         panic!("network-bound GitHub read must return a deferred response");
     };
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // A positive wait: the fixture read completes on a worker thread, which a
+    // loaded CI runner can schedule late. What this file checks is that the
+    // read is deferred at all (the panic above), not how fast it finishes.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(result) = deferred.try_complete() {
             return result.expect("fixture GitHub read completes");

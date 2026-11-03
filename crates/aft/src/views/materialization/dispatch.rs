@@ -83,6 +83,8 @@ struct ImportFact {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct FileFacts {
     language: String,
+    #[serde(default)]
+    go_package: Option<String>,
     types: Vec<TypeHint>,
     methods: Vec<MethodHint>,
     fields: Vec<FieldHint>,
@@ -99,19 +101,31 @@ impl FileFacts {
     fn new(parse: &ParseBlob) -> Self {
         Self {
             language: parse.language.clone(),
+            go_package: parse.dispatch.go_package.clone(),
             types: parse.dispatch.types.clone(),
             methods: parse.dispatch.methods.clone(),
             fields: parse.dispatch.fields.clone(),
             returns: parse.dispatch.returns.clone(),
-            imports: parse
-                .imports
-                .iter()
-                .map(|import| ImportFact {
-                    module_path: import.module_path.clone(),
-                    names: import.names.clone(),
-                    default_import: import.default_import.clone(),
-                })
-                .collect(),
+            imports: if parse.language == "python" {
+                join::dispatch::python_reexports(parse)
+                    .into_iter()
+                    .map(|(module_path, names)| ImportFact {
+                        module_path,
+                        names,
+                        default_import: None,
+                    })
+                    .collect()
+            } else {
+                parse
+                    .imports
+                    .iter()
+                    .map(|import| ImportFact {
+                        module_path: import.module_path.clone(),
+                        names: import.names.clone(),
+                        default_import: import.default_import.clone(),
+                    })
+                    .collect()
+            },
             default_export_symbol: parse.default_export_symbol.clone(),
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
@@ -125,6 +139,7 @@ impl FileFacts {
         ParseBlob {
             entry_point_symbols: Vec::new(),
             dispatch: DispatchFacts {
+                go_package: self.go_package.clone(),
                 types: self.types.clone(),
                 methods: self.methods.clone(),
                 sites: Vec::new(),
@@ -283,13 +298,14 @@ struct FileRow {
 impl FileRow {
     fn decoded(parse: &ParseBlob, facts: FileFacts) -> Result<Self> {
         let facts_json = json(&facts)?;
-        let sites_json = json(&parse.dispatch.sites)?;
+        let sites = parse.bound_dispatch_sites();
+        let sites_json = json(&sites)?;
         Ok(Self {
             facts_digest: digest(&facts_json),
             facts,
             facts_json,
             sites_digest: digest(&sites_json),
-            sites: Some(parse.dispatch.sites.clone()),
+            sites: Some(sites),
             sites_json: Some(sites_json),
             trace: None,
             dirty: true,
@@ -662,6 +678,39 @@ pub(super) fn emit_from_decoded(
         }
     }
     stage.finish("resolver_index", format_args!("files={}", parses.len()));
+    let mut ordinary_syntax = HashSet::new();
+    let mut written_references = transaction.prepare_cached(
+        "SELECT ref_id,full_ref FROM refs WHERE caller_file=?1 AND kind IN ('call','construction')",
+    )?;
+    for path in &selected {
+        if rows
+            .get(path)
+            .is_some_and(|row| row.facts.language == "rust")
+        {
+            let references = written_references.query_map([path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for reference in references {
+                let (id, full) = reference?;
+                if let Some(full) = full {
+                    let associated =
+                        crate::callgraph_store::join::dispatch::associated_reference(&full);
+                    if associated {
+                        if let Some(ordinal) = id
+                            .rsplit(':')
+                            .next()
+                            .and_then(|ordinal| ordinal.parse().ok())
+                        {
+                            resolver.note_associated_site(path, ordinal);
+                        }
+                    }
+                    if associated || full.starts_with("self.") {
+                        ordinary_syntax.insert(id);
+                    }
+                }
+            }
+        }
+    }
     let memoized = MemoizedResolver::new(&resolver);
     let mut sites = Vec::new();
     let mut file_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
@@ -672,12 +721,25 @@ pub(super) fn emit_from_decoded(
             continue;
         };
         for site in row.sites.as_deref().unwrap_or_default() {
+            let ref_id = format!("view:{path}:{}", site.ordinal);
+            let resolution = memoized.resolve(path, site);
+            // Keep proven self-call and scoped module-function bindings when
+            // dispatch facts do not identify a project receiver type.
+            if row.facts.language == "rust"
+                && resolution.external > 0
+                && resolution.targets.is_empty()
+                && scope.ordinary_edge_refs.contains(&ref_id)
+            {
+                if ordinary_syntax.contains(&ref_id) {
+                    continue;
+                }
+            }
             sites.push(ResolvedSite {
                 file: path,
                 language: &row.facts.language,
-                ref_id: format!("view:{path}:{}", site.ordinal),
+                ref_id,
                 site,
-                resolution: memoized.resolve(path, site),
+                resolution,
             });
         }
         // Every file depends on its own facts, which `Resolver::resolve`
@@ -1068,55 +1130,76 @@ fn write_differences(
 
     // Unknown-receiver liveness: one row per site and protected target.
     {
-        let mut wanted = BTreeSet::<(String, i64, String, String)>::new();
-        for site in sites {
-            for (file, symbol) in &site.resolution.protected {
-                wanted.insert((
-                    site.file.to_string(),
-                    i64::from(site.site.ordinal),
-                    file.clone(),
-                    symbol.clone(),
-                ));
-            }
-        }
-        let mut stale = Vec::new();
-        let columns =
-            "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live";
-        let read_row = |row: &rusqlite::Row<'_>| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        };
-        let mut read = transaction.prepare(&match files {
-            None => columns.to_string(),
-            Some(_) => format!("{columns} WHERE caller_file=?1"),
-        })?;
-        for file in files.map_or_else(|| vec![None], |files| files.iter().map(Some).collect()) {
-            let rows = match file {
-                None => read.query_map([], read_row)?,
-                Some(file) => read.query_map([file], read_row)?,
-            };
-            for row in rows {
-                let row = row?;
-                if !wanted.remove(&row) {
-                    stale.push(row);
+        let empty: bool = transaction.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM view_unknown_live)",
+            [],
+            |row| row.get(0),
+        )?;
+        if empty {
+            // A fresh graph has no old protection rows to reconcile. Sites
+            // have unique ordinals here and each protected set is deduplicated,
+            // so stream the rows without cloning the full set of string keys.
+            let mut insert =
+                transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)")?;
+            for site in sites {
+                for (file, symbol) in &site.resolution.protected {
+                    counts.unknown_live_inserted +=
+                        insert.execute(params![site.file, site.site.ordinal, file, symbol])?;
                 }
             }
-        }
-        let mut delete = transaction.prepare(
-            "DELETE FROM view_unknown_live
+        } else {
+            let mut wanted = BTreeSet::<(String, i64, String, String)>::new();
+            for site in sites {
+                for (file, symbol) in &site.resolution.protected {
+                    wanted.insert((
+                        site.file.to_string(),
+                        i64::from(site.site.ordinal),
+                        file.clone(),
+                        symbol.clone(),
+                    ));
+                }
+            }
+            let mut stale = Vec::new();
+            let columns =
+                "SELECT caller_file, ordinal, target_file, target_symbol FROM view_unknown_live";
+            let read_row = |row: &rusqlite::Row<'_>| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            };
+            let mut read = transaction.prepare(&match files {
+                None => columns.to_string(),
+                Some(_) => format!("{columns} WHERE caller_file=?1"),
+            })?;
+            for file in files.map_or_else(|| vec![None], |files| files.iter().map(Some).collect()) {
+                let rows = match file {
+                    None => read.query_map([], read_row)?,
+                    Some(file) => read.query_map([file], read_row)?,
+                };
+                for row in rows {
+                    let row = row?;
+                    if !wanted.remove(&row) {
+                        stale.push(row);
+                    }
+                }
+            }
+            let mut delete = transaction.prepare(
+                "DELETE FROM view_unknown_live
              WHERE caller_file=?1 AND ordinal=?2 AND target_file=?3 AND target_symbol=?4",
-        )?;
-        for row in &stale {
-            counts.unknown_live_deleted += delete.execute(params![row.0, row.1, row.2, row.3])?;
-        }
-        let mut insert =
-            transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)")?;
-        for row in &wanted {
-            counts.unknown_live_inserted += insert.execute(params![row.0, row.1, row.2, row.3])?;
+            )?;
+            for row in &stale {
+                counts.unknown_live_deleted +=
+                    delete.execute(params![row.0, row.1, row.2, row.3])?;
+            }
+            let mut insert =
+                transaction.prepare("INSERT INTO view_unknown_live VALUES (?1,?2,?3,?4)")?;
+            for row in &wanted {
+                counts.unknown_live_inserted +=
+                    insert.execute(params![row.0, row.1, row.2, row.3])?;
+            }
         }
     }
 

@@ -126,11 +126,427 @@ fn set(files: &[&str]) -> BTreeSet<String> {
     files.iter().map(|file| file.to_string()).collect()
 }
 
+fn go_typed_edges(store: &CallGraphStore) -> Vec<(String, String, String)> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.caller_file, e.target_file, e.target_symbol FROM edges e
+         JOIN refs r ON r.ref_id=e.ref_id JOIN files f ON f.path=r.caller_file
+         WHERE f.lang='go' AND e.provenance='type_match' ORDER BY 1,2,3",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn go_method_answers(conn: &Connection) -> Vec<(String, String, String, String, u32)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.caller_file, src.scoped_name, e.target_file, e.target_symbol, r.line
+        FROM edges e JOIN refs r ON r.ref_id=e.ref_id JOIN nodes src ON src.id=e.source_node
+        WHERE e.kind='call' AND e.target_symbol LIKE '%::%' ORDER BY 1,2,3,4,5",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn go_view_answers(
+    fixture: &Fixture,
+    package_known: bool,
+    unknown_file: Option<&str>,
+) -> Vec<(String, String, String, String, u32)> {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    let temp = tempfile::tempdir_in(fixture.temp.path()).unwrap();
+    let blobs_path = temp.path().join("blobs.sqlite");
+    let blobs = Connection::open(&blobs_path).unwrap();
+    blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
+    let mut entries = Vec::new();
+    for path in source_files(&fixture.root) {
+        let source = fs::read_to_string(&path).unwrap();
+        let blob =
+            join::CallgraphBlob::extract(&source, "go", crate::views::callgraph::PRODUCER).unwrap();
+        let mut value = serde_json::to_value(&blob).unwrap();
+        if !package_known || unknown_file == Some(relative_path(&fixture.root, &path).as_str()) {
+            value["dispatch"]
+                .as_object_mut()
+                .unwrap()
+                .remove("go_package");
+        }
+        let blob: join::CallgraphBlob = serde_json::from_value(value).unwrap();
+        let payload = blob.to_bytes().unwrap();
+        let key = blake3::hash(&payload);
+        blobs
+            .execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    key.as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        entries.push((
+            RelPath::new(relative_path(&fixture.root, &path).into_bytes()).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(key.to_hex().to_string()),
+                },
+                resolution_input: false,
+            },
+        ));
+    }
+    let manifest = Manifest::new(entries).unwrap();
+    let database = temp.path().join("view.sqlite");
+    crate::views::materialization::materialize_manifest_view_database(
+        &database,
+        &blobs_path,
+        &manifest,
+    )
+    .unwrap();
+    go_method_answers(&Connection::open(database).unwrap())
+}
+
+fn assert_go_concrete_view_parity(fixture: &Fixture, has_interface: bool) {
+    let legacy = go_method_answers(&fixture.store.conn.lock().unwrap());
+    let mut viewed = go_view_answers(fixture, true, None);
+    // A known interface receiver deliberately retains declaration/implementation
+    // fan-out in views; the retiring store only resolves concrete receivers.
+    let interface = viewed
+        .iter()
+        .filter(|e| e.1 == "contract")
+        .map(|e| e.3.as_str())
+        .collect::<BTreeSet<_>>();
+    if has_interface {
+        assert_eq!(interface, BTreeSet::from(["I::run", "T::run"]));
+    } else {
+        assert!(interface.is_empty());
+    }
+    viewed.retain(|e| e.1 != "contract");
+    assert_eq!(legacy, viewed);
+}
+
+#[test]
+fn go_concrete_method_receivers_bind_across_test_package_files() {
+    let fixture = Fixture::from_files(&[
+        ("suite_test.go", "package db\ntype testSuite struct{}\n"),
+        ("issue_test.go", "package db\nfunc (s *testSuite) issueUseCase() {}\n"),
+        ("close_test.go", "package db\nfunc (s *testSuite) close() { s.issueUseCase() }\nfunc (s testSuite) check() { s.issueUseCase() }\n"),
+        ("external_test.go", "package db_test\ntype testSuite struct{}\nfunc (s *testSuite) issueUseCase() {}\n"),
+        ("web/other.go", "package db\ntype testSuite struct{}\nfunc (s *testSuite) issueUseCase() {}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "close_test.go".into(),
+                "issue_test.go".into(),
+                "testSuite::issueUseCase".into()
+            ),
+            (
+                "close_test.go".into(),
+                "issue_test.go".into(),
+                "testSuite::issueUseCase".into()
+            ),
+        ]
+    );
+    assert_go_concrete_view_parity(&fixture, false);
+}
+
+#[test]
+fn go_concrete_factory_return_and_local_declarations_bind_exactly() {
+    let fixture = Fixture::from_files(&[
+        ("fixture_test.go", "package p\ntype Fixture struct{}\nfunc (f *Fixture) commitLane() {}\ntype Other struct{}\nfunc (f *Other) commitLane() {}\ntype Contract interface { commitLane() }\n"),
+        ("caller_test.go", "package p\nfunc newFixture() *Fixture { return &Fixture{} }\nfunc caller() {\n f := newFixture(); f.commitLane()\n var x Fixture; x.commitLane()\n y := &Fixture{}; y.commitLane()\n z := Fixture{}; z.commitLane()\n}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            );
+            4
+        ]
+    );
+    assert_go_concrete_view_parity(&fixture, false);
+    let changed = edit(
+        &fixture.root,
+        "caller_test.go",
+        "newFixture() *Fixture { return &Fixture{} }",
+        "newFixture() *Other { return &Other{} }",
+    );
+    fixture.refresh_and_compare("go-factory-result", &[changed]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Fixture::commitLane".into()
+            ),
+            (
+                "caller_test.go".into(),
+                "fixture_test.go".into(),
+                "Other::commitLane".into()
+            ),
+        ]
+    );
+    assert_go_concrete_view_parity(&fixture, false);
+}
+
+#[test]
+fn go_concrete_binding_refuses_shadows_interfaces_and_nonlocal_packages() {
+    let fixture = Fixture::from_files(&[
+        ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype I interface { run() }\nfunc factory() *T { return &T{} }\n"),
+        ("caller_test.go", "package p\nfunc shadowed(x *T) { { x := unknown(); x.run() }; x.run() }\nfunc localType() { type T struct{}; var x T; x.run() }\nfunc shadowFactory(factory func() I) { x := factory(); x.run() }\nfunc contract(x I) { x.run() }\nfunc sibling() { { var x T }; x.run() }\nfunc closure(x *T) { f := func(x I) { x.run() }; _ = f }\nfunc switched(x *T, value any) { switch x := value.(type) { case I: x.run() } }\nfunc variadic(x ...T) { x.run() }\nfunc pointer(x **T) { x.run() }\nfunc unknown() I { return nil }\n"),
+        ("external_test.go", "package p_test\nfunc outsider(x *T) { x.run() }\n"),
+    ]);
+    assert!(go_typed_edges(&fixture.store).is_empty());
+    assert_go_concrete_view_parity(&fixture, true);
+}
+
+#[test]
+fn go_concrete_missing_package_fact_is_unknown_in_views() {
+    let fixture = Fixture::from_files(&[
+        (
+            "types.go",
+            "package p\ntype T struct{}\nfunc (x *T) run() {}\n",
+        ),
+        ("caller.go", "package p\nfunc (x *T) caller() { x.run() }\n"),
+    ]);
+    assert_go_concrete_view_parity(&fixture, false);
+    assert_eq!(go_typed_edges(&fixture.store).len(), 1);
+    assert!(go_view_answers(&fixture, false, None).is_empty());
+    let mixed = Fixture::from_files(&[
+        ("interface.go", "package p\ntype I interface { run() }\n"),
+        (
+            "types.go",
+            "package p\ntype T struct{}\nfunc (x *T) run() {}\n",
+        ),
+        ("caller.go", "package p\nfunc contract(x I) { x.run() }\n"),
+    ]);
+    let viewed = go_view_answers(&mixed, true, Some("types.go"));
+    assert_eq!(viewed.len(), 1);
+    assert_eq!(
+        viewed[0].3, "I::run",
+        "an old implementation fact cannot acquire a binding without package identity"
+    );
+}
+
+#[test]
+fn go_concrete_repeated_callback_parameters_are_scoped() {
+    let fixture = Fixture::from_files(&[
+        ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype Other struct{}\nfunc (x *Other) run() {}\nvar x *Other\n"),
+        ("caller.go", "package p\nfunc caller() {\n callbacks := []func(x *T){\n  func(x *T) { x.run() },\n  func(x *T) { x.run() },\n }\n _ = callbacks\n x.run()\n other := func() { var x *Other; x.run() }; _ = other\n}\n"),
+    ]);
+    assert_eq!(
+        go_typed_edges(&fixture.store),
+        vec![("caller.go".into(), "types.go".into(), "T::run".into()); 2]
+    );
+    let answers = go_method_answers(&fixture.store.conn.lock().unwrap());
+    assert_eq!(answers.iter().map(|e| e.4).collect::<Vec<_>>(), vec![4, 5]);
+    assert_go_concrete_view_parity(&fixture, false);
+    for source in [
+        "package p\nfunc caller() { callbacks := []any{func(x *T) { x.run() }, func(x *Other) { x.run() }}; _=callbacks }\n",
+        "package p\nfunc unknown() interface { run() } { return nil }\nfunc caller() { callbacks := []any{func(x *T) { { x := unknown(); x.run() } }, func(x *T) { x.run() }}; _=callbacks }\n",
+        "package p\nimport . \"net/http\"\nfunc caller() { _=StatusOK; callbacks := []any{func(x *T) { x.run() }, func(x *T) { x.run() }}; _=callbacks }\n",
+    ] {
+        let refused = Fixture::from_files(&[
+            ("types.go", "package p\ntype T struct{}\nfunc (x *T) run() {}\ntype Other struct{}\nfunc (x *Other) run() {}\n"),
+            ("caller.go", source),
+        ]);
+        assert!(go_typed_edges(&refused.store).is_empty());
+        assert_go_concrete_view_parity(&refused, false);
+    }
+}
+
 /// A cold-built fixture store that edit shapes are applied to.
 struct Fixture {
     temp: tempfile::TempDir,
     root: PathBuf,
     store: CallGraphStore,
+}
+
+#[test]
+fn typescript_object_store_records_wrapped_returned_and_argument_methods() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => {} });"),
+        ("caller.ts", "import { make as build } from './producer';\nexport function caller() { const adapter = build(); adapter.run(); }\nconst direct = { wrapped: () => {} } satisfies Contract;\ndirect.wrapped();\nfunction unknown(value) { value.argument(); }\nargument();"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM nodes WHERE name IN ('run','argument','wrapped') AND kind='method'"), 3);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 2);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::argument'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn typescript_object_store_factory_edits_match_a_cold_build() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export function make() { return { run() {} }; }"),
+        ("caller.ts", "import { make } from './producer';\nexport function caller() { const adapter = make(); adapter.run(); }"),
+    ]);
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%' AND provenance='type_match'"), 1);
+    let changed = edit(
+        &fixture.root,
+        "producer.ts",
+        "return { run() {} };",
+        "const unused = { run() {} }; return unknown;",
+    );
+    fixture.refresh_and_compare("typescript-object-return-removed", &[changed]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '@object:%'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn typescript_object_store_var_definitions_are_not_bare_name_bindings() {
+    let fixture = Fixture::from_files(&[
+        ("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }"),
+    ]);
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM nodes WHERE name='unique' AND kind='method'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture.store,
+            "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique'"
+        ),
+        1
+    );
+    assert_eq!(count(&fixture.store, "SELECT COUNT(*) FROM edges WHERE target_symbol LIKE '%::unique' AND provenance='type_match'"), 1);
+}
+
+#[test]
+fn typescript_object_cold_cache_avoids_reextraction() {
+    let fixture = Fixture::from_files(&[
+        ("producer.ts", "export const make = () => ({ run() {} });"),
+        ("caller.ts", "import {make} from './producer'; function caller() { const adapter=make(); adapter.run(); }"),
+    ]);
+    let mut retained = RetainedCallerData::new(1024 * 1024);
+    for path in source_files(&fixture.root) {
+        let extract = build_file_extract(&fixture.root, &path).unwrap();
+        retained.retain_objects(&extract);
+    }
+    let connection = fixture.store.conn.lock().unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    let references = load_name_match_refs(&transaction, None).unwrap();
+    assert!(references
+        .iter()
+        .any(|reference| reference.method_name == "run"));
+    let mut objects = typescript_objects::ObjectDispatch::new(
+        &transaction,
+        &fixture.root,
+        Some(&retained.objects),
+    );
+    objects.prepare(&references).unwrap();
+    assert_eq!(objects.source_extracts(), 0);
+    assert!(references
+        .iter()
+        .any(|reference| objects.resolve(&transaction, reference).unwrap().is_some()));
+}
+
+#[test]
+fn typescript_object_views_and_legacy_answers_are_identical() {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    fn answers(connection: &Connection) -> Vec<(String, String, String, String, u32, bool)> {
+        connection.prepare("SELECT src.file_path,src.scoped_name,e.target_file,e.target_symbol,e.line,e.provenance != 'name_match' FROM edges e JOIN nodes src ON src.id=e.source_node WHERE e.kind='call' ORDER BY 1,2,3,4,5,6")
+            .unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+    let cases: &[(&[(&str, &str)], usize)] = &[
+        (&[("caller.ts", "interface T { handler(): void }\nconst actual = ({ handler: () => {} } satisfies T);\nconst other = { handler: () => {} } as T;\nactual.handler();\nother.handler();")], 2),
+        (&[
+            ("producer.ts", "export const make = () => ({ run: () => {} });\nregister({ argument: () => helper() });\nfunction helper() {}"),
+            ("caller.ts", "import { make as build } from './producer';\nfunction caller() { const adapter = build(); adapter.run(); }\nfunction nestedCaller() { const nested = () => ({ child: { run() {} } }); nested().child.run(); }\nfunction unknown(value) { value.argument(); }\nargument();"),
+        ], 5),
+        (&[("caller.ts", "register({ run: () => helper() });\nregister({ run() { helper(); } });\nfunction helper() {}\nfunction first() { const value = { unique() {} }; value.unique(); }\nfunction second() { const value = { unique() {} }; value.unique(); }\nfunction inline() { ({run: function() {}}).run(); }")], 5),
+        (&[("caller.ts", "var value = { unique() {} };\nfunction caller(unknown) { unknown.unique(); unique(); value.unique(); }")], 1),
+    ];
+    for &(files, expected) in cases {
+        let fixture = Fixture::from_files(files);
+        let blob_path = fixture.temp.path().join("blobs.sqlite");
+        let blobs = Connection::open(&blob_path).unwrap();
+        blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY,payload BLOB NOT NULL,payload_digest BLOB NOT NULL,payload_schema INTEGER NOT NULL)").unwrap();
+        let manifest = Manifest::new(files.iter().map(|(path, source)| {
+            let payload =
+                join::CallgraphBlob::extract(source, "typescript", "typescript-object-parity")
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+            let digest = blake3::hash(&payload);
+            let key = digest.to_hex().to_string();
+            blobs
+                .execute(
+                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1,?2,?3,1)",
+                    params![
+                        digest.as_bytes().as_slice(),
+                        payload,
+                        digest.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            (
+                RelPath::new(path.as_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key),
+                        semantic: None,
+                    },
+                    resolution_input: false,
+                },
+            )
+        }))
+        .unwrap();
+        drop(blobs);
+        let view_path = fixture.temp.path().join("view.sqlite");
+        crate::views::materialization::materialize_manifest_view_database(
+            &view_path, &blob_path, &manifest,
+        )
+        .unwrap();
+        let view = Connection::open(view_path).unwrap();
+        let legacy = fixture.store.conn.lock().unwrap();
+        let legacy_answers = answers(&legacy);
+        assert_eq!(
+            legacy_answers.len(),
+            expected,
+            "{files:?}: {legacy_answers:?}"
+        );
+        assert_eq!(answers(&view), legacy_answers, "{files:?}");
+    }
 }
 
 impl Fixture {
@@ -149,6 +565,7 @@ impl Fixture {
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
         for (rel, text) in files {
+            fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
             fs::write(root.join(rel), text).unwrap();
         }
         let store = CallGraphStore::open(temp.path().join("incremental"), root.clone()).unwrap();
@@ -743,9 +1160,17 @@ fn check_edges_found_by_name_lookups(
 #[test]
 fn s3_every_dispatch_edge_is_found_by_the_name_lookups() {
     let fixture = Fixture::new(10, 10);
-    let (edges, path_form_only) = check_edges_found_by_name_lookups(&fixture.store).unwrap();
+    let (edges, _) = check_edges_found_by_name_lookups(&fixture.store).unwrap();
     assert!(edges >= 10, "{edges}");
-    // `Hub::build()` in path0.rs and path1.rs.
+    // Inherent constructors bind during ordinary resolution. Trait-associated
+    // functions still exercise supplemental path-form lookup through a real impl.
+    let path_forms = Fixture::from_files(&[(
+        "path.rs",
+        "pub trait PathFactory { fn build() -> Self; }\npub struct PathTarget;\nimpl PathFactory for PathTarget { fn build() -> Self { Self } }\nfn first() { PathTarget::build(); }\nfn second() { PathTarget::build(); }\n",
+    )]);
+    let (path_edges, path_form_only) =
+        check_edges_found_by_name_lookups(&path_forms.store).unwrap();
+    assert_eq!(path_edges, 2);
     assert_eq!(path_form_only, 2);
 
     // Receiver shapes across the languages with method dispatch.

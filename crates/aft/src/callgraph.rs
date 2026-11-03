@@ -1403,6 +1403,28 @@ pub(crate) fn build_file_data_from_source(
     build_file_data_from_source_with_lang(path, source, lang)
 }
 
+pub(crate) fn build_file_data_with_typescript_objects(
+    path: &Path,
+    source: &str,
+) -> Result<
+    (
+        FileCallData,
+        Option<crate::callgraph_store::join::ParseBlob>,
+    ),
+    AftError,
+> {
+    let lang =
+        detect_language_from_source(path, source).ok_or_else(|| AftError::InvalidRequest {
+            message: format!("unsupported file for call graph: {}", path.display()),
+        })?;
+    if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
+        return build_file_data_from_source_with_lang(path, source, lang).map(|data| (data, None));
+    }
+    let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
+    let lines = SourceLineIndex::new(source);
+    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true)
+}
+
 #[derive(Debug)]
 struct SymbolCallRange {
     symbol_index: usize,
@@ -1735,15 +1757,45 @@ pub(crate) fn build_file_data_from_tree(
     tree: &tree_sitter::Tree,
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false)
+        .map(|(data, _)| data)
+}
+
+fn build_file_data_from_tree_observed(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    tree: &tree_sitter::Tree,
+    line_index: &SourceLineIndex,
+    collect_objects: bool,
+) -> Result<
+    (
+        FileCallData,
+        Option<crate::callgraph_store::join::ParseBlob>,
+    ),
+    AftError,
+> {
     // Parse imports
-    let (import_block, python_bindings) = if lang == LangId::Python {
-        python::extract(source, tree.root_node())
+    let python = (lang == LangId::Python).then(|| python::extract(source, tree.root_node()));
+    let (import_block, python_bindings) = if let Some(python) = &python {
+        (python.imports.clone(), python.bindings.clone())
     } else {
         (imports::parse_imports(&source, &tree, lang), Vec::new())
     };
 
     // Get symbols (for call site extraction and export detection)
-    let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let mut symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
+        source,
+        lang,
+        tree.root_node(),
+        &mut symbols,
+    );
+    let mut rust_qualified = HashMap::new();
+    if lang == LangId::Rust {
+        rust_qualified = qualify_rust_impl_methods(source, tree.root_node(), &mut symbols);
+        symbols.extend(rust_trait_members(source, tree.root_node()));
+    }
 
     let root = tree.root_node();
     let mut macro_body_calls_by_macro = HashMap::new();
@@ -1760,6 +1812,23 @@ pub(crate) fn build_file_data_from_tree(
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
     };
+    if let Some(python) = &python {
+        let mut owned = HashMap::<String, Vec<CallSite>>::new();
+        let mut seen = HashSet::new();
+        for site in calls_by_symbol.into_values().flatten() {
+            if seen.insert((site.byte_start, site.byte_end)) {
+                if let Some(owners) = python.owners.get(&site.byte_start) {
+                    for owner in owners {
+                        owned.entry(owner.clone()).or_default().push(site.clone());
+                    }
+                }
+            }
+        }
+        for sites in owned.values_mut() {
+            sites.sort_by_key(|site| (site.byte_start, site.byte_end));
+        }
+        calls_by_symbol = owned;
+    }
     let mut value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
     } else if lang == LangId::Go {
@@ -1827,7 +1896,13 @@ pub(crate) fn build_file_data_from_tree(
     let rust_attribute_entry_points = if lang == LangId::Rust {
         crate::parser::rust_attribute_entry_points(&source, root)
             .into_iter()
-            .map(|entry| (entry.scoped_name, entry.attribute.to_string()))
+            .map(|entry| {
+                let name = rust_qualified
+                    .get(&entry.scoped_name)
+                    .and_then(|name| name.clone())
+                    .unwrap_or(entry.scoped_name);
+                (name, entry.attribute.to_string())
+            })
             .collect::<HashMap<_, _>>()
     } else {
         HashMap::new()
@@ -1948,7 +2023,7 @@ pub(crate) fn build_file_data_from_tree(
         );
     }
 
-    Ok(FileCallData {
+    let data = FileCallData {
         calls_by_symbol,
         value_refs_by_symbol,
         macro_body_calls_by_macro,
@@ -1959,7 +2034,180 @@ pub(crate) fn build_file_data_from_tree(
         import_block,
         python_bindings,
         lang,
-    })
+    };
+    let objects = if collect_objects {
+        crate::callgraph_store::join::dispatch::typescript_objects_from_data(
+            source,
+            lang,
+            &object_nodes,
+            &data,
+        )
+    } else {
+        None
+    };
+    Ok((data, objects))
+}
+
+pub(crate) fn rust_module_qualified_name(node: Node<'_>, source: &str, name: &str) -> String {
+    let mut modules = Vec::new();
+    let mut parent = node.parent();
+    while let Some(ancestor) = parent {
+        if ancestor.kind() == "mod_item" {
+            if let Some(name) = ancestor.child_by_field_name("name") {
+                modules.push(node_text(name, source));
+            }
+        }
+        parent = ancestor.parent();
+    }
+    modules.reverse();
+    modules.push(name.to_string());
+    modules.join("::")
+}
+
+// Same-named types in separate inline modules must not share method identities.
+fn qualify_rust_impl_methods(
+    source: &str,
+    root: Node<'_>,
+    symbols: &mut [Symbol],
+) -> HashMap<String, Option<String>> {
+    let mut types = HashSet::new();
+    let mut declarations = vec![root];
+    while let Some(node) = declarations.pop() {
+        if matches!(
+            node.kind(),
+            "struct_item" | "enum_item" | "trait_item" | "type_item"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                types.insert(rust_module_qualified_name(
+                    node,
+                    source,
+                    &node_text(name, source),
+                ));
+            }
+        }
+        declarations.extend(node.named_children(&mut node.walk()));
+    }
+    let mut scopes = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "impl_item" {
+            let declared_here = ["type", "trait"]
+                .iter()
+                .filter_map(|field| node.child_by_field_name(field))
+                .any(|ty| {
+                    let name = node_text(ty, source);
+                    let base = name.split('<').next().unwrap_or(&name);
+                    types.contains(&rust_module_qualified_name(node, source, base))
+                });
+            if !declared_here {
+                continue;
+            }
+            if let Some(body) = node.child_by_field_name("body") {
+                for method in body
+                    .named_children(&mut body.walk())
+                    .filter(|n| n.kind() == "function_item")
+                {
+                    if let Some(name) = method.child_by_field_name("name") {
+                        let prefix = rust_module_qualified_name(node, source, "");
+                        scopes.insert(
+                            (
+                                method.end_position().row as u32,
+                                method.end_position().column as u32,
+                                node_text(name, source),
+                            ),
+                            prefix,
+                        );
+                    }
+                }
+            }
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    let mut translated = HashMap::new();
+    for symbol in symbols.iter_mut().filter(|s| s.kind == SymbolKind::Method) {
+        if let Some(prefix) = scopes.get(&(
+            symbol.range.end_line,
+            symbol.range.end_col,
+            symbol.name.clone(),
+        )) {
+            if !prefix.is_empty() {
+                let old = symbol_identity(symbol);
+                let mut scope = prefix
+                    .trim_end_matches("::")
+                    .split("::")
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                scope.extend(symbol.scope_chain.clone());
+                symbol.scope_chain = scope;
+                let new = symbol_identity(symbol);
+                translated
+                    .entry(old)
+                    .and_modify(|name| *name = None)
+                    .or_insert(Some(new));
+            }
+        }
+    }
+    translated
+}
+
+fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "trait_item" {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("body"),
+            ) {
+                let name = node_text(name, source);
+                let mut scope = Vec::new();
+                let mut parent = node.parent();
+                while let Some(ancestor) = parent {
+                    if ancestor.kind() == "mod_item" {
+                        if let Some(module) = ancestor.child_by_field_name("name") {
+                            scope.push(node_text(module, source));
+                        }
+                    }
+                    parent = ancestor.parent();
+                }
+                scope.reverse();
+                scope.push(name.clone());
+                for method in body.named_children(&mut body.walk()) {
+                    if !matches!(method.kind(), "function_item" | "function_signature_item") {
+                        continue;
+                    }
+                    let Some(method_name) = method.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let end = method
+                        .child_by_field_name("body")
+                        .map_or(method.end_byte(), |body| body.start_byte());
+                    symbols.push(Symbol {
+                        name: node_text(method_name, source),
+                        kind: SymbolKind::Method,
+                        range: crate::symbols::Range {
+                            start_line: method.start_position().row as u32,
+                            start_col: method.start_position().column as u32,
+                            end_line: method.end_position().row as u32,
+                            end_col: method.end_position().column as u32,
+                        },
+                        signature: Some(
+                            source[method.start_byte()..end]
+                                .trim()
+                                .trim_end_matches(';')
+                                .to_string(),
+                        ),
+                        scope_chain: scope.clone(),
+                        // Members are reached through the trait, not imported from the module.
+                        exported: false,
+                        parent: Some(name.clone()),
+                    });
+                }
+            }
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    symbols
 }
 
 #[derive(Debug, Clone)]
