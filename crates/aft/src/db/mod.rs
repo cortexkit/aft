@@ -69,6 +69,13 @@ const MIGRATION_VERSIONS: &[u32] = &[
 // Install them on writable opens, including databases already at schema 18.
 const ADDITIVE_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_bash_tasks_task_owner ON bash_tasks(task_id, harness, session_id);
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_project_replay
+  ON bash_tasks(harness, project_key, started_at, task_id)
+  WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')
+     OR completion_delivered = 0
+     OR CASE WHEN json_valid(metadata)
+             THEN json_type(metadata, '$.completion_delivered') = 'false'
+             ELSE 0 END;
 "#;
 
 const MIGRATION_V14: &str = r#"
@@ -1219,6 +1226,7 @@ mod tests {
         "idx_bash_tasks_session_status",
         "idx_bash_tasks_project_lookup",
         "idx_bash_tasks_task_owner",
+        "idx_bash_tasks_project_replay",
         "idx_bash_pattern_watches_session",
         "idx_bash_pattern_watches_task",
         "idx_bash_tasks_started_activity",
