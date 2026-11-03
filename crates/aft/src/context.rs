@@ -10070,6 +10070,14 @@ impl AppContext {
     /// A measured disk-reserve refusal is recorded separately, without adding
     /// to the bug count or replacing the most recent genuine failure.
     pub(crate) fn note_view_load_failure(&self, plane: &'static str, error: &str) {
+        self.note_classified_view_load_failure(
+            plane,
+            error,
+            crate::views::trigram::bind_is_busy(error),
+        );
+    }
+
+    fn note_classified_view_load_failure(&self, plane: &'static str, error: &str, planned: bool) {
         if let Some(condition) = crate::view_storage_reserve::DiskReserveCondition::observed(
             &self.storage_paths().artifacts,
             error,
@@ -10080,7 +10088,7 @@ impl AppContext {
                 .insert(plane.to_string(), condition);
             return;
         }
-        if crate::views::trigram::bind_is_busy(error) {
+        if planned {
             return;
         }
         let cause = view_load_cause(error);
@@ -13229,8 +13237,8 @@ impl AppContext {
                 }
                 match &borrowed {
                     Ok(_) => self.note_view_load_success("callgraph"),
-                    Err(error) if !error.busy => {
-                        self.note_view_load_failure("callgraph", &error.reason)
+                    Err(error) if !error.is_planned() => {
+                        self.note_classified_view_load_failure("callgraph", &error.reason, false)
                     }
                     Err(_) => {}
                 }
@@ -13274,9 +13282,12 @@ impl AppContext {
                             ) {
                                 match &borrowed {
                                     Ok(_) => self.note_view_load_success("callgraph"),
-                                    Err(error) if !error.busy => {
-                                        self.note_view_load_failure("callgraph", &error.reason)
-                                    }
+                                    Err(error) if !error.is_planned() => self
+                                        .note_classified_view_load_failure(
+                                            "callgraph",
+                                            &error.reason,
+                                            false,
+                                        ),
                                     Err(_) => {}
                                 }
                                 return Some(borrowed);
@@ -13284,7 +13295,13 @@ impl AppContext {
                         }
                         // Like the lexical view, a failed callgraph load fails
                         // the query: no legacy store may answer for the view.
-                        self.note_view_load_failure("callgraph", &error.reason);
+                        if !error.is_planned() {
+                            self.note_classified_view_load_failure(
+                                "callgraph",
+                                &error.reason,
+                                false,
+                            );
+                        }
                         return Some(Err(error));
                     }
                 }
@@ -13309,7 +13326,9 @@ impl AppContext {
             self.callgraph_view_routes.fetch_add(1, Ordering::Relaxed);
             self.note_view_load_success("callgraph");
         } else if let Err(error) = &result {
-            self.note_view_load_failure("callgraph", &error.reason);
+            if !error.is_planned() {
+                self.note_classified_view_load_failure("callgraph", &error.reason, false);
+            }
         }
         Some(result)
     }

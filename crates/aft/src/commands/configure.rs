@@ -15966,6 +15966,67 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_views_typed_planned_errors_skip_failures_but_real_errors_count() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        struct Refused(crate::views::callgraph::CallgraphViewError);
+        impl crate::views::callgraph::CallgraphReaderSource for Refused {
+            fn acquire(
+                &self,
+            ) -> Result<
+                Arc<crate::callgraph_store::ReadonlyCallGraphStore>,
+                crate::views::callgraph::CallgraphViewError,
+            > {
+                Err(self.0.clone())
+            }
+            fn record_change(&self, _: &Path) {}
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        init_git_fixture(&root);
+        let root = std::fs::canonicalize(root).unwrap();
+        let ctx = test_context();
+        assert!(
+            handle_configure_for_test(
+                &configure_callgraph_views(&root, &temp.path().join("storage"), true),
+                &ctx
+            )
+            .success
+        );
+        for (busy, building) in [(true, false), (false, true), (false, false)] {
+            // A reason that looks planned must not override a typed real failure.
+            let reason = if busy || building {
+                "opaque typed fixture error"
+            } else {
+                "legacy text and symbol import building"
+            };
+            ctx.install_callgraph_source_for_test(Arc::new(Refused(
+                crate::views::callgraph::CallgraphViewError {
+                    reason: reason.into(),
+                    busy,
+                    building,
+                },
+            )));
+            let before = ctx.callgraph_view_read_diagnostics().attempts;
+            let access = ctx.callgraph_store_for_ops();
+            if building {
+                assert!(matches!(access, CallgraphStoreAccess::Building));
+            } else {
+                assert!(matches!(access, CallgraphStoreAccess::Error(_)));
+            }
+            let diagnostics = ctx.callgraph_view_read_diagnostics();
+            assert_eq!(diagnostics.attempts, before + 1);
+            assert_eq!(diagnostics.last_error.as_deref(), Some(reason));
+            assert!(diagnostics.total_attempt_ms >= diagnostics.last_attempt_ms);
+            let health = ctx.try_health_snapshot(&root);
+            assert_eq!(
+                health.view_load_failures.values().copied().sum::<u64>(),
+                if busy || building { 0 } else { 1 }
+            );
+            assert_eq!(health.view_load_failure_last.is_some(), !busy && !building);
+        }
+    }
+
+    #[test]
     fn callgraph_view_load_failure_fails_every_graph_op_and_counts() {
         let reporting_suffix = "\nThis is an AFT bug: tell the user to report it with `npx @cortexkit/aft doctor --issue`; don't run it yourself.";
         // Holds the process environment lock for the whole test, like the

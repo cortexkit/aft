@@ -481,6 +481,12 @@ pub(crate) struct CallgraphViewError {
     pub building: bool,
 }
 
+impl CallgraphViewError {
+    pub(crate) fn is_planned(&self) -> bool {
+        self.busy || self.building
+    }
+}
+
 impl From<String> for CallgraphViewError {
     fn from(reason: String) -> Self {
         Self {
