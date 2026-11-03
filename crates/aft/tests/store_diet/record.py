@@ -51,6 +51,14 @@ def git(*args):
     return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
 
 
+def clone_baseline(sha, tree):
+    # An older baseline does not have today's byte-pinning attributes. Keep its
+    # checkout defaults at LF regardless of the machine's global Git settings.
+    run(['git', 'clone', '--quiet', '--shared', '--no-checkout',
+         '--config', 'core.autocrlf=false', '--config', 'core.eol=lf', ROOT, tree], ROOT)
+    run(['git', 'checkout', '--quiet', '--detach', sha], tree)
+
+
 def copy_tools(destination):
     if destination.exists():
         shutil.rmtree(destination)
@@ -110,8 +118,7 @@ def record(sha, include_trace, output_dir):
         directory.mkdir(parents=True)
         marker.write_text(sha, encoding='utf-8')
     tree = workspace / 'baseline'
-    run(['git', 'clone', '--quiet', '--shared', '--no-checkout', ROOT, tree], ROOT)
-    run(['git', 'checkout', '--quiet', '--detach', sha], tree)
+    clone_baseline(sha, tree)
     tools = tree / 'crates/aft/tests/store_diet'
     copy_tools(tools)
     patch = tools / 'baseline-harness.patch'

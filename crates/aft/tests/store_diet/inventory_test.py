@@ -50,6 +50,16 @@ def checkout_fixture_bytes(directory, files):
 
 
 class InventoryTests(unittest.TestCase):
+    def test_recorder_clone_does_not_inherit_windows_line_endings(self):
+        tree = pathlib.Path('baseline')
+        with mock.patch.object(recorder, 'run') as run:
+            recorder.clone_baseline('a' * 40, tree)
+        clone = run.call_args_list[0].args[0]
+        self.assertEqual(clone[:5], ['git', 'clone', '--quiet', '--shared', '--no-checkout'])
+        self.assertIn('core.autocrlf=false', clone)
+        self.assertIn('core.eol=lf', clone)
+        self.assertEqual(run.call_args_list[1].args[0], ['git', 'checkout', '--quiet', '--detach', 'a' * 40])
+
     def test_git_checkout_preserves_byte_exact_parity_inputs(self):
         root = 'crates/aft/tests/store_diet/'
         files = {root + name: b'{\n  "fixture": true\n}\n' for name in [

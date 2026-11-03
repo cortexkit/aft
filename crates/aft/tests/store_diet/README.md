@@ -148,6 +148,13 @@ normaliser replaces only the selected top-level numeric value spans: nested row
 fields, whitespace, order, counts, notes and provenance remain byte-identical.
 No other field is admitted by the tool.
 
+Git must preserve the frozen input and oracle bytes as well. `.gitattributes`
+disables checkout text conversion for the corpus, original callgraph fixtures,
+raw copied sample inputs, captures, patches and wire replies. The recorder also
+sets `core.autocrlf=false` and `core.eol=lf` in its scratch clone, because an older
+baseline predates that attribute policy. Replies are not line-ending or path
+normalised to compensate for a checkout difference.
+
 For the committed fixture sample:
 
 ```

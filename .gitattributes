@@ -58,3 +58,15 @@ crates/aft/tests/fixtures/agent_data/** -text
 # sha256 sums of their exact published bytes; Windows autocrlf would rewrite
 # them as CRLF on checkout and break the pins.
 crates/aft/tests/fixtures/secret/** -text
+# Store-diet parity compares raw golden bytes and hashes source-derived facts.
+# Preserve fixture/oracle blobs verbatim even with Windows core.autocrlf=true;
+# gzip captures must remain binary, and source byte offsets must not drift.
+crates/aft/tests/store_diet/*.json -text
+crates/aft/tests/store_diet/*.json.gz -text
+crates/aft/tests/store_diet/*.patch -text
+crates/aft/tests/store_diet/corpus/** -text
+crates/aft/tests/store_diet/wire-*/** -text
+crates/aft/tests/fixtures/callgraph/** -text
+# These full-file inputs are also copied into the frozen language corpus.
+crates/aft/tests/fixtures/sample.* -text
+crates/aft/tests/fixtures/imports_ts.ts -text
