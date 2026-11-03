@@ -115,6 +115,12 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
     let scratch = tempfile::tempdir().unwrap();
     let storage = scratch.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
+    // Git before 2.42 cannot name its system and global attribute files, so
+    // the checkout's conversion policy is not reusable and every walk reads
+    // every file again. AFT_VIEW_FRESH_MODERN_GIT=1 models a newer Git that
+    // reports both files as absent.
+    let _modern_git = std::env::var_os("AFT_VIEW_FRESH_MODERN_GIT")
+        .map(|_| crate::views::verification::known_attribute_sources_for_test(scratch.path()));
     let checkout = |name: &str| {
         let root = scratch.path().join(name);
         let archive = std::process::Command::new("git")
@@ -169,6 +175,7 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
         .unwrap();
         let driver = Arc::new(driver.with_adapters(vec![bridge.adapter.clone()]));
         let access = driver.access();
+        let guard = crate::views::verification::BindGuard::capture(root, None).unwrap();
         let cpu = cpu_seconds();
         let start = std::time::Instant::now();
         let seed = driver.installed_snapshot().generation().clone();
@@ -177,8 +184,9 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
         let work = driver.take_reconcile_work();
         driver.install(&access, &snapshot, revision).unwrap();
         eprintln!(
-            "fresh_bind checkout={name} files={} bind_s={:.3} cpu_s={:.3} work={work:?}",
-            snapshot.live_entries().count(),
+            "fresh_bind checkout={name} policy_reusable={} steady={} bind_s={:.3} cpu_s={:.3} work={work:?}",
+            guard.policy.reusable,
+            guard.steady_supported,
             bound.as_secs_f64(),
             cpu_seconds() - cpu,
         );
