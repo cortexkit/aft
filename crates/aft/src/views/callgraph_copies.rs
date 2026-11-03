@@ -578,7 +578,7 @@ mod tests {
             policy(),
         )
         .unwrap();
-        main_view.reader().unwrap();
+        main_view.ready_reader_for_test();
         Fixture {
             _temp: temp,
             _attributes: attributes,
@@ -729,7 +729,7 @@ mod tests {
             policy(),
         )
         .unwrap();
-        held.reader().unwrap();
+        held.ready_reader_for_test();
         let peer = f._temp.path().join("peer");
         git(
             &f.main,
@@ -782,7 +782,7 @@ mod tests {
             policy(),
         )
         .unwrap();
-        main_view.reader().unwrap();
+        main_view.ready_reader_for_test();
         let held_root = f._temp.path().join("held");
         std::fs::create_dir(&held_root).unwrap();
         std::fs::write(held_root.join("held.ts"), "export function held() {}\n").unwrap();
@@ -793,7 +793,7 @@ mod tests {
             policy(),
         )
         .unwrap();
-        held.reader().unwrap();
+        held.ready_reader_for_test();
         let mut config = crate::config::Config::default();
         config.project_root = Some(f.worker.clone());
         config.storage_dir = Some(f.paths.artifacts.clone());
@@ -807,7 +807,7 @@ mod tests {
         );
         ctx.set_canonical_cache_root(f.worker.clone());
         let reader = ctx
-            .callgraph_view_reader()
+            .with_ready_callgraph_for_test(|| ctx.callgraph_view_reader())
             .expect("views route")
             .expect("must not refuse");
         assert!(reader.file_identities().unwrap().contains_key("a.ts"));

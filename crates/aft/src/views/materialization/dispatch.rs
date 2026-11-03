@@ -667,6 +667,7 @@ pub(super) fn emit_from_decoded(
     let mut file_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
     resolver.take_dependencies();
     for path in &selected {
+        super::check_job_cancelled()?;
         let Some(row) = rows.get(path) else {
             continue;
         };
