@@ -2263,7 +2263,7 @@ impl<'a> Resolver<'a> {
             if base_file.is_empty() {
                 continue;
             }
-            let targets = self.methods(&base_file, &base, member);
+            let targets = self.methods(&base_file, &base, member, false);
             if !targets.is_empty() {
                 return Resolution {
                     targets: targets.into_iter().collect(),
