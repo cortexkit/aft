@@ -432,8 +432,7 @@ impl CallgraphBlob {
             refs,
         };
         parse.entry_point_symbols.sort();
-        dispatch::complete_members(source, lang, root, &mut parse)?;
-        parse.dispatch = dispatch::extract(source, lang, root, &parse)?;
+        parse.dispatch = dispatch::extract(source, lang, root, &mut parse)?;
         Ok(Self::Parse(parse))
     }
 
@@ -1699,26 +1698,108 @@ pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names
 }
 
-/// Bind receiver type names with the same import and re-export rules as
-/// ordinary paths. A name maps to its target file and
-/// symbol only when the target names a node of the index.
+/// Bind receiver names through ordinary language import resolution. Rust names
+/// also retain lexical call contexts; different bindings remain ambiguous.
 pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
     index: &I,
     file: &str,
     parse: &ParseBlob,
     data: &FileCallData,
 ) -> BTreeMap<String, (String, String)> {
-    let mut targets = BTreeMap::new();
-    for name in dispatch_type_names(parse) {
-        if parse.language != "rust" && name.starts_with('@') {
-            continue;
+    if parse.language != "rust" {
+        let mut targets = BTreeMap::new();
+        for name in dispatch_type_names(parse) {
+            if name.starts_with('@')
+                || !parse.imports.iter().any(|import| {
+                    !import.type_only
+                        && (import.default_import.as_deref() == Some(&name)
+                            || import
+                                .names
+                                .iter()
+                                .any(|spec| crate::imports::specifier_local_name(spec) == name))
+                })
+            {
+                continue;
+            }
+            if let Some((_, target_file, symbol)) =
+                super::resolve_js_ts_target(index, file, &name, &name, data)
+            {
+                if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                    targets.insert(name, (target_file, symbol));
+                }
+            }
         }
+        return targets;
+    }
+    let mut names = dispatch_type_names(parse);
+    for import in &data.import_block.imports {
+        names.extend(callgraph::rust_import_local_names(import));
+    }
+    let references = parse
+        .refs
+        .iter()
+        .filter(|raw| matches!(raw.kind, BlobRefKind::Call | BlobRefKind::Construction))
+        .map(|raw| (raw.ordinal, raw))
+        .collect::<HashMap<_, _>>();
+    // Path binding depends on the enclosing scope and the visible import prefix,
+    // not on a call's identity. Resolve repeated uses in the same context once,
+    // while retaining distinct inline modules, impl owners and import scopes.
+    fn context_key<'a>(raw: &'a BlobRef, data: &FileCallData) -> (Option<(&'a str, bool)>, usize) {
+        (
+            raw.caller_symbol.as_deref().map(|caller| {
+                (
+                    caller.rsplit_once("::").map_or("", |(scope, _)| scope),
+                    data.symbol_metadata
+                        .get(caller)
+                        .is_some_and(|meta| meta.kind == SymbolKind::Method),
+                )
+            }),
+            data.import_block
+                .imports
+                .partition_point(|import| import.byte_range.start <= raw.byte_start),
+        )
+    }
+    let mut contexts = HashMap::<_, BTreeMap<_, &BlobRef>>::new();
+    for raw in references.values() {
+        if let Some(name) = raw.full_ref.as_ref().filter(|name| names.contains(*name)) {
+            contexts
+                .entry(name.as_str())
+                .or_default()
+                .insert(context_key(raw, data), raw);
+        }
+    }
+    for site in &parse.dispatch.sites {
+        let (Some(receiver), Some(reference)) = (&site.receiver, references.get(&site.ordinal))
+        else {
+            continue;
+        };
+        let mut name = receiver.as_str();
+        while let Some(expression) = name.strip_prefix("@field:") {
+            name = expression
+                .rsplit_once('|')
+                .map(|(base, _)| base)
+                .unwrap_or(expression);
+        }
+        name = name.strip_prefix("@return:").unwrap_or(name);
+        contexts
+            .entry(name)
+            .or_default()
+            .insert(context_key(reference, data), reference);
+    }
+    let mut targets = BTreeMap::new();
+    for name in names {
         let short = name.rsplit("::").next().unwrap_or(&name);
-        let resolved = if parse.language == "rust" {
+        let sites = contexts
+            .get(name.as_str())
+            .map(|refs| refs.values().copied().map(Some).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![None]);
+        let mut bindings = BTreeSet::new();
+        let mut incomplete = false;
+        for site in sites {
             let raw = super::RawRef {
                 ref_id: String::new(),
                 caller_node: None,
-                caller_symbol: None,
+                caller_symbol: site.and_then(|raw| raw.caller_symbol.clone()),
                 caller_file: file.to_string(),
                 kind: "call".into(),
                 short_name: Some(short.into()),
@@ -1729,28 +1810,25 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
                 requested_name: None,
                 namespace_alias: None,
                 wildcard: false,
-                line: 0,
-                byte_start: 0,
-                byte_end: 0,
+                line: site.map_or(0, |raw| raw.line),
+                byte_start: site.map_or(0, |raw| raw.byte_start),
+                byte_end: site.map_or(0, |raw| raw.byte_end),
                 dependencies: BTreeSet::new(),
             };
-            super::resolve_rust_target(index, file, &name, short, data, &raw)
-        } else if parse.imports.iter().any(|import| {
-            !import.type_only
-                && (import.default_import.as_deref() == Some(&name)
-                    || import
-                        .names
-                        .iter()
-                        .any(|spec| crate::imports::specifier_local_name(spec) == name))
-        }) {
-            super::resolve_js_ts_target(index, file, &name, &name, data)
-        } else {
-            None
-        };
-        if let Some((_, target_file, symbol)) = resolved {
-            if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
-                targets.insert(name, (target_file, symbol));
+            if let Some((_, target_file, symbol)) =
+                super::resolve_rust_target(index, file, &name, short, data, &raw)
+            {
+                if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                    bindings.insert((target_file, symbol));
+                } else {
+                    incomplete = true;
+                }
+            } else {
+                incomplete = true;
             }
+        }
+        if !incomplete && bindings.len() == 1 {
+            targets.insert(name, bindings.into_iter().next().unwrap());
         }
     }
     targets
@@ -2656,10 +2734,24 @@ fn join_manifest_with_surfaces(
             })
             .collect::<Vec<_>>();
         caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        // Scoped and self calls can already have declaration-proven bindings.
+        // Let dispatch refine those bindings instead of skipping them in advance.
+        let associated_ordinals = blob
+            .refs
+            .iter()
+            .filter(|reference| {
+                blob.language == "rust"
+                    && reference.full_ref.as_deref().is_some_and(|name| {
+                        dispatch::associated_reference(name) || name.starts_with("self.")
+                    })
+            })
+            .map(|reference| reference.ordinal)
+            .collect::<BTreeSet<_>>();
         let receiver_ordinals = blob
             .dispatch
             .sites
             .iter()
+            .filter(|site| !associated_ordinals.contains(&site.ordinal))
             .map(|s| s.ordinal)
             .collect::<BTreeSet<_>>();
         let caller_data = &extract.data;

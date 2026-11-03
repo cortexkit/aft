@@ -1771,6 +1771,7 @@ pub(crate) mod perf_tests;
 #[cfg(test)]
 pub(crate) mod position_identity_tests;
 mod refresh_wal;
+mod rust_bindings;
 mod rust_manifest;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
@@ -5586,6 +5587,7 @@ struct NameMatchRef {
     method_name: String,
     colon_dispatch: bool,
     line: u32,
+    byte_range: std::ops::Range<usize>,
     lang: String,
 }
 
@@ -17818,10 +17820,20 @@ fn resolve_exported_symbol_inner<I: ResolverIndex>(
     }
     if requested != "default" {
         if let Some(source_symbol) = index.export_alias(file, requested) {
-            return Some((file.to_string(), source_symbol));
+            if index.lang_for(file) != Some(LangId::Rust)
+                || index.node_for_symbol(file, &source_symbol).is_some()
+            {
+                return Some((file.to_string(), source_symbol));
+            }
         }
         if index.has_export(file, requested) {
-            return Some((file.to_string(), requested.to_string()));
+            // A Rust use can export a name without declaring it in this module.
+            // Follow the re-export rather than claiming this file defines the name.
+            if index.lang_for(file) != Some(LangId::Rust)
+                || index.node_for_symbol(file, requested).is_some()
+            {
+                return Some((file.to_string(), requested.to_string()));
+            }
         }
     } else if let Some(default) = index.default_export(file) {
         return Some((file.to_string(), default));
@@ -17878,6 +17890,49 @@ fn resolve_rust_target<I: ResolverIndex>(
     caller_data: &FileCallData,
     raw: &RawRef,
 ) -> Option<(String, String, String)> {
+    // A self call is bound by its enclosing declaration, including trait
+    // defaults and trait impls whose scope contains both trait and type names.
+    if let Some(member) = full_ref.strip_prefix("self.") {
+        if let Some(owner) = raw
+            .caller_symbol
+            .as_deref()
+            .and_then(|s| s.rsplit_once("::"))
+        {
+            for scope in std::iter::once(owner.0) {
+                let symbol = format!("{scope}::{member}");
+                if caller_data
+                    .symbol_metadata
+                    .get(&symbol)
+                    .is_some_and(|meta| {
+                        meta.kind == SymbolKind::Method
+                            && meta
+                                .signature
+                                .as_deref()
+                                .and_then(signature_parameter_text)
+                                .and_then(|parameters| {
+                                    split_top_level_commas(parameters).first().copied()
+                                })
+                                .and_then(|parameter| {
+                                    rust_parameter_name(
+                                        parameter.split(':').next().unwrap_or(parameter),
+                                    )
+                                })
+                                == Some("self")
+                    })
+                    && index.node_for_symbol(caller_file, &symbol).is_some()
+                {
+                    return Some((
+                        "resolved_local".to_string(),
+                        caller_file.to_string(),
+                        symbol,
+                    ));
+                }
+            }
+        }
+    }
+    if full_ref.contains('.') {
+        return None;
+    }
     if short_name.ends_with('!') && !full_ref.contains("::") {
         if index.node_for_symbol(caller_file, short_name).is_some() {
             return Some((
@@ -17891,6 +17946,25 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
     if full_ref.contains("::") {
+        if let Some((file, symbol)) =
+            rust_associated_target(index, caller_file, full_ref, caller_data, raw)
+        {
+            return Some(("resolved".to_string(), file, symbol));
+        }
+        if let Some((owner, _)) = full_ref.rsplit_once("::") {
+            if !matches!(owner, "Self" | "self" | "super" | "crate") {
+                if let Some((file, symbol)) =
+                    rust_type_binding(index, caller_file, owner, caller_data, raw)
+                {
+                    if index
+                        .node_for_symbol(&file, &symbol)
+                        .is_some_and(|node| !index.node_is_callable(&file, &node))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
         // Self names the enclosing impl or trait, not a module on disk. Keep
         // private associated helpers in the same graph as their public callers.
         if let Some(member) = full_ref.strip_prefix("Self::") {
@@ -17944,6 +18018,66 @@ fn resolve_rust_target<I: ResolverIndex>(
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
 }
 
+fn rust_associated_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    full_ref: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String)> {
+    let (owner, member) = full_ref.rsplit_once("::")?;
+    if matches!(owner, "Self" | "self" | "super" | "crate") {
+        return None;
+    }
+    let binding = rust_type_binding(index, caller_file, owner, caller_data, raw)?;
+    // Follow the imported type before appending its member: the module
+    // re-exports `Backend`, not a free function named `new`.
+    index.node_for_symbol(&binding.0, &binding.1)?;
+    let symbol = format!("{}::{member}", binding.1);
+    index.node_for_symbol(&binding.0, &symbol)?;
+    Some((binding.0, symbol))
+}
+
+fn rust_type_binding<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    owner: &str,
+    caller_data: &FileCallData,
+    raw: &RawRef,
+) -> Option<(String, String)> {
+    if owner.contains("::") {
+        rust_target_for_qualified(
+            index,
+            caller_file,
+            owner,
+            owner.rsplit("::").next()?,
+            caller_data,
+            raw,
+        )
+    } else {
+        let modules = rust_reference_module_segments(index, caller_file, caller_data, raw);
+        if let Some(target) = rust_inline_scoped_target(index, caller_file, &modules, owner) {
+            if index
+                .node_for_symbol(&target.0, &target.1)
+                .is_some_and(|node| !index.node_is_callable(&target.0, &node))
+            {
+                return Some(target);
+            }
+        }
+        if caller_data.symbol_metadata.contains_key(owner) {
+            return Some((caller_file.to_string(), owner.to_string()));
+        }
+        caller_data
+            .import_block
+            .imports
+            .iter()
+            .filter(|import| rust_import_is_visible_to_call(import, raw))
+            .find_map(|import| {
+                rust_target_for_use(index, caller_file, import, owner, caller_data, raw)
+            })
+    }
+}
+
 fn rust_macro_use_target<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
@@ -17988,10 +18122,15 @@ fn rust_unique_file_level_function<I: ResolverIndex>(
     if full_ref.contains("::") || !callgraph::is_bare_callee(full_ref, short_name) {
         return None;
     }
-    // The only symbol with this unqualified name must be the file-level one
-    // itself; with a same-named nested item the call could mean either.
-    let symbol = index.local_symbol(caller_file, caller_data, short_name)?;
-    let is_file_level_function = symbol == short_name
+    // Another free function can shadow a bare call; associated functions
+    // cannot. Keep trait members behind their declaring trait or type.
+    let symbol = short_name.to_string();
+    let is_file_level_function = index.node_for_symbol(caller_file, short_name).is_some()
+        && !caller_data.symbol_metadata.iter().any(|(name, meta)| {
+            name != short_name
+                && last_name_segment(name) == short_name
+                && meta.kind == SymbolKind::Function
+        })
         && caller_data
             .symbol_metadata
             .get(short_name)
@@ -18125,8 +18264,8 @@ fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> boo
 
 /// Module names a `use` declaration binds: `use a::b;` / `use a::b as c;`
 /// bind one, and a use list binds `self` (the prefix module itself, as in
-/// `use crate::cache_freshness::{self, FileFreshness};`) plus each lowercase
-/// entry. Upper-camel names are types, not modules, and are skipped.
+/// `use crate::cache_freshness::{self, FileFreshness};`). Conservative module
+/// candidates use the imported item's spelling, not the alias's capitalization.
 fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<String>)> {
     let path = rust_use_body(&import.raw_text)
         .unwrap_or(&import.module_path)
@@ -18170,7 +18309,10 @@ fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<Stri
                 let local_name = alias
                     .map(str::to_string)
                     .or_else(|| segments.last().cloned())?;
-                is_module_name(&local_name).then_some((local_name, segments))
+                segments
+                    .last()
+                    .is_some_and(|name| is_module_name(name))
+                    .then_some((local_name, segments))
             })
             .collect();
     }
@@ -18188,7 +18330,7 @@ fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<Stri
     else {
         return Vec::new();
     };
-    if !is_module_name(&local_name) {
+    if !segments.last().is_some_and(|name| is_module_name(name)) {
         return Vec::new();
     }
     vec![(local_name, segments)]
@@ -19251,7 +19393,7 @@ impl DbFileIndex {
             }
         }
         let mut module_targets: HashMap<String, Option<String>> = HashMap::new();
-        let mut declared_module_targets = HashMap::new();
+        let mut declared_module_targets = HashMap::<String, Option<String>>::new();
         let mut macro_use_module_targets = BTreeSet::new();
         let mut reexports = Vec::new();
         for raw_ref in &extract.raw_refs {
@@ -19262,15 +19404,12 @@ impl DbFileIndex {
                 continue;
             };
             // An import and its re-export select the same Python module.
-            let target_file =
-                if extract.lang == LangId::Python && module_targets.contains_key(module_path) {
+            let target_file = if extract.lang == LangId::Python {
+                if module_targets.contains_key(module_path) {
                     module_targets.get(module_path).cloned().flatten()
-                } else if extract.lang == LangId::Python
-                    || (extract.lang == LangId::Rust && raw_ref.kind == "reexport")
-                {
-                    // Dependency sets include fallback candidates. Their lexical
-                    // order is not language resolution order; Python packages,
-                    // for example, take precedence over same-named module files.
+                } else {
+                    // Python packages take precedence over same-named module
+                    // files, unlike the lexical order of dependency candidates.
                     module_ref_target(
                         project_root,
                         &extract.rel_path,
@@ -19280,9 +19419,31 @@ impl DbFileIndex {
                         facts,
                         |file| facts.is_file(&project_root.join(file)),
                     )
-                } else {
-                    module_target_from_dependencies(project_root, &raw_ref.dependencies, facts)
-                };
+                }
+            } else if extract.lang == LangId::Rust && raw_ref.kind == "reexport" {
+                // Parsed module refs remain available when immutable facts do
+                // not contain raw source for reparsing module declarations.
+                // Dependency sets include parent-module candidates. Their lexical
+                // order is not Rust resolution order: retain the most-specific
+                // module target for each flattened re-export leaf.
+                declared_module_targets
+                    .get(module_path)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| {
+                        module_ref_target(
+                            project_root,
+                            &extract.rel_path,
+                            &raw_ref.kind,
+                            module_path,
+                            &module_memo,
+                            facts,
+                            |file| facts.is_file(&project_root.join(file)),
+                        )
+                    })
+            } else {
+                module_target_from_dependencies(project_root, &raw_ref.dependencies, facts)
+            };
             module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
@@ -20290,10 +20451,36 @@ fn insert_method_dispatch_edges_with_objects(
     let mut source_cache: DispatchSourceCache = HashMap::new();
     let mut objects = typescript_objects::ObjectDispatch::new(tx, project_root, cached);
     objects.prepare(&references)?;
+    let caller_extracts = HashMap::new();
+    let rust_index = ProjectIndex::from_db_and_callers(
+        tx,
+        project_root,
+        &caller_extracts,
+        WorkspaceCratePrefixCache::default(),
+    );
+    let mut rust_data = HashMap::new();
     let mut edge_ids = BTreeSet::new();
     for reference in references {
         if matches!(reference.lang.as_str(), "typescript" | "tsx") {
             if let Some(candidate) = objects.resolve(tx, &reference)? {
+                edge_ids.insert(insert_method_dispatch_edge(
+                    tx,
+                    &reference,
+                    &candidate,
+                    PROVENANCE_TYPE_MATCH,
+                )?);
+                continue;
+            }
+        }
+        if reference.lang == "rust" {
+            if let Some(candidate) = rust_bound_dispatch_candidate(
+                tx,
+                project_root,
+                &rust_index,
+                &reference,
+                &mut source_cache,
+                &mut rust_data,
+            ) {
                 edge_ids.insert(insert_method_dispatch_edge(
                     tx,
                     &reference,
@@ -20313,6 +20500,11 @@ fn insert_method_dispatch_edges_with_objects(
                     // Anonymous object candidates never participate in name
                     // guessing. Apply that rule once per cached bucket.
                     candidates.retain(|candidate| !candidate.scoped_name.starts_with("@object:"));
+                }
+                if reference.lang == "rust" {
+                    // Trait declarations are dispatch contracts, not evidence
+                    // that an arbitrary receiver implements that trait.
+                    candidates.retain(|candidate| !rust_trait_dispatch_candidate(tx, candidate));
                 }
                 entry.insert(candidates)
             }
@@ -20344,6 +20536,21 @@ fn insert_method_dispatch_edges_with_objects(
                 else {
                     continue;
                 };
+                if reference.lang == "rust"
+                    && !reference.colon_dispatch
+                    && parsed_dispatch_source_for_file(
+                        project_root,
+                        &candidate.file_path,
+                        "rust",
+                        LangId::Rust,
+                        &mut source_cache,
+                    )
+                    .and_then(|parsed| parsed.rust.as_ref())
+                    .and_then(|bindings| bindings.declaration(&candidate.scoped_name))
+                    .is_some_and(|declaration| !declaration.has_self)
+                {
+                    continue;
+                }
                 edge_ids.insert(insert_method_dispatch_edge(
                     tx,
                     &reference,
@@ -20368,6 +20575,20 @@ fn insert_method_dispatch_edges_with_objects(
                 ) else {
                     continue;
                 };
+                if !reference.colon_dispatch
+                    && parsed_dispatch_source_for_file(
+                        project_root,
+                        &candidate.file_path,
+                        "rust",
+                        LangId::Rust,
+                        &mut source_cache,
+                    )
+                    .and_then(|parsed| parsed.rust.as_ref())
+                    .and_then(|bindings| bindings.declaration(&candidate.scoped_name))
+                    .is_some_and(|declaration| !declaration.has_self)
+                {
+                    continue;
+                }
                 edge_ids.insert(insert_method_dispatch_edge(
                     tx,
                     &reference,
@@ -20720,7 +20941,8 @@ fn load_name_match_refs(
     // Existing dispatch edges remain until the incremental pass has computed the
     // expected IDs. Do not let those edges hide unresolved calls that still need processing.
     let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,
-                           n.signature, r.short_name, r.full_ref, r.line, f.lang
+                           n.signature, r.short_name, r.full_ref, r.line, f.lang,
+                           r.byte_start, r.byte_end
                     FROM refs r
                     JOIN files f ON f.path = r.caller_file
                     JOIN nodes n ON n.id = r.caller_node
@@ -20751,6 +20973,7 @@ fn load_name_match_refs(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, usize>(9)?..row.get::<_, usize>(10)?,
                 ))
             })?;
             for row in rows {
@@ -20764,6 +20987,7 @@ fn load_name_match_refs(
                     full_ref,
                     line,
                     lang,
+                    byte_range,
                 ) = row?;
                 if let Some(reference) = name_match_ref_from_parts(
                     ref_id,
@@ -20775,6 +20999,7 @@ fn load_name_match_refs(
                     full_ref,
                     line,
                     lang,
+                    byte_range,
                 ) {
                     references.push(reference);
                 }
@@ -20796,6 +21021,7 @@ fn load_name_match_refs(
             row.get::<_, Option<String>>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, String>(8)?,
+            row.get::<_, usize>(9)?..row.get::<_, usize>(10)?,
         ))
     })?;
     for row in rows {
@@ -20809,6 +21035,7 @@ fn load_name_match_refs(
             full_ref,
             line,
             lang,
+            byte_range,
         ) = row?;
         if let Some(reference) = name_match_ref_from_parts(
             ref_id,
@@ -20820,6 +21047,7 @@ fn load_name_match_refs(
             full_ref,
             line,
             lang,
+            byte_range,
         ) {
             references.push(reference);
         }
@@ -20838,6 +21066,7 @@ fn name_match_ref_from_parts(
     full_ref: Option<String>,
     line: i64,
     lang: String,
+    byte_range: std::ops::Range<usize>,
 ) -> Option<NameMatchRef> {
     let caller_node = caller_node?;
     let full_ref = full_ref?;
@@ -20858,6 +21087,7 @@ fn name_match_ref_from_parts(
         method_name,
         colon_dispatch,
         line: line.max(0) as u32,
+        byte_range,
         lang,
     })
 }
@@ -20928,6 +21158,7 @@ struct ParsedDispatchSource {
     source: String,
     tree: Option<tree_sitter::Tree>,
     go_index: Option<go_dispatch::SourceIndex>,
+    rust: Option<rust_bindings::RustBindings>,
 }
 
 impl ParsedDispatchSource {
@@ -20940,6 +21171,376 @@ impl ParsedDispatchSource {
 }
 
 type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
+
+fn rust_dispatch_data<'a>(
+    project_root: &Path,
+    file: &str,
+    sources: &mut DispatchSourceCache,
+    cache: &'a mut HashMap<String, Option<Rc<FileCallData>>>,
+) -> Option<Rc<FileCallData>> {
+    cache
+        .entry(file.to_string())
+        .or_insert_with(|| {
+            let parsed =
+                parsed_dispatch_source_for_file(project_root, file, "rust", LangId::Rust, sources)?;
+            let mut data = callgraph::build_file_data_from_tree(
+                &project_root.join(file),
+                &parsed.source,
+                LangId::Rust,
+                parsed.tree.as_ref()?,
+                &LineIndex::new(&parsed.source),
+            )
+            .ok()?;
+            extend_rust_imports_from_tree(&parsed.source, parsed.root(), &mut data);
+            // Receiver binding reads declaration/import data and callable names,
+            // not the call-site vectors. Do not retain a second graph per chunk.
+            for calls in data.calls_by_symbol.values_mut() {
+                *calls = Vec::new();
+            }
+            data.value_refs_by_symbol.clear();
+            data.macro_body_calls_by_macro.clear();
+            data.macro_mentions_by_symbol.clear();
+            Some(Rc::new(data))
+        })
+        .as_ref()
+        .cloned()
+}
+
+fn rust_dispatch_raw(reference: &NameMatchRef, byte_start: usize, byte_end: usize) -> RawRef {
+    RawRef {
+        ref_id: reference.ref_id.clone(),
+        caller_node: Some(reference.caller_node.clone()),
+        caller_symbol: Some(reference.caller_symbol.clone()),
+        caller_file: reference.caller_file.clone(),
+        kind: "call".to_string(),
+        short_name: Some(reference.method_name.clone()),
+        full_ref: None,
+        module_path: None,
+        import_kind: None,
+        local_name: None,
+        requested_name: None,
+        namespace_alias: None,
+        wildcard: false,
+        line: reference.line,
+        byte_start,
+        byte_end,
+        dependencies: BTreeSet::new(),
+    }
+}
+
+fn rust_exact_dispatch_candidate(
+    tx: &Transaction<'_>,
+    file: &str,
+    symbol: &str,
+) -> Option<NameMatchCandidate> {
+    tx.prepare_cached(
+        "SELECT id, kind, start_line FROM nodes WHERE file_path=?1 AND scoped_name=?2 AND kind='method'
+         AND (SELECT COUNT(*) FROM nodes WHERE file_path=?1 AND scoped_name=?2)=1",
+    ).ok()?.query_row(
+        params![file, symbol], |row| Ok(NameMatchCandidate {
+            node_id: row.get(0)?, file_path: file.to_string(), scoped_name: symbol.to_string(),
+            kind: row.get(1)?, start_line: row.get::<_, u32>(2)? + 1,
+        }),
+    ).optional().ok().flatten()
+}
+
+fn rust_bound_dispatch_candidate(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    index: &ProjectIndex<'_>,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+    data_cache: &mut HashMap<String, Option<Rc<FileCallData>>>,
+) -> Option<NameMatchCandidate> {
+    let (start, end) = (reference.byte_range.start, reference.byte_range.end);
+    let raw = rust_dispatch_raw(reference, start, end);
+    let data = rust_dispatch_data(
+        project_root,
+        &reference.caller_file,
+        source_cache,
+        data_cache,
+    )?;
+    let binding = if reference.colon_dispatch {
+        rust_type_binding(
+            index,
+            &reference.caller_file,
+            &reference.receiver_expression,
+            &data,
+            &raw,
+        )?
+    } else if reference.receiver_expression == "self" {
+        let parsed = parsed_dispatch_source(project_root, reference, LangId::Rust, source_cache)?;
+        let (scope, _) = reference.caller_symbol.rsplit_once("::")?;
+        let member = format!("{scope}::{}", reference.method_name);
+        if parsed
+            .rust
+            .as_ref()?
+            .declaration(&member)
+            .is_some_and(|declaration| declaration.has_self)
+        {
+            return rust_exact_dispatch_candidate(tx, &reference.caller_file, &member);
+        }
+        let owner = parsed
+            .rust
+            .as_ref()?
+            .declaration(&reference.caller_symbol)?
+            .owner
+            .clone()?;
+        let member = format!("{owner}::{}", reference.method_name);
+        if parsed
+            .rust
+            .as_ref()?
+            .declaration(&member)
+            .is_some_and(|declaration| declaration.has_self)
+        {
+            return rust_exact_dispatch_candidate(tx, &reference.caller_file, &member);
+        }
+        rust_type_binding(index, &reference.caller_file, &owner, &data, &raw)?
+    } else {
+        if !receiver_is_bare_identifier(&reference.receiver_expression) {
+            return None;
+        }
+        let parsed = parsed_dispatch_source(project_root, reference, LangId::Rust, source_cache)?;
+        let source_binding = parsed.rust.as_ref()?.binding(&reference.receiver, start)?;
+        if let Some(annotation) = &source_binding.annotation {
+            let normalized = strip_leading_rust_type_modifiers(annotation);
+            let name = rust_direct_nominal_type_name(normalized)?;
+            if parsed.rust.as_ref()?.type_parameter(name, start) {
+                let bound = parsed
+                    .rust
+                    .as_ref()?
+                    .bound(name, start)?
+                    .trim()
+                    .trim_start_matches(':')
+                    .split('+')
+                    .next()?
+                    .trim();
+                let contract =
+                    rust_type_binding(index, &reference.caller_file, bound, &data, &raw)?;
+                let member = format!("{}::{}", contract.1, reference.method_name);
+                let parsed = parsed_dispatch_source_for_file(
+                    project_root,
+                    &contract.0,
+                    "rust",
+                    LangId::Rust,
+                    source_cache,
+                )?;
+                if !parsed.rust.as_ref()?.declaration(&member)?.has_self {
+                    return None;
+                }
+                return rust_exact_dispatch_candidate(tx, &contract.0, &member);
+            }
+            rust_type_binding(index, &reference.caller_file, name, &data, &raw)?
+        } else {
+            let initializer = source_binding.initializer.as_ref()?;
+            if let rust_bindings::Initializer::Nominal(name, unit_value) = initializer {
+                let name = name.clone();
+                let unit_value = *unit_value;
+                // A bare value can be a constant or a local rather than a constructor.
+                // Its unit-struct declaration must supply the receiver type.
+                if unit_value && parsed.rust.as_ref()?.binding(&name, start).is_some() {
+                    return None;
+                }
+                let binding = rust_type_binding(index, &reference.caller_file, &name, &data, &raw)?;
+                for import in data
+                    .import_block
+                    .imports
+                    .iter()
+                    .filter(|import| rust_import_is_visible_to_call(import, &raw))
+                {
+                    if let Some(other) = rust_target_for_use(
+                        index,
+                        &reference.caller_file,
+                        import,
+                        &name,
+                        &data,
+                        &raw,
+                    ) {
+                        if other != binding && index.node_for_symbol(&other.0, &other.1).is_some() {
+                            return None;
+                        }
+                    }
+                }
+                if unit_value
+                    && !parsed_dispatch_source_for_file(
+                        project_root,
+                        &binding.0,
+                        "rust",
+                        LangId::Rust,
+                        source_cache,
+                    )?
+                    .rust
+                    .as_ref()?
+                    .unit_struct(&binding.1)
+                {
+                    return None;
+                }
+                binding
+            } else {
+                let rust_bindings::Initializer::Call { callee, bytes } = initializer else {
+                    return None;
+                };
+                let (file, symbol): (String, String) = tx.query_row(
+            "SELECT r.target_file, r.target_symbol FROM refs r JOIN nodes n ON n.id=r.target_node
+             WHERE r.caller_file=?1 AND r.byte_start>=?2 AND r.byte_end<=?3 AND r.full_ref=?4 AND r.kind='call' AND r.status<>'unresolved'",
+            params![reference.caller_file, bytes.start, bytes.end, callee],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().ok().flatten()?;
+                let parsed = parsed_dispatch_source_for_file(
+                    project_root,
+                    &file,
+                    "rust",
+                    LangId::Rust,
+                    source_cache,
+                )?;
+                let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+                let declaration_byte = declaration.bytes.start;
+                let declaration_line = declaration.line;
+                let declaration_owner = declaration.owner.clone();
+                let return_type = declaration.return_type.as_deref()?.to_string();
+                if return_type == "Self" {
+                    let owner = declaration_owner?;
+                    let target = format!("{owner}::{}", reference.method_name);
+                    if parsed
+                        .rust
+                        .as_ref()?
+                        .declaration(&target)
+                        .is_some_and(|declaration| declaration.has_self)
+                    {
+                        if let Some(candidate) = rust_exact_dispatch_candidate(tx, &file, &target) {
+                            return Some(candidate);
+                        }
+                    }
+                    (file, owner)
+                } else {
+                    // A declared trait-object return binds the contract, not an arbitrary
+                    // implementation whose method happens to have the same name.
+                    let trait_name = return_type.strip_prefix("&dyn ")?;
+                    if !receiver_is_bare_identifier(trait_name) {
+                        return None;
+                    }
+                    let return_data =
+                        rust_dispatch_data(project_root, &file, source_cache, data_cache)?;
+                    let mut declaration_raw = raw.clone();
+                    declaration_raw.caller_file = file.clone();
+                    declaration_raw.caller_symbol = Some(symbol.clone());
+                    declaration_raw.line = declaration_line;
+                    declaration_raw.byte_start = declaration_byte;
+                    declaration_raw.byte_end = declaration_raw.byte_start;
+                    let binding = rust_type_binding(
+                        index,
+                        &file,
+                        trait_name,
+                        &return_data,
+                        &declaration_raw,
+                    )?;
+                    let member = format!("{}::{}", binding.1, reference.method_name);
+                    let parsed = parsed_dispatch_source_for_file(
+                        project_root,
+                        &binding.0,
+                        "rust",
+                        LangId::Rust,
+                        source_cache,
+                    )?;
+                    if !parsed.rust.as_ref()?.declaration(&member)?.has_self {
+                        return None;
+                    }
+                    return rust_exact_dispatch_candidate(tx, &binding.0, &member);
+                }
+            }
+        }
+    };
+    if !reference.colon_dispatch {
+        let inherent = format!("{}::{}", binding.1, reference.method_name);
+        let parsed = parsed_dispatch_source_for_file(
+            project_root,
+            &binding.0,
+            "rust",
+            LangId::Rust,
+            source_cache,
+        )?;
+        if parsed
+            .rust
+            .as_ref()?
+            .declaration(&inherent)
+            .is_some_and(|declaration| declaration.has_self)
+        {
+            return rust_exact_dispatch_candidate(tx, &binding.0, &inherent);
+        }
+    }
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT scoped_name FROM nodes WHERE file_path=?1 AND name=?2 AND kind='method'",
+        )
+        .ok()?;
+    let methods = statement
+        .query_map(params![binding.0, reference.method_name], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let mut selected = None;
+    for method in methods {
+        let symbol = method.ok()?;
+        let parsed = parsed_dispatch_source_for_file(
+            project_root,
+            &binding.0,
+            "rust",
+            LangId::Rust,
+            source_cache,
+        )?;
+        let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+        if declaration.owner.as_deref() != Some(&binding.1)
+            || !reference.colon_dispatch && !declaration.has_self
+        {
+            continue;
+        }
+        let Some(trait_name) = declaration.trait_name.as_deref() else {
+            continue;
+        };
+        let trait_name = trait_name.to_string();
+        let Some(caller_trait) =
+            rust_type_binding(index, &reference.caller_file, &trait_name, &data, &raw)
+        else {
+            continue;
+        };
+        let impl_data = rust_dispatch_data(project_root, &binding.0, source_cache, data_cache)?;
+        let parsed = parsed_dispatch_source_for_file(
+            project_root,
+            &binding.0,
+            "rust",
+            LangId::Rust,
+            source_cache,
+        )?;
+        let mut impl_raw = raw.clone();
+        impl_raw.caller_file = binding.0.clone();
+        impl_raw.caller_symbol = Some(symbol.clone());
+        let declaration = parsed.rust.as_ref()?.declaration(&symbol)?;
+        impl_raw.line = declaration.line;
+        impl_raw.byte_start = declaration.bytes.start;
+        impl_raw.byte_end = impl_raw.byte_start;
+        if rust_type_binding(index, &binding.0, &trait_name, &impl_data, &impl_raw)
+            != Some(caller_trait)
+        {
+            continue;
+        }
+        let candidate = rust_exact_dispatch_candidate(tx, &binding.0, &symbol)?;
+        if selected.is_some() {
+            return None;
+        }
+        selected = Some(candidate);
+    }
+    selected
+}
+
+fn rust_trait_dispatch_candidate(tx: &Transaction<'_>, candidate: &NameMatchCandidate) -> bool {
+    let Some((owner, _)) = candidate.scoped_name.rsplit_once("::") else {
+        return false;
+    };
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes WHERE file_path=?1 AND scoped_name=?2 AND kind='interface')",
+        params![candidate.file_path, owner], |r| r.get(0),
+    ).unwrap_or(true)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReceiverTypeInference {
@@ -21011,12 +21612,16 @@ fn parse_dispatch_source(
             source: String::new(),
             tree: None,
             go_index,
+            rust: None,
         })
     } else {
+        let rust = (lang == LangId::Rust)
+            .then(|| rust_bindings::RustBindings::new(&source, tree.root_node()));
         Some(ParsedDispatchSource {
             source,
             tree: Some(tree),
             go_index: None,
+            rust,
         })
     }
 }
@@ -21870,6 +22475,14 @@ fn infer_rust_receiver_type(
         .as_deref()
         .and_then(|signature| rust_parameter_type(signature, &reference.receiver))
     {
+        if parsed_dispatch_source(project_root, reference, LangId::Rust, source_cache)
+            .and_then(|parsed| parsed.rust.as_ref())
+            .is_some_and(|bindings| {
+                bindings.type_parameter_in(&reference.caller_symbol, &receiver_type)
+            })
+        {
+            return ReceiverTypeInference::KnownButUnresolved;
+        }
         return ReceiverTypeInference::Known(receiver_type);
     }
 
@@ -34032,6 +34645,438 @@ mod tests {
     }
 
     #[test]
+    fn rust_study_trait_and_impl_self_calls_bind_the_declaring_scope() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "trait-self-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"
+pub trait Analyzer {
+    fn supported_languages(&self) -> bool;
+    fn can_analyze(&self) -> bool { self.supported_languages() }
+    fn create() -> bool;
+}
+pub struct Generic<T>(T);
+impl<T> Generic<T> { fn inherent(&self) {} }
+impl<T> Analyzer for Generic<T> {
+    fn supported_languages(&self) -> bool { true }
+    fn can_analyze(&self) -> bool { self.inherent(); self.supported_languages() }
+    fn create() -> bool { true }
+}
+pub struct Other;
+impl Other { fn supported_languages(&self) -> bool { false } }
+pub fn create() -> bool { false }
+pub fn run() -> bool { create() }
+"#,
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Analyzer::supported_languages",
+            "src/lib.rs",
+            "Analyzer::can_analyze",
+        );
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Analyzer for Generic<T>::supported_languages",
+            "src/lib.rs",
+            "Analyzer for Generic<T>::can_analyze",
+        );
+        assert_direct_caller(&store, "src/lib.rs", "create", "src/lib.rs", "run");
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Generic<T>::inherent",
+            "src/lib.rs",
+            "Analyzer for Generic<T>::can_analyze",
+        );
+        let conn = Connection::open(store.sqlite_path()).expect("reader");
+        let wrong: i64 = conn.query_row("SELECT COUNT(*) FROM edges WHERE target_symbol IN ('Analyzer::create', 'Other::supported_languages')", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            wrong, 0,
+            "associated trait functions are not free functions"
+        );
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_associated_constructor_follows_the_type_reexport() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "associated-reexport-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod database;\nuse database::Backend as Store;\npub fn run() { Store::new(); }\n",
+        );
+        write_file(
+            root,
+            "src/database/mod.rs",
+            "mod backend;\npub use backend::Backend;\npub fn new() {}\n",
+        );
+        write_file(
+            root,
+            "src/database/backend.rs",
+            "pub struct Backend;\nimpl Backend { pub fn new() -> Self { Self } }\n",
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/database/backend.rs",
+            "Backend::new",
+            "src/lib.rs",
+            "run",
+        );
+        let conn = Connection::open(store.sqlite_path()).expect("reader");
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE target_symbol = 'new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            wrong, 0,
+            "a type import must not bind a module's free function"
+        );
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_trait_constructor_requires_the_imported_trait_binding() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "trait-constructor-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod database;\nuse database::{Backend, Database};\npub fn run() { Backend::new(); }\n",
+        );
+        write_file(
+            root,
+            "src/database/mod.rs",
+            "mod backend;\npub use backend::Backend;\npub trait Database { fn new() -> Self; }\n",
+        );
+        write_file(root, "src/database/backend.rs", "use super::Database;\npub struct Backend;\nimpl Database for Backend { fn new() -> Self { Self } }\n");
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/database/backend.rs",
+            "Database for Backend::new",
+            "src/lib.rs",
+            "run",
+        );
+        assert_rust_exact_view_parity(root, &store);
+        let negative = tempdir().expect("negative tempdir");
+        let root = negative.path();
+        write_rust_manifest(root, "trait-constructor-negative");
+        write_file(
+            root,
+            "src/database/mod.rs",
+            "mod backend;\npub use backend::Backend;\npub trait Database { fn new() -> Self; }\n",
+        );
+        write_file(root, "src/database/backend.rs", "use super::Database;\npub struct Backend;\nimpl Database for Backend { fn new() -> Self { Self } }\n");
+        write_file(root, "src/lib.rs", "mod database;\nuse database::Backend;\ntrait Database { fn new() -> Self; }\npub fn run() { Backend::new(); }\n");
+        let (store, _) = cold_build_twice(root);
+        let conn = Connection::open(store.sqlite_path()).expect("reader");
+        let wrong: i64 = conn.query_row("SELECT COUNT(*) FROM edges WHERE target_symbol='Database for Backend::new' AND provenance='type_match'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            wrong, 0,
+            "same-named traits from different modules are not interchangeable"
+        );
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_local_receivers_follow_declared_returns_not_homonyms() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "local-return-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"
+mod types;
+use types::{Symbol, Analyzer, Generic};
+pub struct Manager;
+impl Manager {
+    /// Select the analyzer contract.
+    fn get(&self) -> &dyn Analyzer { todo!() }
+    pub fn run(&self) { let analyzer = self.get(); analyzer.analyze(); }
+}
+pub fn run() {
+    let mut symbol = Symbol::new();
+    symbol = symbol.qualified();
+    let analyzer = Generic::new();
+    analyzer.analyze();
+}
+"#,
+        );
+        write_file(
+            root,
+            "src/types.rs",
+            r#"
+pub struct Symbol;
+impl Symbol { pub fn new() -> Self { Self } pub fn qualified(self) -> Self { self } }
+pub trait Analyzer { fn analyze(&self); }
+pub struct Generic;
+impl Generic { pub fn new() -> Self { Self } }
+impl Analyzer for Generic { fn analyze(&self) {} }
+pub struct Other;
+impl Other { pub fn qualified(self) -> Self { self } }
+"#,
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/types.rs",
+            "Symbol::qualified",
+            "src/lib.rs",
+            "run",
+        );
+        assert_direct_caller(
+            &store,
+            "src/types.rs",
+            "Analyzer for Generic::analyze",
+            "src/lib.rs",
+            "run",
+        );
+        assert_direct_caller(
+            &store,
+            "src/types.rs",
+            "Analyzer::analyze",
+            "src/lib.rs",
+            "Manager::run",
+        );
+        let conn = Connection::open(store.sqlite_path()).expect("reader");
+        let typed: i64 = conn.query_row("SELECT COUNT(*) FROM edges WHERE target_symbol IN ('Symbol::qualified', 'Analyzer for Generic::analyze', 'Analyzer::analyze') AND provenance='type_match'", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            typed, 3,
+            "receiver returns must produce binding-backed edges"
+        );
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE target_symbol='Other::qualified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0);
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    fn assert_rust_exact_view_parity(root: &Path, legacy: &CallGraphStore) {
+        let mut inputs = rust_files(root);
+        inputs.push(root.join("Cargo.toml"));
+        let _ = callgraph_fixture_view(root, &inputs);
+        let view = manifest_view_database_path(&root.join("views"), "parity").unwrap();
+        let rows = |database: &Path| {
+            let conn = Connection::open(database).unwrap();
+            let mut query = conn.prepare("SELECT e.target_file, e.target_symbol, n.file_path, n.scoped_name, e.line
+                FROM edges e JOIN nodes n ON n.id=e.source_node JOIN refs r ON r.ref_id=e.ref_id
+                WHERE e.kind='call' AND r.kind='call' AND e.provenance NOT IN ('name_match', 'dispatch')
+                ORDER BY 1,2,3,4,5").unwrap();
+            query
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, u32>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<BTreeSet<_>>>()
+                .unwrap()
+        };
+        let legacy_rows = rows(legacy.sqlite_path());
+        let view_rows = rows(&view);
+        if legacy_rows != view_rows {
+            let conn = Connection::open(&view).unwrap();
+            let mut facts = conn
+                .prepare("SELECT file_path,facts FROM view_dispatch_files")
+                .unwrap();
+            eprintln!(
+                "dispatch facts: {:?}",
+                facts
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            legacy_rows, view_rows,
+            "exact declaration edges differ between graph producers"
+        );
+    }
+
+    #[test]
+    fn rust_study_unit_struct_receiver_is_not_a_wildcard_imported_function() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "unit-receiver-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"
+pub trait Reporter { fn report(&self); }
+pub struct Console;
+impl Reporter for Console { fn report(&self) {} }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reports() { let reporter = Console; reporter.report(); }
+}
+"#,
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "Reporter for Console::report",
+            "src/lib.rs",
+            "tests::reports",
+        );
+        assert!(store
+            .direct_callers_of(Path::new("src/lib.rs"), "Reporter::report")
+            .unwrap()
+            .is_empty());
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_module_alias_new_keeps_its_ordinary_binding() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "module-new-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod database;\nuse crate::database as Factory;\npub fn run() { Factory::new(); }\n",
+        );
+        write_file(root, "src/database.rs", "pub fn new() {}\n");
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/database.rs", "new", "src/lib.rs", "run");
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_trait_associated_function_is_not_a_free_import() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "associated-function-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "mod api;\nuse api::*;\npub fn unbound() { create(); }\n",
+        );
+        write_file(
+            root,
+            "src/api.rs",
+            "pub trait Factory { fn create() -> Self; }\n",
+        );
+        let data = callgraph::build_file_data(&root.join("src/api.rs")).unwrap();
+        assert_eq!(
+            data.symbol_metadata["Factory::create"].kind,
+            SymbolKind::Method
+        );
+        let (store, _) = cold_build_twice(root);
+        let conn = Connection::open(store.sqlite_path()).unwrap();
+        let wrong: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE target_file='src/api.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong, 0, "trait members are not module-level imports");
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_self_calls_keep_the_inline_type_namespace() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "inline-owner-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            r#"
+use std::io::Write;
+mod left {
+    use super::Write;
+    pub struct Stream;
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { self.write(&[]).map(|_| ()) }
+    }
+}
+mod right {
+    use super::Write;
+    pub struct Stream;
+    impl Write for Stream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { Ok(bytes.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { self.write(&[]).map(|_| ()) }
+    }
+}
+"#,
+        );
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "left::Write for Stream::write",
+            "src/lib.rs",
+            "left::Write for Stream::flush",
+        );
+        assert_direct_caller(
+            &store,
+            "src/lib.rs",
+            "right::Write for Stream::write",
+            "src/lib.rs",
+            "right::Write for Stream::flush",
+        );
+        let left = store
+            .direct_callers_of(Path::new("src/lib.rs"), "left::Write for Stream::write")
+            .unwrap();
+        assert!(left
+            .iter()
+            .all(|site| site.caller.symbol == "left::Write for Stream::flush"));
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
+    fn rust_study_instance_and_associated_functions_with_one_name_stay_distinct() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "receiver-shape-fixture");
+        write_file(root, "src/lib.rs", "mod widget;\nuse widget::{Widget, Reset};\npub fn run(widget: &Widget) {\n    widget.new();\n    Widget::new();\n}\n");
+        write_file(root, "src/widget.rs", "pub struct Widget;\npub trait Reset { fn new(&self) -> bool; }\nimpl Widget {\n    pub fn new() -> Self { Self }\n}\nimpl Reset for Widget {\n    fn new(&self) -> bool { true }\n}\n");
+        let (store, _) = cold_build_twice(root);
+        let method = store
+            .direct_callers_of(Path::new("src/widget.rs"), "Reset for Widget::new")
+            .unwrap();
+        assert!(method
+            .iter()
+            .any(|site| site.caller.symbol == "run" && site.line == 4));
+        assert!(method.iter().all(|site| site.line != 5));
+        let associated = store
+            .direct_callers_of(Path::new("src/widget.rs"), "Widget::new")
+            .unwrap();
+        assert!(associated
+            .iter()
+            .any(|site| site.caller.symbol == "run" && site.line == 5));
+        assert!(associated.iter().all(|site| site.line != 4));
+        assert_rust_exact_view_parity(root, &store);
+    }
+
+    #[test]
     fn rust_same_file_test_module_receiver_method_dispatch_resolves() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
@@ -35399,6 +36444,7 @@ class OnlyService {
             method_name: method_name.to_string(),
             colon_dispatch: false,
             line,
+            byte_range: 0..0,
             lang: lang.to_string(),
         }
     }

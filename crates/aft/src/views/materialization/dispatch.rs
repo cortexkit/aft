@@ -678,6 +678,39 @@ pub(super) fn emit_from_decoded(
         }
     }
     stage.finish("resolver_index", format_args!("files={}", parses.len()));
+    let mut ordinary_syntax = HashSet::new();
+    let mut written_references = transaction.prepare_cached(
+        "SELECT ref_id,full_ref FROM refs WHERE caller_file=?1 AND kind IN ('call','construction')",
+    )?;
+    for path in &selected {
+        if rows
+            .get(path)
+            .is_some_and(|row| row.facts.language == "rust")
+        {
+            let references = written_references.query_map([path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?;
+            for reference in references {
+                let (id, full) = reference?;
+                if let Some(full) = full {
+                    let associated =
+                        crate::callgraph_store::join::dispatch::associated_reference(&full);
+                    if associated {
+                        if let Some(ordinal) = id
+                            .rsplit(':')
+                            .next()
+                            .and_then(|ordinal| ordinal.parse().ok())
+                        {
+                            resolver.note_associated_site(path, ordinal);
+                        }
+                    }
+                    if associated || full.starts_with("self.") {
+                        ordinary_syntax.insert(id);
+                    }
+                }
+            }
+        }
+    }
     let memoized = MemoizedResolver::new(&resolver);
     let mut sites = Vec::new();
     let mut file_dependencies = BTreeMap::<String, BTreeSet<String>>::new();
@@ -687,12 +720,25 @@ pub(super) fn emit_from_decoded(
             continue;
         };
         for site in row.sites.as_deref().unwrap_or_default() {
+            let ref_id = format!("view:{path}:{}", site.ordinal);
+            let resolution = memoized.resolve(path, site);
+            // Keep proven self-call and scoped module-function bindings when
+            // dispatch facts do not identify a project receiver type.
+            if row.facts.language == "rust"
+                && resolution.external > 0
+                && resolution.targets.is_empty()
+                && scope.ordinary_edge_refs.contains(&ref_id)
+            {
+                if ordinary_syntax.contains(&ref_id) {
+                    continue;
+                }
+            }
             sites.push(ResolvedSite {
                 file: path,
                 language: &row.facts.language,
-                ref_id: format!("view:{path}:{}", site.ordinal),
+                ref_id,
                 site,
-                resolution: memoized.resolve(path, site),
+                resolution,
             });
         }
         // Every file depends on its own facts, which `Resolver::resolve`
