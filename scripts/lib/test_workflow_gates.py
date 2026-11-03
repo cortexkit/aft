@@ -708,8 +708,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(job["env"]["CARGO_INCREMENTAL"], "0")
         self.assertNotIn("CARGO_PROFILE_TEST_CODEGEN_UNITS", job["env"])
-        # Preserve the existing ceiling while changing the compilation runner.
-        self.assertEqual(job["timeout-minutes"], "45")
+        # The free 7 GB runner swaps through this build (30-45 minutes), so
+        # the ceiling leaves room for a slow but healthy compile.
+        self.assertEqual(job["timeout-minutes"], "90")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
         build_steps = [command for command in cargo_steps if re.search(r"\bcargo (nextest|test)\b", command)]
         self.assertEqual(len(build_steps), 3)
@@ -729,20 +730,23 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
         self.assertEqual(steps.index(timings), archive_index + 1)
 
-    def test_only_the_macos_libtest_producer_uses_the_release_blacksmith_runner(self) -> None:
+    def test_macos_jobs_use_free_github_runners(self) -> None:
+        # AFT's repository is public, where GitHub's macOS runners are free;
+        # no job may name a paid runner provider.
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
         jobs = suite["jobs"]
         producer = jobs["unit-macos-libtest-archive"]
         self.assertEqual(producer["name"], "Cargo libtest archive (macOS)")
-        self.assertEqual(producer["runs-on"], "blacksmith-6vcpu-macos-26")
-        self.assertEqual(producer["runs-on"], release["jobs"]["build-darwin-arm64"]["runs-on"])
-        self.assertEqual(
-            [name for name, job in jobs.items() if "blacksmith" in str(job.get("runs-on", ""))],
-            ["unit-macos-libtest-archive"],
-        )
-        for name in ("unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
+        for name in ("unit-macos-libtest-archive", "unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
             self.assertEqual(jobs[name]["runs-on"], "macos-26", name)
+        for name in ("build-darwin-arm64", "build-darwin-x64"):
+            self.assertEqual(release["jobs"][name]["runs-on"], "macos-26", name)
+        for workflow in (suite, release):
+            self.assertEqual(
+                [name for name, job in workflow["jobs"].items() if "blacksmith" in str(job.get("runs-on", "")).lower()],
+                [],
+            )
         shards = jobs["unit-macos-libtest-shard"]
         self.assertEqual(shards["name"], "Cargo libtest shard ${{ matrix.shard }}/5 (macOS)")
         self.assertEqual(shards["strategy"]["matrix"]["shard"], ["1", "2", "3", "4", "5"])
@@ -753,7 +757,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
     def test_macos_libtest_timing_summaries_survive_success_and_failure(self) -> None:
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         for job_id, invocation, heading, runner in (
-            ("unit-macos-libtest-archive", "/usr/bin/time -l cargo nextest archive", "Build duration", "blacksmith-6vcpu-macos-26"),
+            ("unit-macos-libtest-archive", "/usr/bin/time -l cargo nextest archive", "Build duration", "macos-26"),
             ("unit-macos-libtest-shard", "./scripts/rust-test-gate.sh", "Test duration", "macos-26"),
         ):
             step = next(step for step in suite["jobs"][job_id]["steps"] if invocation in step.get("run", ""))

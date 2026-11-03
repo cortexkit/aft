@@ -736,10 +736,11 @@ jobs:
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    # The library test compiler peaks near 13 GB, above the free runner's 7 GB.
-    # Only compilation needs the 24 GB runner; the five test shards stay free.
-    runs-on: blacksmith-6vcpu-macos-26
-    timeout-minutes: 45
+    # The library test compiler peaks near 13 GB, above this free runner's
+    # 7 GB, so the build swaps and takes 30-45 minutes; the time limit leaves
+    # room for that instead of cancelling a slow but healthy build.
+    runs-on: macos-26
+    timeout-minutes: 90
     env:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_IDLE_TIMEOUT: "0"
@@ -775,7 +776,7 @@ jobs:
         shell: bash
         run: |
           started=$SECONDS
-          trap 'printf "### macOS libtest archive\n\nRunner: blacksmith-6vcpu-macos-26 (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
+          trap 'printf "### macOS libtest archive\n\nRunner: macos-26 (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"' EXIT
           # Native time reports resident-memory and paging counters for the build.
           /usr/bin/time -l cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --config "$LIBTEST_CARGO_CONFIG" --timings --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
