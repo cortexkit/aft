@@ -85,8 +85,7 @@ fn golden(name: &str, bytes: &[u8]) {
             let expected = std::env::var("AFT_STORE_DIET_BASELINE")
                 .expect("record.py --baseline SHA is required");
             let metadata: Value =
-                serde_json::from_slice(&fs::read(assets().join("baseline.json")).unwrap())
-                    .unwrap();
+                serde_json::from_slice(&fs::read(assets().join("baseline.json")).unwrap()).unwrap();
             assert_eq!(metadata["code_revision"].as_str(), Some(expected.as_str()));
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -142,8 +141,7 @@ fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
 fn counts(store: &CallGraphStore) -> Value {
     let conn = store.conn.lock().unwrap();
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
-            .unwrap();
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json"))).unwrap();
     let mut result = serde_json::Map::new();
     for table in tables.iter().filter(|table| table["graph_data"] == true) {
         let name = table["table"].as_str().unwrap();
@@ -423,8 +421,7 @@ fn plans(store: &CallGraphStore) -> Value {
         let _ = auxiliary.execute_batch(&sql.unwrap());
     }
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
-            .unwrap();
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json"))).unwrap();
     for table in tables {
         let declaration = regex::Regex::new(&format!(r"(?i)^\s*(?:--[^\n]*\n\s*)*CREATE\s+(?:TEMP\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?{}\s*\(", regex::escape(table["table"].as_str().unwrap()))).unwrap();
         if let Some(row) = rows
@@ -687,10 +684,7 @@ fn stored_values(store: &CallGraphStore) -> Value {
 }
 
 fn corpus_cases() -> Vec<Value> {
-    serde_json::from_slice(&read_capture(
-        assets().join("corpus_manifest.json"),
-    ))
-    .unwrap()
+    serde_json::from_slice(&read_capture(assets().join("corpus_manifest.json"))).unwrap()
 }
 
 #[test]
@@ -699,11 +693,7 @@ fn store_diet_language_corpus_legacy() {
     let mut results = serde_json::Map::new();
     for case in corpus_cases() {
         let name = case["name"].as_str().unwrap();
-        let root = assets()
-            .join("corpus")
-            .join(name)
-            .canonicalize()
-            .unwrap();
+        let root = assets().join("corpus").join(name).canonicalize().unwrap();
         let files = fixture_files(&root);
         let store = CallGraphStore::open(temp.path().join(name), root.clone()).unwrap();
         store.cold_build(&files).unwrap();
@@ -721,11 +711,7 @@ fn store_diet_language_corpus_views() {
     let mut results = serde_json::Map::new();
     for case in corpus_cases() {
         let name = case["name"].as_str().unwrap();
-        let root = assets()
-            .join("corpus")
-            .join(name)
-            .canonicalize()
-            .unwrap();
+        let root = assets().join("corpus").join(name).canonicalize().unwrap();
         let files = fixture_files(&root);
         let directory = temp.path().join(name);
         fs::create_dir_all(&directory).unwrap();
@@ -954,8 +940,7 @@ fn store_diet_duplicate_site_order_and_prefix_paths() {
     let root = temp.path().join("source");
     fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    let source =
-        fs::read(assets().join("corpus/receiver-typescript/receiver.ts")).unwrap();
+    let source = fs::read(assets().join("corpus/receiver-typescript/receiver.ts")).unwrap();
     for file in ["a.ts", "a.ts.more.ts"] {
         fs::write(root.join(file), &source).unwrap();
     }
@@ -1241,8 +1226,7 @@ fn stored_json_facts(store: &CallGraphStore) -> Value {
     // Discover payload columns from the table-encoding schema and walk every
     // serialized field. Optional facts added by producers need no allowlist.
     let tables: Vec<Value> =
-        serde_json::from_slice(&read_capture(assets().join("table_encoding.json")))
-            .unwrap();
+        serde_json::from_slice(&read_capture(assets().join("table_encoding.json"))).unwrap();
     let connection = store.conn.lock().unwrap();
     let mut result = serde_json::Map::new();
     for table in tables {
