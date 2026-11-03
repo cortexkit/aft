@@ -842,6 +842,53 @@ fn bench_repository_cold_materialization() {
         let (name, bytes) = row.unwrap();
         println!("repository table={name} allocated_bytes={bytes}");
     }
+    // Stored bytes per column of the largest tables, to choose what to
+    // encode next from measurement rather than estimates.
+    for table in [
+        "refs",
+        "edges",
+        "nodes",
+        "file_dependencies",
+        "view_dispatch_dependencies",
+        "view_dispatch_sites",
+    ] {
+        let columns: Vec<String> = connection
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in columns {
+            let (rows, stored, distinct): (i64, i64, i64) = connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(\"{column}\" AS BLOB))), 0), COUNT(DISTINCT \"{column}\") FROM \"{table}\""
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            println!(
+                "repository column={table}.{column} rows={rows} stored_bytes={stored} distinct={distinct}"
+            );
+        }
+    }
+    let indexes: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    for (name, sql) in indexes {
+        println!(
+            "repository index={name} sql={}",
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+    }
 }
 
 /// Bytes written by a sibling-seeded worker publication, with the donor copied
