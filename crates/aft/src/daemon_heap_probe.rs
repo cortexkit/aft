@@ -163,7 +163,7 @@ fn synthetic_bound_roots() {
                         .bash_background()
                         .observed_status(&id, &session, 4096)
                         .unwrap();
-                    if status.status.is_terminal() {
+                    if status.info.status.is_terminal() {
                         break;
                     }
                     assert!(Instant::now() < deadline, "shell did not complete");
