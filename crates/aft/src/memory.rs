@@ -94,6 +94,8 @@ pub struct RootMemorySnapshot {
     /// installed. Zero almost always; it is a label of its own so a load that
     /// waits is never invisible.
     pub pending_install: MemoryEstimate,
+    pub exact_memo: MemoryEstimate,
+    pub compression_filters: MemoryEstimate,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -187,6 +189,8 @@ impl RootMemorySnapshot {
             lsp,
             parser_pool,
             pending_install: MemoryEstimate::estimated(0),
+            exact_memo: MemoryEstimate::estimated(0),
+            compression_filters: MemoryEstimate::estimated(0),
         }
     }
 
@@ -194,6 +198,19 @@ impl RootMemorySnapshot {
     /// root's status and attributed total.
     pub fn with_pending_install(mut self, pending_install: MemoryEstimate) -> Self {
         self.pending_install = pending_install;
+        let rollup = self.rollup();
+        self.status = rollup.status;
+        self.attributed_bytes = rollup.attributed_bytes;
+        self
+    }
+
+    pub fn with_query_caches(
+        mut self,
+        exact_memo: MemoryEstimate,
+        compression_filters: MemoryEstimate,
+    ) -> Self {
+        self.exact_memo = exact_memo;
+        self.compression_filters = compression_filters;
         let rollup = self.rollup();
         self.status = rollup.status;
         self.attributed_bytes = rollup.attributed_bytes;
@@ -212,6 +229,8 @@ impl RootMemorySnapshot {
             &self.lsp,
             &self.parser_pool,
             &self.pending_install,
+            &self.exact_memo,
+            &self.compression_filters,
         ])
     }
 
@@ -233,6 +252,7 @@ impl RootMemorySnapshot {
             &self.symbols,
             &self.callgraph,
             &self.inspect,
+            &self.exact_memo,
         ]
         .into_iter()
         .filter_map(|estimate| estimate.estimated_bytes)

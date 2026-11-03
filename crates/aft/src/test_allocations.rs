@@ -6,6 +6,7 @@ static PROCESS_COUNTING: AtomicBool = AtomicBool::new(false);
 static PROCESS_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static PROCESS_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 struct CountingAllocator;
@@ -21,12 +22,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
         record_allocation(layout.size());
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
+            LIVE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             record_live(layout.size());
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_ALLOCATIONS.fetch_sub(1, Ordering::Relaxed);
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -63,15 +66,20 @@ pub(crate) fn heap_marker(prefix: &str, phase: &str) {
         #[cfg(not(target_os = "linux"))]
         let rss_peak: Option<u64> = None;
         eprintln!(
-            "view_heap {prefix}.{phase} live={} peak={} rss={rss:?} rss_peak={rss_peak:?}",
+            "view_heap {prefix}.{phase} live={} peak={} allocations={} rss={rss:?} rss_peak={rss_peak:?}",
             LIVE_BYTES.load(Ordering::Relaxed),
             PEAK_BYTES.load(Ordering::Relaxed),
+            live_allocations(),
         );
     }
 }
 
 pub(crate) fn live_bytes() -> usize {
     LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+pub(crate) fn live_allocations() -> usize {
+    LIVE_ALLOCATIONS.load(Ordering::Relaxed)
 }
 
 #[cfg(target_os = "linux")]

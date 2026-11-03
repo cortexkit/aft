@@ -7007,9 +7007,8 @@ impl AppContext {
     /// are rebuilt from the same sources by the next
     /// [`Self::filter_registry`] or [`Self::shared_filter_registry`] call, or
     /// by [`Self::reload_released_filter_registry`] when a background bash
-    /// task is spawned. The compiled builtin filters
-    /// alone take over a megabyte per root, which an evicted root has no use
-    /// for.
+    /// task is spawned. This releases private tables and overrides; immutable
+    /// compiled builtin regexes remain shared by the process.
     pub(crate) fn take_filter_registry(&self) -> crate::compress::toml_filter::FilterRegistry {
         let mut slot = self
             .filter_registry
@@ -15386,6 +15385,7 @@ impl AppContext {
         }
 
         self.callgraph_corpus_memo.lock().take();
+        self.search_exact_memo.clear();
 
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::callgraph_store::close_refresh_connections(&root);
@@ -15662,6 +15662,9 @@ impl AppContext {
         let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
             return false;
         };
+        if !self.search_exact_memo.try_clear_idle() {
+            return false;
+        }
         // Publication memoization can be discarded independently of resident
         // artifact handles, including when the semantic lane remains busy.
         if !self.try_release_view_publication_cache() {
@@ -17945,7 +17948,7 @@ impl AppContext {
         })
     }
 
-    fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
+    fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 12] {
         #[cfg(test)]
         MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let walked = WalkedMemory {
@@ -18032,7 +18035,7 @@ impl AppContext {
 
     /// Build a full memory estimate from index walks (fresh or reused) plus
     /// the cheap subsystem estimates, which are always taken fresh.
-    fn memory_estimates_from(&self, walked: WalkedMemory) -> [crate::memory::MemoryEstimate; 10] {
+    fn memory_estimates_from(&self, walked: WalkedMemory) -> [crate::memory::MemoryEstimate; 12] {
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         let mut timer = crate::test_allocations::profile::Timer::new();
         let WalkedMemory {
@@ -18120,6 +18123,12 @@ impl AppContext {
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");
         let pending_install = self.pending_install_estimate();
+        let exact_memo = self.search_exact_memo.estimated_memory();
+        let compression_filters = match self.filter_registry.try_read() {
+            Ok(registry) => registry.estimated_memory(),
+            Err(TryLockError::Poisoned(error)) => error.into_inner().estimated_memory(),
+            Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
+        };
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / parser and pending install");
         [
@@ -18133,6 +18142,8 @@ impl AppContext {
             lsp,
             parser_pool,
             pending_install,
+            exact_memo,
+            compression_filters,
         ]
     }
 
@@ -18214,9 +18225,9 @@ impl AppContext {
     }
 
     fn memory_root_snapshot_from(
-        estimates: [crate::memory::MemoryEstimate; 10],
+        estimates: [crate::memory::MemoryEstimate; 12],
     ) -> crate::memory::RootMemorySnapshot {
-        let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool, pending_install] =
+        let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool, pending_install, exact_memo, compression_filters] =
             estimates;
         crate::memory::RootMemorySnapshot::new(
             semantic,
@@ -18230,12 +18241,13 @@ impl AppContext {
             parser_pool,
         )
         .with_pending_install(pending_install)
+        .with_query_caches(exact_memo, compression_filters)
     }
 
     /// Pre-aggregate root memory for capped health diagnostics without building
     /// the rich per-subsystem detail that the status command returns.
     fn memory_root_rollup_from(
-        estimates: &[crate::memory::MemoryEstimate; 10],
+        estimates: &[crate::memory::MemoryEstimate; 12],
     ) -> crate::memory::RootMemoryRollup {
         crate::memory::RootMemoryRollup::from_estimates(&[
             &estimates[0],
@@ -18248,6 +18260,8 @@ impl AppContext {
             &estimates[7],
             &estimates[8],
             &estimates[9],
+            &estimates[10],
+            &estimates[11],
         ])
     }
 
@@ -18692,6 +18706,62 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
 #[cfg(test)]
 mod memory_estimate_tests {
     use super::*;
+
+    #[test]
+    fn query_cache_memory_is_attributed_and_released_by_idle_eviction() {
+        use crate::commands::semantic_search::{
+            comparator::CandidateResult,
+            evidence_descriptor::EvidenceDescriptor,
+            generation_token::GenerationToken,
+            memo::{MemoKey, VerifiedExactSet},
+        };
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let key = MemoKey::new(
+            root.path(),
+            GenerationToken::new_with_str("generation"),
+            "query",
+            false,
+        );
+        let warm = || {
+            ctx.search_exact_memo
+                .get_or_verify(&key, 0, 10, || {
+                    Ok(VerifiedExactSet {
+                        results: vec![CandidateResult::new_exact(
+                            root.path().join("file.rs"),
+                            None,
+                            EvidenceDescriptor::for_e1(1, true, false),
+                        )],
+                        file_digests: Default::default(),
+                        bound_disclosure: None,
+                        stability_void: false,
+                    })
+                })
+                .unwrap();
+        };
+        ctx.reset_filter_registry();
+        warm();
+        let (snapshot, rollup) = ctx.memory_root_snapshot_and_rollup();
+        assert!(snapshot.exact_memo.estimated_bytes.unwrap() > 0);
+        assert!(snapshot.compression_filters.estimated_bytes.unwrap() > 0);
+        assert_eq!(snapshot.exact_memo.counts["candidates"], 1);
+        assert_eq!(snapshot.attributed_bytes, rollup.attributed_bytes);
+        assert!(snapshot.evictable_bytes() >= snapshot.exact_memo.estimated_bytes.unwrap());
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(
+            ctx.memory_root_snapshot().exact_memo.estimated_bytes,
+            Some(0)
+        );
+        warm();
+        assert!(ctx.try_evict_idle_artifacts());
+        assert_eq!(
+            ctx.memory_root_snapshot().exact_memo.estimated_bytes,
+            Some(0)
+        );
+    }
 
     #[test]
     fn symbol_memory_rollup_matches_recount_after_mutations() {
