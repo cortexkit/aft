@@ -347,9 +347,11 @@ impl CallgraphBlob {
             file,
             "__callgraph_blob__",
             source,
+            lang,
             &crate::callgraph::ModuleResolutionMemo::default(),
             &paths,
             &line_index,
+            Some(root),
         )
         .raw_refs;
         structural.extend(
@@ -432,8 +434,7 @@ impl CallgraphBlob {
             refs,
         };
         parse.entry_point_symbols.sort();
-        dispatch::complete_members(source, lang, root, &mut parse)?;
-        parse.dispatch = dispatch::extract(source, lang, root, &parse)?;
+        parse.dispatch = dispatch::extract(source, lang, root, &mut parse)?;
         Ok(Self::Parse(parse))
     }
 
@@ -1057,6 +1058,30 @@ fn bound_name(name: &str, path: &str) -> String {
 }
 
 impl ParseBlob {
+    /// Bind Python dispatch hints to the same keys as their call references.
+    /// Nested bodies retain each enclosing caller, so their hints must use
+    /// caller-specific keys rather than the shared syntax ordinal.
+    pub(crate) fn bound_dispatch_sites(&self) -> Vec<dispatch::SiteHint> {
+        let mut sites = self.dispatch.sites.clone();
+        if self.language == "python" {
+            let keys = self
+                .refs
+                .iter()
+                .zip(self.reference_keys())
+                .filter(|(reference, _)| reference.kind == BlobRefKind::Call)
+                .map(|(reference, key)| {
+                    ((reference.ordinal, reference.caller_symbol.as_deref()), key)
+                })
+                .collect::<HashMap<_, _>>();
+            for site in &mut sites {
+                if let Some(key) = keys.get(&(site.ordinal, site.caller.as_deref())) {
+                    site.ordinal = *key;
+                }
+            }
+        }
+        sites
+    }
+
     /// AST ordinals stay intact in the blob. When several facts occupy one
     /// ordinal, their bound keys must also distinguish source span and caller.
     /// Singleton references retain their historical key; collision suffixes
@@ -1112,7 +1137,7 @@ impl ParseBlob {
         keys
     }
 
-    fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
+    pub(super) fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
         let lang = language_id(&self.language)
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(self.language.clone()))?;
         let mut calls_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
@@ -1303,6 +1328,9 @@ impl ParseBlob {
         }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
+        // Imports can also produce re-export rows. Compute each Python module
+        // path's dependencies once per file, then reuse them for both kinds of row.
+        let mut python_module_dependencies = HashMap::new();
         for (position, (raw, reference_key)) in
             self.refs.iter().zip(self.reference_keys()).enumerate()
         {
@@ -1322,7 +1350,16 @@ impl ParseBlob {
                     .into_iter()
                     .collect()
                 } else if let Some(module) = &raw.module_path {
-                    super::module_dependencies(facts.root, &abs, module, facts)
+                    if data.lang == LangId::Python {
+                        python_module_dependencies
+                            .entry(module.clone())
+                            .or_insert_with(|| {
+                                super::module_dependencies(facts.root, &abs, module, facts)
+                            })
+                            .clone()
+                    } else {
+                        super::module_dependencies(facts.root, &abs, module, facts)
+                    }
                 } else {
                     BTreeSet::new()
                 };
@@ -1393,6 +1430,7 @@ impl ParseBlob {
             },
             lang: data.lang,
             data,
+            typescript_objects: None,
             nodes,
             raw_refs,
             dispatch_hints: Vec::new(),
@@ -1451,9 +1489,8 @@ impl JoinResult {
                 continue;
             };
             receiver_sites.extend(
-                blob.dispatch
-                    .sites
-                    .iter()
+                blob.bound_dispatch_sites()
+                    .into_iter()
                     .map(|site| (path.as_bytes().to_vec(), site.ordinal)),
             );
             let extract = blob.bind(rel, &paths)?;
@@ -1632,11 +1669,11 @@ fn manifest_payloads(
     Ok(loaded)
 }
 
-/// The receiver type names of one Rust file that method-call resolution may
+/// The receiver type names of one file that method-call resolution may
 /// look up through ordinary Rust path binding: declared types and their bases,
 /// method owners and traits, field and return types, and each call site's
 /// receiver with any field or return-value wrapper removed.
-fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
+pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for ty in &parse.dispatch.types {
         names.insert(ty.name.clone());
@@ -1663,42 +1700,137 @@ fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names
 }
 
-/// Bind one Rust file's receiver type names with the same workspace, module and
-/// re-export rules as ordinary Rust paths. A name maps to its target file and
-/// symbol only when the target names a node of the index.
-fn resolve_dispatch_type_names<I: super::ResolverIndex>(
+/// Bind receiver names through ordinary language import resolution. Rust names
+/// also retain lexical call contexts; different bindings remain ambiguous.
+pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
     index: &I,
     file: &str,
     parse: &ParseBlob,
     data: &FileCallData,
 ) -> BTreeMap<String, (String, String)> {
-    let mut targets = BTreeMap::new();
-    for name in dispatch_type_names(parse) {
-        let short = name.rsplit("::").next().unwrap_or(&name);
-        let raw = super::RawRef {
-            ref_id: String::new(),
-            caller_node: None,
-            caller_symbol: None,
-            caller_file: file.to_string(),
-            kind: "call".into(),
-            short_name: Some(short.into()),
-            full_ref: Some(name.clone()),
-            module_path: None,
-            import_kind: None,
-            local_name: None,
-            requested_name: None,
-            namespace_alias: None,
-            wildcard: false,
-            line: 0,
-            byte_start: 0,
-            byte_end: 0,
-            dependencies: BTreeSet::new(),
-        };
-        let resolved = super::resolve_rust_target(index, file, &name, short, data, &raw);
-        if let Some((_, target_file, symbol)) = resolved {
-            if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
-                targets.insert(name, (target_file, symbol));
+    if parse.language != "rust" {
+        let mut targets = BTreeMap::new();
+        for name in dispatch_type_names(parse) {
+            if name.starts_with('@')
+                || !parse.imports.iter().any(|import| {
+                    !import.type_only
+                        && (import.default_import.as_deref() == Some(&name)
+                            || import
+                                .names
+                                .iter()
+                                .any(|spec| crate::imports::specifier_local_name(spec) == name))
+                })
+            {
+                continue;
             }
+            if let Some((_, target_file, symbol)) =
+                super::resolve_js_ts_target(index, file, &name, &name, data)
+            {
+                if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                    targets.insert(name, (target_file, symbol));
+                }
+            }
+        }
+        return targets;
+    }
+    let mut names = dispatch_type_names(parse);
+    for import in &data.import_block.imports {
+        names.extend(callgraph::rust_import_local_names(import));
+    }
+    let references = parse
+        .refs
+        .iter()
+        .filter(|raw| matches!(raw.kind, BlobRefKind::Call | BlobRefKind::Construction))
+        .map(|raw| (raw.ordinal, raw))
+        .collect::<HashMap<_, _>>();
+    // Path binding depends on the enclosing scope and the visible import prefix,
+    // not on a call's identity. Resolve repeated uses in the same context once,
+    // while retaining distinct inline modules, impl owners and import scopes.
+    fn context_key<'a>(raw: &'a BlobRef, data: &FileCallData) -> (Option<(&'a str, bool)>, usize) {
+        (
+            raw.caller_symbol.as_deref().map(|caller| {
+                (
+                    caller.rsplit_once("::").map_or("", |(scope, _)| scope),
+                    data.symbol_metadata
+                        .get(caller)
+                        .is_some_and(|meta| meta.kind == SymbolKind::Method),
+                )
+            }),
+            data.import_block
+                .imports
+                .partition_point(|import| import.byte_range.start <= raw.byte_start),
+        )
+    }
+    let mut contexts = HashMap::<_, BTreeMap<_, &BlobRef>>::new();
+    for raw in references.values() {
+        if let Some(name) = raw.full_ref.as_ref().filter(|name| names.contains(*name)) {
+            contexts
+                .entry(name.as_str())
+                .or_default()
+                .insert(context_key(raw, data), raw);
+        }
+    }
+    for site in &parse.dispatch.sites {
+        let (Some(receiver), Some(reference)) = (&site.receiver, references.get(&site.ordinal))
+        else {
+            continue;
+        };
+        let mut name = receiver.as_str();
+        while let Some(expression) = name.strip_prefix("@field:") {
+            name = expression
+                .rsplit_once('|')
+                .map(|(base, _)| base)
+                .unwrap_or(expression);
+        }
+        name = name.strip_prefix("@return:").unwrap_or(name);
+        contexts
+            .entry(name)
+            .or_default()
+            .insert(context_key(reference, data), reference);
+    }
+    let mut targets = BTreeMap::new();
+    for name in names {
+        let short = name.rsplit("::").next().unwrap_or(&name);
+        let sites = contexts
+            .get(name.as_str())
+            .map(|refs| refs.values().copied().map(Some).collect::<Vec<_>>())
+            .unwrap_or_else(|| vec![None]);
+        let mut bindings = BTreeSet::new();
+        let mut incomplete = false;
+        for site in sites {
+            let raw = super::RawRef {
+                ref_id: String::new(),
+                caller_node: None,
+                caller_symbol: site.and_then(|raw| raw.caller_symbol.clone()),
+                caller_file: file.to_string(),
+                kind: "call".into(),
+                short_name: Some(short.into()),
+                full_ref: Some(name.clone()),
+                module_path: None,
+                import_kind: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                line: site.map_or(0, |raw| raw.line),
+                byte_start: site.map_or(0, |raw| raw.byte_start),
+                byte_end: site.map_or(0, |raw| raw.byte_end),
+                dependencies: BTreeSet::new(),
+            };
+            if let Some((_, target_file, symbol)) =
+                super::resolve_rust_target(index, file, &name, short, data, &raw)
+            {
+                if super::ResolverIndex::node_for_symbol(index, &target_file, &symbol).is_some() {
+                    bindings.insert((target_file, symbol));
+                } else {
+                    incomplete = true;
+                }
+            } else {
+                incomplete = true;
+            }
+        }
+        if !incomplete && bindings.len() == 1 {
+            targets.insert(name, bindings.into_iter().next().unwrap());
         }
     }
     targets
@@ -1834,12 +1966,15 @@ impl ViewBindingDependencies {
 /// Inputs that determine a reference's target, excluding call-site identity.
 /// Rust qualified imports are visible only after their declaration; the count
 /// of visible imports identifies that monotone prefix even across nested uses.
+/// Python calls include the selected lexical target or an explicit unresolved binding.
 #[derive(Hash, PartialEq, Eq)]
 struct ViewResolutionBinding {
     kind: String,
     full_ref: Option<String>,
     short_name: Option<String>,
     visible_rust_imports: usize,
+    // Distinguish no lexical binding from a binding that explicitly rejects resolution.
+    python_binding: Option<Option<(String, String)>>,
 }
 
 impl ViewResolutionBinding {
@@ -1848,6 +1983,17 @@ impl ViewResolutionBinding {
             kind: raw.kind.clone(),
             full_ref: raw.full_ref.clone(),
             short_name: raw.short_name.clone(),
+            python_binding: if caller.lang == LangId::Python {
+                caller
+                    .python_bindings
+                    .binary_search_by_key(&(raw.byte_start, raw.byte_end), |binding| {
+                        (binding.byte_start, binding.byte_end)
+                    })
+                    .ok()
+                    .map(|position| caller.python_bindings[position].target.clone())
+            } else {
+                None
+            },
             visible_rust_imports: if caller.lang == LangId::Rust {
                 caller
                     .import_block
@@ -2596,10 +2742,24 @@ fn join_manifest_with_surfaces(
             })
             .collect::<Vec<_>>();
         caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        // Scoped and self calls can already have declaration-proven bindings.
+        // Let dispatch refine those bindings instead of skipping them in advance.
+        let associated_ordinals = blob
+            .refs
+            .iter()
+            .filter(|reference| {
+                blob.language == "rust"
+                    && reference.full_ref.as_deref().is_some_and(|name| {
+                        dispatch::associated_reference(name) || name.starts_with("self.")
+                    })
+            })
+            .map(|reference| reference.ordinal)
+            .collect::<BTreeSet<_>>();
         let receiver_ordinals = blob
             .dispatch
             .sites
             .iter()
+            .filter(|site| !associated_ordinals.contains(&site.ordinal))
             .map(|s| s.ordinal)
             .collect::<BTreeSet<_>>();
         let caller_data = &extract.data;
@@ -2767,7 +2927,10 @@ fn join_manifest_with_surfaces(
             let CallgraphBlob::Parse(blob) = decoded_blob.as_ref() else {
                 continue;
             };
-            if blob.language != "rust" {
+            if !matches!(
+                blob.language.as_str(),
+                "rust" | "typescript" | "tsx" | "javascript"
+            ) {
                 continue;
             }
             // The caller data is the file's own parse; binding consults path

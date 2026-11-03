@@ -16,7 +16,8 @@ fn rust_receiver_index_slices_preserve_local_preorder() {
     ] {
         let tree = parser.parse(source, None).unwrap();
         let nodes = descendants(tree.root_node());
-        let index = RustReceiverIndex::new(&nodes, source);
+        let bindings = RustBindings::new(source, tree.root_node());
+        let index = RustReceiverIndex::new(&nodes, source, &bindings);
         for &function in nodes.iter().filter(|node| FUNCTIONS.contains(&node.kind())) {
             assert_eq!(
                 index
@@ -106,6 +107,213 @@ fn resolutions(parse: &ParseBlob) -> Vec<Resolution> {
         .collect()
 }
 
+fn ts_object_target(parse: &ParseBlob, line: u32) -> BTreeSet<String> {
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), parse)]));
+    let site = parse
+        .dispatch
+        .sites
+        .iter()
+        .find(|s| s.line == line)
+        .unwrap();
+    resolver
+        .resolve("fixture", site)
+        .targets
+        .into_iter()
+        .map(|t| t.symbol)
+        .collect()
+}
+
+#[test]
+fn typescript_object_wrappers_bind_the_literal_not_a_homonym() {
+    let parse = parse("interface Resolver { handler(): void }\nconst actual = ({ handler: () => {} } satisfies Resolver);\nconst other = { handler: () => {} } as Resolver;\nactual.handler();\nother.handler();", "typescript");
+    let first = ts_object_target(&parse, 4);
+    let second = ts_object_target(&parse, 5);
+    assert_eq!(first.len(), 1, "{parse:#?}");
+    assert_eq!(second.len(), 1);
+    assert!(first.is_disjoint(&second));
+    assert!(first
+        .iter()
+        .chain(&second)
+        .all(|s| s.starts_with("@object:")));
+}
+
+#[test]
+fn typescript_object_definitions_are_graph_only() {
+    let source = "function factory() { return { run() { helper(); } }; }\nfunction helper() {}\nregister({ work() {} });\nconst wrapped = { wrappedWork() {} } satisfies Contract;";
+    let tree = crate::parser::FileParser::parse_source(
+        std::path::Path::new("fixture.ts"),
+        source,
+        LangId::TypeScript,
+    )
+    .unwrap();
+    let before =
+        crate::parser::extract_symbols_from_tree(source, &tree, LangId::TypeScript).unwrap();
+    let data = crate::callgraph::build_file_data_from_tree(
+        std::path::Path::new("fixture.ts"),
+        source,
+        LangId::TypeScript,
+        &tree,
+        &crate::callgraph_store::LineIndex::new(source),
+    )
+    .unwrap();
+    let after =
+        crate::parser::extract_symbols_from_tree(source, &tree, LangId::TypeScript).unwrap();
+    assert_eq!(before, after);
+    let mut names = before
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["factory", "helper", "wrapped"]);
+    for name in ["run", "work", "wrappedWork"] {
+        assert!(
+            data.symbol_metadata
+                .keys()
+                .any(|symbol| symbol.ends_with(&format!("::{name}"))),
+            "{name}"
+        );
+    }
+    let run = data
+        .symbol_metadata
+        .iter()
+        .find(|(name, _)| name.ends_with("::run"))
+        .unwrap()
+        .1;
+    assert_eq!(run.signature.as_deref(), Some("run()"));
+    assert!(data
+        .calls_by_symbol
+        .iter()
+        .any(|(symbol, calls)| symbol.ends_with("::run")
+            && calls.iter().any(|call| call.callee_name == "helper")));
+}
+
+#[test]
+fn typescript_object_argument_definitions_have_distinct_identities() {
+    let parse = parse("register({ run: () => helper() });\nregister({ run() { helper(); } });\n({ run: function() {} }).run();\nfunction helper() {}", "typescript");
+    let definitions = parse
+        .symbols
+        .iter()
+        .filter(|s| s.name == "run")
+        .collect::<Vec<_>>();
+    assert_eq!(definitions.len(), 3, "{parse:#?}");
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|s| &s.scoped_name)
+            .collect::<HashSet<_>>()
+            .len(),
+        3
+    );
+    assert_eq!(ts_object_target(&parse, 3).len(), 1);
+    assert_eq!(
+        parse
+            .refs
+            .iter()
+            .filter(|r| r.short_name.as_deref() == Some("helper")
+                && r.caller_symbol.as_ref().is_some_and(|s| s.contains("run")))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn typescript_object_factory_returns_are_lexically_bound() {
+    let parse = parse("function make() { return { run: () => {} }; }\nfunction other() { return { run() {} }; }\nfunction caller() {\n const adapter = make();\n adapter.run();\n const nested = () => ({ child: { run: () => {} } });\n nested().child.run();\n}\nfunction shadow(make: unknown) { const adapter = make(); adapter.run(); }", "typescript");
+    let target = ts_object_target(&parse, 5);
+    assert_eq!(target.len(), 1, "{parse:#?}");
+    assert!(target.iter().all(|s| s.starts_with("@object:0:")));
+    assert_eq!(ts_object_target(&parse, 7).len(), 1, "{parse:#?}");
+    assert!(ts_object_target(&parse, 9).is_empty());
+}
+
+#[test]
+fn typescript_object_same_named_local_bindings_do_not_share_a_method() {
+    let parse = parse("function first() { const value = { run() {} }; value.run(); }\nfunction second() { const value = { run() {} }; value.run(); }", "typescript");
+    let first = ts_object_target(&parse, 1);
+    let second = ts_object_target(&parse, 2);
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert!(first.is_disjoint(&second));
+}
+
+#[test]
+fn typescript_object_unique_existing_selectors_are_preserved() {
+    let parse = parse(
+        "function owner() { const local = { run() {} }; local.run(); }",
+        "typescript",
+    );
+    assert_eq!(
+        parse
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "run")
+            .unwrap()
+            .scoped_name,
+        "local::run"
+    );
+    assert_eq!(
+        ts_object_target(&parse, 1),
+        BTreeSet::from(["local::run".to_string()])
+    );
+}
+
+#[test]
+fn typescript_object_factory_import_uses_the_export_binding() {
+    let producer = parse(
+        "export function make() { return { run: () => {} }; }",
+        "typescript",
+    );
+    let consumer = parse("import { make as build } from './producer';\nfunction caller() { const adapter = build(); adapter.run(); }", "typescript");
+    let mut resolver = Resolver::new(BTreeMap::from([
+        ("producer.ts".into(), &producer),
+        ("consumer.ts".into(), &consumer),
+    ]));
+    resolver.type_targets.insert(
+        ("consumer.ts".into(), "build".into()),
+        ("producer.ts".into(), "make".into()),
+    );
+    let result = resolver.resolve("consumer.ts", &consumer.dispatch.sites[0]);
+    assert_eq!(result.targets.len(), 1, "{consumer:#?}");
+    assert!(result
+        .targets
+        .iter()
+        .all(|t| t.file == "producer.ts" && t.provenance == "exact"));
+}
+
+#[test]
+fn typescript_object_ambiguous_or_mutated_values_do_not_gain_edges() {
+    for source in [
+        "const value = { run() {}, ...unknown }; value.run();",
+        "const value = { run() {}, run: () => {} }; value.run();",
+        "const value = { run() {}, [key]: () => {} }; value.run();",
+        "let value = { run() {} }; value = unknown; value.run();",
+        "const value = { run() {} }; value.run = unknown; value.run();",
+        "function make(flag) { if(flag) return {run(){}}; return {run(){}}; } const value = make(); value.run();",
+        "function make() { function inner() { return { run() {} }; } } const value = make(); value.run();",
+        "async function make() { return { run() {} }; } const value = make(); value.run();",
+        "const value = { run() {} }; function caller(value) { value.run(); }",
+        "register({ run() {} }); function callback(value) { value.run(); }",
+        "const value = { run() {} }; const alias = value; alias.run = unknown; value.run();",
+        "import {make} from './producer'; function caller() { const {make} = unknown; make().run(); }",
+        "import {make} from './producer'; const callback = make => make().run();",
+        "import {make} from './producer'; function caller() { try {} catch(make) { make().run(); } }",
+        "const make = function*() { return { run() {} }; }; make().run();",
+        "const value = { run: function internal() {} }; value.internal();",
+        "const value = { run: () => this.other(), other() {} };",
+        "class Target { run() {} } function make(): Target { make.run(); return new Target(); }",
+        "const value = { run() {} }; function caller(values) { for(const value of values) { value.run(); } }",
+        "import {make} from './producer'; function caller(values) { for(const make of values) { make().run(); } }",
+        "import {make} from './producer'; function caller(values) { for(var make of values) {} make().run(); }",
+        "import {make} from './producer'; function caller() { make = unknown; make().run(); }",
+    ] {
+        let parse = parse(source, "typescript");
+        let producer = self::parse("export function make() { return { run() {} }; }", "typescript");
+        let mut resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parse), ("producer.ts".into(), &producer)]));
+        resolver.type_targets.insert(("fixture".into(), "make".into()), ("producer.ts".into(), "make".into()));
+        assert!(parse.dispatch.sites.iter().all(|site| resolver.resolve("fixture", site).targets.is_empty()), "{source}\n{parse:#?}");
+    }
+}
+
 #[test]
 fn interface_two_implementations_are_possible_targets() {
     let parse = parse("interface I { m(): void; }\nclass A implements I { m() {} }\nclass B implements I { m() {} }\nfunction caller(x: I) { x.m(); }", "typescript");
@@ -178,6 +386,69 @@ fn builtin_type_does_not_link_project_names() {
     assert_eq!(result[0].external, 1);
     assert!(result[0].targets.is_empty());
     assert!(result[0].protected.is_empty());
+}
+
+#[test]
+fn python_unknown_abstract_receivers_stay_live_without_caller_guesses() {
+    let parsed = parse("from abc import abstractmethod\nclass Contract:\n @abstractmethod\n def get_items(self): pass\nclass Other:\n def get_items(self): pass\ndef caller(x):\n x.get_items()\n self.underlying.get_items()\n", "python");
+    let result = resolutions(&parsed);
+    assert_eq!(result.len(), 2);
+    for resolution in result {
+        assert!(resolution.targets.is_empty(), "{resolution:#?}");
+        assert_eq!(resolution.unresolved, 1);
+        assert_eq!(resolution.protected.len(), 2);
+    }
+}
+
+#[test]
+fn python_receiver_evidence_is_local_to_the_calling_scope() {
+    let parsed = parse("class C:\n def m(self): pass\n def own(self):\n  self.m()\ndef caller(x: C):\n x.m()\n y: C\n y.m()\n z = C()\n def nested():\n  z = external\n z.m()\ndef unknown():\n def nested():\n  hidden = C()\n hidden.m()\n", "python");
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    assert_eq!(parsed.dispatch.sites.len(), 5);
+    for site in &parsed.dispatch.sites {
+        let resolution = resolver.resolve("fixture", site);
+        if site.caller.as_deref() == Some("unknown") {
+            assert!(resolution.targets.is_empty());
+            assert_eq!(resolution.unresolved, 1);
+        } else {
+            assert!(resolution.targets.iter().any(|t| t.symbol == "C::m"));
+            assert!(resolution.targets.iter().all(|t| t.provenance == "exact"));
+        }
+    }
+}
+
+#[test]
+fn python_super_uses_c3_base_order_without_subtype_fanout() {
+    // Zulu precedes Alpha even though lexical sorting would reverse them.
+    // Shared owns an initializer, but C3 puts Alpha before that shared ancestor.
+    let parsed = parse("class Shared:\n def __init__(self): pass\nclass Zulu(Shared): pass\nclass Alpha(Shared):\n def __init__(self): pass\nclass Child(Zulu, Alpha):\n def __init__(self):\n  super().__init__()\nclass Sibling(Shared):\n def __init__(self): pass\nclass Direct(Alpha, Zulu):\n def __init__(self):\n  super().__init__()\n", "python");
+    let result = resolutions(&parsed);
+    assert_eq!(result.len(), 2);
+    for resolution in result {
+        assert_eq!(resolution.targets.len(), 1, "{resolution:#?}");
+        let target = resolution.targets.first().unwrap();
+        assert_eq!(target.symbol, "Alpha::__init__");
+        assert_eq!(target.provenance, "exact");
+    }
+}
+
+#[test]
+fn python_super_unknown_cyclic_and_inconsistent_bases_never_guess() {
+    for (source, external) in [
+        ("class Known:\n def __init__(self): pass\nclass Child(External, Known):\n def __init__(self):\n  super().__init__()\n", true),
+        ("class A(B): pass\nclass B(A):\n def __init__(self):\n  super().__init__()\n", false),
+        ("class A: pass\nclass B: pass\nclass X(A, B): pass\nclass Y(B, A): pass\nclass Child(X, Y):\n def __init__(self):\n  super().__init__()\n", false),
+    ] {
+        let parsed = parse(source, "python");
+        let result = resolutions(&parsed);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].targets.is_empty(), "{:#?}", result[0]);
+        assert_eq!(result[0].unresolved, usize::from(!external));
+        assert_eq!(result[0].external, usize::from(external));
+        if external {
+            assert!(result[0].protected.is_empty());
+        }
+    }
 }
 
 #[test]
@@ -469,7 +740,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                             name: "m".into(),
                             symbol: format!("{declaration_owner}::m"),
                             has_body: !interface,
-                            shape: "->".into(),
+                            shape: if language == "rust" { "self;->" } else { "->" }.into(),
                             private: false,
                         }];
                         for i in 0..overrides {
@@ -489,7 +760,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                                 name: "m".into(),
                                 symbol: format!("D{i}::m"),
                                 has_body: true,
-                                shape: "->".into(),
+                                shape: if language == "rust" { "self;->" } else { "->" }.into(),
                                 private: false,
                             });
                         }
@@ -551,7 +822,12 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                         name: "m".into(),
                         symbol: format!("Unrelated{i}::m"),
                         has_body: true,
-                        shape: "different-arity".into(),
+                        shape: if language == "rust" {
+                            "self;different-arity"
+                        } else {
+                            "different-arity"
+                        }
+                        .into(),
                         private: true,
                     });
                 }
@@ -620,4 +896,76 @@ fn relative_import_and_open_receiver_dispatch_do_not_rescan_every_file() {
         "{visits} file visits for {} sites in 130 files",
         16 * sites.len()
     );
+}
+
+#[test]
+fn mixed_old_and_new_rust_shapes_do_not_guess_instance_binding() {
+    let mut old = parse("pub struct Old; impl Old { pub fn m(&self) {} }", "rust");
+    for method in &mut old.dispatch.methods {
+        method.shape = method
+            .shape
+            .strip_prefix("self;")
+            .or_else(|| method.shape.strip_prefix("static;"))
+            .unwrap_or(&method.shape)
+            .to_string();
+    }
+    let encoded = super::super::CallgraphBlob::Parse(old).to_bytes().unwrap();
+    let decoded = super::super::CallgraphBlob::from_bytes(&encoded).unwrap();
+    let old = decoded.parse().unwrap();
+    let fresh = parse("use crate::old::Old; pub struct Fresh; impl Fresh { pub fn m(&self) {} } fn caller(old: &Old, fresh: &Fresh) { old.m(); fresh.m(); }", "rust");
+    let mut resolver = Resolver::new(BTreeMap::from([
+        ("old.rs".to_string(), old),
+        ("new.rs".to_string(), &fresh),
+    ]));
+    resolver.type_targets.insert(
+        ("new.rs".into(), "Old".into()),
+        ("old.rs".into(), "Old".into()),
+    );
+    let old_site = fresh
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.receiver.as_deref() == Some("Old"))
+        .unwrap();
+    let fresh_site = fresh
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.receiver.as_deref() == Some("Fresh"))
+        .unwrap();
+    let uncertain = resolver.resolve("new.rs", old_site);
+    assert!(uncertain.targets.is_empty(), "{uncertain:#?}");
+    assert_eq!(uncertain.unresolved, 1);
+    let exact = resolver.resolve("new.rs", fresh_site);
+    assert_eq!(exact.targets.len(), 1, "{exact:#?}");
+    assert!(exact.targets.iter().all(|target| target.file == "new.rs"
+        && target.symbol == "Fresh::m"
+        && target.provenance == "exact"));
+}
+
+#[test]
+fn rust_colliding_inline_members_retain_positional_declaration_facts() {
+    let parsed = parse(
+        "mod nested { pub struct T; impl T { fn f(&self) {} fn f(&self) {} } }",
+        "rust",
+    );
+    assert_eq!(
+        parsed
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "f")
+            .count(),
+        2
+    );
+    let methods = parsed
+        .dispatch
+        .methods
+        .iter()
+        .filter(|method| method.name == "f")
+        .collect::<Vec<_>>();
+    assert!(
+        !methods.is_empty(),
+        "duplicate binding names must not erase declaration facts"
+    );
+    assert!(methods.iter().all(|method| method.owner == "nested::T"));
 }
