@@ -65,13 +65,13 @@ def copy_tools(destination):
             shutil.copy2(path, target)
 
 
-def capture(binary, tree, tools, work, label, views, trace=None):
+def capture(binary, tree, tools, work, label, views, trace=None, cache_root=None):
     output = work / label
     env = clean_environment()
     if trace:
         env['AFT_STORE_DIET_SQL_TRACE'] = str(trace)
     argv = [sys.executable, tools / 'parity.py', 'capture', binary,
-            tree / 'crates/aft/tests/fixtures/callgraph', work / (label + '-cache'),
+            tree / 'crates/aft/tests/fixtures/callgraph', (cache_root or work) / (label + '-cache'),
             tools / 'wire-manifest.json', output, '--config', tools / 'wire-policy.json']
     if views:
         argv.append('--views')
@@ -84,12 +84,16 @@ def record(sha, include_trace, output_dir):
     if len(sha) != 40:
         raise ValueError('baseline must resolve to a full commit SHA')
     workspace = ROOT / 'target/scratch' / ('store-diet-record-' + sha)
-    marker = workspace / '.store-diet-recorder'
-    if workspace.exists():
-        assert marker.read_text(encoding='utf-8').strip() == sha, 'refuse to replace an unrelated scratch directory'
-        shutil.rmtree(workspace)
-    workspace.mkdir(parents=True)
-    marker.write_text(sha, encoding='utf-8')
+    # Derived SQLite filenames are long; keep cache prefixes below the Unix
+    # virtual file system's 512-byte pathname limit in nested worker checkouts.
+    caches = ROOT / 'target/scratch' / ('diet-cache-' + sha[:12])
+    for directory in [workspace, caches]:
+        marker = directory / '.store-diet-recorder'
+        if directory.exists():
+            assert marker.read_text(encoding='utf-8').strip() == sha, 'refuse to replace an unrelated scratch directory'
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True)
+        marker.write_text(sha, encoding='utf-8')
     tree = workspace / 'baseline'
     run(['git', 'clone', '--quiet', '--shared', '--no-checkout', ROOT, tree], ROOT)
     run(['git', 'checkout', '--quiet', '--detach', sha], tree)
@@ -121,8 +125,8 @@ def record(sha, include_trace, output_dir):
         target = tree / target
     binary = target / 'debug' / ('aft.exe' if os.name == 'nt' else 'aft')
     for mode in ['legacy', 'views']:
-        first = capture(binary, tree, tools, workspace, 'wire-' + mode + '-first', mode == 'views')
-        second = capture(binary, tree, tools, workspace, 'wire-' + mode + '-second', mode == 'views')
+        first = capture(binary, tree, tools, workspace, 'wire-' + mode + '-first', mode == 'views', cache_root=caches)
+        second = capture(binary, tree, tools, workspace, 'wire-' + mode + '-second', mode == 'views', cache_root=caches)
         run([sys.executable, tools / 'parity.py', 'compare', first, second], tree)
         destination = tools / ('wire-' + mode)
         if destination.exists():
@@ -144,7 +148,7 @@ def record(sha, include_trace, output_dir):
         run(['cargo', 'test', '-p', 'agent-file-tools', '--lib', '--', 'store_diet'], tree, traced_env)
         run(['cargo', 'build', '-p', 'agent-file-tools', '--bin', 'aft'], tree)
         for mode in ['legacy', 'views']:
-            output = capture(binary, tree, tools, workspace, 'wire-' + mode + '-traced', mode == 'views', trace)
+            output = capture(binary, tree, tools, workspace, 'wire-' + mode + '-traced', mode == 'views', trace, cache_root=caches)
             run([sys.executable, tools / 'parity.py', 'compare', tools / ('wire-' + mode), output], tree)
         trace_report = workspace / 'uncovered.json'
         dump(tools / 'trace_exemptions.json', {})

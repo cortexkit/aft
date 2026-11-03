@@ -74,6 +74,8 @@ def operation(request):
 
 
 def pending_reply(request, reply):
+    if reply.get('code') == 'callgraph_building':
+        return True
     if operation(request) == 'inspect' and reply.get('code') == 'inspect_not_fresh':
         return True
     graph = (reply.get('index') or {}).get('callgraph') or {}

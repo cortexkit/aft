@@ -51,6 +51,10 @@ again. It publishes only after the whole run succeeds. `recording.json` names th
 commit and output hashes. Review regenerated trace exemptions before committing.
 Use `--output-dir target/scratch/oracles` on a build server; the recorder also
 writes a SHA-keyed tarball for returning the complete artifact set.
+Wire caches use a shorter, marked sibling directory under `target/scratch`:
+SQLite's Unix virtual file system limits complete filenames to 512 bytes, and derived filenames
+already consume about half of that budget. Cache contents never leave the
+checkout, and only directories marked with the selected full SHA are reset.
 
 The initial pre-fix recordings are provisional. Main's selective re-resolution
 fix adds stored target identity/provenance tie-breaks to four edge queries; any

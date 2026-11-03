@@ -15,6 +15,19 @@ import record as recorder
 
 
 class InventoryTests(unittest.TestCase):
+    def test_recorder_uses_short_cache_prefix_for_sqlite_paths(self):
+        root = pathlib.Path('/' + 'w' * 177)
+        work = root / 'target/scratch' / ('store-diet-record-' + 'a' * 40)
+        caches = root / 'target/scratch' / ('diet-cache-' + 'a' * 12)
+        with mock.patch.object(recorder, 'run') as run:
+            recorder.capture(root / 'aft', root, root / 'tools', work,
+                             'wire-views-first', True, cache_root=caches)
+        cache = run.call_args.args[0][5]
+        self.assertEqual(cache, caches / 'wire-views-first-cache')
+        # A representative derived-file suffix consumes 246 bytes.
+        self.assertLess(len(str(cache)) + 246, 512)
+        self.assertGreaterEqual(len(str(work / cache.name)) + 246, 512)
+
     def test_created_file_patterns_expand_to_executable_queries(self):
         row = {'candidate': 'SELECT caller_file FROM refs WHERE ({js}) OR ({rust})'}
         variants = inventory.variants(row, [])
@@ -155,6 +168,7 @@ let q = "SELECT \\\n  ref_id FROM refs";'''
 
     def test_transient_graph_admission_is_not_recorded_as_a_query_answer(self):
         request = {'command': 'callers'}
+        self.assertTrue(parity.pending_reply(request, {'success': False, 'code': 'callgraph_building'}))
         self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'unavailable', 'reason': 'identity_provisional'}}}))
         self.assertTrue(parity.pending_reply(request, {'index': {'callgraph': {'status': 'building'}}}))
         self.assertFalse(parity.pending_reply(request, {'success': True, 'complete': False, 'unresolved_call_sites': 1}))
