@@ -862,16 +862,38 @@ fn callgraph_pending_result(job: &InspectJob, duration: Duration) -> InspectResu
     )
 }
 
+fn dead_code_store_read_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = guard_tests::callgraph_read_retry_now_for_test() {
+        return now;
+    }
+    Instant::now()
+}
+
 fn retry_dead_code_store_read<T>(
     mut read: impl FnMut() -> Result<T, CallGraphStoreError>,
 ) -> Result<T, CallGraphStoreError> {
     // Even a published WAL generation can briefly reject a read-only open while
     // another handle closes and cleans up its WAL. Readiness probes fail fast;
     // give contention the same short grace period as serving-reader queries.
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = dead_code_store_read_now() + Duration::from_millis(100);
     loop {
-        match read() {
-            Err(error) if error.is_transient_lock_contention() && Instant::now() < deadline => {
+        #[cfg(test)]
+        let attempt_started = Instant::now();
+        let result = read();
+        #[cfg(test)]
+        if let Err(error) = &result {
+            guard_tests::observe_callgraph_read_error_for_test(
+                error,
+                attempt_started.elapsed(),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+        }
+        match result {
+            Err(error)
+                if error.is_transient_lock_contention()
+                    && dead_code_store_read_now() < deadline =>
+            {
                 #[cfg(test)]
                 guard_tests::notify_callgraph_read_retry_for_test();
                 std::thread::sleep(Duration::from_millis(5));

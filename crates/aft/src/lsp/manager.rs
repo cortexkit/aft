@@ -6327,7 +6327,7 @@ impl LspManager {
         !entry.stale
             && (!entry.from_receive_order || !self.server_supports_pull_for_file(key, file))
             && entry.content_hash.is_some()
-            && entry.content_hash == file_content_hash(file)
+            && entry.content_hash == self.diagnostics.verified_content_hash(file)
             && self
                 .documents
                 .get(key)
