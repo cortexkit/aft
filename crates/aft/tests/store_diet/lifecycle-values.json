@@ -1,0 +1,95 @@
+{
+  "after_cold": {
+    "files.lang": {
+      "rust": 1
+    },
+    "nodes.kind": {
+      "function": 2
+    },
+    "nodes.provenance": {
+      "treesitter+resolver": 2
+    },
+    "refs.kind": {
+      "call": 1
+    },
+    "refs.status": {
+      "resolved_local": 1
+    },
+    "refs.import_kind": {},
+    "refs.provenance": {
+      "treesitter+resolver": 1
+    },
+    "edges.kind": {
+      "call": 1
+    },
+    "edges.provenance": {
+      "treesitter+resolver": 1
+    },
+    "dispatch_hints.provenance": {},
+    "backend_file_state.backend": {
+      "treesitter": 2
+    },
+    "backend_file_state.status": {
+      "fresh": 1,
+      "undecodable": 1
+    },
+    "nodes.id_form": {
+      "pos:symbol:": 2
+    },
+    "refs.id_form": {
+      "digest": 1
+    },
+    "edges.id_form": {
+      "digest": 1
+    },
+    "refs.unresolved_form": {},
+    "edges.without_ref_row": 0
+  },
+  "after_stale_mark": {
+    "files.lang": {
+      "rust": 1
+    },
+    "nodes.kind": {
+      "function": 2
+    },
+    "nodes.provenance": {
+      "treesitter+resolver": 2
+    },
+    "refs.kind": {
+      "call": 1
+    },
+    "refs.status": {
+      "resolved_local": 1
+    },
+    "refs.import_kind": {},
+    "refs.provenance": {
+      "treesitter+resolver": 1
+    },
+    "edges.kind": {
+      "call": 1
+    },
+    "edges.provenance": {
+      "treesitter+resolver": 1
+    },
+    "dispatch_hints.provenance": {},
+    "backend_file_state.backend": {
+      "treesitter": 2
+    },
+    "backend_file_state.status": {
+      "stale": 1,
+      "undecodable": 1
+    },
+    "nodes.id_form": {
+      "pos:symbol:": 2
+    },
+    "refs.id_form": {
+      "digest": 1
+    },
+    "edges.id_form": {
+      "digest": 1
+    },
+    "refs.unresolved_form": {},
+    "edges.without_ref_row": 0
+  },
+  "staged_ref_write": true
+}

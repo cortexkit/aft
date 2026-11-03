@@ -1,0 +1,1948 @@
+[
+  {
+    "path": "crates/aft/src/access_policy_task_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 451,
+        "helper": "explicit_task_io_grep_rejects_registered_sqlite_names"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/access_policy_tests.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 652,
+        "helper": "artifact_read_owned_live_sqlite_alias_is_refused"
+      },
+      {
+        "line": 1218,
+        "helper": "scratch_read_respects_absolute_floor_and_live_sqlite"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/bash_background/viewed_task.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 41,
+        "helper": "viewed_task_filters_requester_and_non_minted_before_duplicate_limit_after_reopen"
+      },
+      {
+        "line": 78,
+        "helper": "viewed_task_filters_requester_and_non_minted_before_duplicate_limit_after_reopen"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/mod.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 1340,
+        "helper": "opening_populated_pre_presence_store_adds_no_payload_index"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/reclaim.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 240,
+        "helper": "fixture"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v2/read_tests.rs",
+    "raw_open_calls": 6,
+    "helpers": [
+      {
+        "line": 230,
+        "helper": "payload_totals_stay_exact_and_epoch_updates_fire_no_trigger"
+      },
+      {
+        "line": 298,
+        "helper": "payload_totals_stay_exact_under_releases_that_predate_them"
+      },
+      {
+        "line": 454,
+        "helper": "incomplete_or_altered_payload_totals_are_summed_and_rebuilt"
+      },
+      {
+        "line": 484,
+        "helper": "payload_totals_setup_skips_a_busy_store_and_gives_up_past_its_deadline"
+      },
+      {
+        "line": 987,
+        "helper": "deletion_epoch_counts_each_deleted_row_from_any_writer"
+      },
+      {
+        "line": 1037,
+        "helper": "damaged_deletion_epoch_reads_as_none_and_rebuilds_under_a_new_generation"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v2/sizing_tests.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 409,
+        "helper": "probe_inventory"
+      },
+      {
+        "line": 512,
+        "helper": "io_amplification_real_payload_touch_probe"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/copy_tests.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 383,
+        "helper": "sqlite_state"
+      },
+      {
+        "line": 494,
+        "helper": "a_copy_leaves_v1_and_v2_rows_metadata_schema_and_view_state_unchanged"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/initialization.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 54,
+        "helper": "resumable"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/layout_tests.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 28,
+        "helper": "touch_if_current_reads_both_layouts_without_rewriting_rows"
+      },
+      {
+        "line": 39,
+        "helper": "touch_if_current_reads_both_layouts_without_rewriting_rows"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/read_audit.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 94,
+        "helper": "open"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/replay.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 229,
+        "helper": "open"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3/tests.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 1084,
+        "helper": "check_drift"
+      },
+      {
+        "line": 1136,
+        "helper": "drift_refusal_is_cleared_after_valid_replacement_and_never_becomes_floor"
+      },
+      {
+        "line": 1171,
+        "helper": "drift_refusal_covers_an_unresolved_symlinked_storage_parent"
+      },
+      {
+        "line": 1671,
+        "helper": "newer_format_keeps_artifact_refusal_and_malformed_file_reports_found_zero"
+      },
+      {
+        "line": 1708,
+        "helper": "plane_open_enforces_the_same_schema_application_and_pragma_contract"
+      },
+      {
+        "line": 1815,
+        "helper": "failed_upgrade_reader_rejects_a_replaced_database"
+      },
+      {
+        "line": 2356,
+        "helper": "relocated_v3_database_keeps_the_storage_route_for_floor_and_refusal_scope"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/blob_store/v3.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 984,
+        "helper": "validate"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/build_breaker.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 673,
+        "helper": "durable_tallies"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/build_breaker_audit_tests.rs",
+    "raw_open_calls": 9,
+    "helpers": [
+      {
+        "line": 128,
+        "helper": "new"
+      },
+      {
+        "line": 204,
+        "helper": "continuation_cursor"
+      },
+      {
+        "line": 215,
+        "helper": "ambiguity_since"
+      },
+      {
+        "line": 228,
+        "helper": "sweep"
+      },
+      {
+        "line": 346,
+        "helper": "initialize_batch_db"
+      },
+      {
+        "line": 383,
+        "helper": "durable_batch_state"
+      },
+      {
+        "line": 409,
+        "helper": "sqlite_commit_barrier_child"
+      },
+      {
+        "line": 463,
+        "helper": "kill_during_extract_and_reconciliation_commit_is_atomic_and_credit_uses_only_counter"
+      },
+      {
+        "line": 485,
+        "helper": "kill_during_extract_and_reconciliation_commit_is_atomic_and_credit_uses_only_counter"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/cache_location_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 828,
+        "helper": "split_durable_legacy_sqlite_refuses_writable_opens"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/dead_code_projection.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 1370,
+        "helper": "dead_code_projection_with_files_but_no_root_rows_stays_unavailable"
+      },
+      {
+        "line": 1464,
+        "helper": "outbound_projection_sorts_in_rust_without_a_sqlite_temp_btree"
+      },
+      {
+        "line": 1653,
+        "helper": "oversized_projection_delta_is_retained_in_spill_table"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/incremental_parity.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 292,
+        "helper": "s2_refreshed_store_reopens_ready_without_resuming_or_adopting_staging"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/mod.rs",
+    "raw_open_calls": 26,
+    "helpers": [
+      {
+        "line": 683,
+        "helper": "callgraph_writer_waits_when_wal_setup_meets_a_write_lock"
+      },
+      {
+        "line": 758,
+        "helper": "callgraph_reader_setup_does_not_read_locked_schema"
+      },
+      {
+        "line": 792,
+        "helper": "obsolete_generation_is_removed_before_replacement_publication"
+      },
+      {
+        "line": 839,
+        "helper": "obsolete_generation_retirement_preserves_readers_and_interrupted_upgrade_intent"
+      },
+      {
+        "line": 877,
+        "helper": "obsolete_store_probe_preserves_current_missing_and_newer_formats"
+      },
+      {
+        "line": 939,
+        "helper": "kept"
+      },
+      {
+        "line": 989,
+        "helper": "callgraph_readonly_open_is_retryable_while_legacy_writer_is_locked"
+      },
+      {
+        "line": 1123,
+        "helper": "published_generation_stays_readable_while_its_first_writer_opens_beside_a_held_read"
+      },
+      {
+        "line": 1189,
+        "helper": "migrated_generation_is_published_in_wal_mode"
+      },
+      {
+        "line": 4790,
+        "helper": "fixture"
+      },
+      {
+        "line": 6977,
+        "helper": "lock_readiness_for_test"
+      },
+      {
+        "line": 25483,
+        "helper": "schema_and_cold_build_share_one_secondary_index_list"
+      },
+      {
+        "line": 25513,
+        "helper": "disk_index_lookup_failure_fails_the_resolution_window"
+      },
+      {
+        "line": 27549,
+        "helper": "owner_and_linked_worktree_alternation_rebuilds_storm_generation_once"
+      },
+      {
+        "line": 28156,
+        "helper": "nonrepairing_open_policy_leaves_moved_root_metadata_for_maintenance"
+      },
+      {
+        "line": 28184,
+        "helper": "assert_respelled_root_is_rerooted_in_place"
+      },
+      {
+        "line": 28307,
+        "helper": "readonly_store_opens_through_its_uri_under_plain_and_resolved_temp_paths"
+      },
+      {
+        "line": 28371,
+        "helper": "readonly_store_opens_past_the_windows_path_limit_under_a_cache_root"
+      },
+      {
+        "line": 29186,
+        "helper": "direct_callers_real_store_query_plan"
+      },
+      {
+        "line": 29596,
+        "helper": "completed_marker"
+      },
+      {
+        "line": 29847,
+        "helper": "superseded_slice_preserves_staging_and_same_corpus_successor_resumes"
+      },
+      {
+        "line": 30178,
+        "helper": "cold_build_rejects_bytes_changed_after_admission_and_retries_changed_corpus"
+      },
+      {
+        "line": 32466,
+        "helper": "callgraph_fixture_view"
+      },
+      {
+        "line": 32929,
+        "helper": "anchor"
+      },
+      {
+        "line": 35403,
+        "helper": "durable_staging_state"
+      },
+      {
+        "line": 35522,
+        "helper": "issue_250_respawn_loop_converges_or_trips_without_false_readiness"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/perf_tests.rs",
+    "raw_open_calls": 6,
+    "helpers": [
+      {
+        "line": 202,
+        "helper": "stat_first_legacy_store_hashes_once_then_records_source_stats"
+      },
+      {
+        "line": 360,
+        "helper": "stat_first_backfill_defers_to_a_live_writer_without_rebuilding"
+      },
+      {
+        "line": 380,
+        "helper": "stat_first_backfill_defers_to_a_live_writer_without_rebuilding"
+      },
+      {
+        "line": 509,
+        "helper": "callgraph_io_status_scans_visit_only_nonfresh_rows"
+      },
+      {
+        "line": 562,
+        "helper": "callgraph_io_legacy_root_scan_is_cached_once_and_repair_updates_meta"
+      },
+      {
+        "line": 1157,
+        "helper": "perf_audit2_real_repo_output_equivalence"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 95,
+        "helper": "s4_initialize_schema_upgrades_pre_s4_refs_shape"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/callgraph_store/refresh_wal/tests.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 21,
+        "helper": "pinned_reader_does_not_delay_refresh_by_the_write_busy_timeout"
+      },
+      {
+        "line": 65,
+        "helper": "opening_next_queued_refresh_does_not_autocheckpoint_the_previous_batch"
+      },
+      {
+        "line": 223,
+        "helper": "s2_connection_roles_keep_their_checkpoint_thresholds"
+      },
+      {
+        "line": 354,
+        "helper": "s2_hard_cap_retries_busy_restart_before_begin"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/commands/configure.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 17937,
+        "helper": "hold_aft_db_exclusively"
+      },
+      {
+        "line": 18034,
+        "helper": "busy_lexical_bind_retries_until_parent_can_read_child_trigram"
+      },
+      {
+        "line": 23413,
+        "helper": "marker"
+      },
+      {
+        "line": 23461,
+        "helper": "marker"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/commands/inspect.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 6145,
+        "helper": "non_git_obsolete_store_discloses_unknown_dead_code_and_preserves_unused_exports"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/commands/storage_floor_tests.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 351,
+        "helper": "new"
+      },
+      {
+        "line": 734,
+        "helper": "storage_floor_grep_and_glob_report_new_live_alias_in_cached_index"
+      },
+      {
+        "line": 807,
+        "helper": "storage_floor_subdirectory_glob_reports_relative_pattern_omissions"
+      },
+      {
+        "line": 843,
+        "helper": "storage_floor_external_grep_reports_search_root_relative_includes"
+      },
+      {
+        "line": 992,
+        "helper": "storage_floor_glob_discovered_lower_bound_subtracts_known_floor_skips"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/context.rs",
+    "raw_open_calls": 8,
+    "helpers": [
+      {
+        "line": 20302,
+        "helper": "callgraph_cold_build_logs_schema_stale"
+      },
+      {
+        "line": 20320,
+        "helper": "callgraph_cold_build_logs_fingerprint_stale"
+      },
+      {
+        "line": 20360,
+        "helper": "callgraph_cold_build_logs_root_mismatch"
+      },
+      {
+        "line": 21336,
+        "helper": "assert_callgraph_churn_was_not_charged"
+      },
+      {
+        "line": 21975,
+        "helper": "hold_checkout_view_derived_busy"
+      },
+      {
+        "line": 24720,
+        "helper": "failed_database_open_recovers_after_backoff_without_rebind"
+      },
+      {
+        "line": 24951,
+        "helper": "repaired_resident_database_rechecks_schema_and_pushes_recovered_status"
+      },
+      {
+        "line": 25168,
+        "helper": "permanent_database_error_is_rechecked_with_doubling_capped_backoff"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/call_ledger.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 1513,
+        "helper": "concurrent_ledger_writers_do_not_upgrade_stale_snapshots"
+      },
+      {
+        "line": 1546,
+        "helper": "concurrent_ledger_writers_do_not_upgrade_stale_snapshots"
+      },
+      {
+        "line": 1648,
+        "helper": "database"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/file_identity.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 390,
+        "helper": "open_census"
+      },
+      {
+        "line": 987,
+        "helper": "identity_only_connection_tracks_lifetime_without_changing_wal_policy"
+      },
+      {
+        "line": 1067,
+        "helper": "replacing_the_database_file_truncates_the_wal_index_under_a_live_mapping"
+      },
+      {
+        "line": 1116,
+        "helper": "replacing_the_database_file_truncates_the_wal_index_under_a_live_mapping"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/lifecycle.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 698,
+        "helper": "open_census"
+      },
+      {
+        "line": 707,
+        "helper": "open_in_memory"
+      },
+      {
+        "line": 1248,
+        "helper": "tracked_wal_hook_matches_builtin_checkpoint_frequency_size_and_bytes"
+      },
+      {
+        "line": 1448,
+        "helper": "closing_the_last_wal_connection_leaves_checkpoint_bytes_in_residual"
+      },
+      {
+        "line": 1466,
+        "helper": "classifying_close_checkpoint_bytes_as_unmeasurable_does_not_add_a_checkpoint"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/mod.rs",
+    "raw_open_calls": 22,
+    "helpers": [
+      {
+        "line": 1081,
+        "helper": "schema_twenty_one_upgrade_adds_speech_authority_without_a_gap"
+      },
+      {
+        "line": 1115,
+        "helper": "schema_twenty_two_upgrade_preserves_revocations_and_adds_dispatch_outcomes"
+      },
+      {
+        "line": 1147,
+        "helper": "schema_twenty_three_upgrade_adds_watch_gap_state_after_speech_authority"
+      },
+      {
+        "line": 1474,
+        "helper": "migration_v15_installs_call_ledger_from_v13"
+      },
+      {
+        "line": 1487,
+        "helper": "migration_v15_preserves_v14_remote_exec_policies"
+      },
+      {
+        "line": 1545,
+        "helper": "downgrade_refused"
+      },
+      {
+        "line": 1562,
+        "helper": "audit_schema25_is_refused_by_schema24_reader_without_row_loss"
+      },
+      {
+        "line": 1601,
+        "helper": "migration_v10_probe_recognizes_the_reported_version_nine_wedge"
+      },
+      {
+        "line": 1616,
+        "helper": "every_migration_is_safe_to_apply_twice"
+      },
+      {
+        "line": 1632,
+        "helper": "migration_v21_opens_v20_with_default_first_match_and_new_reader_floor"
+      },
+      {
+        "line": 1684,
+        "helper": "migration_v2_deduplicates_compression_events_and_adds_unique_index"
+      },
+      {
+        "line": 1737,
+        "helper": "migration_v3_upgrades_existing_v2_database"
+      },
+      {
+        "line": 1757,
+        "helper": "additive_task_owner_index_keeps_v18_schema_and_reader_floor"
+      },
+      {
+        "line": 1792,
+        "helper": "additive_task_owner_index_keeps_v18_schema_and_reader_floor"
+      },
+      {
+        "line": 1821,
+        "helper": "additive_task_owner_index_keeps_v18_schema_and_reader_floor"
+      },
+      {
+        "line": 1836,
+        "helper": "result_source_migration_preserves_legacy_frames_and_sets_reader_floor"
+      },
+      {
+        "line": 1929,
+        "helper": "migration_v4_adds_restore_metadata_to_v2_and_v3_databases"
+      },
+      {
+        "line": 1960,
+        "helper": "migration_v4_is_idempotent_when_column_already_exists"
+      },
+      {
+        "line": 1985,
+        "helper": "migration_v5_adds_bash_pattern_watches_table"
+      },
+      {
+        "line": 2006,
+        "helper": "migration_v9_adds_task_cascade_and_drops_existing_orphan_watches"
+      },
+      {
+        "line": 2067,
+        "helper": "migration_v7_adds_machine_scoped_standing_root_tables"
+      },
+      {
+        "line": 2091,
+        "helper": "migration_v6_adds_removal_health_indexes"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/remote_exec.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 504,
+        "helper": "exec_remote_migration_from_previous_version_preserves_existing_data"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/rich_ui.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 141,
+        "helper": "rich_ui_migration_fresh_database_has_four_tables"
+      },
+      {
+        "line": 156,
+        "helper": "rich_ui_migration_reapplication_keeps_cursor_key"
+      },
+      {
+        "line": 175,
+        "helper": "rich_ui_migration_upgrade_reopen_and_downgrade_fence"
+      },
+      {
+        "line": 211,
+        "helper": "rich_ui_migration_upgrade_reopen_and_downgrade_fence"
+      },
+      {
+        "line": 222,
+        "helper": "rich_ui_migration_upgrades_schema_18_without_losing_ledger_migration"
+      },
+      {
+        "line": 288,
+        "helper": "rich_ui_presets_exact_identity_and_distinct_presets_are_read_only"
+      },
+      {
+        "line": 324,
+        "helper": "rich_ui_presets_retention_tick_removes_only_older_than_thirty_days"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/db/wal_credit_probe.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 240,
+        "helper": "open_counted"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/disk_write_hunt.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 13,
+        "helper": "copy_db"
+      },
+      {
+        "line": 14,
+        "helper": "copy_db"
+      },
+      {
+        "line": 171,
+        "helper": "bench_disk_write_hunt"
+      },
+      {
+        "line": 191,
+        "helper": "bench_disk_write_query_plans"
+      },
+      {
+        "line": 211,
+        "helper": "bench_disk_write_query_plans"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/gc/family_read_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 888,
+        "helper": "a_reader_snapshot_defers_the_cut_to_the_next_pass_without_waiting"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/gc/mod.rs",
+    "raw_open_calls": 9,
+    "helpers": [
+      {
+        "line": 775,
+        "helper": "blob_gc_deletes_a_bounded_batch_in_one_transaction"
+      },
+      {
+        "line": 852,
+        "helper": "storage_retention_collects_unreferenced_blobs_below_budget"
+      },
+      {
+        "line": 878,
+        "helper": "storage_retention_collects_unreferenced_blobs_below_budget"
+      },
+      {
+        "line": 894,
+        "helper": "storage_retention_blob_mark_includes_sibling_manifests"
+      },
+      {
+        "line": 932,
+        "helper": "storage_retention_blob_mark_includes_sibling_manifests"
+      },
+      {
+        "line": 964,
+        "helper": "storage_retention_sidecar_marking_follows_replacement_and_corruption"
+      },
+      {
+        "line": 968,
+        "helper": "storage_retention_sidecar_marking_follows_replacement_and_corruption"
+      },
+      {
+        "line": 977,
+        "helper": "storage_retention_sidecar_marking_follows_replacement_and_corruption"
+      },
+      {
+        "line": 1047,
+        "helper": "storage_retention_blob_deletion_keeps_legacy_free_pages_reusable"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/inspect/cache.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 3100,
+        "helper": "cache_epoch_immediate_transaction_locks_before_check"
+      },
+      {
+        "line": 3102,
+        "helper": "cache_epoch_immediate_transaction_locks_before_check"
+      },
+      {
+        "line": 3397,
+        "helper": "legacy_duplicate_schema_marks_rows_for_rebuild"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/inspect/manager.rs",
+    "raw_open_calls": 11,
+    "helpers": [
+      {
+        "line": 9549,
+        "helper": "inspect_callgraph_open_waits_out_transient_sqlite_writer_lock"
+      },
+      {
+        "line": 9741,
+        "helper": "direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild"
+      },
+      {
+        "line": 9754,
+        "helper": "direct_callgraph_snapshot_does_not_cold_rebuild_when_store_needs_rebuild"
+      },
+      {
+        "line": 10572,
+        "helper": "corrupt_cached_dead_code_exports"
+      },
+      {
+        "line": 11835,
+        "helper": "profile_incremental_projection_on_store_copy"
+      },
+      {
+        "line": 11836,
+        "helper": "profile_incremental_projection_on_store_copy"
+      },
+      {
+        "line": 11895,
+        "helper": "projection_probe"
+      },
+      {
+        "line": 11927,
+        "helper": "projection_probe_target"
+      },
+      {
+        "line": 12004,
+        "helper": "projection_probe_target"
+      },
+      {
+        "line": 12006,
+        "helper": "projection_probe_target"
+      },
+      {
+        "line": 12895,
+        "helper": "spill_backed_171_file_delta_splices_where_old_bound_was_full"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/legacy_partitions.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 700,
+        "helper": "write_legacy_inventory_fixture"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/migration/per_checkout_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 607,
+        "helper": "a_ledger_from_a_newer_build_is_refused_by_name"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/migration/v3_ledger_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 462,
+        "helper": "a_ledger_from_a_newer_build_is_refused_by_name"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/path_status/health.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 517,
+        "helper": "unknown_write_before_local_close_and_backstop_force_disk_reads"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/path_status/mod.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 1030,
+        "helper": "repeated_status_writes_use_wal_without_rollback_journals"
+      },
+      {
+        "line": 1306,
+        "helper": "opening_an_upgraded_ledger_does_not_wait_for_a_writer"
+      },
+      {
+        "line": 1325,
+        "helper": "ledger_without_marks_reads_and_settles"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/production_storage.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 390,
+        "helper": "old_database"
+      },
+      {
+        "line": 626,
+        "helper": "direct_production_migration_is_refused"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/readonly_artifacts.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 1715,
+        "helper": "readonly_identity_lookup_never_persists_and_refuses_a_busy_legacy_database"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/storage_retention.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 15210,
+        "helper": "views_idle_checkout_rechecks_pin_reader_database_and_session_holds"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/subc/consent_security_audit_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 1298,
+        "helper": "snapshot"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/subc/mod.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 21779,
+        "helper": "identity_retry_replay_is_admitted_as_a_bind_so_reads_never_see_a_torn_root"
+      },
+      {
+        "line": 22009,
+        "helper": "standing"
+      },
+      {
+        "line": 22207,
+        "helper": "identity_retry_settle_pauses_a_sibling_standing_entry_before_the_session_builds"
+      },
+      {
+        "line": 22375,
+        "helper": "quiescing_the_root_cancels_an_admitted_identity_retry_bind"
+      },
+      {
+        "line": 23476,
+        "helper": "busy_database_open_retries_through_wire_admission_without_rebind"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/subc/remote_policy_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 914,
+        "helper": "confine_lookup_takes_no_write_lock_and_copies_no_row"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/assembly.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 2812,
+        "helper": "seed_callgraph_payloads"
+      },
+      {
+        "line": 2910,
+        "helper": "views_corrupt_cached_payload_is_not_reused"
+      },
+      {
+        "line": 3156,
+        "helper": "clear_semantic_rows"
+      },
+      {
+        "line": 3164,
+        "helper": "clear_callgraph_rows"
+      },
+      {
+        "line": 3371,
+        "helper": "other"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/closure_connection_tests.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 15,
+        "helper": "fixture"
+      },
+      {
+        "line": 132,
+        "helper": "bench_closure_probe_strategies"
+      },
+      {
+        "line": 163,
+        "helper": "closure_membership_queries_use_payload_free_index"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/cold_fallback_tests.rs",
+    "raw_open_calls": 13,
+    "helpers": [
+      {
+        "line": 278,
+        "helper": "publish_marked_base"
+      },
+      {
+        "line": 336,
+        "helper": "has_marker"
+      },
+      {
+        "line": 415,
+        "helper": "damaged_meta_page_in_the_base_falls_back_to_a_cold_build"
+      },
+      {
+        "line": 448,
+        "helper": "fingerprint_mismatch_falls_back_to_a_cold_build"
+      },
+      {
+        "line": 547,
+        "helper": "stale_build_output_republishes_an_unchanged_manifest"
+      },
+      {
+        "line": 588,
+        "helper": "callgraph_previous_store_version_rebuilds_existing_view"
+      },
+      {
+        "line": 678,
+        "helper": "transform"
+      },
+      {
+        "line": 704,
+        "helper": "transform"
+      },
+      {
+        "line": 794,
+        "helper": "stale_build_output_does_not_seed_an_incremental_diff"
+      },
+      {
+        "line": 969,
+        "helper": "s4_upgrade_old_own_generation_is_rejected_before_clone"
+      },
+      {
+        "line": 994,
+        "helper": "s4_upgrade_old_own_generation_is_rejected_before_clone"
+      },
+      {
+        "line": 1041,
+        "helper": "s4_upgrade_old_sibling_is_rejected_and_checkout_builds_cold"
+      },
+      {
+        "line": 1064,
+        "helper": "s4_upgrade_old_sibling_is_rejected_and_checkout_builds_cold"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/donor.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 444,
+        "helper": "sealing_leaves_a_rollback_file_with_a_record_and_refuses_write_opens"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/eviction.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 2563,
+        "helper": "publish"
+      },
+      {
+        "line": 4372,
+        "helper": "a_family_within_budget_still_reclaims_a_large_free_list"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/first_load.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 5297,
+        "helper": "caller"
+      },
+      {
+        "line": 6647,
+        "helper": "v3_presence_batch_validates_once_and_rechecks_rows_and_later_schema_drift"
+      },
+      {
+        "line": 7480,
+        "helper": "fresh_checkout"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/generation.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 2812,
+        "helper": "deferred_checkpoint_runs_after_the_publication_path_returns"
+      },
+      {
+        "line": 2867,
+        "helper": "deferred_checkpoint_runs_after_the_publication_path_returns"
+      },
+      {
+        "line": 2912,
+        "helper": "clone_uses_sqlite_backup_for_committed_wal_with_a_live_source"
+      },
+      {
+        "line": 3017,
+        "helper": "clone_copies_a_multi_batch_database_in_one_backup_step"
+      },
+      {
+        "line": 3031,
+        "helper": "clone_refuses_to_replace_a_live_destination"
+      },
+      {
+        "line": 3082,
+        "helper": "state"
+      },
+      {
+        "line": 3122,
+        "helper": "clone_falls_back_to_backup_while_a_reader_keeps_wal_frames"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/lazy_read_benchmark.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 219,
+        "helper": "open"
+      },
+      {
+        "line": 1268,
+        "helper": "select_symbols"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/manifest_incremental.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 1706,
+        "helper": "views_incremental_cached_identity_rejects_new_live_database_alias"
+      },
+      {
+        "line": 1774,
+        "helper": "notified"
+      },
+      {
+        "line": 1925,
+        "helper": "views_incremental_counter_forces_heal_after_external_delete"
+      },
+      {
+        "line": 2193,
+        "helper": "views_incremental_closure_uses_owning_connections_and_revokes_stale_proof"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/manifest_publication_bench.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 47,
+        "helper": "fixture"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/cold_bench.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 137,
+        "helper": "measure_private_cold_build_io"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/dirty_pages.rs",
+    "raw_open_calls": 10,
+    "helpers": [
+      {
+        "line": 56,
+        "helper": "open_probe_connection"
+      },
+      {
+        "line": 357,
+        "helper": "write_row"
+      },
+      {
+        "line": 460,
+        "helper": "write_row"
+      },
+      {
+        "line": 583,
+        "helper": "derived_dirty_page_probe"
+      },
+      {
+        "line": 643,
+        "helper": "dense_one_function_edit_has_bounded_dirty_pages"
+      },
+      {
+        "line": 670,
+        "helper": "dense_one_function_edit_has_bounded_dirty_pages"
+      },
+      {
+        "line": 710,
+        "helper": "occupied_node_position_cycle_preserves_rows_and_rolls_back_late_failure"
+      },
+      {
+        "line": 718,
+        "helper": "occupied_node_position_cycle_preserves_rows_and_rolls_back_late_failure"
+      },
+      {
+        "line": 741,
+        "helper": "occupied_node_position_cycle_preserves_rows_and_rolls_back_late_failure"
+      },
+      {
+        "line": 753,
+        "helper": "occupied_node_position_cycle_preserves_rows_and_rolls_back_late_failure"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/dispatch_proofs.rs",
+    "raw_open_calls": 9,
+    "helpers": [
+      {
+        "line": 45,
+        "helper": "blobs"
+      },
+      {
+        "line": 94,
+        "helper": "seeded_dispatch_incremental_equals_independent_cold_through_switches"
+      },
+      {
+        "line": 145,
+        "helper": "derived_publication_child"
+      },
+      {
+        "line": 314,
+        "helper": "count"
+      },
+      {
+        "line": 435,
+        "helper": "emit_without_caller_node"
+      },
+      {
+        "line": 453,
+        "helper": "emit_without_caller_node"
+      },
+      {
+        "line": 537,
+        "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
+      },
+      {
+        "line": 555,
+        "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
+      },
+      {
+        "line": 575,
+        "helper": "ordinary_edge_on_a_method_call_site_ref_is_deleted"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/fact_tests.rs",
+    "raw_open_calls": 13,
+    "helpers": [
+      {
+        "line": 41,
+        "helper": "workspace_fixture"
+      },
+      {
+        "line": 93,
+        "helper": "memo_hit_callers_retain_member_name_consultations"
+      },
+      {
+        "line": 160,
+        "helper": "version_only_package_edit_resolves_no_unchanged_callers"
+      },
+      {
+        "line": 175,
+        "helper": "workspace_member_added_resolves_only_its_importers"
+      },
+      {
+        "line": 188,
+        "helper": "exports_change_resolves_only_package_importers"
+      },
+      {
+        "line": 201,
+        "helper": "tsconfig_paths_change_resolves_only_alias_importers"
+      },
+      {
+        "line": 220,
+        "helper": "cargo_workspace_member_added_resolves_its_dependents"
+      },
+      {
+        "line": 273,
+        "helper": "rust_mod_move_resolves_declaring_crate_callers"
+      },
+      {
+        "line": 297,
+        "helper": "unattributed_binding_forces_counted_full_fallback"
+      },
+      {
+        "line": 305,
+        "helper": "unattributed_binding_forces_counted_full_fallback"
+      },
+      {
+        "line": 347,
+        "helper": "cold_workspace_after_prior_manifest_matches_fresh_process"
+      },
+      {
+        "line": 403,
+        "helper": "workspace_member_name_change_invalidates_memo_hit_callers"
+      },
+      {
+        "line": 417,
+        "helper": "workspace_discovery_uses_one_config_membership_dependency"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/module_digest_tests.rs",
+    "raw_open_calls": 6,
+    "helpers": [
+      {
+        "line": 79,
+        "helper": "rust_fixture"
+      },
+      {
+        "line": 87,
+        "helper": "edit"
+      },
+      {
+        "line": 182,
+        "helper": "typescript_only_edit_decodes_no_blob_to_decide_seeding"
+      },
+      {
+        "line": 256,
+        "helper": "stale_digest_records_are_computed_in_full_and_seed_the_domain"
+      },
+      {
+        "line": 304,
+        "helper": "b"
+      },
+      {
+        "line": 329,
+        "helper": "other"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/parity.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 42,
+        "helper": "logical_snapshot"
+      },
+      {
+        "line": 182,
+        "helper": "database"
+      },
+      {
+        "line": 218,
+        "helper": "extra_table_in_the_actual_database_is_a_difference"
+      },
+      {
+        "line": 243,
+        "helper": "missing_index_is_a_difference"
+      },
+      {
+        "line": 268,
+        "helper": "storage_class_and_duplicate_rows_are_differences"
+      },
+      {
+        "line": 272,
+        "helper": "storage_class_and_duplicate_rows_are_differences"
+      },
+      {
+        "line": 280,
+        "helper": "storage_class_and_duplicate_rows_are_differences"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/reader_tests.rs",
+    "raw_open_calls": 7,
+    "helpers": [
+      {
+        "line": 142,
+        "helper": "blob_reader_patch_selects_one_file_and_reuses_dispatch"
+      },
+      {
+        "line": 193,
+        "helper": "blob_reader_patch_relinks_incoming_ordinals"
+      },
+      {
+        "line": 216,
+        "helper": "blob_reader_patch_language_corpus_matches_full_through_edits_and_renames"
+      },
+      {
+        "line": 294,
+        "helper": "blob_reader_patch_all_supported_language_fixtures_match_full"
+      },
+      {
+        "line": 351,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      },
+      {
+        "line": 366,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      },
+      {
+        "line": 372,
+        "helper": "graph_answers_ignore_edge_insertion_order_at_tied_positions"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/tests.rs",
+    "raw_open_calls": 50,
+    "helpers": [
+      {
+        "line": 24,
+        "helper": "manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption"
+      },
+      {
+        "line": 123,
+        "helper": "fixture"
+      },
+      {
+        "line": 211,
+        "helper": "cold_sqlite_full_removes_files_and_retry_succeeds"
+      },
+      {
+        "line": 250,
+        "helper": "private_cold_matches_legacy_every_table_and_index"
+      },
+      {
+        "line": 343,
+        "helper": "manifest_blob_reader_decodes_each_payload_once"
+      },
+      {
+        "line": 383,
+        "helper": "read_callgraph_blob"
+      },
+      {
+        "line": 401,
+        "helper": "materialization_join_omits_only_the_duplicate_resolution_order"
+      },
+      {
+        "line": 422,
+        "helper": "cold_reference_batches_match_unbatched_rows_and_dispatch"
+      },
+      {
+        "line": 432,
+        "helper": "caller"
+      },
+      {
+        "line": 450,
+        "helper": "selected_binding_load_skips_changed_payloads_and_matches_cold"
+      },
+      {
+        "line": 543,
+        "helper": "incremental_delete_rows_are_bounded_by_changed_manifest_paths"
+      },
+      {
+        "line": 607,
+        "helper": "mismatched_base_is_rejected_and_old_schema_is_cold_upgraded"
+      },
+      {
+        "line": 626,
+        "helper": "missing_blob_rolls_back_deletions_and_fingerprint"
+      },
+      {
+        "line": 758,
+        "helper": "bench_real_manifest_diff"
+      },
+      {
+        "line": 1072,
+        "helper": "added_and_removed_targets_relink_previously_unresolved_callers"
+      },
+      {
+        "line": 1098,
+        "helper": "selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates"
+      },
+      {
+        "line": 1132,
+        "helper": "new_reexport_target_invalidates_transitive_unchanged_importer"
+      },
+      {
+        "line": 1206,
+        "helper": "bench_controlled_300_path_diff"
+      },
+      {
+        "line": 1251,
+        "helper": "bench_controlled_300_path_diff"
+      },
+      {
+        "line": 1272,
+        "helper": "added_rust_module_invalidates_missing_candidate"
+      },
+      {
+        "line": 1292,
+        "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
+      },
+      {
+        "line": 1345,
+        "helper": "changed_tsconfig_relinks_unchanged_importer_with_cold_parity"
+      },
+      {
+        "line": 1361,
+        "helper": "binding_dependencies_exclude_existing_workspace_directory_probes"
+      },
+      {
+        "line": 1384,
+        "helper": "legacy_generation_without_diff_metadata_cold_upgrades"
+      },
+      {
+        "line": 1398,
+        "helper": "unrelated_export_surface_change_skips_reresolving_unchanged_binding_caller"
+      },
+      {
+        "line": 1433,
+        "helper": "used_export_surface_change_reresolves_unchanged_binding_caller"
+      },
+      {
+        "line": 1463,
+        "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
+      },
+      {
+        "line": 1537,
+        "helper": "colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows"
+      },
+      {
+        "line": 1550,
+        "helper": "report_wal_pages"
+      },
+      {
+        "line": 1591,
+        "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
+      },
+      {
+        "line": 1615,
+        "helper": "persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers"
+      },
+      {
+        "line": 1669,
+        "helper": "memoized_bindings_keep_callers_and_reference_kinds_distinct"
+      },
+      {
+        "line": 1699,
+        "helper": "memoized_rust_bindings_keep_import_visibility"
+      },
+      {
+        "line": 1717,
+        "helper": "memoized_bindings_keep_call_and_value_ref_results_distinct"
+      },
+      {
+        "line": 2176,
+        "helper": "differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs"
+      },
+      {
+        "line": 2315,
+        "helper": "colliding_relink_parity"
+      },
+      {
+        "line": 2433,
+        "helper": "macro_rust_relink_ordinal_shift_matches_cold"
+      },
+      {
+        "line": 2481,
+        "helper": "colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes"
+      },
+      {
+        "line": 2523,
+        "helper": "incremental_dispatch_resolves_only_files_whose_inputs_changed"
+      },
+      {
+        "line": 2601,
+        "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
+      },
+      {
+        "line": 2623,
+        "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
+      },
+      {
+        "line": 2639,
+        "helper": "s4_shift_views_on_keeps_inbound_edges_and_matches_cold"
+      },
+      {
+        "line": 2662,
+        "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
+      },
+      {
+        "line": 2679,
+        "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
+      },
+      {
+        "line": 2688,
+        "helper": "s4_collisions_and_in_file_moves_views_on_every_table"
+      },
+      {
+        "line": 2717,
+        "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
+      },
+      {
+        "line": 2724,
+        "helper": "s4_upgrade_materializer_discards_old_identity_base_and_upgrades_shape"
+      },
+      {
+        "line": 2731,
+        "helper": "s4_shared_symbol_ranges_views_on_every_table"
+      },
+      {
+        "line": 2776,
+        "helper": "first"
+      },
+      {
+        "line": 2798,
+        "helper": "relinking_fixture"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/materialization/update_bench.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 189,
+        "helper": "bench_repository_incremental_update"
+      },
+      {
+        "line": 330,
+        "helper": "aft_view_patch_probe"
+      },
+      {
+        "line": 335,
+        "helper": "aft_view_patch_probe"
+      },
+      {
+        "line": 405,
+        "helper": "aft_view_patch_probe"
+      },
+      {
+        "line": 543,
+        "helper": "aft_view_patch_probe"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/mod.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 1608,
+        "helper": "concurrent_artifact_checkpoints_never_see_busy"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/semantic.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 3727,
+        "helper": "alpha"
+      },
+      {
+        "line": 5097,
+        "helper": "chunk_cache_store_refusal_is_not_an_embedding_retry"
+      },
+      {
+        "line": 6019,
+        "helper": "v3_semantic_touch_skips_current_rows_and_publishes_after_epoch_advance"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/semantic_fill_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 52,
+        "helper": "example"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/semantic_read_tests.rs",
+    "raw_open_calls": 4,
+    "helpers": [
+      {
+        "line": 598,
+        "helper": "restart_without_a_marker_falls_back_to_reading_chunk_rows"
+      },
+      {
+        "line": 699,
+        "helper": "verified_run_markers_work_with_v0_61_store_sql"
+      },
+      {
+        "line": 954,
+        "helper": "restart_with_a_damaged_deletion_epoch_seeds_nothing_and_still_fills"
+      },
+      {
+        "line": 973,
+        "helper": "restart_with_a_damaged_deletion_epoch_seeds_nothing_and_still_fills"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/semantic_runtime_tests.rs",
+    "raw_open_calls": 1,
+    "helpers": [
+      {
+        "line": 466,
+        "helper": "usage"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/tree_base_tests.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 255,
+        "helper": "a_tree_base_without_a_holding_proof_falls_back_to_the_full_check"
+      },
+      {
+        "line": 275,
+        "helper": "a_tree_base_without_a_holding_proof_falls_back_to_the_full_check"
+      },
+      {
+        "line": 478,
+        "helper": "a_tree_proof_round_trips_and_refuses_another_application"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/verification.rs",
+    "raw_open_calls": 5,
+    "helpers": [
+      {
+        "line": 1038,
+        "helper": "write_evidence"
+      },
+      {
+        "line": 1091,
+        "helper": "read_evidence"
+      },
+      {
+        "line": 1223,
+        "helper": "write_tree_proof"
+      },
+      {
+        "line": 1278,
+        "helper": "read_tree_proof"
+      },
+      {
+        "line": 1907,
+        "helper": "stat_evidence_is_generation_root_policy_and_version_paired"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/worker_seed_tests.rs",
+    "raw_open_calls": 3,
+    "helpers": [
+      {
+        "line": 320,
+        "helper": "worker_seed_uses_freshest_ready_sibling_and_repairs_unusable_own_base"
+      },
+      {
+        "line": 467,
+        "helper": "indexed_donor_from_an_older_build_output_is_forgotten_not_reused"
+      },
+      {
+        "line": 633,
+        "helper": "worker_seed_copy_that_fails_readiness_is_rebuilt_cold_not_served"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/src/views/write_accounting.rs",
+    "raw_open_calls": 2,
+    "helpers": [
+      {
+        "line": 191,
+        "helper": "open_connection"
+      },
+      {
+        "line": 194,
+        "helper": "open_connection"
+      }
+    ]
+  },
+  {
+    "path": "crates/aft/tests/store_diet/harness.rs",
+    "raw_open_calls": 6,
+    "helpers": [
+      {
+        "line": 180,
+        "helper": "try_view_store_custom"
+      },
+      {
+        "line": 348,
+        "helper": "plans"
+      },
+      {
+        "line": 991,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 993,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 1016,
+        "helper": "store_diet_duplicate_site_order_and_prefix_paths"
+      },
+      {
+        "line": 1038,
+        "helper": "reordered_site_manifest"
+      }
+    ]
+  }
+]

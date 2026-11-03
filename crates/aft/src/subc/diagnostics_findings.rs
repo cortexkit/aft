@@ -453,6 +453,9 @@ fn collect_cleanup(metrics: &Value, now: u64, window: u64, findings: &mut Vec<Fi
             continue;
         };
         if at >= now.saturating_sub(window) && at <= now {
+            // Budget stops and history-census restarts caused by concurrent
+            // bindings are recorded in retention's `incomplete` list.
+            // Only real failures in `errors` contribute to this warning.
             if let Some(errors) = report["errors"].as_array().filter(|e| !e.is_empty()) {
                 findings.push(condition("cleanup_failures", &format!("{key}/retention"), Severity::Warn, errors.len() as u64, at, at,
                     "The latest retention pass recorded cleanup failures.", vec![],
@@ -740,6 +743,29 @@ mod tests {
             "standing trash survives an older pass; retention history does not"
         );
         assert!(findings[0].key.ends_with("/trash/unlink_guard"));
+    }
+
+    #[test]
+    fn diagnostics_findings_cleanup_incomplete_does_not_warn() {
+        let mut metrics = healthy_metrics();
+        metrics["storage_retention"] = json!({"/private/cache": {
+            "at_ms": 950_000,
+            "errors": [],
+            "incomplete": [
+                "cache: retention deadline reached",
+                "binding_history_incomplete: examined=8192 accumulated=8192 restarted=true"
+            ],
+            "trash": {"at_ms": 950_000, "incomplete": false, "kept_by_reason": {}}
+        }});
+        assert!(snapshot(&metrics).is_empty());
+
+        metrics["storage_retention"]["/private/cache"]["errors"] =
+            json!(["cache: removal refused"]);
+        let findings = snapshot(&metrics);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].check, "cleanup_failures");
+        assert_eq!(findings[0].count, 1);
+        assert_eq!(findings[0].severity, Severity::Warn);
     }
 
     #[test]

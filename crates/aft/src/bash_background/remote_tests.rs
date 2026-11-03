@@ -1875,6 +1875,8 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     };
     assert_eq!(
@@ -4169,6 +4171,8 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
@@ -5480,6 +5484,8 @@ fn persist_accepted_with_snapshot_cap(
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
@@ -8158,6 +8164,8 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
@@ -8281,6 +8289,8 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     });
     let now = 1_042_900;
@@ -8739,6 +8749,8 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     });
     let minutes_left = |budget: &ReattachBudget| {
@@ -15634,6 +15646,8 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         returned_files: None,
         return_first_seq: None,
         return_staging: Default::default(),
+        return_max_bytes: exec::return_max_bytes(),
+        return_cap_retried: false,
         expired_gap_unverified: Vec::new(),
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
@@ -15996,4 +16010,100 @@ fn expired_gap_unverified_line_is_the_approved_text() {
         expired_gap_unverified_line(4, 4),
         "records 4 to 4 could not be verified: they may be expired returned-file data or lost output, and the runner did not report chunk counts"
     );
+}
+
+#[tokio::test]
+async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
+    for retry in [false, true] {
+        let script = if retry {
+            Script::ReturnCapRefusal {
+                code: "invalid_params",
+                field: "return_max_bytes",
+                max_bytes: Some(20 * 1024 * 1024),
+                always: false,
+                after_accepted: false,
+            }
+        } else {
+            Script::ReturnVector("two-files-one-empty")
+        };
+        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+            script,
+            &[
+                "exec-remote/v1",
+                "exec-remote-return/v2",
+                "exec-remote-return/v3",
+                exec::types::SUBMISSION_KEY_CAPABILITY,
+            ],
+            1,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            return_call(&["dist/hello.txt", "dist/empty.txt"]),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        assert_eq!(
+            fs::read(dir.path().join("dist/hello.txt")).unwrap(),
+            b"hello"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), if retry { 2 } else { 1 });
+        assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let saved = read_task(&task.paths.json).unwrap();
+        let remote = saved.remote.unwrap();
+        let cap = if retry { 20 * 1024 * 1024 } else { 134_217_728 };
+        assert_eq!(remote.return_max_bytes, cap);
+        assert_eq!(remote.return_cap_retried, retry);
+        let restored =
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+        assert_eq!(restored.return_max_bytes, Some(cap));
+        if retry {
+            assert_eq!(runs[1]["return_max_bytes"], cap);
+            let mut sink = TaskSink::new(ctx.bash_background(), task).unwrap();
+            assert!(
+                !sink
+                    .return_request(&restored.with_return_max_bytes(10_485_760), true)
+                    .unwrap(),
+                "restart cannot spend the retry twice"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::ReturnCapRefusal {
+            code: "invalid_params",
+            field: "return_max_bytes",
+            max_bytes: Some(10_485_760),
+            always: true,
+            after_accepted: false,
+        },
+        &[
+            "exec-remote/v1",
+            "exec-remote-return/v2",
+            "exec-remote-return/v3",
+            exec::types::SUBMISSION_KEY_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        return_call(&["dist/hello.txt", "dist/empty.txt"]),
+    )
+    .await;
+    assert!(!reply.success, "{reply:?}");
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    assert!(!dir.path().join("dist/hello.txt").exists());
 }

@@ -60,3 +60,18 @@ the requested root has no live actor, the handler returns:
 and each operation as `{name, kind}` at `manifest.rs:145-157`;
 `health.digest` is a `query`. An undeclared operation or an agent-tool envelope
 on this route is refused with `unknown_management_op`.
+
+## Storage retention in the subc health report
+
+Storage cleanup is reported by the subc health-check report's `metrics`, not
+by the `health.digest` fields. `metrics.storage_retention` holds the
+latest report per storage root. Each report separates `errors` (real I/O,
+removal, or safety-check failures) from `incomplete` (work deferred by a time
+or entry budget, or a concurrent bind invalidating the root-history census).
+Both are lists of reasons; `stopped_early` and `binding_history` describe progress.
+
+`metrics.storage_retention_totals.errors` and `.incomplete` count those lists
+across all storage roots, even when individual reports are omitted to fit the
+health payload budget. `diagnostics.findings` derives its `cleanup_failures`
+warning from `errors`, never from `incomplete`. Trash census and
+`kept_by_reason` accounting is separate from these root-sweep reason lists.

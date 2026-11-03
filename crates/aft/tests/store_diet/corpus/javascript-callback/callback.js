@@ -1,0 +1,1 @@
+function callback() {} class Service {} export default () => { register(callback); return new Service().method(); };

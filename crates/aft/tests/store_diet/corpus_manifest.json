@@ -1,0 +1,1556 @@
+[
+  {
+    "name": "c-pointer",
+    "language": "c",
+    "shapes": [
+      "free call",
+      "function-pointer member call"
+    ],
+    "files": [
+      {
+        "target": "fixture.c",
+        "source": "crates/aft/src/calls.rs",
+        "owner": "extracts_c_calls_and_attributes_them_to_function_symbols",
+        "sha256": "77a00e95064f2eb7c827ebefd73324c6afea7c1091385974c17c9ac24d2675ea"
+      }
+    ]
+  },
+  {
+    "name": "cpp-header",
+    "language": "cpp",
+    "shapes": [
+      "ambiguous header detection",
+      "method",
+      "object construction"
+    ],
+    "files": [
+      {
+        "target": "widget.h",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "h_header_cpp_outline_zoom_and_method_callers",
+        "sha256": "76730bd13b271fb014d3cebec30519b1975c45f256cf5404fd7eb0c6239904ab"
+      }
+    ]
+  },
+  {
+    "name": "cpp-qualified",
+    "language": "cpp",
+    "shapes": [
+      "member call",
+      "pointer call",
+      "qualified template call"
+    ],
+    "files": [
+      {
+        "target": "fixture.cpp",
+        "source": "crates/aft/src/calls.rs",
+        "owner": "extracts_cpp_calls_and_attributes_them_to_function_symbols",
+        "sha256": "ebb0a9af63eecbd6e4e56bacc24956663b48f8de807f207b2a3289417b519378"
+      }
+    ]
+  },
+  {
+    "name": "csharp-overloads",
+    "language": "csharp",
+    "shapes": [
+      "same-named overloads",
+      "arity shapes",
+      "last scoped definition"
+    ],
+    "files": [
+      {
+        "target": "Overloads.cs",
+        "new_for": "SQLite-order contract: same-named overloads and dispatch node selection",
+        "text": "class C {\n public void M() {}\n public void M(int value) {}\n public void Caller() { M(); M(1); }\n}\n",
+        "sha256": "88bb54a6d9b3c84b38f5a110254320bb934a2ef736b3eea7a0d3ef5873954ecf"
+      }
+    ]
+  },
+  {
+    "name": "cuda-kernel",
+    "language": "cuda",
+    "shapes": [
+      "device function",
+      "kernel",
+      "kernel launch"
+    ],
+    "files": [
+      {
+        "target": "sample.cu",
+        "source": "crates/aft/tests/fixtures/sample.cu",
+        "sha256": "ae9d432830dc810d4dd1082b34266c0f43fe38b354388825027054e91596d7e0"
+      }
+    ]
+  },
+  {
+    "name": "go-callback",
+    "language": "go",
+    "shapes": [
+      "callback reference",
+      "function value"
+    ],
+    "files": [
+      {
+        "target": "callback.go",
+        "source": "crates/aft/src/callgraph.rs",
+        "owner": "call_site_kind_classification_matches_range_lookup",
+        "sha256": "c896f05b3534a27d9811f4f8dc460a283353c88fb92b97fc2c4a1916b71f98b9"
+      }
+    ]
+  },
+  {
+    "name": "go-interface",
+    "language": "go",
+    "shapes": [
+      "interface",
+      "two implementations",
+      "dispatch"
+    ],
+    "files": [
+      {
+        "target": "interface.go",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "trait_and_go_interface_fanout_and_rust_generic_bound_forms",
+        "sha256": "6b730476fb277c7cddfbc98ce27f5a2463b04222feba89c8eec58ebefead18dd"
+      }
+    ]
+  },
+  {
+    "name": "go-members",
+    "language": "go",
+    "shapes": [
+      "pointer receiver",
+      "interface",
+      "external call"
+    ],
+    "files": [
+      {
+        "target": "sample.go",
+        "source": "crates/aft/tests/fixtures/sample.go",
+        "sha256": "733321c0b8f135cd30d2e6e386e708ea1c0ba99f073164981ed18699db07d70a"
+      }
+    ]
+  },
+  {
+    "name": "groovy-members",
+    "language": "groovy",
+    "shapes": [
+      "trait",
+      "interface",
+      "methods",
+      "closure property",
+      "no call-node support"
+    ],
+    "files": [
+      {
+        "target": "sample.groovy",
+        "source": "crates/aft/tests/fixtures/sample.groovy",
+        "sha256": "9210668dd28dc9312fbdac3a59e355b220c0ddb1e92f69b703ae05855d9b7f8e"
+      }
+    ]
+  },
+  {
+    "name": "java-constructor",
+    "language": "java",
+    "shapes": [
+      "constructor",
+      "method",
+      "interface",
+      "enum",
+      "record"
+    ],
+    "files": [
+      {
+        "target": "Greeter.java",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_java_symbols_include_types_members_and_fields",
+        "sha256": "93df0cb869c06c7d342386da88d9217136911fe1cee6099d3188677922cfe558"
+      }
+    ]
+  },
+  {
+    "name": "java-field",
+    "language": "java",
+    "shapes": [
+      "field receiver",
+      "competing method owners",
+      "type matching"
+    ],
+    "files": [
+      {
+        "target": "EntryPoint.java",
+        "source": "crates/aft/src/callgraph_store/mod.rs",
+        "owner": "java_field_receiver_type_selects_declared_class_method",
+        "sha256": "abbb1003e2f1059ae23a5446914a59c279772041168d8728ea251b936b526257"
+      }
+    ]
+  },
+  {
+    "name": "java-final",
+    "language": "java",
+    "shapes": [
+      "closed dispatch type"
+    ],
+    "files": [
+      {
+        "target": "Closed.java",
+        "new_for": "Missing stored dispatch shape: closed=true",
+        "text": "final class C { void m() {} }\n",
+        "sha256": "67c511d4197070174410d3a6ec34648a97207943518e53195fc5534ed7d10e49"
+      }
+    ]
+  },
+  {
+    "name": "javascript-callback",
+    "language": "javascript",
+    "shapes": [
+      "closure",
+      "callback reference",
+      "construction"
+    ],
+    "files": [
+      {
+        "target": "callback.js",
+        "source": "crates/aft/src/callgraph.rs",
+        "owner": "call_site_kind_classification_matches_range_lookup",
+        "sha256": "ab200a67e453a812c1bc894a0a8c653163c7e6144ad6d25053ca55ae21d0cddb"
+      }
+    ]
+  },
+  {
+    "name": "javascript-dynamic",
+    "language": "javascript",
+    "shapes": [
+      "unknown receiver",
+      "computed member",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.js",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "ea56d2b6d0ebe8b0fcf0cbc9835d27eac1be97f03dc2664e4b996a79092d07de"
+      }
+    ]
+  },
+  {
+    "name": "javascript-objects",
+    "language": "javascript",
+    "shapes": [
+      "constructor",
+      "methods",
+      "arrow closure",
+      "callback"
+    ],
+    "files": [
+      {
+        "target": "sample.js",
+        "source": "crates/aft/tests/fixtures/sample.js",
+        "sha256": "feb9a040bf9e8c88d17fd0cd25b4fce77996fa0556b260c8851732d9985b2dd1"
+      }
+    ]
+  },
+  {
+    "name": "kotlin-property",
+    "language": "kotlin",
+    "shapes": [
+      "property receiver",
+      "factory construction",
+      "inferred local receiver"
+    ],
+    "files": [
+      {
+        "target": "Handler.kt",
+        "source": "crates/aft/src/callgraph_store/mod.rs",
+        "owner": "kotlin_property_and_local_value_types_are_inferred",
+        "sha256": "8eab0469f39aa96a5c08d601c8fd0c51c007396ed70c4ee430f24cd7b618d137"
+      }
+    ]
+  },
+  {
+    "name": "lua-members",
+    "language": "lua",
+    "shapes": [
+      "module table",
+      "method",
+      "local function"
+    ],
+    "files": [
+      {
+        "target": "greeter.lua",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_lua_symbols_include_module_tables_functions_and_methods",
+        "sha256": "21cb7b0756c0ee07a2b9d7cb806837c1fa5bea2a72168882e29e3e605a7d2280"
+      }
+    ]
+  },
+  {
+    "name": "metal-kernel",
+    "language": "metal",
+    "shapes": [
+      "kernel",
+      "helper call"
+    ],
+    "files": [
+      {
+        "target": "sample.metal",
+        "source": "crates/aft/tests/fixtures/sample.metal",
+        "sha256": "9a5cc2892fdd1ee4866c89a366907d57f8c3fd570d40b2075fbd77eadc236eba"
+      }
+    ]
+  },
+  {
+    "name": "objc-messages",
+    "language": "objc",
+    "shapes": [
+      "class method",
+      "instance method",
+      "new message",
+      "message sends",
+      "no call-node support"
+    ],
+    "files": [
+      {
+        "target": "Greeter.m",
+        "source": "crates/aft/tests/integration/objc_test.rs",
+        "sha256": "0d053a0ca60c90527e24b74a1e98f243a70e01a87347bcdb21c88c009d09b615"
+      }
+    ]
+  },
+  {
+    "name": "pascal-members",
+    "language": "pascal",
+    "shapes": [
+      "constructor",
+      "virtual declaration",
+      "interface",
+      "no call-node support"
+    ],
+    "files": [
+      {
+        "target": "MyUnit.pas",
+        "source": "crates/aft/src/parser.rs",
+        "owner": "extract_pascal_symbols_test",
+        "sha256": "bd58ed371deee99e6a29e06bba8c6c860f23f074fe0cffdbb95fdca60a42e1c5"
+      }
+    ]
+  },
+  {
+    "name": "perl-factory",
+    "language": "perl",
+    "shapes": [
+      "package",
+      "new/bless constructor",
+      "method"
+    ],
+    "files": [
+      {
+        "target": "Greeter.pm",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_perl_symbols_include_packages_subroutines_constants_and_variables",
+        "sha256": "04e6c87a78db31c288ed67b1689cc3cd93c883af77c23603b3ffcc5db90b3884"
+      }
+    ]
+  },
+  {
+    "name": "php-members",
+    "language": "php",
+    "shapes": [
+      "namespace",
+      "interface",
+      "trait",
+      "methods"
+    ],
+    "files": [
+      {
+        "target": "Greeter.php",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_php_symbols_include_namespaces_types_functions_methods_and_properties",
+        "sha256": "ab0857d24036023f4b68033d1ec620ebbdb4856707f3cbb8c3d386e4fec0e047"
+      }
+    ]
+  },
+  {
+    "name": "python-dynamic",
+    "language": "python",
+    "shapes": [
+      "unknown receiver",
+      "getattr dynamic call",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.py",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "9cdc1f3714f4a6614a50bb3776d5643fedef67eff696f90d8cd3ba659a6b4a35"
+      }
+    ]
+  },
+  {
+    "name": "python-members",
+    "language": "python",
+    "shapes": [
+      "functions",
+      "class methods",
+      "decorators"
+    ],
+    "files": [
+      {
+        "target": "sample.py",
+        "source": "crates/aft/tests/fixtures/sample.py",
+        "sha256": "8e486bfdfc578965e89da3dd92bbea5507e8bd571dfac9fa22021618cfdd54bd"
+      }
+    ]
+  },
+  {
+    "name": "r-functions",
+    "language": "r",
+    "shapes": [
+      "functions",
+      "anonymous function assignment",
+      "no call-node support"
+    ],
+    "files": [
+      {
+        "target": "analysis.R",
+        "source": "crates/aft/src/parser.rs",
+        "owner": "extract_r_symbols_test",
+        "sha256": "951065b484a1587a6601a202dce6c06865361cfc16a038bde91bf6c0a2936ac7"
+      }
+    ]
+  },
+  {
+    "name": "receiver-csharp",
+    "language": "csharp",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.cs",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "f314c3344395d8d9d058f60bfafe4e1e0074671ac4d1eb20606efa3bca7289b5",
+        "sha256": "f314c3344395d8d9d058f60bfafe4e1e0074671ac4d1eb20606efa3bca7289b5"
+      }
+    ]
+  },
+  {
+    "name": "receiver-go",
+    "language": "go",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.go",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "ace7fe2bb01cccb7aa86fafcc01f53095c2730d78e2f570c085b749d283c5383",
+        "sha256": "ace7fe2bb01cccb7aa86fafcc01f53095c2730d78e2f570c085b749d283c5383"
+      }
+    ]
+  },
+  {
+    "name": "receiver-java",
+    "language": "java",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.java",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "f314c3344395d8d9d058f60bfafe4e1e0074671ac4d1eb20606efa3bca7289b5",
+        "sha256": "f314c3344395d8d9d058f60bfafe4e1e0074671ac4d1eb20606efa3bca7289b5"
+      }
+    ]
+  },
+  {
+    "name": "receiver-javascript",
+    "language": "javascript",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.js",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "cf15627bbbb86133c614c26cb9a754d9fedbab6cb728358b1276c1d806923fc0",
+        "sha256": "cf15627bbbb86133c614c26cb9a754d9fedbab6cb728358b1276c1d806923fc0"
+      }
+    ]
+  },
+  {
+    "name": "receiver-kotlin",
+    "language": "kotlin",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.kt",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "bf5f09dce261e1d48eab7655378eac833c7f1552be0f4741d2a24e72b888748c",
+        "sha256": "bf5f09dce261e1d48eab7655378eac833c7f1552be0f4741d2a24e72b888748c"
+      }
+    ]
+  },
+  {
+    "name": "receiver-python",
+    "language": "python",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.py",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "e54157f25a5d7c1749b0190dbcc0082de1b113b43c12f28b824ffffb88f85b45",
+        "sha256": "e54157f25a5d7c1749b0190dbcc0082de1b113b43c12f28b824ffffb88f85b45"
+      }
+    ]
+  },
+  {
+    "name": "receiver-rust",
+    "language": "rust",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.rs",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "5c06b2bfcea285c8e0def65f46bf9e6f5724fad21946f75a789c3531c9caaf7c",
+        "sha256": "5c06b2bfcea285c8e0def65f46bf9e6f5724fad21946f75a789c3531c9caaf7c"
+      }
+    ]
+  },
+  {
+    "name": "receiver-typescript",
+    "language": "typescript",
+    "shapes": [
+      "typed receiver",
+      "method call",
+      "constructor/factory receiver where present",
+      "dispatch hint"
+    ],
+    "files": [
+      {
+        "target": "receiver.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "receiver_form_extraction_table",
+        "literal_sha256": "71e256cb5f95a9231db8a62a96d5abfcec9937c33e22949a4d6e070d963bb435",
+        "sha256": "71e256cb5f95a9231db8a62a96d5abfcec9937c33e22949a4d6e070d963bb435"
+      }
+    ]
+  },
+  {
+    "name": "ruby-factory",
+    "language": "ruby",
+    "shapes": [
+      "initialize",
+      "class factory",
+      "method"
+    ],
+    "files": [
+      {
+        "target": "greeter.rb",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_ruby_symbols_include_modules_classes_methods_and_constants",
+        "sha256": "be89cbde2a32107443c1120e10c266c7ea1734421bfdf4dcb83c4ba80c927514"
+      }
+    ]
+  },
+  {
+    "name": "rust-callback",
+    "language": "rust",
+    "shapes": [
+      "callback reference",
+      "value reference",
+      "qualified reference"
+    ],
+    "files": [
+      {
+        "target": "lib.rs",
+        "source": "crates/aft/src/callgraph.rs",
+        "owner": "call_site_kind_classification_matches_range_lookup",
+        "sha256": "7455fc11fdaedc7f69bfac143840059e31098b72dcfbd5146287a25be7d78e71"
+      }
+    ]
+  },
+  {
+    "name": "rust-default-dispatch",
+    "language": "rust",
+    "shapes": [
+      "trait default body",
+      "dynamic receiver",
+      "duplicate target provenance tie"
+    ],
+    "files": [
+      {
+        "target": "lib.rs",
+        "new_for": "SQLite-order contract: identical dispatch edge identity reached as both exact and dispatch",
+        "text": "trait I { fn m(&self) {} }\nstruct T;\nimpl I for T {}\nfn caller(x: &dyn I) { x.m(); }\n",
+        "sha256": "98ec9a741500db20f764abcfb2437b3ed01fab8ad219a61dff47418298feef86"
+      }
+    ]
+  },
+  {
+    "name": "rust-macros",
+    "language": "rust",
+    "shapes": [
+      "macro template call",
+      "unparseable macro mention",
+      "macro-expanded methods",
+      "module imports"
+    ],
+    "files": [
+      {
+        "target": "Cargo.toml",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "write_rust_manifest",
+        "format_args": {
+          "package_name": "rust-macro-fixture"
+        },
+        "sha256": "6b8813dc73abd10140544f1518d4ca61d2558aadc5a3fd59923d3dc671240244"
+      },
+      {
+        "target": "src/lib.rs",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "write_rust_macro_fixture",
+        "sha256": "8ae13f9a9b3f9925d933a2511cc2e356719aa309ca33e3c2a8382ccce3f261b4"
+      },
+      {
+        "target": "src/targets.rs",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "write_rust_macro_fixture",
+        "sha256": "96ad7e46907430868619d6f39c614133189ca4da9f8e5e7992e295489569b1b2"
+      },
+      {
+        "target": "src/callers.rs",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "write_rust_macro_fixture",
+        "sha256": "5105d2b3abd728cd505f32e59354d5818b84f5f51af2feb179a5907699dc6564"
+      },
+      {
+        "target": "src/methods.rs",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "write_rust_macro_fixture",
+        "sha256": "0cb5b0f5e230cc7c0754664ac36071d8371075f1a7bac5054c06d784fef0d1b0"
+      }
+    ]
+  },
+  {
+    "name": "rust-members",
+    "language": "rust",
+    "shapes": [
+      "methods",
+      "struct",
+      "trait",
+      "enum"
+    ],
+    "files": [
+      {
+        "target": "sample.rs",
+        "source": "crates/aft/tests/fixtures/sample.rs",
+        "sha256": "d4ef693febdd3bb124268c834d345aeebc7045b581a3e321b569d7ad2d6d000f"
+      }
+    ]
+  },
+  {
+    "name": "rust-trait",
+    "language": "rust",
+    "shapes": [
+      "trait",
+      "dynamic receiver",
+      "two implementations"
+    ],
+    "files": [
+      {
+        "target": "lib.rs",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "trait_and_go_interface_fanout_and_rust_generic_bound_forms",
+        "sha256": "e8f94e572d05fca07c369a583768a43690160ba11a31316242d264d8e0351410"
+      }
+    ]
+  },
+  {
+    "name": "scala-givens",
+    "language": "scala",
+    "shapes": [
+      "enum method",
+      "given",
+      "lambda",
+      "external calls"
+    ],
+    "files": [
+      {
+        "target": "Color.scala",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_scala3_symbols_include_enums_and_named_givens",
+        "sha256": "d5d747ddb42692c7e3d08f21dd0d4f2a11f9525bd4b03657430bf9f003b52895"
+      }
+    ]
+  },
+  {
+    "name": "smoke-bash",
+    "language": "bash",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.sh",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "15c0dee42a23cf9a725809841b0021932107bd69993674877df8f6e61dd3f4be",
+        "sha256": "15c0dee42a23cf9a725809841b0021932107bd69993674877df8f6e61dd3f4be"
+      }
+    ]
+  },
+  {
+    "name": "smoke-c",
+    "language": "c",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.c",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "6d08f0099583a55bdec087a23587ca6ff1210816b80cfd3610e8bc614a3ca25b",
+        "sha256": "6d08f0099583a55bdec087a23587ca6ff1210816b80cfd3610e8bc614a3ca25b"
+      }
+    ]
+  },
+  {
+    "name": "smoke-cpp",
+    "language": "cpp",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.cpp",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "6d08f0099583a55bdec087a23587ca6ff1210816b80cfd3610e8bc614a3ca25b",
+        "sha256": "6d08f0099583a55bdec087a23587ca6ff1210816b80cfd3610e8bc614a3ca25b"
+      }
+    ]
+  },
+  {
+    "name": "smoke-csharp",
+    "language": "csharp",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.cs",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "bc62c6c928d0c8de74d438893e69f2e31708e52e7ee4c0ecfae3c12ee3a2e2f0",
+        "sha256": "bc62c6c928d0c8de74d438893e69f2e31708e52e7ee4c0ecfae3c12ee3a2e2f0"
+      }
+    ]
+  },
+  {
+    "name": "smoke-cuda",
+    "language": "cuda",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.cu",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "2ffa3bcd138556523f0b87ef4e2b7401da8195adec33b0b5e6a908cb2e15d88a",
+        "sha256": "2ffa3bcd138556523f0b87ef4e2b7401da8195adec33b0b5e6a908cb2e15d88a"
+      }
+    ]
+  },
+  {
+    "name": "smoke-go",
+    "language": "go",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.go",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "d1a34fb12c63af04f93f66cf05ae7e9d914c785da1994ddfecf1f34b34ddfaa9",
+        "sha256": "d1a34fb12c63af04f93f66cf05ae7e9d914c785da1994ddfecf1f34b34ddfaa9"
+      }
+    ]
+  },
+  {
+    "name": "smoke-groovy",
+    "language": "groovy",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.groovy",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "41e45a79c7ce43756bbfc5718df8710530c30e6a737a85ade49fa4d3b6d2e72a",
+        "sha256": "41e45a79c7ce43756bbfc5718df8710530c30e6a737a85ade49fa4d3b6d2e72a"
+      }
+    ]
+  },
+  {
+    "name": "smoke-html",
+    "language": "html",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.html",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "70af46bbb226dedf33a3f6404d1e12c66cb5044eb002184be9f1d1eeaf17a153",
+        "sha256": "70af46bbb226dedf33a3f6404d1e12c66cb5044eb002184be9f1d1eeaf17a153"
+      }
+    ]
+  },
+  {
+    "name": "smoke-java",
+    "language": "java",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.java",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "ac6dca151e4e95ee0ed0b8e5597aeb7a925f1d7d5e59f3d48c719e13a2ce4268",
+        "sha256": "ac6dca151e4e95ee0ed0b8e5597aeb7a925f1d7d5e59f3d48c719e13a2ce4268"
+      }
+    ]
+  },
+  {
+    "name": "smoke-javascript",
+    "language": "javascript",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.js",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "ffa1456dc040cc54d5391f6d0755c5714a2f57656119f841fb7fe8977d4c1011",
+        "sha256": "ffa1456dc040cc54d5391f6d0755c5714a2f57656119f841fb7fe8977d4c1011"
+      }
+    ]
+  },
+  {
+    "name": "smoke-json",
+    "language": "json",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.json",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "53c80e7db11dc215a270af29ad8d0cc9d2a18531ccbd8e0ced367cef222bc686",
+        "sha256": "53c80e7db11dc215a270af29ad8d0cc9d2a18531ccbd8e0ced367cef222bc686"
+      }
+    ]
+  },
+  {
+    "name": "smoke-kotlin",
+    "language": "kotlin",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.kt",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "fd8e46a7cd5469e956570af0d7224d2d30b1dda917bd759aef9e60efc257ff99",
+        "sha256": "fd8e46a7cd5469e956570af0d7224d2d30b1dda917bd759aef9e60efc257ff99"
+      }
+    ]
+  },
+  {
+    "name": "smoke-lua",
+    "language": "lua",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.lua",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "d2e76bbbb179ff469f71f5bf816b761fbf5020567b20ed1a9022a53e03f4ad5b",
+        "sha256": "d2e76bbbb179ff469f71f5bf816b761fbf5020567b20ed1a9022a53e03f4ad5b"
+      }
+    ]
+  },
+  {
+    "name": "smoke-markdown",
+    "language": "markdown",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.md",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "07b94c5fa93f28ae8497b278a74a357f0b80e13e2caddedea77d2c437b278bbe",
+        "sha256": "07b94c5fa93f28ae8497b278a74a357f0b80e13e2caddedea77d2c437b278bbe"
+      }
+    ]
+  },
+  {
+    "name": "smoke-metal",
+    "language": "metal",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.metal",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "4a488699a17edb35c0301f7c7a3fa37decf444341ee79e0edc7212b822094acd",
+        "sha256": "4a488699a17edb35c0301f7c7a3fa37decf444341ee79e0edc7212b822094acd"
+      }
+    ]
+  },
+  {
+    "name": "smoke-objc",
+    "language": "objc",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.m",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "3860857a5e07eb8c796e059fdece760d69c17006f003fe8aae476c87a7658b35",
+        "sha256": "3860857a5e07eb8c796e059fdece760d69c17006f003fe8aae476c87a7658b35"
+      }
+    ]
+  },
+  {
+    "name": "smoke-pascal",
+    "language": "pascal",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.pas",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "7a6811f1453ec9877dee847a4674d172a35de7438bbf99c794d580c5be131fda",
+        "sha256": "7a6811f1453ec9877dee847a4674d172a35de7438bbf99c794d580c5be131fda"
+      }
+    ]
+  },
+  {
+    "name": "smoke-perl",
+    "language": "perl",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.pl",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "1e9b659c18bba6312e0b86f721dc281d8e63008e2bbde6b08731dde15324a380",
+        "sha256": "1e9b659c18bba6312e0b86f721dc281d8e63008e2bbde6b08731dde15324a380"
+      }
+    ]
+  },
+  {
+    "name": "smoke-php",
+    "language": "php",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.php",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "a050ac070e4fc0e2d4656bc40a4253c011c218d2e9216588dd65252205416899",
+        "sha256": "a050ac070e4fc0e2d4656bc40a4253c011c218d2e9216588dd65252205416899"
+      }
+    ]
+  },
+  {
+    "name": "smoke-python",
+    "language": "python",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.py",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "3c2991fa0b7bfb294c19707bcbfa39b3a0502a0827d670155649ebf20ef199e2",
+        "sha256": "3c2991fa0b7bfb294c19707bcbfa39b3a0502a0827d670155649ebf20ef199e2"
+      }
+    ]
+  },
+  {
+    "name": "smoke-r",
+    "language": "r",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.r",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "a48c2629153ded1757ca101ab38e1148a313feea5a3b21591a09bc0651697461",
+        "sha256": "a48c2629153ded1757ca101ab38e1148a313feea5a3b21591a09bc0651697461"
+      }
+    ]
+  },
+  {
+    "name": "smoke-ruby",
+    "language": "ruby",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.rb",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "96a6cb6d35dbf6110d368e47a6a9d59e70eb60045be5903880c51edff9372725",
+        "sha256": "96a6cb6d35dbf6110d368e47a6a9d59e70eb60045be5903880c51edff9372725"
+      }
+    ]
+  },
+  {
+    "name": "smoke-rust",
+    "language": "rust",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.rs",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "33a37d35dcb63869d324659c2fd128990da7af535f12227f667e9706aad8bde9",
+        "sha256": "33a37d35dcb63869d324659c2fd128990da7af535f12227f667e9706aad8bde9"
+      }
+    ]
+  },
+  {
+    "name": "smoke-scala",
+    "language": "scala",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.scala",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "f610df1b5f6d8d69c564229d14333b295718066a394e5a52c98b08e17a54b1aa",
+        "sha256": "f610df1b5f6d8d69c564229d14333b295718066a394e5a52c98b08e17a54b1aa"
+      }
+    ]
+  },
+  {
+    "name": "smoke-scss",
+    "language": "scss",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.scss",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "d07441b4efcce68fb634ea67bd99cb1d65eaabc5a65cc10b53b3c39d96f668be",
+        "sha256": "d07441b4efcce68fb634ea67bd99cb1d65eaabc5a65cc10b53b3c39d96f668be"
+      }
+    ]
+  },
+  {
+    "name": "smoke-solidity",
+    "language": "solidity",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.sol",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "d010b2d38a33947302211fcf7267fef1d9d0f81b5539cf83c22c380e85a7d63d",
+        "sha256": "d010b2d38a33947302211fcf7267fef1d9d0f81b5539cf83c22c380e85a7d63d"
+      }
+    ]
+  },
+  {
+    "name": "smoke-swift",
+    "language": "swift",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.swift",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "7423cb3ea33517bd7146775525756ae5f0b5989fb32863e861581c83597e52d2",
+        "sha256": "7423cb3ea33517bd7146775525756ae5f0b5989fb32863e861581c83597e52d2"
+      }
+    ]
+  },
+  {
+    "name": "smoke-toml",
+    "language": "toml",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.toml",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "d93db1bbf161afa27c62fb5b01c03fc1fe5faa2ba70f0e554d2fe604ee7c521d",
+        "sha256": "d93db1bbf161afa27c62fb5b01c03fc1fe5faa2ba70f0e554d2fe604ee7c521d"
+      }
+    ]
+  },
+  {
+    "name": "smoke-tsx",
+    "language": "tsx",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.tsx",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "c7b102bceb0e654ab2ec0de8bbec4988ac741ec60423711576d957379fd80ce7",
+        "sha256": "c7b102bceb0e654ab2ec0de8bbec4988ac741ec60423711576d957379fd80ce7"
+      }
+    ]
+  },
+  {
+    "name": "smoke-typescript",
+    "language": "typescript",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.ts",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "ffa1456dc040cc54d5391f6d0755c5714a2f57656119f841fb7fe8977d4c1011",
+        "sha256": "ffa1456dc040cc54d5391f6d0755c5714a2f57656119f841fb7fe8977d4c1011"
+      }
+    ]
+  },
+  {
+    "name": "smoke-vue",
+    "language": "vue",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.vue",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "86e76ac967d6c9f51f116de57adaddc77c5d4e311176bf0b3d833596cecea717",
+        "sha256": "86e76ac967d6c9f51f116de57adaddc77c5d4e311176bf0b3d833596cecea717"
+      }
+    ]
+  },
+  {
+    "name": "smoke-yaml",
+    "language": "yaml",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.yaml",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "59f4192a3f25af9d8e70635adc2a432d5694666aabde810282840ea34c97611d",
+        "sha256": "59f4192a3f25af9d8e70635adc2a432d5694666aabde810282840ea34c97611d"
+      }
+    ]
+  },
+  {
+    "name": "smoke-zig",
+    "language": "zig",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.zig",
+        "source": "crates/aft/src/callgraph_store/position_identity_tests.rs",
+        "owner": "language_fixtures",
+        "literal_sha256": "80fca986d5249e26f56f055fb10bc3cc5e6d6a0898df0a0ca7a9a53093576f73",
+        "sha256": "80fca986d5249e26f56f055fb10bc3cc5e6d6a0898df0a0ca7a9a53093576f73"
+      }
+    ]
+  },
+  {
+    "name": "solidity-contract",
+    "language": "solidity",
+    "shapes": [
+      "constructor",
+      "interface",
+      "library",
+      "modifier",
+      "methods"
+    ],
+    "files": [
+      {
+        "target": "Vault.sol",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_solidity_symbols_include_contracts_functions_events_and_errors",
+        "sha256": "0bb4ea916d5af4b9595e666f2e45c355b8a07539612f8ce931abe1627d3ce87a"
+      }
+    ]
+  },
+  {
+    "name": "swift-members",
+    "language": "swift",
+    "shapes": [
+      "struct method",
+      "class method",
+      "protocol",
+      "type alias"
+    ],
+    "files": [
+      {
+        "target": "Greeter.swift",
+        "source": "crates/aft/tests/integration/outline_languages_test.rs",
+        "owner": "outline_swift_symbols_include_types_protocols_functions_and_properties",
+        "sha256": "e178bae5ea7d7a66fae818cc40aa03fe4fa04107508420e467c26e7a3b2b3669"
+      }
+    ]
+  },
+  {
+    "name": "tsx-components",
+    "language": "tsx",
+    "shapes": [
+      "JSX",
+      "class methods",
+      "callback property"
+    ],
+    "files": [
+      {
+        "target": "sample.tsx",
+        "source": "crates/aft/tests/fixtures/sample.tsx",
+        "sha256": "8c4f56949170f6e40417509213caa99f4327e5761bc73ac900aa9afdb3a110e7"
+      }
+    ]
+  },
+  {
+    "name": "tsx-construction",
+    "language": "tsx",
+    "shapes": [
+      "JSX call",
+      "constructorless construction"
+    ],
+    "files": [
+      {
+        "target": "component.tsx",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_indexes_tsx_jsx_components_and_new_expressions",
+        "sha256": "37089e4cbbc1c8ed34d1fa8f3f00cd6b85fd64d5d4cce68d861d51eb6e336665"
+      }
+    ]
+  },
+  {
+    "name": "typescript-callback",
+    "language": "typescript",
+    "shapes": [
+      "explicit constructor",
+      "callback reference",
+      "method chain"
+    ],
+    "files": [
+      {
+        "target": "callback.ts",
+        "source": "crates/aft/src/callgraph.rs",
+        "owner": "call_site_kind_classification_matches_range_lookup",
+        "sha256": "8a3f51321ea7630c2b3129085c3065fe66ae5f7af3d92ee78581b95aa187a2d5"
+      }
+    ]
+  },
+  {
+    "name": "typescript-dynamic",
+    "language": "typescript",
+    "shapes": [
+      "unknown receiver",
+      "computed member",
+      "unresolved protected targets"
+    ],
+    "files": [
+      {
+        "target": "dynamic.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_and_dynamic_public_fixture_python_js_ts",
+        "sha256": "ea56d2b6d0ebe8b0fcf0cbc9835d27eac1be97f03dc2664e4b996a79092d07de"
+      }
+    ]
+  },
+  {
+    "name": "typescript-export-alias",
+    "language": "typescript",
+    "shapes": [
+      "source-less export alias",
+      "cross-file caller"
+    ],
+    "files": [
+      {
+        "target": "module.ts",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_source_less_export_alias_resolves_local_symbol",
+        "sha256": "633975d995b7ba89e19407722affd3a2e6ac2141d5e1eec66357eb4edec4350e"
+      },
+      {
+        "target": "app.ts",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_source_less_export_alias_resolves_local_symbol",
+        "sha256": "5a018babecd83ad6e5eddb898e5d9677809c449fba40b04bfe6d430403b03d19"
+      }
+    ]
+  },
+  {
+    "name": "typescript-external",
+    "language": "typescript",
+    "shapes": [
+      "builtin receiver",
+      "external dispatch"
+    ],
+    "files": [
+      {
+        "target": "external.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "builtin_type_does_not_link_project_names",
+        "sha256": "e4b7a761ae124021861dfd770f26e303984c7e6d9789395665d1b48783f1116d"
+      }
+    ]
+  },
+  {
+    "name": "typescript-imports",
+    "language": "typescript",
+    "shapes": [
+      "value import",
+      "type-only import",
+      "external and relative unresolved imports"
+    ],
+    "files": [
+      {
+        "target": "imports.ts",
+        "source": "crates/aft/tests/fixtures/imports_ts.ts",
+        "sha256": "021861e2ad003a02143cead538d539a94318e8d11d3a3549b074ae1742536904"
+      }
+    ]
+  },
+  {
+    "name": "typescript-interface",
+    "language": "typescript",
+    "shapes": [
+      "interface",
+      "two implementation dispatch fanout"
+    ],
+    "files": [
+      {
+        "target": "interface.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "interface_two_implementations_are_possible_targets",
+        "sha256": "c045fb4ec6c47ba35f126aa74b4e10eb89886842e3a35695ff10f24683663545"
+      }
+    ]
+  },
+  {
+    "name": "typescript-members",
+    "language": "typescript",
+    "shapes": [
+      "methods",
+      "arrow function",
+      "interface",
+      "enum",
+      "type alias"
+    ],
+    "files": [
+      {
+        "target": "sample.ts",
+        "source": "crates/aft/tests/fixtures/sample.ts",
+        "sha256": "dcc1903d7cbdf8c743d629c14cdff1b791d12f5305b09617ff0384611b2ad12d"
+      }
+    ]
+  },
+  {
+    "name": "typescript-private",
+    "language": "typescript",
+    "shapes": [
+      "private method",
+      "unknown receiver",
+      "arity mismatch"
+    ],
+    "files": [
+      {
+        "target": "private.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "unknown_arity_and_private_methods_remain_live_without_edges",
+        "sha256": "a705bdff9da88c31239a8835a887c3c5e3a2014bcf92a7c13b3990ac77facf13"
+      }
+    ]
+  },
+  {
+    "name": "typescript-reexport",
+    "language": "typescript",
+    "shapes": [
+      "aliased re-export",
+      "cross-file call"
+    ],
+    "files": [
+      {
+        "target": "real.ts",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+        "sha256": "50dff33bf873d89df8c10f6bff42bff2e431ce6f1dd28d75296bee57edeb1a63"
+      },
+      {
+        "target": "barrel.ts",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+        "sha256": "b6e6e68c053c8d7ccc9a9797193fffcfaa7fbf086307498924618561c6f8158d"
+      },
+      {
+        "target": "app.ts",
+        "source": "crates/aft/tests/integration/callgraph_test.rs",
+        "owner": "callgraph_reexport_alias_resolves_to_source_symbol",
+        "sha256": "f08571147b5bcac8003533c4e434ac73aea947b39d7c1ed6a5c0e6cebe26e947"
+      }
+    ]
+  },
+  {
+    "name": "typescript-top-level",
+    "language": "typescript",
+    "shapes": [
+      "file summary",
+      "top-level dispatch caller",
+      "constructed receiver without a function scope"
+    ],
+    "files": [
+      {
+        "target": "top.ts",
+        "new_for": "Missing stored values: nodes.kind=file_summary, top id forms and dispatch caller=false",
+        "text": "class C { m() {} }\nnew C().m();\n",
+        "sha256": "d9ef79adcc9964ff4d53d8ff2e8362e2a9cd37029bd9c0d4e1bd353a04ea3ea3"
+      }
+    ]
+  },
+  {
+    "name": "typescript-virtual",
+    "language": "typescript",
+    "shapes": [
+      "inheritance",
+      "super",
+      "constructor receiver",
+      "virtual dispatch"
+    ],
+    "files": [
+      {
+        "target": "virtual.ts",
+        "source": "crates/aft/src/callgraph_store/dispatch/tests.rs",
+        "owner": "concrete_inherited_and_constructor_receiver_forms",
+        "sha256": "4b96ccb91823980ef4c7c6a186e693c7f13caad5d3f15194c989f74a44aab7fc"
+      }
+    ]
+  },
+  {
+    "name": "vue-opaque",
+    "language": "vue",
+    "shapes": [
+      "SFC handler",
+      "computed closure",
+      "opaque script/no call-node support"
+    ],
+    "files": [
+      {
+        "target": "App.vue",
+        "source": "crates/aft/tests/integration/vue_test.rs",
+        "sha256": "ce19f6e9cfc4a196cbca495f3b49f50522ca79ee63b13bfd98a848fea72dc34d"
+      }
+    ]
+  },
+  {
+    "name": "zig-methods",
+    "language": "zig",
+    "shapes": [
+      "struct method",
+      "free call",
+      "qualified call"
+    ],
+    "files": [
+      {
+        "target": "fixture.zig",
+        "source": "crates/aft/src/calls.rs",
+        "owner": "extracts_zig_calls_and_attributes_them_to_function_symbols",
+        "sha256": "fe951cf04c9abb7543725a917adb6351c320abaeb7d6c9ae856796718a41c010"
+      }
+    ]
+  }
+]

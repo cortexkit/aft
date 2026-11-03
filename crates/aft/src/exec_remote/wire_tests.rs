@@ -112,6 +112,13 @@ pub(crate) fn signer_refusal(detail: &str, retry_after_ms: Option<u64>) -> Termi
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum Script {
+    ReturnCapRefusal {
+        code: &'static str,
+        field: &'static str,
+        max_bytes: Option<u64>,
+        always: bool,
+        after_accepted: bool,
+    },
     SubmissionFreshReplyLost,
     SubmissionGapExpired {
         unknown: bool,
@@ -399,6 +406,35 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.run" if matches!(script, Script::ReturnCapRefusal { .. }) => {
+                            let Script::ReturnCapRefusal { code, field, max_bytes, always, after_accepted } = script else { unreachable!() };
+                            runs += 1;
+                            if runs == 1 || always {
+                                if after_accepted {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                                }
+                                let mut detail = json!({"field":field});
+                                if let Some(maximum) = max_bytes { detail["max_bytes"] = json!(maximum); }
+                                replies.push(reply(FrameType::Error, json!({"code":code,"message":"return cap refused","detail":detail})));
+                            } else {
+                                let records = super::return_vectors::return_vector_records("two-files-one-empty");
+                                if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                                }
+                                let first_seq = records.iter().find_map(|record| match record {
+                                    StreamRecord::ReturnChunk(chunk) => Some(chunk.seq),
+                                    StreamRecord::ReturnManifest(manifest) => Some(manifest.seq),
+                                    _ => None,
+                                }).unwrap_or(0);
+                                for seq in 0..first_seq {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(Vec::new())))).unwrap()));
+                                }
+                                for record in records {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                                }
+                                replies.push(reply(FrameType::StreamEnd, Value::Null));
+                            }
+                        }
                         "exec.run" if matches!(script, Script::ReturnPathsUnsupported) => {
                             let terminal: Value = serde_json::from_str(include_str!("fixtures/motor/return-paths-unsupported.json")).unwrap();
                             replies.push(reply(FrameType::StreamData, terminal));
@@ -1930,4 +1966,253 @@ async fn empty_attach_reports_no_frames_and_keeps_accepted_resume_point() {
         "StreamEnd alone must not reset the empty-attach budget"
     );
     assert_eq!(attached.resume_point(), Some(point));
+}
+
+#[tokio::test]
+async fn return_cap_selection_obeys_the_selected_providers_v3_claim() {
+    for (claims, expected) in [
+        (
+            vec![client::CAPABILITY, RETURN_CHUNKED_CAPABILITY],
+            10_485_760,
+        ),
+        (
+            vec![
+                client::CAPABILITY,
+                RETURN_CHUNKED_CAPABILITY,
+                RETURN_LARGE_CAPABILITY,
+            ],
+            134_217_728,
+        ),
+    ] {
+        let daemon =
+            daemon_with_capabilities(Script::ReturnVector("two-files-one-empty"), &claims, 1).await;
+        let client = client(&daemon).await;
+        assert_eq!(client.return_max_bytes().await.unwrap(), expected);
+        let request = RunRequest::new(
+            "/workspace/task",
+            "/workspace/repo",
+            "/workspace/task",
+            "build",
+        )
+        .with_return_paths(vec!["dist/hello.txt".into(), "dist/empty.txt".into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(RETURN_LARGE_MAX_BYTES_CAP);
+        let mut stream = client.run(&request).await.unwrap();
+        let mut sink = MemorySink::default();
+        loop {
+            if matches!(
+                stream.next(&mut sink).await.unwrap(),
+                client::StreamProgress::Complete(_)
+            ) {
+                break;
+            }
+        }
+        let runs: Vec<_> = daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["method"] == "exec.run")
+            .map(|(_, body)| body["params"].clone())
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["return_max_bytes"], expected);
+    }
+}
+
+#[tokio::test]
+async fn return_cap_refusal_resubmits_once_and_no_other_refusal_is_retried() {
+    let cases = [
+        (
+            "invalid_params",
+            "return_max_bytes",
+            Some(20 * 1024 * 1024),
+            false,
+            false,
+            2,
+            true,
+        ),
+        (
+            "invalid_params",
+            "return_max_bytes",
+            Some(20 * 1024 * 1024),
+            true,
+            false,
+            2,
+            false,
+        ),
+        (
+            "invalid_params",
+            "return_max_bytes",
+            None,
+            false,
+            false,
+            1,
+            false,
+        ),
+        (
+            "invalid_params",
+            "return_paths",
+            Some(10_485_760),
+            false,
+            false,
+            1,
+            false,
+        ),
+        (
+            "not_ready",
+            "return_max_bytes",
+            Some(10_485_760),
+            false,
+            false,
+            1,
+            false,
+        ),
+        (
+            "invalid_params",
+            "return_max_bytes",
+            Some(134_217_728),
+            false,
+            false,
+            1,
+            false,
+        ),
+        (
+            "invalid_params",
+            "return_max_bytes",
+            Some(10_485_760),
+            false,
+            true,
+            1,
+            false,
+        ),
+    ];
+    for (code, field, max_bytes, always, after_accepted, count, completes) in cases {
+        let daemon = daemon_with_capabilities(
+            Script::ReturnCapRefusal {
+                code,
+                field,
+                max_bytes,
+                always,
+                after_accepted,
+            },
+            &[
+                client::CAPABILITY,
+                RETURN_CHUNKED_CAPABILITY,
+                RETURN_LARGE_CAPABILITY,
+            ],
+            1,
+        )
+        .await;
+        let client = client(&daemon).await;
+        let request = RunRequest::new(
+            "/workspace/task",
+            "/workspace/repo",
+            "/workspace/task",
+            "build",
+        )
+        .with_return_paths(vec!["dist/hello.txt".into(), "dist/empty.txt".into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(RETURN_LARGE_MAX_BYTES_CAP);
+        let mut stream = client.run(&request).await.unwrap();
+        let mut sink = MemorySink::default();
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match stream.next(&mut sink).await {
+                    Ok(client::StreamProgress::Complete(_)) => break true,
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("{code}/{field}/{max_bytes:?}: {error:?}");
+                        break false;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed, completes, "{code}/{field}/{max_bytes:?}");
+        let runs: Vec<_> = daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["method"] == "exec.run")
+            .map(|(_, body)| body["params"].clone())
+            .collect();
+        assert_eq!(runs.len(), count, "{code}/{field}/{max_bytes:?}");
+        if count == 2 {
+            let mut expected = runs[0].clone();
+            expected["return_max_bytes"] = json!(max_bytes.unwrap());
+            assert_eq!(
+                runs[1], expected,
+                "only the cap changes on the safe resubmit"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn return_cap_refusal_preserves_memory_size_on_the_single_resubmit() {
+    let daemon = daemon_with_capabilities(
+        Script::ReturnCapRefusal {
+            code: "invalid_params",
+            field: "return_max_bytes",
+            max_bytes: Some(20 * 1024 * 1024),
+            always: false,
+            after_accepted: false,
+        },
+        &[
+            client::CAPABILITY,
+            MEMORY_CAPABILITY,
+            RETURN_CHUNKED_CAPABILITY,
+            RETURN_LARGE_CAPABILITY,
+        ],
+        1,
+    )
+    .await;
+    let client = client(&daemon).await;
+    let request = RunRequest::new(
+        "/workspace/task",
+        "/workspace/repo",
+        "/workspace/task",
+        "build",
+    )
+    .with_weight_hint(2)
+    .with_memory_mib(16_384)
+    .with_return_paths(vec!["dist/hello.txt".into(), "dist/empty.txt".into()])
+    .with_return_chunked(true)
+    .with_return_max_bytes(RETURN_LARGE_MAX_BYTES_CAP);
+    let mut stream = client.run(&request).await.unwrap();
+    let mut sink = MemorySink::default();
+    let verdict = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let client::StreamProgress::Complete(verdict) = stream.next(&mut sink).await.unwrap()
+            {
+                break verdict;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(verdict, Verdict::Exited { code: 0 });
+    let runs: Vec<_> = daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, body)| body["method"] == "exec.run")
+        .map(|(_, body)| body["params"].clone())
+        .collect();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
+    assert_eq!(runs[1]["return_max_bytes"], 20_971_520);
+    for run in &runs {
+        assert_eq!(run["memory_mib"], 16_384);
+    }
+    let mut expected = runs[0].clone();
+    expected["return_max_bytes"] = json!(20_971_520);
+    assert_eq!(
+        runs[1], expected,
+        "memory and every other identity field stay unchanged"
+    );
 }
