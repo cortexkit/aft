@@ -1,17 +1,10 @@
 {
-  "slice_class": "ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
-  "kind": "paging",
+  "kind": "harness",
   "fixtures": [
-    "commands::semantic_search::memo::tests::exact_memo_releases_old_generations_of_the_same_query",
-    "commands::semantic_search::memo::tests::exact_memo_oversized_entry_is_served_in_full_but_not_retained",
-    "commands::semantic_search::tests::exact_page_memo_keys_include_corpus_generation",
-    "commands::semantic_search::tests::repeated_paged_search_reads_exact_candidates_once_per_query_generation"
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs"
   ],
-  "fenced_files": [
-    "crates/aft/src/commands/semantic_search/memo.rs",
-    "crates/aft/src/lib.rs"
-  ],
-  "slices": ["exact-memo-heap-budget"],
-  "note": "Bound retained exact-search payload capacity and retire obsolete generations of the same query. Cache admission never cuts the verified set or the ranking input; oversized sets are served in full without retention. Routing, candidate verification and score-free ordering are unchanged; benchmark rows must remain byte-identical. The descriptor is conservatively ranking-classed because the memo is inside the ranking fence. The lib.rs change only registers the Linux test-only heap probe."
+  "note": "Bounds the exact-search memo's retained payload (8 MiB) and retires obsolete generations of the same query. Cache admission never cuts the verified candidate set or the ranking input; oversized sets are served in full without being retained. Routing, candidate verification and score-free ordering are unchanged, so ranked rows must remain byte-identical. lib.rs only registers a Linux test-only heap probe."
 }
