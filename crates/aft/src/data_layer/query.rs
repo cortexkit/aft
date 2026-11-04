@@ -114,7 +114,7 @@ impl MemorySlices {
 }
 
 /// The names a slice's symbols can be found by.
-fn symbol_keys(slice: &FileSlice) -> BTreeSet<String> {
+pub(crate) fn symbol_keys(slice: &FileSlice) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for node in &slice.nodes {
         keys.insert(node.name.clone());
@@ -166,6 +166,10 @@ impl<S: SliceSource> SliceReader<S> {
             project_root,
             project_key,
         }
+    }
+
+    pub(crate) fn source(&self) -> &S {
+        &self.source
     }
 
     fn rel(&self, file_rel: &Path) -> Result<String> {

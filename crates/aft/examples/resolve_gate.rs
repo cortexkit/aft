@@ -45,4 +45,12 @@ fn main() {
             .all(|(_, differing, _, _)| *differing == 0),
         "a query over slices answers differently from today's database"
     );
+    assert_eq!(report.segment_failures, 0, "a read from the segment failed");
+    assert!(
+        report
+            .segment_queries
+            .values()
+            .all(|(_, differing, _, _)| *differing == 0),
+        "a query over stored slices answers differently from today's database"
+    );
 }

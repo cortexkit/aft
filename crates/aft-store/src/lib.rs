@@ -13,6 +13,7 @@ pub mod cache;
 pub mod checkout;
 pub mod content;
 pub mod family;
+pub mod graph;
 pub mod ids;
 pub mod postings;
 pub mod scan;
@@ -24,6 +25,7 @@ pub mod text;
 mod fault;
 mod fs;
 mod le;
+mod packed;
 #[cfg(test)]
 mod test_rng;
 

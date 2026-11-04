@@ -12,15 +12,10 @@
 //! only when its own file is resolved.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-
-use flate2::Compression;
-use flate2::read::ZlibDecoder;
-use flate2::write::ZlibEncoder;
 
 use super::{ContentRecord, DecodeError, RecordKey};
 use crate::ids::Digest128;
-use crate::le::{u32_at, u64_at};
+use crate::packed::{self, PackedBuilder};
 use crate::segment::{
     Alignment, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
     SectionKind, SectionSpec, Segment, SegmentError, SegmentWriter,
@@ -33,10 +28,7 @@ const BODIES: SectionKind = SectionKind::new(0x0202);
 const BODY_INDEX: SectionKind = SectionKind::new(0x0203);
 const VERSION: u16 = 1;
 const KEY_SPACE: KeySpace = KeySpace::new(0);
-const BODY_INDEX_LEN: usize = 17;
-
-/// A body is stored compressed only when that saves at least this share.
-const MIN_SAVING_PERCENT: usize = 10;
+const BODY_INDEX_LEN: usize = packed::INDEX_ENTRY_LEN;
 
 /// The content sections this build reads.
 pub const KNOWN: [KnownSection; 4] = [
@@ -57,12 +49,6 @@ pub const KNOWN: [KnownSection; 4] = [
         version: VERSION,
     },
 ];
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Codec {
-    Raw = 0,
-    Zlib = 1,
-}
 
 /// Collects records for the content sections of one segment.
 #[derive(Debug, Default)]
@@ -99,8 +85,7 @@ impl ContentSectionsBuilder {
     pub fn write(self, writer: &mut SegmentWriter) -> Result<(), SegmentError> {
         let mut table = UnitTableBuilder::new(Digest128::LEN);
         let mut surfaces = Vec::new();
-        let mut bodies = Vec::new();
-        let mut index = Vec::with_capacity(self.records.len() * BODY_INDEX_LEN);
+        let mut bodies = PackedBuilder::with_capacity(self.records.len());
         for (key, (surface, body)) in self.records {
             table.push(
                 key.digest().as_bytes(),
@@ -110,42 +95,14 @@ impl ContentSectionsBuilder {
                 },
             );
             surfaces.extend_from_slice(&surface);
-            let (codec, stored) = pack(&body);
-            index.extend_from_slice(&(bodies.len() as u64).to_le_bytes());
-            index.extend_from_slice(
-                &u32::try_from(stored.len())
-                    .expect("a body is under 4 GiB")
-                    .to_le_bytes(),
-            );
-            index.extend_from_slice(
-                &u32::try_from(body.len())
-                    .expect("a body is under 4 GiB")
-                    .to_le_bytes(),
-            );
-            index.push(codec as u8);
-            bodies.extend_from_slice(&stored);
+            bodies.push(&body);
         }
+        let (bodies, index) = bodies.finish();
         let (table, units) = table.finish();
         writer.write_section(spec(UNITS), &table, units)?;
         writer.write_section(spec(SURFACES), &surfaces, units)?;
         writer.write_section(spec(BODIES), &bodies, units)?;
         writer.write_section(spec(BODY_INDEX), &index, units)
-    }
-}
-
-fn pack(body: &[u8]) -> (Codec, Vec<u8>) {
-    if body.is_empty() {
-        return (Codec::Raw, Vec::new());
-    }
-    let mut encoder = ZlibEncoder::new(Vec::with_capacity(body.len() / 3), Compression::fast());
-    encoder
-        .write_all(body)
-        .expect("writing into a Vec cannot fail");
-    let packed = encoder.finish().expect("writing into a Vec cannot fail");
-    if packed.len() * 100 <= body.len() * (100 - MIN_SAVING_PERCENT) {
-        (Codec::Zlib, packed)
-    } else {
-        (Codec::Raw, body.to_vec())
     }
 }
 
@@ -256,37 +213,7 @@ impl<'s> ContentSegment<'s> {
     /// When a read fails, a block fails its checksum, or the stored body
     /// does not unpack to its recorded length.
     pub fn body(&self, ordinal: u32) -> Result<Vec<u8>, SegmentError> {
-        let mut entry = [0; BODY_INDEX_LEN];
-        self.segment.read(
-            self.index,
-            u64::from(ordinal) * BODY_INDEX_LEN as u64,
-            &mut entry,
-        )?;
-        let offset = u64_at(&entry, 0);
-        let stored = u32_at(&entry, 8);
-        let unpacked = u32_at(&entry, 12);
-        let bytes = self
-            .segment
-            .read_range(self.bodies, offset..offset + u64::from(stored))?;
-        match entry[16] {
-            0 if stored == unpacked => Ok(bytes),
-            1 => {
-                let mut out = Vec::with_capacity(unpacked as usize);
-                ZlibDecoder::new(bytes.as_slice())
-                    .take(u64::from(unpacked) + 1)
-                    .read_to_end(&mut out)
-                    .map_err(|_| malformed(self.segment, "a record body does not unpack"))?;
-                if out.len() == unpacked as usize {
-                    Ok(out)
-                } else {
-                    Err(malformed(
-                        self.segment,
-                        "a record body unpacks to the wrong length",
-                    ))
-                }
-            }
-            _ => Err(malformed(self.segment, "unknown record body codec")),
-        }
+        packed::read(self.segment, self.bodies, self.index, ordinal)
     }
 
     /// The whole record at `ordinal`.

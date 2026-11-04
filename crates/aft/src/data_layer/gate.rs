@@ -55,6 +55,12 @@ pub struct ResolveGateReport {
     /// slices, ms over today's database).
     pub queries: BTreeMap<&'static str, (usize, usize, f64, f64)>,
     pub slices_ms: f64,
+    /// The same queries over slices written to a segment and read back.
+    pub segment_queries: BTreeMap<&'static str, (usize, usize, f64, f64)>,
+    pub segment_write_ms: f64,
+    pub segment_bytes: u64,
+    /// Reads from the segment that failed.
+    pub segment_failures: usize,
     /// Up to twenty paths whose results differ, for a first look.
     pub examples: Vec<String>,
 }
@@ -306,7 +312,11 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     let connection = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     compare_tables(&connection, &rows, &mut report).map_err(|error| error.to_string())?;
     drop(connection);
-    compare_queries(root, &inputs, &resolved, &path, &mut report)?;
+    let records = by_key
+        .iter()
+        .map(|(key, record)| (key.digest().to_string(), (*key, Arc::clone(record))))
+        .collect::<HashMap<_, _>>();
+    compare_queries(root, &inputs, &resolved, &records, &path, &mut report)?;
     let _ = std::fs::remove_dir_all(&database);
     Ok(report)
 }
@@ -317,11 +327,13 @@ fn compare_queries(
     root: &Path,
     inputs: &super::callgraph::CheckoutInputs,
     resolved: &BTreeMap<String, super::callgraph::FileResolution>,
+    records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
     database: &Path,
     report: &mut ResolveGateReport,
 ) -> Result<(), String> {
-    use crate::callgraph_store::CallGraphRead;
-    use crate::parser::LangId;
+    use aft_store::cache::BlockCache;
+    use aft_store::ids::{FamilyId, SegmentId, WriterIncarnation};
+    use aft_store::segment::{Segment, SegmentMeta};
 
     let started = Instant::now();
     let mut slices = super::query::MemorySlices::default();
@@ -337,6 +349,72 @@ fn compare_queries(
     )
     .map_err(|error| error.to_string())?;
 
+    let mut examples = Vec::new();
+    compare_readers(&ours, &theirs, inputs, &mut report.queries, &mut examples);
+
+    // The same queries over slices written to a segment and read back.
+    let directory =
+        std::env::temp_dir().join(format!("aft-resolve-gate-segment-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let segment_path = directory.join("1.seg");
+    let family = FamilyId::from_digest(aft_store::ids::Digest128::of(b"resolve gate"));
+    let started = Instant::now();
+    super::graph_store::write_segment(
+        &segment_path,
+        SegmentMeta {
+            family,
+            segment: SegmentId::new(1),
+            incarnation: WriterIncarnation::new(1),
+            created_unix_ms: 0,
+        },
+        inputs,
+        resolved,
+        records,
+    )?;
+    report.segment_write_ms = started.elapsed().as_secs_f64() * 1000.0;
+    report.segment_bytes = std::fs::metadata(&segment_path)
+        .map_err(|error| error.to_string())?
+        .len();
+    let segment = Segment::open(
+        &segment_path,
+        family,
+        &super::graph_store::known_sections(),
+        Arc::new(BlockCache::new(256 << 20)),
+    )
+    .map_err(|error| error.to_string())?;
+    let stored = super::graph_store::StoredSlices::open(&segment, inputs)?;
+    let stored = super::query::SliceReader::new(stored, root.to_path_buf(), "gate".to_string());
+    compare_readers(
+        &stored,
+        &theirs,
+        inputs,
+        &mut report.segment_queries,
+        &mut examples,
+    );
+    let failures = stored.source().failures();
+    report.segment_failures = failures.len();
+    examples.extend(failures.into_iter().take(10));
+    drop(stored);
+    drop(segment);
+    let _ = std::fs::remove_dir_all(&directory);
+    report.examples.extend(examples);
+    eprintln!("query examples: {:#?}", report.examples);
+    Ok(())
+}
+
+/// Runs every store primitive the commands use on `ours` and on `theirs`,
+/// for a sample of symbols and names, and records each primitive's calls,
+/// differences and time in `queries`.
+fn compare_readers(
+    ours: &impl crate::callgraph_store::CallGraphRead,
+    theirs: &impl crate::callgraph_store::CallGraphRead,
+    inputs: &super::callgraph::CheckoutInputs,
+    queries: &mut BTreeMap<&'static str, (usize, usize, f64, f64)>,
+    examples_out: &mut Vec<String>,
+) {
+    use crate::parser::LangId;
+
+    let mut examples = std::mem::take(examples_out);
     let mut compare = |name: &'static str,
                        ours_run: &mut dyn FnMut() -> String,
                        theirs_run: &mut dyn FnMut() -> String,
@@ -347,7 +425,7 @@ fn compare_queries(
         let started = Instant::now();
         let right = theirs_run();
         let theirs_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let entry = report.queries.entry(name).or_default();
+        let entry = queries.entry(name).or_default();
         entry.0 += 1;
         entry.2 += ours_ms;
         entry.3 += theirs_ms;
@@ -366,7 +444,6 @@ fn compare_queries(
             }
         }
     };
-    let mut examples = Vec::new();
     let show = |value: &dyn std::fmt::Debug| format!("{value:#?}");
 
     // A deterministic sample of symbols: every 20th node in path order.
@@ -695,9 +772,7 @@ fn compare_queries(
         },
         &mut examples,
     );
-    report.examples.extend(examples);
-    eprintln!("query examples: {:#?}", report.examples);
-    Ok(())
+    *examples_out = examples;
 }
 
 /// Every row as one string of its compared columns, so two tables compare
