@@ -17,9 +17,10 @@ use crate::callgraph_store::join::dispatch::{
     DispatchFacts, FieldHint, MethodHint, ReturnHint, SiteHint, TypeHint,
 };
 use crate::callgraph_store::join::{
-    BlobImport, BlobRef, BlobRefKind, BlobSymbol, CallgraphBlob, ConfigBlob, ManifestJoinError,
-    ParseBlob,
+    self, BlobImport, BlobRef, BlobRefKind, BlobSymbol, CallgraphBlob, ConfigBlob,
+    ManifestJoinError, ParseBlob,
 };
+use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
 /// carry it, so output from another version is extracted again.
@@ -51,18 +52,140 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
 ///
 /// When the extractor fails on the source.
 pub fn extract(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJoinError> {
-    let blob = if language == "config" {
-        CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION)
-    } else {
-        // A source that is not valid UTF-8 cannot be parsed; like checkout
-        // assembly today, it gets the call graph of an empty file.
-        CallgraphBlob::extract(
-            std::str::from_utf8(source).unwrap_or(""),
-            language,
-            EXTRACTOR_VERSION,
-        )?
+    extract_with_tree(source, language).map(|(record, _)| record)
+}
+
+/// The syntax tree a content parsed to, kept so the next version of the
+/// same file can be parsed incrementally by [`extract_incremental`].
+#[derive(Clone)]
+pub struct SyntaxTree {
+    tree: tree_sitter::Tree,
+    language: LangId,
+}
+
+/// The text the extractor parses for `source`. A source that is not valid
+/// UTF-8 cannot be parsed; like checkout assembly today, it gets the call
+/// graph of an empty file.
+fn parsed_text(source: &[u8]) -> &str {
+    std::str::from_utf8(source).unwrap_or("")
+}
+
+/// Extracts the record of `source` in `language`, as [`extract`] does, and
+/// returns the syntax tree it parsed, or `None` for a configuration input,
+/// which is stored raw and never parsed.
+///
+/// # Errors
+///
+/// When the extractor fails on the source.
+pub fn extract_with_tree(
+    source: &[u8],
+    language: &str,
+) -> Result<(ContentRecord, Option<SyntaxTree>), ManifestJoinError> {
+    if language == "config" {
+        let blob = CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION);
+        return Ok((record_from_blob(&blob), None));
+    }
+    let text = parsed_text(source);
+    let lang = join::language_id(language)
+        .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
+    let tree = SyntaxTree {
+        tree: join::single_walk::parse_source(text, lang)?,
+        language: lang,
     };
+    let record = extract_parsed(source, language, &tree)?;
+    Ok((record, Some(tree)))
+}
+
+/// Parses `source` again after an edit, reusing the tree of the version it
+/// was edited from: `previous` is the tree [`extract_with_tree`] or this
+/// function returned for `previous_source`. The edit is taken to be the one
+/// span between the texts' common prefix and common suffix, so tree-sitter
+/// reparses only what that span touches. The tree equals a fresh parse of
+/// `source`. Returns `None` for a configuration input.
+///
+/// # Errors
+///
+/// When the language is not one the call graph parses, or parsing fails.
+pub fn reparse(
+    previous_source: &[u8],
+    previous: &SyntaxTree,
+    source: &[u8],
+    language: &str,
+) -> Result<Option<SyntaxTree>, ManifestJoinError> {
+    if language == "config" {
+        return Ok(None);
+    }
+    let lang = join::language_id(language)
+        .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
+    let text = parsed_text(source);
+    if previous.language != lang {
+        // A header can parse as another language after an edit; its old
+        // tree is of no use to the new grammar.
+        return Ok(Some(SyntaxTree {
+            tree: join::single_walk::parse_source(text, lang)?,
+            language: lang,
+        }));
+    }
+    let tree = join::single_walk::reparse_source(
+        parsed_text(previous_source),
+        &previous.tree,
+        text,
+        lang,
+    )?;
+    Ok(Some(SyntaxTree {
+        tree,
+        language: lang,
+    }))
+}
+
+/// Extracts the record of `source` in `language` from `tree`, the tree
+/// [`extract_with_tree`] or [`reparse`] returned for this same source.
+///
+/// # Errors
+///
+/// When the extractor fails on the source, or `tree` was parsed as another
+/// language.
+pub fn extract_parsed(
+    source: &[u8],
+    language: &str,
+    tree: &SyntaxTree,
+) -> Result<ContentRecord, ManifestJoinError> {
+    if language == "config" {
+        return Ok(record_from_blob(&CallgraphBlob::config(
+            source.to_vec(),
+            EXTRACTOR_VERSION,
+        )));
+    }
+    if join::language_id(language) != Some(tree.language) {
+        return Err(ManifestJoinError::Parse(format!(
+            "a {:?} syntax tree cannot be extracted as {language}",
+            tree.language
+        )));
+    }
+    let blob =
+        CallgraphBlob::extract_tree(parsed_text(source), language, EXTRACTOR_VERSION, &tree.tree)?;
     Ok(record_from_blob(&blob))
+}
+
+/// Extracts the record of `source` after an edit from `previous_source`,
+/// reparsing incrementally from `previous`, the tree that version parsed
+/// to. The record equals [`extract`]'s for `source`; the returned tree
+/// serves the next edit.
+///
+/// # Errors
+///
+/// When the extractor fails on the source.
+pub fn extract_incremental(
+    previous_source: &[u8],
+    previous: &SyntaxTree,
+    source: &[u8],
+    language: &str,
+) -> Result<(ContentRecord, Option<SyntaxTree>), ManifestJoinError> {
+    let Some(tree) = reparse(previous_source, previous, source, language)? else {
+        return extract_with_tree(source, language);
+    };
+    let record = extract_parsed(source, language, &tree)?;
+    Ok((record, Some(tree)))
 }
 
 /// The stored record of a parse output. Lossless apart from the extractor's
@@ -451,5 +574,60 @@ mod tests {
             assert_eq!(blob_from_record(&decoded).unwrap(), original, "{path}");
         }
         assert_eq!(language_for("README.md", b"# x"), None);
+    }
+
+    #[test]
+    fn incremental_records_equal_full_extractions() {
+        let base =
+            "use std::fmt;\nfn caller() {\n    helper(1);\n}\nfn helper(x: u8) -> u8 { x }\n";
+        // Each version is edited from the one before it.
+        let versions = [
+            // Insert a call inside a body.
+            "use std::fmt;\nfn caller() {\n    helper(1);\n    other();\n}\nfn helper(x: u8) -> u8 { x }\n",
+            // Delete a whole item.
+            "use std::fmt;\nfn caller() {\n    helper(1);\n    other();\n}\n",
+            // Edit at the start, in a multi-byte character.
+            "// é\nuse std::fmt;\nfn caller() {\n    helper(1);\n    other();\n}\n",
+            // Leave the file unparsable, then repair it.
+            "// é\nuse std::fmt;\nfn caller() {\n    helper(1\n    other();\n}\n",
+            "// é\nuse std::fmt;\nfn caller() {\n    helper(1);\n    other();\n}\nmod m;\n",
+            // The same text again.
+            "// é\nuse std::fmt;\nfn caller() {\n    helper(1);\n    other();\n}\nmod m;\n",
+            "",
+            "fn again() { helper(); }",
+        ];
+        let (_, tree) = extract_with_tree(base.as_bytes(), "rust").unwrap();
+        let mut previous = (base, tree.unwrap());
+        for version in versions {
+            let (record, tree) = extract_incremental(
+                previous.0.as_bytes(),
+                &previous.1,
+                version.as_bytes(),
+                "rust",
+            )
+            .unwrap();
+            assert_eq!(
+                record,
+                extract(version.as_bytes(), "rust").unwrap(),
+                "{version:?}"
+            );
+            let tree = tree.unwrap();
+            let (_, fresh) = extract_with_tree(version.as_bytes(), "rust").unwrap();
+            assert_eq!(
+                tree.tree.root_node().to_sexp(),
+                fresh.unwrap().tree.root_node().to_sexp(),
+                "{version:?}"
+            );
+            previous = (version, tree);
+        }
+        // A tree of another language is not reused.
+        let (_, typescript) = extract_with_tree(b"f();", "typescript").unwrap();
+        let (record, _) =
+            extract_incremental(b"f();", &typescript.unwrap(), b"f();", "rust").unwrap();
+        assert_eq!(record, extract(b"f();", "rust").unwrap());
+        // Configuration inputs have no tree.
+        let (record, tree) = extract_with_tree(b"[package]\n", "config").unwrap();
+        assert!(tree.is_none());
+        assert_eq!(record, extract(b"[package]\n", "config").unwrap());
     }
 }

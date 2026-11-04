@@ -7,7 +7,8 @@
 //! their nodes changed. `CallgraphBlob::extract_reference` keeps the
 //! extractor this replaced, for the extraction gate.
 //!
-//! This module also parses for extraction.
+//! This module also parses for extraction, including incremental reparsing
+//! after an edit.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -253,6 +254,60 @@ pub(crate) fn parse_source(
     with_parser(lang, |parser| parser.parse(source, None))
 }
 
+/// Parses `source` as `lang` after an edit from `previous_source`, whose
+/// tree in the same language is `previous`. The edit given to tree-sitter is
+/// the span between the texts' common prefix and common suffix; tree-sitter
+/// reuses every subtree the edit does not touch, and the tree it returns is
+/// the tree a fresh parse of `source` gives.
+pub(crate) fn reparse_source(
+    previous_source: &str,
+    previous: &tree_sitter::Tree,
+    source: &str,
+    lang: LangId,
+) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    let Some(edit) = text_edit(previous_source.as_bytes(), source.as_bytes()) else {
+        return Ok(previous.clone());
+    };
+    let mut tree = previous.clone();
+    tree.edit(&edit);
+    with_parser(lang, |parser| parser.parse(source, Some(&tree)))
+}
+
+/// The single edit that turns `old` into `new`: everything between their
+/// common prefix and their common suffix. `None` when they are equal.
+fn text_edit(old: &[u8], new: &[u8]) -> Option<tree_sitter::InputEdit> {
+    if old == new {
+        return None;
+    }
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let longest_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(longest_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Tree-sitter counts rows by '\n' and columns in bytes.
+    let point = |text: &[u8], byte: usize| {
+        let before = &text[..byte];
+        let row = before.iter().filter(|&&b| b == b'\n').count();
+        let line_start = before
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        tree_sitter::Point::new(row, byte - line_start)
+    };
+    Some(tree_sitter::InputEdit {
+        start_byte: prefix,
+        old_end_byte: old.len() - suffix,
+        new_end_byte: new.len() - suffix,
+        start_position: point(old, prefix),
+        old_end_position: point(old, old.len() - suffix),
+        new_end_position: point(new, new.len() - suffix),
+    })
+}
+
 thread_local! {
     // A parser is mutable and not shareable, so each extraction thread keeps
     // one per grammar instead of building one per file.
@@ -322,5 +377,24 @@ mod tests {
             }
             assert!(single == reference, "{language}: outputs differ");
         }
+    }
+
+    #[test]
+    fn text_edit_spans_the_changed_bytes() {
+        assert!(text_edit(b"abc", b"abc").is_none());
+        let edit = text_edit(b"ab\ncd\nef", b"ab\nXYZ\nef").unwrap();
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (3, 5, 6)
+        );
+        assert_eq!(edit.start_position, tree_sitter::Point::new(1, 0));
+        assert_eq!(edit.old_end_position, tree_sitter::Point::new(1, 2));
+        assert_eq!(edit.new_end_position, tree_sitter::Point::new(1, 3));
+        // Repeated text: the prefix and suffix may not overlap.
+        let edit = text_edit(b"aaaa", b"aa").unwrap();
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (2, 4, 2)
+        );
     }
 }

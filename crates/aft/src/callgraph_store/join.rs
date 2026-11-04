@@ -308,6 +308,17 @@ impl CallgraphBlob {
         single_walk::extract(source, language, extractor_version.into())
     }
 
+    /// Extracts the parse output of `source` from `tree`, its syntax tree
+    /// in `language`.
+    pub(crate) fn extract_tree(
+        source: &str,
+        language: &str,
+        extractor_version: impl Into<String>,
+        tree: &tree_sitter::Tree,
+    ) -> Result<Self, ManifestJoinError> {
+        single_walk::extract_tree(source, language, extractor_version.into(), tree)
+    }
+
     /// The extractor before the single walk: the same passes, each walking
     /// the tree itself and asking tree-sitter for parents and siblings. It
     /// stays only so the extraction gate (`data_layer::extract_gate`) can
@@ -631,7 +642,7 @@ fn append_optional_field(output: &mut Vec<u8>, value: Option<&[u8]>) {
     }
 }
 
-fn language_id(language: &str) -> Option<LangId> {
+pub(crate) fn language_id(language: &str) -> Option<LangId> {
     Some(match language {
         "typescript" => LangId::TypeScript,
         "tsx" => LangId::Tsx,
