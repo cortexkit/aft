@@ -479,8 +479,9 @@ impl Codes {
     }
 }
 
-/// The int8 layouts compared against the stored one, all bounded the same
-/// way: by the residual each layout leaves.
+/// The int8 layouts compared with each other, all bounded the same way: by
+/// the residual each layout leaves. The plane stores the centered one, with
+/// each segment's own mean; these use the corpus mean.
 struct Alternatives {
     symmetric: Codes,
     /// The corpus mean subtracted before quantizing.
@@ -1044,13 +1045,13 @@ fn main() {
                 bounded_counts(&all.members, &units.norms, query_norm, &bounds, &exact, k)
             };
             let counts = [
-                pick(&symmetric, 0.0, f64::min),
-                pick(&symmetric, 0.0, |_, l2| l2),
-                pick(&symmetric, 0.0, |l1, _| l1),
                 pick(&centered, shift, f64::min),
+                pick(&centered, shift, |_, l2| l2),
+                pick(&centered, shift, |l1, _| l1),
+                pick(&symmetric, 0.0, f64::min),
                 pick(&per_dimension, 0.0, f64::min),
             ];
-            let approx: Vec<f64> = symmetric.iter().map(|e| e.0).collect();
+            let approx: Vec<f64> = centered.iter().map(|e| e.0 + shift).collect();
             let exact_windows = fixed_windows(
                 &all.members,
                 &units.norms,
@@ -1064,10 +1065,10 @@ fn main() {
         })
         .collect();
     let names = [
-        "per-vector symmetric, min(L1, L2) bound (stored)",
-        "per-vector symmetric, L2 residual bound only",
-        "per-vector symmetric, L1 (largest residual) bound only",
-        "corpus mean subtracted, then per-vector symmetric",
+        "mean subtracted, per-vector symmetric, min(L1, L2) bound (stored)",
+        "mean subtracted, per-vector symmetric, L2 residual bound only",
+        "mean subtracted, per-vector symmetric, L1 (largest residual) bound only",
+        "per-vector symmetric without centering, min(L1, L2) bound",
         "each dimension scaled by its corpus maximum, then per-vector symmetric",
     ];
     let quantization: serde_json::Map<String, Value> = names

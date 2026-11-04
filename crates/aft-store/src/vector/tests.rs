@@ -251,6 +251,14 @@ fn vectors_and_chunk_maps_round_trip() {
     let opened = VectorSegment::open(&segment).unwrap().unwrap();
     assert_eq!(opened.model(), &model(70));
     assert_eq!(opened.len(), 40);
+    // The center is the mean of the stored vectors, to f32 precision.
+    for (dimension, center) in opened.center().iter().enumerate() {
+        let mean = vectors.iter().map(|v| f64::from(v[dimension])).sum::<f64>() / 40.0;
+        assert!(
+            (f64::from(*center) - mean).abs() < 1e-6,
+            "dimension {dimension}"
+        );
+    }
     let mut texts = opened.texts().unwrap();
     assert!(texts.is_sorted(), "units are in key order");
     texts.sort();

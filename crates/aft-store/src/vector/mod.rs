@@ -14,9 +14,13 @@
 //! same members, in the same order, with the same score bits (see
 //! [`VectorIndex::search`]).
 //!
-//! The codes are per-vector symmetric int8 (`cᵢ = round(vᵢ / s)`, with
-//! `s = max |vᵢ| / 127`). Each vector also stores its residual norm and its
-//! largest component residual, so the bound needs nothing else.
+//! The codes are per-vector symmetric int8 of each vector's offset from its
+//! segment's mean vector (`cᵢ = round((vᵢ − μᵢ) / s)`, with
+//! `s = max |vᵢ − μᵢ| / 127`). Each vector also stores its residual norm
+//! and its largest component residual, so the bound needs nothing else.
+//! Centering was chosen over plain per-vector and per-dimension scaling by
+//! measurement (`examples/vector_gate.rs`): it rescored the fewest members on
+//! every model measured.
 
 mod model;
 mod score;

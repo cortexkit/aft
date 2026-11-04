@@ -7,6 +7,7 @@
 //! |---|---|
 //! | fingerprint | the [`ModelIdentity`] every vector and chunk map here belongs to |
 //! | vector units | a unit table: each embedded-text digest in ascending order, located at its f32 row; a vector's ordinal is its position |
+//! | scan center | the mean of the segment's vectors (f32 each); every vector's codes are relative to it |
 //! | scan rows | per vector, by ordinal: scale, residual, norm and largest component residual (f32 each), then the int8 codes padded to 16 bytes; 64-byte aligned |
 //! | f32 rows | per vector, by ordinal: the vector as the embedder returned it, read only to rescore; 64-byte aligned |
 //! | chunk maps | a unit table: each (content, path) key in ascending order, located at its map |
@@ -19,7 +20,7 @@ use std::collections::BTreeMap;
 
 use super::VectorError;
 use super::model::{ChunkMapKey, ModelIdentity, TextDigest};
-use super::score::{ScanParams, quantize};
+use super::score::{ScanParams, mean, quantize};
 use crate::ids::{ContentKey, Digest128};
 use crate::le::u32_at;
 use crate::segment::{
@@ -34,9 +35,11 @@ const SCAN: SectionKind = SectionKind::new(0x0302);
 const VECTORS: SectionKind = SectionKind::new(0x0303);
 const CHUNK_MAPS: SectionKind = SectionKind::new(0x0304);
 const CHUNK_MAP_DATA: SectionKind = SectionKind::new(0x0305);
-const KINDS: [SectionKind; 6] = [
+const CENTER: SectionKind = SectionKind::new(0x0306);
+const KINDS: [SectionKind; 7] = [
     FINGERPRINT,
     UNITS,
+    CENTER,
     SCAN,
     VECTORS,
     CHUNK_MAPS,
@@ -55,13 +58,17 @@ const FLAG_EXPORTED: u8 = 1;
 pub const MAX_DIMENSIONS: u32 = 8192;
 
 /// The vector sections this build reads.
-pub const KNOWN: [KnownSection; 6] = [
+pub const KNOWN: [KnownSection; 7] = [
     KnownSection {
         kind: FINGERPRINT,
         version: VERSION,
     },
     KnownSection {
         kind: UNITS,
+        version: VERSION,
+    },
+    KnownSection {
+        kind: CENTER,
         version: VERSION,
     },
     KnownSection {
@@ -192,7 +199,7 @@ impl VectorSectionsBuilder {
         self.maps.len()
     }
 
-    /// Writes the six sections into `writer`.
+    /// Writes the seven sections into `writer`.
     ///
     /// # Errors
     ///
@@ -221,13 +228,24 @@ impl VectorSectionsBuilder {
         let (table, units) = table.finish();
         writer.write_section(spec(UNITS, Alignment::Word), &table, units)?;
 
+        let center = mean(self.vectors.values().map(Vec::as_slice), dimensions);
+        let center_bytes: Vec<u8> = center
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        writer.write_section(
+            spec(CENTER, Alignment::Word),
+            &center_bytes,
+            dimensions as u64,
+        )?;
+
         // Streamed one row at a time: neither section is ever whole in memory.
         writer.begin_section(spec(SCAN, Alignment::Vector))?;
         let mut row = Vec::with_capacity(row_len);
         let mut codes = Vec::with_capacity(dimensions);
         for vector in self.vectors.values() {
             codes.clear();
-            let params = quantize(vector, &mut codes);
+            let params = quantize(vector, &center, &mut codes);
             row.clear();
             for value in [
                 params.scale,
@@ -296,6 +314,8 @@ pub struct VectorSegment<'s> {
     segment: &'s Segment,
     model: ModelIdentity,
     units: UnitTable<'s>,
+    /// Decoded once: every search needs all of it, and it is one vector.
+    center: Vec<f32>,
     scan: SectionHandle,
     vectors: SectionHandle,
     maps: UnitTable<'s>,
@@ -314,6 +334,7 @@ impl<'s> VectorSegment<'s> {
         let [
             Some(fingerprint),
             Some(units),
+            Some(center),
             Some(scan),
             Some(vectors),
             Some(maps),
@@ -340,6 +361,19 @@ impl<'s> VectorSegment<'s> {
             .ok_or_else(|| malformed(segment, "the model fingerprint does not decode"))?;
         let dimensions = model.dimensions as usize;
         let units = UnitTable::open(segment, units)?;
+        let center_info = segment.info(center);
+        if center_info.len != dimensions as u64 * 4 || center_info.item_count != dimensions as u64 {
+            return Err(malformed(
+                segment,
+                "the scan center does not match the model",
+            ));
+        }
+        let mut center_bytes = vec![0; dimensions * 4];
+        segment.read(center, 0, &mut center_bytes)?;
+        let center = f32s(&center_bytes);
+        if center.iter().any(|value| !value.is_finite()) {
+            return Err(malformed(segment, "the scan center is not finite"));
+        }
         let count = u64::from(units.len());
         let scan_info = segment.info(scan);
         let vectors_info = segment.info(vectors);
@@ -364,6 +398,7 @@ impl<'s> VectorSegment<'s> {
             segment,
             model,
             units,
+            center,
             scan,
             vectors,
             maps,
@@ -385,6 +420,12 @@ impl<'s> VectorSegment<'s> {
     #[must_use]
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    /// The mean vector the segment's codes are relative to.
+    #[must_use]
+    pub fn center(&self) -> &[f32] {
+        &self.center
     }
 
     /// How many vectors the segment holds.

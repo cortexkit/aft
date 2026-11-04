@@ -401,6 +401,10 @@ impl<'s> VectorIndex<'s> {
         let mut bounds = Vec::with_capacity(members.slots.len());
         let mut buf = Vec::new();
         for (segment, range) in self.segments.iter().zip(&members.segment_slots) {
+            if range.is_empty() {
+                continue;
+            }
+            let center = terms.center(query, segment.center());
             for_each_window(
                 &members.slots[range.clone()],
                 (READ_BYTES / row_len).max(1),
@@ -415,7 +419,7 @@ impl<'s> VectorIndex<'s> {
                         let row = &buf[at..at + row_len];
                         let params = scan_params(row);
                         let approx = approx_dot(query, scan_codes(row, dimensions));
-                        let (low, high) = terms.dot_bounds(approx, &params);
+                        let (low, high) = terms.dot_bounds(approx, &params, &center);
                         bounds.push(UnitBounds {
                             low,
                             high,

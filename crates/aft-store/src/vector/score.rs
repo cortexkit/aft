@@ -8,14 +8,16 @@
 //! operations on its own, so the same expressions give the same bits on
 //! every platform.
 //!
-//! The approximate score reads the int8 codes. For a stored vector `v` with
-//! scale `s` and codes `c`, and a query `q`, the real dot product `q·v`
-//! lies within `min(e∞·‖q‖₁, r·‖q‖₂)` of `s·(q·c)`, where `r = ‖v − s·c‖₂`
-//! and `e∞ = max |vᵢ − s·cᵢ|` are measured when the vector is written
-//! (Cauchy–Schwarz and Hölder's inequality: true for any codes, however they
-//! were chosen). Float rounding in both the approximation and today's f32
-//! sum is bounded on top of that, so the interval is guaranteed to hold
-//! today's computed dot product, not just the real one.
+//! The approximate score reads the int8 codes. Every vector of a segment is
+//! quantized relative to the segment's mean vector `μ` (its center): for a
+//! stored vector `v` with scale `s` and codes `c`, `v = μ + s·c + e`, and
+//! for a query `q` the real dot product `q·v` lies within
+//! `min(e∞·‖q‖₁, r·‖q‖₂)` of `q·μ + s·(q·c)`, where `r = ‖e‖₂` and
+//! `e∞ = max |eᵢ|` are measured when the vector is written (Cauchy–Schwarz
+//! and Hölder's inequality: true for any codes, however they were chosen).
+//! Float rounding in both the approximation and today's f32 sum is bounded
+//! on top of that, so the interval is guaranteed to hold today's computed
+//! dot product, not just the real one.
 
 use std::cmp::Ordering;
 
@@ -147,15 +149,44 @@ impl QueryTerms {
         }
     }
 
+    /// The query's terms for one segment's center `μ`.
+    pub(crate) fn center(&self, query: &[f32], center: &[f32]) -> CenterTerms {
+        // Products of two f32s are exact in f64; the sum's rounding is at
+        // most a relative n·2⁻⁵³ of Σ|qᵢμᵢ| ≤ ‖q‖‖μ‖, doubled here.
+        let shift = query
+            .iter()
+            .zip(center)
+            .map(|(q, m)| f64::from(*q) * f64::from(*m))
+            .sum::<f64>();
+        let l2 = center
+            .iter()
+            .map(|m| f64::from(*m) * f64::from(*m))
+            .sum::<f64>()
+            .sqrt()
+            * (1.0 + 1e-12);
+        CenterTerms {
+            shift,
+            shift_error: (query.len() + 2) as f64 * f64::EPSILON * self.l2 * l2,
+            l2,
+        }
+    }
+
     /// Bounds on today's f32 dot product of the query with a stored vector,
     /// from the vector's codes.
     ///
-    /// `approx` is [`approx_dot`] of the codes; the result is `(low, high)`
-    /// with `low ≤ dot_product(query, v) ≤ high`.
-    pub(crate) fn dot_bounds(&self, approx: f32, params: &ScanParams) -> (f32, f32) {
+    /// `approx` is [`approx_dot`] of the codes and `center` the terms for the
+    /// segment's center; the result is `(low, high)` with
+    /// `low ≤ dot_product(query, v) ≤ high`.
+    pub(crate) fn dot_bounds(
+        &self,
+        approx: f32,
+        params: &ScanParams,
+        center: &CenterTerms,
+    ) -> (f32, f32) {
         let scale = f64::from(params.scale);
-        let center = scale * f64::from(approx);
-        // Each of these bounds |q·v − s·(q·c)| on its own.
+        // `scale · approx` is exact in f64; adding the shift rounds once.
+        let estimate = center.shift + scale * f64::from(approx);
+        // Each of these bounds |q·v − (q·μ + s·(q·c))| = |q·e| on its own.
         let quantization =
             (f64::from(params.max_residual) * self.l1).min(f64::from(params.residual) * self.l2);
         // A bound on ‖v‖₂ from today's f32 norm, whose own rounding is at most
@@ -163,29 +194,43 @@ impl QueryTerms {
         let vector_l2 = f64::from(params.norm) * (1.0 + 2.0 * self.gamma);
         // Rounding: today's f32 sum is within γ·Σ|qᵢvᵢ| ≤ γ·‖q‖‖v‖ of the
         // real dot product, and the int8 sum within γ·Σ|qᵢ·s·cᵢ| ≤
-        // γ·‖q‖(‖v‖ + r) of s·(q·c), since ‖s·c‖ ≤ ‖v‖ + r.
-        let rounding = self.gamma * self.l2 * (2.0 * vector_l2 + f64::from(params.residual))
-            + self.subnormal_slack * (1.0 + scale);
+        // γ·‖q‖(‖v‖ + ‖μ‖ + r) of s·(q·c), since s·c = v − μ − e.
+        let rounding =
+            self.gamma * self.l2 * (2.0 * vector_l2 + center.l2 + f64::from(params.residual))
+                + self.subnormal_slack * (1.0 + scale)
+                + center.shift_error
+                + estimate.abs() * f64::EPSILON;
         // The bound terms are themselves computed in f64; a relative margin
         // far above f64's rounding covers that.
         let error = (quantization + rounding) * (1.0 + 1e-9);
         (
-            f32_at_or_above(center - error),
-            f32_at_or_below(center + error),
+            f32_at_or_above(estimate - error),
+            f32_at_or_below(estimate + error),
         )
     }
+}
+
+/// What the scan needs of a query for one segment.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CenterTerms {
+    /// `q·μ`, computed in f64.
+    shift: f64,
+    /// At least the rounding error of `shift`.
+    shift_error: f64,
+    /// At least `‖μ‖₂`.
+    l2: f64,
 }
 
 /// The per-vector values the scan reads beside the codes.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct ScanParams {
-    /// Code `c` stands for `c · scale`.
+    /// Code `c` stands for `c · scale`, added to the segment's center.
     pub(crate) scale: f32,
-    /// At least `‖v − scale·c‖₂`.
+    /// At least `‖v − μ − scale·c‖₂`.
     pub(crate) residual: f32,
     /// Today's f32 norm of the vector, exactly as `vector_norm` computes it.
     pub(crate) norm: f32,
-    /// At least `max |vᵢ − scale·cᵢ|`.
+    /// At least `max |vᵢ − μᵢ − scale·cᵢ|`.
     pub(crate) max_residual: f32,
 }
 
@@ -242,21 +287,57 @@ pub(crate) fn approx_dot(query: &[f32], codes: &[u8]) -> f32 {
     total
 }
 
-/// Quantizes one vector: per-vector symmetric int8, `cᵢ = round(vᵢ / s)` with
-/// `s = max |vᵢ| / 127`, plus the residuals the error bound needs, rounded
+/// The mean of `vectors`, the center a segment's codes are relative to.
+pub(crate) fn mean<'v>(
+    vectors: impl ExactSizeIterator<Item = &'v [f32]>,
+    dimensions: usize,
+) -> Vec<f32> {
+    let count = vectors.len();
+    let mut sums = vec![0f64; dimensions];
+    for vector in vectors {
+        for (sum, value) in sums.iter_mut().zip(vector) {
+            *sum += f64::from(*value);
+        }
+    }
+    sums.iter()
+        .map(|sum| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "any f32 near the mean serves; the residuals are measured against the stored one"
+            )]
+            let value = (sum / count.max(1) as f64) as f32;
+            value
+        })
+        .collect()
+}
+
+/// Quantizes one vector relative to its segment's `center`: per-vector
+/// symmetric int8 of `w = v − μ`, `cᵢ = round(wᵢ / s)` with
+/// `s = max |wᵢ| / 127`, plus the residuals the error bound needs, rounded
 /// up so the bound stays a bound.
-pub(crate) fn quantize(vector: &[f32], codes: &mut Vec<u8>) -> ScanParams {
-    let peak = vector
+///
+/// Centering is chosen by measurement: on aft's own chunks, real queries and
+/// three real models, it shrank the set of members a search must rescore at
+/// every percentile, most for models whose vectors share a large common
+/// component (bge-base: median 509 to 158), and it costs one stored vector
+/// per segment.
+pub(crate) fn quantize(vector: &[f32], center: &[f32], codes: &mut Vec<u8>) -> ScanParams {
+    let offsets: Vec<f64> = vector
         .iter()
-        .fold(0f32, |peak, value| peak.max(value.abs()));
-    let scale = peak / 127.0;
+        .zip(center)
+        .map(|(v, m)| f64::from(*v) - f64::from(*m))
+        .collect();
+    let peak = offsets.iter().fold(0f64, |peak, w| peak.max(w.abs()));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "any f32 scale works; the residuals are measured against the stored one"
+    )]
+    let scale = (peak / 127.0) as f32;
     let mut squares = 0f64;
     let mut max_residual = 0f64;
-    for value in vector {
+    for offset in &offsets {
         let code = if scale > 0.0 {
-            (f64::from(*value) / f64::from(scale))
-                .round()
-                .clamp(-127.0, 127.0)
+            (offset / f64::from(scale)).round().clamp(-127.0, 127.0)
         } else {
             0.0
         };
@@ -267,16 +348,20 @@ pub(crate) fn quantize(vector: &[f32], codes: &mut Vec<u8>) -> ScanParams {
         let code = code as i8;
         codes.push(code.cast_unsigned());
         // An f32 times a small integer is exact in f64.
-        let residual = (f64::from(*value) - f64::from(scale) * f64::from(code)).abs();
+        let residual = (offset - f64::from(scale) * f64::from(code)).abs();
         squares += residual * residual;
         max_residual = max_residual.max(residual);
     }
-    // f64 sums and roots are off by far less than this margin.
+    // The offsets carry one f64 rounding each, at most 2⁻⁵²·peak; the sums
+    // and root are off by far less than the relative margin.
+    let slack = peak * f64::EPSILON;
     let margin = 1.0 + 1e-12;
     ScanParams {
         scale,
-        residual: f32_at_or_above(squares.sqrt() * margin),
+        residual: f32_at_or_above(
+            (squares.sqrt() + slack * (offsets.len() as f64).sqrt()) * margin,
+        ),
         norm: vector_norm(vector),
-        max_residual: f32_at_or_above(max_residual * margin),
+        max_residual: f32_at_or_above((max_residual + slack) * margin),
     }
 }

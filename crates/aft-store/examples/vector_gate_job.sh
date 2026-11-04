@@ -2,8 +2,8 @@
 # The vector-plane gate on real data, for a Linux build server with network
 # access (models and Python packages are downloaded):
 #
-#   1. cut this checkout into today's semantic chunks with AFT's own
-#      `export_chunks` example;
+#   1. cut this checkout into today's semantic chunks with a copy of AFT's
+#      own `export_chunks` example (see the build step);
 #   2. embed every chunk, and the real aft_search query samples, with real
 #      models (`vector_gate_embed.py`);
 #   3. run `vector_gate` on each model's vectors, and on the benchmark's
@@ -32,8 +32,17 @@ MODELS="${MODELS:-minilm static bge-base}"
 stage() { echo "== $1 ($(date -u +%H:%M:%S))"; }
 
 stage "build"
-if ! cargo build --profile stage -p agent-file-tools --example export_chunks --target-dir "$TD" \
-  >"$OUT/build-aft.log" 2>&1; then
+# `export_chunks` at this base stops at the first CUDA kernel chunk: it does
+# not decode SymbolKind::Kernel (byte 10). The job builds a copy that does,
+# as a temporary example removed when the job ends; the copy differs from
+# the original only in that one match arm.
+EXPORTER=crates/aft/examples/vector_gate_export_chunks.rs
+trap 'rm -f "$EXPORTER"' EXIT
+sed 's/        9 => Ok(SymbolKind::FileSummary),/        9 => Ok(SymbolKind::FileSummary),\n        10 => Ok(SymbolKind::Kernel),/' \
+  crates/aft/examples/export_chunks.rs >"$EXPORTER"
+grep -q 'SymbolKind::Kernel' "$EXPORTER" || { echo "could not add the Kernel kind"; exit 1; }
+if ! cargo build --profile stage -p agent-file-tools --example vector_gate_export_chunks \
+  --target-dir "$TD" >"$OUT/build-aft.log" 2>&1; then
   echo "export_chunks build failed"; tail -30 "$OUT/build-aft.log"; exit 1
 fi
 if ! cargo build --release -p aft-store --example vector_gate --target-dir "$TD" \
@@ -43,7 +52,10 @@ fi
 GATE="$TD/release/examples/vector_gate"
 
 stage "chunks"
-"$TD/stage/examples/export_chunks" . "$T/chunks-aft.jsonl" 2>&1 | tail -2
+if ! "$TD/stage/examples/vector_gate_export_chunks" . "$T/chunks-aft.jsonl" >"$OUT/export.log" 2>&1; then
+  echo "chunk export failed"; tail -5 "$OUT/export.log"; exit 1
+fi
+tail -1 "$OUT/export.log"
 gzip -1 "$T/chunks-aft.jsonl"
 CHUNKS="$T/chunks-aft.jsonl.gz"
 
