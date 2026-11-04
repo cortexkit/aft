@@ -19,16 +19,16 @@ cargo build --profile ci-storm -p agent-file-tools \
 bin="${CARGO_TARGET_DIR:-target}/ci-storm/examples"
 status=0
 started=$(date +%s)
-GATE_SAMPLE_SCALE="$scale" "$bin/resolve_gate" . "$threads" > "$out/parity.txt" 2> "$out/parity.err" \
-  || status=1
-echo "parity rc=$? in $(( $(date +%s) - started ))s"
+GATE_SAMPLE_SCALE="$scale" "$bin/resolve_gate" . "$threads" > "$out/parity.txt" 2> "$out/parity.err"
+rc=$?; [ "$rc" -eq 0 ] || status=1
+echo "parity rc=$rc in $(( $(date +%s) - started ))s"
 grep -E "^ *(rows_only|binding_mismatches|dispatch_mismatches|fragment_mismatches|segment_failures|segment_bytes|dead_code_differing)" "$out/parity.txt"
 grep -A12 "examples: \[" "$out/parity.txt" | head -14
 grep -E "panicked|assertion" -A3 "$out/parity.err" | head -8
 started=$(date +%s)
-"$bin/edit_gate" crates/aft/examples/data/edit-pack-aft.jsonl.gz "$threads" 5 > "$out/edit.jsonl" 2> "$out/edit.err" \
-  || status=1
-echo "edit rc=$? in $(( $(date +%s) - started ))s"
+"$bin/edit_gate" crates/aft/examples/data/edit-pack-aft.jsonl.gz "$threads" 5 > "$out/edit.jsonl" 2> "$out/edit.err"
+rc=$?; [ "$rc" -eq 0 ] || status=1
+echo "edit rc=$rc in $(( $(date +%s) - started ))s"
 tail -2 "$out/edit.err"
 python3 - "$out/edit.jsonl" <<'PY'
 import json, sys
@@ -46,9 +46,9 @@ for e in bad[:3]:
     print(" ", e["commit"], e["seq"], e["path"], e.get("examples", [])[:4])
 PY
 started=$(date +%s)
-"$bin/reuse_gate" crates/aft/examples/data/edit-pack-aft.jsonl.gz "$threads" > "$out/reuse.txt" 2> "$out/reuse.err" \
-  || status=1
-echo "reuse rc=$? in $(( $(date +%s) - started ))s"
+"$bin/reuse_gate" crates/aft/examples/data/edit-pack-aft.jsonl.gz "$threads" > "$out/reuse.txt" 2> "$out/reuse.err"
+rc=$?; [ "$rc" -eq 0 ] || status=1
+echo "reuse rc=$rc in $(( $(date +%s) - started ))s"
 tail -2 "$out/reuse.err"
 grep -E " diff [0-9]+ [1-9]| diff [1-9]" "$out/reuse.txt" | cut -c1-300 | head -5
 exit "$status"
