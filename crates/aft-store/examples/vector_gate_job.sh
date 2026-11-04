@@ -21,6 +21,9 @@ cd "$(dirname "$0")/../../.."
 git log -1 --oneline 2>/dev/null || true
 
 OUT=target/vector-gate
+# A build server may keep this folder from an earlier job; start clean so
+# every report comes from this run.
+rm -rf "$OUT"
 mkdir -p "$OUT"
 T=$(mktemp -d)
 mkdir -p "$T/home" "$T/config" "$T/data" "$T/state" "$T/cache" "$T/storage"
@@ -32,15 +35,19 @@ MODELS="${MODELS:-minilm static bge-base}"
 stage() { echo "== $1 ($(date -u +%H:%M:%S))"; }
 
 stage "build"
-# `export_chunks` at this base stops at the first CUDA kernel chunk: it does
-# not decode SymbolKind::Kernel (byte 10). The job builds a copy that does,
-# as a temporary example removed when the job ends; the copy differs from
-# the original only in that one match arm.
+# The checked-in `export_chunks` example is behind the index format it reads:
+# it does not decode SymbolKind::Kernel (byte 10), so it stops at the first
+# CUDA kernel chunk, and it treats the skipped-rows trailer the index now
+# writes after its entries as trailing garbage. The job builds a copy that
+# decodes the kind and allows the trailer, as a temporary example removed
+# when the job ends; the copy differs from the original only in those lines.
 EXPORTER=crates/aft/examples/vector_gate_export_chunks.rs
 trap 'rm -f "$EXPORTER"' EXIT
-sed 's/        9 => Ok(SymbolKind::FileSummary),/        9 => Ok(SymbolKind::FileSummary),\n        10 => Ok(SymbolKind::Kernel),/' \
+sed -e 's/        9 => Ok(SymbolKind::FileSummary),/        9 => Ok(SymbolKind::FileSummary),\n        10 => Ok(SymbolKind::Kernel),/' \
+  -e 's/    if cursor.position() != bytes.len() as u64 {/    if cursor.position() > bytes.len() as u64 {/' \
   crates/aft/examples/export_chunks.rs >"$EXPORTER"
-grep -q 'SymbolKind::Kernel' "$EXPORTER" || { echo "could not add the Kernel kind"; exit 1; }
+grep -q 'SymbolKind::Kernel' "$EXPORTER" && grep -q 'cursor.position() > bytes.len()' "$EXPORTER" ||
+  { echo "could not patch the exporter copy"; exit 1; }
 if ! cargo build --profile stage -p agent-file-tools --example vector_gate_export_chunks \
   --target-dir "$TD" >"$OUT/build-aft.log" 2>&1; then
   echo "export_chunks build failed"; tail -30 "$OUT/build-aft.log"; exit 1
