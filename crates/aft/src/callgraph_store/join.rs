@@ -1868,6 +1868,11 @@ impl DispatchTypeTargetTrace {
             .collect()
     }
 
+    /// Every path whose presence this resolution probed.
+    pub(crate) fn probes(&self) -> &BTreeSet<String> {
+        &self.probes
+    }
+
     /// True when a path this resolution probed was added or removed.
     pub(crate) fn probes_any(&self, paths: &BTreeSet<String>) -> bool {
         !self.probes.is_disjoint(paths)

@@ -19,7 +19,7 @@
 //! reads the outputs of passes 2 and 3, so one round reaches the result a
 //! cold build gives.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,6 +54,90 @@ pub struct UpdateStats {
     pub total_ms: f64,
 }
 
+/// Which files recorded each input key, for one kind of recording: the
+/// reverse inputs a change is looked up in.
+#[derive(Debug, Default)]
+struct Readers {
+    by_key: HashMap<String, HashSet<String>>,
+    keys_of: HashMap<String, BTreeSet<String>>,
+}
+
+impl Readers {
+    fn set(&mut self, file: &str, keys: BTreeSet<String>) {
+        self.remove(file);
+        for key in &keys {
+            self.by_key
+                .entry(key.clone())
+                .or_default()
+                .insert(file.to_string());
+        }
+        self.keys_of.insert(file.to_string(), keys);
+    }
+
+    fn remove(&mut self, file: &str) {
+        let Some(keys) = self.keys_of.remove(file) else {
+            return;
+        };
+        for key in keys {
+            if let Some(files) = self.by_key.get_mut(&key) {
+                files.remove(file);
+                if files.is_empty() {
+                    self.by_key.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// The files that recorded one of `keys`.
+    fn of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        keys.into_iter()
+            .filter_map(|key| self.by_key.get(key))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Every reverse input of a checkout's resolution.
+#[derive(Debug, Default)]
+struct ReverseInputs {
+    /// What each file's binding probed or read (pass 1).
+    binding: Readers,
+    /// What each file's resolution depends on (pass 2).
+    resolution: Readers,
+    /// What each file's dispatch type targets depend on (pass 3).
+    dispatch: Readers,
+    /// The method-call dependency keys each file's sites recorded (pass 4).
+    sites: Readers,
+}
+
+impl ReverseInputs {
+    fn note_prebound(&mut self, file: &str, binding: &ViewBindingDependencies) {
+        self.binding.set(file, binding.dependencies.clone());
+    }
+
+    fn note_resolution(&mut self, file: &str, resolution: &FileResolution) {
+        self.resolution
+            .set(file, resolution.binding.dependencies.clone());
+        match &resolution.dispatch {
+            Some(dispatch) => {
+                let mut keys = dispatch.trace.dependencies();
+                keys.extend(dispatch.trace.probes().iter().cloned());
+                self.dispatch.set(file, keys);
+            }
+            None => self.dispatch.remove(file),
+        }
+        self.sites.set(file, resolution.site_dependencies.clone());
+    }
+
+    fn remove(&mut self, file: &str) {
+        self.binding.remove(file);
+        self.resolution.remove(file);
+        self.dispatch.remove(file);
+        self.sites.remove(file);
+    }
+}
+
 /// A checkout's resolution, with what each pass recorded.
 pub struct LiveCheckout {
     pub(crate) inputs: CheckoutInputs,
@@ -62,7 +146,8 @@ pub struct LiveCheckout {
     prebound: HashMap<String, ViewBindingDependencies>,
     pub(crate) resolved: BTreeMap<String, FileResolution>,
     calls: MethodCallInputs,
-    pool: rayon::ThreadPool,
+    reverse: ReverseInputs,
+    pool: Arc<rayon::ThreadPool>,
 }
 
 impl LiveCheckout {
@@ -72,13 +157,13 @@ impl LiveCheckout {
     ///
     /// When resolution fails on a file.
     pub(crate) fn cold(inputs: CheckoutInputs, threads: usize) -> Result<Self, ManifestJoinError> {
-        let pool = super::callgraph::pool(threads)?;
+        let pool = Arc::new(super::callgraph::pool(threads)?);
         let (surfaces, prebound, resolved, calls) = pool.install(|| {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
             let (surfaces, prebound) = bind_all(&inputs, &paths)?;
             let surfaces: Surfaces = Arc::new(surfaces);
             let mut resolved = resolve_files(&inputs, &surfaces, &prebound, &paths)?;
-            let calls = MethodCallInputs::build(&inputs, &resolved);
+            let mut calls = MethodCallInputs::build(&inputs, &resolved);
             for (path, sites, dependencies) in calls.resolve_sites(&inputs, &paths) {
                 let file = resolved.get_mut(&path).expect("resolved");
                 file.sites = sites;
@@ -86,12 +171,20 @@ impl LiveCheckout {
             }
             Ok::<_, ManifestJoinError>((surfaces, prebound, resolved, calls))
         })?;
+        let mut reverse = ReverseInputs::default();
+        for (path, binding) in &prebound {
+            reverse.note_prebound(path, binding);
+        }
+        for (path, file) in &resolved {
+            reverse.note_resolution(path, file);
+        }
         Ok(Self {
             inputs,
             surfaces,
             prebound,
             resolved,
             calls,
+            reverse,
             pool,
         })
     }
@@ -108,14 +201,16 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
-        let pool = std::mem::replace(&mut self.pool, super::callgraph::pool(1)?);
-        let result = pool.install(|| self.update_in_pool(next, changed));
-        self.pool = pool;
-        let mut stats = result?;
+        let pool = Arc::clone(&self.pool);
+        let mut stats = pool.install(|| self.update_in_pool(next, changed))?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(stats)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the four passes run in order and each reads the previous one's results"
+    )]
     fn update_in_pool(
         &mut self,
         next: CheckoutInputs,
@@ -130,10 +225,8 @@ impl LiveCheckout {
         let membership = changed
             .iter()
             .filter(|path| {
-                old.state.get(path.as_bytes()).is_some()
-                    != inputs.state.get(path.as_bytes()).is_some()
-                    || old.state.get(path.as_bytes()).map(|record| record.kind)
-                        != inputs.state.get(path.as_bytes()).map(|record| record.kind)
+                old.state.get(path.as_bytes()).map(|record| record.kind)
+                    != inputs.state.get(path.as_bytes()).map(|record| record.kind)
             })
             .cloned()
             .collect::<BTreeSet<_>>();
@@ -153,6 +246,7 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
+        drop(old);
 
         // Pass 1. A binding depends on the file's own parse, on which paths
         // exist, and on configuration it read.
@@ -162,51 +256,55 @@ impl LiveCheckout {
         if !configs.is_empty() {
             binding_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
-        let rebind = inputs
-            .parses
-            .keys()
-            .filter(|path| {
-                contents.contains(*path)
-                    || self
-                        .prebound
-                        .get(path.as_str())
-                        .is_none_or(|binding| !binding.dependencies.is_disjoint(&binding_keys))
-            })
-            .collect::<Vec<_>>();
-        let (new_surfaces, new_prebound) = bind_all(inputs, &rebind)?;
+        let mut rebind = self.reverse.binding.of(&binding_keys);
+        rebind.extend(contents.iter().cloned());
+        rebind.retain(|path| inputs.parses.contains_key(path));
+        let rebind = rebind.into_iter().collect::<Vec<_>>();
+        let rebind_refs = rebind.iter().collect::<Vec<_>>();
+        let (new_surfaces, new_prebound) = bind_all(inputs, &rebind_refs)?;
         stats.rebound = rebind.len();
         let mut surfaces_changed = BTreeSet::new();
+        let mut references_changed = BTreeSet::new();
         for path in &rebind {
-            let same = self
-                .prebound
-                .get(path.as_str())
-                .is_some_and(|old| old.same_surface(&new_prebound[path.as_str()]));
-            if !same {
-                surfaces_changed.insert((*path).clone());
+            let new = &new_prebound[path.as_str()];
+            match self.prebound.get(path.as_str()) {
+                Some(old) => {
+                    if !old.same_surface(new) {
+                        surfaces_changed.insert(path.clone());
+                    }
+                    if old.references != new.references {
+                        references_changed.insert(path.clone());
+                    }
+                }
+                None => {
+                    surfaces_changed.insert(path.clone());
+                    references_changed.insert(path.clone());
+                }
             }
         }
-        for path in old.parses.keys() {
-            if !inputs.parses.contains_key(path) {
-                surfaces_changed.insert(path.clone());
-                self.prebound.remove(path);
-                self.resolved.remove(path);
-            }
+        let removed = self
+            .resolved
+            .keys()
+            .filter(|path| !inputs.parses.contains_key(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in &removed {
+            surfaces_changed.insert(path.clone());
+            self.prebound.remove(path);
+            self.resolved.remove(path);
+            self.reverse.remove(path);
         }
         stats.surfaces_changed = surfaces_changed.len();
-        let mut surfaces = (*self.surfaces).clone();
-        surfaces.retain(|path, _| inputs.parses.contains_key(path));
-        let references_changed = rebind
-            .iter()
-            .filter(|path| {
-                self.prebound
-                    .get(path.as_str())
-                    .is_none_or(|old| old.references != new_prebound[path.as_str()].references)
-            })
-            .map(|path| (*path).clone())
-            .collect::<BTreeSet<_>>();
+        // No index from the last update is alive, so this edits in place.
+        let surfaces = Arc::make_mut(&mut self.surfaces);
+        for path in &removed {
+            surfaces.remove(path);
+        }
         surfaces.extend(new_surfaces);
-        self.prebound.extend(new_prebound);
-        self.surfaces = Arc::new(surfaces);
+        for (path, binding) in new_prebound {
+            self.reverse.note_prebound(&path, &binding);
+            self.prebound.insert(path, binding);
+        }
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // What a recorded answer can depend on that changed.
@@ -229,44 +327,45 @@ impl LiveCheckout {
         let started = Instant::now();
         let facts = Rc::new(ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs })));
         let index = resolver_index(&self.surfaces, &facts);
-        let mut answers = BTreeMap::new();
-        let mut resolve = BTreeSet::new();
-        let mut replayed = Vec::new();
+        let mut resolve = contents.clone();
+        resolve.extend(references_changed.iter().cloned());
+        resolve.retain(|path| inputs.parses.contains_key(path));
         for path in inputs.parses.keys() {
-            let Some(old) = self.resolved.get(path) else {
+            if !self.resolved.contains_key(path) {
                 resolve.insert(path.clone());
+            }
+        }
+        let mut answers = BTreeMap::new();
+        for path in self.reverse.resolution.of(&changed_keys) {
+            if resolve.contains(&path) {
+                continue;
+            }
+            let Some(old) = self.resolved.get(&path) else {
                 continue;
             };
-            if contents.contains(path) || references_changed.contains(path) {
-                resolve.insert(path.clone());
-                continue;
-            }
-            if old.binding.dependencies.is_disjoint(&changed_keys) {
-                continue;
-            }
             stats.replayed += 1;
             if old
                 .binding
                 .surface_replays(&index, &changed_keys, &mut answers)
             {
-                replayed.push(path.clone());
+                stats.kept_after_replay += 1;
             } else {
-                resolve.insert(path.clone());
+                resolve.insert(path);
             }
         }
         drop(answers);
         // Files kept whose binding was redone carry their resolution over.
         for path in &rebind {
-            if resolve.contains(*path) {
+            if resolve.contains(path) {
                 continue;
             }
-            let mut binding = self.prebound[path.as_str()].clone();
             if let Some(old) = self.resolved.get_mut(path.as_str()) {
+                let mut binding = self.prebound[path.as_str()].clone();
                 binding.reuse_resolution(&old.binding);
                 old.binding = binding;
+                self.reverse.note_resolution(path, old);
             }
         }
-        stats.kept_after_replay = replayed.len();
         let paths = resolve.iter().collect::<Vec<_>>();
         let fresh = resolve_files(inputs, &self.surfaces, &self.prebound, &paths)?;
         stats.resolved = fresh.len();
@@ -276,6 +375,7 @@ impl LiveCheckout {
                 file.sites = old.sites;
                 file.site_dependencies = old.site_dependencies;
             }
+            self.reverse.note_resolution(&path, &file);
             self.resolved.insert(path, file);
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -284,29 +384,34 @@ impl LiveCheckout {
         let started = Instant::now();
         let mut trace_answers = BTreeMap::new();
         let mut recompute = Vec::new();
-        for (path, file) in &self.resolved {
-            if resolve.contains(path) {
+        let mut trace_keys = changed_keys.clone();
+        trace_keys.extend(membership.iter().cloned());
+        for path in self.reverse.dispatch.of(&trace_keys) {
+            if resolve.contains(&path) {
                 continue;
             }
-            let Some(dispatch) = &file.dispatch else {
+            let Some(dispatch) = self
+                .resolved
+                .get(&path)
+                .and_then(|file| file.dispatch.as_ref())
+            else {
                 continue;
             };
             let trace = &dispatch.trace;
-            if trace.dependencies().is_disjoint(&changed_keys) && !trace.probes_any(&membership) {
-                continue;
-            }
             stats.dispatch_replayed += 1;
             if trace.probes_any(&membership)
                 || !trace.replays(&index, &changed_keys, &mut trace_answers)
             {
-                recompute.push(path.clone());
+                recompute.push(path);
             }
         }
         drop(trace_answers);
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
-            self.resolved.get_mut(path).expect("kept").dispatch = dispatch;
+            let file = self.resolved.get_mut(path).expect("kept");
+            file.dispatch = dispatch;
+            self.reverse.note_resolution(path, file);
         }
         stats.dispatch_recomputed = recompute.len();
         stats.dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -329,21 +434,20 @@ impl LiveCheckout {
                 stats.facts_changed += 1;
             }
             site_keys.extend(keys);
-            if own && inputs.parses.contains_key(path) {
+            if own {
                 sites.insert(path.clone());
             }
         }
-        for (path, file) in &self.resolved {
-            if !file.site_dependencies.is_disjoint(&site_keys) {
-                sites.insert(path.clone());
-            }
-        }
+        sites.extend(self.reverse.sites.of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in self.calls.resolve_sites(inputs, &paths) {
             let file = self.resolved.get_mut(&path).expect("resolved");
             file.sites = kept;
             file.site_dependencies = dependencies;
+            self.reverse
+                .sites
+                .set(&path, file.site_dependencies.clone());
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;

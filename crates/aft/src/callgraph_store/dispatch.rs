@@ -1825,6 +1825,41 @@ impl<'a> Resolver<'a> {
     pub fn note_associated_site(&mut self, file: &str, ordinal: u32) {
         self.associated_sites.insert((file.to_string(), ordinal));
     }
+    /// A resolver over `files` with targets and associated-function sites a
+    /// caller keeps between runs, so a run over a few files does not copy
+    /// them. [`Resolver::into_parts`] gives them back.
+    pub fn with_parts(
+        files: BTreeMap<String, &'a ParseBlob>,
+        import_targets: BTreeMap<(String, String), String>,
+        type_targets: BTreeMap<(String, String), (String, String)>,
+        associated_sites: HashSet<(String, u32)>,
+    ) -> Self {
+        Self {
+            files,
+            import_targets,
+            type_targets,
+            associated_sites,
+            methods_by_name: std::cell::OnceCell::new(),
+            dependencies: Default::default(),
+            #[cfg(test)]
+            file_visits: std::cell::Cell::new(0),
+        }
+    }
+    /// The import targets, type targets and associated-function sites given
+    /// to [`Resolver::with_parts`].
+    pub fn into_parts(
+        self,
+    ) -> (
+        BTreeMap<(String, String), String>,
+        BTreeMap<(String, String), (String, String)>,
+        HashSet<(String, u32)>,
+    ) {
+        (
+            self.import_targets,
+            self.type_targets,
+            self.associated_sites,
+        )
+    }
     fn associated_site(&self, file: &str, ordinal: u32) -> bool {
         self.associated_sites.contains(&(file.to_string(), ordinal))
     }

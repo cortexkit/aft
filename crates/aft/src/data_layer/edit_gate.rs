@@ -223,6 +223,23 @@ fn compare(
                 .map(|(_, name)| name)
                 .collect::<Vec<_>>();
                 examples.push(format!("{path}: recorded {}", what.join(", ")));
+                // Which lines of the two recordings' debug forms differ.
+                let ours_text = format!(
+                    "{:#?}",
+                    (&ours.binding, &ours.site_dependencies, &ours.dispatch)
+                );
+                let theirs_text = format!(
+                    "{:#?}",
+                    (&theirs.binding, &theirs.site_dependencies, &theirs.dispatch)
+                );
+                let ours_lines = ours_text.lines().collect::<BTreeSet<_>>();
+                let theirs_lines = theirs_text.lines().collect::<BTreeSet<_>>();
+                for line in ours_lines.difference(&theirs_lines).take(6) {
+                    examples.push(format!("  live: {}", line.trim()));
+                }
+                for line in theirs_lines.difference(&ours_lines).take(6) {
+                    examples.push(format!("  cold: {}", line.trim()));
+                }
             }
         }
     }

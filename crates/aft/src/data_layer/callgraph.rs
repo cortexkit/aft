@@ -95,7 +95,7 @@ pub(crate) fn resolve_checkout(
         let (surfaces, prebound) = bind_all(inputs, &paths)?;
         let surfaces: Surfaces = Arc::new(surfaces);
         let mut resolved = resolve_files(inputs, &surfaces, &prebound, &paths)?;
-        let calls = MethodCallInputs::build(inputs, &resolved);
+        let mut calls = MethodCallInputs::build(inputs, &resolved);
         for (path, sites, dependencies) in calls.resolve_sites(inputs, &paths) {
             let file = resolved
                 .get_mut(&path)
@@ -261,7 +261,13 @@ pub(crate) struct MethodCallInputs {
     ordinary: HashMap<String, OrdinaryCalls>,
     import_targets: BTreeMap<(String, String), String>,
     type_targets: BTreeMap<(String, String), (String, String)>,
+    /// (file, reference key) of every Rust associated-function call.
+    associated: HashSet<(String, u32)>,
 }
+
+/// Below this many files, pass 4 runs on one thread over the kept inputs
+/// instead of copying them for each parallel chunk.
+const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
     pub(crate) fn build(
@@ -314,8 +320,12 @@ impl MethodCallInputs {
                 self.type_targets.remove(&(path.to_string(), name.clone()));
             }
         }
+        if let Some(old) = self.ordinary.remove(path) {
+            for key in old.associated {
+                self.associated.remove(&(path.to_string(), key));
+            }
+        }
         self.resolver_parses.remove(path);
-        self.ordinary.remove(path);
         if let Some((facts, calls)) = new {
             for (module, target) in &facts.import_targets {
                 self.import_targets
@@ -325,6 +335,9 @@ impl MethodCallInputs {
                 self.type_targets
                     .insert((path.to_string(), name.clone()), target.clone());
             }
+            for key in &calls.associated {
+                self.associated.insert((path.to_string(), *key));
+            }
             self.resolver_parses
                 .insert(path.to_string(), facts.resolver_parse());
             self.facts.insert(path.to_string(), facts);
@@ -333,13 +346,34 @@ impl MethodCallInputs {
         (keys, own_changed)
     }
 
-    /// Pass 4 for `paths`, in parallel: each file's kept method-call sites
-    /// and the dependency keys their resolutions read.
+    fn files(&self) -> BTreeMap<String, &ParseBlob> {
+        self.resolver_parses
+            .iter()
+            .map(|(path, parse)| (path.clone(), parse))
+            .collect()
+    }
+
+    /// Pass 4 for `paths`: each file's kept method-call sites and the
+    /// dependency keys their resolutions read. A few files run on this
+    /// thread; more run in parallel chunks, each with its own resolver.
     pub(crate) fn resolve_sites(
-        &self,
+        &mut self,
         inputs: &CheckoutInputs,
         paths: &[&String],
     ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+        if paths.len() <= SMALL_SITE_RUN {
+            let import_targets = std::mem::take(&mut self.import_targets);
+            let type_targets = std::mem::take(&mut self.type_targets);
+            let associated = std::mem::take(&mut self.associated);
+            let resolver =
+                Resolver::with_parts(self.files(), import_targets, type_targets, associated);
+            let results = self.resolve_chunk(inputs, &resolver, paths);
+            let (import_targets, type_targets, associated) = resolver.into_parts();
+            self.import_targets = import_targets;
+            self.type_targets = type_targets;
+            self.associated = associated;
+            return results;
+        }
         let chunk = paths
             .len()
             .div_ceil(rayon::current_num_threads() * 4)
@@ -349,55 +383,57 @@ impl MethodCallInputs {
             .map(|chunk| {
                 // The resolver and its memo are single-threaded caches over
                 // shared inputs: one per chunk of files.
-                let mut resolver = Resolver::new(
-                    self.resolver_parses
-                        .iter()
-                        .map(|(path, parse)| (path.clone(), parse))
-                        .collect(),
+                let resolver = Resolver::with_parts(
+                    self.files(),
+                    self.import_targets.clone(),
+                    self.type_targets.clone(),
+                    self.associated.clone(),
                 );
-                resolver.import_targets = self.import_targets.clone();
-                resolver.type_targets = self.type_targets.clone();
-                for (path, calls) in &self.ordinary {
-                    for key in &calls.associated {
-                        resolver.note_associated_site(path, *key);
-                    }
-                }
-                let memoized = MemoizedResolver::new(&resolver);
-                resolver.take_dependencies();
-                chunk
-                    .iter()
-                    .map(|path| {
-                        let (_, parse) = &inputs.parses[path.as_str()];
-                        let calls = &self.ordinary[path.as_str()];
-                        let mut sites = Vec::new();
-                        for site in parse.bound_dispatch_sites() {
-                            let ref_id = format!("view:{path}:{}", site.ordinal);
-                            let resolution = memoized.resolve(path, &site);
-                            // Keep proven self-call and scoped module-function
-                            // bindings when dispatch facts do not identify a
-                            // project receiver type.
-                            if parse.language == "rust"
-                                && resolution.external > 0
-                                && resolution.targets.is_empty()
-                                && calls.edges.contains(&ref_id)
-                                && calls.syntax.contains(&ref_id)
-                            {
-                                continue;
-                            }
-                            sites.push(SiteResolution {
-                                site,
-                                resolution: (*resolution).clone(),
-                            });
-                        }
-                        // Every file depends on its own facts, which
-                        // `Resolver::resolve` reads without recording.
-                        let mut dependencies = resolver.take_dependencies();
-                        dependencies.insert(dependency::file(path));
-                        ((*path).clone(), sites, dependencies)
-                    })
-                    .collect::<Vec<_>>()
+                self.resolve_chunk(inputs, &resolver, chunk)
             })
             .flatten()
+            .collect()
+    }
+
+    fn resolve_chunk(
+        &self,
+        inputs: &CheckoutInputs,
+        resolver: &Resolver<'_>,
+        paths: &[&String],
+    ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+        let memoized = MemoizedResolver::new(resolver);
+        resolver.take_dependencies();
+        paths
+            .iter()
+            .map(|path| {
+                let (_, parse) = &inputs.parses[path.as_str()];
+                let calls = &self.ordinary[path.as_str()];
+                let mut sites = Vec::new();
+                for site in parse.bound_dispatch_sites() {
+                    let ref_id = format!("view:{path}:{}", site.ordinal);
+                    let resolution = memoized.resolve(path, &site);
+                    // Keep proven self-call and scoped module-function
+                    // bindings when dispatch facts do not identify a
+                    // project receiver type.
+                    if parse.language == "rust"
+                        && resolution.external > 0
+                        && resolution.targets.is_empty()
+                        && calls.edges.contains(&ref_id)
+                        && calls.syntax.contains(&ref_id)
+                    {
+                        continue;
+                    }
+                    sites.push(SiteResolution {
+                        site,
+                        resolution: (*resolution).clone(),
+                    });
+                }
+                // Every file depends on its own facts, which
+                // `Resolver::resolve` reads without recording.
+                let mut dependencies = resolver.take_dependencies();
+                dependencies.insert(dependency::file(path));
+                ((*path).clone(), sites, dependencies)
+            })
             .collect()
     }
 }
