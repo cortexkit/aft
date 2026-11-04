@@ -463,8 +463,11 @@ impl<S: SliceSource> SliceReader<S> {
         name: Option<&str>,
         member_call: bool,
     ) -> Vec<(String, u64, u64, Vec<SliceRef>, Arc<FileSlice>)> {
+        // The named count matches the name exactly, an empty one included;
+        // the method-site query treats an empty name as every site.
+        let name = name.filter(|name| !(member_call && name.is_empty()));
         let files = match name {
-            Some(name) if !name.is_empty() => self
+            Some(name) => self
                 .source
                 .files_with_ref_name(name)
                 .intersection(&self.source.files_of_language(language))
@@ -482,7 +485,7 @@ impl<S: SliceSource> SliceReader<S> {
                 if !matches!(reference.kind, "call" | "construction") || reference.resolved {
                     continue;
                 }
-                if let Some(name) = name.filter(|name| !name.is_empty()) {
+                if let Some(name) = name {
                     if reference.short_name.as_deref() != Some(name) {
                         continue;
                     }

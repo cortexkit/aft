@@ -696,6 +696,7 @@ fn compare_queries(
         &mut examples,
     );
     report.examples.extend(examples);
+    eprintln!("query examples: {:#?}", report.examples);
     Ok(())
 }
 
