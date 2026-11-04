@@ -3490,8 +3490,9 @@ impl BgTaskRegistry {
                 }
             };
             if !request.return_paths.is_empty() {
+                let maximum = client.return_max_bytes().await.map_err(|e| e.to_string())?;
                 request.return_max_bytes =
-                    Some(client.return_max_bytes().await.map_err(|e| e.to_string())?);
+                    Some(exec::requested_return_max_bytes(&request, maximum));
             }
             fallback = Some(local);
             if remote.explicit_runon {
