@@ -250,9 +250,11 @@ pub(crate) fn assemble(
                 BlobRefKind::Call | BlobRefKind::Construction | BlobRefKind::CallbackRef
             ),
         ) {
+            // A construction is a call when it targets a function or method
+            // (a constructor), and a value reference otherwise.
             let kind = match row.kind {
                 BlobRefKind::Construction
-                    if target_node
+                    if !target_node
                         .as_deref()
                         .and_then(|id| nodes.kind(id))
                         .is_some_and(|kind| matches!(kind, "function" | "method")) =>

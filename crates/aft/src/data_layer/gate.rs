@@ -225,6 +225,17 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
             report.binding_mismatches += 1;
             if report.examples.len() < 20 {
                 report.examples.push(format!("binding {path}"));
+                // The lines of the two recordings' debug forms that differ.
+                let ours = format!("{:#?}", file.binding);
+                let theirs = format!("{:#?}", join.bindings.get(path));
+                let ours_lines = ours.lines().collect::<BTreeSet<_>>();
+                let theirs_lines = theirs.lines().collect::<BTreeSet<_>>();
+                for line in ours_lines.difference(&theirs_lines).take(8) {
+                    report.examples.push(format!("  ours:  {}", line.trim()));
+                }
+                for line in theirs_lines.difference(&ours_lines).take(8) {
+                    report.examples.push(format!("  join:  {}", line.trim()));
+                }
             }
         }
         if join.dispatch_type_targets.get(path) != file.dispatch.as_ref() {

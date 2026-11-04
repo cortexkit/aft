@@ -17610,7 +17610,15 @@ fn go_package_dir(
     module: Option<&str>,
 ) -> Option<PathBuf> {
     Some(if let Some(module) = module {
+        // The module map is built once per index from every go.mod and the
+        // directories walked to find them. Each caller that reads it records
+        // those inputs, whichever caller built it, so its recorded inputs do
+        // not depend on the order callers are resolved in.
+        if cache.1.get().is_some() {
+            facts.facts.memo_replay(facts.root, "go-modules", "");
+        }
         let modules = cache.1.get_or_init(|| {
+            facts.facts.memo_start(facts.root, "go-modules", "");
             let mut modules = HashMap::new();
             let mut stack = vec![facts.root.to_path_buf()];
             while let Some(dir) = stack.pop() {
@@ -17643,6 +17651,7 @@ fn go_package_dir(
                     }
                 }
             }
+            facts.facts.memo_finish(facts.root, "go-modules", "");
             modules
         });
         let Some((prefix, dir)) = modules
