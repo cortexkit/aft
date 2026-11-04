@@ -119,10 +119,13 @@ fn layout() -> PostingLayout {
     PostingLayout::new(&[])
 }
 
+/// A fragment's bytes and the hashes of its terms.
+type PendingFragment = (Vec<u8>, Vec<(TermKind, u64)>);
+
 /// Collects fragments for the graph sections of one segment.
 #[derive(Debug, Default)]
 pub struct GraphSectionsBuilder {
-    fragments: BTreeMap<FragmentKey, (Vec<u8>, Vec<(TermKind, u64)>)>,
+    fragments: BTreeMap<FragmentKey, PendingFragment>,
 }
 
 impl GraphSectionsBuilder {
@@ -248,8 +251,9 @@ impl<'s> GraphSegment<'s> {
             ));
         }
         let mut terms = Vec::with_capacity(TermKind::ALL.len());
-        for (kind, pair) in TermKind::ALL.into_iter().zip(handles[3..].chunks_exact(2)) {
-            terms.push((kind, LookupTable::open(segment, pair[0])?, pair[1]));
+        let (pairs, _) = handles[3..].as_chunks::<2>();
+        for (kind, [lookup, postings]) in TermKind::ALL.into_iter().zip(pairs) {
+            terms.push((kind, LookupTable::open(segment, *lookup)?, *postings));
         }
         Ok(Some(Self {
             segment,
