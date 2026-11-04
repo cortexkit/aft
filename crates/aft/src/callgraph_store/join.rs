@@ -1289,14 +1289,22 @@ impl ParseBlob {
         cached: Option<&BTreeMap<u32, BTreeSet<String>>>,
     ) -> Result<super::FileExtract, ManifestJoinError> {
         let data = self.file_data(path)?;
+        // A node id names the file, the scoped name, and which symbol of that
+        // name it is (overloads share one). It leaves out the AST position, so
+        // an edit that only moves code keeps every id, and resolutions that
+        // recorded a node answer stay valid.
+        let mut occurrences = HashMap::<String, usize>::new();
         let nodes = self
             .symbols
             .iter()
             .map(|symbol| {
                 let scoped_name = bound_name(&symbol.scoped_name, path);
+                let occurrence = occurrences.entry(scoped_name.clone()).or_default();
+                let id = format!("{path}:{occurrence}:{scoped_name}");
+                *occurrence += 1;
                 super::NodeRecord {
                     is_test: symbol.is_test,
-                    id: format!("{path}:{}:{scoped_name}", symbol.ordinal),
+                    id,
                     file_path: path.to_string(),
                     name: bound_name(&symbol.name, path),
                     scoped_name,
