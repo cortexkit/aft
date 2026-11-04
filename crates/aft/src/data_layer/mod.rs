@@ -11,6 +11,8 @@ pub mod gate;
 pub(crate) mod graph_rows;
 pub(crate) mod graph_store;
 pub mod incremental;
+#[cfg(test)]
+mod incremental_tests;
 pub(crate) mod overlay;
 pub(crate) mod query;
 pub(crate) mod slice;

@@ -6,6 +6,7 @@
 //! built and queried directly without going through the in-memory call graph.
 
 pub(crate) mod disk_facts;
+pub(crate) mod fact_answers;
 pub(crate) mod facts;
 mod go_dispatch;
 pub mod join;

@@ -115,8 +115,10 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinErro
         .map_err(|error| ManifestJoinError::Parse(error.to_string()))
 }
 
+/// The facts one resolver thread reads, recording every checkout read with
+/// its answer so a stored resolution can be validated elsewhere.
 fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
-    ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs }))
+    ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs }))
 }
 
 /// Pass 1 for `paths`, in parallel: each file's bound surface, and its

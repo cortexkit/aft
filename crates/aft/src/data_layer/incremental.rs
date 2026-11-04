@@ -24,6 +24,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion};
+use crate::callgraph_store::facts::ProjectFacts;
 use crate::callgraph_store::join::{
     rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies, ViewBindingFacts,
     VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
@@ -40,9 +42,11 @@ use super::callgraph::{
 #[derive(Clone, Debug, Default)]
 pub struct UpdateStats {
     pub changed_paths: usize,
-    /// The update resolved the whole checkout again, because a symlink was
-    /// added, removed or retargeted.
-    pub full: bool,
+    /// Recorded checkout reads asked again, and how many got a different
+    /// answer.
+    pub answers_checked: usize,
+    pub answers_changed: usize,
+    pub facts_ms: f64,
     pub rebound: usize,
     pub surfaces_changed: usize,
     pub replayed: usize,
@@ -155,7 +159,73 @@ pub struct LiveCheckout {
     pool: Arc<rayon::ThreadPool>,
 }
 
+/// Files whose recorded checkout reads now get different answers, by the
+/// part of their resolution that made the read.
+#[derive(Default)]
+struct StaleAnswers {
+    binding: BTreeSet<String>,
+    resolution: BTreeSet<String>,
+    dispatch: BTreeSet<String>,
+    /// Distinct reads asked again.
+    checked: usize,
+    /// Distinct reads whose answer changed.
+    changed: usize,
+}
+
 impl LiveCheckout {
+    /// Asks every distinct recorded checkout read again of `inputs`, and
+    /// lists the files with a read whose answer differs.
+    fn stale_answers(&self, inputs: &CheckoutInputs) -> StaleAnswers {
+        /// Whether any of `answers` differs now; each distinct read is asked
+        /// once and kept in `now`.
+        fn differs<'a>(
+            answers: &'a FactAnswers,
+            now: &mut HashMap<&'a FactQuestion, FactAnswer>,
+            facts: &dyn ProjectFacts,
+        ) -> bool {
+            let mut any = false;
+            for (question, recorded) in answers {
+                let answer = now
+                    .entry(question)
+                    .or_insert_with(|| question.answer(facts));
+                any |= answer != recorded;
+            }
+            any
+        }
+        let facts = CheckoutFacts { inputs };
+        let mut now = HashMap::<&FactQuestion, FactAnswer>::new();
+        let mut stale = StaleAnswers::default();
+        let files = self.resolved.iter().collect::<Vec<_>>();
+        for (path, file) in &files {
+            if differs(&file.binding.binding_answers, &mut now, &facts) {
+                stale.binding.insert((*path).clone());
+            }
+            if differs(&file.binding.resolution_answers, &mut now, &facts) {
+                stale.resolution.insert((*path).clone());
+            }
+            if let Some(dispatch) = &file.dispatch {
+                if differs(&dispatch.trace.answers, &mut now, &facts) {
+                    stale.dispatch.insert((*path).clone());
+                }
+            }
+        }
+        stale.checked = now.len();
+        stale.changed = files
+            .iter()
+            .flat_map(|(_, file)| {
+                file.binding
+                    .answers()
+                    .chain(file.dispatch.iter().flat_map(|d| d.trace.answers.iter()))
+            })
+            .filter(|(question, recorded)| {
+                now.get(question).is_some_and(|answer| answer != *recorded)
+            })
+            .map(|(question, _)| question)
+            .collect::<BTreeSet<_>>()
+            .len();
+        stale
+    }
+
     /// Resolves every file of `inputs` cold.
     ///
     /// # Errors
@@ -206,30 +276,6 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
-        // Resolution follows symlinks wherever a path passes through one,
-        // and the recorded inputs do not yet name the links a path passed
-        // through. So a link that appears, disappears or points elsewhere
-        // resolves the checkout again from scratch. Links change rarely.
-        let links_changed = changed.iter().any(|path| {
-            let link = |inputs: &CheckoutInputs| {
-                inputs
-                    .state
-                    .get(path.as_bytes())
-                    .filter(|record| record.kind == aft_store::checkout::PathKind::Symlink)
-                    .map(|record| record.link.clone())
-            };
-            link(&self.inputs) != link(&next)
-        });
-        if links_changed {
-            let threads = self.pool.current_num_threads();
-            *self = Self::cold(next, threads)?;
-            return Ok(UpdateStats {
-                changed_paths: changed.len(),
-                full: true,
-                total_ms: started.elapsed().as_secs_f64() * 1000.0,
-                ..UpdateStats::default()
-            });
-        }
         let pool = Arc::clone(&self.pool);
         let mut stats = pool.install(|| self.update_in_pool(next, changed))?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -259,6 +305,18 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
+        let link = |inputs: &CheckoutInputs, path: &str| {
+            inputs
+                .state
+                .get(path.as_bytes())
+                .filter(|record| record.kind == aft_store::checkout::PathKind::Symlink)
+                .map(|record| record.link.clone())
+        };
+        let links = changed
+            .iter()
+            .filter(|path| link(&old, path) != link(inputs, path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let configs = changed
             .iter()
             .filter(|path| {
@@ -276,6 +334,21 @@ impl LiveCheckout {
             .cloned()
             .collect::<BTreeSet<_>>();
         drop(old);
+
+        // Every checkout read a resolution made is recorded with its answer.
+        // When paths, links or configuration changed, each distinct recorded
+        // read is asked again; a file any of whose answers differ is bound,
+        // resolved or traced again. This needs no rule about which change can
+        // affect which read.
+        let started = Instant::now();
+        let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
+            StaleAnswers::default()
+        } else {
+            self.stale_answers(inputs)
+        };
+        stats.answers_checked = stale.checked;
+        stats.answers_changed = stale.changed;
+        stats.facts_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // Pass 1. A binding depends on the file's own parse, on which paths
         // exist, and on configuration it read.
@@ -299,6 +372,7 @@ impl LiveCheckout {
         }
         let mut rebind = self.reverse.binding.of(&binding_keys);
         rebind.extend(contents.iter().cloned());
+        rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
@@ -386,10 +460,12 @@ impl LiveCheckout {
 
         // Pass 2.
         let started = Instant::now();
-        let facts = Rc::new(ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs })));
+        let facts = Rc::new(ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs })));
         let index = resolver_index(&self.surfaces, &facts);
         let mut resolve = contents.clone();
         resolve.extend(references_changed.iter().cloned());
+        resolve.extend(stale.binding.iter().cloned());
+        resolve.extend(stale.resolution.iter().cloned());
         resolve.retain(|path| inputs.parses.contains_key(path));
         for path in inputs.parses.keys() {
             if !self.resolved.contains_key(path) {
@@ -447,6 +523,11 @@ impl LiveCheckout {
         let mut recompute = Vec::new();
         let mut trace_keys = changed_keys.clone();
         trace_keys.extend(membership.iter().cloned());
+        for path in &stale.dispatch {
+            if !resolve.contains(path) && !recompute.contains(path) {
+                recompute.push(path.clone());
+            }
+        }
         for path in self.reverse.dispatch.of(&trace_keys) {
             if resolve.contains(&path) {
                 continue;
@@ -460,6 +541,9 @@ impl LiveCheckout {
             };
             let trace = &dispatch.trace;
             stats.dispatch_replayed += 1;
+            if recompute.contains(&path) {
+                continue;
+            }
             if trace.probes_any(&membership)
                 || !trace.replays(&index, &changed_keys, &mut trace_answers)
             {

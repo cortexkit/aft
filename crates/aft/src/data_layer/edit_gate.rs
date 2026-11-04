@@ -57,6 +57,9 @@ pub struct EditRecord {
 /// [`UpdateStats`] as a flat record.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct UpdateStatsRecord {
+    pub answers_checked: usize,
+    pub answers_changed: usize,
+    pub facts_ms: f64,
     pub rebound: usize,
     pub surfaces_changed: usize,
     pub replayed: usize,
@@ -76,6 +79,9 @@ pub struct UpdateStatsRecord {
 impl From<UpdateStats> for UpdateStatsRecord {
     fn from(stats: UpdateStats) -> Self {
         Self {
+            answers_checked: stats.answers_checked,
+            answers_changed: stats.answers_changed,
+            facts_ms: stats.facts_ms,
             rebound: stats.rebound,
             surfaces_changed: stats.surfaces_changed,
             replayed: stats.replayed,

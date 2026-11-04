@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aft_store::content::codec::{Decoder, Encoder};
 use aft_store::content::DecodeError;
 
+use super::super::fact_answers::{FactAnswer, FactAnswers, FactQuestion};
 use super::{
     finish_binding, ConfigConsultations, DispatchTypeTargetTrace, DispatchTypeTargets,
     ViewBindingDependencies, ViewSurfaceQuery,
@@ -184,6 +185,69 @@ fn read_query(input: &mut Decoder<'_>) -> Result<ViewSurfaceQuery, DecodeError> 
     })
 }
 
+fn fact_answers(out: &mut Encoder, values: &FactAnswers) {
+    out.usize(values.len());
+    for (asked, answered) in values {
+        let (code, path) = match asked {
+            FactQuestion::IsFile(path) => (0, path),
+            FactQuestion::IsDir(path) => (1, path),
+            FactQuestion::Link(path) => (2, path),
+            FactQuestion::Canonical(path) => (3, path),
+            FactQuestion::ListDir(path) => (4, path),
+            FactQuestion::Config(path) => (5, path),
+        };
+        out.byte(code);
+        out.blob(path);
+        match answered {
+            FactAnswer::Bool(value) => {
+                out.byte(0);
+                out.bool(*value);
+            }
+            FactAnswer::Path(None) => out.byte(1),
+            FactAnswer::Path(Some(path)) => {
+                out.byte(2);
+                out.blob(path);
+            }
+            FactAnswer::Digest(digest) => {
+                out.byte(3);
+                out.blob(digest);
+            }
+        }
+    }
+}
+
+fn read_fact_answers(input: &mut Decoder<'_>) -> Result<FactAnswers, DecodeError> {
+    let count = input.count()?;
+    (0..count)
+        .map(|_| {
+            let code = input.byte()?;
+            let path = input.blob()?.to_vec();
+            let asked = match code {
+                0 => FactQuestion::IsFile(path),
+                1 => FactQuestion::IsDir(path),
+                2 => FactQuestion::Link(path),
+                3 => FactQuestion::Canonical(path),
+                4 => FactQuestion::ListDir(path),
+                5 => FactQuestion::Config(path),
+                _ => return Err(DecodeError("unknown fact question")),
+            };
+            let answered = match input.byte()? {
+                0 => FactAnswer::Bool(input.bool()?),
+                1 => FactAnswer::Path(None),
+                2 => FactAnswer::Path(Some(input.blob()?.to_vec())),
+                3 => FactAnswer::Digest(
+                    input
+                        .blob()?
+                        .try_into()
+                        .map_err(|_| DecodeError("a fact digest is not 16 bytes"))?,
+                ),
+                _ => return Err(DecodeError("unknown fact answer")),
+            };
+            Ok((asked, answered))
+        })
+        .collect()
+}
+
 fn queries(out: &mut Encoder, values: &[(ViewSurfaceQuery, String)]) {
     out.usize(values.len());
     for (asked, answered) in values {
@@ -211,6 +275,8 @@ pub(crate) fn encode_binding(out: &mut Encoder, value: &ViewBindingDependencies)
     strings(out, &value.binding_probes);
     strings(out, &value.resolved_dependencies);
     queries(out, &value.surface_queries);
+    fact_answers(out, &value.binding_answers);
+    fact_answers(out, &value.resolution_answers);
 }
 
 /// Reads a binding written by [`encode_binding`], with its summaries.
@@ -228,6 +294,8 @@ pub(crate) fn decode_binding(
         binding_probes: string_set(input)?,
         resolved_dependencies: string_set(input)?,
         surface_queries: read_queries(input)?,
+        binding_answers: read_fact_answers(input)?,
+        resolution_answers: read_fact_answers(input)?,
         ..ViewBindingDependencies::default()
     };
     finish_binding(&mut binding);
@@ -244,6 +312,7 @@ pub(crate) fn encode_dispatch(out: &mut Encoder, value: &DispatchTypeTargets) {
     }
     queries(out, &value.trace.queries);
     strings(out, &value.trace.probes);
+    fact_answers(out, &value.trace.answers);
 }
 
 /// Reads dispatch type targets written by [`encode_dispatch`].
@@ -257,6 +326,7 @@ pub(crate) fn decode_dispatch(input: &mut Decoder<'_>) -> Result<DispatchTypeTar
         trace: DispatchTypeTargetTrace {
             queries: read_queries(input)?,
             probes: string_set(input)?,
+            answers: read_fact_answers(input)?,
         },
     })
 }

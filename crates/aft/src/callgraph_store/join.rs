@@ -1855,6 +1855,9 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
 pub(crate) struct DispatchTypeTargetTrace {
     queries: Vec<(ViewSurfaceQuery, String)>,
     probes: BTreeSet<String>,
+    /// Every checkout read with its answer, when answers were recorded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) answers: super::fact_answers::FactAnswers,
 }
 
 impl DispatchTypeTargetTrace {
@@ -1957,6 +1960,13 @@ pub(crate) struct ViewBindingDependencies {
     binding_probes: BTreeSet<String>,
     resolved_dependencies: BTreeSet<String>,
     surface_queries: Vec<(ViewSurfaceQuery, String)>,
+    /// Every checkout read binding made, with its answer, when answers were
+    /// recorded (see [`super::fact_answers`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) binding_answers: super::fact_answers::FactAnswers,
+    /// Likewise for resolution's reads beyond binding's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) resolution_answers: super::fact_answers::FactAnswers,
     #[serde(skip)]
     surface: Option<ViewFileSurface>,
 }
@@ -2018,7 +2028,27 @@ impl ViewBindingDependencies {
         self.resolved_dependencies = old.resolved_dependencies.clone();
         self.surface_queries = old.surface_queries.clone();
         self.resolution_facts = old.resolution_facts.clone();
+        self.resolution_answers = old.resolution_answers.clone();
         finish_binding(self);
+    }
+
+    /// Every checkout read binding and resolution made, with its answer.
+    pub(crate) fn answers(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &super::fact_answers::FactQuestion,
+            &super::fact_answers::FactAnswer,
+        ),
+    > {
+        self.binding_answers
+            .iter()
+            .chain(self.resolution_answers.iter())
+    }
+
+    /// The surface queries resolution asked, with their recorded answers.
+    pub(crate) fn surface_queries(&self) -> &[(ViewSurfaceQuery, String)] {
+        &self.surface_queries
     }
 }
 
@@ -2196,6 +2226,7 @@ impl ConfigConsultations {
 struct ConsultationTrace {
     config: ConfigConsultations,
     probes: BTreeSet<String>,
+    answers: super::fact_answers::FactAnswers,
 }
 type ConsultationMemoKey = (std::path::PathBuf, String, String);
 
@@ -2218,6 +2249,10 @@ pub(crate) struct ViewBindingFacts<'a> {
     /// Nonzero while a repository-wide structure is built: its reads are
     /// not the caller's inputs.
     paused: std::cell::Cell<u32>,
+    /// Whether every read is also kept as a typed question with its answer
+    /// (see [`super::fact_answers`]).
+    typed: bool,
+    answers: std::cell::RefCell<super::fact_answers::FactAnswers>,
 }
 
 impl<'a> ViewBindingFacts<'a> {
@@ -2235,8 +2270,40 @@ impl<'a> ViewBindingFacts<'a> {
             config_cache: Default::default(),
             directory_cache: Default::default(),
             paused: Default::default(),
+            typed: false,
+            answers: Default::default(),
         }
     }
+
+    /// Like [`Self::new`], and also keeps every read as a typed question
+    /// with its answer, which [`Self::take_answers`] hands over.
+    pub(crate) fn typed(inner: Rc<dyn ProjectFacts + 'a>) -> Self {
+        Self {
+            typed: true,
+            ..Self::new(inner)
+        }
+    }
+
+    /// The questions read since the last call, with their answers.
+    pub(crate) fn take_answers(&self) -> super::fact_answers::FactAnswers {
+        std::mem::take(&mut *self.answers.borrow_mut())
+    }
+
+    fn answered(
+        &self,
+        question: super::fact_answers::FactQuestion,
+        answer: impl FnOnce() -> super::fact_answers::FactAnswer,
+    ) {
+        if !self.typed || self.paused.get() > 0 {
+            return;
+        }
+        let answer = answer();
+        for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
+            trace.answers.insert(question.clone(), answer.clone());
+        }
+        self.answers.borrow_mut().insert(question, answer);
+    }
+
     fn file_fact(&self, rel: &[u8]) -> bool {
         if let Some(value) = self.file_cache.borrow().get(rel) {
             return *value;
@@ -2357,6 +2424,16 @@ impl ProjectFacts for ViewBindingFacts<'_> {
             parent.config.extend(&trace.config);
             parent.probes.extend(trace.probes.iter().cloned());
         }
+        if self.typed && self.paused.get() == 0 {
+            for (_, parent) in self.memo_stack.borrow_mut().iter_mut() {
+                parent
+                    .answers
+                    .extend(trace.answers.iter().map(|(q, a)| (q.clone(), a.clone())));
+            }
+            self.answers
+                .borrow_mut()
+                .extend(trace.answers.iter().map(|(q, a)| (q.clone(), a.clone())));
+        }
     }
     fn workspace_package(&self, root: &Path, name: &str) -> Option<Option<std::path::PathBuf>> {
         self.workspace_packages
@@ -2387,10 +2464,19 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         if is_file {
             self.record(rel);
         }
+        self.answered(
+            super::fact_answers::FactQuestion::IsFile(rel.to_vec()),
+            || super::fact_answers::FactAnswer::Bool(is_file),
+        );
         is_file
     }
     fn is_dir(&self, rel: &[u8]) -> bool {
-        self.inner.is_dir(rel)
+        let is_dir = self.inner.is_dir(rel);
+        self.answered(
+            super::fact_answers::FactQuestion::IsDir(rel.to_vec()),
+            || super::fact_answers::FactAnswer::Bool(is_dir),
+        );
+        is_dir
     }
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
         self.consultations.borrow_mut().unattributed = true;
@@ -2402,17 +2488,27 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
         self.config_event(rel, None);
         self.record(rel);
-        if let Some(value) = self.config_cache.borrow().get(rel) {
-            return value.clone();
-        }
-        let value = self.inner.config_bytes(rel);
-        self.config_cache
-            .borrow_mut()
-            .insert(rel.to_vec(), value.clone());
+        let cached = self.config_cache.borrow().get(rel).cloned();
+        let value = cached.unwrap_or_else(|| {
+            let value = self.inner.config_bytes(rel);
+            self.config_cache
+                .borrow_mut()
+                .insert(rel.to_vec(), value.clone());
+            value
+        });
+        self.answered(
+            super::fact_answers::FactQuestion::Config(rel.to_vec()),
+            || super::fact_answers::config_answer(value.as_deref()),
+        );
         value
     }
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
-        self.inner.symlink_target(rel)
+        let target = self.inner.symlink_target(rel);
+        self.answered(
+            super::fact_answers::FactQuestion::Link(rel.to_vec()),
+            || super::fact_answers::FactAnswer::Path(target.map(<[u8]>::to_vec)),
+        );
+        target
     }
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
         // FactPaths canonicalizes before testing existence, so misses must be
@@ -2431,16 +2527,25 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         if canonical.as_ref().is_none_or(|path| self.file_fact(path)) {
             self.record(rel);
         }
+        self.answered(
+            super::fact_answers::FactQuestion::Canonical(rel.to_vec()),
+            || super::fact_answers::FactAnswer::Path(canonical.clone()),
+        );
         canonical
     }
     fn list_dir(&self, rel: &[u8]) -> Vec<super::facts::DirEntry> {
-        if let Some(value) = self.directory_cache.borrow().get(rel) {
-            return value.clone();
-        }
-        let value = self.inner.list_dir(rel);
-        self.directory_cache
-            .borrow_mut()
-            .insert(rel.to_vec(), value.clone());
+        let cached = self.directory_cache.borrow().get(rel).cloned();
+        let value = cached.unwrap_or_else(|| {
+            let value = self.inner.list_dir(rel);
+            self.directory_cache
+                .borrow_mut()
+                .insert(rel.to_vec(), value.clone());
+            value
+        });
+        self.answered(
+            super::fact_answers::FactQuestion::ListDir(rel.to_vec()),
+            || super::fact_answers::listing_answer(&value),
+        );
         value
     }
 }
@@ -2522,6 +2627,7 @@ pub(crate) fn bind_file(
     let paths = FactPaths { root, facts };
     facts.take();
     facts.take_config();
+    facts.take_answers();
     let extract = blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
     let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
     let mut binding = cache.cloned().unwrap_or_default();
@@ -2541,6 +2647,7 @@ pub(crate) fn bind_file(
             .collect();
         binding.binding_probes = facts.take();
         binding.binding_facts = facts.take_config();
+        binding.binding_answers = facts.take_answers();
         binding.dependencies = binding.references.values().flatten().cloned().collect();
         binding
             .dependencies
@@ -2577,7 +2684,9 @@ pub(crate) fn resolve_file(
         .chain(binding.binding_probes.iter())
         .cloned()
         .collect();
+    facts.take_answers();
     let extract = blob.bind_with_dependencies(caller, &paths, Some(&binding.references))?;
+    binding.resolution_answers = facts.take_answers();
     let mut caller_work = blob
         .refs
         .iter()
@@ -2641,12 +2750,14 @@ pub(crate) fn resolve_file(
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     facts.take();
                     facts.take_config();
+                    facts.take_answers();
                     let resolved = super::resolve_ref(raw, &surface_index)
                         .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
                     // The memo table is local to each caller. Extending the
                     // binding's facts once keeps its configuration dependencies
                     // associated with that caller even on cache hits.
                     binding.resolution_facts.extend(&facts.take_config());
+                    binding.resolution_answers.extend(facts.take_answers());
                     caller_queries.extend(surface_index.take());
                     binding.resolved_dependencies.extend(
                         resolved
@@ -2724,6 +2835,7 @@ pub(crate) fn dispatch_type_targets_for(
     let data = blob.file_data(file)?;
     facts.take();
     facts.take_config();
+    facts.take_answers();
     let recording = ViewSurfaceIndex {
         inner: index,
         queries: Default::default(),
@@ -2737,6 +2849,7 @@ pub(crate) fn dispatch_type_targets_for(
         trace: DispatchTypeTargetTrace {
             queries: recording.take().into_iter().collect(),
             probes,
+            answers: facts.take_answers(),
         },
     })
 }
