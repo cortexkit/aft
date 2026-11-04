@@ -146,6 +146,68 @@ impl fmt::Display for SegmentId {
     }
 }
 
+/// One checkout of a family: a main checkout, a worktree or a clone. The value
+/// is derived from the checkout's root path and Git directory by the caller.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CheckoutId(Digest128);
+
+impl CheckoutId {
+    #[must_use]
+    pub const fn from_digest(digest: Digest128) -> Self {
+        Self(digest)
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> Digest128 {
+        self.0
+    }
+}
+
+impl fmt::Display for CheckoutId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for CheckoutId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CheckoutId({})", self.0)
+    }
+}
+
+/// The number of one published manifest. Each publication's generation is one
+/// above the newest before it; a generation names one manifest forever.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Generation(u64);
+
+impl Generation {
+    /// The generation of a family that has never published: no segments and
+    /// no checkouts. No manifest file carries it.
+    pub const EMPTY: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The generation published after this one.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl fmt::Display for Generation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// One run of a writing process. Recorded in every segment it writes, so
 /// files left behind by a crashed writer can be told apart from a live one's.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

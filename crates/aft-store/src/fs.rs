@@ -2,8 +2,10 @@
 //! system.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
+
+use crate::fault;
 
 /// Creates a new file for writing, owner-only on Unix. Refuses to replace an
 /// existing file: stored files are immutable and their names never reused.
@@ -37,6 +39,78 @@ pub(crate) fn open_read(path: &Path) -> io::Result<File> {
         options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
     }
     options.open(path)
+}
+
+/// Writes a new file and makes it and its directory entry durable before
+/// returning. Refuses to replace an existing file.
+pub(crate) fn write_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fault::point("create")?;
+    let mut file = create_new_private(path)?;
+    fault::point("write")?;
+    file.write_all(bytes)?;
+    fault::point("sync")?;
+    file.sync_all()?;
+    drop(file);
+    sync_parent(path)
+}
+
+/// Reads a whole stored file, with the same sharing rules as [`open_read`].
+pub(crate) fn read_all(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_read(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Removes a file; a file that is already gone counts as removed.
+pub(crate) fn remove_file(path: &Path) -> io::Result<()> {
+    fault::point("remove")?;
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Renames `from` to `to`, which must not exist, and makes the change durable.
+///
+/// Every name the store renames to is new, so the rename never replaces a
+/// file. That keeps it correct on volumes without atomic rename-over.
+pub(crate) fn rename_new_durable(from: &Path, to: &Path) -> io::Result<()> {
+    if to.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a stored file name is never reused",
+        ));
+    }
+    fault::point("rename")?;
+    std::fs::rename(from, to)?;
+    sync_parent(to)
+}
+
+/// Flushes the directory holding `path`, so a file created, renamed or
+/// removed in it stays so after power loss.
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) => sync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// Flushes a directory's entries to stable storage.
+///
+/// Windows has no supported way to flush a directory through a normal
+/// handle. NTFS journals directory changes itself, so this does nothing
+/// there, and the store promises no more than that across power loss.
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    fault::point("sync_dir")?;
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Reads exactly `buf.len()` bytes at `offset`. Every call names its own

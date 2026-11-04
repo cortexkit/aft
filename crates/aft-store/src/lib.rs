@@ -10,15 +10,20 @@
 //! defines the formats and the code that writes, verifies and reads them.
 
 pub mod cache;
+pub mod family;
 pub mod ids;
 pub mod postings;
 pub mod segment;
 pub mod table;
 
+mod fault;
 mod fs;
 mod le;
 #[cfg(test)]
 mod test_rng;
 
 pub use cache::{BlockCache, CacheStats};
-pub use ids::{ContentKey, Digest128, FamilyId, SegmentId, WriterIncarnation};
+pub use family::{Family, FamilyError, Snapshot, WriteSession};
+pub use ids::{
+    CheckoutId, ContentKey, Digest128, FamilyId, Generation, SegmentId, WriterIncarnation,
+};
