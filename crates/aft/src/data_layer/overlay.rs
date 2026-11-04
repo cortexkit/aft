@@ -54,14 +54,14 @@ impl<B: SliceSource> OverlaySlices<B> {
     }
 
     /// Whether the base still answers for `path`.
-    fn from_base(&self, path: &str) -> bool {
+    fn answers_from_base(&self, path: &str) -> bool {
         !self.removed.contains(path) && self.replaced.slice(path).is_none()
     }
 
     fn merge(&self, base: BTreeSet<String>, own: BTreeSet<String>) -> BTreeSet<String> {
         let mut files = base
             .into_iter()
-            .filter(|path| self.from_base(path))
+            .filter(|path| self.answers_from_base(path))
             .collect::<BTreeSet<_>>();
         files.extend(own);
         files

@@ -97,10 +97,7 @@ pub(crate) fn snapshot(root: &Path, rows: &GraphRows) -> CallgraphSnapshot {
 }
 
 /// Nodes in `ORDER BY file_path, start_line, name, kind, id`.
-fn nodes_in_file_order<'r>(
-    rows: &'r GraphRows,
-    keep: impl Fn(&NodeRow) -> bool,
-) -> Vec<&'r NodeRow> {
+fn nodes_in_file_order(rows: &GraphRows, keep: impl Fn(&NodeRow) -> bool) -> Vec<&NodeRow> {
     let mut nodes = rows
         .nodes
         .values()
