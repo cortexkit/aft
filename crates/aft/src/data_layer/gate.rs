@@ -835,24 +835,22 @@ pub(crate) fn compare_readers(
         &mut || show(&theirs.indexed_file_count().map_err(|e| e.to_string())),
         &mut examples,
     );
+    // Every edge, one per line, so a difference names the edges that differ
+    // rather than only a count.
+    let edges = |snapshot: crate::callgraph_store::Result<
+        BTreeSet<crate::callgraph_store::StoredEdge>,
+    >| match snapshot {
+        Ok(edges) => edges
+            .iter()
+            .map(|edge| format!("{edge:?}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(error) => format!("error: {error}"),
+    };
     compare(
         "edge_snapshot",
-        &mut || {
-            show(
-                &ours
-                    .edge_snapshot()
-                    .map(|edges| edges.len())
-                    .map_err(|e| e.to_string()),
-            )
-        },
-        &mut || {
-            show(
-                &theirs
-                    .edge_snapshot()
-                    .map(|edges| edges.len())
-                    .map_err(|e| e.to_string()),
-            )
-        },
+        &mut || edges(ours.edge_snapshot()),
+        &mut || edges(theirs.edge_snapshot()),
         &mut examples,
     );
     *examples_out = examples;

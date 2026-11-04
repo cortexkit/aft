@@ -5,7 +5,9 @@
 //! Paths are sorted by their bytes, so a directory is a contiguous range and
 //! a lookup is a binary search.
 
-use crate::family::record::{Payload, RecordError};
+use crate::content::DecodeError;
+use crate::content::codec::{Decoder, Encoder};
+use crate::family::record::RecordError;
 use crate::ids::{ContentKey, Digest128};
 
 /// What a stat call said about a file when its content was last read.
@@ -187,47 +189,61 @@ impl CheckoutState {
     }
 
     /// The bytes stored as the payload of a state record.
+    ///
+    /// Paths are sorted, so each is stored as the length it shares with the
+    /// path before it plus the rest. Numbers are varints; times are stored
+    /// as differences from a related time (change and birth time from the
+    /// modification time, observation time and device from the previous
+    /// path's), which are small or zero for files of one checkout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(u8::try_from(self.git.len()).expect("checked in new"));
-        out.extend_from_slice(&self.git);
-        out.extend_from_slice(self.conversion.as_bytes());
-        out.extend_from_slice(
-            &u32::try_from(self.paths.len())
-                .expect("a checkout has fewer than 2^32 paths")
-                .to_le_bytes(),
-        );
+        let mut out = Encoder::default();
+        out.byte(STATE_FORMAT);
+        out.blob(&self.git);
+        out.blob(self.conversion.as_bytes());
+        out.usize(self.paths.len());
+        let mut previous: Option<&PathRecord> = None;
         for record in &self.paths {
-            out.extend_from_slice(
-                &u32::try_from(record.path.len())
-                    .expect("checked in new")
-                    .to_le_bytes(),
-            );
-            out.extend_from_slice(&record.path);
-            out.extend_from_slice(&record.mode.to_le_bytes());
-            out.push(record.kind.code());
-            out.extend_from_slice(record.content.digest().as_bytes());
-            out.extend_from_slice(
-                &u32::try_from(record.link.len())
-                    .expect("checked in new")
-                    .to_le_bytes(),
-            );
-            out.extend_from_slice(&record.link);
+            let shared = previous.map_or(0, |previous| {
+                previous
+                    .path
+                    .iter()
+                    .zip(&record.path)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            out.usize(shared);
+            out.blob(&record.path[shared..]);
+            out.u32(record.mode);
+            out.byte(record.kind.code());
+            out.blob(record.content.digest().as_bytes());
+            out.blob(&record.link);
             let stat = &record.stat;
-            out.extend_from_slice(&stat.size.to_le_bytes());
-            out.extend_from_slice(&stat.mtime_ns.to_le_bytes());
-            out.extend_from_slice(&stat.ctime_ns.to_le_bytes());
-            put_optional(&mut out, stat.birth_ns.map(i64::cast_unsigned));
-            out.extend_from_slice(&stat.file_id.to_le_bytes());
-            out.extend_from_slice(&stat.device.to_le_bytes());
+            let before = previous.map(|previous| &previous.stat);
+            out.u64(stat.size);
+            out.u64(zigzag(stat.mtime_ns));
+            out.u64(zigzag(stat.ctime_ns.wrapping_sub(stat.mtime_ns)));
+            put_optional(
+                &mut out,
+                stat.birth_ns
+                    .map(|birth| zigzag(birth.wrapping_sub(stat.mtime_ns))),
+            );
+            out.u64(stat.file_id);
+            out.u64(zigzag(
+                stat.device
+                    .wrapping_sub(before.map_or(0, |before| before.device))
+                    .cast_signed(),
+            ));
             put_optional(&mut out, stat.usn);
             put_optional(&mut out, stat.journal);
-            out.extend_from_slice(&stat.observed_ns.to_le_bytes());
-            out.push(u8::try_from(record.language.len()).expect("checked in new"));
-            out.extend_from_slice(record.language.as_bytes());
+            out.u64(zigzag(
+                stat.observed_ns
+                    .wrapping_sub(before.map_or(0, |before| before.observed_ns)),
+            ));
+            out.str(&record.language);
+            previous = Some(record);
         }
-        out
+        out.finish()
     }
 
     /// Reads a state record's payload.
@@ -236,41 +252,64 @@ impl CheckoutState {
     ///
     /// When the payload is not a well-formed state.
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, RecordError> {
-        let mut input = Payload::new(payload);
-        let git_len = usize::from(input.take(1)?[0]);
-        let git = input.take(git_len)?.to_vec();
-        let conversion = input.digest()?;
-        let count = input.u32()?;
-        let mut paths = Vec::new();
+        let invalid = |error: DecodeError| RecordError::Invalid(error.0);
+        let mut input = Decoder::new(payload).map_err(invalid)?;
+        if input.byte().map_err(invalid)? != STATE_FORMAT {
+            return Err(RecordError::Invalid("unknown checkout state format"));
+        }
+        let git = input.blob().map_err(invalid)?.to_vec();
+        if git.len() > usize::from(u8::MAX) {
+            return Err(RecordError::Invalid("Git fingerprint too long"));
+        }
+        let conversion = Digest128::from_bytes(
+            input
+                .blob()
+                .map_err(invalid)?
+                .try_into()
+                .map_err(|_| RecordError::Invalid("conversion digest length"))?,
+        );
+        let count = input.count().map_err(invalid)?;
+        let mut paths = Vec::<PathRecord>::with_capacity(count);
         for _ in 0..count {
-            let path_len =
-                usize::try_from(input.u32()?).map_err(|_| RecordError::Invalid("path length"))?;
-            let path = input.take(path_len)?.to_vec();
-            let mode = input.u32()?;
-            let kind =
-                PathKind::from_code(input.take(1)?[0]).ok_or(RecordError::Invalid("path kind"))?;
-            let content = ContentKey::from_digest(input.digest()?);
-            let link_len =
-                usize::try_from(input.u32()?).map_err(|_| RecordError::Invalid("link length"))?;
-            let link = input.take(link_len)?.to_vec();
-            let stat = StatEvidence {
-                size: input.u64()?,
-                mtime_ns: input.u64()?.cast_signed(),
-                ctime_ns: input.u64()?.cast_signed(),
-                birth_ns: optional(&mut input)?.map(u64::cast_signed),
-                file_id: input.u64()?,
-                device: input.u64()?,
-                usn: optional(&mut input)?,
-                journal: optional(&mut input)?,
-                observed_ns: input.u64()?.cast_signed(),
+            let shared = input.usize().map_err(invalid)?;
+            let suffix = input.blob().map_err(invalid)?;
+            let mut path = match paths.last() {
+                Some(last) if shared <= last.path.len() => last.path[..shared].to_vec(),
+                None if shared == 0 => Vec::new(),
+                _ => return Err(RecordError::Invalid("shared path prefix too long")),
             };
-            let language_len = usize::from(input.take(1)?[0]);
-            let language = String::from_utf8(input.take(language_len)?.to_vec())
-                .map_err(|_| RecordError::Invalid("language is not UTF-8"))?;
-            if paths
-                .last()
-                .is_some_and(|last: &PathRecord| last.path >= path)
-            {
+            path.extend_from_slice(suffix);
+            let mode = input.u32().map_err(invalid)?;
+            let kind = PathKind::from_code(input.byte().map_err(invalid)?)
+                .ok_or(RecordError::Invalid("path kind"))?;
+            let content = ContentKey::from_digest(Digest128::from_bytes(
+                input
+                    .blob()
+                    .map_err(invalid)?
+                    .try_into()
+                    .map_err(|_| RecordError::Invalid("content key length"))?,
+            ));
+            let link = input.blob().map_err(invalid)?.to_vec();
+            let before = paths.last().map(|last| last.stat);
+            let size = input.u64().map_err(invalid)?;
+            let mtime_ns = unzigzag(input.u64().map_err(invalid)?);
+            let ctime_ns = mtime_ns.wrapping_add(unzigzag(input.u64().map_err(invalid)?));
+            let birth_ns =
+                optional(&mut input)?.map(|delta| mtime_ns.wrapping_add(unzigzag(delta)));
+            let file_id = input.u64().map_err(invalid)?;
+            let device = before
+                .map_or(0, |before| before.device)
+                .wrapping_add(unzigzag(input.u64().map_err(invalid)?).cast_unsigned());
+            let usn = optional(&mut input)?;
+            let journal = optional(&mut input)?;
+            let observed_ns = before
+                .map_or(0, |before| before.observed_ns)
+                .wrapping_add(unzigzag(input.u64().map_err(invalid)?));
+            let language = input.string().map_err(invalid)?;
+            if language.len() > usize::from(u8::MAX) {
+                return Err(RecordError::Invalid("language too long"));
+            }
+            if paths.last().is_some_and(|last| last.path >= path) {
                 return Err(RecordError::Invalid("paths out of order"));
             }
             paths.push(PathRecord {
@@ -279,11 +318,21 @@ impl CheckoutState {
                 kind,
                 content,
                 link,
-                stat,
+                stat: StatEvidence {
+                    size,
+                    mtime_ns,
+                    ctime_ns,
+                    birth_ns,
+                    file_id,
+                    device,
+                    usn,
+                    journal,
+                    observed_ns,
+                },
                 language,
             });
         }
-        input.finish()?;
+        input.finish().map_err(invalid)?;
         Ok(Self {
             git,
             conversion,
@@ -292,20 +341,32 @@ impl CheckoutState {
     }
 }
 
-fn put_optional(out: &mut Vec<u8>, value: Option<u64>) {
+/// The version of [`CheckoutState::encode`]'s layout, its first byte.
+const STATE_FORMAT: u8 = 1;
+
+const fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)).cast_unsigned()
+}
+
+const fn unzigzag(value: u64) -> i64 {
+    (value >> 1).cast_signed() ^ -((value & 1).cast_signed())
+}
+
+fn put_optional(out: &mut Encoder, value: Option<u64>) {
     match value {
         Some(value) => {
-            out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
+            out.byte(1);
+            out.u64(value);
         }
-        None => out.push(0),
+        None => out.byte(0),
     }
 }
 
-fn optional(input: &mut Payload<'_>) -> Result<Option<u64>, RecordError> {
-    match input.take(1)?[0] {
+fn optional(input: &mut Decoder<'_>) -> Result<Option<u64>, RecordError> {
+    let invalid = |error: DecodeError| RecordError::Invalid(error.0);
+    match input.byte().map_err(invalid)? {
         0 => Ok(None),
-        1 => Ok(Some(input.u64()?)),
+        1 => Ok(Some(input.u64().map_err(invalid)?)),
         _ => Err(RecordError::Invalid("optional field flag")),
     }
 }
@@ -348,6 +409,26 @@ mod tests {
         assert_eq!(state.paths()[0].path, b"README");
         let decoded = CheckoutState::decode(&state.encode()).unwrap();
         assert_eq!(decoded, state);
+        // Extreme stat values survive the differences they are stored as.
+        let mut extreme = record("z", "z");
+        extreme.stat = StatEvidence {
+            size: u64::MAX,
+            mtime_ns: i64::MIN,
+            ctime_ns: i64::MAX,
+            birth_ns: Some(i64::MAX),
+            file_id: u64::MAX,
+            device: u64::MAX,
+            usn: Some(0),
+            journal: Some(u64::MAX),
+            observed_ns: i64::MIN,
+        };
+        let state = CheckoutState::new(
+            Vec::new(),
+            Digest128::of(b""),
+            vec![record("a", "a"), extreme, record("zz", "zz")],
+        )
+        .unwrap();
+        assert_eq!(CheckoutState::decode(&state.encode()).unwrap(), state);
         assert!(matches!(
             CheckoutState::new(
                 Vec::new(),
