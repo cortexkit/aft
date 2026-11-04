@@ -23,6 +23,7 @@ fn main() {
     )
     .unwrap();
     eprintln!("checked {checked} edits against cold resolutions; {failures} differed");
+    assert!(checked > 0, "no edit was checked against a cold resolution");
     assert_eq!(
         failures, 0,
         "an incremental update differs from a cold resolution"

@@ -157,7 +157,10 @@ pub(crate) fn read(
     family: FamilyId,
     number: u64,
 ) -> Result<Vec<u8>, RecordError> {
-    let bytes = crate::fs::read_all(path)?;
+    let limit = HEADER_LEN as u64 + MAX_PAYLOAD + Digest128::LEN as u64;
+    let bytes = crate::fs::read_at_most(path, limit)
+        .map_err(RecordError::Io)?
+        .ok_or(RecordError::Invalid("larger than any record"))?;
     decode(&bytes, kind, family, number).map(<[u8]>::to_vec)
 }
 

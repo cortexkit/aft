@@ -181,5 +181,14 @@ fn main() {
         },
     });
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    assert_eq!(
+        gate.failed.load(Ordering::Relaxed),
+        0,
+        "an extraction failed"
+    );
+    assert!(
+        gate.parsed.load(Ordering::Relaxed) > 0,
+        "no file was extracted"
+    );
     assert_eq!(gate.mismatched.load(Ordering::Relaxed), 0);
 }

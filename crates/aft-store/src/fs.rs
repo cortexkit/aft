@@ -54,11 +54,16 @@ pub(crate) fn write_new_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     sync_parent(path)
 }
 
-/// Reads a whole stored file, with the same sharing rules as [`open_read`].
-pub(crate) fn read_all(path: &Path) -> io::Result<Vec<u8>> {
+/// Reads a whole stored file of at most `limit` bytes, with the same sharing
+/// rules as [`open_read`]; `None` when it is longer. Nothing past the limit
+/// is read, so a damaged or hostile file cannot make the reader allocate
+/// for its full length.
+pub(crate) fn read_at_most(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
-    open_read(path)?.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    open_read(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
 }
 
 /// Removes a file; a file that is already gone counts as removed.

@@ -35,9 +35,9 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     }
     let path = Path::new(path);
     let language = if path.extension().is_some_and(|extension| extension == "h") {
-        // A header's language comes from parsing it: C, then C++, then
-        // Objective-C.
-        crate::parser::language_for_content_hash(path, blake3::hash(source))?
+        // A header's language comes from parsing these bytes: C, then C++,
+        // then Objective-C. A header that is not text parses as nothing.
+        crate::parser::detect_language_from_source(path, std::str::from_utf8(source).ok()?)?
     } else {
         crate::views::callgraph::source_language(path)?
     };
@@ -398,6 +398,20 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_language_comes_from_its_own_bytes() {
+        // Bytes no other test parses, so no earlier parse can have chosen
+        // their language.
+        let cpp = b"// a_header_language_comes_from_its_own_bytes\nnamespace demo { class Widget { public: int size() const; }; }\n";
+        let c = b"// a_header_language_comes_from_its_own_bytes\nstruct point { int x; int y; };\nint area(struct point p);\n";
+        assert_eq!(
+            language_for("include/widget.h", cpp).as_deref(),
+            Some("cpp")
+        );
+        assert_eq!(language_for("include/point.h", c).as_deref(), Some("c"));
+        assert_eq!(language_for("include/binary.h", &[0xff, 0xfe, 0x00]), None);
+    }
 
     #[test]
     fn records_round_trip_every_field_of_real_parses() {

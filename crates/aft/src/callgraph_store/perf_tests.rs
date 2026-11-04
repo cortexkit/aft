@@ -1674,14 +1674,15 @@ fn go_package_symbol_index_matches_scan() {
 
     let mut oversized = ProjectIndex::from_parts(
         &root,
-        memory.files.clone(),
+        (*memory.files).clone(),
         HashMap::new(),
         WorkspaceCratePrefixCache::default(),
         Rc::new(DiskFacts::new(&root)),
     );
     let long_symbol = "x".repeat(GO_PACKAGE_MEMO_BYTES);
-    oversized
-        .files
+    // `from_parts` gave this index its own copy of the files, so this
+    // changes only the oversized index.
+    Arc::make_mut(&mut oversized.files)
         .get_mut("pkg/a.go")
         .unwrap()
         .node_by_bare

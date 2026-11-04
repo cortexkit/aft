@@ -459,3 +459,49 @@ fn a_crash_at_any_step_leaves_the_newest_complete_generation_readable() {
     println!("crash points tried: {steps}");
     assert!(steps > 10, "the writer passed only {steps} file steps");
 }
+
+/// A reader that binds while a reclaimer scans keeps its lease and its data.
+/// The reader takes its snapshot between the scan's lease and owner
+/// listings, the point a scan that listed owners first got wrong: it found
+/// the new lease, missed its owner, and deleted both the lease and, on the
+/// next reclaim, the segment the reader still held.
+#[test]
+fn a_reader_binding_during_a_scan_keeps_its_lease_and_data() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let dir = tempfile::tempdir().unwrap();
+    let writer_family = open(dir.path());
+    publish(&writer_family, b"first", b"state one");
+    let reader_family = Rc::new(open(dir.path()));
+    let held = Rc::new(RefCell::new(None));
+    let saved = held.clone();
+    super::lease::BETWEEN_LISTINGS.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            *saved.borrow_mut() = Some(reader_family.snapshot().unwrap());
+        }));
+    });
+    let first = writer_family
+        .try_write()
+        .unwrap()
+        .unwrap()
+        .reclaim()
+        .unwrap();
+    let snapshot = held
+        .borrow_mut()
+        .take()
+        .expect("the reader bound during the scan");
+    assert_eq!(first.removed_leases, 0, "a live reader's lease was removed");
+    assert_eq!(read_section(&snapshot), b"first");
+    publish(&writer_family, b"second", b"state two");
+    writer_family
+        .try_write()
+        .unwrap()
+        .unwrap()
+        .reclaim()
+        .unwrap();
+    assert_eq!(
+        read_section(&snapshot),
+        b"first",
+        "the held generation's segment was reclaimed"
+    );
+}

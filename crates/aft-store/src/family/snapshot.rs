@@ -116,7 +116,21 @@ impl Snapshot {
                 ),
             });
         }
-        Ok(Segment::open(&path, self.family, known, cache)?)
+        let segment = Segment::open(&path, self.family, known, cache)?;
+        // An intact segment of the same family and length under the wrong
+        // name (a restore or copy mix-up) passes every checksum.
+        if segment.id() != id {
+            return Err(FamilyError::Damaged {
+                path,
+                reason: format!(
+                    "the file holds segment {}; generation {} names segment {}",
+                    segment.id().get(),
+                    self.manifest.generation(),
+                    id.get()
+                ),
+            });
+        }
+        Ok(segment)
     }
 
     /// The payload of a checkout's state at this generation, or `None` when

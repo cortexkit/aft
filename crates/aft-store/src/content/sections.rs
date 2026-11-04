@@ -200,10 +200,11 @@ impl<'s> ContentSegment<'s> {
     /// When a read fails or a block fails its checksum.
     pub fn surface(&self, ordinal: u32) -> Result<Vec<u8>, SegmentError> {
         let (_, location) = self.units.entry(ordinal)?;
-        self.segment.read_range(
-            self.surfaces,
-            location.offset..location.offset + u64::from(location.len),
-        )
+        let end = location
+            .offset
+            .checked_add(u64::from(location.len))
+            .ok_or_else(|| malformed(self.segment, "a surface's range overflows"))?;
+        self.segment.read_range(self.surfaces, location.offset..end)
     }
 
     /// The body bytes of the record at `ordinal`, unpacked.

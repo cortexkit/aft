@@ -30,6 +30,14 @@ const LEASE_SUFFIX: &str = ".lease";
 /// belong to a process about to lock them.
 const INCOMING_GRACE: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+thread_local! {
+    /// A test runs this between the scan's lease and owner listings, to
+    /// place a new reader exactly there.
+    pub(super) static BETWEEN_LISTINGS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// This process's presence in one family.
 #[derive(Debug)]
 pub(super) struct Owner {
@@ -180,6 +188,19 @@ impl LeaseScan {
 pub(super) fn scan(layout: &Layout, family: FamilyId) -> Result<LeaseScan, FamilyError> {
     let leases_dir = layout.leases_dir();
     let mut scan = LeaseScan::default();
+    // Leases are listed before owners. A process renames its owner file into
+    // `leases/` before it writes any lease, so the owner of every lease in
+    // this listing either appears in the owner listing below or has been
+    // removed, which only happens once its process has ended. Listing owners
+    // first would miss an owner that appeared in between, and count its new
+    // lease as dead.
+    let leases = super::names_with_suffix(&leases_dir, LEASE_SUFFIX)?;
+    #[cfg(test)]
+    BETWEEN_LISTINGS.with(|slot| {
+        if let Some(callback) = slot.borrow_mut().take() {
+            callback();
+        }
+    });
     let mut alive = BTreeMap::<String, bool>::new();
     for (stem, path) in super::names_with_suffix(&leases_dir, OWNER_SUFFIX)? {
         match free_lock(&path) {
@@ -192,13 +213,15 @@ pub(super) fn scan(layout: &Layout, family: FamilyId) -> Result<LeaseScan, Famil
             }
         }
     }
-    for (stem, path) in super::names_with_suffix(&leases_dir, LEASE_SUFFIX)? {
+    for (stem, path) in leases {
         let Some((owner, number)) = stem
             .rsplit_once('.')
             .and_then(|(owner, number)| Some((owner, super::canonical_number(number)?)))
         else {
             continue;
         };
+        // Absent from the owner listing: the owner file was removed after
+        // this lease was written, so its process has ended.
         if !alive.get(owner).copied().unwrap_or(false) {
             scan.dead_leases.push(path);
             continue;

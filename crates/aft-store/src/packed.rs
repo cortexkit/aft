@@ -17,6 +17,10 @@ use crate::segment::{ErrorKind, SectionHandle, Segment, SegmentError};
 /// The width of one index entry.
 pub(crate) const INDEX_ENTRY_LEN: usize = 17;
 
+/// The largest unit a reader unpacks. A stored length above it is malformed,
+/// so a damaged index cannot make a reader allocate for it.
+const MAX_UNPACKED: u32 = 256 << 20;
+
 /// Bytes are stored compressed only when that saves at least this share.
 const MIN_SAVING_PERCENT: usize = 10;
 
@@ -107,8 +111,9 @@ pub(crate) fn read(
     let bytes = segment.read_range(data, offset..end)?;
     match entry[16] {
         RAW if stored == unpacked => Ok(bytes),
-        ZLIB => {
-            let mut out = Vec::with_capacity(unpacked as usize);
+        ZLIB if unpacked <= MAX_UNPACKED => {
+            // Grown as bytes arrive rather than sized from the stored length.
+            let mut out = Vec::with_capacity((unpacked as usize).min(1 << 20));
             ZlibDecoder::new(bytes.as_slice())
                 .take(u64::from(unpacked) + 1)
                 .read_to_end(&mut out)

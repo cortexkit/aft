@@ -289,15 +289,29 @@ impl Segment {
     ///
     /// As [`read`](Self::read).
     ///
+    /// A range read from stored offsets is untrusted, so a backwards range,
+    /// or one past the end of its section, is refused before anything is
+    /// allocated.
+    ///
     /// # Panics
     ///
-    /// When `handle` belongs to another segment, or the range is backwards.
+    /// When `handle` belongs to another segment.
     pub fn read_range(
         &self,
         handle: SectionHandle,
         range: Range<u64>,
     ) -> Result<Vec<u8>, SegmentError> {
-        assert!(range.start <= range.end, "backwards range {range:?}");
+        if range.start > range.end {
+            return Err(self.error(ErrorKind::Malformed("a stored range runs backwards")));
+        }
+        let info = self.info(handle);
+        if range.end > info.len {
+            return Err(self.error(ErrorKind::OutOfRange {
+                id: info.id,
+                end: range.end,
+                len: info.len,
+            }));
+        }
         let len = usize::try_from(range.end - range.start)
             .map_err(|_| self.error(ErrorKind::Malformed("range is larger than memory")))?;
         let mut buf = vec![0; len];

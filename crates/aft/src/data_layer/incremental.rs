@@ -40,6 +40,9 @@ use super::callgraph::{
 #[derive(Clone, Debug, Default)]
 pub struct UpdateStats {
     pub changed_paths: usize,
+    /// The update resolved the whole checkout again, because a symlink was
+    /// added, removed or retargeted.
+    pub full: bool,
     pub rebound: usize,
     pub surfaces_changed: usize,
     pub replayed: usize,
@@ -203,6 +206,30 @@ impl LiveCheckout {
         changed: &BTreeSet<String>,
     ) -> Result<UpdateStats, ManifestJoinError> {
         let started = Instant::now();
+        // Resolution follows symlinks wherever a path passes through one,
+        // and the recorded inputs do not yet name the links a path passed
+        // through. So a link that appears, disappears or points elsewhere
+        // resolves the checkout again from scratch. Links change rarely.
+        let links_changed = changed.iter().any(|path| {
+            let link = |inputs: &CheckoutInputs| {
+                inputs
+                    .state
+                    .get(path.as_bytes())
+                    .filter(|record| record.kind == aft_store::checkout::PathKind::Symlink)
+                    .map(|record| record.link.clone())
+            };
+            link(&self.inputs) != link(&next)
+        });
+        if links_changed {
+            let threads = self.pool.current_num_threads();
+            *self = Self::cold(next, threads)?;
+            return Ok(UpdateStats {
+                changed_paths: changed.len(),
+                full: true,
+                total_ms: started.elapsed().as_secs_f64() * 1000.0,
+                ..UpdateStats::default()
+            });
+        }
         let pool = Arc::clone(&self.pool);
         let mut stats = pool.install(|| self.update_in_pool(next, changed))?;
         stats.total_ms = started.elapsed().as_secs_f64() * 1000.0;

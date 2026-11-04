@@ -393,7 +393,9 @@ pub fn run(
             record.differing_files = Some(answers);
             record.differing_recordings = Some(recordings);
             checked += 1;
-            if answers > 0 {
+            // A different recording is a failure too: a stored resolution
+            // with stale recorded inputs cannot be reused safely elsewhere.
+            if answers > 0 || recordings > 0 {
                 failures += 1;
             }
             if last_of_commit {

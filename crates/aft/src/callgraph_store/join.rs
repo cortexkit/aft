@@ -3217,7 +3217,11 @@ impl ViewSurfaceQuery {
                 );
                 dependencies
             }
-            Self::GoPackage(..) => vec![VIEW_GO_PACKAGE_DOMAIN.into()],
+            // Which directory an import path names comes from the module map,
+            // so a `go.mod` edit alone can change the answer.
+            Self::GoPackage(..) => {
+                vec![VIEW_GO_PACKAGE_DOMAIN.into(), VIEW_GO_MODULES_DOMAIN.into()]
+            }
             Self::Language(file)
             | Self::MacroUse(file)
             | Self::Module(file, _)

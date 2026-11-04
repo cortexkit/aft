@@ -221,7 +221,15 @@ impl<'f> WriteSession<'f> {
         let number = match self.next_state.get(&checkout) {
             Some(number) => *number,
             None => {
-                std::fs::create_dir_all(&dir).map_err(FamilyError::io(&dir))?;
+                if !dir.is_dir() {
+                    std::fs::create_dir_all(&dir).map_err(FamilyError::io(&dir))?;
+                    // The manifest will name a file inside this new
+                    // directory, so the directory's own entry must be
+                    // durable first: sync the folder that holds it.
+                    if let Some(parent) = dir.parent() {
+                        crate::fs::sync_dir(parent).map_err(FamilyError::io(parent))?;
+                    }
+                }
                 numbered_desc(&dir, STATE_PREFIX)?
                     .first()
                     .map_or(1, |(number, _)| number + 1)

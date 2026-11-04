@@ -35988,7 +35988,7 @@ mod crate_scan_memo_tests {
 
         // Remove two files and add two, the way a join rebuilds its index
         // from the previous index's files.
-        let mut files = first.files.clone();
+        let mut files = (*first.files).clone();
         files.remove("crates/a/src/lib.rs");
         files.remove("crates/a/src/foo.rs");
         files.insert(
@@ -36030,7 +36030,7 @@ mod reexport_resolution_tests {
             facts: Rc::new(DiskFacts::new(Path::new("/fixture"))),
             unbound_non_utf8_paths: Vec::new(),
             project_root: PathBuf::from("/fixture"),
-            files: files.into_iter().collect(),
+            files: Arc::new(files.into_iter().collect()),
             caller_data: HashMap::new(),
             lazy: None,
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
