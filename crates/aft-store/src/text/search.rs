@@ -109,6 +109,8 @@ enum Place {
     },
     /// Not indexed, or in no segment yet: always a candidate.
     Unchecked,
+    /// A symlink: grep never follows one, so it is never a candidate.
+    Excluded,
 }
 
 /// Where each path of one checkout state finds its content's text unit.
@@ -128,8 +130,12 @@ impl TextMembership {
             .paths()
             .iter()
             .map(|record| {
-                if record.kind != PathKind::Text {
-                    return Place::Unchecked;
+                match record.kind {
+                    PathKind::Text => {}
+                    PathKind::Symlink => return Place::Excluded,
+                    PathKind::Binary | PathKind::Oversize | PathKind::Unreadable => {
+                        return Place::Unchecked;
+                    }
                 }
                 match locator.get(record.content) {
                     Some(Located::Indexed { segment, ordinal }) => {
@@ -271,6 +277,7 @@ fn search(
         match membership.places[index] {
             Place::Indexed { segment, ordinal } => members[segment as usize].push((ordinal, index)),
             Place::Unchecked => found.push(path.clone()),
+            Place::Excluded => {}
         }
     }
     for (segment, mut members) in members.into_iter().enumerate() {
@@ -512,6 +519,7 @@ mod tests {
                     mode: 0,
                     kind: PathKind::Text,
                     content: ContentKey::of(text.as_bytes()),
+                    link: Vec::new(),
                     stat: StatEvidence::default(),
                     language: String::new(),
                 }

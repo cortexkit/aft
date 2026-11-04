@@ -2142,7 +2142,7 @@ type ConsultationMemoKey = (std::path::PathBuf, String, String);
 
 /// Memo answers and their provenance belong to one immutable manifest join.
 /// Replaying provenance on hits keeps missing candidates and facts attributable.
-struct ViewBindingFacts<'a> {
+pub(crate) struct ViewBindingFacts<'a> {
     inner: Rc<dyn ProjectFacts + 'a>,
     probes: std::cell::RefCell<BTreeSet<String>>,
     consultations: std::cell::RefCell<ConfigConsultations>,
@@ -2159,7 +2159,7 @@ struct ViewBindingFacts<'a> {
 }
 
 impl<'a> ViewBindingFacts<'a> {
-    fn new(inner: Rc<dyn ProjectFacts + 'a>) -> Self {
+    pub(crate) fn new(inner: Rc<dyn ProjectFacts + 'a>) -> Self {
         Self {
             inner,
             probes: Default::default(),
@@ -2429,6 +2429,240 @@ pub(crate) fn join_selected_manifest_for_materialization(
     )
 }
 
+/// Binds one file's parse against its checkout's path facts. Returns the
+/// file's resolver surface, and its binding: which paths each reference's
+/// binding probed, and the paths and configuration fields binding consulted.
+/// With `cache`, reference dependencies come from that earlier binding of the
+/// same parse instead of being recorded again.
+pub(crate) fn bind_file(
+    rel: &str,
+    blob: &ParseBlob,
+    facts: &ViewBindingFacts<'_>,
+    cache: Option<&ViewBindingDependencies>,
+) -> Result<(super::DbFileIndex, ViewBindingDependencies), ManifestJoinError> {
+    let root = Path::new("/");
+    let paths = FactPaths { root, facts };
+    facts.take();
+    facts.take_config();
+    let extract = blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
+    let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
+    let mut binding = cache.cloned().unwrap_or_default();
+    binding.surface = Some(ViewFileSurface::capture(&blob.language, &file_index));
+    if cache.is_none() {
+        binding.references = blob
+            .refs
+            .iter()
+            .zip(&extract.raw_refs)
+            .enumerate()
+            .map(|(position, (_, bound))| {
+                (
+                    u32::try_from(position).expect("reference vector fits u32"),
+                    bound.dependencies.clone(),
+                )
+            })
+            .collect();
+        binding.binding_probes = facts.take();
+        binding.binding_facts = facts.take_config();
+        binding.dependencies = binding.references.values().flatten().cloned().collect();
+        binding
+            .dependencies
+            .extend(binding.binding_probes.iter().cloned());
+    }
+    Ok((file_index, binding))
+}
+
+/// Resolves every reference of one caller against `index`, adding one row per
+/// reference to `rows`. Records in `binding` the surface queries resolution
+/// asked with their answers, the paths it consulted beyond binding's, and the
+/// configuration fields it read. Returns how many distinct bindings it
+/// resolved (references sharing a binding are resolved once).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one caller's resolution needs every one of these inputs"
+)]
+pub(crate) fn resolve_file(
+    caller: &str,
+    key: &BlobKey,
+    blob: &ParseBlob,
+    binding: &mut ViewBindingDependencies,
+    index: &ManifestProjectIndex<'_>,
+    facts: &ViewBindingFacts<'_>,
+    mut resolution_order: Option<&mut Vec<CallerRefKey>>,
+    rows: &mut BTreeSet<DerivedRow>,
+) -> Result<usize, ManifestJoinError> {
+    let root = Path::new("/");
+    let paths = FactPaths { root, facts };
+    let basis: BTreeSet<String> = binding
+        .references
+        .values()
+        .flatten()
+        .chain(binding.binding_probes.iter())
+        .cloned()
+        .collect();
+    let extract = blob.bind_with_dependencies(caller, &paths, Some(&binding.references))?;
+    let mut caller_work = blob
+        .refs
+        .iter()
+        .zip(extract.raw_refs)
+        .zip(blob.reference_keys())
+        .map(|((raw, bound), reference_key)| {
+            (
+                CallerRefKey {
+                    caller_blob_key: key.clone(),
+                    ref_ordinal: reference_key,
+                    caller_path: caller.as_bytes().to_vec(),
+                },
+                (raw.kind, bound),
+            )
+        })
+        .collect::<Vec<_>>();
+    caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+    // Scoped and self calls can already have declaration-proven bindings.
+    // Let dispatch refine those bindings instead of skipping them in advance.
+    let associated_ordinals = blob
+        .refs
+        .iter()
+        .filter(|reference| {
+            blob.language == "rust"
+                && reference.full_ref.as_deref().is_some_and(|name| {
+                    dispatch::associated_reference(name) || name.starts_with("self.")
+                })
+        })
+        .map(|reference| reference.ordinal)
+        .collect::<BTreeSet<_>>();
+    let receiver_ordinals = blob
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| !associated_ordinals.contains(&site.ordinal))
+        .map(|s| s.ordinal)
+        .collect::<BTreeSet<_>>();
+    let caller_data = &extract.data;
+    let surface_index = ViewSurfaceIndex {
+        inner: index,
+        queries: Default::default(),
+        caller: Some((caller, caller_data)),
+    };
+    let mut resolutions = HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
+    let mut caller_queries = BTreeMap::new();
+    for (key, (kind, raw)) in caller_work {
+        let memo_key = ViewResolutionBinding::new(&raw, caller_data);
+        // Dependencies belonging to a call site are not part of the memoized
+        // target. Preserve them even when another reference resolved its binding.
+        binding.resolved_dependencies.extend(
+            raw.dependencies
+                .iter()
+                .filter(|dependency| !basis.contains(*dependency))
+                .cloned(),
+        );
+        let (target_file, target_symbol) = if receiver_ordinals.contains(&key.ref_ordinal) {
+            (None, None)
+        } else {
+            match resolutions.entry(memo_key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    facts.take();
+                    facts.take_config();
+                    let resolved = super::resolve_ref(raw, &surface_index)
+                        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                    // The memo table is local to each caller. Extending the
+                    // binding's facts once keeps its configuration dependencies
+                    // associated with that caller even on cache hits.
+                    binding.resolution_facts.extend(&facts.take_config());
+                    caller_queries.extend(surface_index.take());
+                    binding.resolved_dependencies.extend(
+                        resolved
+                            .dependencies
+                            .into_iter()
+                            .chain(facts.take())
+                            .filter(|dependency| !basis.contains(dependency)),
+                    );
+                    entry
+                        .insert((resolved.target_file, resolved.target_symbol))
+                        .clone()
+                }
+            }
+        };
+        if let Some(order) = resolution_order.as_deref_mut() {
+            order.push(key.clone());
+        }
+        rows.insert(DerivedRow {
+            caller_blob_key: key.caller_blob_key,
+            ref_ordinal: key.ref_ordinal,
+            caller_path: key.caller_path,
+            kind,
+            status: if target_file.is_some() {
+                ResolutionStatus::Resolved
+            } else {
+                ResolutionStatus::Unresolved
+            },
+            target_path: target_file.map(String::into_bytes),
+            target_symbol,
+        });
+    }
+    binding.surface_queries = caller_queries.into_iter().collect();
+    Ok(resolutions.len())
+}
+
+/// Fills a binding's summary fields once binding and resolution are done:
+/// every configuration field it consulted, whether any configuration read
+/// was opaque, and every path its answers depend on.
+pub(crate) fn finish_binding(binding: &mut ViewBindingDependencies) {
+    binding.consulted_facts = binding
+        .binding_facts
+        .facts
+        .union(&binding.resolution_facts.facts)
+        .cloned()
+        .collect();
+    binding.unattributed =
+        binding.binding_facts.unattributed() || binding.resolution_facts.unattributed();
+    binding.dependencies = binding
+        .references
+        .values()
+        .flatten()
+        .cloned()
+        .chain(binding.binding_probes.iter().cloned())
+        .chain(binding.resolved_dependencies.iter().cloned())
+        .chain(
+            binding
+                .surface_queries
+                .iter()
+                .flat_map(|(query, _)| query.dependencies()),
+        )
+        .collect();
+}
+
+/// The project files the type names of one Rust, TypeScript or JavaScript
+/// file resolve to, for method-call resolution, with the surface queries and
+/// path probes they consulted.
+pub(crate) fn dispatch_type_targets_for(
+    file: &str,
+    blob: &ParseBlob,
+    index: &ManifestProjectIndex<'_>,
+    facts: &ViewBindingFacts<'_>,
+) -> Result<DispatchTypeTargets, ManifestJoinError> {
+    // The caller data is the file's own parse; binding consults path facts
+    // only for reference dependencies, which are not wanted here.
+    let data = blob.file_data(file)?;
+    facts.take();
+    facts.take_config();
+    let recording = ViewSurfaceIndex {
+        inner: index,
+        queries: Default::default(),
+        caller: None,
+    };
+    let targets = resolve_dispatch_type_names(&recording, file, blob, &data);
+    let probes = facts.take();
+    facts.take_config();
+    Ok(DispatchTypeTargets {
+        targets,
+        trace: DispatchTypeTargetTrace {
+            queries: recording.take().into_iter().collect(),
+            probes,
+        },
+    })
+}
+
 fn join_manifest_with_surfaces(
     manifest: &Manifest,
     blobs: &impl ManifestBlobReader,
@@ -2483,10 +2717,6 @@ fn join_manifest_with_surfaces(
         blobs: &reader,
     })));
     let root = Path::new("/");
-    let paths = FactPaths {
-        root,
-        facts: facts.as_ref(),
-    };
     let mut files = HashMap::new();
     let mut bindings = BTreeMap::new();
     let mut unbound_non_utf8_paths = Vec::new();
@@ -2547,22 +2777,12 @@ fn join_manifest_with_surfaces(
             continue;
         };
         decoded_caller_blobs += 1;
-        facts.take();
-        facts.take_config();
         #[cfg(test)]
         let before = crate::test_allocations::live_bytes();
-        let extract =
-            blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
+        let (file_index, binding) = bind_file(rel, blob, &facts, cache)?;
         #[cfg(test)]
         {
             heap_parts[1] += crate::test_allocations::live_bytes() as isize - before as isize;
-        }
-        #[cfg(test)]
-        let before = crate::test_allocations::live_bytes();
-        let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
-        #[cfg(test)]
-        {
-            heap_parts[2] += crate::test_allocations::live_bytes() as isize - before as isize;
         }
         rebuilt_surface_paths.insert(rel.to_string());
         match reuse {
@@ -2577,36 +2797,8 @@ fn join_manifest_with_surfaces(
             }
             _ => rebuilt_missing += 1,
         }
-        #[cfg(test)]
-        let before = crate::test_allocations::live_bytes();
-        let mut binding = cache.cloned().unwrap_or_default();
-        binding.surface = Some(ViewFileSurface::capture(&blob.language, &file_index));
         files.insert(rel.to_string(), file_index);
-        if cache.is_none() {
-            binding.references = blob
-                .refs
-                .iter()
-                .zip(&extract.raw_refs)
-                .enumerate()
-                .map(|(position, (_, bound))| {
-                    (
-                        u32::try_from(position).expect("reference vector fits u32"),
-                        bound.dependencies.clone(),
-                    )
-                })
-                .collect();
-            binding.binding_probes = facts.take();
-            binding.binding_facts = facts.take_config();
-            binding.dependencies = binding.references.values().flatten().cloned().collect();
-            binding
-                .dependencies
-                .extend(binding.binding_probes.iter().cloned());
-        }
         bindings.insert(rel.to_string(), binding);
-        #[cfg(test)]
-        {
-            heap_parts[3] += crate::test_allocations::live_bytes() as isize - before as isize;
-        }
         // Only the resolver surface survives this pass. Nodes, caller data and
         // raw references are rebuilt for one selected caller at a time below.
     }
@@ -2682,7 +2874,7 @@ fn join_manifest_with_surfaces(
         }
     }
     profile.finish("index_and_surface_replay");
-    let index = ManifestProjectIndex::from_parts(
+    let index = ManifestProjectIndex::from_shared(
         root,
         index.files,
         HashMap::new(),
@@ -2690,22 +2882,6 @@ fn join_manifest_with_surfaces(
         facts.clone(),
     );
     profile.finish("decode_resolved_callers");
-    let bases: BTreeMap<_, BTreeSet<_>> = resolved_callers
-        .iter()
-        .map(|caller| {
-            let binding = &bindings[caller];
-            (
-                caller.clone(),
-                binding
-                    .references
-                    .values()
-                    .flatten()
-                    .chain(binding.binding_probes.iter())
-                    .cloned()
-                    .collect(),
-            )
-        })
-        .collect();
     let mut resolved_bindings = 0;
     for caller in &resolved_callers {
         if crate::executor::current_job_cancelled() {
@@ -2723,139 +2899,23 @@ fn join_manifest_with_surfaces(
         if !rebuilt_surface_paths.contains(caller) {
             decoded_caller_blobs += 1;
         }
-        let extract =
-            blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
-        let mut caller_work = blob
-            .refs
-            .iter()
-            .zip(extract.raw_refs)
-            .zip(blob.reference_keys())
-            .map(|((raw, bound), reference_key)| {
-                (
-                    CallerRefKey {
-                        caller_blob_key: key.clone(),
-                        ref_ordinal: reference_key,
-                        caller_path: caller.as_bytes().to_vec(),
-                    },
-                    (raw.kind, bound),
-                )
-            })
-            .collect::<Vec<_>>();
-        caller_work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
-        // Scoped and self calls can already have declaration-proven bindings.
-        // Let dispatch refine those bindings instead of skipping them in advance.
-        let associated_ordinals = blob
-            .refs
-            .iter()
-            .filter(|reference| {
-                blob.language == "rust"
-                    && reference.full_ref.as_deref().is_some_and(|name| {
-                        dispatch::associated_reference(name) || name.starts_with("self.")
-                    })
-            })
-            .map(|reference| reference.ordinal)
-            .collect::<BTreeSet<_>>();
-        let receiver_ordinals = blob
-            .dispatch
-            .sites
-            .iter()
-            .filter(|site| !associated_ordinals.contains(&site.ordinal))
-            .map(|s| s.ordinal)
-            .collect::<BTreeSet<_>>();
-        let caller_data = &extract.data;
-        let surface_index = ViewSurfaceIndex {
-            inner: &index,
-            queries: Default::default(),
-            caller: Some((caller, caller_data)),
-        };
-        let basis = &bases[caller];
         let binding = bindings.get_mut(caller).expect("bound caller dependencies");
-        let mut resolutions =
-            HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
-        let mut caller_queries = BTreeMap::new();
-        for (key, (kind, raw)) in caller_work {
-            let memo_key = ViewResolutionBinding::new(&raw, caller_data);
-            // Dependencies belonging to a call site are not part of the memoized
-            // target. Preserve them even when another reference resolved its binding.
-            binding.resolved_dependencies.extend(
-                raw.dependencies
-                    .iter()
-                    .filter(|dependency| !basis.contains(*dependency))
-                    .cloned(),
-            );
-            let (target_file, target_symbol) = if receiver_ordinals.contains(&key.ref_ordinal) {
-                (None, None)
-            } else {
-                match resolutions.entry(memo_key) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        facts.take();
-                        facts.take_config();
-                        let resolved = super::resolve_ref(raw, &surface_index)
-                            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-                        // The memo table is local to each caller. Extending the
-                        // binding's facts once keeps its configuration dependencies
-                        // associated with that caller even on cache hits.
-                        binding.resolution_facts.extend(&facts.take_config());
-                        caller_queries.extend(surface_index.take());
-                        binding.resolved_dependencies.extend(
-                            resolved
-                                .dependencies
-                                .into_iter()
-                                .chain(facts.take())
-                                .filter(|dependency| !basis.contains(dependency)),
-                        );
-                        entry
-                            .insert((resolved.target_file, resolved.target_symbol))
-                            .clone()
-                    }
-                }
-            };
-            if record_order {
-                result.resolution_order.push(key.clone());
-            }
-            result.rows.insert(DerivedRow {
-                caller_blob_key: key.caller_blob_key,
-                ref_ordinal: key.ref_ordinal,
-                caller_path: key.caller_path,
-                kind,
-                status: if target_file.is_some() {
-                    ResolutionStatus::Resolved
-                } else {
-                    ResolutionStatus::Unresolved
-                },
-                target_path: target_file.map(String::into_bytes),
-                target_symbol,
-            });
-        }
-        resolved_bindings += resolutions.len();
-        binding.surface_queries = caller_queries.into_iter().collect();
+        let order = record_order.then_some(&mut result.resolution_order);
+        resolved_bindings += resolve_file(
+            caller,
+            key,
+            blob,
+            binding,
+            &index,
+            &facts,
+            order,
+            &mut result.rows,
+        )?;
     }
     result.resolution_order.sort();
     profile.finish("resolve_and_record");
     for binding in bindings.values_mut() {
-        binding.consulted_facts = binding
-            .binding_facts
-            .facts
-            .union(&binding.resolution_facts.facts)
-            .cloned()
-            .collect();
-        binding.unattributed =
-            binding.binding_facts.unattributed() || binding.resolution_facts.unattributed();
-        binding.dependencies = binding
-            .references
-            .values()
-            .flatten()
-            .cloned()
-            .chain(binding.binding_probes.iter().cloned())
-            .chain(binding.resolved_dependencies.iter().cloned())
-            .chain(
-                binding
-                    .surface_queries
-                    .iter()
-                    .flat_map(|(query, _)| query.dependencies()),
-            )
-            .collect();
+        finish_binding(binding);
     }
     profile.finish("dependency_union");
     let mut dispatch_type_targets = BTreeMap::new();
@@ -2938,26 +2998,9 @@ fn join_manifest_with_surfaces(
             if !rebuilt_surface_paths.contains(file) && !resolved_callers.contains(file) {
                 dispatch_type_target_decoded_blobs += 1;
             }
-            let data = blob.file_data(file)?;
-            facts.take();
-            facts.take_config();
-            let recording = ViewSurfaceIndex {
-                inner: &index,
-                queries: Default::default(),
-                caller: None,
-            };
-            let targets = resolve_dispatch_type_names(&recording, file, blob, &data);
-            let probes = facts.take();
-            facts.take_config();
             dispatch_type_targets.insert(
                 file.to_string(),
-                DispatchTypeTargets {
-                    targets,
-                    trace: DispatchTypeTargetTrace {
-                        queries: recording.take().into_iter().collect(),
-                        probes,
-                    },
-                },
+                dispatch_type_targets_for(file, blob, &index, &facts)?,
             );
         }
         stage.finish(

@@ -168,7 +168,9 @@ pub fn scan(
                     return WalkState::Continue;
                 }
             };
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            let file_type = entry.file_type();
+            let is_link = file_type.is_some_and(|kind| kind.is_symlink());
+            if !is_link && !file_type.is_some_and(|kind| kind.is_file()) {
                 return WalkState::Continue;
             }
             let relative = match relative_bytes(root, entry.path()) {
@@ -182,9 +184,12 @@ pub fn scan(
                 }
             };
             let previous = previous.and_then(|state| state.get(&relative));
-            if let Some(record) =
+            let record = if is_link {
+                record_symlink(entry.path(), relative)
+            } else {
                 record_file(entry.path(), relative, previous, policy, sink, &counters)
-            {
+            };
+            if let Some(record) = record {
                 records
                     .lock()
                     .expect("no panics while holding it")
@@ -263,6 +268,7 @@ fn record_file(
             mode,
             kind: PathKind::Oversize,
             content,
+            link: Vec::new(),
             stat,
             language: String::new(),
         });
@@ -298,6 +304,7 @@ fn record_file(
             mode,
             kind: PathKind::Oversize,
             content,
+            link: Vec::new(),
             stat,
             language: String::new(),
         });
@@ -317,7 +324,28 @@ fn record_file(
             ContentKind::Binary => PathKind::Binary,
         },
         content,
+        link: Vec::new(),
         stat,
+        language: String::new(),
+    })
+}
+
+/// The record of a symlink: its target, never followed. `None` when it
+/// vanished.
+fn record_symlink(path: &Path, relative: Vec<u8>) -> Option<PathRecord> {
+    let target = match std::fs::read_link(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => PathBuf::new(),
+    };
+    let link = os_bytes(target.as_os_str());
+    Some(PathRecord {
+        content: ContentKey::stand_in(&relative, &link),
+        path: relative,
+        mode: 0o120_000,
+        kind: PathKind::Symlink,
+        link,
+        stat: StatEvidence::default(),
         language: String::new(),
     })
 }
@@ -334,6 +362,7 @@ fn unreadable(relative: Vec<u8>, stat: StatEvidence, counters: &Counters) -> Pat
         path: relative,
         mode: 0,
         kind: PathKind::Unreadable,
+        link: Vec::new(),
         stat,
         language: String::new(),
     }
@@ -404,6 +433,18 @@ fn relative_bytes(root: &Path, path: &Path) -> Result<Vec<u8>, ScanError> {
         );
     }
     Ok(out)
+}
+
+/// An OS string's bytes: raw on Unix, UTF-8 with `/` separators elsewhere.
+fn os_bytes(os: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        std::os::unix::ffi::OsStrExt::as_bytes(os).to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        os.to_string_lossy().replace('\\', "/").into_bytes()
+    }
 }
 
 fn error_path(error: &ignore::Error) -> Option<PathBuf> {
@@ -557,27 +598,38 @@ mod tests {
         // Another repository nested inside it stays a member.
         write("vendor/lib/.git/HEAD", b"ref: refs/heads/main\n");
         write("vendor/lib/lib.rs", b"pub fn lib() {}\n");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("src/a.rs", root.join("link.rs")).unwrap();
 
         let policy = ScanPolicy {
             max_indexed_len: 1024,
             ..ScanPolicy::default()
         };
+        let get = |state: &CheckoutState, path: &str| state.get(path.as_bytes()).unwrap().clone();
         let sink = Collect::default();
         let first = scan(root, &policy, None, &sink).unwrap();
-        assert_eq!(
-            paths(&first.state),
-            [
-                ".aftignore",
-                ".gitignore",
-                "big.txt",
-                "blob.bin",
-                "src/.hidden.rs",
-                "src/a.rs",
-                "src/b.rs",
-                "vendor/lib/lib.rs"
-            ]
-        );
-        let get = |state: &CheckoutState, path: &str| state.get(path.as_bytes()).unwrap().clone();
+        #[cfg(unix)]
+        {
+            let link = get(&first.state, "link.rs");
+            assert_eq!(
+                (link.kind, link.link.as_slice()),
+                (PathKind::Symlink, &b"src/a.rs"[..])
+            );
+        }
+        let mut expected = vec![
+            ".aftignore",
+            ".gitignore",
+            "big.txt",
+            "blob.bin",
+            "src/.hidden.rs",
+            "src/a.rs",
+            "src/b.rs",
+            "vendor/lib/lib.rs",
+        ];
+        if cfg!(unix) {
+            expected.insert(4, "link.rs");
+        }
+        assert_eq!(paths(&first.state), expected);
         assert_eq!(get(&first.state, "big.txt").kind, PathKind::Oversize);
         assert_eq!(get(&first.state, "blob.bin").kind, PathKind::Binary);
         assert_eq!(

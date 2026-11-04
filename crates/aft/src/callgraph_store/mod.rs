@@ -2304,7 +2304,7 @@ impl CallgraphRefreshState {
 type WorkspaceCratePrefixes = HashMap<String, String>;
 
 #[derive(Clone, Debug, Default)]
-struct WorkspaceCratePrefixCache(
+pub(crate) struct WorkspaceCratePrefixCache(
     Arc<OnceLock<WorkspaceCratePrefixes>>,
     Arc<OnceLock<HashMap<String, String>>>,
 );
@@ -5612,7 +5612,7 @@ struct FileRow {
 }
 
 #[derive(Debug, Clone)]
-struct DbFileIndex {
+pub(crate) struct DbFileIndex {
     lang: Option<LangId>,
     exports: HashSet<String>,
     default_export: Option<String>,
@@ -5634,11 +5634,13 @@ struct ReexportIndex {
 }
 
 #[derive(Clone)]
-struct ProjectIndex<'a> {
+pub(crate) struct ProjectIndex<'a> {
     facts: Rc<dyn ProjectFacts + 'a>,
     unbound_non_utf8_paths: Vec<Vec<u8>>,
     project_root: PathBuf,
-    files: HashMap<String, DbFileIndex>,
+    /// Shared, so several resolver threads can each wrap the same bound
+    /// surfaces in their own index with their own memos.
+    files: Arc<HashMap<String, DbFileIndex>>,
     caller_data: HashMap<String, &'a FileCallData>,
     /// Stored file indexes loaded on demand, for an incremental refresh. Files
     /// in `files` take precedence over it.
@@ -18977,6 +18979,23 @@ impl<'a> ProjectIndex<'a> {
     fn from_parts(
         project_root: &Path,
         files: HashMap<String, DbFileIndex>,
+        caller_data: HashMap<String, &'a FileCallData>,
+        workspace_crate_prefixes: WorkspaceCratePrefixCache,
+        facts: Rc<dyn ProjectFacts + 'a>,
+    ) -> Self {
+        Self::from_shared(
+            project_root,
+            Arc::new(files),
+            caller_data,
+            workspace_crate_prefixes,
+            facts,
+        )
+    }
+
+    /// An index over bound surfaces another index or thread also holds.
+    pub(crate) fn from_shared(
+        project_root: &Path,
+        files: Arc<HashMap<String, DbFileIndex>>,
         caller_data: HashMap<String, &'a FileCallData>,
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
         facts: Rc<dyn ProjectFacts + 'a>,

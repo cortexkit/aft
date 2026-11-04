@@ -199,7 +199,7 @@ impl<'a> ObjectDispatch<'a> {
                     ),
                 );
             }
-            self.index.files.insert(file.to_string(), file_index);
+            Arc::make_mut(&mut self.index.files).insert(file.to_string(), file_index);
         }
         let targets = join::resolve_dispatch_type_names(&self.index, file, &parse, &data);
         if let Some(error) = self.index.take_lazy_load_error() {

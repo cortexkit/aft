@@ -2,4 +2,6 @@
 //! which language a file is parsed as and how its extractors' output maps to
 //! stored records.
 
+pub mod callgraph;
 pub mod content;
+pub mod gate;

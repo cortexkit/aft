@@ -44,6 +44,9 @@ pub enum PathKind {
     /// Could not be read; `content` is a stand-in. Grep reads it directly
     /// and reports the error.
     Unreadable,
+    /// A symbolic link, never followed. Its target is in
+    /// [`PathRecord::link`]; `content` is a stand-in.
+    Symlink,
 }
 
 impl PathKind {
@@ -53,6 +56,7 @@ impl PathKind {
             Self::Binary => 1,
             Self::Oversize => 2,
             Self::Unreadable => 3,
+            Self::Symlink => 4,
         }
     }
 
@@ -62,6 +66,7 @@ impl PathKind {
             1 => Some(Self::Binary),
             2 => Some(Self::Oversize),
             3 => Some(Self::Unreadable),
+            4 => Some(Self::Symlink),
             _ => None,
         }
     }
@@ -83,6 +88,9 @@ pub struct PathRecord {
     pub mode: u32,
     pub kind: PathKind,
     pub content: ContentKey,
+    /// A symlink's target bytes, exactly as stored in the link; empty for
+    /// every other kind.
+    pub link: Vec<u8>,
     pub stat: StatEvidence,
     /// The language the file is parsed as, empty when it is not parsed.
     pub language: String,
@@ -200,6 +208,12 @@ impl CheckoutState {
             out.extend_from_slice(&record.mode.to_le_bytes());
             out.push(record.kind.code());
             out.extend_from_slice(record.content.digest().as_bytes());
+            out.extend_from_slice(
+                &u32::try_from(record.link.len())
+                    .expect("checked in new")
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(&record.link);
             let stat = &record.stat;
             out.extend_from_slice(&stat.size.to_le_bytes());
             out.extend_from_slice(&stat.mtime_ns.to_le_bytes());
@@ -236,6 +250,9 @@ impl CheckoutState {
             let kind =
                 PathKind::from_code(input.take(1)?[0]).ok_or(RecordError::Invalid("path kind"))?;
             let content = ContentKey::from_digest(input.digest()?);
+            let link_len =
+                usize::try_from(input.u32()?).map_err(|_| RecordError::Invalid("link length"))?;
+            let link = input.take(link_len)?.to_vec();
             let stat = StatEvidence {
                 size: input.u64()?,
                 mtime_ns: input.u64()?.cast_signed(),
@@ -261,6 +278,7 @@ impl CheckoutState {
                 mode,
                 kind,
                 content,
+                link,
                 stat,
                 language,
             });
@@ -302,6 +320,7 @@ mod tests {
             mode: 0o100_644,
             kind: PathKind::Text,
             content: ContentKey::of(content.as_bytes()),
+            link: Vec::new(),
             stat: StatEvidence {
                 size: content.len() as u64,
                 mtime_ns: -5,
