@@ -13,6 +13,8 @@ use std::fmt;
 
 #[path = "dispatch.rs"]
 pub mod dispatch;
+#[path = "join_record.rs"]
+pub(crate) mod record;
 
 #[cfg(test)]
 pub(crate) use extraction_work::CountingParser as Parser;
@@ -1968,6 +1970,15 @@ impl ViewBindingDependencies {
 
     pub(crate) fn surface_json(&self) -> Result<Option<String>, serde_json::Error> {
         self.surface.as_ref().map(serde_json::to_string).transpose()
+    }
+
+    /// This binding without its bound file surface, which is not stored:
+    /// binding computes it again from the file's own parse.
+    pub(crate) fn without_surface(&self) -> Self {
+        Self {
+            surface: None,
+            ..self.clone()
+        }
     }
 
     /// Whether binding gave this file the surface `other` recorded, so no

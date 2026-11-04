@@ -15,7 +15,7 @@
 //! ordinals) are within the content, so they are the same wherever the
 //! content appears.
 
-mod codec;
+pub mod codec;
 mod sections;
 
 pub use sections::{ContentReadError, ContentSectionsBuilder, ContentSegment, KNOWN};

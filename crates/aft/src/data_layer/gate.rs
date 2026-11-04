@@ -42,6 +42,15 @@ pub struct ResolveGateReport {
     pub tables: BTreeMap<&'static str, (usize, usize, usize)>,
     pub assemble_ms: f64,
     pub materialize_ms: f64,
+    /// Fragments that did not decode to the resolution they were encoded
+    /// from (bound surfaces aside, which are not stored).
+    pub fragment_mismatches: usize,
+    /// Every file's fragment: encoded bytes, and the same compressed one
+    /// fragment at a time.
+    pub fragment_bytes: usize,
+    pub fragment_zlib_bytes: usize,
+    pub fragment_encode_ms: f64,
+    pub fragment_decode_ms: f64,
     /// Up to twenty paths whose results differ, for a first look.
     pub examples: Vec<String>,
 }
@@ -251,6 +260,34 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
         .filter(|path| !resolved.contains_key(*path))
         .count();
     report.binding_mismatches += unresolved_by_new;
+
+    for (path, file) in &resolved {
+        let started = Instant::now();
+        let bytes = super::fragment::encode(file);
+        report.fragment_encode_ms += started.elapsed().as_secs_f64() * 1000.0;
+        report.fragment_bytes += bytes.len();
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut zlib, &bytes).map_err(|error| error.to_string())?;
+        report.fragment_zlib_bytes += zlib.finish().map_err(|error| error.to_string())?.len();
+        let key = &inputs.parses[path].0;
+        let started = Instant::now();
+        let decoded =
+            super::fragment::decode(key, path, &bytes).map_err(|error| error.0.to_string())?;
+        report.fragment_decode_ms += started.elapsed().as_secs_f64() * 1000.0;
+        let expected = super::callgraph::FileResolution {
+            rows: file.rows.clone(),
+            binding: file.binding.without_surface(),
+            dispatch: file.dispatch.clone(),
+            sites: file.sites.clone(),
+            site_dependencies: file.site_dependencies.clone(),
+        };
+        if decoded != expected {
+            report.fragment_mismatches += 1;
+            if report.examples.len() < 30 {
+                report.examples.push(format!("fragment {path}"));
+            }
+        }
+    }
 
     let started = Instant::now();
     let rows = super::graph_rows::assemble(&inputs, &resolved);

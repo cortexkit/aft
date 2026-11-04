@@ -7,7 +7,7 @@ use super::DecodeError;
 
 /// Writes one record's fields; strings go to the record's table.
 #[derive(Debug, Default)]
-pub(crate) struct Encoder {
+pub struct Encoder {
     out: Vec<u8>,
     strings: Vec<Vec<u8>>,
     index: HashMap<Vec<u8>, u32>,
@@ -18,7 +18,7 @@ impl Encoder {
         clippy::cast_possible_truncation,
         reason = "each byte keeps the low seven bits on purpose"
     )]
-    pub(crate) fn u64(&mut self, mut value: u64) {
+    pub fn u64(&mut self, mut value: u64) {
         while value >= 0x80 {
             self.out.push((value as u8) | 0x80);
             value >>= 7;
@@ -26,23 +26,23 @@ impl Encoder {
         self.out.push(value as u8);
     }
 
-    pub(crate) fn u32(&mut self, value: u32) {
+    pub fn u32(&mut self, value: u32) {
         self.u64(u64::from(value));
     }
 
-    pub(crate) fn usize(&mut self, value: usize) {
+    pub fn usize(&mut self, value: usize) {
         self.u64(value as u64);
     }
 
-    pub(crate) fn bool(&mut self, value: bool) {
+    pub fn bool(&mut self, value: bool) {
         self.out.push(u8::from(value));
     }
 
-    pub(crate) fn byte(&mut self, value: u8) {
+    pub fn byte(&mut self, value: u8) {
         self.out.push(value);
     }
 
-    pub(crate) fn str(&mut self, value: &str) {
+    pub fn str(&mut self, value: &str) {
         self.bytes_ref(value.as_bytes());
     }
 
@@ -57,7 +57,7 @@ impl Encoder {
     }
 
     /// An optional string: 0 for none, otherwise its index plus one.
-    pub(crate) fn opt_str(&mut self, value: Option<&str>) {
+    pub fn opt_str(&mut self, value: Option<&str>) {
         match value {
             None => self.u64(0),
             Some(value) => {
@@ -74,7 +74,7 @@ impl Encoder {
         }
     }
 
-    pub(crate) fn strs(&mut self, values: &[String]) {
+    pub fn strs(&mut self, values: &[String]) {
         self.usize(values.len());
         for value in values {
             self.str(value);
@@ -82,13 +82,13 @@ impl Encoder {
     }
 
     /// Raw bytes stored inline, not in the table.
-    pub(crate) fn blob(&mut self, value: &[u8]) {
+    pub fn blob(&mut self, value: &[u8]) {
         self.usize(value.len());
         self.out.extend_from_slice(value);
     }
 
     /// The string table followed by the fields.
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         let mut table = Self::default();
         table.usize(self.strings.len());
         for string in &self.strings {
@@ -102,14 +102,14 @@ impl Encoder {
 
 /// Reads what an [`Encoder`] wrote.
 #[derive(Debug)]
-pub(crate) struct Decoder<'a> {
+pub struct Decoder<'a> {
     input: &'a [u8],
     position: usize,
     strings: Vec<&'a str>,
 }
 
 impl<'a> Decoder<'a> {
-    pub(crate) fn new(input: &'a [u8]) -> Result<Self, DecodeError> {
+    pub fn new(input: &'a [u8]) -> Result<Self, DecodeError> {
         let mut decoder = Self {
             input,
             position: 0,
@@ -129,7 +129,7 @@ impl<'a> Decoder<'a> {
         Ok(decoder)
     }
 
-    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
+    pub fn u64(&mut self) -> Result<u64, DecodeError> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
             let byte = *self
@@ -145,15 +145,15 @@ impl<'a> Decoder<'a> {
         Err(DecodeError("varint is too long"))
     }
 
-    pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
+    pub fn u32(&mut self) -> Result<u32, DecodeError> {
         u32::try_from(self.u64()?).map_err(|_| DecodeError("value exceeds 32 bits"))
     }
 
-    pub(crate) fn usize(&mut self) -> Result<usize, DecodeError> {
+    pub fn usize(&mut self) -> Result<usize, DecodeError> {
         usize::try_from(self.u64()?).map_err(|_| DecodeError("value exceeds usize"))
     }
 
-    pub(crate) fn bool(&mut self) -> Result<bool, DecodeError> {
+    pub fn bool(&mut self) -> Result<bool, DecodeError> {
         match self.byte()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -161,7 +161,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    pub(crate) fn byte(&mut self) -> Result<u8, DecodeError> {
+    pub fn byte(&mut self) -> Result<u8, DecodeError> {
         let byte = *self
             .input
             .get(self.position)
@@ -170,7 +170,7 @@ impl<'a> Decoder<'a> {
         Ok(byte)
     }
 
-    pub(crate) fn str(&mut self) -> Result<&'a str, DecodeError> {
+    pub fn str(&mut self) -> Result<&'a str, DecodeError> {
         let index = self.usize()?;
         self.strings
             .get(index)
@@ -178,11 +178,11 @@ impl<'a> Decoder<'a> {
             .ok_or(DecodeError("string index out of range"))
     }
 
-    pub(crate) fn string(&mut self) -> Result<String, DecodeError> {
+    pub fn string(&mut self) -> Result<String, DecodeError> {
         self.str().map(str::to_string)
     }
 
-    pub(crate) fn opt_string(&mut self) -> Result<Option<String>, DecodeError> {
+    pub fn opt_string(&mut self) -> Result<Option<String>, DecodeError> {
         match self.usize()? {
             0 => Ok(None),
             index => self
@@ -193,12 +193,12 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    pub(crate) fn strings(&mut self) -> Result<Vec<String>, DecodeError> {
+    pub fn strings(&mut self) -> Result<Vec<String>, DecodeError> {
         let count = self.count()?;
         (0..count).map(|_| self.string()).collect()
     }
 
-    pub(crate) fn blob(&mut self) -> Result<&'a [u8], DecodeError> {
+    pub fn blob(&mut self) -> Result<&'a [u8], DecodeError> {
         let len = self.usize()?;
         let end = self
             .position
@@ -212,7 +212,7 @@ impl<'a> Decoder<'a> {
 
     /// A count of items still to come, checked against the bytes left so a
     /// damaged count cannot ask for a huge allocation.
-    pub(crate) fn count(&mut self) -> Result<usize, DecodeError> {
+    pub fn count(&mut self) -> Result<usize, DecodeError> {
         let count = self.usize()?;
         if count > self.input.len() - self.position {
             return Err(DecodeError("count exceeds the bytes left"));
@@ -220,7 +220,7 @@ impl<'a> Decoder<'a> {
         Ok(count)
     }
 
-    pub(crate) fn finish(self) -> Result<(), DecodeError> {
+    pub fn finish(self) -> Result<(), DecodeError> {
         if self.position == self.input.len() {
             Ok(())
         } else {

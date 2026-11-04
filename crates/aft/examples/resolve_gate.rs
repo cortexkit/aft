@@ -27,6 +27,10 @@ fn main() {
         (0, 0, 0, 0),
         "the data layer's resolution differs from the join's"
     );
+    assert_eq!(
+        report.fragment_mismatches, 0,
+        "a fragment does not round-trip"
+    );
     assert!(
         report
             .tables

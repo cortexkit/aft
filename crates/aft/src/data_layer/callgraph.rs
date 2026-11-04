@@ -62,7 +62,7 @@ pub(crate) struct SiteResolution {
 }
 
 /// One file's resolution.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileResolution {
     /// One row per reference.
     pub(crate) rows: Vec<DerivedRow>,
