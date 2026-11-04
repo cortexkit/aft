@@ -15,4 +15,5 @@ pub mod incremental;
 mod incremental_tests;
 pub(crate) mod overlay;
 pub(crate) mod query;
+pub mod reuse;
 pub(crate) mod slice;

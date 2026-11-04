@@ -117,7 +117,7 @@ pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinErro
 
 /// The facts one resolver thread reads, recording every checkout read with
 /// its answer so a stored resolution can be validated elsewhere.
-fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
+pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
     ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs }))
 }
 

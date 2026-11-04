@@ -504,3 +504,123 @@ fn check_overlay(
         + failures.len();
     Ok((laid, differing))
 }
+
+/// One commit-end checkout resolved by reusing other checkouts' stored
+/// resolutions, against its cold resolution.
+#[derive(Debug, serde::Serialize)]
+pub struct ReuseRecord {
+    pub commit: usize,
+    pub cold_ms: f64,
+    #[serde(flatten)]
+    pub stats: super::reuse::ReuseStats,
+    /// Files whose rows, sites or dispatch targets differ from the cold
+    /// resolution, and files whose recorded reads differ.
+    pub differing_files: usize,
+    pub differing_recordings: usize,
+    pub examples: Vec<String>,
+}
+
+/// The cross-checkout gate. Builds the checkout at the end of every commit
+/// of the pack and resolves each cold. Then resolves each again reusing
+/// only resolutions other commits made, and compares with its cold
+/// resolution: reuse must give exactly the same answers and recorded reads.
+/// Writes one JSON line per commit to `out`; returns the commits checked
+/// and how many differed.
+///
+/// # Errors
+///
+/// When the pack cannot be read or resolution fails.
+pub fn run_reuse(
+    pack: &Path,
+    threads: usize,
+    out: &mut dyn std::io::Write,
+) -> Result<(usize, usize), String> {
+    let reader = std::io::BufReader::new(flate2::read::GzDecoder::new(
+        std::fs::File::open(pack).map_err(|error| error.to_string())?,
+    ));
+    let mut lines = reader.lines();
+    let first: serde_json::Value = serde_json::from_str(
+        &lines
+            .next()
+            .ok_or("empty pack")?
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut files = Files::default();
+    for (path, text) in first["files"].as_object().ok_or("no base files")? {
+        files.set(path, text.as_str().unwrap_or_default())?;
+    }
+    let mut edits = Vec::new();
+    for line in lines {
+        let line = line.map_err(|error| error.to_string())?;
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if value["type"] == "edit" {
+            edits.push(value);
+        }
+    }
+    // The checkout at the end of each commit, resolved cold.
+    let mut checkouts = Vec::new();
+    let mut cold_ms = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        let path = edit["path"].as_str().ok_or("edit without path")?;
+        if edit["kind"] == "delete" {
+            files.entries.remove(path);
+        } else {
+            let text = edit["text"].as_str().ok_or("edit text is not a string")?;
+            files.set(path, text)?;
+        }
+        let last_of_commit = edits
+            .get(index + 1)
+            .is_none_or(|next| next["commit"] != edit["commit"]);
+        if last_of_commit {
+            let inputs = files.inputs();
+            let started = Instant::now();
+            let cold = resolve_checkout(&inputs, threads).map_err(|error| error.to_string())?;
+            cold_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            checkouts.push((inputs, cold));
+        }
+    }
+    let distinct = super::reuse::distinct_resolutions(&checkouts);
+    let mut failures = 0;
+    for (commit, (inputs, cold)) in checkouts.iter().enumerate() {
+        // Only resolutions some other commit made.
+        let pool = distinct
+            .iter()
+            .map(|(file, variants)| {
+                (
+                    *file,
+                    variants
+                        .iter()
+                        .filter(|(_, sources)| sources.iter().any(|source| *source != commit))
+                        .map(|(resolution, _)| *resolution)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .filter(|(_, variants)| !variants.is_empty())
+            .collect();
+        let (reused, stats) = super::reuse::resolve_reusing(inputs, &pool, threads)
+            .map_err(|error| error.to_string())?;
+        let mut record = ReuseRecord {
+            commit,
+            cold_ms: cold_ms[commit],
+            stats,
+            differing_files: 0,
+            differing_recordings: 0,
+            examples: Vec::new(),
+        };
+        let (answers, recordings) = compare(&reused, cold, &mut record.examples);
+        record.differing_files = answers;
+        record.differing_recordings = recordings;
+        if answers > 0 || recordings > 0 {
+            failures += 1;
+        }
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&record).map_err(|error| error.to_string())?
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok((checkouts.len(), failures))
+}
