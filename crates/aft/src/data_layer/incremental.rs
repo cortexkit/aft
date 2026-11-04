@@ -25,9 +25,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::callgraph_store::join::{
-    ManifestJoinError, ViewBindingDependencies, ViewBindingFacts, VIEW_CONFIG_MEMBERSHIP_DOMAIN,
-    VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
+    rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies, ViewBindingFacts,
+    VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
+    VIEW_RUST_CRATES_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
+use crate::callgraph_store::DbFileIndex;
 
 use super::callgraph::{
     bind_all, dispatch_targets, resolve_files, resolver_index, CheckoutFacts, CheckoutInputs,
@@ -262,6 +264,12 @@ impl LiveCheckout {
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
+        let rust_crates_changed = configs
+            .iter()
+            .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
+        if rust_crates_changed {
+            binding_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
+        }
         let mut rebind = self.reverse.binding.of(&binding_keys);
         rebind.extend(contents.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
@@ -269,6 +277,19 @@ impl LiveCheckout {
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
         let (new_surfaces, new_prebound) = bind_all(inputs, &rebind_refs)?;
         stats.rebound = rebind.len();
+        // The Rust module tree changes when a Rust file is added or removed,
+        // or a rebound file declares different modules.
+        let module_tree_changed = membership.iter().any(|path| path.ends_with(".rs"))
+            || rebind.iter().any(|path| {
+                path.ends_with(".rs")
+                    && self
+                        .surfaces
+                        .get(path.as_str())
+                        .map(DbFileIndex::declared_module_targets)
+                        != new_surfaces
+                            .get(path.as_str())
+                            .map(DbFileIndex::declared_module_targets)
+            });
         let mut surfaces_changed = BTreeSet::new();
         let mut references_changed = BTreeSet::new();
         for path in &rebind {
@@ -320,16 +341,20 @@ impl LiveCheckout {
         if !configs.is_empty() {
             changed_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
-        if surfaces_changed.iter().any(|path| path.ends_with(".rs"))
-            || membership.iter().any(|path| path.ends_with(".rs"))
-        {
+        if module_tree_changed {
             changed_keys.insert(VIEW_RUST_MODULE_DOMAIN.to_string());
+        }
+        for path in surfaces_changed.iter().filter(|path| path.ends_with(".rs")) {
+            changed_keys.insert(rust_module_key_for_file(path));
         }
         if membership.iter().any(|path| path.ends_with(".go")) {
             changed_keys.insert(VIEW_GO_PACKAGE_DOMAIN.to_string());
         }
         if go_modules_changed {
             changed_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
+        }
+        if rust_crates_changed {
+            changed_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
         }
 
         // Pass 2.

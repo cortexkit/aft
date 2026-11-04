@@ -540,6 +540,12 @@ fn materialize_reading(
                 {
                     seeds.insert(join::VIEW_GO_MODULES_DOMAIN.as_bytes().to_vec());
                 }
+                if changed
+                    .iter()
+                    .any(|path| path.as_slice() == b"Cargo.toml" || path.ends_with(b"/Cargo.toml"))
+                {
+                    seeds.insert(join::VIEW_RUST_CRATES_DOMAIN.as_bytes().to_vec());
+                }
                 let (selected, domain_only) =
                     dependent_closure(&transaction, &seeds, module_domain_changed)?;
                 module_domain_callers = domain_only;

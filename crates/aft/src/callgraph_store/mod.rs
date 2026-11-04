@@ -5641,6 +5641,13 @@ struct FileRow {
     source_identity: Option<String>,
 }
 
+impl DbFileIndex {
+    /// The modules this file declares, each with the file it names.
+    pub(crate) fn declared_module_targets(&self) -> &HashMap<String, Option<String>> {
+        &self.declared_module_targets
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DbFileIndex {
     lang: Option<LangId>,
@@ -6158,13 +6165,15 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
-        if self.workspace_crate_prefixes.0.get().is_some() {
-            self.facts.memo_replay(&self.project_root, "crates", "");
-        }
+        // The map reads every Cargo.toml of the workspace. A reader records
+        // the map's domain key, not those reads, so what it records does not
+        // depend on which reader built the map; its `Crate` answer is
+        // recorded by the surface index.
+        self.facts.record_domain(join::VIEW_RUST_CRATES_DOMAIN);
         self.workspace_crate_prefixes
             .0
             .get_or_init(|| {
-                self.facts.memo_start(&self.project_root, "crates", "");
+                self.facts.pause_recording();
                 let prefixes = build_workspace_crate_prefixes(
                     &self.project_root,
                     &FactPaths {
@@ -6172,7 +6181,7 @@ impl ResolverIndex for ProjectIndex<'_> {
                         facts: self.facts.as_ref(),
                     },
                 );
-                self.facts.memo_finish(&self.project_root, "crates", "");
+                self.facts.resume_recording();
                 prefixes
             })
             .get(crate_name)

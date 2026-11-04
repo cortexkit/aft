@@ -3157,7 +3157,25 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
 }
 
 pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
+/// The Rust module tree: which files exist and which modules each declares.
+/// `Parent` answers read it; a file whose module declarations change, or a
+/// Rust file added or removed, sets it.
 pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
+
+/// The key of what Rust files at `segments` under `src_prefix` contain, for
+/// inline module lookups that consult those files.
+pub(crate) fn rust_module_key(src_prefix: &str, segments: &[String]) -> String {
+    format!("\0view:rust-module:{src_prefix}:{}", segments.join("::"))
+}
+
+/// [`rust_module_key`] for the Rust file at `path`: the key its surface
+/// changes set.
+pub(crate) fn rust_module_key_for_file(path: &str) -> String {
+    rust_module_key(
+        &super::rust_src_prefix(path),
+        &super::rust_module_segments_for_rel(path),
+    )
+}
 /// Recorded by every Go package file listing. A listing reads the directory,
 /// not the files in it, so a file added to the package is no recorded
 /// dependency of the callers that listed it; the owner rechecks this domain
@@ -3169,16 +3187,35 @@ pub(crate) const VIEW_GO_PACKAGE_DOMAIN: &str = "\0view:go-package-files";
 /// changes the map (a `go.mod` added, removed or rewritten) re-checks every
 /// reader through the `GoPackage` answers they recorded.
 pub(crate) const VIEW_GO_MODULES_DOMAIN: &str = "\0view:go-modules";
+/// The Rust workspace's crate names and source folders, read from every
+/// `Cargo.toml`. Recorded like [`VIEW_GO_MODULES_DOMAIN`]: one key for the
+/// map, set by any `Cargo.toml` added, removed or rewritten, with the
+/// answers each reader used kept as `Crate` queries.
+pub(crate) const VIEW_RUST_CRATES_DOMAIN: &str = "\0view:rust-crates";
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
-            Self::Crate(_) => vec![VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()],
+            Self::Crate(_) => vec![
+                VIEW_CONFIG_MEMBERSHIP_DOMAIN.into(),
+                VIEW_RUST_CRATES_DOMAIN.into(),
+            ],
             Self::CrateRoot(file) => {
                 vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()]
             }
-            Self::Parent(file) | Self::Inline(file, ..) => {
-                vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
+            Self::Parent(file) => vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()],
+            // An inline lookup checks the files whose module path is a
+            // proper prefix of the looked-up path, in the caller's source
+            // folder. Which files those are follows from paths alone, so it
+            // changes only when Rust files are added or removed (the module
+            // domain); what they contain is keyed by their module path.
+            Self::Inline(file, segments, _) => {
+                let prefix = super::rust_src_prefix(file);
+                let mut dependencies = vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()];
+                dependencies.extend(
+                    (0..segments.len()).map(|len| rust_module_key(&prefix, &segments[..len])),
+                );
+                dependencies
             }
             Self::GoPackage(..) => vec![VIEW_GO_PACKAGE_DOMAIN.into()],
             Self::Language(file)
