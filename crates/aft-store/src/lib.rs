@@ -21,6 +21,7 @@ pub mod segment;
 pub mod stat;
 pub mod table;
 pub mod text;
+pub mod vector;
 
 mod fault;
 mod fs;
