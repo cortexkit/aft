@@ -303,7 +303,7 @@ impl MethodCallInputs {
             });
         let old_facts = self.facts.get(path);
         let mut keys = BTreeSet::new();
-        FileFacts::changed_keys(
+        FileFacts::changed_keys_by_method(
             path,
             old_facts,
             new.as_ref().map(|(facts, _)| facts),

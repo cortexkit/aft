@@ -203,6 +203,58 @@ impl FileFacts {
             }
         }
     }
+
+    /// Like [`Self::changed_keys`], but when only some of a non-Go file's
+    /// methods change, names only the method names whose methods changed.
+    ///
+    /// That is enough because of what a resolution that found this file
+    /// through a method name reads without recording this file's key: the
+    /// methods of that name, and the file's other facts (language, types,
+    /// Go package). When any of those other facts change, every method name
+    /// is named, as before. A Go resolution also reads the file's other
+    /// methods (an interface's required set), so a Go file names every
+    /// method name.
+    pub(crate) fn changed_keys_by_method(
+        path: &str,
+        old: Option<&Self>,
+        new: Option<&Self>,
+        keys: &mut BTreeSet<String>,
+    ) {
+        let (Some(old), Some(new)) = (old, new) else {
+            return Self::changed_keys(path, old, new, keys);
+        };
+        let without_methods = |facts: &Self| Self {
+            methods: Vec::new(),
+            ..facts.clone()
+        };
+        if old.language == "go"
+            || new.language == "go"
+            || without_methods(old) != without_methods(new)
+        {
+            return Self::changed_keys(path, Some(old), Some(new), keys);
+        }
+        if old.methods == new.methods {
+            return;
+        }
+        keys.insert(dependency::file(path));
+        keys.insert(dependency::directory(path));
+        let by_name = |facts: &'_ Self| {
+            let mut names = BTreeMap::<String, Vec<MethodHint>>::new();
+            for method in &facts.methods {
+                names
+                    .entry(method.name.clone())
+                    .or_default()
+                    .push(method.clone());
+            }
+            names
+        };
+        let (old, new) = (by_name(old), by_name(new));
+        for name in old.keys().chain(new.keys()) {
+            if old.get(name) != new.get(name) {
+                keys.insert(dependency::method(name));
+            }
+        }
+    }
 }
 
 fn json<T: Serialize>(value: &T) -> Result<String> {
