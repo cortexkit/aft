@@ -20,9 +20,10 @@ use tree_sitter::Parser;
 
 use crate::callgraph_store::disk_facts::{CanonicalProbeMemo, DiskFacts};
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
+use crate::callgraph_store::join::syntax_index::{Direct, Nav, SyntaxIndex};
 #[cfg(test)]
-use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
-use crate::calls::{extract_calls_full, extract_rust_value_references};
+use crate::calls::{call_node_kinds, extract_callee_name, extract_calls_full, extract_full_callee};
+use crate::calls::{extract_calls_full_with, extract_rust_value_references_with};
 #[cfg(test)]
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -1422,7 +1423,7 @@ pub(crate) fn build_file_data_with_typescript_objects(
     }
     let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
     let lines = SourceLineIndex::new(source);
-    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true)
+    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true, Direct)
 }
 
 #[derive(Debug)]
@@ -1434,17 +1435,18 @@ struct SymbolCallRange {
 
 type SourceLineIndex = crate::callgraph_store::LineIndex;
 
-fn collect_calls_by_symbol(
+fn collect_calls_by_symbol<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     lang: LangId,
     symbols: &[Symbol],
     line_index: &SourceLineIndex,
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Vec<CallSite>> {
     attribute_sites_to_symbols(
         line_index,
         symbols,
-        extract_calls_full(source, root, 0, source.len(), lang),
+        extract_calls_full_with(source, root, 0, source.len(), lang, nav),
         lang,
     )
 }
@@ -1522,16 +1524,17 @@ fn split_macro_body_calls(
     (ordinary, body_calls)
 }
 
-fn collect_rust_value_refs_by_symbol(
+fn collect_rust_value_refs_by_symbol<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &[Symbol],
     line_index: &SourceLineIndex,
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Vec<CallSite>> {
     let mut references = attribute_sites_to_symbols(
         line_index,
         symbols,
-        extract_rust_value_references(source, root),
+        extract_rust_value_references_with(source, root, nav),
         LangId::Rust,
     );
     // A function item remains a reference whether it is passed to an API or
@@ -1542,17 +1545,22 @@ fn collect_rust_value_refs_by_symbol(
     references
 }
 
-fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> Option<bool> {
+fn rust_item_is_test<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    byte: usize,
+    nav: impl Nav<'tree>,
+) -> Option<bool> {
     if root.has_error() {
         return None;
     }
     let mut node = root.descendant_for_byte_range(byte, byte)?;
     let mut item = node;
-    while let Some(parent) = item.parent() {
-        if item.kind() == "attribute_item" {
-            while let Some(next) = item.next_named_sibling() {
+    while let Some(parent) = nav.parent(item) {
+        if nav.kind(item) == "attribute_item" {
+            while let Some(next) = nav.next_named_sibling(item) {
                 item = next;
-                if item.kind() != "attribute_item" && !item.is_extra() {
+                if nav.kind(item) != "attribute_item" && !item.is_extra() {
                     break;
                 }
             }
@@ -1561,9 +1569,10 @@ fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> 
         }
         item = parent;
     }
-    while let Some(parent) = node.parent() {
-        let mut sibling = node.prev_named_sibling();
-        while let Some(attribute) = sibling.filter(|n| n.kind() == "attribute_item" || n.is_extra())
+    while let Some(parent) = nav.parent(node) {
+        let mut sibling = nav.prev_named_sibling(node);
+        while let Some(attribute) =
+            sibling.filter(|n| nav.kind(*n) == "attribute_item" || n.is_extra())
         {
             let text = source[attribute.byte_range()]
                 .split_whitespace()
@@ -1571,7 +1580,7 @@ fn rust_item_is_test(source: &str, root: tree_sitter::Node<'_>, byte: usize) -> 
             if text == "#[test]" || text == "#[cfg(test)]" {
                 return Some(true);
             }
-            sibling = attribute.prev_named_sibling();
+            sibling = nav.prev_named_sibling(attribute);
         }
         node = parent;
     }
@@ -1694,49 +1703,33 @@ thread_local! {
     static CALL_SITE_KIND_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn classify_call_site_kinds(
-    root: tree_sitter::Node<'_>,
+fn classify_call_site_kinds<'tree>(
+    root: tree_sitter::Node<'tree>,
     calls: &mut HashMap<String, Vec<CallSite>>,
     value_refs: &mut HashMap<String, Vec<CallSite>>,
+    nav: impl Nav<'tree>,
 ) {
     let mut syntax_by_span = calls
         .values()
         .chain(value_refs.values())
         .flatten()
         .map(|site| ((site.byte_start, site.byte_end), CallSiteSyntax::default()))
-        .collect::<HashMap<_, _>>();
+        .collect::<rustc_hash::FxHashMap<_, _>>();
     if syntax_by_span.is_empty() {
         return;
     }
 
-    // Looking every range up from the root repeats long descents on nested calls.
-    // One cursor walk retains argument context on a heap-backed ancestor path.
-    let mut cursor = root.walk();
-    let mut argument_parents = Vec::new();
-    'walk: loop {
-        let node = cursor.node();
+    // Looking every range up from the root repeats long descents on nested
+    // calls. One walk keeps each node's parent kind, the argument context.
+    nav.walk_with_parent_kind(root, |node, kind, parent_kind| {
         #[cfg(test)]
         CALL_SITE_KIND_NODE_VISITS.with(|visits| visits.set(visits.get() + 1));
         if let Some(syntax) = syntax_by_span.get_mut(&(node.start_byte(), node.end_byte())) {
             // Equal-span descendants overwrite ancestors, matching the deepest range lookup.
-            syntax.construction = node.kind() == "new_expression";
-            syntax.argument = argument_parents.last().copied().unwrap_or(false);
+            syntax.construction = kind == "new_expression";
+            syntax.argument = matches!(parent_kind, Some("arguments" | "argument_list"));
         }
-        let arguments = matches!(node.kind(), "arguments" | "argument_list");
-        if cursor.goto_first_child() {
-            argument_parents.push(arguments);
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                break 'walk;
-            }
-            argument_parents.pop();
-        }
-    }
+    });
     for site in calls.values_mut().flatten() {
         if syntax_by_span[&(site.byte_start, site.byte_end)].construction {
             site.kind = CallSiteKind::Construction;
@@ -1757,17 +1750,32 @@ pub(crate) fn build_file_data_from_tree(
     tree: &tree_sitter::Tree,
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
-    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false)
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, Direct)
         .map(|(data, _)| data)
 }
 
-fn build_file_data_from_tree_observed(
+/// Like [`build_file_data_from_tree`], with `index`, the tree's syntax
+/// index, answering every walk and parent or sibling lookup.
+pub(crate) fn build_file_data_from_index<'tree>(
     path: &Path,
     source: &str,
     lang: LangId,
-    tree: &tree_sitter::Tree,
+    tree: &'tree tree_sitter::Tree,
+    line_index: &SourceLineIndex,
+    index: &SyntaxIndex<'tree>,
+) -> Result<FileCallData, AftError> {
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, index)
+        .map(|(data, _)| data)
+}
+
+fn build_file_data_from_tree_observed<'tree>(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    tree: &'tree tree_sitter::Tree,
     line_index: &SourceLineIndex,
     collect_objects: bool,
+    nav: impl Nav<'tree>,
 ) -> Result<
     (
         FileCallData,
@@ -1784,25 +1792,31 @@ fn build_file_data_from_tree_observed(
     };
 
     // Get symbols (for call site extraction and export detection)
-    let mut symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
+    let mut symbols = crate::parser::extract_symbols_from_tree_with(&source, &tree, lang, nav)?;
     let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
         source,
         lang,
         tree.root_node(),
         &mut symbols,
+        nav,
     );
     let mut rust_qualified = HashMap::new();
     if lang == LangId::Rust {
-        rust_qualified = qualify_rust_impl_methods(source, tree.root_node(), &mut symbols);
-        symbols.extend(rust_trait_members(source, tree.root_node()));
+        rust_qualified = qualify_rust_impl_methods(source, tree.root_node(), &mut symbols, nav);
+        symbols.extend(rust_trait_members(source, tree.root_node(), nav));
     }
 
     let root = tree.root_node();
     let mut macro_body_calls_by_macro = HashMap::new();
     let mut macro_mentions_by_symbol = HashMap::new();
     let mut calls_by_symbol = if lang == LangId::Rust {
-        let (raw_calls, macro_facts) =
-            crate::calls::extract_rust_calls_with_macro_facts(&source, root, 0, source.len());
+        let (raw_calls, macro_facts) = crate::calls::extract_rust_calls_with_macro_facts_with(
+            &source,
+            root,
+            0,
+            source.len(),
+            nav,
+        );
         let (raw_calls, body_calls) =
             split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
@@ -1810,7 +1824,7 @@ fn build_file_data_from_tree_observed(
             attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions, lang);
         attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang)
     } else {
-        collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
+        collect_calls_by_symbol(&source, root, lang, &symbols, line_index, nav)
     };
     if let Some(python) = &python {
         let mut owned = HashMap::<String, Vec<CallSite>>::new();
@@ -1830,7 +1844,7 @@ fn build_file_data_from_tree_observed(
         calls_by_symbol = owned;
     }
     let mut value_refs_by_symbol = if lang == LangId::Rust {
-        collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
+        collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index, nav)
     } else if lang == LangId::Go {
         attribute_sites_to_symbols(
             line_index,
@@ -1842,20 +1856,20 @@ fn build_file_data_from_tree_observed(
         attribute_sites_to_symbols(
             line_index,
             &symbols,
-            crate::calls::extract_js_callback_references(source, root),
+            crate::calls::extract_js_callback_references_with(source, root, nav),
             lang,
         )
     } else {
         HashMap::new()
     };
 
-    let default_export = find_default_export(&source, root, path, lang);
+    let default_export = find_default_export(&source, root, path, lang, nav);
 
     if let Some(default_export) = &default_export {
         if default_export.synthetic {
             let byte_start = default_export.node.byte_range().start;
             let byte_end = default_export.node.byte_range().end;
-            let raw_calls = extract_calls_full(&source, root, byte_start, byte_end, lang);
+            let raw_calls = extract_calls_full_with(&source, root, byte_start, byte_end, lang, nav);
             let sites: Vec<CallSite> = raw_calls
                 .into_iter()
                 .filter(|(_, short, _, _, _)| *short != default_export.symbol)
@@ -1876,7 +1890,7 @@ fn build_file_data_from_tree_observed(
         }
     }
 
-    classify_call_site_kinds(root, &mut calls_by_symbol, &mut value_refs_by_symbol);
+    classify_call_site_kinds(root, &mut calls_by_symbol, &mut value_refs_by_symbol, nav);
 
     // Collect exported symbol names
     let mut exported_symbols: Vec<String> = symbols
@@ -1894,7 +1908,7 @@ fn build_file_data_from_tree_observed(
     }
 
     let rust_attribute_entry_points = if lang == LangId::Rust {
-        crate::parser::rust_attribute_entry_points(&source, root)
+        crate::parser::rust_attribute_entry_points_with(&source, root, nav)
             .into_iter()
             .map(|entry| {
                 let name = rust_qualified
@@ -1908,6 +1922,11 @@ fn build_file_data_from_tree_observed(
         HashMap::new()
     };
 
+    // Every Go variable of a main package initializes with the program.
+    let go_main_package = lang == LangId::Go
+        && root.named_children(&mut root.walk()).any(|n| {
+            n.kind() == "package_clause" && source[n.byte_range()].trim() == "package main"
+        });
     // Build per-symbol metadata for entry point detection
     let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
@@ -1921,6 +1940,7 @@ fn build_file_data_from_tree_observed(
                             source,
                             root,
                             line_index.byte_offset(s.range.start_line, s.range.start_col),
+                            nav,
                         )
                     } else {
                         Some(false)
@@ -1934,13 +1954,8 @@ fn build_file_data_from_tree_observed(
                         .get(&identity)
                         .cloned()
                         .or_else(|| {
-                            (lang == LangId::Go
-                                && s.kind == SymbolKind::Variable
-                                && root.named_children(&mut root.walk()).any(|n| {
-                                    n.kind() == "package_clause"
-                                        && source[n.byte_range()].trim() == "package main"
-                                }))
-                            .then(|| "go_package_initializer".to_string())
+                            (go_main_package && s.kind == SymbolKind::Variable)
+                                .then(|| "go_package_initializer".to_string())
                         }),
                 },
             )
@@ -1962,14 +1977,15 @@ fn build_file_data_from_tree_observed(
     // Template calls have a real macro owner. The owner is not a root: only
     // an invocation from reachable code can make its outgoing edges live.
     if lang == LangId::Rust {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "macro_definition" {
+        // A later definition of the same macro name replaces an earlier one,
+        // in the order of a stack walk over named children.
+        nav.walk_named(root, |node, kind| {
+            if kind == "macro_definition" {
                 if let Some(name) = node.child_by_field_name("name") {
                     symbol_metadata.insert(
                         format!("{}!", &source[name.byte_range()]),
                         SymbolMeta {
-                            is_test: rust_item_is_test(source, root, node.start_byte()),
+                            is_test: rust_item_is_test(source, root, node.start_byte(), nav),
                             kind: SymbolKind::Function,
                             exported: false,
                             signature: None,
@@ -1980,8 +1996,8 @@ fn build_file_data_from_tree_observed(
                     );
                 }
             }
-            stack.extend(node.named_children(&mut node.walk()));
-        }
+            true
+        });
     }
     if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
         || value_refs_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
@@ -2048,16 +2064,22 @@ fn build_file_data_from_tree_observed(
     Ok((data, objects))
 }
 
-pub(crate) fn rust_module_qualified_name(node: Node<'_>, source: &str, name: &str) -> String {
+/// `name` qualified by the inline modules around `node`.
+pub(crate) fn rust_module_qualified_name<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+    nav: impl Nav<'tree>,
+) -> String {
     let mut modules = Vec::new();
-    let mut parent = node.parent();
+    let mut parent = nav.parent(node);
     while let Some(ancestor) = parent {
-        if ancestor.kind() == "mod_item" {
+        if nav.kind(ancestor) == "mod_item" {
             if let Some(name) = ancestor.child_by_field_name("name") {
                 modules.push(node_text(name, source));
             }
         }
-        parent = ancestor.parent();
+        parent = nav.parent(ancestor);
     }
     modules.reverse();
     modules.push(name.to_string());
@@ -2065,16 +2087,16 @@ pub(crate) fn rust_module_qualified_name(node: Node<'_>, source: &str, name: &st
 }
 
 // Same-named types in separate inline modules must not share method identities.
-fn qualify_rust_impl_methods(
+fn qualify_rust_impl_methods<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &mut [Symbol],
+    nav: impl Nav<'tree>,
 ) -> HashMap<String, Option<String>> {
     let mut types = HashSet::new();
-    let mut declarations = vec![root];
-    while let Some(node) = declarations.pop() {
+    nav.walk_named(root, |node, kind| {
         if matches!(
-            node.kind(),
+            kind,
             "struct_item" | "enum_item" | "trait_item" | "type_item"
         ) {
             if let Some(name) = node.child_by_field_name("name") {
@@ -2082,25 +2104,27 @@ fn qualify_rust_impl_methods(
                     node,
                     source,
                     &node_text(name, source),
+                    nav,
                 ));
             }
         }
-        declarations.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     let mut scopes = HashMap::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "impl_item" {
+    nav.walk_named(root, |node, kind| {
+        if kind == "impl_item" {
             let declared_here = ["type", "trait"]
                 .iter()
                 .filter_map(|field| node.child_by_field_name(field))
                 .any(|ty| {
                     let name = node_text(ty, source);
                     let base = name.split('<').next().unwrap_or(&name);
-                    types.contains(&rust_module_qualified_name(node, source, base))
+                    types.contains(&rust_module_qualified_name(node, source, base, nav))
                 });
             if !declared_here {
-                continue;
+                // Nothing under an impl of a type declared elsewhere is
+                // qualified, nested impls included.
+                return false;
             }
             if let Some(body) = node.child_by_field_name("body") {
                 for method in body
@@ -2108,7 +2132,7 @@ fn qualify_rust_impl_methods(
                     .filter(|n| n.kind() == "function_item")
                 {
                     if let Some(name) = method.child_by_field_name("name") {
-                        let prefix = rust_module_qualified_name(node, source, "");
+                        let prefix = rust_module_qualified_name(node, source, "", nav);
                         scopes.insert(
                             (
                                 method.end_position().row as u32,
@@ -2121,8 +2145,8 @@ fn qualify_rust_impl_methods(
                 }
             }
         }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     let mut translated = HashMap::new();
     for symbol in symbols.iter_mut().filter(|s| s.kind == SymbolKind::Method) {
         if let Some(prefix) = scopes.get(&(
@@ -2150,25 +2174,24 @@ fn qualify_rust_impl_methods(
     translated
 }
 
-fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
+fn rust_trait_members<'tree>(source: &str, root: Node<'tree>, nav: impl Nav<'tree>) -> Vec<Symbol> {
     let mut symbols = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "trait_item" {
+    nav.walk_named(root, |node, kind| {
+        if kind == "trait_item" {
             if let (Some(name), Some(body)) = (
                 node.child_by_field_name("name"),
                 node.child_by_field_name("body"),
             ) {
                 let name = node_text(name, source);
                 let mut scope = Vec::new();
-                let mut parent = node.parent();
+                let mut parent = nav.parent(node);
                 while let Some(ancestor) = parent {
-                    if ancestor.kind() == "mod_item" {
+                    if nav.kind(ancestor) == "mod_item" {
                         if let Some(module) = ancestor.child_by_field_name("name") {
                             scope.push(node_text(module, source));
                         }
                     }
-                    parent = ancestor.parent();
+                    parent = nav.parent(ancestor);
                 }
                 scope.reverse();
                 scope.push(name.clone());
@@ -2205,8 +2228,8 @@ fn rust_trait_members(source: &str, root: Node<'_>) -> Vec<Symbol> {
                 }
             }
         }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     symbols
 }
 
@@ -2223,40 +2246,23 @@ fn find_default_export<'tree>(
     root: Node<'tree>,
     path: &Path,
     lang: LangId,
+    nav: impl Nav<'tree>,
 ) -> Option<DefaultExport<'tree>> {
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         return None;
     }
-    find_default_export_inner(source, root, path)
-}
-
-fn find_default_export_inner<'tree>(
-    source: &str,
-    node: Node<'tree>,
-    path: &Path,
-) -> Option<DefaultExport<'tree>> {
-    if node.kind() == "export_statement" {
-        if let Some(default_export) = default_export_from_statement(source, node, path) {
-            return Some(default_export);
+    // The first export statement in preorder that names a default export.
+    let mut found = None;
+    nav.walk(root, |node, kind| {
+        if found.is_some() {
+            return false;
         }
-    }
-
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return None;
-    }
-
-    loop {
-        let child = cursor.node();
-        if let Some(default_export) = find_default_export_inner(source, child, path) {
-            return Some(default_export);
+        if kind == "export_statement" {
+            found = default_export_from_statement(source, node, path);
         }
-        if !cursor.goto_next_sibling() {
-            break;
-        }
-    }
-
-    None
+        found.is_none()
+    });
+    found
 }
 
 fn default_export_from_statement<'tree>(
@@ -4919,6 +4925,7 @@ def right():
                 lang,
                 &symbols,
                 &SourceLineIndex::new(source),
+                Direct,
             );
             let mut reference = reference;
             reference.remove("Worker");
@@ -4966,6 +4973,7 @@ def right():
             LangId::TypeScript,
             &symbols,
             &SourceLineIndex::new(source),
+            Direct,
         );
         assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
         assert_eq!(

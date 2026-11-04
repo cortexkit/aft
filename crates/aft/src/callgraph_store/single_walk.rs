@@ -1,0 +1,326 @@
+//! The call-graph extractor: one walk over each file's syntax tree.
+//!
+//! A [`SyntaxIndex`] walks the tree once; every pass of the extraction reads
+//! the nodes, kinds and neighbours it recorded instead of walking the tree
+//! again or asking tree-sitter to search for a parent. The passes are the
+//! ones the extractor always ran, with the same rules; only how they find
+//! their nodes changed. `CallgraphBlob::extract_reference` keeps the
+//! extractor this replaced, for the extraction gate.
+//!
+//! This module also parses for extraction.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::Path;
+
+use super::syntax_index::SyntaxIndex;
+use super::{
+    assign_ordinals, blob_imports, blob_refs, blob_symbols, dispatch, language_id, structural_ref,
+    AstPreorderNode, BlobRef, BlobRefKind, CallgraphBlob, ManifestJoinError, ParseBlob, Parser,
+};
+use crate::callgraph;
+use crate::callgraph_store::facts::{BlobKey, FactPaths, ManifestFacts};
+use crate::parser::{grammar_for, LangId};
+use crate::views::Manifest;
+
+/// Parses `source` as `language` and extracts its parse output.
+pub(super) fn extract(
+    source: &str,
+    language: &str,
+    extractor_version: String,
+) -> Result<CallgraphBlob, ManifestJoinError> {
+    let lang = language_id(language)
+        .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
+    let tree = parse_source(source, lang)?;
+    extract_tree(source, language, extractor_version, &tree)
+}
+
+/// Extracts the parse output of `source` from `tree`, its syntax tree in
+/// `language`.
+pub(super) fn extract_tree(
+    source: &str,
+    language: &str,
+    extractor_version: String,
+    tree: &tree_sitter::Tree,
+) -> Result<CallgraphBlob, ManifestJoinError> {
+    let lang = language_id(language)
+        .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
+    let root = tree.root_node();
+    let index = SyntaxIndex::new(root);
+    let ast_nodes = ast_preorder_nodes(&index);
+    let line_index = crate::callgraph_store::LineIndex::new(source);
+    let mut data = callgraph::build_file_data_from_index(
+        Path::new("__callgraph_blob__"),
+        source,
+        lang,
+        tree,
+        &line_index,
+        &index,
+    )
+    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+    if lang == LangId::Rust {
+        crate::callgraph_store::extend_rust_imports_from_uses(
+            source,
+            index
+                .preorder_kinds()
+                .filter(|(_, kind)| *kind == "use_declaration")
+                .map(|(node, _)| node),
+            &mut data,
+        );
+    }
+    let mut symbols = blob_symbols(&data);
+    let mut imports = blob_imports(&data);
+    let mut refs = blob_refs(&line_index, &data);
+    if lang == LangId::Rust {
+        refs.extend(rust_module_refs(source, &index));
+    }
+    let empty = Manifest::new([]).map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+    let reader = |_: &BlobKey| None;
+    let empty_facts = ManifestFacts {
+        manifest: &empty,
+        blobs: &reader,
+    };
+    let paths = FactPaths {
+        root: Path::new("/"),
+        facts: &empty_facts,
+    };
+    let file = Path::new("/__callgraph_blob__");
+    let mut structural = crate::callgraph_store::collect_reexport_refs_with_line_index(
+        paths.root,
+        file,
+        "__callgraph_blob__",
+        source,
+        lang,
+        &crate::callgraph::ModuleResolutionMemo::default(),
+        &paths,
+        &line_index,
+        Some(root),
+    )
+    .raw_refs;
+    structural.extend(
+        crate::callgraph_store::collect_source_less_export_alias_refs_with_line_index(
+            "__callgraph_blob__",
+            source,
+            &line_index,
+        )
+        .raw_refs,
+    );
+    if lang == LangId::Rust {
+        structural.extend(
+            crate::callgraph_store::collect_rust_pub_use_reexport_refs(
+                paths.root,
+                file,
+                "__callgraph_blob__",
+                &data.import_block.imports,
+                &line_index,
+                &paths,
+            )
+            .raw_refs,
+        );
+    }
+    refs.extend(structural.into_iter().map(structural_ref));
+    assign_ordinals(
+        &ast_nodes,
+        &line_index,
+        &mut symbols,
+        &mut imports,
+        &mut refs,
+    );
+    let mut exported_symbols = data.exported_symbols.clone();
+    exported_symbols.sort();
+    let mut callable_symbols = data.calls_by_symbol.keys().cloned().collect::<Vec<_>>();
+    callable_symbols.sort();
+    refs.sort_by(|left, right| {
+        (
+            left.ordinal,
+            left.kind,
+            left.byte_start,
+            left.byte_end,
+            left.full_ref.as_deref(),
+            left.caller_symbol.as_deref(),
+        )
+            .cmp(&(
+                right.ordinal,
+                right.kind,
+                right.byte_start,
+                right.byte_end,
+                right.full_ref.as_deref(),
+                right.caller_symbol.as_deref(),
+            ))
+    });
+    refs.dedup_by(|left, right| {
+        left.ordinal == right.ordinal
+            && left.kind == right.kind
+            && left.byte_start == right.byte_start
+            && left.byte_end == right.byte_end
+            && left.full_ref == right.full_ref
+            && left.caller_symbol == right.caller_symbol
+    });
+
+    let mut parse = ParseBlob {
+        entry_point_symbols: data
+            .symbol_metadata
+            .iter()
+            .filter(|(_, meta)| meta.entry_point_attribute.is_some())
+            .map(|(name, _)| name.clone())
+            .collect(),
+        dispatch: dispatch::DispatchFacts::default(),
+        extractor_version,
+        language: language.to_string(),
+        ast_nodes,
+        symbols,
+        default_export_symbol: data.default_export_symbol,
+        exported_symbols,
+        callable_symbols,
+        imports,
+        python_bindings: data.python_bindings,
+        refs,
+    };
+    parse.entry_point_symbols.sort();
+    parse.dispatch = dispatch::extract_with(source, lang, root, &mut parse, &index)?;
+    Ok(CallgraphBlob::Parse(parse))
+}
+
+/// Every node's kind and span in preorder, numbered by position.
+fn ast_preorder_nodes(index: &SyntaxIndex<'_>) -> Vec<AstPreorderNode> {
+    index
+        .preorder_kinds()
+        .enumerate()
+        .map(|(ordinal, (node, kind))| AstPreorderNode {
+            ordinal: ordinal as u32,
+            kind: Cow::Borrowed(kind),
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+        })
+        .collect()
+}
+
+/// A reference for each `mod name;` declaration (a module whose body is in
+/// another file).
+fn rust_module_refs(source: &str, index: &SyntaxIndex<'_>) -> Vec<BlobRef> {
+    let mut refs = Vec::new();
+    for (node, kind) in index.preorder_kinds() {
+        if kind != "mod_item"
+            || node
+                .named_children(&mut node.walk())
+                .any(|child| child.kind() == "declaration_list")
+        {
+            continue;
+        }
+        let Some(name) = node.child_by_field_name("name") else {
+            continue;
+        };
+        let module_name = source[name.byte_range()].to_string();
+        refs.push(BlobRef {
+            ordinal: 0,
+            kind: BlobRefKind::Module,
+            caller_symbol: None,
+            short_name: Some(module_name.clone()),
+            full_ref: Some(
+                if crate::callgraph_store::rust_module_has_macro_use_with(source, node, index) {
+                    format!("#[macro_use] mod {module_name};")
+                } else {
+                    module_name.clone()
+                },
+            ),
+            module_path: Some(module_name),
+            line: node.start_position().row as u32 + 1,
+            byte_start: node.start_byte(),
+            byte_end: node.end_byte(),
+            path_override: crate::callgraph_store::rust_module_path_override_with(
+                source, node, index,
+            )
+            .map(str::to_string),
+            local_name: None,
+            requested_name: None,
+            namespace_alias: None,
+            wildcard: false,
+            import_kind: None,
+        });
+    }
+    refs
+}
+
+/// Parses `source` as `lang` for extraction, reusing a header's tree when
+/// its language was chosen by parsing it.
+pub(crate) fn parse_source(
+    source: &str,
+    lang: LangId,
+) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    if let Some(tree) = crate::parser::cached_header_tree(source, lang) {
+        return Ok(tree);
+    }
+    with_parser(lang, |parser| parser.parse(source, None))
+}
+
+thread_local! {
+    // A parser is mutable and not shareable, so each extraction thread keeps
+    // one per grammar instead of building one per file.
+    static EXTRACTION_PARSERS: std::cell::RefCell<HashMap<LangId, Parser>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn with_parser(
+    lang: LangId,
+    parse: impl FnOnce(&mut Parser) -> Option<tree_sitter::Tree>,
+) -> Result<tree_sitter::Tree, ManifestJoinError> {
+    EXTRACTION_PARSERS.with(|parsers| {
+        let mut parsers = parsers.borrow_mut();
+        let parser = match parsers.entry(lang) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&grammar_for(lang))
+                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                entry.insert(parser)
+            }
+        };
+        parse(parser)
+            .ok_or_else(|| ManifestJoinError::Parse("tree-sitter returned no tree".to_string()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both extractors on real files of several languages; the gate
+    /// (`data_layer::extract_gate`) runs the same check on whole
+    /// repositories.
+    #[test]
+    fn single_walk_output_equals_the_replaced_extractor() {
+        let sources = [
+            (include_str!("rust_bindings.rs"), "rust"),
+            (include_str!("dispatch.rs"), "rust"),
+            (include_str!("../calls.rs"), "rust"),
+            (
+                include_str!("../../../../packages/aft-bridge/src/bash-hints.ts"),
+                "typescript",
+            ),
+            (
+                include_str!("../../../../benchmarks/aft-search/author_real_query.py"),
+                "python",
+            ),
+            (
+                include_str!("../../tests/store_diet/corpus/receiver-go/receiver.go"),
+                "go",
+            ),
+            (
+                "export default () => run(x => x.go());\nconst o = { m() { this.n(); } };\n",
+                "javascript",
+            ),
+            ("{\"a\": [1, {\"b\": 2}]}", "json"),
+        ];
+        for (source, language) in sources {
+            let mut single = extract(source, language, "test".to_string()).unwrap();
+            let mut reference = CallgraphBlob::extract_reference(source, language, "test").unwrap();
+            for blob in [&mut single, &mut reference] {
+                if let CallgraphBlob::Parse(parse) = blob {
+                    parse.ast_nodes.clear();
+                }
+            }
+            assert!(single == reference, "{language}: outputs differ");
+        }
+    }
+}

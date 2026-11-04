@@ -28,6 +28,7 @@ use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
 use crate::symbols::{Range, SymbolKind};
+use join::syntax_index::{Direct, Nav};
 #[cfg(test)]
 use join::Parser;
 use rayon::prelude::*;
@@ -16475,27 +16476,45 @@ fn rust_external_module_target(
 }
 
 fn rust_module_path_override<'a>(source: &'a str, module: Node<'_>) -> Option<&'a str> {
-    let mut previous = module.prev_sibling();
+    rust_module_path_override_with(source, module, Direct)
+}
+
+/// The `#[path = "..."]` attribute before a `mod` declaration.
+fn rust_module_path_override_with<'a, 'tree>(
+    source: &'a str,
+    module: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<&'a str> {
+    let mut previous = nav.prev_sibling(module);
     while let Some(attribute) = previous {
-        if attribute.kind() != "attribute_item" {
+        if nav.kind(attribute) != "attribute_item" {
             break;
         }
         if let Some(path) = rust_path_attribute(source.get(attribute.byte_range())?) {
             return Some(path);
         }
-        previous = attribute.prev_sibling();
+        previous = nav.prev_sibling(attribute);
     }
     None
 }
 
 pub(super) fn rust_module_has_macro_use(source: &str, module: Node<'_>) -> bool {
-    let mut previous = module.prev_sibling();
+    rust_module_has_macro_use_with(source, module, Direct)
+}
+
+/// Whether a `#[macro_use]` attribute precedes a `mod` declaration.
+fn rust_module_has_macro_use_with<'tree>(
+    source: &str,
+    module: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> bool {
+    let mut previous = nav.prev_sibling(module);
     while let Some(attribute) = previous {
-        if matches!(attribute.kind(), "line_comment" | "block_comment") {
-            previous = attribute.prev_sibling();
+        if matches!(nav.kind(attribute), "line_comment" | "block_comment") {
+            previous = nav.prev_sibling(attribute);
             continue;
         }
-        if attribute.kind() != "attribute_item" {
+        if nav.kind(attribute) != "attribute_item" {
             break;
         }
         if node_text(attribute, source)
@@ -16506,7 +16525,7 @@ pub(super) fn rust_module_has_macro_use(source: &str, module: Node<'_>) -> bool 
         {
             return true;
         }
-        previous = attribute.prev_sibling();
+        previous = nav.prev_sibling(attribute);
     }
     false
 }
@@ -16552,6 +16571,31 @@ fn extend_rust_imports_from_tree(source: &str, root: Node<'_>, data: &mut FileCa
     data.import_block.byte_range = import_byte_range_from_imports(&data.import_block.imports);
 }
 
+/// Like [`extend_rust_imports_from_tree`], given the tree's
+/// `use_declaration` nodes in preorder instead of walking it for them.
+fn extend_rust_imports_from_uses<'tree>(
+    source: &str,
+    uses: impl Iterator<Item = Node<'tree>>,
+    data: &mut FileCallData,
+) {
+    let mut seen = HashSet::new();
+    let mut nested_imports = Vec::new();
+    for node in uses {
+        collect_rust_use_import(source, node, &mut seen, &mut nested_imports);
+    }
+    if nested_imports.is_empty() {
+        return;
+    }
+    data.import_block
+        .imports
+        .retain(|import| !seen.contains(&(import.byte_range.start, import.byte_range.end)));
+    data.import_block.imports.extend(nested_imports);
+    data.import_block
+        .imports
+        .sort_by_key(|import| import.byte_range.start);
+    data.import_block.byte_range = import_byte_range_from_imports(&data.import_block.imports);
+}
+
 fn collect_rust_use_imports(
     source: &str,
     node: Node<'_>,
@@ -16559,36 +16603,7 @@ fn collect_rust_use_imports(
     imports: &mut Vec<ImportStatement>,
 ) {
     if node.kind() == "use_declaration" {
-        let range = node.byte_range();
-        if seen.insert((range.start, range.end)) {
-            if let Some(import) = rust_import_from_use_node(source, node) {
-                let paths = node
-                    .child_by_field_name("argument")
-                    .map(|argument| rust_use_leaf_paths(source, argument))
-                    .unwrap_or_default();
-                if paths.is_empty() {
-                    imports.push(import);
-                } else {
-                    for (path, range) in paths {
-                        let mut leaf = import.clone();
-                        leaf.byte_range = range;
-                        leaf.module_path = path.clone();
-                        leaf.raw_text = format!(
-                            "{}use {path};",
-                            leaf.default_import
-                                .as_ref()
-                                .map(|v| format!("{v} "))
-                                .unwrap_or_default()
-                        );
-                        leaf.names = Vec::new();
-                        if let ImportForm::RustUse { named, .. } = &mut leaf.form {
-                            named.clear();
-                        }
-                        imports.push(leaf);
-                    }
-                }
-            }
-        }
+        collect_rust_use_import(source, node, seen, imports);
     }
 
     let mut cursor = node.walk();
@@ -16600,6 +16615,47 @@ fn collect_rust_use_imports(
         if !cursor.goto_next_sibling() {
             break;
         }
+    }
+}
+
+/// The imports one `use` declaration binds: one per leaf of its use tree.
+fn collect_rust_use_import(
+    source: &str,
+    node: Node<'_>,
+    seen: &mut HashSet<(usize, usize)>,
+    imports: &mut Vec<ImportStatement>,
+) {
+    let range = node.byte_range();
+    if !seen.insert((range.start, range.end)) {
+        return;
+    }
+    let Some(import) = rust_import_from_use_node(source, node) else {
+        return;
+    };
+    let paths = node
+        .child_by_field_name("argument")
+        .map(|argument| rust_use_leaf_paths(source, argument))
+        .unwrap_or_default();
+    if paths.is_empty() {
+        imports.push(import);
+        return;
+    }
+    for (path, range) in paths {
+        let mut leaf = import.clone();
+        leaf.byte_range = range;
+        leaf.module_path = path.clone();
+        leaf.raw_text = format!(
+            "{}use {path};",
+            leaf.default_import
+                .as_ref()
+                .map(|v| format!("{v} "))
+                .unwrap_or_default()
+        );
+        leaf.names = Vec::new();
+        if let ImportForm::RustUse { named, .. } = &mut leaf.form {
+            named.clear();
+        }
+        imports.push(leaf);
     }
 }
 

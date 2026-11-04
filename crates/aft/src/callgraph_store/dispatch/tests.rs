@@ -17,7 +17,7 @@ fn rust_receiver_index_slices_preserve_local_preorder() {
         let tree = parser.parse(source, None).unwrap();
         let nodes = descendants(tree.root_node());
         let bindings = RustBindings::new(source, tree.root_node());
-        let index = RustReceiverIndex::new(&nodes, source, &bindings);
+        let index = RustReceiverIndex::new(&nodes, source, &bindings, Direct);
         for &function in nodes.iter().filter(|node| FUNCTIONS.contains(&node.kind())) {
             assert_eq!(
                 index

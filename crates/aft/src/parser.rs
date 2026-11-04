@@ -13,6 +13,7 @@ use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::resolve_module_path;
+use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::error::AftError;
 use crate::symbol_cache_disk;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
@@ -2564,7 +2565,19 @@ pub fn extract_symbols_from_tree(
     tree: &Tree,
     lang: LangId,
 ) -> Result<Vec<Symbol>, AftError> {
-    let mut symbols = extract_symbols_from_tree_unbounded(source, tree, lang)?;
+    extract_symbols_from_tree_with(source, tree, lang, Direct)
+}
+
+/// [`extract_symbols_from_tree`], with `nav` walking a Rust tree and
+/// answering its parent and sibling lookups. Other languages run tree-sitter
+/// queries, which walk the tree themselves.
+pub(crate) fn extract_symbols_from_tree_with<'tree>(
+    source: &str,
+    tree: &'tree Tree,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = extract_symbols_from_tree_unbounded(source, tree, lang, nav)?;
     for symbol in &mut symbols {
         if let Some(signature) = symbol.signature.as_mut() {
             truncate_signature(signature);
@@ -2587,15 +2600,16 @@ pub(crate) fn truncate_signature(signature: &mut String) {
     signature.push('…');
 }
 
-fn extract_symbols_from_tree_unbounded(
+fn extract_symbols_from_tree_unbounded<'tree>(
     source: &str,
-    tree: &Tree,
+    tree: &'tree Tree,
     lang: LangId,
+    nav: impl Nav<'tree>,
 ) -> Result<Vec<Symbol>, AftError> {
     let root = tree.root_node();
 
     if lang == LangId::Rust {
-        return extract_rs_symbols(source, &root);
+        return extract_rs_symbols(source, &root, nav);
     }
     if lang == LangId::Html {
         return extract_html_symbols(source, &root);
@@ -2621,9 +2635,9 @@ fn extract_symbols_from_tree_unbounded(
     })?;
 
     match lang {
-        LangId::TypeScript | LangId::Tsx => extract_ts_symbols(source, &root, query),
-        LangId::JavaScript => extract_js_symbols(source, &root, query),
-        LangId::Python => extract_py_symbols(source, &root, query),
+        LangId::TypeScript | LangId::Tsx => extract_ts_symbols(source, &root, query, nav),
+        LangId::JavaScript => extract_js_symbols(source, &root, query, nav),
+        LangId::Python => extract_py_symbols(source, &root, query, nav),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
         LangId::Cpp | LangId::Cuda | LangId::Metal => {
@@ -2674,9 +2688,20 @@ pub(crate) fn node_range(node: &Node) -> Range {
 /// This ensures that when agents edit/replace a symbol, they get the full
 /// declaration including `#[test]`, `#[derive(...)]`, `/// doc`, `@decorator`, etc.
 pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId) -> Range {
+    node_range_with_decorators_with(node, source, lang, Direct)
+}
+
+/// [`node_range_with_decorators`], looking up parents and siblings with
+/// `nav`.
+pub(crate) fn node_range_with_decorators_with<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Range {
     if matches!(lang, LangId::Python) {
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "decorated_definition" {
+        if let Some(parent) = nav.parent(*node) {
+            if nav.kind(parent) == "decorated_definition" {
                 return node_range(&parent);
             }
         }
@@ -2690,25 +2715,30 @@ pub(crate) fn node_range_with_decorators(node: &Node, source: &str, lang: LangId
     // does, because they're replacing the *declaration*). Walk up to the
     // export_statement so the range covers `export ...`/`export default ...`.
     if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
-        if let Some(parent) = node.parent() {
-            if parent.kind() == "export_statement" {
-                return node_range_with_decorators_inner(&parent, source, lang);
+        if let Some(parent) = nav.parent(*node) {
+            if nav.kind(parent) == "export_statement" {
+                return node_range_with_decorators_inner(&parent, source, lang, nav);
             }
         }
     }
 
-    node_range_with_decorators_inner(node, source, lang)
+    node_range_with_decorators_inner(node, source, lang, nav)
 }
 
 /// Inner walk that handles preceding-sibling expansion (decorators, doc comments).
 /// Split from `node_range_with_decorators` so the export-statement parent path can
 /// recurse without re-checking the export wrapper.
-fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> Range {
+fn node_range_with_decorators_inner<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Range {
     let mut range = node_range(node);
 
     let mut current = *node;
-    while let Some(prev) = current.prev_sibling() {
-        let kind = prev.kind();
+    while let Some(prev) = nav.prev_sibling(current) {
+        let kind = nav.kind(prev);
         let should_include = match lang {
             LangId::Rust => {
                 // Include #[...] attributes
@@ -2879,9 +2909,9 @@ struct ExportIndex {
     names: HashSet<String>,
 }
 
-fn collect_exports(source: &str, root: &Node) -> ExportIndex {
+fn collect_exports<'tree>(source: &str, root: &Node<'tree>, nav: impl Nav<'tree>) -> ExportIndex {
     let mut ranges = Vec::new();
-    let names = walk_export_statements(source, root, |node| ranges.push(node.byte_range()));
+    let names = walk_export_statements(source, root, nav, |node| ranges.push(node.byte_range()));
     // Keep only ranges no other range contains. A node is inside some export
     // statement exactly when it is inside one of the outermost ones, and once
     // contained ranges are gone, both starts and ends increase along the list,
@@ -2929,7 +2959,7 @@ thread_local! {
 /// them from [`collect_exports`]; tests use this to check that walk.
 #[cfg(test)]
 fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
-    walk_export_statements(source, root, |_| {})
+    walk_export_statements(source, root, Direct, |_| {})
 }
 
 /// Pre-order walk of the whole tree: calls `on_export` for every
@@ -2940,31 +2970,21 @@ fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
 /// TypeScript grammar (an HTML page whose URL ended in `.d.ts`) produced an
 /// error-recovery tree deep enough to overflow the 2 MiB executor worker
 /// stack and abort the daemon - twice, 55 s apart, on the same request.
-fn walk_export_statements(
+fn walk_export_statements<'tree>(
     source: &str,
-    root: &Node,
+    root: &Node<'tree>,
+    nav: impl Nav<'tree>,
     mut on_export: impl FnMut(&Node),
 ) -> HashSet<String> {
     let mut exported = HashSet::new();
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        if node.kind() == "export_statement" {
+    nav.walk(*root, |node, kind| {
+        if kind == "export_statement" {
             on_export(&node);
             collect_names_from_export_statement(source, &node, &mut exported);
         }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return exported;
-            }
-        }
-    }
+        true
+    });
+    exported
 }
 
 fn collect_names_from_export_statement(source: &str, node: &Node, exported: &mut HashSet<String>) {
@@ -3056,12 +3076,13 @@ fn extract_signature(source: &str, node: &Node) -> String {
     trimmed.to_string()
 }
 
-fn push_default_export_symbol(
+fn push_default_export_symbol<'tree>(
     symbols: &mut Vec<Symbol>,
     source: &str,
     lang: LangId,
-    body_node: Node,
-    def_node: Node,
+    body_node: Node<'tree>,
+    def_node: Node<'tree>,
+    nav: impl Nav<'tree>,
 ) {
     let kind = if body_node.kind() == "class" {
         SymbolKind::Class
@@ -3072,7 +3093,7 @@ fn push_default_export_symbol(
     symbols.push(Symbol {
         name: "default".to_string(),
         kind,
-        range: node_range_with_decorators(&def_node, source, lang),
+        range: node_range_with_decorators_with(&def_node, source, lang, nav),
         signature: Some(extract_signature(source, &def_node)),
         scope_chain: vec![],
         exported: true,
@@ -3100,18 +3121,19 @@ fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
     }
 }
 
-fn push_ts_member_symbol(
+fn push_ts_member_symbol<'tree>(
     symbols: &mut Vec<Symbol>,
     source: &str,
-    name_node: Node<'_>,
-    def_node: Node<'_>,
+    name_node: Node<'tree>,
+    def_node: Node<'tree>,
     parent_name: &str,
     kind: SymbolKind,
+    nav: impl Nav<'tree>,
 ) {
     symbols.push(Symbol {
         name: node_text(source, &name_node).to_string(),
         kind,
-        range: node_range_with_decorators(&def_node, source, LangId::TypeScript),
+        range: node_range_with_decorators_with(&def_node, source, LangId::TypeScript, nav),
         signature: Some(extract_signature(source, &def_node)),
         scope_chain: vec![parent_name.to_string()],
         exported: false,
@@ -3120,14 +3142,19 @@ fn push_ts_member_symbol(
 }
 
 /// Extract symbols from TypeScript / TSX source.
-fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_ts_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::TypeScript;
     let capture_names = query.capture_names();
 
     let ExportIndex {
         ranges: export_ranges,
         names: exported_names,
-    } = collect_exports(source, root);
+    } = collect_exports(source, root, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3226,7 +3253,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3240,7 +3267,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&range_node, source, lang),
+                range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3250,7 +3277,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Anonymous/default function or class expression
         if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
-            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node, nav);
         }
 
         // Class declaration
@@ -3258,7 +3285,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3274,7 +3301,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Method,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![class_name.clone()],
                 exported: false, // methods inherit export from class
@@ -3296,6 +3323,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 class_name,
                 SymbolKind::Method,
+                nav,
             );
         }
 
@@ -3304,7 +3332,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Interface,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3326,6 +3354,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 interface_name,
                 SymbolKind::Method,
+                nav,
             );
         }
 
@@ -3344,6 +3373,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                     def_node,
                     interface_name,
                     SymbolKind::Method,
+                    nav,
                 );
             }
         }
@@ -3363,6 +3393,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 def_node,
                 object_name,
                 SymbolKind::Method,
+                nav,
             );
 
             // A named function expression also has a lexical name that callers may search for.
@@ -3376,6 +3407,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                             value_node,
                             object_name,
                             SymbolKind::Function,
+                            nav,
                         );
                     }
                 }
@@ -3387,7 +3419,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Enum,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3400,7 +3432,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::TypeAlias,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3411,8 +3443,8 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         // Top-level const/let variable declaration (not arrow functions — those are handled above)
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
             // Only include module-scope variables (parent is program/export_statement, not inside a function)
-            let is_top_level = def_node
-                .parent()
+            let is_top_level = nav
+                .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
             let range_node = var_decl_node.unwrap_or(def_node);
@@ -3426,7 +3458,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 symbols.push(Symbol {
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&range_node, source, lang),
+                    range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -3490,14 +3522,19 @@ impl VariableNameIndex {
 }
 
 /// Extract symbols from JavaScript source.
-fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_js_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::JavaScript;
     let capture_names = query.capture_names();
 
     let ExportIndex {
         ranges: export_ranges,
         names: exported_names,
-    } = collect_exports(source, root);
+    } = collect_exports(source, root, nav);
 
     let mut symbols = Vec::new();
     let mut variable_names = VariableNameIndex::default();
@@ -3552,7 +3589,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3565,7 +3602,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
-                range: node_range_with_decorators(&range_node, source, lang),
+                range: node_range_with_decorators_with(&range_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3574,14 +3611,14 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         if let (Some(body_node), Some(def_node)) = (default_body_node, default_def_node) {
-            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node);
+            push_default_export_symbol(&mut symbols, source, lang, body_node, def_node, nav);
         }
 
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![],
                 exported: is_exported(&def_node, &export_ranges),
@@ -3596,7 +3633,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Method,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: Some(extract_signature(source, &def_node)),
                 scope_chain: vec![class_name.clone()],
                 exported: false,
@@ -3610,8 +3647,8 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         // .js file produced no symbol for outline/dead_code/callgraph. Mirror the
         // TS extractor: module-scope, non-function-valued, not already captured.
         if let (Some(name_node), Some(def_node)) = (var_name_node, var_def_node) {
-            let is_top_level = def_node
-                .parent()
+            let is_top_level = nav
+                .parent(def_node)
                 .map(|p| p.kind() == "program" || p.kind() == "export_statement")
                 .unwrap_or(false);
             let range_node = var_decl_node.unwrap_or(def_node);
@@ -3625,7 +3662,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 symbols.push(Symbol {
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
-                    range: node_range_with_decorators(&range_node, source, lang),
+                    range: node_range_with_decorators_with(&range_node, source, lang, nav),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: vec![],
                     exported: is_exported(&def_node, &export_ranges),
@@ -3642,23 +3679,28 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
 /// Walk parent nodes to build a scope chain for Python symbols.
 /// A function inside `class_definition > block` gets the class name in its scope.
-fn py_scope_chain(node: &Node, source: &str) -> Vec<String> {
+fn py_scope_chain<'tree>(node: &Node<'tree>, source: &str, nav: impl Nav<'tree>) -> Vec<String> {
     let mut chain = Vec::new();
-    let mut current = node.parent();
+    let mut current = nav.parent(*node);
     while let Some(parent) = current {
-        if parent.kind() == "class_definition" {
+        if nav.kind(parent) == "class_definition" {
             if let Some(name_node) = parent.child_by_field_name("name") {
                 chain.push(node_text(source, &name_node).to_string());
             }
         }
-        current = parent.parent();
+        current = nav.parent(parent);
     }
     chain.reverse();
     chain
 }
 
 /// Extract symbols from Python source.
-fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
+fn extract_py_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    query: &Query,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::Python;
     let capture_names = query.capture_names();
 
@@ -3735,7 +3777,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Function definition
         if let (Some(name_node), Some(def_node)) = (fn_name_node, fn_def_node) {
-            let scope = py_scope_chain(&def_node, source);
+            let scope = py_scope_chain(&def_node, source, nav);
             let is_method = !scope.is_empty();
             let name = node_text(source, &name_node).to_string();
             // Skip __init__ and other dunders as separate symbols — they're methods
@@ -3749,7 +3791,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             let sig = if decorated_fn_lines.contains(&def_node.start_position().row) {
                 // Find the decorated_definition parent to get decorator text
                 let mut sig_parts = Vec::new();
-                let mut parent = def_node.parent();
+                let mut parent = nav.parent(def_node);
                 while let Some(p) = parent {
                     if p.kind() == "decorated_definition" {
                         // Get decorator lines
@@ -3766,7 +3808,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                         }
                         break;
                     }
-                    parent = p.parent();
+                    parent = nav.parent(p);
                 }
                 sig_parts.push(extract_signature(source, &def_node));
                 Some(sig_parts.join("\n"))
@@ -3777,7 +3819,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name,
                 kind,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: sig,
                 scope_chain: scope.clone(),
                 exported: false, // Python has no export concept
@@ -3787,12 +3829,12 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Class definition
         if let (Some(name_node), Some(def_node)) = (class_name_node, class_def_node) {
-            let scope = py_scope_chain(&def_node, source);
+            let scope = py_scope_chain(&def_node, source, nav);
 
             // Build signature — include decorator if decorated
             let sig = if decorated_fn_lines.contains(&def_node.start_position().row) {
                 let mut sig_parts = Vec::new();
-                let mut parent = def_node.parent();
+                let mut parent = nav.parent(def_node);
                 while let Some(p) = parent {
                     if p.kind() == "decorated_definition" {
                         let mut dc = p.walk();
@@ -3808,7 +3850,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                         }
                         break;
                     }
-                    parent = p.parent();
+                    parent = nav.parent(p);
                 }
                 sig_parts.push(extract_signature(source, &def_node));
                 Some(sig_parts.join("\n"))
@@ -3819,7 +3861,7 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Class,
-                range: node_range_with_decorators(&def_node, source, lang),
+                range: node_range_with_decorators_with(&def_node, source, lang, nav),
                 signature: sig,
                 scope_chain: scope.clone(),
                 exported: false,
@@ -3832,17 +3874,21 @@ fn extract_py_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     Ok(symbols)
 }
 
-fn rust_mod_scope_chain(node: &Node, source: &str) -> Vec<String> {
+fn rust_mod_scope_chain<'tree>(
+    node: &Node<'tree>,
+    source: &str,
+    nav: impl Nav<'tree>,
+) -> Vec<String> {
     let mut scopes = Vec::new();
-    let mut current = node.parent();
+    let mut current = nav.parent(*node);
 
     while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
+        if nav.kind(parent) == "mod_item" {
             if let Some(name_node) = parent.child_by_field_name("name") {
                 scopes.push(node_text(source, &name_node).to_string());
             }
         }
-        current = parent.parent();
+        current = nav.parent(parent);
     }
 
     scopes.reverse();
@@ -3874,18 +3920,35 @@ pub(crate) fn rust_attribute_entry_points<'a>(
     source: &str,
     root: Node<'a>,
 ) -> Vec<RustAttributeEntryPoint> {
-    let bare_command_imported = rust_file_imports_tauri_command(source, root);
+    rust_attribute_entry_points_with(source, root, Direct)
+}
+
+/// [`rust_attribute_entry_points`], walking and looking up with `nav`.
+pub(crate) fn rust_attribute_entry_points_with<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Vec<RustAttributeEntryPoint> {
+    let bare_command_imported = rust_file_imports_tauri_command(source, root, nav);
     let mut function_nodes = Vec::new();
-    rust_collect_function_items(root, &mut function_nodes);
+    nav.walk(root, |node, kind| {
+        if kind == "function_item" {
+            function_nodes.push(node);
+        }
+        true
+    });
 
     let mut entry_points = BTreeMap::new();
     for function_node in function_nodes {
-        let Some(attribute) =
-            rust_entry_point_attribute_for_function(source, &function_node, bare_command_imported)
-        else {
+        let Some(attribute) = rust_entry_point_attribute_for_function(
+            source,
+            &function_node,
+            bare_command_imported,
+            nav,
+        ) else {
             continue;
         };
-        let Some((name, scoped_name)) = rust_function_identity(source, &function_node) else {
+        let Some((name, scoped_name)) = rust_function_identity(source, &function_node, nav) else {
             continue;
         };
         entry_points
@@ -3900,28 +3963,16 @@ pub(crate) fn rust_attribute_entry_points<'a>(
     entry_points.into_values().collect()
 }
 
-fn rust_collect_function_items<'a>(node: Node<'a>, function_nodes: &mut Vec<Node<'a>>) {
-    if node.kind() == "function_item" {
-        function_nodes.push(node);
-    }
-
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            rust_collect_function_items(cursor.node(), function_nodes);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-}
-
-fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(String, String)> {
+fn rust_function_identity<'tree>(
+    source: &str,
+    function_node: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<(String, String)> {
     let name_node = function_node.child_by_field_name("name")?;
     let name = node_text(source, &name_node).to_string();
-    let declaration_list_owner = rust_function_declaration_list_owner(function_node);
+    let declaration_list_owner = rust_function_declaration_list_owner(function_node, nav);
 
-    match declaration_list_owner.as_ref().map(Node::kind) {
+    match declaration_list_owner.map(|owner| nav.kind(owner)) {
         Some("impl_item") => {
             let scope_name = rust_impl_scope_name(declaration_list_owner.as_ref().unwrap(), source);
             let scoped_name = if scope_name.is_empty() {
@@ -3933,7 +3984,7 @@ fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(Str
         }
         Some(owner_kind) if owner_kind != "mod_item" => None,
         _ => {
-            let scope_chain = rust_mod_scope_chain(function_node, source);
+            let scope_chain = rust_mod_scope_chain(function_node, source, nav);
             let scoped_name = if scope_chain.is_empty() {
                 name.clone()
             } else {
@@ -3944,11 +3995,13 @@ fn rust_function_identity(source: &str, function_node: &Node<'_>) -> Option<(Str
     }
 }
 
-fn rust_function_declaration_list_owner<'a>(function_node: &Node<'a>) -> Option<Node<'a>> {
-    function_node
-        .parent()
-        .filter(|parent| parent.kind() == "declaration_list")
-        .and_then(|parent| parent.parent())
+fn rust_function_declaration_list_owner<'tree>(
+    function_node: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<Node<'tree>> {
+    nav.parent(*function_node)
+        .filter(|parent| nav.kind(*parent) == "declaration_list")
+        .and_then(|parent| nav.parent(parent))
 }
 
 fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
@@ -3975,14 +4028,15 @@ fn rust_impl_scope_name(impl_node: &Node, source: &str) -> String {
     }
 }
 
-fn rust_entry_point_attribute_for_function(
+fn rust_entry_point_attribute_for_function<'tree>(
     source: &str,
-    function_node: &Node,
+    function_node: &Node<'tree>,
     bare_command_imported: bool,
+    nav: impl Nav<'tree>,
 ) -> Option<&'static str> {
     let mut current = *function_node;
-    while let Some(prev) = current.prev_sibling() {
-        let kind = prev.kind();
+    while let Some(prev) = nav.prev_sibling(current) {
+        let kind = nav.kind(prev);
         match kind {
             "attribute_item" => {
                 if let Some(attribute) =
@@ -4055,27 +4109,19 @@ fn rust_entry_point_attribute_for_path(
         .find(|attribute| *attribute != "tauri::command" && *attribute == last_segment)
 }
 
-fn rust_file_imports_tauri_command(source: &str, root: Node<'_>) -> bool {
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "use_declaration"
-            && rust_use_declaration_imports_tauri_command(node_text(source, &node))
-        {
-            return true;
-        }
-
-        let mut cursor = node.walk();
-        if cursor.goto_first_child() {
-            loop {
-                stack.push(cursor.node());
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-    }
-
-    false
+fn rust_file_imports_tauri_command<'tree>(
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> bool {
+    // Any `use` that imports the attribute decides it, wherever it is.
+    let mut imported = false;
+    nav.walk(root, |node, kind| {
+        imported |= kind == "use_declaration"
+            && rust_use_declaration_imports_tauri_command(node_text(source, &node));
+        !imported
+    });
+    imported
 }
 
 fn rust_use_declaration_imports_tauri_command(use_text: &str) -> bool {
@@ -4154,10 +4200,14 @@ fn rust_impl_parent_name(impl_target: &str) -> String {
         .to_string()
 }
 
-fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+fn extract_rs_symbols<'tree>(
+    source: &str,
+    root: &Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Result<Vec<Symbol>, AftError> {
     let mut symbols = Vec::new();
     let mut macro_bodies = Vec::new();
-    extract_rs_symbols_from_root(source, *root, &mut symbols, &mut macro_bodies);
+    extract_rs_symbols_from_root(source, *root, &mut symbols, &mut macro_bodies, nav);
 
     // Bodies found inside a macro body are queued on the same worklist rather
     // than handled by recursion, so deeply nested macros cannot exhaust the
@@ -4168,7 +4218,13 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
             continue;
         };
         let before = symbols.len();
-        extract_rs_symbols_from_root(source, tree.root_node(), &mut symbols, &mut macro_bodies);
+        extract_rs_symbols_from_root(
+            source,
+            tree.root_node(),
+            &mut symbols,
+            &mut macro_bodies,
+            Direct,
+        );
         found_macro_symbols |= symbols.len() > before;
     }
 
@@ -4229,11 +4285,12 @@ fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree>
 
 /// Walk one Rust syntax tree, appending its symbols and queueing the bodies of
 /// item-position macros for a separate parse.
-fn extract_rs_symbols_from_root(
+fn extract_rs_symbols_from_root<'tree>(
     source: &str,
-    root: Node<'_>,
+    root: Node<'tree>,
     symbols: &mut Vec<Symbol>,
     macro_bodies: &mut Vec<tree_sitter::Range>,
+    nav: impl Nav<'tree>,
 ) {
     let lang = LangId::Rust;
     let is_pub = |node: &Node| -> bool {
@@ -4262,12 +4319,12 @@ fn extract_rs_symbols_from_root(
         Some(node_text(source, &name_node).to_string())
     };
 
-    let item_symbol = |node: Node<'_>, kind: SymbolKind| -> Option<Symbol> {
+    let item_symbol = |node: Node<'tree>, kind: SymbolKind| -> Option<Symbol> {
         let name = symbol_name(&node)?;
         Some(Symbol {
             name,
             kind,
-            range: node_range_with_decorators(&node, source, lang),
+            range: node_range_with_decorators_with(&node, source, lang, nav),
             signature: Some(extract_signature(source, &node)),
             scope_chain: Vec::new(),
             exported: is_pub(&node),
@@ -4275,9 +4332,9 @@ fn extract_rs_symbols_from_root(
         })
     };
 
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        match node.kind() {
+    // Every node in preorder.
+    nav.walk(root, |node, kind| {
+        match kind {
             "macro_definition" => {
                 let mut rule_cursor = node.walk();
                 for rule in node.children(&mut rule_cursor) {
@@ -4296,8 +4353,8 @@ fn extract_rs_symbols_from_root(
             // the ones inside function bodies (`println!`, `vec!`, ...) keeps
             // the extra parsing proportional to item-level macros.
             "macro_invocation"
-                if node.parent().is_some_and(|parent| {
-                    matches!(parent.kind(), "source_file" | "declaration_list")
+                if nav.parent(node).is_some_and(|parent| {
+                    matches!(nav.kind(parent), "source_file" | "declaration_list")
                 }) =>
             {
                 let body = node
@@ -4311,21 +4368,20 @@ fn extract_rs_symbols_from_root(
                 }
             }
             "function_item" => {
-                let declaration_list_owner = node
-                    .parent()
-                    .filter(|parent| parent.kind() == "declaration_list")
-                    .and_then(|parent| parent.parent());
-                let in_non_module_declaration_list = declaration_list_owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.kind() != "mod_item");
+                let declaration_list_owner = nav
+                    .parent(node)
+                    .filter(|parent| nav.kind(*parent) == "declaration_list")
+                    .and_then(|parent| nav.parent(parent));
+                let in_non_module_declaration_list =
+                    declaration_list_owner.is_some_and(|owner| nav.kind(owner) != "mod_item");
 
                 if !in_non_module_declaration_list {
                     if let Some(name) = symbol_name(&node) {
-                        let scope_chain = rust_mod_scope_chain(&node, source);
+                        let scope_chain = rust_mod_scope_chain(&node, source, nav);
                         symbols.push(Symbol {
                             name,
                             kind: SymbolKind::Function,
-                            range: node_range_with_decorators(&node, source, lang),
+                            range: node_range_with_decorators_with(&node, source, lang, nav),
                             signature: Some(extract_signature(source, &node)),
                             scope_chain: scope_chain.clone(),
                             exported: is_pub(&node),
@@ -4388,8 +4444,8 @@ fn extract_rs_symbols_from_root(
                                             symbols.push(Symbol {
                                                 name,
                                                 kind: SymbolKind::Method,
-                                                range: node_range_with_decorators(
-                                                    &method, source, lang,
+                                                range: node_range_with_decorators_with(
+                                                    &method, source, lang, nav,
                                                 ),
                                                 signature: Some(extract_signature(source, &method)),
                                                 scope_chain: if scope_name.is_empty() {
@@ -4420,19 +4476,8 @@ fn extract_rs_symbols_from_root(
             }
             _ => {}
         }
-
-        let mut child_cursor = node.walk();
-        let mut children = Vec::new();
-        if child_cursor.goto_first_child() {
-            loop {
-                children.push(child_cursor.node());
-                if !child_cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-        }
-        pending.extend(children.into_iter().rev());
-    }
+        true
+    });
 }
 
 /// Extract symbols from Go source.
@@ -9921,7 +9966,7 @@ mod tests {
                     }
                 }
             }
-            let index = collect_exports(source, &root);
+            let index = collect_exports(source, &root, Direct);
             assert_eq!(index.names, collect_exported_symbol_names(source, &root));
             let mut walk = root.walk();
             let mut checked = 0usize;
@@ -10198,7 +10243,7 @@ mod tests {
         let query_execute_elapsed = query_execute_started.elapsed();
 
         let direct_extract_started = std::time::Instant::now();
-        let symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        let symbols = extract_rs_symbols(source, &tree.root_node(), Direct).unwrap();
         let direct_extract_elapsed = direct_extract_started.elapsed();
 
         eprintln!(
@@ -10269,12 +10314,12 @@ mod tests {
             }
 
             if let (Some(name_node), Some(definition)) = (function_name, function_definition) {
-                let owner = rust_function_declaration_list_owner(&definition);
+                let owner = rust_function_declaration_list_owner(&definition, Direct);
                 if owner
                     .as_ref()
                     .is_none_or(|owner| owner.kind() == "mod_item")
                 {
-                    let scope_chain = rust_mod_scope_chain(&definition, source);
+                    let scope_chain = rust_mod_scope_chain(&definition, source, Direct);
                     symbols.push(Symbol {
                         name: node_text(source, &name_node).to_string(),
                         kind: SymbolKind::Function,
@@ -10400,7 +10445,7 @@ pub(crate) mod outer {
         let tree = parser.parse(source, None).unwrap();
 
         let query_symbols = extract_rs_symbols_with_query_oracle(source, tree.root_node());
-        let walk_symbols = extract_rs_symbols(source, &tree.root_node()).unwrap();
+        let walk_symbols = extract_rs_symbols(source, &tree.root_node(), Direct).unwrap();
         assert_eq!(
             rust_symbol_fingerprint(&walk_symbols),
             rust_symbol_fingerprint(&query_symbols)

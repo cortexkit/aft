@@ -37,6 +37,12 @@ mod payload_tests;
 #[path = "extraction_index.rs"]
 mod extraction_index;
 
+#[path = "single_walk.rs"]
+pub(crate) mod single_walk;
+
+#[path = "syntax_index.rs"]
+pub(crate) mod syntax_index;
+
 use super::facts::{BlobKey, FactPaths, ManifestFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
@@ -295,6 +301,18 @@ impl CallgraphBlob {
     /// Extracts path-free callgraph parse output from source bytes and the
     /// extractor version that names the corresponding content key.
     pub fn extract(
+        source: &str,
+        language: &str,
+        extractor_version: impl Into<String>,
+    ) -> Result<Self, ManifestJoinError> {
+        single_walk::extract(source, language, extractor_version.into())
+    }
+
+    /// The extractor before the single walk: the same passes, each walking
+    /// the tree itself and asking tree-sitter for parents and siblings. It
+    /// stays only so the extraction gate (`data_layer::extract_gate`) can
+    /// check both give the same output.
+    pub fn extract_reference(
         source: &str,
         language: &str,
         extractor_version: impl Into<String>,

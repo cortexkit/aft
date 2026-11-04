@@ -3,8 +3,11 @@
 //! Extracted from `commands/zoom.rs` so both the zoom command and the
 //! call-graph engine can reuse the same AST-walking logic.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::callgraph_store::join::syntax_index::{Direct, Nav};
 use crate::parser::LangId;
 
 // Defensive recursion bound for AST walkers. Hand-written code nests only tens
@@ -588,15 +591,26 @@ pub fn extract_js_callback_references(
     source: &str,
     root: tree_sitter::Node<'_>,
 ) -> Vec<(String, String, u32, usize, usize)> {
+    extract_js_callback_references_with(source, root, Direct)
+}
+
+/// [`extract_js_callback_references`], walking and looking up with `nav`.
+pub(crate) fn extract_js_callback_references_with<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Vec<(String, String, u32, usize, usize)> {
     let mut results = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "arguments" {
+    // Callbacks in one scope ask the same scopes the same questions; each
+    // scope's bindings are read once.
+    let mut scopes = FxHashMap::default();
+    nav.walk_named(root, |node, kind| {
+        if kind == "arguments" {
             for argument in node.named_children(&mut node.walk()) {
-                if matches!(argument.kind(), "identifier" | "member_expression") {
+                if matches!(nav.kind(argument), "identifier" | "member_expression") {
                     let full = source[argument.byte_range()].trim();
                     let root_name = full.split('.').next().unwrap_or(full);
-                    if !js_callback_is_shadowed(source, argument, root_name) {
+                    if !js_callback_is_shadowed(source, argument, root_name, nav, &mut scopes) {
                         results.push((
                             full.to_string(),
                             full.rsplit('.').next().unwrap_or(full).to_string(),
@@ -608,44 +622,85 @@ pub fn extract_js_callback_references(
                 }
             }
         }
-        stack.extend(node.named_children(&mut node.walk()));
-    }
+        true
+    });
     results.sort_by_key(|site| site.3);
     results
 }
 
-fn js_callback_is_shadowed(source: &str, argument: tree_sitter::Node<'_>, name: &str) -> bool {
-    let mut ancestor = argument.parent();
+/// The bindings of one JavaScript scope that can shadow a callback name.
+struct JsScopeBindings<'source> {
+    /// The text of every identifier among the scope's parameters.
+    parameters: FxHashSet<&'source str>,
+    /// For a block or program: the first `let`, `const` or `var` binding of
+    /// each name, and whether it shadows (it does unless its value is a
+    /// function).
+    declarations: FxHashMap<&'source str, bool>,
+}
+
+fn js_scope_bindings<'tree, 'source>(
+    source: &'source str,
+    scope: tree_sitter::Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> JsScopeBindings<'source> {
+    let mut bindings = JsScopeBindings {
+        parameters: FxHashSet::default(),
+        declarations: FxHashMap::default(),
+    };
+    if let Some(parameters) = scope.child_by_field_name("parameters") {
+        nav.walk_named(parameters, |node, kind| {
+            if kind == "identifier" {
+                bindings.parameters.insert(&source[node.byte_range()]);
+            }
+            true
+        });
+    }
+    if matches!(nav.kind(scope), "statement_block" | "program") {
+        for declaration in scope.named_children(&mut scope.walk()) {
+            if !matches!(
+                declaration.kind(),
+                "lexical_declaration" | "variable_declaration"
+            ) {
+                continue;
+            }
+            for binding in declaration.named_children(&mut declaration.walk()) {
+                if let Some(name) = binding.child_by_field_name("name") {
+                    let shadows = !binding.child_by_field_name("value").is_some_and(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    });
+                    bindings
+                        .declarations
+                        .entry(&source[name.byte_range()])
+                        .or_insert(shadows);
+                }
+            }
+        }
+    }
+    bindings
+}
+
+/// Whether a parameter or a preceding scope's declaration binds `name` where
+/// `argument` is passed. The innermost scope that binds it decides; among
+/// a block's declarations the first one does.
+fn js_callback_is_shadowed<'tree, 'source>(
+    source: &'source str,
+    argument: tree_sitter::Node<'tree>,
+    name: &str,
+    nav: impl Nav<'tree>,
+    scopes: &mut FxHashMap<usize, JsScopeBindings<'source>>,
+) -> bool {
+    let mut ancestor = nav.parent(argument);
     while let Some(scope) = ancestor {
-        if let Some(parameters) = scope.child_by_field_name("parameters") {
-            let mut stack = vec![parameters];
-            while let Some(node) = stack.pop() {
-                if node.kind() == "identifier" && &source[node.byte_range()] == name {
-                    return true;
-                }
-                stack.extend(node.named_children(&mut node.walk()));
-            }
+        let bindings = scopes
+            .entry(scope.id())
+            .or_insert_with(|| js_scope_bindings(source, scope, nav));
+        if bindings.parameters.contains(name) {
+            return true;
         }
-        if matches!(scope.kind(), "statement_block" | "program") {
-            for declaration in scope.named_children(&mut scope.walk()) {
-                if matches!(
-                    declaration.kind(),
-                    "lexical_declaration" | "variable_declaration"
-                ) {
-                    for binding in declaration.named_children(&mut declaration.walk()) {
-                        if binding
-                            .child_by_field_name("name")
-                            .is_some_and(|n| &source[n.byte_range()] == name)
-                        {
-                            return !binding.child_by_field_name("value").is_some_and(|value| {
-                                matches!(value.kind(), "arrow_function" | "function_expression")
-                            });
-                        }
-                    }
-                }
-            }
+        if let Some(&shadows) = bindings.declarations.get(name) {
+            return shadows;
         }
-        ancestor = scope.parent();
+        ancestor = nav.parent(scope);
     }
     false
 }
@@ -659,6 +714,15 @@ pub fn extract_rust_value_references(
     source: &str,
     root: tree_sitter::Node,
 ) -> Vec<(String, String, u32, usize, usize)> {
+    extract_rust_value_references_with(source, root, Direct)
+}
+
+/// [`extract_rust_value_references`], walking and looking up with `nav`.
+pub(crate) fn extract_rust_value_references_with<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Vec<(String, String, u32, usize, usize)> {
     #[cfg(test)]
     if LEGACY_VALUE_REFERENCES.with(|legacy| legacy.get()) {
         let mut results = Vec::new();
@@ -667,20 +731,21 @@ pub fn extract_rust_value_references(
     }
     let mut walk = RustValueWalk {
         source,
+        nav,
         ancestors: Vec::new(),
-        blocks: HashMap::new(),
+        blocks: FxHashMap::default(),
         results: Vec::new(),
     };
     // Callers may pass a subtree. Capture its outside ancestry once, rather
     // than asking tree-sitter to rediscover it for every identifier.
-    let mut parent = root.parent();
+    let mut parent = nav.parent(root);
     while let Some(node) = parent {
         walk.ancestors.push(node);
-        parent = node.parent();
+        parent = nav.parent(node);
     }
     walk.ancestors.reverse();
     for node in &walk.ancestors {
-        if node.kind() == "block" {
+        if nav.kind(*node) == "block" {
             walk.blocks
                 .insert(node.id(), rust_block_bindings(*node, source));
         }
@@ -695,20 +760,21 @@ thread_local! {
     static VALUE_BINDING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-struct RustValueWalk<'tree, 'source> {
+struct RustValueWalk<'tree, 'source, N> {
     source: &'source str,
+    nav: N,
     ancestors: Vec<tree_sitter::Node<'tree>>,
     // The first declaration end for a name is enough: the legacy rule asks
     // whether *any* preceding let binds it, not which binding supplies a type.
-    blocks: HashMap<usize, HashMap<&'source str, usize>>,
+    blocks: FxHashMap<usize, FxHashMap<&'source str, usize>>,
     results: Vec<(String, String, u32, usize, usize)>,
 }
 
 fn rust_block_bindings<'source>(
     block: tree_sitter::Node<'_>,
     source: &'source str,
-) -> HashMap<&'source str, usize> {
-    let mut bindings = HashMap::new();
+) -> FxHashMap<&'source str, usize> {
+    let mut bindings = FxHashMap::default();
     let mut cursor = block.walk();
     for child in block.children(&mut cursor) {
         #[cfg(test)]
@@ -734,19 +800,21 @@ fn rust_block_bindings<'source>(
     bindings
 }
 
-impl<'tree> RustValueWalk<'tree, '_> {
+impl<'tree, N: Nav<'tree>> RustValueWalk<'tree, '_, N> {
     fn visit(&mut self, node: tree_sitter::Node<'tree>, depth: u32) {
-        if node.kind() == "block" {
+        let nav = self.nav;
+        let kind = nav.kind(node);
+        if kind == "block" {
             self.blocks
                 .insert(node.id(), rust_block_bindings(node, self.source));
         }
         let nested = self.ancestors.last().is_some_and(|parent| {
             matches!(
-                parent.kind(),
+                nav.kind(*parent),
                 "scoped_identifier" | "scoped_type_identifier" | "generic_function"
             )
         });
-        if matches!(node.kind(), "identifier" | "scoped_identifier")
+        if matches!(kind, "identifier" | "scoped_identifier")
             && !nested
             && self.is_value_position(node)
         {
@@ -754,7 +822,7 @@ impl<'tree> RustValueWalk<'tree, '_> {
             let short = full.rsplit("::").next().unwrap_or(full).trim();
             if !full.is_empty()
                 && !short.is_empty()
-                && (node.kind() != "identifier" || !self.is_shadowed(node))
+                && (kind != "identifier" || !self.is_shadowed(node))
             {
                 self.results.push((
                     full.to_string(),
@@ -767,13 +835,10 @@ impl<'tree> RustValueWalk<'tree, '_> {
         }
         if depth < MAX_AST_WALK_DEPTH {
             self.ancestors.push(node);
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                self.visit(child, depth + 1);
-            }
+            nav.for_each_child(node, |child| self.visit(child, depth + 1));
             self.ancestors.pop();
         }
-        if node.kind() == "block" {
+        if kind == "block" {
             self.blocks.remove(&node.id());
         }
     }
@@ -786,10 +851,11 @@ impl<'tree> RustValueWalk<'tree, '_> {
                     .child_by_field_name(field)
                     .is_some_and(|child| same_node(&child, &current))
             };
-            if parent.kind() == "call_expression" && selected("function") {
+            let parent_kind = self.nav.kind(*parent);
+            if parent_kind == "call_expression" && selected("function") {
                 return false;
             }
-            match parent.kind() {
+            match parent_kind {
                 "block"
                     if parent.named_child(parent.named_child_count().saturating_sub(1) as u32)
                         == Some(current) =>
@@ -823,7 +889,7 @@ impl<'tree> RustValueWalk<'tree, '_> {
         let name = &self.source[node.byte_range()];
         let mut current = node;
         for parent in self.ancestors.iter().rev() {
-            match parent.kind() {
+            match self.nav.kind(*parent) {
                 "function_item" | "closure_expression" => {
                     if parent
                         .child_by_field_name("parameters")
@@ -1169,18 +1235,35 @@ pub fn extract_calls_full(
     byte_end: usize,
     lang: LangId,
 ) -> Vec<(String, String, u32, usize, usize)> {
+    extract_calls_full_with(source, root, byte_start, byte_end, lang, Direct)
+}
+
+/// [`extract_calls_full`], walking with `nav`.
+pub(crate) fn extract_calls_full_with<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    byte_start: usize,
+    byte_end: usize,
+    lang: LangId,
+    nav: impl Nav<'tree>,
+) -> Vec<(String, String, u32, usize, usize)> {
     if lang == LangId::Rust {
-        return extract_rust_calls_with_macro_facts(source, root, byte_start, byte_end).0;
+        return extract_rust_calls_with_macro_facts_with(source, root, byte_start, byte_end, nav).0;
     }
     let mut results = Vec::new();
     let call_kinds = call_node_kinds(lang);
-    collect_calls_full(
+    if call_kinds.is_empty() {
+        // A grammar without call nodes has no calls to find.
+        return results;
+    }
+    collect_calls_full_with(
         root,
         source,
         byte_start,
         byte_end,
         &call_kinds,
         &mut results,
+        nav,
     );
     results
 }
@@ -1243,18 +1326,32 @@ pub fn extract_rust_calls_with_macro_facts(
     byte_start: usize,
     byte_end: usize,
 ) -> (Vec<CallTuple>, RustMacroFacts) {
+    extract_rust_calls_with_macro_facts_with(source, root, byte_start, byte_end, Direct)
+}
+
+/// [`extract_rust_calls_with_macro_facts`], walking the outer tree with
+/// `nav`. Macro token trees are parsed on their own, so their trees are
+/// walked directly.
+pub(crate) fn extract_rust_calls_with_macro_facts_with<'tree>(
+    source: &str,
+    root: tree_sitter::Node<'tree>,
+    byte_start: usize,
+    byte_end: usize,
+    nav: impl Nav<'tree>,
+) -> (Vec<CallTuple>, RustMacroFacts) {
     let mut results = Vec::new();
     let call_kinds = call_node_kinds(LangId::Rust);
-    collect_calls_full(
+    collect_calls_full_with(
         root,
         source,
         byte_start,
         byte_end,
         &call_kinds,
         &mut results,
+        nav,
     );
     let mut facts = RustMacroFacts::default();
-    collect_rust_macro_calls(
+    collect_rust_macro_calls_with(
         root,
         source,
         byte_start,
@@ -1262,6 +1359,7 @@ pub fn extract_rust_calls_with_macro_facts(
         0,
         &mut results,
         &mut facts,
+        nav,
     );
     results.sort_by_key(|(_, _, _, start, end)| (*start, *end));
     results.dedup();
@@ -1280,28 +1378,27 @@ fn collect_rust_macro_calls(
     results: &mut Vec<CallTuple>,
     facts: &mut RustMacroFacts,
 ) {
-    // The reparse-depth bound does not bound ordinary AST nesting. A cursor
+    collect_rust_macro_calls_with(
+        node, source, byte_start, byte_end, depth, results, facts, Direct,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_rust_macro_calls_with<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    depth: u32,
+    results: &mut Vec<CallTuple>,
+    facts: &mut RustMacroFacts,
+    nav: impl Nav<'tree>,
+) {
+    // The reparse-depth bound does not bound ordinary AST nesting. The walk
     // keeps that traversal off the native stack without dropping nested facts.
-    let mut cursor = node.walk();
-    loop {
-        let descend = visit_rust_macro_node(
-            cursor.node(),
-            source,
-            byte_start,
-            byte_end,
-            depth,
-            results,
-            facts,
-        );
-        if descend && cursor.goto_first_child() {
-            continue;
-        }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return;
-            }
-        }
-    }
+    nav.walk(node, |node, _| {
+        visit_rust_macro_node(node, source, byte_start, byte_end, depth, results, facts)
+    });
 }
 
 fn visit_rust_macro_node(
@@ -1530,40 +1627,46 @@ fn collect_calls_full(
     call_kinds: &[&str],
     results: &mut Vec<(String, String, u32, usize, usize)>,
 ) {
+    collect_calls_full_with(
+        node, source, byte_start, byte_end, call_kinds, results, Direct,
+    );
+}
+
+fn collect_calls_full_with<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    call_kinds: &[&str],
+    results: &mut Vec<(String, String, u32, usize, usize)>,
+    nav: impl Nav<'tree>,
+) {
     // Preserve preorder and range pruning while allowing generated expressions
     // to nest beyond the refresh worker's native stack capacity.
-    let mut cursor = node.walk();
-    loop {
-        let node = cursor.node();
+    nav.walk(node, |node, kind| {
         let node_start = node.start_byte();
         let node_end = node.end_byte();
         let overlaps = node_end > byte_start && node_start < byte_end;
-        if overlaps {
-            if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end
-            {
-                if let (Some(full), Some(short)) = (
-                    extract_full_callee(&node, source),
-                    extract_callee_name(&node, source),
-                ) {
-                    results.push((
-                        full,
-                        short,
-                        node.start_position().row as u32 + 1,
-                        node_start,
-                        node_end,
-                    ));
-                }
-            }
-            if cursor.goto_first_child() {
-                continue;
+        if overlaps
+            && call_kinds.contains(&kind)
+            && node_start >= byte_start
+            && node_end <= byte_end
+        {
+            if let (Some(full), Some(short)) = (
+                extract_full_callee(&node, source),
+                extract_callee_name(&node, source),
+            ) {
+                results.push((
+                    full,
+                    short,
+                    node.start_position().row as u32 + 1,
+                    node_start,
+                    node_end,
+                ));
             }
         }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return;
-            }
-        }
-    }
+        overlaps
+    });
 }
 
 #[cfg(test)]

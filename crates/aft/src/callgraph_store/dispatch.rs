@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 use super::super::rust_bindings::{Initializer, RustBindings};
+use super::syntax_index::{Direct, Nav};
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
 use crate::parser::LangId;
 
@@ -40,10 +41,11 @@ pub(crate) fn complete_typescript_symbols<'tree>(
     lang: LangId,
     root: Node<'tree>,
     symbols: &mut Vec<crate::symbols::Symbol>,
+    nav: impl Nav<'tree>,
 ) -> Vec<Node<'tree>> {
     if matches!(lang, LangId::TypeScript | LangId::Tsx) {
-        let nodes = descendants(root);
-        typescript::complete_symbols(&nodes, source, symbols);
+        let nodes = nav.reverse_named_preorder(root);
+        typescript::complete_symbols(&nodes, source, symbols, nav);
         nodes
     } else {
         Vec::new()
@@ -112,7 +114,7 @@ pub(crate) fn typescript_objects_from_data(
     // This pass links calls only to methods of object literals and single
     // object-literal returns. Class and parameter types cannot supply those
     // bindings, so do not compute and discard them.
-    let objects = typescript::Objects::new_objects_only(nodes, source, &parse);
+    let objects = typescript::Objects::new_objects_only(nodes, source, &parse, Direct);
     profile.finish("index", format_args!("nodes={}", nodes.len()));
     let mut facts = DispatchFacts::default();
     objects.extract(&mut facts);
@@ -146,9 +148,10 @@ pub(crate) fn typescript_objects_from_data(
             continue;
         };
         let ty = if text(receiver, source) == "this" {
-            enclosing(call, FUNCTIONS)
+            Direct
+                .enclosing(call, FUNCTIONS)
                 .filter(|function| function.kind() == "method_definition")
-                .and_then(|function| typescript::object_member(function, source))
+                .and_then(|function| typescript::object_member(function, source, Direct))
                 .map(|(object, _)| typescript::object_identity(object))
         } else {
             objects.object_receiver(receiver, call)
@@ -345,14 +348,6 @@ fn type_name(raw: &str) -> String {
         .trim()
         .to_string()
 }
-fn enclosing<'a>(mut node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    loop {
-        if kinds.contains(&node.kind()) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
 const TYPES: &[&str] = &[
     "class_declaration",
     "class_definition",
@@ -377,8 +372,8 @@ const FUNCTIONS: &[&str] = &[
     "generator_function",
     "lambda_expression",
 ];
-fn named(node: Node<'_>, source: &str) -> Option<String> {
-    if let Some((_, name)) = typescript::object_member(node, source) {
+fn named<'tree>(node: Node<'tree>, source: &str, nav: impl Nav<'tree>) -> Option<String> {
+    if let Some((_, name)) = typescript::object_member(node, source, nav) {
         return Some(name);
     }
     field(node, &["name"])
@@ -389,17 +384,22 @@ fn named(node: Node<'_>, source: &str) -> Option<String> {
         })
         .map(|name| text(name, source).to_string())
 }
-fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option<String>)> {
+fn owner<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    language: &str,
+    nav: impl Nav<'tree>,
+) -> Option<(String, Option<String>)> {
     if typescript::supported(language) {
-        if let Some((object, _)) = typescript::object_member(node, source) {
+        if let Some((object, _)) = typescript::object_member(node, source, nav) {
             return Some((typescript::object_identity(object), None));
         }
-        if matches!(node.kind(), "function_expression" | "generator_function") {
+        if matches!(nav.kind(node), "function_expression" | "generator_function") {
             return None;
         }
     }
     if language == "rust" {
-        if let Some(implementation) = enclosing(node, &["impl_item"]) {
+        if let Some(implementation) = nav.enclosing(node, &["impl_item"]) {
             return Some((
                 type_name(text(field(implementation, &["type"])?, source)),
                 field(implementation, &["trait"]).map(|n| type_name(text(n, source))),
@@ -407,7 +407,7 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
         }
     }
     if language == "go" {
-        if let Some(method) = enclosing(node, &["method_declaration"]) {
+        if let Some(method) = nav.enclosing(node, &["method_declaration"]) {
             let receiver = field(method, &["receiver"])?;
             let parameter = descendants(receiver)
                 .into_iter()
@@ -415,22 +415,23 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
             return Some((type_name(text(field(parameter, &["type"])?, source)), None));
         }
     }
-    enclosing(node, TYPES)
-        .and_then(|n| named(n, source))
+    nav.enclosing(node, TYPES)
+        .and_then(|n| named(n, source, nav))
         .map(|n| (n, None))
 }
 
 /// Complete member declarations omitted by the legacy callable-only extractor.
 /// Interface declarations and trait default bodies need stable node identities
 /// even when the old graph never considered them callable.
-fn complete_members(
+fn complete_members<'tree>(
     source: &str,
     lang: LangId,
-    all: &[Node<'_>],
+    all: &[Node<'tree>],
     parse: &mut ParseBlob,
+    spans: &SpanOrdinals,
     rust_bindings: Option<&RustBindings>,
+    nav: impl Nav<'tree>,
 ) -> Result<(), ManifestJoinError> {
-    let spans = exact_ordinals(parse);
     // Symbol starts may include documentation. End positions still identify the
     // same member, and an indexed lookup avoids scanning all symbols per node.
     let mut identities = HashMap::new();
@@ -446,13 +447,13 @@ fn complete_members(
         .collect::<HashSet<_>>();
     let mut callers = symbol_callers(parse);
     for &node in all {
-        if !FUNCTIONS.contains(&node.kind()) {
+        if !FUNCTIONS.contains(&nav.kind(node)) {
             continue;
         }
-        let Some((owner, _)) = owner(node, source, &parse.language) else {
+        let Some((owner, _)) = owner(node, source, &parse.language, nav) else {
             continue;
         };
-        let Some(name) = named(node, source) else {
+        let Some(name) = named(node, source, nav) else {
             continue;
         };
         let position = (
@@ -531,7 +532,7 @@ fn complete_members(
         .collect::<HashMap<_, _>>();
     for &call in all
         .iter()
-        .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
+        .filter(|n| crate::calls::call_node_kinds(lang).contains(&nav.kind(**n)))
     {
         let callee = field(call, &["function", "name"]).or_else(|| {
             if parse.language == "kotlin" {
@@ -548,8 +549,8 @@ fn complete_members(
         };
         if let Some(&index) = call_ordinals.get(&ordinal) {
             if typescript::supported(&parse.language) {
-                if let Some(function) = enclosing(call, FUNCTIONS) {
-                    if typescript::object_member(function, source).is_some() {
+                if let Some(function) = nav.enclosing(call, FUNCTIONS) {
+                    if typescript::object_member(function, source, nav).is_some() {
                         if let Some(caller) = callers.get(&(
                             function.start_position().row as u32,
                             function.start_position().column as u32,
@@ -561,7 +562,7 @@ fn complete_members(
             }
             continue;
         }
-        let caller = enclosing(call, FUNCTIONS).and_then(|function| {
+        let caller = nav.enclosing(call, FUNCTIONS).and_then(|function| {
             callers
                 .get(&(
                     function.start_position().row as u32,
@@ -611,21 +612,42 @@ pub fn extract(
     root: Node<'_>,
     parse: &mut ParseBlob,
 ) -> Result<DispatchFacts, ManifestJoinError> {
-    let all = descendants(root);
+    extract_with(source, lang, root, parse, Direct)
+}
+
+/// [`extract`], walking and looking up with `nav`.
+pub(crate) fn extract_with<'tree>(
+    source: &str,
+    lang: LangId,
+    root: Node<'tree>,
+    parse: &mut ParseBlob,
+    nav: impl Nav<'tree>,
+) -> Result<DispatchFacts, ManifestJoinError> {
+    let all = nav.reverse_named_preorder(root);
+    // Member completion adds symbols but never syntax nodes, so both passes
+    // share one span index.
+    let spans = exact_ordinals(parse);
     // Member identities and receiver facts consult the same immutable source.
     // Keep one lexical index for both passes and release it with this file.
-    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new(source, root));
-    complete_members(source, lang, &all, parse, rust_bindings.as_ref())?;
+    let rust_bindings = (lang == LangId::Rust).then(|| RustBindings::new_with(source, root, nav));
+    complete_members(
+        source,
+        lang,
+        &all,
+        parse,
+        &spans,
+        rust_bindings.as_ref(),
+        nav,
+    )?;
     let language = parse.language.as_str();
     let index_receivers = language == "rust";
     #[cfg(test)]
     let index_receivers = index_receivers && !UNINDEXED_RECEIVERS.with(|mode| mode.get());
     let receiver_index = index_receivers
-        .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap()));
+        .then(|| RustReceiverIndex::new(&all, source, rust_bindings.as_ref().unwrap(), nav));
     let rust_bindings = rust_bindings.as_ref();
     let go_index = (language == "go")
         .then(|| crate::callgraph_store::go_dispatch::SourceIndex::new(root, source, false));
-    let spans = exact_ordinals(parse);
     let callers = symbol_callers(parse);
     let mut symbols_by_name_line = HashMap::new();
     for symbol in &parse.symbols {
@@ -635,7 +657,7 @@ pub fn extract(
     }
     let mut functions = HashMap::<(u32, u32), Node<'_>>::new();
     let mut functions_by_end = HashMap::new();
-    for &node in all.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
+    for &node in all.iter().filter(|n| FUNCTIONS.contains(&nav.kind(**n))) {
         functions_by_end.insert(node.end_byte(), node);
         let key = (
             node.end_position().row as u32,
@@ -654,22 +676,22 @@ pub fn extract(
     let mut facts = DispatchFacts::default();
     facts.go_package = go_index.as_ref().and_then(|index| index.package.clone());
     let ts_objects =
-        typescript::supported(language).then(|| typescript::Objects::new(&all, source, parse));
+        typescript::supported(language).then(|| typescript::Objects::new(&all, source, parse, nav));
     if let Some(objects) = &ts_objects {
         objects.extract(&mut facts);
     }
     if language == "rust" {
         for node in &all {
-            if node.kind() == "field_declaration" {
+            if nav.kind(*node) == "field_declaration" {
                 if let (Some(container), Some(name), Some(ty)) = (
-                    enclosing(*node, &["struct_item"]),
+                    nav.enclosing(*node, &["struct_item"]),
                     field(*node, &["name"]),
                     field(*node, &["type"]),
                 ) {
-                    if let Some(owner) = named(container, source) {
+                    if let Some(owner) = named(container, source, nav) {
                         facts.fields.push(FieldHint {
                             owner: crate::callgraph::rust_module_qualified_name(
-                                container, source, &owner,
+                                container, source, &owner, nav,
                             ),
                             name: text(name, source).to_string(),
                             ty: type_name(text(ty, source)),
@@ -692,7 +714,7 @@ pub fn extract(
                             .and_then(|index| index.declaration_at(node.start_byte()))
                             .and_then(|declaration| declaration.owner.as_ref())
                             .map(|owner| type_name(owner))
-                            .or_else(|| owner(node, source, language).map(|(owner, _)| owner))
+                            .or_else(|| owner(node, source, language, nav).map(|(owner, _)| owner))
                             .unwrap_or(ty);
                     }
                     facts.returns.push(ReturnHint {
@@ -704,21 +726,22 @@ pub fn extract(
         }
     }
     for node in &all {
-        if !TYPES.contains(&node.kind()) {
+        let kind = nav.kind(*node);
+        if !TYPES.contains(&kind) {
             continue;
         }
-        if language == "go" && enclosing(*node, FUNCTIONS).is_some() {
+        if language == "go" && nav.enclosing(*node, FUNCTIONS).is_some() {
             continue;
         }
-        let Some(mut name) = named(*node, source) else {
+        let Some(mut name) = named(*node, source, nav) else {
             continue;
         };
         if language == "rust" {
-            name = crate::callgraph::rust_module_qualified_name(*node, source, &name);
+            name = crate::callgraph::rust_module_qualified_name(*node, source, &name, nav);
         }
         let body = field(*node, &["body", "type"]);
-        let interface = node.kind().contains("interface")
-            || node.kind() == "trait_item"
+        let interface = kind.contains("interface")
+            || kind == "trait_item"
             || body.is_some_and(|n| n.kind() == "interface_type")
             || text(*node, source)
                 .split('{')
@@ -801,11 +824,11 @@ pub fn extract(
         if !["method", "function"].contains(&symbol.kind.as_str()) {
             continue;
         }
-        let Some((mut owner, mut trait_name)) = owner(node, source, language) else {
+        let Some((mut owner, mut trait_name)) = owner(node, source, language, nav) else {
             continue;
         };
         if ts_objects.as_ref().is_some_and(|objects| {
-            typescript::object_member(node, source).is_some_and(|(object, name)| {
+            typescript::object_member(node, source, nav).is_some_and(|(object, name)| {
                 name != symbol.name || !objects.unambiguous_member(object, &name)
             })
         }) {
@@ -820,7 +843,8 @@ pub fn extract(
                 owner = type_name(declared);
             }
             if let Some(name) = &trait_name {
-                let qualified = crate::callgraph::rust_module_qualified_name(node, source, name);
+                let qualified =
+                    crate::callgraph::rust_module_qualified_name(node, source, name, nav);
                 if facts
                     .types
                     .iter()
@@ -865,11 +889,11 @@ pub fn extract(
             "method_spec",
             "method_declaration",
         ]
-        .contains(&node.kind())
+        .contains(&nav.kind(*node))
         {
             continue;
         }
-        let Some((mut owner, trait_name)) = owner(*node, source, language) else {
+        let Some((mut owner, trait_name)) = owner(*node, source, language, nav) else {
             continue;
         };
         if language == "rust" {
@@ -881,7 +905,7 @@ pub fn extract(
                 owner = type_name(declared);
             }
         }
-        let Some(name) = named(*node, source) else {
+        let Some(name) = named(*node, source, nav) else {
             continue;
         };
         if method_names.contains(&(owner.clone(), name.clone(), trait_name.clone())) {
@@ -919,7 +943,7 @@ pub fn extract(
         }
         // Trait implementations supply both concrete lookup and default-body
         // inheritance; trait receivers still fan out to every implementation.
-        for implementation in all.iter().filter(|n| n.kind() == "impl_item") {
+        for implementation in all.iter().filter(|n| nav.kind(**n) == "impl_item") {
             if let (Some(ty), Some(trait_node)) = (
                 field(*implementation, &["type"]),
                 field(*implementation, &["trait"]),
@@ -928,12 +952,14 @@ pub fn extract(
                     *implementation,
                     source,
                     &type_name(text(ty, source)),
+                    nav,
                 );
                 let mut trait_name = type_name(text(trait_node, source));
                 let qualified = crate::callgraph::rust_module_qualified_name(
                     *implementation,
                     source,
                     &trait_name,
+                    nav,
                 );
                 if type_indices.contains_key(&qualified) {
                     trait_name = qualified;
@@ -950,7 +976,7 @@ pub fn extract(
     let calls = all
         .iter()
         .copied()
-        .filter(|n| call_kinds.contains(&n.kind()))
+        .filter(|n| call_kinds.contains(&nav.kind(*n)))
         .collect::<Vec<_>>();
     let call_ranges = calls
         .iter()
@@ -1085,6 +1111,7 @@ pub fn extract(
                     language,
                     &facts,
                     receiver_index.as_ref(),
+                    nav,
                 )
             })
         };
@@ -1095,7 +1122,7 @@ pub fn extract(
                 // the caller recorded during extraction, not the enclosing function.
                 reference.caller_symbol.clone()
             } else {
-                enclosing(call, FUNCTIONS)
+                nav.enclosing(call, FUNCTIONS)
                     .and_then(|function| {
                         callers
                             .get(&(
@@ -1204,8 +1231,11 @@ pub fn extract(
     Ok(facts)
 }
 
-fn exact_ordinals(parse: &ParseBlob) -> HashMap<(usize, usize), u32> {
-    let mut spans = HashMap::new();
+/// The ordinal of the first syntax node with each byte span.
+type SpanOrdinals = rustc_hash::FxHashMap<(usize, usize), u32>;
+
+fn exact_ordinals(parse: &ParseBlob) -> SpanOrdinals {
+    let mut spans = SpanOrdinals::default();
     for node in &parse.ast_nodes {
         spans
             .entry((node.byte_start, node.byte_end))
@@ -1245,7 +1275,12 @@ struct RustReceiverIndex<'nodes, 'tree> {
 }
 
 impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
-    fn new(nodes: &'nodes [Node<'tree>], source: &str, bindings: &'nodes RustBindings) -> Self {
+    fn new(
+        nodes: &'nodes [Node<'tree>],
+        source: &str,
+        bindings: &'nodes RustBindings,
+        nav: impl Nav<'tree>,
+    ) -> Self {
         #[cfg(test)]
         super::extraction_work::note(|work| {
             work.receiver_index_passes += 1;
@@ -1266,7 +1301,7 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
                 .is_some_and(|(_, _, remaining)| *remaining == 0)
             {
                 let (ancestor, start, _) = ancestors.pop().unwrap();
-                if FUNCTIONS.contains(&ancestor.kind()) {
+                if FUNCTIONS.contains(&nav.kind(ancestor)) {
                     index.functions.insert(ancestor.id(), (start, position));
                 }
             }
@@ -1274,8 +1309,10 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
                 *remaining -= 1;
             }
             ancestors.push((node, position, node.named_child_count()));
-            if node.kind() == "function_item" && named(node, source).as_deref() == Some("new") {
-                if let Some((owner, _)) = owner(node, source, "rust") {
+            if nav.kind(node) == "function_item"
+                && named(node, source, nav).as_deref() == Some("new")
+            {
+                if let Some((owner, _)) = owner(node, source, "rust", nav) {
                     if field(node, &["return_type"])
                         .is_some_and(|ty| ["Self", owner.as_str()].contains(&text(ty, source)))
                     {
@@ -1285,7 +1322,7 @@ impl<'nodes, 'tree> RustReceiverIndex<'nodes, 'tree> {
             }
         }
         for (ancestor, start, _) in ancestors {
-            if FUNCTIONS.contains(&ancestor.kind()) {
+            if FUNCTIONS.contains(&nav.kind(ancestor)) {
                 index.functions.insert(ancestor.id(), (start, nodes.len()));
             }
         }
@@ -1309,7 +1346,7 @@ fn unindexed_constructor_present(
     language: &str,
     ty: &str,
 ) -> Option<bool> {
-    let constructor_nodes = descendants(enclosing(function, &["source_file"])?);
+    let constructor_nodes = descendants(Direct.enclosing(function, &["source_file"])?);
     #[cfg(test)]
     super::extraction_work::note(|work| {
         work.receiver_constructor_scans += 1;
@@ -1317,25 +1354,27 @@ fn unindexed_constructor_present(
     });
     Some(constructor_nodes.into_iter().any(|node| {
         node.kind() == "function_item"
-            && named(node, source).as_deref() == Some("new")
-            && owner(node, source, language).is_some_and(|(owner, _)| owner == ty)
+            && named(node, source, Direct).as_deref() == Some("new")
+            && owner(node, source, language, Direct).is_some_and(|(owner, _)| owner == ty)
             && field(node, &["return_type"])
                 .is_some_and(|result| ["Self", ty].contains(&text(result, source)))
     }))
 }
 
-fn receiver_type<'tree>(
+#[allow(clippy::too_many_arguments)]
+fn receiver_type<'tree, N: Nav<'tree>>(
     receiver: Node<'tree>,
     call: Node<'tree>,
     source: &str,
     language: &str,
     facts: &DispatchFacts,
     rust_index: Option<&RustReceiverIndex<'_, 'tree>>,
+    nav: N,
 ) -> Option<String> {
     #[cfg(test)]
     super::extraction_work::note(|work| work.receiver_type_calls += 1);
     let value = text(receiver, source);
-    let function = enclosing(call, FUNCTIONS)?;
+    let function = nav.enclosing(call, FUNCTIONS)?;
     #[cfg(test)]
     let unindexed = (language == "rust" && rust_index.is_none()).then(|| {
         let mut root = call;
@@ -1358,7 +1397,7 @@ fn receiver_type<'tree>(
         })
         .and_then(|declaration| declaration.owner.as_ref())
         .map(|owner| type_name(owner))
-        .or_else(|| owner(function, source, language).map(|(o, _)| o));
+        .or_else(|| owner(function, source, language, nav).map(|(o, _)| o));
     if language == "rust" {
         if receiver.kind() == "call_expression" {
             return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
@@ -1371,6 +1410,7 @@ fn receiver_type<'tree>(
                 language,
                 facts,
                 rust_index,
+                nav,
             )?;
             let member = text(field(receiver, &["field"])?, source);
             return Some(format!("@field:{base}|{member}"));
@@ -1389,9 +1429,9 @@ fn receiver_type<'tree>(
         }
         "python" if value == "self" => return current_owner,
         "python" if value == "cls" => {
-            let decorated = function
-                .parent()
-                .filter(|p| p.kind() == "decorated_definition")?;
+            let decorated = nav
+                .parent(function)
+                .filter(|p| nav.kind(*p) == "decorated_definition")?;
             if text(decorated, source).contains("@classmethod") {
                 return current_owner;
             }
@@ -1491,20 +1531,20 @@ fn receiver_type<'tree>(
     let indexed_nodes = rust_index.and_then(|index| index.function_nodes(function));
     let mut nodes: Cow<'_, [Node<'tree>]> = match indexed_nodes {
         Some(nodes) => Cow::Borrowed(nodes),
-        None => Cow::Owned(descendants(function)),
+        None => Cow::Owned(nav.reverse_named_preorder(function)),
     };
     if ["java", "csharp", "kotlin"].contains(&language) {
-        if let Some(class) = enclosing(function, TYPES) {
+        if let Some(class) = nav.enclosing(function, TYPES) {
             nodes
                 .to_mut()
-                .extend(descendants(class).into_iter().filter(|n| {
-                    enclosing(*n, FUNCTIONS).is_none()
+                .extend(nav.reverse_named_preorder(class).into_iter().filter(|n| {
+                    nav.enclosing(*n, FUNCTIONS).is_none()
                         && [
                             "field_declaration",
                             "variable_declarator",
                             "property_declaration",
                         ]
-                        .contains(&n.kind())
+                        .contains(&nav.kind(*n))
                 }));
         }
     }
@@ -1530,7 +1570,7 @@ fn receiver_type<'tree>(
             "local_variable_declaration",
             "property_declaration",
         ]
-        .contains(&declaration.kind())
+        .contains(&nav.kind(*declaration))
         {
             continue;
         }
@@ -1553,20 +1593,19 @@ fn receiver_type<'tree>(
         if binding_text != value && !binding_text.strip_suffix(':').is_some_and(|s| s == value) {
             continue;
         }
-        if language == "python" && enclosing(*declaration, FUNCTIONS) != Some(function) {
+        if language == "python" && nav.enclosing(*declaration, FUNCTIONS) != Some(function) {
             continue;
         }
         if let Some(annotation) = field(*declaration, &["type"])
             .or_else(|| {
-                declaration
-                    .parent()
+                nav.parent(*declaration)
                     .filter(|p| {
                         [
                             "variable_declaration",
                             "local_variable_declaration",
                             "field_declaration",
                         ]
-                        .contains(&p.kind())
+                        .contains(&nav.kind(*p))
                     })
                     .and_then(|p| field(p, &["type"]))
             })
@@ -1586,8 +1625,8 @@ fn receiver_type<'tree>(
                 let raw_annotation = text(annotation, source);
                 let annotation = type_name(raw_annotation);
                 if let Some(parameter) = nodes.iter().find(|n| {
-                    ["type_parameter", "type_parameter_declaration"].contains(&n.kind())
-                        && named(**n, source).as_deref() == Some(&annotation)
+                    ["type_parameter", "type_parameter_declaration"].contains(&nav.kind(**n))
+                        && named(**n, source, nav).as_deref() == Some(&annotation)
                 }) {
                     if language == "rust" {
                         // A bound identifies the called contract, not its eventual
@@ -1604,7 +1643,7 @@ fn receiver_type<'tree>(
                     // resolved by these syntactic hints. Trait objects and opaque
                     // parameters still name a known contract and retain its type.
                     if raw_annotation.contains('<')
-                        && nodes.iter().any(|n| n.kind() == "type_parameter")
+                        && nodes.iter().any(|n| nav.kind(*n) == "type_parameter")
                         || annotation.contains("::")
                             && !annotation
                                 .split("::")
@@ -1625,8 +1664,8 @@ fn receiver_type<'tree>(
             {
                 let annotation = type_name(text(annotation, source));
                 if nodes.iter().any(|n| {
-                    n.kind() == "type_parameter"
-                        && named(*n, source).as_deref() == Some(&annotation)
+                    nav.kind(*n) == "type_parameter"
+                        && named(*n, source, nav).as_deref() == Some(&annotation)
                 }) {
                     return None;
                 }
@@ -1648,10 +1687,10 @@ fn receiver_type<'tree>(
                     "short_var_declaration",
                     "update_expression",
                 ]
-                .contains(&n.kind())
+                .contains(&nav.kind(**n))
                     && field(**n, &["left", "argument"])
                         .is_some_and(|lhs| text(lhs, source).trim() == value)
-                    && (language != "python" || enclosing(**n, FUNCTIONS) == Some(function))
+                    && (language != "python" || nav.enclosing(**n, FUNCTIONS) == Some(function))
             })
             .count();
         if (language == "python" || language == "go") && assignments > 1
