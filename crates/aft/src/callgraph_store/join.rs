@@ -2033,6 +2033,16 @@ impl ViewBindingDependencies {
         })
     }
 
+    /// This binding without the checkout reads recorded with their answers,
+    /// for comparing with a binding recorded without them.
+    pub(crate) fn without_answers(&self) -> Self {
+        Self {
+            binding_answers: super::fact_answers::FactAnswers::new(),
+            resolution_answers: super::fact_answers::FactAnswers::new(),
+            ..self.clone()
+        }
+    }
+
     /// Carries a resolution over from `old`, whose recorded answers replay,
     /// onto this file's new binding.
     pub(crate) fn reuse_resolution(&mut self, old: &Self) {
@@ -2391,6 +2401,17 @@ impl<'a> ViewBindingFacts<'a> {
     fn take(&self) -> BTreeSet<String> {
         std::mem::take(&mut *self.probes.borrow_mut())
     }
+    /// A configuration file's bytes, read once and cached.
+    fn config_value(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        let cached = self.config_cache.borrow().get(rel).cloned();
+        cached.unwrap_or_else(|| {
+            let value = self.inner.config_bytes(rel);
+            self.config_cache
+                .borrow_mut()
+                .insert(rel.to_vec(), value.clone());
+            value
+        })
+    }
 }
 
 impl ProjectFacts for ViewBindingFacts<'_> {
@@ -2403,6 +2424,19 @@ impl ProjectFacts for ViewBindingFacts<'_> {
             self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
         }
         self.config_event(rel, Some(name));
+        // The resolver records a field each time it uses one, though it reads
+        // the file's bytes only the first time it parses it, so the field is
+        // recorded with its value here, for every file that uses it.
+        self.answered(
+            super::fact_answers::FactQuestion::ConfigField(rel.to_vec(), name.to_string()),
+            || {
+                super::fact_answers::config_field_answer(
+                    rel,
+                    self.config_value(rel).as_deref(),
+                    name,
+                )
+            },
+        );
     }
     fn memo_start(&self, path: &Path, kind: &str, name: &str) {
         self.memo_stack.borrow_mut().push((
@@ -2501,24 +2535,20 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
             trace.config.unattributed = true;
         }
-        self.attributed_config_bytes(rel)
-    }
-    fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
-        self.config_event(rel, None);
-        self.record(rel);
-        let cached = self.config_cache.borrow().get(rel).cloned();
-        let value = cached.unwrap_or_else(|| {
-            let value = self.inner.config_bytes(rel);
-            self.config_cache
-                .borrow_mut()
-                .insert(rel.to_vec(), value.clone());
-            value
-        });
+        let value = self.attributed_config_bytes(rel);
+        // Read without naming fields: the whole file is the input.
         self.answered(
             super::fact_answers::FactQuestion::Config(rel.to_vec()),
             || super::fact_answers::config_answer(value.as_deref()),
         );
         value
+    }
+    fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        self.config_event(rel, None);
+        self.record(rel);
+        // The fields the resolver reads from these bytes are recorded, with
+        // their values, as it uses them (`config_fact`).
+        self.config_value(rel)
     }
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
         let target = self.inner.symlink_target(rel);

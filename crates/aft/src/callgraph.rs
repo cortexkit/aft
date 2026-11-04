@@ -3110,7 +3110,15 @@ impl RustCrateRootMemo {
 }
 
 fn read_rust_crate_targets(crate_root: &Path, facts: &FactPaths<'_>) -> Option<RustCrateTargets> {
-    let bytes = facts.attributed_bytes(&crate_root.join("Cargo.toml"))?;
+    let manifest = crate_root.join("Cargo.toml");
+    // A crate's targets come from `[lib] path`, the target tables and their
+    // auto-discovery switches, so a change to any of them changes this
+    // answer. Without these fields the read named no field, and only another
+    // reader's unrelated field on the same file kept it from counting as
+    // reading the whole file.
+    facts.config_fact(&manifest, "disk.lib.path");
+    facts.config_fact(&manifest, "disk.targets");
+    let bytes = facts.attributed_bytes(&manifest)?;
     let cargo: toml::Value = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
     let lib = cargo
         .get("lib")

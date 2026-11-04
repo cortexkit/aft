@@ -195,9 +195,13 @@ fn fact_answers(out: &mut Encoder, values: &FactAnswers) {
             FactQuestion::Canonical(path) => (3, path),
             FactQuestion::ListDir(path) => (4, path),
             FactQuestion::Config(path) => (5, path),
+            FactQuestion::ConfigField(path, _) => (6, path),
         };
         out.byte(code);
         out.blob(path);
+        if let FactQuestion::ConfigField(_, name) = asked {
+            out.str(name);
+        }
         match answered {
             FactAnswer::Bool(value) => {
                 out.byte(0);
@@ -229,6 +233,7 @@ fn read_fact_answers(input: &mut Decoder<'_>) -> Result<FactAnswers, DecodeError
                 3 => FactQuestion::Canonical(path),
                 4 => FactQuestion::ListDir(path),
                 5 => FactQuestion::Config(path),
+                6 => FactQuestion::ConfigField(path, input.string()?),
                 _ => return Err(DecodeError("unknown fact question")),
             };
             let answered = match input.byte()? {

@@ -133,7 +133,7 @@ mod module_digest;
 pub(crate) mod parity;
 pub(crate) mod payload;
 pub(crate) mod profile;
-mod resolution_facts;
+pub(crate) mod resolution_facts;
 mod stable_rows;
 
 // Rebuild older generations rather than retaining rows produced by the

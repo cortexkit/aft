@@ -252,6 +252,39 @@ fn compare(
                 .map(|(_, name)| name)
                 .collect::<Vec<_>>();
                 examples.push(format!("{path}: recorded {}", what.join(", ")));
+                // Recorded checkout reads only one side made, or answered
+                // differently, by name.
+                let reads = |file: &FileResolution, part: &str| -> BTreeMap<String, String> {
+                    let answers = match part {
+                        "binding" => &file.binding.binding_answers,
+                        "resolution" => &file.binding.resolution_answers,
+                        _ => match &file.dispatch {
+                            Some(dispatch) => &dispatch.trace.answers,
+                            None => return BTreeMap::new(),
+                        },
+                    };
+                    answers
+                        .iter()
+                        .map(|(question, answer)| {
+                            (describe_question(question), format!("{answer:?}"))
+                        })
+                        .collect()
+                };
+                for part in ["binding", "resolution", "dispatch"] {
+                    let (ours_reads, theirs_reads) = (reads(ours, part), reads(theirs, part));
+                    for (question, answer) in &ours_reads {
+                        if theirs_reads.get(question) != Some(answer) {
+                            examples
+                                .push(format!("  {part} read only live: {question} = {answer}"));
+                        }
+                    }
+                    for (question, answer) in &theirs_reads {
+                        if ours_reads.get(question) != Some(answer) {
+                            examples
+                                .push(format!("  {part} read only cold: {question} = {answer}"));
+                        }
+                    }
+                }
                 // Which lines of the two recordings' debug forms differ.
                 let ours_text = format!(
                     "{:#?}",
@@ -273,6 +306,23 @@ fn compare(
         }
     }
     (answers, recordings)
+}
+
+/// A recorded checkout read, with its path as text.
+fn describe_question(question: &crate::callgraph_store::fact_answers::FactQuestion) -> String {
+    use crate::callgraph_store::fact_answers::FactQuestion as Q;
+    let (name, path) = match question {
+        Q::IsFile(path) => ("is_file", path),
+        Q::IsDir(path) => ("is_dir", path),
+        Q::Link(path) => ("link", path),
+        Q::Canonical(path) => ("canonical", path),
+        Q::ListDir(path) => ("list_dir", path),
+        Q::Config(path) => ("config", path),
+        Q::ConfigField(path, field) => {
+            return format!("config_field({}, {field})", String::from_utf8_lossy(path));
+        }
+    };
+    format!("{name}({})", String::from_utf8_lossy(path))
 }
 
 /// Replays the pack at `pack`, checking every `check_every`-th edit and
@@ -448,6 +498,10 @@ pub fn run(
             serde_json::to_string(&record).map_err(|error| error.to_string())?
         )
         .map_err(|error| error.to_string())?;
+        // Investigating a failure needs only the first one.
+        if failures > 0 && std::env::var_os("EDIT_GATE_STOP_AT_FIRST").is_some() {
+            break;
+        }
     }
     drop(segment);
     let _ = std::fs::remove_dir_all(&directory);

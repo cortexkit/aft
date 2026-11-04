@@ -211,7 +211,7 @@ impl LiveCheckout {
 
     /// Asks every distinct recorded checkout read again of `inputs`, and
     /// lists the files with a read whose answer differs.
-    fn stale_answers(&self, inputs: &CheckoutInputs) -> StaleAnswers {
+    fn stale_answers(&self, inputs: &CheckoutInputs, configs_changed: bool) -> StaleAnswers {
         /// Whether any of `answers` differs now; each distinct read is asked
         /// once and kept in `now`.
         fn differs<'a>(
@@ -233,7 +233,12 @@ impl LiveCheckout {
         let mut stale = StaleAnswers::default();
         let files = self.resolved.iter().collect::<Vec<_>>();
         for (path, file) in &files {
-            if differs(&file.binding.binding_answers, &mut now, &facts) {
+            // A configuration read the resolver attributed to no field is
+            // recorded without its answer, so any configuration change may
+            // change it.
+            if differs(&file.binding.binding_answers, &mut now, &facts)
+                || (configs_changed && file.binding.unattributed)
+            {
                 stale.binding.insert((*path).clone());
             }
             if differs(&file.binding.resolution_answers, &mut now, &facts) {
@@ -380,7 +385,7 @@ impl LiveCheckout {
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
         } else {
-            self.stale_answers(inputs)
+            self.stale_answers(inputs, !configs.is_empty())
         };
         stats.answers_checked = stale.checked;
         stats.answers_changed = stale.changed;

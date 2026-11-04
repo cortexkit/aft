@@ -246,7 +246,15 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
         ));
     }
     for (path, file) in &resolved {
-        if join.bindings.get(path) != Some(&file.binding) {
+        // The data layer also records every checkout read with its answer;
+        // today's join records none, so those are left out of the comparison.
+        let binding = file.binding.without_answers();
+        let dispatch = file.dispatch.as_ref().map(|dispatch| {
+            let mut dispatch = dispatch.clone();
+            dispatch.trace.answers.clear();
+            dispatch
+        });
+        if join.bindings.get(path) != Some(&binding) {
             report.binding_mismatches += 1;
             if report.examples.len() < 20 {
                 report.examples.push(format!("binding {path}"));
@@ -263,7 +271,7 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
                 }
             }
         }
-        if join.dispatch_type_targets.get(path) != file.dispatch.as_ref() {
+        if join.dispatch_type_targets.get(path) != dispatch.as_ref() {
             report.dispatch_mismatches += 1;
             if report.examples.len() < 20 {
                 report.examples.push(format!("dispatch {path}"));

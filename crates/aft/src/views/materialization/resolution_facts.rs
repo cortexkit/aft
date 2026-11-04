@@ -62,6 +62,23 @@ pub(crate) fn project(path: &[u8], bytes: &[u8]) -> Option<FactDigests> {
                     .expect("TOML value"),
                 );
             }
+            // What the crate-target reader consumes besides `[lib] path`.
+            let section = |name: &str| value.as_ref().and_then(|v| v.get(name));
+            let auto = |key: &str| section("package").and_then(|package| package.get(key));
+            insert(
+                "disk.targets",
+                serde_json::to_value((
+                    section("bin"),
+                    section("example"),
+                    section("test"),
+                    section("bench"),
+                    auto("autobins"),
+                    auto("autoexamples"),
+                    auto("autotests"),
+                    auto("autobenches"),
+                ))
+                .expect("TOML value"),
+            );
         }
         _ => return None,
     }
@@ -237,6 +254,22 @@ mod tests {
         assert_eq!(
             changed("Cargo.toml", "[lib]\npath = \"a\"", "[lib]\npath = \"b\""),
             ["disk.lib.path"]
+        );
+        assert_eq!(
+            changed(
+                "Cargo.toml",
+                "[[bin]]\nname = \"x\"\npath = \"a.rs\"",
+                "[[bin]]\nname = \"x\"\npath = \"b.rs\""
+            ),
+            ["disk.targets"]
+        );
+        assert_eq!(
+            changed(
+                "Cargo.toml",
+                "[package]\nname = \"p\"",
+                "[package]\nname = \"p\"\nautotests = false"
+            ),
+            ["disk.targets"]
         );
         // Invalid TOML still has line-oriented names for the manifest resolver.
         assert_eq!(

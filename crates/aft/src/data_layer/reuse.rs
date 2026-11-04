@@ -180,6 +180,11 @@ fn holds<'v>(
     {
         return Err(Rejection::Binding);
     }
+    // A configuration read attributed to no field was not recorded with its
+    // answer, so it cannot be checked here.
+    if variant.binding.unattributed {
+        return Err(Rejection::Reads);
+    }
     let mut answers = variant.binding.resolution_answers.iter().chain(
         variant
             .dispatch
@@ -207,9 +212,9 @@ fn holds<'v>(
 
 /// Distinct resolutions of `checkouts`, each with the checkouts that made
 /// it, for a pool: equal resolutions of one file are kept once.
-pub(crate) fn distinct_resolutions<'c>(
-    checkouts: &'c [(CheckoutInputs, BTreeMap<String, FileResolution>)],
-) -> HashMap<(&'c str, &'c str), Vec<(&'c FileResolution, BTreeSet<usize>)>> {
+pub(crate) fn distinct_resolutions(
+    checkouts: &[(CheckoutInputs, BTreeMap<String, FileResolution>)],
+) -> HashMap<(&str, &str), Vec<(&FileResolution, BTreeSet<usize>)>> {
     let mut distinct = HashMap::<(&str, &str), Vec<(&FileResolution, BTreeSet<usize>)>>::new();
     for (index, (inputs, resolved)) in checkouts.iter().enumerate() {
         for (path, file) in resolved {

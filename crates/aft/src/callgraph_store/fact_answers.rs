@@ -26,8 +26,11 @@ pub(crate) enum FactQuestion {
     Canonical(Vec<u8>),
     /// A directory's entries and their kinds.
     ListDir(Vec<u8>),
-    /// A configuration file's bytes.
+    /// A configuration file's bytes, read without naming a field.
     Config(Vec<u8>),
+    /// One field of a configuration file, as the resolver names it (see
+    /// [`config_field_answer`]).
+    ConfigField(Vec<u8>, String),
 }
 
 /// What a [`FactQuestion`] was answered.
@@ -53,6 +56,9 @@ impl FactQuestion {
             Self::Canonical(path) => FactAnswer::Path(facts.canonical(path)),
             Self::ListDir(path) => listing_answer(&facts.list_dir(path)),
             Self::Config(path) => config_answer(facts.config_bytes(path).as_deref()),
+            Self::ConfigField(path, name) => {
+                config_field_answer(path, facts.config_bytes(path).as_deref(), name)
+            }
         }
     }
 }
@@ -86,6 +92,25 @@ pub(crate) fn config_answer(bytes: Option<&[u8]>) -> FactAnswer {
         }
     }
     FactAnswer::Digest(truncate(&hasher.finalize()))
+}
+
+/// The answer for one field of a configuration file: the digest of the
+/// field's value as the resolver reads it, the same projection today's
+/// refresh compares. A field the projection does not know, or a file it
+/// cannot project, falls back to the whole file's answer: never finer than
+/// what is known to be the field's only input.
+pub(crate) fn config_field_answer(path: &[u8], bytes: Option<&[u8]>, name: &str) -> FactAnswer {
+    let projected = bytes
+        .and_then(|bytes| crate::views::materialization::resolution_facts::project(path, bytes))
+        .and_then(|fields| fields.get(name).cloned());
+    match projected {
+        Some(digest) => {
+            let hash = blake3::hash(digest.as_bytes());
+            FactAnswer::Digest(truncate(&hash))
+        }
+        None if bytes.is_none() => config_answer(None),
+        None => config_answer(bytes),
+    }
 }
 
 fn truncate(hash: &blake3::Hash) -> [u8; 16] {
