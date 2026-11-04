@@ -11,7 +11,8 @@
 //! non-zero on any difference.
 //!
 //! Inputs (nothing is random; see `vector_gate_embed.py` for where each
-//! vector comes from):
+//! vector comes from, and `vector_gate_job.sh` for the whole run on a build
+//! server):
 //!
 //! ```text
 //! # A dataset written by vector_gate_embed.py over export_chunks output:
