@@ -38,6 +38,27 @@ pub(crate) trait SliceSource {
     fn files(&self) -> Vec<String>;
 }
 
+impl<T: SliceSource + ?Sized> SliceSource for Arc<T> {
+    fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
+        (**self).slice(path)
+    }
+    fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String> {
+        (**self).caller_files(target_file, target_symbol)
+    }
+    fn files_with_ref_name(&self, short_name: &str) -> BTreeSet<String> {
+        (**self).files_with_ref_name(short_name)
+    }
+    fn files_with_symbol_name(&self, name: &str) -> BTreeSet<String> {
+        (**self).files_with_symbol_name(name)
+    }
+    fn files_of_language(&self, language: &str) -> BTreeSet<String> {
+        (**self).files_of_language(language)
+    }
+    fn files(&self) -> Vec<String> {
+        (**self).files()
+    }
+}
+
 /// Slices kept in memory, with their lookups.
 #[derive(Debug, Default)]
 pub(crate) struct MemorySlices {

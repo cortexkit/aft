@@ -108,6 +108,9 @@ pub struct CheckoutState {
     /// under which the recorded contents were read.
     pub conversion: Digest128,
     paths: Vec<PathRecord>,
+    /// For each path, the call-graph fragment that holds its resolution in
+    /// this checkout, when it has one. Empty, or one entry per path.
+    fragments: Vec<Option<Digest128>>,
 }
 
 /// Why a state could not be built.
@@ -117,6 +120,8 @@ pub enum StateError {
     DuplicatePath(String),
     #[error("a path, Git fingerprint or language is too long to store")]
     TooLong,
+    #[error("plane keys must have one entry per path")]
+    PlaneMismatch,
 }
 
 impl CheckoutState {
@@ -148,7 +153,28 @@ impl CheckoutState {
             git,
             conversion,
             paths,
+            fragments: Vec::new(),
         })
+    }
+
+    /// This state with `fragments`, one entry per path in path order: the
+    /// call-graph fragment each path's resolution is in.
+    ///
+    /// # Errors
+    ///
+    /// When `fragments` does not have one entry per path.
+    pub fn with_fragments(mut self, fragments: Vec<Option<Digest128>>) -> Result<Self, StateError> {
+        if fragments.len() != self.paths.len() {
+            return Err(StateError::PlaneMismatch);
+        }
+        self.fragments = fragments;
+        Ok(self)
+    }
+
+    /// The call-graph fragment of the path at `index`, if it has one.
+    #[must_use]
+    pub fn fragment(&self, index: usize) -> Option<Digest128> {
+        self.fragments.get(index).copied().flatten()
     }
 
     /// The paths in byte order.
@@ -243,6 +269,18 @@ impl CheckoutState {
             out.str(&record.language);
             previous = Some(record);
         }
+        // Fragments follow the paths: a flag, then one optional digest per
+        // path.
+        out.byte(u8::from(!self.fragments.is_empty()));
+        for fragment in &self.fragments {
+            match fragment {
+                Some(digest) => {
+                    out.byte(1);
+                    out.blob(digest.as_bytes());
+                }
+                None => out.byte(0),
+            }
+        }
         out.finish()
     }
 
@@ -332,17 +370,39 @@ impl CheckoutState {
                 language,
             });
         }
+        let mut fragments = Vec::new();
+        match input.byte().map_err(invalid)? {
+            0 => {}
+            1 => {
+                fragments.reserve(paths.len());
+                for _ in 0..paths.len() {
+                    fragments.push(match input.byte().map_err(invalid)? {
+                        0 => None,
+                        1 => Some(Digest128::from_bytes(
+                            input
+                                .blob()
+                                .map_err(invalid)?
+                                .try_into()
+                                .map_err(|_| RecordError::Invalid("fragment key length"))?,
+                        )),
+                        _ => return Err(RecordError::Invalid("fragment flag")),
+                    });
+                }
+            }
+            _ => return Err(RecordError::Invalid("fragment section flag")),
+        }
         input.finish().map_err(invalid)?;
         Ok(Self {
             git,
             conversion,
             paths,
+            fragments,
         })
     }
 }
 
 /// The version of [`CheckoutState::encode`]'s layout, its first byte.
-const STATE_FORMAT: u8 = 1;
+const STATE_FORMAT: u8 = 2;
 
 const fn zigzag(value: i64) -> u64 {
     ((value << 1) ^ (value >> 63)).cast_unsigned()
@@ -429,6 +489,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(CheckoutState::decode(&state.encode()).unwrap(), state);
+        // Fragment keys, some paths without one, survive too.
+        let with_fragments = state
+            .clone()
+            .with_fragments(vec![
+                Some(Digest128::of(b"f")),
+                None,
+                Some(Digest128::of(b"g")),
+            ])
+            .unwrap();
+        let decoded = CheckoutState::decode(&with_fragments.encode()).unwrap();
+        assert_eq!(decoded, with_fragments);
+        assert_eq!(decoded.fragment(0), Some(Digest128::of(b"f")));
+        assert_eq!(decoded.fragment(1), None);
+        assert!(matches!(
+            state.with_fragments(vec![None]),
+            Err(StateError::PlaneMismatch)
+        ));
         assert!(matches!(
             CheckoutState::new(
                 Vec::new(),

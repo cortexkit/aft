@@ -476,7 +476,9 @@ fn compare_queries(
         Arc::new(BlockCache::new(256 << 20)),
     )
     .map_err(|error| error.to_string())?;
-    let stored = super::graph_store::StoredSlices::open(&segment, inputs, &fragments)?;
+    let segment = Arc::new(segment);
+    let stored =
+        super::graph_store::StoredSlices::open(vec![Arc::clone(&segment)], inputs, &fragments)?;
     let stored = super::query::SliceReader::new(stored, root.to_path_buf(), "gate".to_string());
     compare_readers(
         &stored,

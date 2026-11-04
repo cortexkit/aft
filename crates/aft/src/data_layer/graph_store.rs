@@ -86,6 +86,25 @@ pub(crate) fn write_segment(
     resolved: &BTreeMap<String, FileResolution>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
+    let mut writer = SegmentWriter::create(path, meta).map_err(|error| error.to_string())?;
+    let keys = write_sections(&mut writer, inputs, resolved, records)?;
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(keys)
+}
+
+/// Writes the content records and fragments of `resolved`'s files into
+/// `writer`, as [`write_segment`] does, for a segment that may hold other
+/// planes' sections too. Returns each file's fragment key.
+///
+/// # Errors
+///
+/// When a file has no content record, or the sections cannot be written.
+pub(crate) fn write_sections(
+    writer: &mut SegmentWriter,
+    inputs: &CheckoutInputs,
+    resolved: &BTreeMap<String, FileResolution>,
+    records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut content = ContentSectionsBuilder::new();
     let mut graph = GraphSectionsBuilder::new();
     let mut keys = BTreeMap::new();
@@ -106,87 +125,125 @@ pub(crate) fn write_segment(
             terms.iter().map(|(kind, term)| (*kind, term.as_slice())),
         );
     }
-    let mut writer = SegmentWriter::create(path, meta).map_err(|error| error.to_string())?;
-    content
-        .write(&mut writer)
-        .map_err(|error| error.to_string())?;
-    graph
-        .write(&mut writer)
-        .map_err(|error| error.to_string())?;
-    writer.finish().map_err(|error| error.to_string())?;
+    content.write(writer).map_err(|error| error.to_string())?;
+    graph.write(writer).map_err(|error| error.to_string())?;
     Ok(keys)
 }
 
-/// Where one path's record and fragment are.
+/// Where one path's record and fragment are: each as (index into the
+/// reader's segments, ordinal in that segment).
 #[derive(Clone, Debug)]
 struct Located {
     record_key: String,
-    record: u32,
-    fragment: u32,
+    record: (u32, u32),
+    fragment: (u32, u32),
 }
 
-/// A checkout's slices read from one segment.
+/// A checkout's slices read from its segments.
+///
+/// The reader owns its segments, so a checkout's snapshot can keep it for
+/// as long as the snapshot lives. A file's record and fragment can be in
+/// different segments, and a later segment can hold a newer fragment of a
+/// file; the checkout's state names which fragment is current, and lookups
+/// skip every other one.
 ///
 /// A read that fails (a checksum, a malformed record) is recorded in
 /// [`StoredSlices::failures`] and the file is treated as absent, because the
-/// slice source answers with options; the gate fails on any recorded
-/// failure.
-pub(crate) struct StoredSlices<'s> {
-    content: ContentSegment<'s>,
-    graph: GraphSegment<'s>,
+/// slice source answers with options; callers fail on any recorded failure.
+pub(crate) struct StoredSlices {
+    segments: Vec<Arc<Segment>>,
     paths: BTreeMap<String, Located>,
-    by_fragment: HashMap<u32, String>,
+    by_fragment: HashMap<(u32, u32), String>,
     cache: Mutex<HashMap<String, Arc<FileSlice>>>,
     failures: Mutex<Vec<String>>,
 }
 
-impl<'s> StoredSlices<'s> {
-    /// Opens the slices of `inputs`'s parsed files in `segment`, each with
-    /// the fragment `fragments` names for it.
+/// Finds `key` in the newest of `segments` that holds it.
+fn find_newest<T>(
+    segments: &[Option<T>],
+    find: impl Fn(&T) -> Result<Option<u32>, aft_store::segment::SegmentError>,
+) -> Result<Option<(u32, u32)>, String> {
+    for (index, segment) in segments.iter().enumerate().rev() {
+        let Some(segment) = segment else {
+            continue;
+        };
+        if let Some(ordinal) = find(segment).map_err(|error| error.to_string())? {
+            let index = u32::try_from(index).map_err(|_| "too many segments".to_string())?;
+            return Ok(Some((index, ordinal)));
+        }
+    }
+    Ok(None)
+}
+
+impl StoredSlices {
+    /// Opens the slices of `inputs`'s parsed files in `segments` (oldest
+    /// first), each with the fragment `fragments` names for it.
     ///
     /// # Errors
     ///
-    /// When the segment lacks the call-graph sections, or a parsed file has
-    /// no record or fragment in it.
+    /// When a segment is malformed, or a parsed file has no record or
+    /// fragment in any segment.
     pub(crate) fn open(
-        segment: &'s Segment,
+        segments: Vec<Arc<Segment>>,
         inputs: &CheckoutInputs,
         fragments: &BTreeMap<String, FragmentKey>,
     ) -> Result<Self, String> {
-        let content = ContentSegment::open(segment)
-            .map_err(|error| error.to_string())?
-            .ok_or("the segment has no content sections")?;
-        let graph = GraphSegment::open(segment)
-            .map_err(|error| error.to_string())?
-            .ok_or("the segment has no graph sections")?;
+        let files = inputs
+            .parses
+            .iter()
+            .map(|(file, (key, _))| {
+                let fragment = fragments
+                    .get(file)
+                    .ok_or_else(|| format!("no fragment key for {file}"))?;
+                Ok((file.clone(), key.clone(), *fragment))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::open_files(segments, &files)
+    }
+
+    /// Opens the slices of `files`, each a (path, parse key, fragment key),
+    /// in `segments` (oldest first).
+    ///
+    /// # Errors
+    ///
+    /// When a segment is malformed, or a file has no record or fragment in
+    /// any segment.
+    pub(crate) fn open_files(
+        segments: Vec<Arc<Segment>>,
+        files: &[(String, String, FragmentKey)],
+    ) -> Result<Self, String> {
         let mut paths = BTreeMap::new();
         let mut by_fragment = HashMap::new();
-        for (file, (key, _)) in &inputs.parses {
-            let record_key = record_key_of(key)?;
-            let record = content
-                .find(record_key)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("no stored record for {file}"))?;
-            let fragment_key = fragments
-                .get(file)
-                .ok_or_else(|| format!("no fragment key for {file}"))?;
-            let fragment = graph
-                .find(*fragment_key)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("no stored fragment for {file}"))?;
-            by_fragment.insert(fragment, file.clone());
-            paths.insert(
-                file.clone(),
-                Located {
-                    record_key: key.clone(),
-                    record,
-                    fragment,
-                },
-            );
+        {
+            let contents = segments
+                .iter()
+                .map(|segment| ContentSegment::open(segment))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let graphs = segments
+                .iter()
+                .map(|segment| GraphSegment::open(segment))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            for (file, key, fragment_key) in files {
+                let record_key = record_key_of(key)?;
+                let record = find_newest(&contents, |content| content.find(record_key))?
+                    .ok_or_else(|| format!("no stored record for {file}"))?;
+                let fragment = find_newest(&graphs, |graph| graph.find(*fragment_key))?
+                    .ok_or_else(|| format!("no stored fragment for {file}"))?;
+                by_fragment.insert(fragment, file.clone());
+                paths.insert(
+                    file.clone(),
+                    Located {
+                        record_key: key.clone(),
+                        record,
+                        fragment,
+                    },
+                );
+            }
         }
         Ok(Self {
-            content,
-            graph,
+            segments,
             paths,
             by_fragment,
             cache: Mutex::new(HashMap::new()),
@@ -209,10 +266,22 @@ impl<'s> StoredSlices<'s> {
             .push(what);
     }
 
+    fn content(&self, index: u32) -> Result<ContentSegment<'_>, String> {
+        ContentSegment::open(&self.segments[index as usize])
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "a record's segment has no content sections".to_string())
+    }
+
+    fn graph(&self, index: u32) -> Result<GraphSegment<'_>, String> {
+        GraphSegment::open(&self.segments[index as usize])
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "a fragment's segment has no graph sections".to_string())
+    }
+
     fn load(&self, file: &str, located: &Located) -> Result<FileSlice, String> {
         let record = self
-            .content
-            .record(located.record)
+            .content(located.record.0)?
+            .record(located.record.1)
             .map_err(|error| error.to_string())?;
         let CallgraphBlob::Parse(parse) =
             blob_from_record(&record).map_err(|error| error.to_string())?
@@ -220,8 +289,8 @@ impl<'s> StoredSlices<'s> {
             return Err(format!("{file}: its stored record is not a parse"));
         };
         let bytes = self
-            .graph
-            .fragment(located.fragment)
+            .graph(located.fragment.0)?
+            .fragment(located.fragment.1)
             .map_err(|error| error.to_string())?;
         let resolution = super::fragment::decode(&located.record_key, file, &bytes)
             .map_err(|error| error.0.to_string())?;
@@ -233,17 +302,30 @@ impl<'s> StoredSlices<'s> {
         ))
     }
 
+    /// The files whose current fragment is listed under `term`, in every
+    /// segment that has graph sections.
     fn files_for(&self, kind: TermKind, term: &[u8]) -> BTreeSet<String> {
-        match self.graph.candidates(kind, term) {
-            Ok(ordinals) => ordinals
-                .into_iter()
-                .filter_map(|ordinal| self.by_fragment.get(&ordinal).cloned())
-                .collect(),
-            Err(error) => {
-                self.fail(format!("{kind:?} lookup: {error}"));
-                BTreeSet::new()
+        let mut files = BTreeSet::new();
+        for (index, segment) in self.segments.iter().enumerate() {
+            let graph = match GraphSegment::open(segment) {
+                Ok(Some(graph)) => graph,
+                Ok(None) => continue,
+                Err(error) => {
+                    self.fail(format!("{kind:?} lookup: {error}"));
+                    continue;
+                }
+            };
+            let index = u32::try_from(index).expect("fewer than 2^32 segments");
+            match graph.candidates(kind, term) {
+                Ok(ordinals) => files.extend(
+                    ordinals
+                        .into_iter()
+                        .filter_map(|ordinal| self.by_fragment.get(&(index, ordinal)).cloned()),
+                ),
+                Err(error) => self.fail(format!("{kind:?} lookup: {error}")),
             }
         }
+        files
     }
 }
 
@@ -261,7 +343,7 @@ fn record_key_of(key: &str) -> Result<RecordKey, String> {
     Ok(RecordKey::from_digest(Digest128::from_bytes(bytes)))
 }
 
-impl SliceSource for StoredSlices<'_> {
+impl SliceSource for StoredSlices {
     fn slice(&self, path: &str) -> Option<Arc<FileSlice>> {
         if let Some(slice) = self
             .cache

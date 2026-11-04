@@ -379,13 +379,15 @@ pub fn run(
         &live.resolved,
         &files.contents,
     )?;
-    let segment = Segment::open(
-        &segment_path,
-        family,
-        &known_sections(),
-        Arc::new(BlockCache::new(256 << 20)),
-    )
-    .map_err(|error| error.to_string())?;
+    let segment = Arc::new(
+        Segment::open(
+            &segment_path,
+            family,
+            &known_sections(),
+            Arc::new(BlockCache::new(256 << 20)),
+        )
+        .map_err(|error| error.to_string())?,
+    );
     let base = base_inputs
         .parses
         .iter()
@@ -513,7 +515,7 @@ pub fn run(
 /// with slices of the cold resolution `cold`. Returns how many files the
 /// overlay holds and how many primitives answered differently.
 fn check_overlay(
-    segment: &Segment,
+    segment: &Arc<Segment>,
     base_inputs: &CheckoutInputs,
     fragments: &BTreeMap<String, aft_store::graph::FragmentKey>,
     base: &BTreeMap<String, (String, Vec<u8>)>,
@@ -521,7 +523,11 @@ fn check_overlay(
     cold: &BTreeMap<String, FileResolution>,
     examples: &mut Vec<String>,
 ) -> Result<(usize, usize), String> {
-    let mut overlay = OverlaySlices::new(StoredSlices::open(segment, base_inputs, fragments)?);
+    let mut overlay = OverlaySlices::new(StoredSlices::open(
+        vec![Arc::clone(segment)],
+        base_inputs,
+        fragments,
+    )?);
     for (path, (key, parse)) in &live.inputs.parses {
         let resolution = &live.resolved[path];
         let same = base.get(path).is_some_and(|(base_key, bytes)| {

@@ -3,6 +3,7 @@
 //! stored records.
 
 pub mod callgraph;
+pub mod checkout;
 pub mod content;
 pub(crate) mod dead_code;
 pub mod edit_gate;
