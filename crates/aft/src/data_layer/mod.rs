@@ -5,3 +5,4 @@
 pub mod callgraph;
 pub mod content;
 pub mod gate;
+pub(crate) mod graph_rows;

@@ -40,6 +40,8 @@ use crate::callgraph_store::join::{
 use crate::callgraph_store::{DbFileIndex, ProjectIndex, WorkspaceCratePrefixCache};
 use crate::views::materialization::dispatch::FileFacts;
 
+use super::graph_rows::references_by_key;
+
 /// What resolving a checkout reads.
 #[derive(Debug)]
 pub(crate) struct CheckoutInputs {
@@ -292,16 +294,6 @@ fn resolve_method_calls(
         file.site_dependencies = dependencies;
     }
     Ok(resolved)
-}
-
-/// Each reference of a parse by its reference key. When two references
-/// share a key, the later one wins, as when rows were emitted.
-fn references_by_key(parse: &ParseBlob) -> HashMap<u32, &BlobRef> {
-    parse
-        .reference_keys()
-        .into_iter()
-        .zip(&parse.refs)
-        .collect()
 }
 
 /// The target file of each module a file imports, from its pass-2 rows.

@@ -36,6 +36,12 @@ pub struct ResolveGateReport {
     pub rows_only_join: usize,
     pub binding_mismatches: usize,
     pub dispatch_mismatches: usize,
+    /// Assembled rows against the views database today's materialization
+    /// writes from the same inputs, per table: (rows here, rows there,
+    /// rows that differ).
+    pub tables: BTreeMap<&'static str, (usize, usize, usize)>,
+    pub assemble_ms: f64,
+    pub materialize_ms: f64,
     /// Up to twenty paths whose results differ, for a first look.
     pub examples: Vec<String>,
 }
@@ -185,6 +191,7 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
         (path, entry)
     }))
     .map_err(|error| error.to_string())?;
+    let blobs_again = Blobs(blobs.clone());
     let started = Instant::now();
     let join = join_selected_manifest_for_materialization(
         &manifest,
@@ -233,5 +240,212 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
         .filter(|path| !resolved.contains_key(*path))
         .count();
     report.binding_mismatches += unresolved_by_new;
+
+    let started = Instant::now();
+    let rows = super::graph_rows::assemble(&inputs, &resolved);
+    report.assemble_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let database = std::env::temp_dir().join(format!("aft-resolve-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&database).map_err(|error| error.to_string())?;
+    let path = database.join("view.sqlite");
+    let started = Instant::now();
+    crate::views::materialization::materialize_from_blob_reader(&path, &manifest, &blobs_again)
+        .map_err(|error| error.to_string())?;
+    report.materialize_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let connection = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
+    compare_tables(&connection, &rows, &mut report).map_err(|error| error.to_string())?;
+    drop(connection);
+    let _ = std::fs::remove_dir_all(&database);
     Ok(report)
+}
+
+/// Every row as one string of its compared columns, so two tables compare
+/// as sets of strings.
+fn table(connection: &rusqlite::Connection, sql: &str) -> rusqlite::Result<BTreeSet<String>> {
+    let mut statement = connection.prepare(sql)?;
+    let columns = statement.column_count();
+    let rows = statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|index| {
+                    Ok(match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                        rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+                        rusqlite::types::ValueRef::Real(value) => value.to_string(),
+                        rusqlite::types::ValueRef::Text(value)
+                        | rusqlite::types::ValueRef::Blob(value) => {
+                            String::from_utf8_lossy(value).into_owned()
+                        }
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map(|fields| fields.join("\u{1f}"))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(rows)
+}
+
+fn opt(value: Option<&str>) -> String {
+    value.map_or_else(|| "NULL".to_string(), str::to_string)
+}
+
+fn join_fields(fields: &[String]) -> String {
+    fields.join("\u{1f}")
+}
+
+fn compare_tables(
+    connection: &rusqlite::Connection,
+    rows: &super::graph_rows::GraphRows,
+    report: &mut ResolveGateReport,
+) -> rusqlite::Result<()> {
+    let mut record = |name: &'static str, ours: BTreeSet<String>, theirs: BTreeSet<String>| {
+        let differing = ours.symmetric_difference(&theirs).count();
+        for row in ours.symmetric_difference(&theirs).take(3) {
+            if report.examples.len() < 40 {
+                let side = if ours.contains(row) { "ours" } else { "views" };
+                report
+                    .examples
+                    .push(format!("{name} {side}: {}", row.replace('\u{1f}', " | ")));
+            }
+        }
+        report
+            .tables
+            .insert(name, (ours.len(), theirs.len(), differing));
+    };
+    let b = |value: bool| i64::from(value).to_string();
+    record(
+        "files",
+        rows.files
+            .iter()
+            .map(|(path, (key, language))| {
+                join_fields(&[path.clone(), key.clone(), language.clone()])
+            })
+            .collect(),
+        table(connection, "SELECT path, content_hash, lang FROM files")?,
+    );
+    record(
+        "nodes",
+        rows.nodes
+            .values()
+            .map(|node| {
+                join_fields(&[
+                    node.id.clone(),
+                    node.file_path.clone(),
+                    node.name.clone(),
+                    node.scoped_name.clone(),
+                    node.kind.clone(),
+                    node.start_line.to_string(),
+                    node.start_col.to_string(),
+                    node.end_line.to_string(),
+                    node.end_col.to_string(),
+                    node.range_ordinal.to_string(),
+                    opt(node.signature.as_deref()),
+                    b(node.exported),
+                    b(node.is_default_export),
+                    b(node.entry_point),
+                    node.is_test.map_or_else(|| "NULL".to_string(), b),
+                ])
+            })
+            .collect(),
+        table(
+            connection,
+            "SELECT id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
+                    end_col, range_ordinal, signature, exported, is_default_export,
+                    is_callgraph_entry_point, is_test FROM nodes",
+        )?,
+    );
+    record(
+        "refs",
+        rows.refs
+            .values()
+            .map(|reference| {
+                join_fields(&[
+                    reference.ref_id.clone(),
+                    opt(reference.caller_node.as_deref()),
+                    reference.caller_file.clone(),
+                    reference.kind.to_string(),
+                    opt(reference.short_name.as_deref()),
+                    opt(reference.full_ref.as_deref()),
+                    opt(reference.module_path.as_deref()),
+                    opt(reference.import_kind.as_deref()),
+                    opt(reference.local_name.as_deref()),
+                    opt(reference.requested_name.as_deref()),
+                    opt(reference.namespace_alias.as_deref()),
+                    b(reference.wildcard),
+                    reference.line.to_string(),
+                    reference.byte_start.to_string(),
+                    reference.byte_end.to_string(),
+                    reference.status.to_string(),
+                    opt(reference.target_node.as_deref()),
+                    opt(reference.target_file.as_deref()),
+                    opt(reference.target_symbol.as_deref()),
+                ])
+            })
+            .collect(),
+        table(
+            connection,
+            "SELECT ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
+                    import_kind, local_name, requested_name, namespace_alias, wildcard, line,
+                    byte_start, byte_end, status, target_node, target_file, target_symbol
+             FROM refs",
+        )?,
+    );
+    record(
+        "edges",
+        rows.edges
+            .values()
+            .map(|edge| {
+                join_fields(&[
+                    edge.edge_id.clone(),
+                    edge.ref_id.clone(),
+                    edge.source_node.clone(),
+                    opt(edge.target_node.as_deref()),
+                    edge.target_file.clone(),
+                    edge.target_symbol.clone(),
+                    edge.kind.to_string(),
+                    edge.line.to_string(),
+                    edge.provenance.clone(),
+                ])
+            })
+            .collect(),
+        table(
+            connection,
+            "SELECT edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                    kind, line, provenance FROM edges",
+        )?,
+    );
+    record(
+        "view_dispatch_sites",
+        rows.sites
+            .values()
+            .map(|site| {
+                join_fields(&[
+                    site.caller_file.clone(),
+                    site.ordinal.to_string(),
+                    site.language.clone(),
+                    site.unresolved.to_string(),
+                    site.dynamic.to_string(),
+                    site.external.to_string(),
+                ])
+            })
+            .collect(),
+        table(
+            connection,
+            "SELECT caller_file, ordinal, language, unresolved_receiver_sites,
+                    dynamic_member_sites, external FROM view_dispatch_sites",
+        )?,
+    );
+    record(
+        "view_unknown_live",
+        rows.unknown_live
+            .iter()
+            .map(|(caller, file, symbol)| {
+                join_fields(&[caller.clone(), file.clone(), symbol.clone()])
+            })
+            .collect(),
+        table(
+            connection,
+            "SELECT caller_file, target_file, target_symbol FROM view_unknown_live",
+        )?,
+    );
+    Ok(())
 }

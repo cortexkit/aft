@@ -1,5 +1,8 @@
 //! Resolves a real checkout with the data layer's parallel per-file resolver
-//! and with today's join, and reports whether they agree.
+//! and with today's join, and reports whether they agree. Then assembles the
+//! call graph's rows from the data layer's resolution and compares them,
+//! table by table, with the views database today's materialization writes
+//! from the same inputs.
 //!
 //! ```text
 //! cargo run --release -p agent-file-tools --example resolve_gate -- <checkout root> [threads]
@@ -23,5 +26,12 @@ fn main() {
         ),
         (0, 0, 0, 0),
         "the data layer's resolution differs from the join's"
+    );
+    assert!(
+        report
+            .tables
+            .values()
+            .all(|(_, _, differing)| *differing == 0),
+        "the assembled call graph differs from today's views database"
     );
 }
