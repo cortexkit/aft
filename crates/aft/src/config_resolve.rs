@@ -208,6 +208,7 @@ pub enum RawFormatter {
     Rustfmt,
     Goimports,
     Gofmt,
+    Nixfmt,
     None,
 }
 
@@ -223,6 +224,7 @@ impl RawFormatter {
             Self::Rustfmt => "rustfmt",
             Self::Goimports => "goimports",
             Self::Gofmt => "gofmt",
+            Self::Nixfmt => "nixfmt",
             Self::None => "none",
         }
     }
@@ -3712,6 +3714,30 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nixfmt_is_a_recognized_formatter_and_reaches_the_resolved_map() {
+        let raw = serde_json::from_str::<super::RawAftConfig>(r#"{"formatter":{"nix":"nixfmt"}}"#);
+        assert!(raw.is_ok(), "formatter.nix must accept nixfmt: {raw:?}");
+
+        let result = super::resolve_config_for_harness(
+            &[tier("user", r#"{"formatter":{"nix":"nixfmt"}}"#)],
+            Some(&crate::harness::Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.formatter.get("nix").map(String::as_str),
+            Some("nixfmt")
+        );
+        assert!(
+            !result
+                .dropped
+                .iter()
+                .any(|dropped| dropped.key.starts_with("formatter")),
+            "formatter.nix must not be dropped: {:?}",
+            result.dropped
+        );
+    }
+
     #[test]
     fn storage_cache_dir_is_a_recognized_user_setting() {
         let raw = serde_json::from_str::<super::RawAftConfig>(

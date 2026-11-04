@@ -33,6 +33,7 @@ function buildSchema(): Record<string, unknown> {
       "rustfmt",
       "goimports",
       "gofmt",
+      "nixfmt",
       "none",
     ],
   };

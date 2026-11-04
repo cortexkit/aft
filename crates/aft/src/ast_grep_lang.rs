@@ -43,6 +43,7 @@ pub enum AstGrepLang {
     R,
     Groovy,
     ObjC,
+    Nix,
 }
 
 #[derive(Clone, Debug)]
@@ -125,11 +126,29 @@ impl AstGrepLang {
             "r" => Some(Self::R),
             "groovy" => Some(Self::Groovy),
             "objc" | "objective-c" | "objectivec" | "obj-c" => Some(Self::ObjC),
+            "nix" => Some(Self::Nix),
             _ => None,
         }
     }
 
     pub(crate) fn compile_pattern(&self, pattern: &str) -> Result<Pattern, PatternError> {
+        if matches!(self, Self::Nix) {
+            // A bare binding (`$NAME = true;`) is not a complete Nix expression,
+            // so a whole-expression pattern fails to parse. Match the binding
+            // inside an attrset context instead: the selector scopes the pattern
+            // to one binding, which keeps sibling bindings intact on replace.
+            return Pattern::try_new(pattern, self.clone()).or_else(|_| {
+                let context = format!("{{ {pattern} }}");
+                if nix_wrapper_is_single_binding(&context) {
+                    Pattern::contextual(&context, "binding", self.clone())
+                } else {
+                    // Several members would each match on their own, silently
+                    // widening or narrowing what the user asked for.
+                    Err(PatternError::Parse(pattern.to_string()))
+                }
+            });
+        }
+
         if matches!(self, Self::Pascal) {
             if pascal_pattern_is_declaration(pattern) {
                 return Pattern::try_new(pattern, self.clone());
@@ -182,6 +201,7 @@ impl AstGrepLang {
             Self::R => &["R", "r"],
             Self::Groovy => &["groovy", "gvy", "gy", "gsh", "gradle"],
             Self::ObjC => &["m", "mm", "h"],
+            Self::Nix => &["nix"],
         }
     }
 
@@ -209,6 +229,70 @@ impl AstGrepLang {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         self.matches_extension(ext)
     }
+}
+
+/// Replace ast-grep metavariables with an ordinary identifier so the grammar
+/// can parse the pattern without its metavariable sentinels.
+fn nix_pattern_without_meta_variables(pattern: &str) -> String {
+    let mut plain = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '$' {
+            plain.push(character);
+            continue;
+        }
+        let mut signature = String::new();
+        while chars.peek() == Some(&'$') {
+            signature.push(chars.next().expect("peeked"));
+        }
+        let mut name = String::new();
+        while let Some(next) = chars.peek() {
+            if next.is_alphanumeric() || matches!(next, '_' | '\'') {
+                name.push(chars.next().expect("peeked"));
+            } else {
+                break;
+            }
+        }
+        if signature.is_empty() && name.is_empty() {
+            plain.push('$');
+        } else {
+            plain.push_str("_aft_meta");
+        }
+    }
+    plain
+}
+
+/// A contextual pattern's wrapper must contain exactly one `binding` member;
+/// `inherit`/`inherit_from` siblings would otherwise be ignored by the selector.
+fn nix_wrapper_is_single_binding(source: &str) -> bool {
+    let plain = nix_pattern_without_meta_variables(source);
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_nix::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(&plain, None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let Some(expression) = root.child_by_field_name("expression") else {
+        return false;
+    };
+    let mut cursor = expression.walk();
+    let Some(set) = expression
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "binding_set")
+    else {
+        return false;
+    };
+    let mut set_cursor = set.walk();
+    let members: Vec<tree_sitter::Node> = set.named_children(&mut set_cursor).collect();
+    members.len() == 1 && members[0].kind() == "binding"
 }
 
 fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
@@ -361,7 +445,7 @@ impl Language for AstGrepLang {
             | Self::Perl
             | Self::R
             | Self::ObjC => '\u{00B5}', // µ
-            Self::Pascal => '_',
+            Self::Pascal | Self::Nix => '_',
             // $ is valid in TS, JS, Go, Solidity, Groovy, and Vue template identifiers.
             // Groovy also uses $ inside GStrings, so keeping $ avoids rejecting
             // literal interpolation patterns while still letting $NAME meta-vars bind.
@@ -400,6 +484,7 @@ impl LanguageExt for AstGrepLang {
             Self::R => tree_sitter_r::LANGUAGE.into(),
             Self::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
+            Self::Nix => tree_sitter_nix::LANGUAGE.into(),
         }
     }
 }
@@ -452,6 +537,81 @@ mod tests {
             Some(AstGrepLang::ObjC)
         );
         assert_eq!(AstGrepLang::from_str("markdown"), None);
+    }
+
+    #[test]
+    fn test_nix_language_and_contextual_binding_patterns() {
+        let lang = AstGrepLang::Nix;
+        assert_eq!(AstGrepLang::from_str("nix"), Some(AstGrepLang::Nix));
+        assert!(lang.extensions().contains(&"nix"));
+
+        // A bare binding is not a complete Nix expression; the contextual
+        // fallback must scope the pattern to one binding.
+        let source = "{ foo = true; bar = false; baz.qux = true; }";
+        let pattern = lang
+            .compile_pattern("$NAME = true;")
+            .expect("contextual binding pattern compiles");
+        let grep = lang.ast_grep(source);
+        let root = grep.root();
+        let matched: Vec<String> = root
+            .find_all(&pattern)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(matched, vec!["foo = true;", "baz.qux = true;"]);
+
+        // Replacing must touch only the matched bindings, never siblings.
+        let mut edits = root.replace_all(&pattern, "$NAME = false;");
+        edits.sort_by(|a, b| b.position.cmp(&a.position));
+        let mut bytes = source.as_bytes().to_vec();
+        for edit in edits {
+            bytes.splice(
+                edit.position..edit.position + edit.deleted_length,
+                edit.inserted_text.iter().copied(),
+            );
+        }
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "{ foo = false; bar = false; baz.qux = false; }"
+        );
+
+        // Several bindings in one pattern must not degrade into per-binding
+        // matches that silently drop the adjacency the user asked for.
+        assert!(
+            lang.compile_pattern("$A = true; $B = false;").is_err(),
+            "multi-binding patterns are rejected"
+        );
+        assert!(
+            lang.compile_pattern("$A = true; inherit $B;").is_err(),
+            "a wrapper with an inherit member is rejected"
+        );
+
+        // The `_` sentinel only rewrites `$`-metavariables; a literal identifier
+        // written with a leading underscore stays literal and matches itself.
+        let underscore = lang
+            .compile_pattern("_module.args = $V;")
+            .expect("underscore pattern compiles");
+        let literal = lang
+            .ast_grep("{ _module.args = 1; other.args = 2; }")
+            .root()
+            .find_all(&underscore)
+            .count();
+        assert_eq!(literal, 1, "a literal `_`-prefixed key matches itself only");
+        let unrelated = lang
+            .ast_grep("{ other.args = 1; }")
+            .root()
+            .find_all(&underscore)
+            .count();
+        assert_eq!(unrelated, 0, "the literal key does not widen the match");
+        // `_` followed by an uppercase letter is still a metavariable.
+        let upper = lang
+            .compile_pattern("_FOO = $V;")
+            .expect("uppercase pattern compiles");
+        let upper_matches = lang
+            .ast_grep("{ _FOO = 1; bar = 2; }")
+            .root()
+            .find_all(&upper)
+            .count();
+        assert_eq!(upper_matches, 2, "`_` + uppercase binds as a metavariable");
     }
 
     #[test]

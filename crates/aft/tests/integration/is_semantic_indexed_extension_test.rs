@@ -9,7 +9,7 @@ fn semantic_extension_policy_stays_in_sync_with_parser_code_arms() {
         "ts", "tsx", "js", "jsx", "py", "rs", "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
         "cu", "cuh", "metal", "zig", "cs", "sh", "bash", "zsh", "sol", "vue", "pas", "pp", "dpr",
         "dpk", "lpr", "java", "kt", "kts", "rb", "swift", "scala", "sc", "lua", "pl", "pm", "t",
-        "r", "R", "m", "mm", "toml", "yaml", "yml",
+        "r", "R", "m", "mm", "toml", "nix", "yaml", "yml",
     ];
     for extension in code_extensions {
         let path = format!("fixture.{extension}");

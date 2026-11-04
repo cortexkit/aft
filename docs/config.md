@@ -185,8 +185,8 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "validate_on_edit": "syntax",
 
   // Per-language formatter overrides (auto-detected from project config files if omitted)
-  // Keys: "typescript", "python", "rust", "go"
-  // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "none"
+  // Keys: "typescript", "python", "rust", "go", "nix"
+  // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "nixfmt" | "none"
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"
