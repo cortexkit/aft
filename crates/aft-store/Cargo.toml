@@ -11,11 +11,24 @@ publish = false
 
 [dependencies]
 blake3 = "1"
+content_inspector = "0.2.4"
+ignore = "0.4"
 regex-syntax = "0.8"
 thiserror = "2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
 [dev-dependencies]
+flate2 = "1.1"
+rayon = "1"
 regex = "1"
+serde_json = "1"
 tempfile = "3"
 
 [lints.rust]

@@ -12,83 +12,145 @@ use std::sync::Arc;
 use super::plan::Query;
 use super::sections::{TextSegment, TextStatus};
 use super::trigrams::ContentTrigrams;
-use crate::checkout::CheckoutState;
+use crate::checkout::{CheckoutState, PathKind};
 use crate::ids::ContentKey;
 use crate::segment::SegmentError;
 
-/// Where one path's content is in the family's text segments.
+/// Where one content's text unit is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Located {
+    Indexed {
+        segment: u32,
+        ordinal: u32,
+    },
+    /// Known and not indexed: binary, or larger than the limit it was
+    /// indexed under.
+    Unindexed {
+        status: TextStatus,
+        len: u64,
+    },
+}
+
+/// Where each content of a family's text segments is, shared by every
+/// checkout of the family. Built once per segment set; a publication that
+/// only adds segments extends it.
+#[derive(Clone, Debug, Default)]
+pub struct TextLocator {
+    by_key: HashMap<ContentKey, Located>,
+}
+
+impl TextLocator {
+    /// Locates every content of `segments`, which are in the order a
+    /// snapshot lists them: by ascending id, so newer segments come later.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn build(segments: &[TextSegment<'_>]) -> Result<Self, SegmentError> {
+        let mut locator = Self::default();
+        for (index, segment) in segments.iter().enumerate() {
+            locator.extend(index, segment)?;
+        }
+        Ok(locator)
+    }
+
+    /// Adds the contents of the segment at `index` of the segment list. A
+    /// content it shares with an earlier segment is located in this one, so
+    /// a content indexed again (for instance under a larger size limit) is
+    /// found in its newest form.
+    ///
+    /// # Errors
+    ///
+    /// When the segment cannot be read.
+    pub fn extend(&mut self, index: usize, segment: &TextSegment<'_>) -> Result<(), SegmentError> {
+        let index = u32::try_from(index).expect("fewer than 2^32 segments");
+        for (ordinal, key) in segment.keys()?.into_iter().enumerate() {
+            let ordinal = u32::try_from(ordinal).expect("a segment holds fewer than 2^32 units");
+            let unit = segment.unit(ordinal)?;
+            let located = if unit.status == TextStatus::Indexed {
+                Located::Indexed {
+                    segment: index,
+                    ordinal,
+                }
+            } else {
+                Located::Unindexed {
+                    status: unit.status,
+                    len: unit.len,
+                }
+            };
+            self.by_key.insert(key, located);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get(&self, key: ContentKey) -> Option<Located> {
+        self.by_key.get(&key).copied()
+    }
+
+    /// How many contents the segments hold.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+}
+
+/// Where one path's content is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Place {
     Indexed {
         segment: u32,
         ordinal: u32,
     },
-    /// The content is known and not indexed (binary or too large).
-    Unindexed,
-    /// No segment holds the content yet.
-    Missing,
+    /// Not indexed, or in no segment yet: always a candidate.
+    Unchecked,
 }
 
-/// Where each path of one checkout state finds its content's text unit, for
-/// one set of segments. Built once per state and segment set.
+/// Where each path of one checkout state finds its content's text unit.
+/// Built once per state and locator: one hash lookup per path.
 #[derive(Clone, Debug)]
 pub struct TextMembership {
     places: Vec<Place>,
+    missing: usize,
 }
 
 impl TextMembership {
-    /// Locates the content of every path of `state` in `segments`.
-    ///
-    /// # Errors
-    ///
-    /// When a segment cannot be read.
-    pub fn build(
-        state: &CheckoutState,
-        segments: &[TextSegment<'_>],
-    ) -> Result<Self, SegmentError> {
-        let mut located = HashMap::<ContentKey, (u32, u32)>::new();
-        for (segment, text) in segments.iter().enumerate() {
-            let segment = u32::try_from(segment).expect("fewer than 2^32 segments");
-            for (ordinal, key) in text.keys()?.into_iter().enumerate() {
-                let ordinal =
-                    u32::try_from(ordinal).expect("a segment holds fewer than 2^32 units");
-                located.entry(key).or_insert((segment, ordinal));
-            }
-        }
-        let mut status = HashMap::<(u32, u32), TextStatus>::new();
-        let mut places = Vec::with_capacity(state.paths().len());
-        for record in state.paths() {
-            let place = match located.get(&record.content) {
-                Some(&(segment, ordinal)) => {
-                    let unit_status = match status.get(&(segment, ordinal)) {
-                        Some(known) => *known,
-                        None => {
-                            let unit = segments[segment as usize].unit(ordinal)?;
-                            status.insert((segment, ordinal), unit.status);
-                            unit.status
-                        }
-                    };
-                    if unit_status == TextStatus::Indexed {
+    /// Locates the content of every path of `state`.
+    #[must_use]
+    pub fn build(state: &CheckoutState, locator: &TextLocator) -> Self {
+        let mut missing = 0;
+        let places = state
+            .paths()
+            .iter()
+            .map(|record| {
+                if record.kind != PathKind::Text {
+                    return Place::Unchecked;
+                }
+                match locator.get(record.content) {
+                    Some(Located::Indexed { segment, ordinal }) => {
                         Place::Indexed { segment, ordinal }
-                    } else {
-                        Place::Unindexed
+                    }
+                    Some(Located::Unindexed { .. }) => Place::Unchecked,
+                    None => {
+                        missing += 1;
+                        Place::Unchecked
                     }
                 }
-                None => Place::Missing,
-            };
-            places.push(place);
-        }
-        Ok(Self { places })
+            })
+            .collect();
+        Self { places, missing }
     }
 
     /// How many paths no segment holds yet. Grep stays correct by reading
     /// them; this tells the caller the index is still catching up.
     #[must_use]
     pub fn missing(&self) -> usize {
-        self.places
-            .iter()
-            .filter(|place| **place == Place::Missing)
-            .count()
+        self.missing
     }
 }
 
@@ -208,7 +270,7 @@ fn search(
         }
         match membership.places[index] {
             Place::Indexed { segment, ordinal } => members[segment as usize].push((ordinal, index)),
-            Place::Unindexed | Place::Missing => found.push(path.clone()),
+            Place::Unchecked => found.push(path.clone()),
         }
     }
     for (segment, mut members) in members.into_iter().enumerate() {
@@ -448,6 +510,7 @@ mod tests {
                 PathRecord {
                     path,
                     mode: 0,
+                    kind: PathKind::Text,
                     content: ContentKey::of(text.as_bytes()),
                     stat: StatEvidence::default(),
                     language: String::new(),
@@ -455,7 +518,7 @@ mod tests {
             })
             .collect();
         let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records).unwrap();
-        let membership = TextMembership::build(&state, &segments).unwrap();
+        let membership = TextMembership::build(&state, &TextLocator::build(&segments).unwrap());
         assert!(membership.missing() > 0);
 
         // An edit, a deletion and a new file that is not indexed.

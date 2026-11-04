@@ -105,6 +105,19 @@ impl ContentKey {
         Self(digest)
     }
 
+    /// A key for a file whose bytes are not read, such as one over the size
+    /// limit, derived from its path and stat evidence. It is hashed in its
+    /// own key-derivation context, so it never equals the key of real bytes,
+    /// and it changes whenever the evidence does.
+    #[must_use]
+    pub fn stand_in(path: &[u8], evidence: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("aft-store 2026-11 unread file stand-in");
+        hasher.update(&u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(path);
+        hasher.update(evidence);
+        Self(Digest128::from_hash(&hasher.finalize()))
+    }
+
     #[must_use]
     pub const fn digest(&self) -> Digest128 {
         self.0

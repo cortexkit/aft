@@ -14,7 +14,9 @@ pub mod checkout;
 pub mod family;
 pub mod ids;
 pub mod postings;
+pub mod scan;
 pub mod segment;
+pub mod stat;
 pub mod table;
 pub mod text;
 

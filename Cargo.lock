@@ -23,10 +23,16 @@ name = "aft-store"
 version = "0.63.4"
 dependencies = [
  "blake3",
+ "content_inspector",
+ "flate2",
+ "ignore",
+ "rayon",
  "regex",
  "regex-syntax",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

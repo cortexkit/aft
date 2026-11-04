@@ -31,6 +31,48 @@ pub struct StatEvidence {
     pub observed_ns: i64,
 }
 
+/// What AFT knows about a path's bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathKind {
+    /// Read and indexed; `content` is the key of its bytes.
+    Text,
+    /// Read and found to be binary; `content` is the key of its bytes.
+    Binary,
+    /// Larger than the indexing limit and not read; `content` is a
+    /// stand-in derived from its path and evidence.
+    Oversize,
+    /// Could not be read; `content` is a stand-in. Grep reads it directly
+    /// and reports the error.
+    Unreadable,
+}
+
+impl PathKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Text => 0,
+            Self::Binary => 1,
+            Self::Oversize => 2,
+            Self::Unreadable => 3,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Text),
+            1 => Some(Self::Binary),
+            2 => Some(Self::Oversize),
+            3 => Some(Self::Unreadable),
+            _ => None,
+        }
+    }
+
+    /// Whether `content` is the key of the path's real bytes.
+    #[must_use]
+    pub const fn has_content(self) -> bool {
+        matches!(self, Self::Text | Self::Binary)
+    }
+}
+
 /// One path of a checkout.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PathRecord {
@@ -39,6 +81,7 @@ pub struct PathRecord {
     pub path: Vec<u8>,
     /// The Unix mode bits Git records, or zero.
     pub mode: u32,
+    pub kind: PathKind,
     pub content: ContentKey,
     pub stat: StatEvidence,
     /// The language the file is parsed as, empty when it is not parsed.
@@ -155,6 +198,7 @@ impl CheckoutState {
             );
             out.extend_from_slice(&record.path);
             out.extend_from_slice(&record.mode.to_le_bytes());
+            out.push(record.kind.code());
             out.extend_from_slice(record.content.digest().as_bytes());
             let stat = &record.stat;
             out.extend_from_slice(&stat.size.to_le_bytes());
@@ -189,6 +233,8 @@ impl CheckoutState {
                 usize::try_from(input.u32()?).map_err(|_| RecordError::Invalid("path length"))?;
             let path = input.take(path_len)?.to_vec();
             let mode = input.u32()?;
+            let kind =
+                PathKind::from_code(input.take(1)?[0]).ok_or(RecordError::Invalid("path kind"))?;
             let content = ContentKey::from_digest(input.digest()?);
             let stat = StatEvidence {
                 size: input.u64()?,
@@ -213,6 +259,7 @@ impl CheckoutState {
             paths.push(PathRecord {
                 path,
                 mode,
+                kind,
                 content,
                 stat,
                 language,
@@ -253,6 +300,7 @@ mod tests {
         PathRecord {
             path: path.as_bytes().to_vec(),
             mode: 0o100_644,
+            kind: PathKind::Text,
             content: ContentKey::of(content.as_bytes()),
             stat: StatEvidence {
                 size: content.len() as u64,

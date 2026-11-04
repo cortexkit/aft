@@ -12,6 +12,8 @@ mod sections;
 mod trigrams;
 
 pub use plan::{Query, plan, plan_pattern};
-pub use search::{OverlayEntry, Scope, TextMembership, TextOverlay, candidates};
+pub use search::{
+    Located, OverlayEntry, Scope, TextLocator, TextMembership, TextOverlay, candidates,
+};
 pub use sections::{KNOWN, TextSectionsBuilder, TextSegment, TextStatus, TextUnit};
 pub use trigrams::{ContentTrigrams, fold, next_bit, pack};
