@@ -8,6 +8,7 @@
 //! function), it reads that file's slice.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -467,6 +468,35 @@ impl<S: SliceSource> SliceReader<S> {
         name: Option<&str>,
         member_call: bool,
     ) -> Vec<(String, u64, u64, Vec<SliceRef>, Arc<FileSlice>)> {
+        let mut spans = Vec::new();
+        self.visit_unresolved_spans(
+            language,
+            name,
+            member_call,
+            |file, span, references, slice| {
+                spans.push((
+                    file.to_string(),
+                    span.0,
+                    span.1,
+                    references.to_vec(),
+                    Arc::clone(slice),
+                ));
+                ControlFlow::Continue(())
+            },
+        );
+        spans
+    }
+
+    /// Calls `visit` with each span [`Self::unresolved_spans`] lists, in
+    /// the same order, until it breaks. Reads files one at a time, so a
+    /// caller that stops early reads no further.
+    fn visit_unresolved_spans(
+        &self,
+        language: &str,
+        name: Option<&str>,
+        member_call: bool,
+        mut visit: impl FnMut(&str, (u64, u64), &[SliceRef], &Arc<FileSlice>) -> ControlFlow<()>,
+    ) {
         // The named count matches the name exactly, an empty one included;
         // the method-site query treats an empty name as every site.
         let name = name.filter(|name| !(member_call && name.is_empty()));
@@ -479,11 +509,19 @@ impl<S: SliceSource> SliceReader<S> {
                 .collect::<BTreeSet<_>>(),
             _ => self.source.files_of_language(language),
         };
-        let mut spans = Vec::new();
         for file in files {
             let Some(slice) = self.source.slice(&file) else {
                 continue;
             };
+            // Each reference's edges, so the call-edge check below reads only
+            // the reference's own.
+            let mut edges_by_ref = HashMap::<&str, Vec<&SliceEdge>>::new();
+            for edge in slice.edges.values() {
+                edges_by_ref
+                    .entry(edge.ref_id.as_str())
+                    .or_default()
+                    .push(edge);
+            }
             let mut groups = BTreeMap::<(u64, u64), Vec<SliceRef>>::new();
             for reference in slice.refs.values() {
                 if !matches!(reference.kind, "call" | "construction") || reference.resolved {
@@ -502,7 +540,10 @@ impl<S: SliceSource> SliceReader<S> {
                         continue;
                     }
                 }
-                if self.has_call_edge(&slice, &reference.ref_id) {
+                let has_call_edge = edges_by_ref
+                    .get(reference.ref_id.as_str())
+                    .is_some_and(|edges| edges.iter().any(|edge| self.edge_kind(edge) == "call"));
+                if has_call_edge {
                     continue;
                 }
                 groups
@@ -510,11 +551,12 @@ impl<S: SliceSource> SliceReader<S> {
                     .or_default()
                     .push(reference.clone());
             }
-            for ((start, end), references) in groups {
-                spans.push((file.clone(), start, end, references, Arc::clone(&slice)));
+            for (span, references) in groups {
+                if visit(&file, span, &references, &slice).is_break() {
+                    return;
+                }
             }
         }
-        spans
     }
 }
 
@@ -928,28 +970,34 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
 }
 
 impl<S: SliceSource> SliceReader<S> {
+    /// Counts unresolved spans up to the limit, and stops reading files
+    /// once it is reached, as the database query stops at its `LIMIT`.
     fn count_unresolved(&self, language: LangId, include_tests: bool, name: Option<&str>) -> usize {
         let mut count = 0;
-        for (file, _, _, references, slice) in
-            self.unresolved_spans(lang_label(language), name, false)
-        {
-            let counted = include_tests
-                || references.iter().any(|reference| {
-                    let caller_is_test = reference
-                        .caller_node
-                        .as_deref()
-                        .and_then(|id| slice.node(id))
-                        .and_then(|node| node.is_test)
-                        .unwrap_or(false);
-                    !caller_is_test && !crate::inspect::job::is_test_file(&file)
-                });
-            if counted {
-                count += 1;
-                if count == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
-                    break;
+        self.visit_unresolved_spans(
+            lang_label(language),
+            name,
+            false,
+            |file, _, references, slice| {
+                let counted = include_tests
+                    || references.iter().any(|reference| {
+                        let caller_is_test = reference
+                            .caller_node
+                            .as_deref()
+                            .and_then(|id| slice.node(id))
+                            .and_then(|node| node.is_test)
+                            .unwrap_or(false);
+                        !caller_is_test && !crate::inspect::job::is_test_file(file)
+                    });
+                if counted {
+                    count += 1;
+                    if count == UNRESOLVED_CALL_SITE_COUNT_LIMIT {
+                        return ControlFlow::Break(());
+                    }
                 }
-            }
-        }
+                ControlFlow::Continue(())
+            },
+        );
         count
     }
 }

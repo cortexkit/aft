@@ -109,6 +109,8 @@ pub(crate) struct FileSlice {
     /// Scoped name to the first surviving node id with it.
     scoped: HashMap<String, String>,
     kinds: HashMap<String, String>,
+    /// Node id to its position in `nodes`.
+    node_index: HashMap<String, usize>,
 }
 
 impl FileSlice {
@@ -128,7 +130,7 @@ impl FileSlice {
 
     /// The node with `id`.
     pub(crate) fn node(&self, id: &str) -> Option<&SliceNode> {
-        self.nodes.iter().find(|node| node.id == id)
+        self.node_index.get(id).map(|index| &self.nodes[*index])
     }
 
     /// Assembles the slice of the file at `path`.
@@ -321,6 +323,11 @@ impl FileSlice {
                 .entry(node.scoped_name.clone())
                 .or_insert_with(|| node.id.clone());
             self.kinds.insert(node.id.clone(), node.kind.clone());
+            // A later duplicate id would not be found by the scan this
+            // replaces, which returned the first; keep the first here too.
+            self.node_index
+                .entry(node.id.clone())
+                .or_insert(self.nodes.len());
             self.nodes.push(node);
         }
     }
