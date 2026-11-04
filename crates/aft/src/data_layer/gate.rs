@@ -853,6 +853,136 @@ pub(crate) fn compare_readers(
         &mut || edges(theirs.edge_snapshot()),
         &mut examples,
     );
+
+    // The public operations, as the commands compose them from the
+    // primitives above: what an agent's call-graph reply is built from.
+    // Every 400th symbol in path order; each operation runs at the depth
+    // the commands default to and with tests both left out and included.
+    use crate::commands::callgraph_store_adapter as adapter;
+    let public = symbols.iter().step_by(400).cloned().collect::<Vec<_>>();
+    for (index, (file, scoped, _)) in public.iter().enumerate() {
+        let path = Path::new(file);
+        for include_tests in [false, true] {
+            compare(
+                "callers (public)",
+                &mut || {
+                    show(&adapter::callers_result(
+                        ours,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut || {
+                    show(&adapter::callers_result(
+                        theirs,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut examples,
+            );
+            compare(
+                "impact (public)",
+                &mut || {
+                    show(&adapter::impact_result(
+                        ours,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut || {
+                    show(&adapter::impact_result(
+                        theirs,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut examples,
+            );
+            compare(
+                "call_tree (public)",
+                &mut || {
+                    show(&adapter::call_tree_result(
+                        ours,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut || {
+                    show(&adapter::call_tree_result(
+                        theirs,
+                        path,
+                        scoped,
+                        2,
+                        include_tests,
+                    ))
+                },
+                &mut examples,
+            );
+            compare(
+                "trace_to (public)",
+                &mut || {
+                    show(&adapter::trace_to_result(
+                        ours,
+                        path,
+                        scoped,
+                        4,
+                        include_tests,
+                    ))
+                },
+                &mut || {
+                    show(&adapter::trace_to_result(
+                        theirs,
+                        path,
+                        scoped,
+                        4,
+                        include_tests,
+                    ))
+                },
+                &mut examples,
+            );
+        }
+        // From this symbol to the next sampled one, named with its file.
+        if let Some((to_file, to_scoped, _)) = public.get(index + 1) {
+            let to_path = Path::new(to_file);
+            compare(
+                "trace_to_symbol (public)",
+                &mut || {
+                    show(&adapter::trace_to_symbol_result(
+                        ours,
+                        path,
+                        scoped,
+                        to_scoped,
+                        Some(to_path),
+                        4,
+                        false,
+                    ))
+                },
+                &mut || {
+                    show(&adapter::trace_to_symbol_result(
+                        theirs,
+                        path,
+                        scoped,
+                        to_scoped,
+                        Some(to_path),
+                        4,
+                        false,
+                    ))
+                },
+                &mut examples,
+            );
+        }
+    }
     *examples_out = examples;
 }
 
