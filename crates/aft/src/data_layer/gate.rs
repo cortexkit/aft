@@ -405,7 +405,7 @@ fn compare_queries(
 /// Runs every store primitive the commands use on `ours` and on `theirs`,
 /// for a sample of symbols and names, and records each primitive's calls,
 /// differences and time in `queries`.
-fn compare_readers(
+pub(crate) fn compare_readers(
     ours: &impl crate::callgraph_store::CallGraphRead,
     theirs: &impl crate::callgraph_store::CallGraphRead,
     inputs: &super::callgraph::CheckoutInputs,

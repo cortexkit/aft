@@ -13,13 +13,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use aft_store::cache::BlockCache;
 use aft_store::checkout::{CheckoutState, PathKind, PathRecord, StatEvidence};
-use aft_store::content::{RecordBody, RecordKey};
+use aft_store::content::{ContentRecord, RecordBody, RecordKey};
 use aft_store::ids::{ContentKey, Digest128};
+use aft_store::ids::{FamilyId, SegmentId, WriterIncarnation};
+use aft_store::segment::{Segment, SegmentMeta};
 
 use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
+use super::graph_store::{known_sections, write_segment, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateStats};
+use super::overlay::OverlaySlices;
+use super::query::{MemorySlices, SliceReader};
+use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
 /// One edit's measurement and check.
@@ -37,6 +44,13 @@ pub struct EditRecord {
     pub differing_files: Option<usize>,
     /// Files whose recorded inputs differ from the cold resolution's.
     pub differing_recordings: Option<usize>,
+    /// Files the overlay over the base segment replaces or removes; `None`
+    /// when the overlay was not checked at this edit.
+    pub overlay_files: Option<usize>,
+    /// Store primitives whose answer over the overlay differs from slices
+    /// of a cold resolution.
+    pub overlay_differing: Option<usize>,
+    pub overlay_check_ms: Option<f64>,
     pub examples: Vec<String>,
 }
 
@@ -93,6 +107,8 @@ enum Parsed {
 struct Files {
     entries: BTreeMap<String, (ContentKey, String, Option<Parsed>)>,
     records: HashMap<RecordKey, Option<Parsed>>,
+    /// Every parsed record, by the key its parse carries.
+    contents: HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 }
 
 impl Files {
@@ -116,7 +132,10 @@ impl Files {
                     RecordBody::Parsed { .. } => {
                         match blob_from_record(&record).map_err(|error| error.to_string())? {
                             CallgraphBlob::Parse(parse) => {
-                                Some(Parsed::Parse(key.digest().to_string(), Arc::new(parse)))
+                                let parse_key = key.digest().to_string();
+                                self.contents
+                                    .insert(parse_key.clone(), (key, Arc::new(record.clone())));
+                                Some(Parsed::Parse(parse_key, Arc::new(parse)))
                             }
                             CallgraphBlob::Config(_) => None,
                         }
@@ -277,13 +296,50 @@ pub fn run(
     }
     let extract_ms = started.elapsed().as_secs_f64() * 1000.0;
     let started = Instant::now();
+    let base_inputs = files.inputs();
     let mut live =
         LiveCheckout::cold(files.inputs(), threads).map_err(|error| error.to_string())?;
+    let cold_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // The base segment the overlay is checked over: the cold resolution,
+    // stored once, never republished during the run.
+    let directory = std::env::temp_dir().join(format!("aft-edit-gate-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let segment_path = directory.join("1.seg");
+    let family = FamilyId::from_digest(Digest128::of(b"edit gate"));
+    write_segment(
+        &segment_path,
+        SegmentMeta {
+            family,
+            segment: SegmentId::new(1),
+            incarnation: WriterIncarnation::new(1),
+            created_unix_ms: 0,
+        },
+        &base_inputs,
+        &live.resolved,
+        &files.contents,
+    )?;
+    let segment = Segment::open(
+        &segment_path,
+        family,
+        &known_sections(),
+        Arc::new(BlockCache::new(256 << 20)),
+    )
+    .map_err(|error| error.to_string())?;
+    let base = base_inputs
+        .parses
+        .iter()
+        .map(|(path, (key, _))| {
+            let bytes = super::fragment::encode(&live.resolved[path]);
+            (path.clone(), (key.clone(), bytes))
+        })
+        .collect::<BTreeMap<_, _>>();
     writeln!(
         out,
         "{}",
         serde_json::json!({"base": true, "files": files.entries.len(), "extract_ms": extract_ms,
-            "cold_ms": started.elapsed().as_secs_f64() * 1000.0})
+            "cold_ms": cold_ms,
+            "segment_bytes": std::fs::metadata(&segment_path).map(|m| m.len()).unwrap_or(0)})
     )
     .map_err(|error| error.to_string())?;
     let mut edits = Vec::new();
@@ -325,6 +381,9 @@ pub fn run(
             extract_ms,
             differing_files: None,
             differing_recordings: None,
+            overlay_files: None,
+            overlay_differing: None,
+            overlay_check_ms: None,
             examples: Vec::new(),
         };
         if last_of_commit || (index + 1) % check_every.max(1) == 0 {
@@ -337,6 +396,23 @@ pub fn run(
             if answers > 0 {
                 failures += 1;
             }
+            if last_of_commit {
+                let started = Instant::now();
+                let (files_laid, differing) = check_overlay(
+                    &segment,
+                    &base_inputs,
+                    &base,
+                    &live,
+                    &cold,
+                    &mut record.examples,
+                )?;
+                record.overlay_files = Some(files_laid);
+                record.overlay_differing = Some(differing);
+                record.overlay_check_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                if differing > 0 {
+                    failures += 1;
+                }
+            }
         }
         writeln!(
             out,
@@ -345,5 +421,57 @@ pub fn run(
         )
         .map_err(|error| error.to_string())?;
     }
+    drop(segment);
+    let _ = std::fs::remove_dir_all(&directory);
     Ok((checked, failures))
+}
+
+/// Lays every file whose parse or resolution changed since the base over
+/// the base segment, and compares every store primitive over that overlay
+/// with slices of the cold resolution `cold`. Returns how many files the
+/// overlay holds and how many primitives answered differently.
+fn check_overlay(
+    segment: &Segment,
+    base_inputs: &CheckoutInputs,
+    base: &BTreeMap<String, (String, Vec<u8>)>,
+    live: &LiveCheckout,
+    cold: &BTreeMap<String, FileResolution>,
+    examples: &mut Vec<String>,
+) -> Result<(usize, usize), String> {
+    let mut overlay = OverlaySlices::new(StoredSlices::open(segment, base_inputs)?);
+    for (path, (key, parse)) in &live.inputs.parses {
+        let resolution = &live.resolved[path];
+        let same = base.get(path).is_some_and(|(base_key, bytes)| {
+            base_key == key && *bytes == super::fragment::encode(resolution)
+        });
+        if !same {
+            overlay.replace(FileSlice::build(path, key, parse, resolution));
+        }
+    }
+    for path in base.keys() {
+        if !live.inputs.parses.contains_key(path) {
+            overlay.remove(path);
+        }
+    }
+    let laid = overlay.len();
+    let root = std::path::PathBuf::from("/");
+    let ours = SliceReader::new(overlay, root.clone(), "gate".to_string());
+    let mut slices = MemorySlices::default();
+    for (path, file) in cold {
+        let (key, parse) = &live.inputs.parses[path];
+        slices.insert(FileSlice::build(path, key, parse, file));
+    }
+    let theirs = SliceReader::new(slices, root, "gate".to_string());
+    let mut queries = BTreeMap::new();
+    let mut found = Vec::new();
+    super::gate::compare_readers(&ours, &theirs, &live.inputs, &mut queries, &mut found);
+    let failures = ours.source().base().failures();
+    examples.extend(failures.iter().take(5).cloned());
+    examples.extend(found.into_iter().take(20));
+    let differing = queries
+        .values()
+        .filter(|(_, differing, _, _)| *differing > 0)
+        .count()
+        + failures.len();
+    Ok((laid, differing))
 }
