@@ -854,15 +854,22 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             .unresolved_spans(lang_label(language), Some(name), true)
             .into_iter()
             .map(|(file, _, _, references, slice)| {
-                // One row per span: the database keeps the group's first
-                // reference by id.
-                let first = &references[0];
-                let caller = first.caller_node.as_deref().and_then(|id| slice.node(id));
+                // One row per span. Several references share a span when a
+                // call inside a nested function is also credited to the
+                // functions around it; the row names the last one written,
+                // which is the innermost caller. The database's GROUP BY
+                // returned that row because it reads a group in the order
+                // the references were inserted.
+                let last = references
+                    .iter()
+                    .max_by_key(|reference| reference.ordinal)
+                    .expect("a span has a reference");
+                let caller = last.caller_node.as_deref().and_then(|id| slice.node(id));
                 StoreRefSite {
                     is_test: caller.and_then(|node| node.is_test),
                     file,
                     caller_symbol: caller.map(|node| node.scoped_name.clone()),
-                    line: first.line,
+                    line: last.line,
                     local_name: None,
                 }
             })

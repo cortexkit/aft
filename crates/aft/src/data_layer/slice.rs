@@ -42,6 +42,8 @@ pub(crate) struct SliceNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SliceRef {
     pub(crate) ref_id: String,
+    /// The reference's ordinal in its file, the order it was written in.
+    pub(crate) ordinal: u32,
     pub(crate) caller_node: Option<String>,
     pub(crate) kind: &'static str,
     pub(crate) short_name: Option<String>,
@@ -194,6 +196,7 @@ impl FileSlice {
                 ref_id.clone(),
                 SliceRef {
                     ref_id,
+                    ordinal: row.ref_ordinal,
                     caller_node,
                     kind: ref_kind(row.kind),
                     short_name: reference.short_name.clone(),
