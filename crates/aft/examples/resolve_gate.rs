@@ -38,4 +38,11 @@ fn main() {
             .all(|(_, _, differing)| *differing == 0),
         "the assembled call graph differs from today's views database"
     );
+    assert!(
+        report
+            .queries
+            .values()
+            .all(|(_, differing, _, _)| *differing == 0),
+        "a query over slices answers differently from today's database"
+    );
 }

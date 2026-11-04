@@ -51,6 +51,10 @@ pub struct ResolveGateReport {
     pub fragment_zlib_bytes: usize,
     pub fragment_encode_ms: f64,
     pub fragment_decode_ms: f64,
+    /// Per query primitive: (calls compared, calls that differ, ms over
+    /// slices, ms over today's database).
+    pub queries: BTreeMap<&'static str, (usize, usize, f64, f64)>,
+    pub slices_ms: f64,
     /// Up to twenty paths whose results differ, for a first look.
     pub examples: Vec<String>,
 }
@@ -302,8 +306,397 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     let connection = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     compare_tables(&connection, &rows, &mut report).map_err(|error| error.to_string())?;
     drop(connection);
+    compare_queries(root, &inputs, &resolved, &path, &mut report)?;
     let _ = std::fs::remove_dir_all(&database);
     Ok(report)
+}
+
+/// Runs every store primitive the commands use over slices and over today's
+/// database, for a sample of symbols and names, and records differences.
+fn compare_queries(
+    root: &Path,
+    inputs: &super::callgraph::CheckoutInputs,
+    resolved: &BTreeMap<String, super::callgraph::FileResolution>,
+    database: &Path,
+    report: &mut ResolveGateReport,
+) -> Result<(), String> {
+    use crate::callgraph_store::CallGraphRead;
+    use crate::parser::LangId;
+
+    let started = Instant::now();
+    let mut slices = super::query::MemorySlices::default();
+    for (path, file) in resolved {
+        let (key, parse) = &inputs.parses[path];
+        slices.insert(super::slice::FileSlice::build(path, key, parse, file));
+    }
+    let ours = super::query::SliceReader::new(slices, root.to_path_buf(), "gate".to_string());
+    report.slices_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let theirs = crate::callgraph_store::ReadonlyCallGraphStore::open_materialized_database(
+        root.to_path_buf(),
+        database.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut compare = |name: &'static str,
+                       ours_run: &mut dyn FnMut() -> String,
+                       theirs_run: &mut dyn FnMut() -> String,
+                       examples: &mut Vec<String>| {
+        let started = Instant::now();
+        let left = ours_run();
+        let ours_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let right = theirs_run();
+        let theirs_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let entry = report.queries.entry(name).or_default();
+        entry.0 += 1;
+        entry.2 += ours_ms;
+        entry.3 += theirs_ms;
+        if left != right {
+            entry.1 += 1;
+            if examples.len() < 60 && entry.1 <= 3 {
+                let left_lines = left.lines().collect::<BTreeSet<_>>();
+                let right_lines = right.lines().collect::<BTreeSet<_>>();
+                examples.push(format!("query {name} differs"));
+                for line in left_lines.difference(&right_lines).take(4) {
+                    examples.push(format!("  slices: {}", line.trim()));
+                }
+                for line in right_lines.difference(&left_lines).take(4) {
+                    examples.push(format!("  views:  {}", line.trim()));
+                }
+            }
+        }
+    };
+    let mut examples = Vec::new();
+    let show = |value: &dyn std::fmt::Debug| format!("{value:#?}");
+
+    // A deterministic sample of symbols: every 20th node in path order.
+    let mut symbols = Vec::new();
+    for (path, (_, parse)) in &inputs.parses {
+        for symbol in &parse.symbols {
+            symbols.push((
+                path.clone(),
+                symbol.scoped_name.clone(),
+                symbol.name.clone(),
+            ));
+        }
+    }
+    let sample = symbols.iter().step_by(20).cloned().collect::<Vec<_>>();
+    for chunk in sample.chunks(200) {
+        let targets = chunk
+            .iter()
+            .map(|(file, scoped, _)| (file.clone(), scoped.clone()))
+            .collect::<Vec<_>>();
+        let sorted = |map: std::collections::HashMap<
+            (String, String),
+            Vec<crate::callgraph_store::StoreCallSite>,
+        >| { map.into_iter().collect::<BTreeMap<_, _>>() };
+        compare(
+            "direct_callers_for_symbols",
+            &mut || {
+                show(
+                    &ours
+                        .direct_callers_for_symbols(&targets)
+                        .map(sorted)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .direct_callers_for_symbols(&targets)
+                        .map(sorted)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+        compare(
+            "direct_caller_counts_of",
+            &mut || {
+                show(
+                    &ours
+                        .direct_caller_counts_of(&targets)
+                        .map(|m| m.into_iter().collect::<BTreeMap<_, _>>())
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .direct_caller_counts_of(&targets)
+                        .map(|m| m.into_iter().collect::<BTreeMap<_, _>>())
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+        compare(
+            "outgoing_calls_for_symbols",
+            &mut || {
+                show(
+                    &ours
+                        .outgoing_calls_for_symbols(&targets)
+                        .map(sorted)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .outgoing_calls_for_symbols(&targets)
+                        .map(sorted)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+    }
+    for (file, scoped, name) in &sample {
+        for query in [scoped, name] {
+            compare(
+                "nodes_for_stored",
+                &mut || {
+                    show(
+                        &ours
+                            .nodes_for_stored(file, query)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut || {
+                    show(
+                        &theirs
+                            .nodes_for_stored(file, query)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut examples,
+            );
+        }
+        compare(
+            "nodes_matching",
+            &mut || show(&ours.nodes_matching(name).map_err(|e| e.to_string())),
+            &mut || show(&theirs.nodes_matching(name).map_err(|e| e.to_string())),
+            &mut examples,
+        );
+        compare(
+            "trace_to_symbol_candidates",
+            &mut || {
+                show(
+                    &ours
+                        .trace_to_symbol_candidates(scoped)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .trace_to_symbol_candidates(scoped)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+        compare(
+            "node_for",
+            &mut || {
+                show(
+                    &ours
+                        .node_for(Path::new(file), scoped)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .node_for(Path::new(file), scoped)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+        compare(
+            "stored_content_hash",
+            &mut || show(&ours.stored_content_hash(file).map_err(|e| e.to_string())),
+            &mut || show(&theirs.stored_content_hash(file).map_err(|e| e.to_string())),
+            &mut examples,
+        );
+        let Ok(nodes) = theirs.nodes_for_stored(file, scoped) else {
+            continue;
+        };
+        for node in &nodes {
+            compare(
+                "outgoing_calls_of",
+                &mut || show(&ours.outgoing_calls_of(node).map_err(|e| e.to_string())),
+                &mut || show(&theirs.outgoing_calls_of(node).map_err(|e| e.to_string())),
+                &mut examples,
+            );
+            compare(
+                "resolved_self_calls_of",
+                &mut || show(&ours.resolved_self_calls_of(node).map_err(|e| e.to_string())),
+                &mut || {
+                    show(
+                        &theirs
+                            .resolved_self_calls_of(node)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut examples,
+            );
+            compare(
+                "unresolved_calls_of",
+                &mut || show(&ours.unresolved_calls_of(node).map_err(|e| e.to_string())),
+                &mut || show(&theirs.unresolved_calls_of(node).map_err(|e| e.to_string())),
+                &mut examples,
+            );
+        }
+    }
+
+    // Names used by references: every 50th distinct short name.
+    let mut names = BTreeSet::new();
+    for (_, parse) in inputs.parses.values() {
+        for reference in &parse.refs {
+            if let Some(name) = &reference.short_name {
+                names.insert(name.clone());
+            }
+        }
+    }
+    let languages = [
+        LangId::Rust,
+        LangId::TypeScript,
+        LangId::JavaScript,
+        LangId::Python,
+        LangId::Go,
+    ];
+    for name in names.iter().step_by(50) {
+        for kind in ["call", "construction", "value_ref"] {
+            compare(
+                "ref_sites_named",
+                &mut || {
+                    show(
+                        &ours
+                            .ref_sites_named(kind, name, 50)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut || {
+                    show(
+                        &theirs
+                            .ref_sites_named(kind, name, 50)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut examples,
+            );
+        }
+        for language in languages {
+            compare(
+                "unresolved_method_sites_named",
+                &mut || {
+                    show(
+                        &ours
+                            .unresolved_method_sites_named(name, language)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut || {
+                    show(
+                        &theirs
+                            .unresolved_method_sites_named(name, language)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut examples,
+            );
+            for include_tests in [false, true] {
+                compare(
+                    "unresolved_call_site_count_named",
+                    &mut || {
+                        show(
+                            &ours
+                                .unresolved_call_site_count_named(name, language, include_tests)
+                                .map_err(|e| e.to_string()),
+                        )
+                    },
+                    &mut || {
+                        show(
+                            &theirs
+                                .unresolved_call_site_count_named(name, language, include_tests)
+                                .map_err(|e| e.to_string()),
+                        )
+                    },
+                    &mut examples,
+                );
+            }
+        }
+    }
+    for language in languages {
+        compare(
+            "unresolved_method_sites_named (all)",
+            &mut || {
+                show(
+                    &ours
+                        .unresolved_method_sites_named("", language)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut || {
+                show(
+                    &theirs
+                        .unresolved_method_sites_named("", language)
+                        .map_err(|e| e.to_string()),
+                )
+            },
+            &mut examples,
+        );
+        for include_tests in [false, true] {
+            compare(
+                "unresolved_call_site_count",
+                &mut || {
+                    show(
+                        &ours
+                            .unresolved_call_site_count(language, include_tests)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut || {
+                    show(
+                        &theirs
+                            .unresolved_call_site_count(language, include_tests)
+                            .map_err(|e| e.to_string()),
+                    )
+                },
+                &mut examples,
+            );
+        }
+    }
+    compare(
+        "indexed_file_count",
+        &mut || show(&ours.indexed_file_count().map_err(|e| e.to_string())),
+        &mut || show(&theirs.indexed_file_count().map_err(|e| e.to_string())),
+        &mut examples,
+    );
+    compare(
+        "edge_snapshot",
+        &mut || {
+            show(
+                &ours
+                    .edge_snapshot()
+                    .map(|edges| edges.len())
+                    .map_err(|e| e.to_string()),
+            )
+        },
+        &mut || {
+            show(
+                &theirs
+                    .edge_snapshot()
+                    .map(|edges| edges.len())
+                    .map_err(|e| e.to_string()),
+            )
+        },
+        &mut examples,
+    );
+    report.examples.extend(examples);
+    Ok(())
 }
 
 /// Every row as one string of its compared columns, so two tables compare

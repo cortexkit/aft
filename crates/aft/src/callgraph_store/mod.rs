@@ -5319,6 +5319,36 @@ impl StoreNode {
     pub(crate) fn node_id(&self) -> &str {
         &self.node_id
     }
+
+    /// A node from its fields, for stores that do not keep database rows.
+    #[expect(clippy::too_many_arguments, reason = "one argument per node field")]
+    pub(crate) fn from_parts(
+        node_id: String,
+        file: String,
+        symbol: String,
+        name: String,
+        kind: String,
+        line: u32,
+        end_line: u32,
+        signature: Option<String>,
+        exported: bool,
+        is_entry_point: bool,
+        lang: LangId,
+    ) -> Self {
+        Self {
+            node_id,
+            file,
+            symbol,
+            name,
+            kind,
+            line,
+            end_line,
+            signature,
+            exported,
+            is_entry_point,
+            lang,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10280,6 +10310,41 @@ impl ReadonlyCallGraphStore {
             family,
             sqlite_path,
             view_dir,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        );
+        inner.manifest_view = true;
+        inner.database_ready.store(true, AtomicOrdering::Release);
+        Ok(Self {
+            inner,
+            _view_pin: None,
+            _generation_pin: None,
+            health_stale_census: Mutex::new(None),
+        })
+    }
+
+    /// Opens a materialized view database by its path, outside any view
+    /// directory, so the data layer's gates can read the same graph through
+    /// today's queries and compare answers.
+    pub(crate) fn open_materialized_database(
+        project_root: PathBuf,
+        sqlite_path: PathBuf,
+    ) -> Result<Self> {
+        let conn = open_readonly_connection(&sqlite_path)?;
+        ensure_database_ready(&conn)?;
+        configure_serving_reader(&conn)?;
+        let directory = sqlite_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut inner = CallGraphStore::from_connection(
+            project_root,
+            "gate".to_string(),
+            sqlite_path,
+            directory,
             false,
             None,
             None,
@@ -25648,7 +25713,7 @@ fn is_type_like(kind: &SymbolKind) -> bool {
     )
 }
 
-fn lang_label(lang: LangId) -> &'static str {
+pub(crate) fn lang_label(lang: LangId) -> &'static str {
     match lang {
         LangId::TypeScript => "typescript",
         LangId::Tsx => "tsx",
@@ -25686,7 +25751,7 @@ fn lang_label(lang: LangId) -> &'static str {
     }
 }
 
-fn lang_from_label(label: &str) -> Option<LangId> {
+pub(crate) fn lang_from_label(label: &str) -> Option<LangId> {
     match label {
         "typescript" => Some(LangId::TypeScript),
         "tsx" => Some(LangId::Tsx),
@@ -25739,7 +25804,7 @@ fn normalize_file_list(project_root: &Path, files: &[PathBuf]) -> Result<Vec<Pat
     Ok(normalized)
 }
 
-fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
+pub(crate) fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     let full_path = if path.is_relative() {
         project_root.join(path)
     } else {
@@ -25884,7 +25949,7 @@ fn canonicalize_missing_path(path: &Path) -> PathBuf {
     resolved
 }
 
-fn relative_path(project_root: &Path, path: &Path) -> String {
+pub(crate) fn relative_path(project_root: &Path, path: &Path) -> String {
     if let Ok(stripped) = path.strip_prefix(project_root) {
         return stripped.to_string_lossy().replace('\\', "/");
     }
