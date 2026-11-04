@@ -249,8 +249,15 @@ fn record_file(
         Err(_) => return Some(unreadable(relative, StatEvidence::default(), counters)),
     };
     let mode = file_mode(path);
+    // Unchanged bytes are reused, but whether a file is indexed at all is
+    // this scan's policy: a size limit raised or lowered since the earlier
+    // scan reclassifies the file, and an oversize file must now be read.
+    let same_class = |previous: &PathRecord| {
+        (previous.kind == PathKind::Oversize) == (stat.size > policy.max_indexed_len)
+    };
     if let Some(previous) = previous
         && previous.stat.proves_unchanged(&stat)
+        && same_class(previous)
     {
         counters.reused.fetch_add(1, Ordering::Relaxed);
         return Some(PathRecord {
@@ -672,5 +679,37 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(contents(&third.state), contents(&second.state));
+    }
+
+    #[test]
+    fn a_changed_size_limit_reclassifies_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("big.txt"), vec![b'x'; 2048]).unwrap();
+        std::fs::write(root.join("small.txt"), b"small").unwrap();
+        let limit = |max_indexed_len| ScanPolicy {
+            max_indexed_len,
+            ..ScanPolicy::default()
+        };
+        let kind = |state: &CheckoutState, path: &str| state.get(path.as_bytes()).unwrap().kind;
+        let sink = Collect::default();
+        let first = scan(root, &limit(1024), None, &sink).unwrap();
+        assert_eq!(kind(&first.state, "big.txt"), PathKind::Oversize);
+
+        // Raising the limit reads the file that was too large, though its
+        // bytes did not change; the other file is reused unread.
+        let raised = scan(root, &limit(4096), Some(&aged(&first.state)), &sink).unwrap();
+        assert_eq!(kind(&raised.state, "big.txt"), PathKind::Text);
+        assert_eq!((raised.counters.read, raised.counters.reused), (1, 1));
+        assert_eq!(
+            sink.read.lock().unwrap()[&b"big.txt"[..]].2.len(),
+            2048,
+            "the reclassified file was handed over whole"
+        );
+
+        // Lowering it again makes it oversize without reading it.
+        let lowered = scan(root, &limit(1024), Some(&aged(&raised.state)), &sink).unwrap();
+        assert_eq!(kind(&lowered.state, "big.txt"), PathKind::Oversize);
+        assert_eq!((lowered.counters.read, lowered.counters.reused), (0, 1));
     }
 }
