@@ -11,13 +11,13 @@ use std::time::Instant;
 use aft_store::checkout::PathKind;
 use aft_store::content::{ContentRecord, RecordBody, RecordKey};
 use aft_store::ids::ContentKey;
-use aft_store::scan::{ContentKind, ContentSink, ScanPolicy, scan};
+use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
 
-use super::callgraph::{CheckoutInputs, resolve_checkout};
-use super::content::{EXTRACTOR_VERSION, blob_from_record, extract, language_for};
+use super::callgraph::{resolve_checkout, CheckoutInputs};
+use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use crate::callgraph_store::join::{
-    CallgraphBlob, DispatchTypeTargetPlan, ManifestBlobReader, ManifestJoinError,
-    join_selected_manifest_for_materialization,
+    join_selected_manifest_for_materialization, CallgraphBlob, DispatchTypeTargetPlan,
+    ManifestBlobReader, ManifestJoinError,
 };
 use crate::views::{ByteString, Manifest, ManifestEntry, RegularPlanes, RelPath};
 

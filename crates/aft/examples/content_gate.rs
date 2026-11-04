@@ -22,17 +22,17 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use aft::callgraph_store::join::CallgraphBlob;
-use aft::data_layer::content::{EXTRACTOR_VERSION, blob_from_record, extract, language_for};
+use aft::data_layer::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use aft_store::content::{ContentRecord, RecordBody};
 use aft_store::ids::ContentKey;
-use aft_store::scan::{ContentKind, ContentSink, ScanPolicy, scan};
-use flate2::Compression;
+use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
 use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 #[derive(Default)]
 struct Gate {

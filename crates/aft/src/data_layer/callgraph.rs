@@ -12,12 +12,16 @@
 //!    answer and each path or configuration field consulted.
 //! 3. **Dispatch targets**: for Rust, TypeScript and JavaScript files, the
 //!    files their type names resolve to, for method-call resolution.
+//! 4. **Method calls**: every file's method-call sites against every file's
+//!    method-call facts, including the import targets other files' pass 2
+//!    found and the type targets their pass 3 found. Each file records the
+//!    dependency keys its resolutions read.
 //!
 //! The resolver's memos and recorders are single-threaded, so each thread
 //! has its own; they are caches and recorders, never inputs, so results do
 //! not depend on which thread resolves which file.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -25,11 +29,16 @@ use aft_store::checkout::{CheckoutState, PathKind};
 use rayon::prelude::*;
 
 use crate::callgraph_store::facts::{BlobKey, DirEntry, EntryKind, ProjectFacts};
+use crate::callgraph_store::join::dispatch::{
+    associated_reference, dependency, MemoizedResolver, Resolution, Resolver, SiteHint,
+};
 use crate::callgraph_store::join::{
+    bind_file, dispatch_type_targets_for, finish_binding, resolve_file, BlobRef, BlobRefKind,
     DerivedRow, DispatchTypeTargets, ManifestJoinError, ParseBlob, ViewBindingDependencies,
-    ViewBindingFacts, bind_file, dispatch_type_targets_for, finish_binding, resolve_file,
+    ViewBindingFacts,
 };
 use crate::callgraph_store::{DbFileIndex, ProjectIndex, WorkspaceCratePrefixCache};
+use crate::views::materialization::dispatch::FileFacts;
 
 /// What resolving a checkout reads.
 #[derive(Debug)]
@@ -43,6 +52,13 @@ pub(crate) struct CheckoutInputs {
     pub(crate) configs: HashMap<Vec<u8>, Arc<[u8]>>,
 }
 
+/// One method-call site's resolution, as pass 4 keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SiteResolution {
+    pub(crate) site: SiteHint,
+    pub(crate) resolution: Resolution,
+}
+
 /// One file's resolution.
 #[derive(Debug, Default)]
 pub(crate) struct FileResolution {
@@ -54,6 +70,10 @@ pub(crate) struct FileResolution {
     /// For Rust, TypeScript and JavaScript files, the targets of their type
     /// names.
     pub(crate) dispatch: Option<DispatchTypeTargets>,
+    /// Pass 4: the method-call sites kept, in site order.
+    pub(crate) sites: Vec<SiteResolution>,
+    /// Pass 4: the dependency keys its site resolutions read.
+    pub(crate) site_dependencies: BTreeSet<String>,
 }
 
 /// Resolves every parsed file of a checkout on `threads` threads.
@@ -138,12 +158,216 @@ fn resolve_in_pool(
                         rows: rows.into_iter().collect(),
                         binding,
                         dispatch,
+                        ..FileResolution::default()
                     },
                 ))
             },
         )
         .collect::<Result<BTreeMap<_, _>, ManifestJoinError>>()?;
+    resolve_method_calls(inputs, resolved)
+}
+
+/// What pass 4 reads about one file beyond its own facts: which of its
+/// references Rust spells as an associated or `self.` call, and which of
+/// its references already have an ordinary edge from pass 2.
+#[derive(Default)]
+struct OrdinaryCalls {
+    /// `view:<path>:<key>` of call and construction references spelled as an
+    /// associated function or a `self.` call.
+    syntax: HashSet<String>,
+    /// Reference keys of associated-function calls.
+    associated: Vec<u32>,
+    /// `view:<path>:<key>` of references pass 2 linked from a caller symbol
+    /// to a target symbol.
+    edges: HashSet<String>,
+}
+
+fn resolve_method_calls(
+    inputs: &CheckoutInputs,
+    mut resolved: BTreeMap<String, FileResolution>,
+) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    let mut facts = BTreeMap::new();
+    let mut ordinary = HashMap::new();
+    for (path, (_, parse)) in &inputs.parses {
+        let file = &resolved[path];
+        let references = references_by_key(parse);
+        let mut file_facts = FileFacts::new(parse);
+        file_facts.import_targets = import_targets(&file.rows, &references);
+        if let Some(dispatch) = &file.dispatch {
+            file_facts.type_targets = dispatch.targets.clone();
+        }
+        ordinary.insert(
+            path.clone(),
+            ordinary_calls(path, parse, &file.rows, &references),
+        );
+        facts.insert(path.clone(), file_facts);
+    }
+    let resolver_parses = facts
+        .iter()
+        .map(|(path, facts)| (path.clone(), facts.resolver_parse()))
+        .collect::<BTreeMap<_, _>>();
+    let import_targets = facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .import_targets
+                .iter()
+                .map(move |(module, target)| ((path.clone(), module.clone()), target.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let type_targets = facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .type_targets
+                .iter()
+                .map(move |(name, target)| ((path.clone(), name.clone()), target.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let paths = inputs.parses.keys().collect::<Vec<_>>();
+    let chunk = paths
+        .len()
+        .div_ceil(rayon::current_num_threads() * 4)
+        .max(1);
+    let results = paths
+        .par_chunks(chunk)
+        .map(|chunk| {
+            // The resolver and its memo are single-threaded caches over
+            // shared inputs: one per chunk of files.
+            let mut resolver = Resolver::new(
+                resolver_parses
+                    .iter()
+                    .map(|(path, parse)| (path.clone(), parse))
+                    .collect(),
+            );
+            resolver.import_targets = import_targets.clone();
+            resolver.type_targets = type_targets.clone();
+            for (path, calls) in &ordinary {
+                for key in &calls.associated {
+                    resolver.note_associated_site(path, *key);
+                }
+            }
+            let memoized = MemoizedResolver::new(&resolver);
+            resolver.take_dependencies();
+            chunk
+                .iter()
+                .map(|path| {
+                    let (_, parse) = &inputs.parses[*path];
+                    let calls = &ordinary[*path];
+                    let mut sites = Vec::new();
+                    for site in parse.bound_dispatch_sites() {
+                        let ref_id = format!("view:{path}:{}", site.ordinal);
+                        let resolution = memoized.resolve(path, &site);
+                        // Keep proven self-call and scoped module-function
+                        // bindings when dispatch facts do not identify a
+                        // project receiver type.
+                        if parse.language == "rust"
+                            && resolution.external > 0
+                            && resolution.targets.is_empty()
+                            && calls.edges.contains(&ref_id)
+                            && calls.syntax.contains(&ref_id)
+                        {
+                            continue;
+                        }
+                        sites.push(SiteResolution {
+                            site,
+                            resolution: (*resolution).clone(),
+                        });
+                    }
+                    // Every file depends on its own facts, which
+                    // `Resolver::resolve` reads without recording.
+                    let mut dependencies = resolver.take_dependencies();
+                    dependencies.insert(dependency::file(path));
+                    ((*path).clone(), sites, dependencies)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (path, sites, dependencies) in results.into_iter().flatten() {
+        let file = resolved
+            .get_mut(&path)
+            .expect("every parsed file was resolved");
+        file.sites = sites;
+        file.site_dependencies = dependencies;
+    }
     Ok(resolved)
+}
+
+/// Each reference of a parse by its reference key. When two references
+/// share a key, the later one wins, as when rows were emitted.
+fn references_by_key(parse: &ParseBlob) -> HashMap<u32, &BlobRef> {
+    parse
+        .reference_keys()
+        .into_iter()
+        .zip(&parse.refs)
+        .collect()
+}
+
+/// The target file of each module a file imports, from its pass-2 rows.
+/// For a module imported from two targets, the greater path wins, as when
+/// they were read back sorted.
+fn import_targets(
+    rows: &[DerivedRow],
+    references: &HashMap<u32, &BlobRef>,
+) -> BTreeMap<String, String> {
+    let mut pairs = rows
+        .iter()
+        .filter(|row| row.kind == BlobRefKind::Import)
+        .filter_map(|row| {
+            let module = references.get(&row.ref_ordinal)?.module_path.clone()?;
+            let target = String::from_utf8(row.target_path.clone()?).ok()?;
+            Some((module, target))
+        })
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs.into_iter().collect()
+}
+
+fn ordinary_calls(
+    path: &str,
+    parse: &ParseBlob,
+    rows: &[DerivedRow],
+    references: &HashMap<u32, &BlobRef>,
+) -> OrdinaryCalls {
+    let mut calls = OrdinaryCalls::default();
+    let mut symbols = HashSet::new();
+    for symbol in &parse.symbols {
+        symbols.insert(symbol.scoped_name.as_str());
+        symbols.insert(symbol.name.as_str());
+    }
+    for row in rows {
+        let Some(reference) = references.get(&row.ref_ordinal) else {
+            continue;
+        };
+        let ref_id = format!("view:{path}:{}", row.ref_ordinal);
+        let full = reference.full_ref.as_deref().filter(|_| {
+            parse.language == "rust"
+                && matches!(row.kind, BlobRefKind::Call | BlobRefKind::Construction)
+        });
+        if let Some(full) = full {
+            let associated = associated_reference(full);
+            if associated {
+                calls.associated.push(row.ref_ordinal);
+            }
+            if associated || full.starts_with("self.") {
+                calls.syntax.insert(ref_id.clone());
+            }
+        }
+        if matches!(
+            row.kind,
+            BlobRefKind::Call | BlobRefKind::Construction | BlobRefKind::CallbackRef
+        ) && reference
+            .caller_symbol
+            .as_deref()
+            .is_some_and(|symbol| symbols.contains(symbol))
+            && row.target_path.is_some()
+            && row.target_symbol.is_some()
+        {
+            calls.edges.insert(ref_id);
+        }
+    }
+    calls
 }
 
 /// The checkout's paths and configuration, as the resolver asks for them.

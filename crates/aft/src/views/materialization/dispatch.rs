@@ -73,7 +73,7 @@ thread_local! {
 
 /// The import fields method-call resolution reads.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-struct ImportFact {
+pub(crate) struct ImportFact {
     module_path: String,
     names: Vec<String>,
     default_import: Option<String>,
@@ -83,7 +83,7 @@ struct ImportFact {
 /// call sites. Positions are left out, so an edit that only moves code keeps
 /// a file's facts, and the resolutions that read them, unchanged.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-struct FileFacts {
+pub(crate) struct FileFacts {
     language: String,
     #[serde(default)]
     go_package: Option<String>,
@@ -94,13 +94,13 @@ struct FileFacts {
     imports: Vec<ImportFact>,
     default_export_symbol: Option<String>,
     /// Target file of each resolved import, by module path.
-    import_targets: BTreeMap<String, String>,
+    pub(crate) import_targets: BTreeMap<String, String>,
     /// Target file and symbol of each Rust receiver type name.
-    type_targets: BTreeMap<String, (String, String)>,
+    pub(crate) type_targets: BTreeMap<String, (String, String)>,
 }
 
 impl FileFacts {
-    fn new(parse: &ParseBlob) -> Self {
+    pub(crate) fn new(parse: &ParseBlob) -> Self {
         Self {
             language: parse.language.clone(),
             go_package: parse.dispatch.go_package.clone(),
@@ -137,7 +137,7 @@ impl FileFacts {
     /// A parse blob carrying only what [`Resolver`] reads. Fields the resolver
     /// never reads (symbols, references, AST nodes, import positions, sites)
     /// are left empty.
-    fn resolver_parse(&self) -> ParseBlob {
+    pub(crate) fn resolver_parse(&self) -> ParseBlob {
         ParseBlob {
             entry_point_symbols: Vec::new(),
             dispatch: DispatchFacts {
