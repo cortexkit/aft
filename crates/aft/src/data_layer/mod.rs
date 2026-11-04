@@ -4,6 +4,7 @@
 
 pub mod callgraph;
 pub mod content;
+pub(crate) mod dead_code;
 pub mod edit_gate;
 pub mod fragment;
 pub mod gate;

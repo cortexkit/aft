@@ -774,7 +774,7 @@ fn entry_point_symbols_from_store(
 
 /// Provenance of a projected call built from an unresolved, path-qualified value
 /// reference such as `.map(Type::method)`.
-const UNRESOLVED_VALUE_PATH_PROVENANCE: &str = "unresolved_value_path";
+pub(crate) const UNRESOLVED_VALUE_PATH_PROVENANCE: &str = "unresolved_value_path";
 
 const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
             r.caller_node,
@@ -1069,7 +1069,7 @@ fn caller_symbol_from_row(row: &OutboundRow) -> (String, bool) {
     (TOP_LEVEL_SYMBOL.to_string(), row.caller_node.is_some())
 }
 
-fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
+pub(crate) fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
     matches!(status, "resolved" | "resolved_local")
         || provenance.is_some_and(|provenance| {
             provenance == PROVENANCE_TYPE_MATCH
@@ -1079,7 +1079,7 @@ fn is_resolved_edge(status: &str, provenance: Option<&str>) -> bool {
         })
 }
 
-fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
+pub(crate) fn is_method_dispatch_callee(full_callee: &str, callee_name: &str) -> bool {
     let full_callee = full_callee.trim();
     if !full_callee.contains('.') || full_callee == callee_name.trim() {
         return false;
@@ -1153,7 +1153,7 @@ struct EntryPointSymbolRow {
     lang: String,
 }
 
-fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
+pub(crate) fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
     match label {
         "function" => Some(SymbolKind::Function),
         "kernel" => Some(SymbolKind::Kernel),

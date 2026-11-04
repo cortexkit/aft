@@ -52,9 +52,9 @@ const SCHEMA_VERSION: i64 = 3;
 pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
 pub(crate) const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
-const PROVENANCE_NAME_MATCH: &str = "name_match";
-const PROVENANCE_TYPE_MATCH: &str = "type_match";
-const PROVENANCE_VALUE_REF: &str = "value_ref";
+pub(crate) const PROVENANCE_NAME_MATCH: &str = "name_match";
+pub(crate) const PROVENANCE_TYPE_MATCH: &str = "type_match";
+pub(crate) const PROVENANCE_VALUE_REF: &str = "value_ref";
 /// Ref kind for a call written directly in a `macro_rules!` template; the
 /// macro name is stored in `local_name`. Never resolved into an edge.
 pub(crate) const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
@@ -62,7 +62,7 @@ pub(crate) const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
 /// parsed as Rust. Never resolved into an edge.
 pub(crate) const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
-const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+pub(crate) const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 const MIGRATION_MANIFEST_VERSION: u32 = 1;
 const MIGRATION_GENERATION_TAG: &str = ".migrated.";
@@ -1757,7 +1757,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-mod dead_code_projection;
+pub(crate) mod dead_code_projection;
 
 #[cfg(test)]
 mod dispatch_narrowing_tests;

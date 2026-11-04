@@ -88,6 +88,12 @@ pub(crate) struct GraphRows {
     /// Path, record key and language of each parsed file.
     pub(crate) files: BTreeMap<String, (String, String)>,
     pub(crate) nodes: BTreeMap<String, NodeRow>,
+    /// Node ids in the order the database stores them: insertion order,
+    /// with a replaced row moved to the end.
+    pub(crate) node_order: Vec<String>,
+    /// Each edge's place in insertion order; a query that joins a reference
+    /// to its edges reads them in this order.
+    pub(crate) edge_sequence: HashMap<String, u64>,
     pub(crate) refs: BTreeMap<String, RefRow>,
     pub(crate) edges: BTreeMap<String, EdgeRow>,
     pub(crate) sites: BTreeMap<(String, u32), SiteRow>,
@@ -264,6 +270,8 @@ pub(crate) fn assemble(
                 BlobRefKind::CallbackRef => "callback_ref",
                 _ => "call",
             };
+            rows.edge_sequence
+                .insert(format!("edge:{ref_id}"), rows.edge_sequence.len() as u64);
             rows.edges.insert(
                 format!("edge:{ref_id}"),
                 EdgeRow {
@@ -369,6 +377,8 @@ pub(crate) fn assemble(
                     "dispatch:{path}:{}:{}:{}",
                     site.ordinal, target.file, target.symbol
                 );
+                rows.edge_sequence
+                    .insert(edge_id.clone(), rows.edge_sequence.len() as u64);
                 rows.edges.insert(
                     edge_id.clone(),
                     EdgeRow {
@@ -388,6 +398,13 @@ pub(crate) fn assemble(
             }
         }
     }
+    let mut order = nodes
+        .rows
+        .iter()
+        .map(|(id, (sequence, _))| (*sequence, id.clone()))
+        .collect::<Vec<_>>();
+    order.sort_unstable();
+    rows.node_order = order.into_iter().map(|(_, id)| id).collect();
     rows.nodes = nodes
         .rows
         .into_iter()

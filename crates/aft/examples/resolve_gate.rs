@@ -47,6 +47,11 @@ fn main() {
     );
     assert_eq!(report.segment_failures, 0, "a read from the segment failed");
     assert!(
+        report.dead_code_differing.is_empty(),
+        "the dead-code snapshot differs from today's projection: {:?}",
+        report.dead_code_differing
+    );
+    assert!(
         report
             .segment_queries
             .values()

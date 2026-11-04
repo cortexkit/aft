@@ -61,6 +61,12 @@ pub struct ResolveGateReport {
     pub segment_bytes: u64,
     /// Reads from the segment that failed.
     pub segment_failures: usize,
+    /// Dead-code snapshot parts (files, exports, outbound calls, entry
+    /// points, entry-point symbols, Go initializers) that differ from
+    /// today's projection of the database.
+    pub dead_code_differing: Vec<String>,
+    pub dead_code_ms: f64,
+    pub dead_code_today_ms: f64,
     /// Up to twenty paths whose results differ, for a first look.
     pub examples: Vec<String>,
 }
@@ -312,6 +318,7 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     let connection = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
     compare_tables(&connection, &rows, &mut report).map_err(|error| error.to_string())?;
     drop(connection);
+    compare_dead_code(root, &rows, &path, &mut report)?;
     let records = by_key
         .iter()
         .map(|(key, record)| (key.digest().to_string(), (*key, Arc::clone(record))))
@@ -319,6 +326,82 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     compare_queries(root, &inputs, &resolved, &records, &path, &mut report)?;
     let _ = std::fs::remove_dir_all(&database);
     Ok(report)
+}
+
+/// Builds the dead-code snapshot from the rows and projects today's from the
+/// database, and records which parts differ.
+fn compare_dead_code(
+    root: &Path,
+    rows: &super::graph_rows::GraphRows,
+    database: &Path,
+    report: &mut ResolveGateReport,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let ours = super::dead_code::snapshot(root, rows);
+    report.dead_code_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let store = crate::callgraph_store::ReadonlyCallGraphStore::open_materialized_database(
+        root.to_path_buf(),
+        database.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let (_, theirs, _, _) =
+        crate::callgraph_store::dead_code_projection::project_dead_code_snapshot_from_view(&store)
+            .map_err(|error| error.to_string())?;
+    report.dead_code_today_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut part = |name: &str, left: String, right: String| {
+        if left != right {
+            report.dead_code_differing.push(name.to_string());
+            let left = left.lines().collect::<BTreeSet<_>>();
+            let right = right.lines().collect::<BTreeSet<_>>();
+            for line in left.difference(&right).take(4) {
+                report
+                    .examples
+                    .push(format!("dead code {name} ours:  {}", line.trim()));
+            }
+            for line in right.difference(&left).take(4) {
+                report
+                    .examples
+                    .push(format!("dead code {name} today: {}", line.trim()));
+            }
+            if left == right {
+                report
+                    .examples
+                    .push(format!("dead code {name}: same rows, different order"));
+            }
+        }
+    };
+    part(
+        "files",
+        format!("{:#?}", ours.files),
+        format!("{:#?}", theirs.files),
+    );
+    part(
+        "exported_symbols",
+        format!("{:#?}", ours.exported_symbols),
+        format!("{:#?}", theirs.exported_symbols),
+    );
+    part(
+        "outbound_calls",
+        format!("{:#?}", ours.outbound_calls),
+        format!("{:#?}", theirs.outbound_calls),
+    );
+    part(
+        "entry_points",
+        format!("{:#?}", ours.entry_points),
+        format!("{:#?}", theirs.entry_points),
+    );
+    part(
+        "entry_point_symbols",
+        format!("{:#?}", ours.entry_point_symbols),
+        format!("{:#?}", theirs.entry_point_symbols),
+    );
+    part(
+        "go_initializers",
+        format!("{:#?}", ours.go_initializers),
+        format!("{:#?}", theirs.go_initializers),
+    );
+    Ok(())
 }
 
 /// Runs every store primitive the commands use over slices and over today's
