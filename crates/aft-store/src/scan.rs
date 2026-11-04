@@ -3,8 +3,8 @@
 //! A scan walks the checkout, keeps every file its ignore rules admit, and
 //! records each one's content key. A file whose stat evidence still matches
 //! the previous state keeps its recorded key without being read. Every other
-//! file is read and hashed once, and a content the family does not hold yet
-//! is handed to a [`ContentSink`], which indexes it.
+//! file is read and hashed once and handed to a [`ContentSink`], which
+//! indexes what its planes do not hold yet.
 //!
 //! What the scan never does: follow a symlink, cross onto another
 //! filesystem, enter a `.git` directory or a linked worktree of the same
@@ -12,7 +12,6 @@
 //! of its side files (opening any of those from a process that holds a
 //! connection drops that process's locks on them).
 
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
@@ -56,14 +55,14 @@ pub enum ContentKind {
     Binary,
 }
 
-/// Receives the contents a scan reads. Called from several threads.
+/// Receives every file a scan reads, from several threads at once.
+///
+/// The same content can arrive once per path that holds it. Each plane
+/// decides what identifies its own work (the text plane needs a content
+/// once; parsing needs it once per language, which the path decides) and
+/// skips what it already holds.
 pub trait ContentSink: Sync {
-    /// Whether the family already holds `key`; such contents are not handed
-    /// over again.
-    fn known(&self, key: ContentKey) -> bool;
-    /// A content the family does not hold yet. Called at most once per key
-    /// in a scan.
-    fn read(&self, key: ContentKey, kind: ContentKind, bytes: &[u8]);
+    fn read(&self, path: &[u8], key: ContentKey, kind: ContentKind, bytes: &[u8]);
 }
 
 /// What a scan did, for status and for the cost gates.
@@ -72,11 +71,9 @@ pub struct ScanCounters {
     pub files: usize,
     /// Files whose content key came from the previous state unread.
     pub reused: usize,
-    /// Files read and hashed.
+    /// Files read, hashed and handed to the sink.
     pub read: usize,
     pub bytes_read: u64,
-    /// Contents handed to the sink.
-    pub new_contents: usize,
     pub oversize: usize,
     pub unreadable: usize,
     /// Files that changed while being read; their records are marked racy
@@ -148,7 +145,6 @@ pub fn scan(
 
     let records = Mutex::new(Vec::new());
     let walk_error = Mutex::new(None);
-    let seen = Mutex::new(HashSet::new());
     let counters = Counters::default();
     builder.build_parallel().run(|| {
         Box::new(|entry| {
@@ -186,15 +182,9 @@ pub fn scan(
                 }
             };
             let previous = previous.and_then(|state| state.get(&relative));
-            if let Some(record) = record_file(
-                entry.path(),
-                relative,
-                previous,
-                policy,
-                sink,
-                &seen,
-                &counters,
-            ) {
+            if let Some(record) =
+                record_file(entry.path(), relative, previous, policy, sink, &counters)
+            {
                 records
                     .lock()
                     .expect("no panics while holding it")
@@ -218,7 +208,6 @@ struct Counters {
     reused: AtomicUsize,
     read: AtomicUsize,
     bytes_read: AtomicU64,
-    new_contents: AtomicUsize,
     oversize: AtomicUsize,
     unreadable: AtomicUsize,
     changed_while_read: AtomicUsize,
@@ -231,7 +220,6 @@ impl Counters {
             reused: self.reused.into_inner(),
             read: self.read.into_inner(),
             bytes_read: self.bytes_read.into_inner(),
-            new_contents: self.new_contents.into_inner(),
             oversize: self.oversize.into_inner(),
             unreadable: self.unreadable.into_inner(),
             changed_while_read: self.changed_while_read.into_inner(),
@@ -246,7 +234,6 @@ fn record_file(
     previous: Option<&PathRecord>,
     policy: &ScanPolicy,
     sink: &dyn ContentSink,
-    seen: &Mutex<HashSet<ContentKey>>,
     counters: &Counters,
 ) -> Option<PathRecord> {
     let stat = match observe(path) {
@@ -321,15 +308,7 @@ fn record_file(
     } else {
         ContentKind::Text
     };
-    if !sink.known(content)
-        && seen
-            .lock()
-            .expect("no panics while holding it")
-            .insert(content)
-    {
-        counters.new_contents.fetch_add(1, Ordering::Relaxed);
-        sink.read(content, kind, &bytes);
-    }
+    sink.read(&relative, content, kind, &bytes);
     Some(PathRecord {
         path: relative,
         mode,
@@ -504,24 +483,23 @@ mod tests {
     use super::*;
     use crate::stat::RACY_WINDOW_NS;
 
+    /// What the sink saw for one path: its key, kind and bytes.
+    type Seen = (ContentKey, ContentKind, Vec<u8>);
+
     #[derive(Default)]
     struct Collect {
-        known: HashSet<ContentKey>,
-        read: Mutex<BTreeMap<ContentKey, (ContentKind, Vec<u8>)>>,
+        read: Mutex<BTreeMap<Vec<u8>, Seen>>,
         calls: AtomicUsize,
     }
 
     impl ContentSink for Collect {
-        fn known(&self, key: ContentKey) -> bool {
-            self.known.contains(&key)
-        }
-
-        fn read(&self, key: ContentKey, kind: ContentKind, bytes: &[u8]) {
+        fn read(&self, path: &[u8], key: ContentKey, kind: ContentKind, bytes: &[u8]) {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(ContentKey::of(bytes), key);
             self.read
                 .lock()
                 .unwrap()
-                .insert(key, (kind, bytes.to_vec()));
+                .insert(path.to_vec(), (key, kind, bytes.to_vec()));
         }
     }
 
@@ -606,10 +584,14 @@ mod tests {
             get(&first.state, "src/a.rs").content,
             get(&first.state, "src/b.rs").content
         );
-        // Two paths, one content: handed over once. The oversize file is
+        // Every read file is handed over with its path; the oversize file is
         // never read.
-        assert_eq!(sink.calls.load(Ordering::Relaxed), 6);
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 7);
         assert_eq!(first.counters.read, 7);
+        assert_eq!(
+            sink.read.lock().unwrap()[&b"blob.bin"[..]].1,
+            ContentKind::Binary
+        );
         assert_eq!(first.counters.oversize, 1);
 
         // Unchanged files are reused unread; an edit is read again.
@@ -638,18 +620,5 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(contents(&third.state), contents(&second.state));
-    }
-
-    #[test]
-    fn known_contents_are_not_handed_over() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "same").unwrap();
-        let sink = Collect {
-            known: HashSet::from([ContentKey::of(b"same")]),
-            ..Collect::default()
-        };
-        let scan = scan(dir.path(), &ScanPolicy::default(), None, &sink).unwrap();
-        assert_eq!(scan.counters.read, 1);
-        assert_eq!(sink.calls.load(Ordering::Relaxed), 0);
     }
 }

@@ -43,14 +43,16 @@ use aft_store::text::{
 };
 use rayon::prelude::*;
 
-struct Collect(Mutex<TextSectionsBuilder>);
+struct Collect(
+    Mutex<TextSectionsBuilder>,
+    Mutex<std::collections::HashSet<ContentKey>>,
+);
 
 impl ContentSink for Collect {
-    fn known(&self, _key: ContentKey) -> bool {
-        false
-    }
-
-    fn read(&self, key: ContentKey, kind: ContentKind, bytes: &[u8]) {
+    fn read(&self, _path: &[u8], key: ContentKey, kind: ContentKind, bytes: &[u8]) {
+        if !self.1.lock().unwrap().insert(key) {
+            return;
+        }
         let len = bytes.len() as u64;
         match kind {
             ContentKind::Text => {
@@ -83,7 +85,7 @@ fn main() {
     let max_patterns: usize = args.get(4).map_or(usize::MAX, |n| n.parse().unwrap());
 
     let policy = ScanPolicy::default();
-    let sink = Collect(Mutex::new(TextSectionsBuilder::new()));
+    let sink = Collect(Mutex::default(), Mutex::default());
     let started = Instant::now();
     let cold = scan(root, &policy, None, &sink).unwrap();
     let cold_scan_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -140,7 +142,7 @@ fn main() {
         root,
         &policy,
         Some(&state),
-        &Collect(Mutex::new(TextSectionsBuilder::new())),
+        &Collect(Mutex::default(), Mutex::default()),
     )
     .unwrap();
     let warm_scan_ms = started.elapsed().as_secs_f64() * 1000.0;
