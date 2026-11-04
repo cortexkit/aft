@@ -414,6 +414,9 @@ fn compare_dead_code(
 
 /// Runs every store primitive the commands use over slices and over today's
 /// database, for a sample of symbols and names, and records differences.
+///
+/// `GATE_SAMPLE_SCALE=N` samples N times more sparsely, for iterating; the
+/// default (1) is the sample a milestone gate uses.
 fn compare_queries(
     root: &Path,
     inputs: &super::callgraph::CheckoutInputs,
@@ -548,7 +551,11 @@ pub(crate) fn compare_readers(
             ));
         }
     }
-    let sample = symbols.iter().step_by(20).cloned().collect::<Vec<_>>();
+    let sample = symbols
+        .iter()
+        .step_by(20 * sample_scale())
+        .cloned()
+        .collect::<Vec<_>>();
     for chunk in sample.chunks(200) {
         let targets = chunk
             .iter()
@@ -735,7 +742,7 @@ pub(crate) fn compare_readers(
         LangId::Python,
         LangId::Go,
     ];
-    for name in names.iter().step_by(50) {
+    for name in names.iter().step_by(50 * sample_scale()) {
         for kind in ["call", "construction", "value_ref"] {
             compare(
                 "ref_sites_named",
@@ -867,7 +874,11 @@ pub(crate) fn compare_readers(
     // Every 400th symbol in path order; each operation runs at the depth
     // the commands default to and with tests both left out and included.
     use crate::commands::callgraph_store_adapter as adapter;
-    let public = symbols.iter().step_by(400).cloned().collect::<Vec<_>>();
+    let public = symbols
+        .iter()
+        .step_by(400 * sample_scale())
+        .cloned()
+        .collect::<Vec<_>>();
     for (index, (file, scoped, _)) in public.iter().enumerate() {
         let path = Path::new(file);
         for include_tests in [false, true] {
@@ -1184,4 +1195,13 @@ fn compare_tables(
         )?,
     );
     Ok(())
+}
+
+/// How much more sparsely than the default the query comparison samples.
+fn sample_scale() -> usize {
+    std::env::var("GATE_SAMPLE_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse::<usize>().ok())
+        .filter(|scale| *scale > 0)
+        .unwrap_or(1)
 }
