@@ -178,7 +178,7 @@ impl FileFacts {
 
     /// The keys of every resolution that may read this file's facts, when the
     /// facts change from `old` to `new` (either side may be absent).
-    fn changed_keys(
+    pub(crate) fn changed_keys(
         path: &str,
         old: Option<&Self>,
         new: Option<&Self>,

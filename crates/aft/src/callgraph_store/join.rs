@@ -1876,7 +1876,7 @@ impl DispatchTypeTargetTrace {
     /// only index entries that are the same as when it was recorded. Traces
     /// share queries (a crate's module parents, for one), so answers are kept
     /// in `answers` for the next trace checked against the same index.
-    fn replays<'q>(
+    pub(crate) fn replays<'q>(
         &'q self,
         index: &impl super::ResolverIndex,
         changed: &BTreeSet<String>,
@@ -1968,6 +1968,41 @@ impl ViewBindingDependencies {
 
     pub(crate) fn surface_json(&self) -> Result<Option<String>, serde_json::Error> {
         self.surface.as_ref().map(serde_json::to_string).transpose()
+    }
+
+    /// Whether binding gave this file the surface `other` recorded, so no
+    /// other file's resolution can read a different answer from it.
+    pub(crate) fn same_surface(&self, other: &Self) -> bool {
+        self.surface == other.surface
+    }
+
+    /// True when every surface query this resolution asked that depends on
+    /// one of `changed` still has the answer it recorded in `index`. A query
+    /// depending on nothing in `changed` reads only index entries that are
+    /// unchanged. Answers are kept in `answers` for the next file replayed
+    /// against the same index.
+    pub(crate) fn surface_replays<'q>(
+        &'q self,
+        index: &impl super::ResolverIndex,
+        changed: &BTreeSet<String>,
+        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+    ) -> bool {
+        self.surface_queries.iter().all(|(query, expected)| {
+            !query
+                .dependencies()
+                .iter()
+                .any(|dependency| changed.contains(dependency))
+                || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+        })
+    }
+
+    /// Carries a resolution over from `old`, whose recorded answers replay,
+    /// onto this file's new binding.
+    pub(crate) fn reuse_resolution(&mut self, old: &Self) {
+        self.resolved_dependencies = old.resolved_dependencies.clone();
+        self.surface_queries = old.surface_queries.clone();
+        self.resolution_facts = old.resolution_facts.clone();
+        finish_binding(self);
     }
 }
 
@@ -3045,7 +3080,7 @@ fn join_manifest_with_surfaces(
 /// Querying these answers against a new index is cheaper than walking references
 /// and is sound only while the caller's immutable parse blob remains unchanged.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-enum ViewSurfaceQuery {
+pub(crate) enum ViewSurfaceQuery {
     Language(String),
     Module(String, String),
     MacroUse(String),

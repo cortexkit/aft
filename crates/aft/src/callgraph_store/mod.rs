@@ -5627,7 +5627,7 @@ pub(crate) struct DbFileIndex {
 }
 
 #[derive(Debug, Clone)]
-struct ReexportIndex {
+pub(crate) struct ReexportIndex {
     target_file: Option<String>,
     named: HashMap<String, String>,
     wildcard: bool,
@@ -5962,7 +5962,7 @@ impl CrateScanMemo {
 /// Resolution reads symbols and exports through one interface. Incremental
 /// refreshes use the in-memory index, while cold builds query only the rows
 /// needed by the active caller from SQLite.
-trait ResolverIndex {
+pub(crate) trait ResolverIndex {
     fn macro_use_modules(&self, file: &str) -> Vec<String>;
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
     // Enumerate package files without building or reading a cached package

@@ -43,7 +43,7 @@ use crate::views::materialization::dispatch::FileFacts;
 use super::graph_rows::references_by_key;
 
 /// What resolving a checkout reads.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CheckoutInputs {
     /// The checkout's paths.
     pub(crate) state: CheckoutState,
@@ -78,6 +78,9 @@ pub(crate) struct FileResolution {
     pub(crate) site_dependencies: BTreeSet<String>,
 }
 
+/// The bound surfaces of every parsed file, shared read-only by resolution.
+pub(crate) type Surfaces = Arc<HashMap<String, DbFileIndex>>;
+
 /// Resolves every parsed file of a checkout on `threads` threads.
 ///
 /// # Errors
@@ -87,55 +90,96 @@ pub(crate) fn resolve_checkout(
     inputs: &CheckoutInputs,
     threads: usize,
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
-    let pool = rayon::ThreadPoolBuilder::new()
+    pool(threads)?.install(|| {
+        let paths = inputs.parses.keys().collect::<Vec<_>>();
+        let (surfaces, prebound) = bind_all(inputs, &paths)?;
+        let surfaces: Surfaces = Arc::new(surfaces);
+        let mut resolved = resolve_files(inputs, &surfaces, &prebound, &paths)?;
+        let calls = MethodCallInputs::build(inputs, &resolved);
+        for (path, sites, dependencies) in calls.resolve_sites(inputs, &paths) {
+            let file = resolved
+                .get_mut(&path)
+                .expect("every parsed file was resolved");
+            file.sites = sites;
+            file.site_dependencies = dependencies;
+        }
+        Ok(resolved)
+    })
+}
+
+pub(crate) fn pool(threads: usize) -> Result<rayon::ThreadPool, ManifestJoinError> {
+    rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
         .thread_name(|index| format!("aft-resolve-{index}"))
         .build()
-        .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-    pool.install(|| resolve_in_pool(inputs))
+        .map_err(|error| ManifestJoinError::Parse(error.to_string()))
 }
 
-fn resolve_in_pool(
-    inputs: &CheckoutInputs,
-) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
-    let parses = inputs.parses.iter().collect::<Vec<_>>();
-    let facts_for_thread = || ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs }));
+fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
+    ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs }))
+}
 
-    // Pass 1: bind every file.
-    let bound = parses
+/// Pass 1 for `paths`, in parallel: each file's bound surface, and its
+/// binding before resolution.
+///
+/// # Errors
+///
+/// When binding fails on a file.
+pub(crate) fn bind_all(
+    inputs: &CheckoutInputs,
+    paths: &[&String],
+) -> Result<
+    (
+        HashMap<String, DbFileIndex>,
+        HashMap<String, ViewBindingDependencies>,
+    ),
+    ManifestJoinError,
+> {
+    let bound = paths
         .par_iter()
-        .map_init(facts_for_thread, |facts, (path, (_, parse))| {
-            bind_file(path, parse, facts, None).map(|bound| ((*path).clone(), bound))
-        })
+        .map_init(
+            || thread_facts(inputs),
+            |facts, path| {
+                let (_, parse) = &inputs.parses[path.as_str()];
+                bind_file(path, parse, facts, None).map(|bound| ((*path).clone(), bound))
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
     let mut surfaces = HashMap::with_capacity(bound.len());
-    let mut bindings = HashMap::with_capacity(bound.len());
+    let mut prebound = HashMap::with_capacity(bound.len());
     for (path, (surface, binding)) in bound {
         surfaces.insert(path.clone(), surface);
-        bindings.insert(path, binding);
+        prebound.insert(path, binding);
     }
-    let surfaces: Arc<HashMap<String, DbFileIndex>> = Arc::new(surfaces);
+    Ok((surfaces, prebound))
+}
 
-    // Passes 2 and 3: resolve every file against the shared surfaces.
-    let resolved = parses
+/// Passes 2 and 3 for `paths`, in parallel, against every file's bound
+/// surface. Method-call sites are left empty, for [`MethodCallInputs`].
+///
+/// # Errors
+///
+/// When resolution fails on a file.
+pub(crate) fn resolve_files(
+    inputs: &CheckoutInputs,
+    surfaces: &Surfaces,
+    prebound: &HashMap<String, ViewBindingDependencies>,
+    paths: &[&String],
+) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
+    paths
         .par_iter()
         .map_init(
             || {
-                let facts = Rc::new(facts_for_thread());
-                let index = ProjectIndex::from_shared(
-                    std::path::Path::new("/"),
-                    Arc::clone(&surfaces),
-                    HashMap::new(),
-                    WorkspaceCratePrefixCache::default(),
-                    facts.clone(),
-                );
+                let facts = Rc::new(thread_facts(inputs));
+                let index = resolver_index(surfaces, &facts);
                 (facts, index)
             },
-            |(facts, index), (path, (key, parse))| {
-                let mut binding = bindings
+            |(facts, index), path| {
+                let (key, parse) = &inputs.parses[path.as_str()];
+                let mut binding = prebound
                     .get(path.as_str())
                     .cloned()
-                    .expect("every parsed file was bound");
+                    .expect("every resolved file was bound");
                 let mut rows = BTreeSet::new();
                 resolve_file(
                     path,
@@ -148,12 +192,7 @@ fn resolve_in_pool(
                     &mut rows,
                 )?;
                 finish_binding(&mut binding);
-                let dispatch = matches!(
-                    parse.language.as_str(),
-                    "rust" | "typescript" | "tsx" | "javascript"
-                )
-                .then(|| dispatch_type_targets_for(path, parse, index, facts))
-                .transpose()?;
+                let dispatch = dispatch_targets(path, parse, index, facts)?;
                 Ok((
                     (*path).clone(),
                     FileResolution {
@@ -165,15 +204,44 @@ fn resolve_in_pool(
                 ))
             },
         )
-        .collect::<Result<BTreeMap<_, _>, ManifestJoinError>>()?;
-    resolve_method_calls(inputs, resolved)
+        .collect()
+}
+
+/// A resolver index over `surfaces`, recording into `facts`.
+pub(crate) fn resolver_index<'a>(
+    surfaces: &Surfaces,
+    facts: &Rc<ViewBindingFacts<'a>>,
+) -> ProjectIndex<'a> {
+    ProjectIndex::from_shared(
+        std::path::Path::new("/"),
+        Arc::clone(surfaces),
+        HashMap::new(),
+        WorkspaceCratePrefixCache::default(),
+        facts.clone(),
+    )
+}
+
+/// Pass 3 for one file: for Rust, TypeScript and JavaScript, the targets of
+/// its type names.
+pub(crate) fn dispatch_targets(
+    path: &str,
+    parse: &ParseBlob,
+    index: &ProjectIndex<'_>,
+    facts: &ViewBindingFacts<'_>,
+) -> Result<Option<DispatchTypeTargets>, ManifestJoinError> {
+    matches!(
+        parse.language.as_str(),
+        "rust" | "typescript" | "tsx" | "javascript"
+    )
+    .then(|| dispatch_type_targets_for(path, parse, index, facts))
+    .transpose()
 }
 
 /// What pass 4 reads about one file beyond its own facts: which of its
 /// references Rust spells as an associated or `self.` call, and which of
 /// its references already have an ordinary edge from pass 2.
-#[derive(Default)]
-struct OrdinaryCalls {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OrdinaryCalls {
     /// `view:<path>:<key>` of call and construction references spelled as an
     /// associated function or a `self.` call.
     syntax: HashSet<String>,
@@ -184,116 +252,154 @@ struct OrdinaryCalls {
     edges: HashSet<String>,
 }
 
-fn resolve_method_calls(
-    inputs: &CheckoutInputs,
-    mut resolved: BTreeMap<String, FileResolution>,
-) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
-    let mut facts = BTreeMap::new();
-    let mut ordinary = HashMap::new();
-    for (path, (_, parse)) in &inputs.parses {
-        let file = &resolved[path];
-        let references = references_by_key(parse);
-        let mut file_facts = FileFacts::new(parse);
-        file_facts.import_targets = import_targets(&file.rows, &references);
-        if let Some(dispatch) = &file.dispatch {
-            file_facts.type_targets = dispatch.targets.clone();
-        }
-        ordinary.insert(
-            path.clone(),
-            ordinary_calls(path, parse, &file.rows, &references),
-        );
-        facts.insert(path.clone(), file_facts);
-    }
-    let resolver_parses = facts
-        .iter()
-        .map(|(path, facts)| (path.clone(), facts.resolver_parse()))
-        .collect::<BTreeMap<_, _>>();
-    let import_targets = facts
-        .iter()
-        .flat_map(|(path, facts)| {
-            facts
-                .import_targets
-                .iter()
-                .map(move |(module, target)| ((path.clone(), module.clone()), target.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let type_targets = facts
-        .iter()
-        .flat_map(|(path, facts)| {
-            facts
-                .type_targets
-                .iter()
-                .map(move |(name, target)| ((path.clone(), name.clone()), target.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
+/// Every file's method-call facts, as pass 4 reads them. Kept by a live
+/// checkout and updated file by file.
+#[derive(Debug, Default)]
+pub(crate) struct MethodCallInputs {
+    pub(crate) facts: BTreeMap<String, FileFacts>,
+    resolver_parses: BTreeMap<String, ParseBlob>,
+    ordinary: HashMap<String, OrdinaryCalls>,
+    import_targets: BTreeMap<(String, String), String>,
+    type_targets: BTreeMap<(String, String), (String, String)>,
+}
 
-    let paths = inputs.parses.keys().collect::<Vec<_>>();
-    let chunk = paths
-        .len()
-        .div_ceil(rayon::current_num_threads() * 4)
-        .max(1);
-    let results = paths
-        .par_chunks(chunk)
-        .map(|chunk| {
-            // The resolver and its memo are single-threaded caches over
-            // shared inputs: one per chunk of files.
-            let mut resolver = Resolver::new(
-                resolver_parses
-                    .iter()
-                    .map(|(path, parse)| (path.clone(), parse))
-                    .collect(),
-            );
-            resolver.import_targets = import_targets.clone();
-            resolver.type_targets = type_targets.clone();
-            for (path, calls) in &ordinary {
-                for key in &calls.associated {
-                    resolver.note_associated_site(path, *key);
-                }
-            }
-            let memoized = MemoizedResolver::new(&resolver);
-            resolver.take_dependencies();
-            chunk
-                .iter()
-                .map(|path| {
-                    let (_, parse) = &inputs.parses[*path];
-                    let calls = &ordinary[*path];
-                    let mut sites = Vec::new();
-                    for site in parse.bound_dispatch_sites() {
-                        let ref_id = format!("view:{path}:{}", site.ordinal);
-                        let resolution = memoized.resolve(path, &site);
-                        // Keep proven self-call and scoped module-function
-                        // bindings when dispatch facts do not identify a
-                        // project receiver type.
-                        if parse.language == "rust"
-                            && resolution.external > 0
-                            && resolution.targets.is_empty()
-                            && calls.edges.contains(&ref_id)
-                            && calls.syntax.contains(&ref_id)
-                        {
-                            continue;
-                        }
-                        sites.push(SiteResolution {
-                            site,
-                            resolution: (*resolution).clone(),
-                        });
-                    }
-                    // Every file depends on its own facts, which
-                    // `Resolver::resolve` reads without recording.
-                    let mut dependencies = resolver.take_dependencies();
-                    dependencies.insert(dependency::file(path));
-                    ((*path).clone(), sites, dependencies)
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    for (path, sites, dependencies) in results.into_iter().flatten() {
-        let file = resolved
-            .get_mut(&path)
-            .expect("every parsed file was resolved");
-        file.sites = sites;
-        file.site_dependencies = dependencies;
+impl MethodCallInputs {
+    pub(crate) fn build(
+        inputs: &CheckoutInputs,
+        resolved: &BTreeMap<String, FileResolution>,
+    ) -> Self {
+        let mut calls = Self::default();
+        for path in inputs.parses.keys() {
+            calls.update(inputs, path, resolved.get(path));
+        }
+        calls
     }
-    Ok(resolved)
+
+    /// The facts of one file as `resolution` leaves them, or none when the
+    /// file is gone. Returns the dependency keys whose readers the change
+    /// can affect, and whether the file's own pass-4 inputs changed.
+    pub(crate) fn update(
+        &mut self,
+        inputs: &CheckoutInputs,
+        path: &str,
+        resolution: Option<&FileResolution>,
+    ) -> (BTreeSet<String>, bool) {
+        let new = resolution
+            .zip(inputs.parses.get(path))
+            .map(|(file, (_, parse))| {
+                let references = references_by_key(parse);
+                let mut facts = FileFacts::new(parse);
+                facts.import_targets = import_targets(&file.rows, &references);
+                if let Some(dispatch) = &file.dispatch {
+                    facts.type_targets = dispatch.targets.clone();
+                }
+                (facts, ordinary_calls(path, parse, &file.rows, &references))
+            });
+        let old_facts = self.facts.get(path);
+        let mut keys = BTreeSet::new();
+        FileFacts::changed_keys(
+            path,
+            old_facts,
+            new.as_ref().map(|(facts, _)| facts),
+            &mut keys,
+        );
+        let own_changed = keys.contains(&dependency::file(path))
+            || self.ordinary.get(path) != new.as_ref().map(|(_, calls)| calls);
+        if let Some(old) = self.facts.remove(path) {
+            for module in old.import_targets.keys() {
+                self.import_targets
+                    .remove(&(path.to_string(), module.clone()));
+            }
+            for name in old.type_targets.keys() {
+                self.type_targets.remove(&(path.to_string(), name.clone()));
+            }
+        }
+        self.resolver_parses.remove(path);
+        self.ordinary.remove(path);
+        if let Some((facts, calls)) = new {
+            for (module, target) in &facts.import_targets {
+                self.import_targets
+                    .insert((path.to_string(), module.clone()), target.clone());
+            }
+            for (name, target) in &facts.type_targets {
+                self.type_targets
+                    .insert((path.to_string(), name.clone()), target.clone());
+            }
+            self.resolver_parses
+                .insert(path.to_string(), facts.resolver_parse());
+            self.facts.insert(path.to_string(), facts);
+            self.ordinary.insert(path.to_string(), calls);
+        }
+        (keys, own_changed)
+    }
+
+    /// Pass 4 for `paths`, in parallel: each file's kept method-call sites
+    /// and the dependency keys their resolutions read.
+    pub(crate) fn resolve_sites(
+        &self,
+        inputs: &CheckoutInputs,
+        paths: &[&String],
+    ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+        let chunk = paths
+            .len()
+            .div_ceil(rayon::current_num_threads() * 4)
+            .max(1);
+        paths
+            .par_chunks(chunk)
+            .map(|chunk| {
+                // The resolver and its memo are single-threaded caches over
+                // shared inputs: one per chunk of files.
+                let mut resolver = Resolver::new(
+                    self.resolver_parses
+                        .iter()
+                        .map(|(path, parse)| (path.clone(), parse))
+                        .collect(),
+                );
+                resolver.import_targets = self.import_targets.clone();
+                resolver.type_targets = self.type_targets.clone();
+                for (path, calls) in &self.ordinary {
+                    for key in &calls.associated {
+                        resolver.note_associated_site(path, *key);
+                    }
+                }
+                let memoized = MemoizedResolver::new(&resolver);
+                resolver.take_dependencies();
+                chunk
+                    .iter()
+                    .map(|path| {
+                        let (_, parse) = &inputs.parses[path.as_str()];
+                        let calls = &self.ordinary[path.as_str()];
+                        let mut sites = Vec::new();
+                        for site in parse.bound_dispatch_sites() {
+                            let ref_id = format!("view:{path}:{}", site.ordinal);
+                            let resolution = memoized.resolve(path, &site);
+                            // Keep proven self-call and scoped module-function
+                            // bindings when dispatch facts do not identify a
+                            // project receiver type.
+                            if parse.language == "rust"
+                                && resolution.external > 0
+                                && resolution.targets.is_empty()
+                                && calls.edges.contains(&ref_id)
+                                && calls.syntax.contains(&ref_id)
+                            {
+                                continue;
+                            }
+                            sites.push(SiteResolution {
+                                site,
+                                resolution: (*resolution).clone(),
+                            });
+                        }
+                        // Every file depends on its own facts, which
+                        // `Resolver::resolve` reads without recording.
+                        let mut dependencies = resolver.take_dependencies();
+                        dependencies.insert(dependency::file(path));
+                        ((*path).clone(), sites, dependencies)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect()
+    }
 }
 
 /// The target file of each module a file imports, from its pass-2 rows.
@@ -365,8 +471,8 @@ fn ordinary_calls(
 /// The checkout's paths and configuration, as the resolver asks for them.
 /// Answers what the views manifest answered for the same checkout.
 #[derive(Debug)]
-struct CheckoutFacts<'a> {
-    inputs: &'a CheckoutInputs,
+pub(crate) struct CheckoutFacts<'a> {
+    pub(crate) inputs: &'a CheckoutInputs,
 }
 
 impl CheckoutFacts<'_> {
