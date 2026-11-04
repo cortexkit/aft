@@ -16,8 +16,43 @@
 //! content appears.
 
 mod codec;
+mod sections;
+
+pub use sections::{ContentReadError, ContentSectionsBuilder, ContentSegment, KNOWN};
 
 use codec::{Decoder, Encoder};
+
+use crate::ids::{ContentKey, Digest128};
+
+/// The key of a content record: the content, the language it is parsed as,
+/// and the extractor version. The same bytes at a `.ts` and a `.js` path are
+/// two records; a new extractor version never reads an old one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RecordKey(Digest128);
+
+impl RecordKey {
+    #[must_use]
+    pub fn new(content: ContentKey, language: &str, extractor_version: &str) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key("aft-store 2026-11 content record key");
+        hasher.update(content.digest().as_bytes());
+        for part in [language, extractor_version] {
+            hasher.update(&(part.len() as u64).to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        Self(Digest128::from_hash(&hasher.finalize()))
+    }
+
+    /// A key read back from storage.
+    #[must_use]
+    pub const fn from_digest(digest: Digest128) -> Self {
+        Self(digest)
+    }
+
+    #[must_use]
+    pub const fn digest(&self) -> Digest128 {
+        self.0
+    }
+}
 
 /// Why stored bytes are not a well-formed record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
