@@ -42,6 +42,14 @@ pub(crate) trait ProjectFacts {
     fn memo_start(&self, _path: &Path, _kind: &str, _name: &str) {}
     fn memo_finish(&self, _path: &Path, _kind: &str, _name: &str) {}
     fn memo_replay(&self, _path: &Path, _kind: &str, _name: &str) {}
+    /// Records that the caller depends on a repository-wide structure,
+    /// named by its domain key, instead of on that structure's inputs.
+    fn record_domain(&self, _key: &str) {}
+    /// Stops recording consultations until the matching
+    /// [`ProjectFacts::resume_recording`]; for building a repository-wide
+    /// structure whose readers record its domain key instead.
+    fn pause_recording(&self) {}
+    fn resume_recording(&self) {}
     fn workspace_package(&self, _root: &Path, _name: &str) -> Option<Option<PathBuf>> {
         None
     }

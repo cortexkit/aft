@@ -2215,6 +2215,9 @@ pub(crate) struct ViewBindingFacts<'a> {
     file_cache: std::cell::RefCell<HashMap<Vec<u8>, bool>>,
     config_cache: std::cell::RefCell<HashMap<Vec<u8>, Option<Arc<[u8]>>>>,
     directory_cache: std::cell::RefCell<HashMap<Vec<u8>, Vec<super::facts::DirEntry>>>,
+    /// Nonzero while a repository-wide structure is built: its reads are
+    /// not the caller's inputs.
+    paused: std::cell::Cell<u32>,
 }
 
 impl<'a> ViewBindingFacts<'a> {
@@ -2231,6 +2234,7 @@ impl<'a> ViewBindingFacts<'a> {
             file_cache: Default::default(),
             config_cache: Default::default(),
             directory_cache: Default::default(),
+            paused: Default::default(),
         }
     }
     fn file_fact(&self, rel: &[u8]) -> bool {
@@ -2243,6 +2247,9 @@ impl<'a> ViewBindingFacts<'a> {
     }
 
     fn record(&self, path: &[u8]) {
+        if self.paused.get() > 0 {
+            return;
+        }
         // Directory discovery may probe thousands of missing package manifests.
         // One membership domain rechecks those bindings on config add/remove;
         // individual config content changes use the field consultations instead.
@@ -2277,6 +2284,9 @@ impl<'a> ViewBindingFacts<'a> {
     }
 
     fn config_event(&self, path: &[u8], name: Option<&str>) {
+        if self.paused.get() > 0 {
+            return;
+        }
         let Ok(path) = std::str::from_utf8(path) else {
             self.consultations.borrow_mut().unattributed = true;
             return;
@@ -2323,6 +2333,15 @@ impl ProjectFacts for ViewBindingFacts<'_> {
             .expect("balanced resolver memo recording");
         debug_assert_eq!(key, (path.into(), kind.into(), name.into()));
         self.memo_traces.borrow_mut().insert(key, trace);
+    }
+    fn record_domain(&self, key: &str) {
+        self.record(key.as_bytes());
+    }
+    fn pause_recording(&self) {
+        self.paused.set(self.paused.get() + 1);
+    }
+    fn resume_recording(&self) {
+        self.paused.set(self.paused.get().saturating_sub(1));
     }
     fn memo_replay(&self, path: &Path, kind: &str, name: &str) {
         let traces = self.memo_traces.borrow();
@@ -3144,6 +3163,12 @@ pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
 /// dependency of the callers that listed it; the owner rechecks this domain
 /// whenever a `.go` file is added or removed.
 pub(crate) const VIEW_GO_PACKAGE_DOMAIN: &str = "\0view:go-package-files";
+/// The Go module map: every `go.mod` and the module path it declares. A
+/// reader records this one key instead of the map's inputs, so its recorded
+/// inputs are the same whichever reader built the map, and an edit that
+/// changes the map (a `go.mod` added, removed or rewritten) re-checks every
+/// reader through the `GoPackage` answers they recorded.
+pub(crate) const VIEW_GO_MODULES_DOMAIN: &str = "\0view:go-modules";
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {

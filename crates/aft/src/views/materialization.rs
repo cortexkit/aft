@@ -534,6 +534,12 @@ fn materialize_reading(
                 }) {
                     seeds.insert(join::VIEW_GO_PACKAGE_DOMAIN.as_bytes().to_vec());
                 }
+                if changed
+                    .iter()
+                    .any(|path| path.as_slice() == b"go.mod" || path.ends_with(b"/go.mod"))
+                {
+                    seeds.insert(join::VIEW_GO_MODULES_DOMAIN.as_bytes().to_vec());
+                }
                 let (selected, domain_only) =
                     dependent_closure(&transaction, &seeds, module_domain_changed)?;
                 module_domain_callers = domain_only;

@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use crate::callgraph_store::join::{
     ManifestJoinError, ViewBindingDependencies, ViewBindingFacts, VIEW_CONFIG_MEMBERSHIP_DOMAIN,
-    VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
+    VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
 
 use super::callgraph::{
@@ -256,6 +256,12 @@ impl LiveCheckout {
         if !configs.is_empty() {
             binding_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
+        let go_modules_changed = configs
+            .iter()
+            .any(|path| path == "go.mod" || path.ends_with("/go.mod"));
+        if go_modules_changed {
+            binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
+        }
         let mut rebind = self.reverse.binding.of(&binding_keys);
         rebind.extend(contents.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
@@ -321,6 +327,9 @@ impl LiveCheckout {
         }
         if membership.iter().any(|path| path.ends_with(".go")) {
             changed_keys.insert(VIEW_GO_PACKAGE_DOMAIN.to_string());
+        }
+        if go_modules_changed {
+            changed_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
 
         // Pass 2.
