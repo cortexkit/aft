@@ -856,20 +856,20 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
             .map(|(file, _, _, references, slice)| {
                 // One row per span. Several references share a span when a
                 // call inside a nested function is also credited to the
-                // functions around it; the row names the last one written,
-                // which is the innermost caller. The database's GROUP BY
-                // returned that row because it reads a group in the order
-                // the references were inserted.
-                let last = references
+                // functions around it. The extractor writes the innermost
+                // caller's reference first, and the row names it, as the
+                // database's GROUP BY did when it read a group in insertion
+                // order.
+                let first = references
                     .iter()
-                    .max_by_key(|reference| reference.ordinal)
+                    .min_by_key(|reference| reference.ordinal)
                     .expect("a span has a reference");
-                let caller = last.caller_node.as_deref().and_then(|id| slice.node(id));
+                let caller = first.caller_node.as_deref().and_then(|id| slice.node(id));
                 StoreRefSite {
                     is_test: caller.and_then(|node| node.is_test),
                     file,
                     caller_symbol: caller.map(|node| node.scoped_name.clone()),
-                    line: last.line,
+                    line: first.line,
                     local_name: None,
                 }
             })
