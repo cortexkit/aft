@@ -173,6 +173,42 @@ struct StaleAnswers {
 }
 
 impl LiveCheckout {
+    /// Files whose recorded reads or surface answers no longer hold in the
+    /// current checkout, whatever changed: an update that left one of them
+    /// unchecked missed a file it had to resolve again. Asks everything, so
+    /// it is for gates, not for updates.
+    pub(crate) fn stale_recordings(&self) -> Vec<String> {
+        let inputs = &self.inputs;
+        let checkout = CheckoutFacts { inputs };
+        let facts = Rc::new(ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs })));
+        let index = resolver_index(&self.surfaces, &facts);
+        let mut now = HashMap::<&FactQuestion, FactAnswer>::new();
+        let mut surface = BTreeMap::new();
+        let mut traced = BTreeMap::new();
+        let mut stale = Vec::new();
+        for (path, file) in &self.resolved {
+            let mut holds = file.binding.answers().all(|(question, recorded)| {
+                now.entry(question)
+                    .or_insert_with(|| question.answer(&checkout))
+                    == recorded
+            });
+            holds = holds && file.binding.all_surface_answers_hold(&index, &mut surface);
+            if let Some(dispatch) = &file.dispatch {
+                holds = holds
+                    && dispatch.trace.answers.iter().all(|(question, recorded)| {
+                        now.entry(question)
+                            .or_insert_with(|| question.answer(&checkout))
+                            == recorded
+                    })
+                    && dispatch.trace.all_answers_hold(&index, &mut traced);
+            }
+            if !holds {
+                stale.push(path.clone());
+            }
+        }
+        stale
+    }
+
     /// Asks every distinct recorded checkout read again of `inputs`, and
     /// lists the files with a read whose answer differs.
     fn stale_answers(&self, inputs: &CheckoutInputs) -> StaleAnswers {

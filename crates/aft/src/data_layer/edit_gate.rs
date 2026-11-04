@@ -44,6 +44,10 @@ pub struct EditRecord {
     pub differing_files: Option<usize>,
     /// Files whose recorded inputs differ from the cold resolution's.
     pub differing_recordings: Option<usize>,
+    /// Files whose recorded answers no longer hold after this edit, though
+    /// the update kept them: checked after every edit.
+    pub undiscovered: usize,
+    pub discovery_ms: f64,
     /// Files the overlay over the base segment replaces or removes; `None`
     /// when the overlay was not checked at this edit.
     pub overlay_files: Option<usize>,
@@ -387,11 +391,26 @@ pub fn run(
             extract_ms,
             differing_files: None,
             differing_recordings: None,
+            undiscovered: 0,
+            discovery_ms: 0.0,
             overlay_files: None,
             overlay_differing: None,
             overlay_check_ms: None,
             examples: Vec::new(),
         };
+        let started = Instant::now();
+        let undiscovered = live.stale_recordings();
+        record.discovery_ms = started.elapsed().as_secs_f64() * 1000.0;
+        record.undiscovered = undiscovered.len();
+        if !undiscovered.is_empty() {
+            failures += 1;
+            record.examples.extend(
+                undiscovered
+                    .iter()
+                    .take(5)
+                    .map(|path| format!("{path}: recorded answers no longer hold")),
+            );
+        }
         if last_of_commit || (index + 1) % check_every.max(1) == 0 {
             let cold =
                 resolve_checkout(&live.inputs, threads).map_err(|error| error.to_string())?;

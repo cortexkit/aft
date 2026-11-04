@@ -1900,6 +1900,17 @@ impl DispatchTypeTargetTrace {
                 || *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
         })
     }
+
+    /// True when every recorded surface answer is unchanged in `index`.
+    pub(crate) fn all_answers_hold<'q>(
+        &'q self,
+        index: &impl super::ResolverIndex,
+        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+    ) -> bool {
+        self.queries.iter().all(|(query, expected)| {
+            *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+        })
+    }
 }
 
 /// One Rust file's receiver type targets, keyed by the type name as written.
@@ -2046,9 +2057,16 @@ impl ViewBindingDependencies {
             .chain(self.resolution_answers.iter())
     }
 
-    /// The surface queries resolution asked, with their recorded answers.
-    pub(crate) fn surface_queries(&self) -> &[(ViewSurfaceQuery, String)] {
-        &self.surface_queries
+    /// True when every surface query resolution asked still has its
+    /// recorded answer in `index`, whatever changed.
+    pub(crate) fn all_surface_answers_hold<'q>(
+        &'q self,
+        index: &impl super::ResolverIndex,
+        answers: &mut BTreeMap<&'q ViewSurfaceQuery, String>,
+    ) -> bool {
+        self.surface_queries.iter().all(|(query, expected)| {
+            *answers.entry(query).or_insert_with(|| query.answer(index)) == *expected
+        })
     }
 }
 
