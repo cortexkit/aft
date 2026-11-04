@@ -307,7 +307,7 @@ pub fn run(
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let segment_path = directory.join("1.seg");
     let family = FamilyId::from_digest(Digest128::of(b"edit gate"));
-    write_segment(
+    let fragments = write_segment(
         &segment_path,
         SegmentMeta {
             family,
@@ -403,6 +403,7 @@ pub fn run(
                 let (files_laid, differing) = check_overlay(
                     &segment,
                     &base_inputs,
+                    &fragments,
                     &base,
                     &live,
                     &cold,
@@ -435,12 +436,13 @@ pub fn run(
 fn check_overlay(
     segment: &Segment,
     base_inputs: &CheckoutInputs,
+    fragments: &BTreeMap<String, aft_store::graph::FragmentKey>,
     base: &BTreeMap<String, (String, Vec<u8>)>,
     live: &LiveCheckout,
     cold: &BTreeMap<String, FileResolution>,
     examples: &mut Vec<String>,
 ) -> Result<(usize, usize), String> {
-    let mut overlay = OverlaySlices::new(StoredSlices::open(segment, base_inputs)?);
+    let mut overlay = OverlaySlices::new(StoredSlices::open(segment, base_inputs, fragments)?);
     for (path, (key, parse)) in &live.inputs.parses {
         let resolution = &live.resolved[path];
         let same = base.get(path).is_some_and(|(base_key, bytes)| {

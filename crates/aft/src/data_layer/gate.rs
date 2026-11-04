@@ -442,7 +442,7 @@ fn compare_queries(
     let segment_path = directory.join("1.seg");
     let family = FamilyId::from_digest(aft_store::ids::Digest128::of(b"resolve gate"));
     let started = Instant::now();
-    super::graph_store::write_segment(
+    let fragments = super::graph_store::write_segment(
         &segment_path,
         SegmentMeta {
             family,
@@ -465,7 +465,7 @@ fn compare_queries(
         Arc::new(BlockCache::new(256 << 20)),
     )
     .map_err(|error| error.to_string())?;
-    let stored = super::graph_store::StoredSlices::open(&segment, inputs)?;
+    let stored = super::graph_store::StoredSlices::open(&segment, inputs, &fragments)?;
     let stored = super::query::SliceReader::new(stored, root.to_path_buf(), "gate".to_string());
     compare_readers(
         &stored,

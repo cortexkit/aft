@@ -32,13 +32,20 @@ pub(crate) fn known_sections() -> Vec<KnownSection> {
         .collect()
 }
 
-/// The key of the fragment for the file at `path` whose content record has
-/// the key `record_key`.
+/// The key of a fragment: the file's record and path, and the fragment's
+/// own bytes. Two checkouts can resolve the same content at the same path
+/// differently (their other files differ), so the bytes are part of the
+/// key; two that resolve it the same way share one fragment.
 #[must_use]
-pub(crate) fn fragment_key(record_key: &str, path: &str) -> FragmentKey {
-    FragmentKey::from_digest(Digest128::of(
-        format!("aft call-graph fragment 1\0{record_key}\0{path}").as_bytes(),
-    ))
+pub(crate) fn fragment_key(record_key: &str, path: &str, bytes: &[u8]) -> FragmentKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aft call-graph fragment 1\0");
+    hasher.update(record_key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    FragmentKey::from_digest(Digest128::from_hash(&hasher.finalize()))
 }
 
 /// The terms queries find a slice's fragment by.
@@ -66,7 +73,8 @@ fn call_target(file: &str, symbol: &str) -> Vec<u8> {
 }
 
 /// Writes the call graph of a checkout into a new segment at `path`.
-/// `records` holds the content record of every parse, by its key.
+/// `records` holds the content record of every parse, by its key. Returns
+/// each file's fragment key, which the checkout's state records.
 ///
 /// # Errors
 ///
@@ -77,9 +85,10 @@ pub(crate) fn write_segment(
     inputs: &CheckoutInputs,
     resolved: &BTreeMap<String, FileResolution>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
-) -> Result<(), String> {
+) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut content = ContentSectionsBuilder::new();
     let mut graph = GraphSectionsBuilder::new();
+    let mut keys = BTreeMap::new();
     for (file, resolution) in resolved {
         let (key, parse) = &inputs.parses[file];
         let (record_key, record) = records
@@ -88,9 +97,12 @@ pub(crate) fn write_segment(
         content.add(*record_key, record);
         let slice = FileSlice::build(file, key, parse, resolution);
         let terms = slice_terms(&slice);
+        let bytes = super::fragment::encode(resolution);
+        let fragment = fragment_key(key, file, &bytes);
+        keys.insert(file.clone(), fragment);
         graph.add(
-            fragment_key(key, file),
-            super::fragment::encode(resolution),
+            fragment,
+            bytes,
             terms.iter().map(|(kind, term)| (*kind, term.as_slice())),
         );
     }
@@ -102,7 +114,7 @@ pub(crate) fn write_segment(
         .write(&mut writer)
         .map_err(|error| error.to_string())?;
     writer.finish().map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(keys)
 }
 
 /// Where one path's record and fragment are.
@@ -129,13 +141,18 @@ pub(crate) struct StoredSlices<'s> {
 }
 
 impl<'s> StoredSlices<'s> {
-    /// Opens the slices of `inputs`'s parsed files in `segment`.
+    /// Opens the slices of `inputs`'s parsed files in `segment`, each with
+    /// the fragment `fragments` names for it.
     ///
     /// # Errors
     ///
     /// When the segment lacks the call-graph sections, or a parsed file has
     /// no record or fragment in it.
-    pub(crate) fn open(segment: &'s Segment, inputs: &CheckoutInputs) -> Result<Self, String> {
+    pub(crate) fn open(
+        segment: &'s Segment,
+        inputs: &CheckoutInputs,
+        fragments: &BTreeMap<String, FragmentKey>,
+    ) -> Result<Self, String> {
         let content = ContentSegment::open(segment)
             .map_err(|error| error.to_string())?
             .ok_or("the segment has no content sections")?;
@@ -150,8 +167,11 @@ impl<'s> StoredSlices<'s> {
                 .find(record_key)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("no stored record for {file}"))?;
+            let fragment_key = fragments
+                .get(file)
+                .ok_or_else(|| format!("no fragment key for {file}"))?;
             let fragment = graph
-                .find(fragment_key(key, file))
+                .find(*fragment_key)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("no stored fragment for {file}"))?;
             by_fragment.insert(fragment, file.clone());
