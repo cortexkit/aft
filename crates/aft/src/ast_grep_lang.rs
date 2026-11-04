@@ -133,18 +133,18 @@ impl AstGrepLang {
 
     pub(crate) fn compile_pattern(&self, pattern: &str) -> Result<Pattern, PatternError> {
         if matches!(self, Self::Nix) {
-            // A bare binding (`$NAME = true;`) is not a complete Nix expression,
-            // so a whole-expression pattern fails to parse. Match the binding
-            // inside an attrset context instead: the selector scopes the pattern
-            // to one binding, which keeps sibling bindings intact on replace.
+            // A bare binding (`$NAME = true;`) or `inherit` clause is not a
+            // complete Nix expression, so a whole-expression pattern fails to
+            // parse. Match the member inside an attrset context instead: the
+            // selector scopes the pattern to that member's own kind, which
+            // keeps sibling bindings intact on replace.
             return Pattern::try_new(pattern, self.clone()).or_else(|_| {
                 let context = format!("{{ {pattern} }}");
-                if nix_wrapper_is_single_binding(&context) {
-                    Pattern::contextual(&context, "binding", self.clone())
-                } else {
+                match nix_wrapper_selector(&context) {
+                    Some(selector) => Pattern::contextual(&context, selector, self.clone()),
                     // Several members would each match on their own, silently
                     // widening or narrowing what the user asked for.
-                    Err(PatternError::Parse(pattern.to_string()))
+                    None => Err(PatternError::Parse(pattern.to_string())),
                 }
             });
         }
@@ -262,37 +262,38 @@ fn nix_pattern_without_meta_variables(pattern: &str) -> String {
     plain
 }
 
-/// A contextual pattern's wrapper must contain exactly one `binding` member;
-/// `inherit`/`inherit_from` siblings would otherwise be ignored by the selector.
-fn nix_wrapper_is_single_binding(source: &str) -> bool {
+/// The selector a contextual Nix pattern must use: the sole member's own node
+/// kind. `inherit`/`inherit_from` clauses are real syntax worth finding, so
+/// they are addressable on their own; a wrapper holding any other number of
+/// members is rejected because the selector would match one of them and
+/// silently narrow or widen the query.
+fn nix_wrapper_selector(source: &str) -> Option<&'static str> {
     let plain = nix_pattern_without_meta_variables(source);
     let mut parser = tree_sitter::Parser::new();
-    if parser
+    parser
         .set_language(&tree_sitter_nix::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(&plain, None) else {
-        return false;
-    };
+        .ok()?;
+    let tree = parser.parse(&plain, None)?;
     let root = tree.root_node();
     if root.has_error() {
-        return false;
+        return None;
     }
-    let Some(expression) = root.child_by_field_name("expression") else {
-        return false;
-    };
+    let expression = root.child_by_field_name("expression")?;
     let mut cursor = expression.walk();
-    let Some(set) = expression
+    let set = expression
         .named_children(&mut cursor)
-        .find(|child| child.kind() == "binding_set")
-    else {
-        return false;
-    };
+        .find(|child| child.kind() == "binding_set")?;
     let mut set_cursor = set.walk();
     let members: Vec<tree_sitter::Node> = set.named_children(&mut set_cursor).collect();
-    members.len() == 1 && members[0].kind() == "binding"
+    let [only] = members.as_slice() else {
+        return None;
+    };
+    match only.kind() {
+        "binding" => Some("binding"),
+        "inherit" => Some("inherit"),
+        "inherit_from" => Some("inherit_from"),
+        _ => None,
+    }
 }
 
 fn php_snippet_selector(pattern: &str) -> Result<String, PatternError> {
@@ -612,6 +613,34 @@ mod tests {
             .find_all(&upper)
             .count();
         assert_eq!(upper_matches, 2, "`_` + uppercase binds as a metavariable");
+    }
+
+    #[test]
+    fn test_nix_contextual_inherit_patterns() {
+        let lang = AstGrepLang::Nix;
+        let source = "{ foo = true; inherit bar; inherit (lib) mkIf; }";
+
+        let plain = lang
+            .compile_pattern("inherit $NAME;")
+            .expect("an inherit clause pattern compiles");
+        let matched: Vec<String> = lang
+            .ast_grep(source)
+            .root()
+            .find_all(&plain)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(matched, vec!["inherit bar;"]);
+
+        let from = lang
+            .compile_pattern("inherit ($SRC) $NAME;")
+            .expect("an inherit-from pattern compiles");
+        let matched: Vec<String> = lang
+            .ast_grep(source)
+            .root()
+            .find_all(&from)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(matched, vec!["inherit (lib) mkIf;"]);
     }
 
     #[test]

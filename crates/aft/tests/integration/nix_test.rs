@@ -67,7 +67,10 @@ fn nix_outline_zoom_and_language_label() {
     );
     assert_eq!(flake_outline["success"], true, "{flake_outline:?}");
     let flake_text = flake_outline["text"].as_str().unwrap();
-    assert!(flake_text.contains("devShells.default"), "{flake_text}");
+    assert!(
+        flake_text.contains("devShells.x86_64-linux.default"),
+        "{flake_text}"
+    );
     assert!(
         flake_text.contains("outputs = inputs@"),
         "function binding must keep its name in the outline: {flake_text}"
@@ -91,7 +94,7 @@ fn nix_outline_zoom_and_language_label() {
             "id": "zoom-nix",
             "command": "zoom",
             "file": dir.path().join("flake.nix"),
-            "symbol": "outputs.devShells.default",
+            "symbol": "outputs.devShells.x86_64-linux.default",
             "context_lines": 0,
         })
         .to_string(),
@@ -106,7 +109,7 @@ fn nix_outline_zoom_and_language_label() {
             .as_str()
             .unwrap_or_default()
             .trim_start()
-            .starts_with("devShells.default ="),
+            .starts_with("devShells.x86_64-linux.default ="),
         "zoom must return the nested binding, not the whole outputs expression: {zoom:?}"
     );
 
@@ -211,7 +214,7 @@ fn nix_unsupported_columns_report_no_edges() {
             "id": "zoom-nix-callgraph",
             "command": "zoom",
             "file": dir.path().join("flake.nix"),
-            "symbol": "outputs.devShells.default",
+            "symbol": "outputs.devShells.x86_64-linux.default",
         })
         .to_string(),
     );

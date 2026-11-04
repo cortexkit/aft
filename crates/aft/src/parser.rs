@@ -6737,7 +6737,8 @@ fn nix_unwrap_parentheses(mut node: Node) -> Node {
 }
 
 /// The `binding_set` a value produces after unwrapping parentheses, a function
-/// body, or a `let … in` body. `None` when the value is not an attribute set.
+/// body, an application's final argument, or a `let … in` body. `None` when the
+/// value is not an attribute set.
 fn nix_value_binding_set(node: Node) -> Option<Node> {
     let mut current = nix_unwrap_parentheses(node);
     loop {
@@ -6748,6 +6749,13 @@ fn nix_value_binding_set(node: Node) -> Option<Node> {
             }
             "let_expression" => {
                 current = current.child_by_field_name("body")?;
+                current = nix_unwrap_parentheses(current);
+            }
+            // Module and package values are commonly wrapped in a call
+            // (`config = lib.mkIf cond { … }`); the final argument is the
+            // configuration attrset, the same rule the entry walk applies.
+            "apply_expression" => {
+                current = current.child_by_field_name("argument")?;
                 current = nix_unwrap_parentheses(current);
             }
             "attrset_expression" | "rec_attrset_expression" | "let_attrset_expression" => {
@@ -12147,6 +12155,28 @@ const helpers = {
     }
 
     #[test]
+    fn nix_nested_application_values_expand_one_level() {
+        let names = nix_names("{\n  config = lib.mkIf true { services.demo.enable = true; };\n}\n");
+        assert!(
+            names.contains(&"services.demo.enable".to_string()),
+            "an application-wrapped value must nest one level: {names:?}"
+        );
+
+        // The depth stop still applies: the nested binding's own child is not
+        // expanded even though its value is an attrset.
+        let deep = nix_names("{\n  config = f { a = { b = 1; }; };\n}\n");
+        assert!(deep.contains(&"a".to_string()), "{deep:?}");
+        assert!(!deep.contains(&"b".to_string()), "{deep:?}");
+
+        // Only an attribute-set argument is followed; lists and `//` splits
+        // nested in a binding still contribute nothing.
+        let shapes = nix_names(
+            "{\n  config = lib.mkMerge [ { a = 1; } { b = 2; } ];\n  other = { x = 1; } // { y = 2; };\n}\n",
+        );
+        assert_eq!(shapes, vec!["config".to_string(), "other".to_string()]);
+    }
+
+    #[test]
     fn nix_applied_let_argument_keeps_file_level_bindings() {
         let names = nix_names("stdenv.mkDerivation (let v = \"1\"; in { version = v; })\n");
         assert!(names.contains(&"v".to_string()), "{names:?}");
@@ -12216,7 +12246,7 @@ const helpers = {
 
     #[test]
     fn nix_flake_outline_nests_outputs_one_level() {
-        let source = "{\n  outputs = inputs@{ self, nixpkgs }: {\n    devShells.default = nixpkgs.legacyPackages.x86_64-linux.mkShell { };\n  };\n}\n";
+        let source = "{\n  outputs = inputs@{ self, nixpkgs }: {\n    devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShell { };\n  };\n}\n";
         let symbols = nix_symbols(source);
         let outputs = symbols
             .iter()
@@ -12235,11 +12265,14 @@ const helpers = {
 
         let dev_shell = symbols
             .iter()
-            .find(|symbol| symbol.name == "devShells.default")
+            .find(|symbol| symbol.name == "devShells.x86_64-linux.default")
             .expect("nested flake output");
         assert_eq!(dev_shell.scope_chain, vec!["outputs"]);
         assert_eq!(dev_shell.parent.as_deref(), Some("outputs"));
-        assert!(symbol_query_matches(dev_shell, "outputs.devShells.default"));
+        assert!(symbol_query_matches(
+            dev_shell,
+            "outputs.devShells.x86_64-linux.default"
+        ));
     }
 
     #[test]

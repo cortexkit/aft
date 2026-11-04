@@ -184,7 +184,8 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // Auto-validate after edits: "syntax" (tree-sitter, fast) or "full" (runs type checker)
   "validate_on_edit": "syntax",
 
-  // Per-language formatter overrides (auto-detected from project config files if omitted)
+  // Per-language formatter overrides (auto-detected from project config files if omitted;
+  // "nix" has no auto-detection and formats only when set explicitly to "nixfmt")
   // Keys: "typescript", "python", "rust", "go", "nix"
   // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "nixfmt" | "none"
   "formatter": {
