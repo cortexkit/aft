@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aft",
+    "crates/aft-store",
     "crates/aft-tokenizer",
     "crates/aft-fake-lsp",
     "crates/secret-rules",

@@ -19,6 +19,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aft-store"
+version = "0.63.4"
+dependencies = [
+ "blake3",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "aft-test-fake-lsp-server"
 version = "0.0.0"
 dependencies = [

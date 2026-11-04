@@ -1,0 +1,36 @@
+[package]
+name = "aft-store"
+version = "0.63.4"
+edition = "2024"
+description = "On-disk index formats for Agent File Tools"
+license = "MIT"
+rust-version.workspace = true
+# Nothing depends on this crate yet, so it is not published. It must be
+# published alongside agent-file-tools once that crate depends on it.
+publish = false
+
+[dependencies]
+blake3 = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+# Stored formats convert between widths constantly; every narrowing must be
+# checked, never silently truncated.
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+unwrap_used = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"
