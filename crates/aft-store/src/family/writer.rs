@@ -10,6 +10,7 @@ use super::lease::{self, LeaseScan};
 use super::manifest::{Manifest, SegmentEntry, StateRef};
 use super::record::{self, Kind, RecordError};
 use super::{Family, FamilyError, HORIZON_PREFIX, MANIFEST_PREFIX, STATE_PREFIX, numbered_desc};
+use crate::checkout::CheckoutState;
 use crate::ids::{CheckoutId, Digest128, Generation, SegmentId, WriterIncarnation};
 use crate::segment::{SegmentMeta, SegmentWriter};
 
@@ -238,6 +239,19 @@ impl<'f> WriteSession<'f> {
         };
         self.staged_states.insert((checkout, number), state);
         Ok(state)
+    }
+
+    /// Writes a checkout state as a new state file and stages it.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_state`](Self::write_state).
+    pub fn write_checkout_state(
+        &mut self,
+        checkout: CheckoutId,
+        state: &CheckoutState,
+    ) -> Result<StateRef, FamilyError> {
+        self.write_state(checkout, &state.encode())
     }
 
     /// Publishes a new generation: the current one with `change` applied.

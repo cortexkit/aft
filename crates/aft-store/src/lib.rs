@@ -10,11 +10,13 @@
 //! defines the formats and the code that writes, verifies and reads them.
 
 pub mod cache;
+pub mod checkout;
 pub mod family;
 pub mod ids;
 pub mod postings;
 pub mod segment;
 pub mod table;
+pub mod text;
 
 mod fault;
 mod fs;

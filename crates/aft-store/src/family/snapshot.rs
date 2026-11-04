@@ -8,6 +8,7 @@ use super::manifest::Manifest;
 use super::record::{self, Kind};
 use super::{Family, FamilyError, Layout};
 use crate::cache::BlockCache;
+use crate::checkout::CheckoutState;
 use crate::ids::{CheckoutId, Digest128, FamilyId, Generation, SegmentId};
 use crate::segment::{KnownSection, Segment};
 
@@ -141,5 +142,29 @@ impl Snapshot {
             });
         }
         Ok(Some(payload))
+    }
+
+    /// A checkout's state at this generation, decoded.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_state`](Self::read_state), and when the payload is not a
+    /// well-formed state.
+    pub fn checkout_state(
+        &self,
+        checkout: CheckoutId,
+    ) -> Result<Option<CheckoutState>, FamilyError> {
+        let Some(payload) = self.read_state(checkout)? else {
+            return Ok(None);
+        };
+        CheckoutState::decode(&payload).map(Some).map_err(|error| {
+            let path = self
+                .manifest
+                .checkout(checkout)
+                .map_or_else(PathBuf::new, |state| {
+                    self.layout.state(checkout, state.number)
+                });
+            FamilyError::record(&path, error)
+        })
     }
 }

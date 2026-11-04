@@ -42,7 +42,7 @@
 
 mod lease;
 mod manifest;
-mod record;
+pub(crate) mod record;
 mod snapshot;
 mod writer;
 

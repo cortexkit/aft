@@ -11,9 +11,11 @@ publish = false
 
 [dependencies]
 blake3 = "1"
+regex-syntax = "0.8"
 thiserror = "2"
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3"
 
 [lints.rust]

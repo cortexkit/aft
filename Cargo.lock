@@ -23,6 +23,8 @@ name = "aft-store"
 version = "0.63.4"
 dependencies = [
  "blake3",
+ "regex",
+ "regex-syntax",
  "tempfile",
  "thiserror 2.0.18",
 ]
