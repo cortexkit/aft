@@ -14049,10 +14049,11 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(root.get("actor_count").and_then(Value::as_u64), Some(1));
     assert_eq!(root.get("state").and_then(Value::as_str), Some("ready"));
-    // The data layer serves text search and the call graph; a plane the
-    // bind's configuration switches off reports "off", the word every index
-    // consumer uses (spec/feature-config/consumer-responses.json). Semantic
-    // search still reports its own index.
+    // The data layer serves the text search index and the call graph; when
+    // the bind's configuration switches either off, health reports it "off",
+    // the word every index consumer uses
+    // (spec/feature-config/consumer-responses.json). Semantic search still
+    // reports its own index.
     assert_eq!(
         root.pointer("/search_index/status").and_then(Value::as_str),
         Some("off")

@@ -8288,10 +8288,11 @@ mod tests {
             Some("1 root(s) warming background indexes (serving normally)")
         );
         let metrics = report.metrics.expect("health metrics");
-        // The data layer serves text search and the call graph; a plane the
-        // configuration switches off reports "off", the word every index
-        // consumer uses (spec/feature-config/consumer-responses.json).
-        // Semantic search still reports its own index.
+        // The data layer serves the text search index and the call graph;
+        // when the configuration switches either off, health reports it
+        // "off", the word every index consumer uses
+        // (spec/feature-config/consumer-responses.json). Semantic search
+        // still reports its own index.
         assert_eq!(metrics["roots"][0]["search_index"]["status"], "off");
         assert_eq!(metrics["roots"][0]["semantic_index"]["status"], "disabled");
         assert_eq!(metrics["roots"][0]["callgraph_store"]["status"], "off");
@@ -8365,8 +8366,9 @@ mod tests {
             config,
         ));
         ctx.set_canonical_cache_root(root.as_path().to_path_buf());
-        // Bound with the text plane alone: the call graph is off because the
-        // configuration switches it off, not because nothing bound the root.
+        // The root's checkout is bound and builds the text search index
+        // alone: the call graph reports off because the configuration
+        // switches it off, not because nothing has bound the root yet.
         let checkout = ctx.data_checkout().expect("the data layer binds the root");
         assert!(!checkout.checkout().planes().callgraph);
         assert!(executor.register_actor(root.clone(), ctx));

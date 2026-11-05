@@ -7106,10 +7106,10 @@ mod tests {
     }
 
     /// Waits up to 60 s for `ctx`'s checkout in the data layer to publish
-    /// both planes with no recorded edit pending. The text plane is published
-    /// before the call graph, and the call graph's publication is a new one
-    /// that changes the view's text generation, so a test counting the reads
-    /// of one text generation waits for both.
+    /// both its text search index and its call graph, with no recorded edit
+    /// pending. The text index is published first, and the call graph's
+    /// publication is a new one that changes the view's text generation, so
+    /// a test counting the reads of one text generation waits for both.
     fn wait_for_data_layer_settled(ctx: &AppContext) {
         use crate::data_layer::surfaces::{report, READY};
         let started = Instant::now();
@@ -7130,7 +7130,8 @@ mod tests {
     }
 
     /// A configured context over `root`, with the data layer on for the
-    /// calling thread and its family store under `storage`.
+    /// calling thread and its storage folder (where the data layer keeps its
+    /// index store) at `storage`.
     fn data_layer_context(root: &Path, storage: &Path) -> AppContext {
         crate::data_layer::runtime::force_on_for_test();
         let ctx = AppContext::new(

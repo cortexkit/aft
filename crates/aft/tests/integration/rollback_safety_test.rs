@@ -307,7 +307,8 @@ fn future_index_store_manifest_is_refused_by_name_and_left_byte_identical() {
     let segments_before = listing(&family_dir.join("segments"));
 
     let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": true }));
-    // A query binds the root's checkout, which reads the newest manifest.
+    // The first query of the root binds its checkout in the data layer: it
+    // opens the index store and reads the newest manifest there.
     let grep: RawRequest = serde_json::from_value(json!({
         "id": "grep-rollback-safety",
         "command": "grep",

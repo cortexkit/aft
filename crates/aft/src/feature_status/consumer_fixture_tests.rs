@@ -303,16 +303,17 @@ fn aft_callgraph_matches_the_shared_fixtures() {
 }
 
 /// A context over `files` for zoom's call-graph field, with the data layer on
-/// for the calling thread and a family store of its own, and the root's
-/// checkout in the named scenario. Returns the project and storage folders
-/// with it, to keep them for the call.
+/// for the calling thread and a storage folder of its own (where the data
+/// layer keeps its index store), and the root's checkout in the named
+/// scenario. Returns the project and storage folders with it, to keep them
+/// for the call.
 /// - `off`: every index configured off, so the checkout is never bound;
 /// - `unavailable`: the call graph enabled, and nothing has bound the root
 ///   yet, so nothing is built;
 /// - `building` and `partially_ready`: the caller holds the checkout's slot
 ///   as a bind in progress does (`AppContext::hold_data_checkout_slot_for_test`).
-///   The call graph is building in both; zoom does not read the text plane
-///   that is ready in the second.
+///   The call graph is building in both; zoom does not read the text search
+///   index that is ready in the second.
 fn data_layer_scenario(
     name: &str,
     files: &[(&str, &str)],
