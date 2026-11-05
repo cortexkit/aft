@@ -582,38 +582,124 @@ mod tests {
         )
     }
 
+    /// One ranked row: its score's bits, its fields, and what it shows apart
+    /// from its file (so two copies of one chunk in two files compare equal).
+    type Ranked = (u32, String, String);
+
+    fn ranked(result: &SemanticResult) -> Ranked {
+        (
+            result.score.to_bits(),
+            row(result),
+            format!(
+                "{} {:?} {} {:?}",
+                result.name, result.kind, result.exported, result.snippet
+            ),
+        )
+    }
+
+    /// How two answers to one question compare.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Same,
+        /// The same score sequence, and the same rows within every run of
+        /// equal scores, the run cut by `k` excepted (its rows are any of
+        /// the chunks with that score): only equal scores are in another
+        /// order. `duplicates` when every reordered run holds copies of one
+        /// chunk, `first_page` when a reordered row is among the first ten.
+        TiesOnly {
+            duplicates: bool,
+            first_page: bool,
+        },
+        Different,
+    }
+
+    fn verdict(today: &[Ranked], data: &[Ranked], k: usize) -> Verdict {
+        if today == data {
+            return Verdict::Same;
+        }
+        if today.len() != data.len() || today.iter().zip(data).any(|(a, b)| a.0 != b.0) {
+            return Verdict::Different;
+        }
+        let mut duplicates = true;
+        let mut first_page = false;
+        let mut start = 0;
+        while start < today.len() {
+            let end = start + today[start..].partition_point(|row| row.0 == today[start].0);
+            let (left, right) = (&today[start..end], &data[start..end]);
+            if left != right {
+                let cut = end == today.len() && today.len() == k;
+                let mut left_rows: Vec<&String> = left.iter().map(|row| &row.1).collect();
+                let mut right_rows: Vec<&String> = right.iter().map(|row| &row.1).collect();
+                left_rows.sort_unstable();
+                right_rows.sort_unstable();
+                if !cut && left_rows != right_rows {
+                    return Verdict::Different;
+                }
+                duplicates &= left.iter().chain(right).all(|row| row.2 == left[0].2);
+                first_page |= left
+                    .iter()
+                    .zip(right)
+                    .position(|(a, b)| a != b)
+                    .is_some_and(|offset| start + offset < 10);
+            }
+            start = end;
+        }
+        Verdict::TiesOnly {
+            duplicates,
+            first_page,
+        }
+    }
+
     /// What one comparison found over the query list, recorded as it goes
     /// so no answer is kept past its comparison.
     #[derive(Default)]
     struct Tally {
         queries: usize,
         differing: usize,
+        ties_only: usize,
+        ties_only_duplicates: usize,
+        ties_only_first_page: usize,
         today: Duration,
         data: Duration,
         examples: Vec<Value>,
+        tie_examples: Vec<Value>,
     }
 
     impl Tally {
         fn record(
             &mut self,
             query: &str,
-            today: (Vec<String>, Duration),
-            data: (Vec<String>, Duration),
+            k: usize,
+            today: (Vec<Ranked>, Duration),
+            data: (Vec<Ranked>, Duration),
         ) {
             self.queries += 1;
             self.today += today.1;
             self.data += data.1;
-            if today.0 == data.0 {
-                return;
-            }
-            self.differing += 1;
-            if self.examples.len() >= 25 {
+            let examples = match verdict(&today.0, &data.0, k) {
+                Verdict::Same => return,
+                Verdict::TiesOnly {
+                    duplicates,
+                    first_page,
+                } => {
+                    self.ties_only += 1;
+                    self.ties_only_duplicates += usize::from(duplicates);
+                    self.ties_only_first_page += usize::from(first_page);
+                    &mut self.tie_examples
+                }
+                Verdict::Different => {
+                    self.differing += 1;
+                    &mut self.examples
+                }
+            };
+            if examples.len() >= 25 {
                 return;
             }
             let parted = today.0.iter().zip(&data.0).position(|(a, b)| a != b);
-            let clip =
-                |line: Option<&String>| line.map(|line| line.chars().take(400).collect::<String>());
-            self.examples.push(json!({
+            let clip = |line: Option<&Ranked>| {
+                line.map(|line| line.1.chars().take(400).collect::<String>())
+            };
+            examples.push(json!({
                 "query": query,
                 "today_rows": today.0.len(),
                 "data_rows": data.0.len(),
@@ -629,9 +715,13 @@ mod tests {
             json!({
                 "queries": self.queries,
                 "differing": self.differing,
+                "allowed_ties_in_path_order": self.ties_only,
+                "ties_between_copies_of_one_chunk": self.ties_only_duplicates,
+                "ties_reordered_in_first_ten": self.ties_only_first_page,
                 "today_ms_per_call": per_call(self.today),
                 "data_ms_per_call": per_call(self.data),
                 "examples": self.examples,
+                "tie_examples": self.tie_examples,
             })
         }
     }
@@ -645,7 +735,8 @@ mod tests {
     /// Asks today's semantic index and the data layer's meaning plane, built
     /// from the same checkout with the same embedder, the semantic lane's
     /// question for each distinct query of a real query list, and writes
-    /// what differs and what each costs. The gate for wiring aft_search's
+    /// what differs and what each costs. Answers that differ only in the
+    /// order of equal scores are counted apart (see [`Verdict::TiesOnly`]). The gate for wiring aft_search's
     /// semantic lane onto the data layer runs it on aft's own checkout:
     ///
     /// `AFT_MEANING_PARITY_ROOT=<checkout> AFT_MEANING_PARITY_QUERIES=<one
@@ -795,15 +886,18 @@ mod tests {
                                         .search_filtered(&vector, k, &include)
                                         .unwrap()
                                         .iter()
-                                        .map(row)
+                                        .map(ranked)
                                         .collect::<Vec<_>>()
                                 })
                             };
-                            found.push((name, ask(today_index), ask(data_index)));
+                            found.push((name, k, ask(today_index), ask(data_index)));
                         }
                         let mut tallies = tallies.lock().unwrap();
-                        for (name, today, data) in found {
-                            tallies.entry(name).or_default().record(query, today, data);
+                        for (name, k, today, data) in found {
+                            tallies
+                                .entry(name)
+                                .or_default()
+                                .record(query, k, today, data);
                         }
                         let finished = tallies.get("lane").map_or(0, |tally| tally.queries);
                         if finished % 500 == 0 {
@@ -842,9 +936,12 @@ mod tests {
         for (name, tally) in &tallies {
             report[*name] = tally.summary();
             println!(
-                "{name}: {} of {} differ; today {:.3} ms, data layer {:.3} ms per call",
+                "{name}: {} of {} differ, {} only in the order of equal scores ({} of them copies of one chunk, {} within the first ten); today {:.3} ms, data layer {:.3} ms per call",
                 tally.differing,
                 tally.queries,
+                tally.ties_only,
+                tally.ties_only_duplicates,
+                tally.ties_only_first_page,
                 tally.today.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
                 tally.data.as_secs_f64() * 1000.0 / tally.queries.max(1) as f64,
             );
@@ -855,6 +952,9 @@ mod tests {
             .filter(|(_, tally)| tally.differing > 0)
             .map(|(name, tally)| format!("{name}: {} of {}", tally.differing, tally.queries))
             .collect::<Vec<_>>();
+        // Equal scores are in path order on the data layer and in today's
+        // build order (newest file first) there; every other difference
+        // fails.
         assert!(
             failing.is_empty(),
             "semantic lane answers differ: {failing:?}"
