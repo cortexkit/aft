@@ -299,7 +299,9 @@ pub struct DeltaReport {
     /// Content records written: the changed parsed and configuration files.
     pub records: usize,
     pub text_units: usize,
-    /// Segments in the family's store afterwards.
+    /// Segments this checkout's text, content and call graph read from
+    /// afterwards. Vector segments and other checkouts' segments are not
+    /// counted: a build of this checkout cannot fold them.
     pub segments: usize,
     pub ms: f64,
 }
@@ -1072,18 +1074,71 @@ impl Checkout {
     }
 
     /// Segments of the current generation that no other checkout's state
-    /// reads: for every text unit, content record and fragment another
-    /// checkout needs, readers take the newest segment that holds it, so
-    /// only those segments are kept. Vector segments follow their own rule
-    /// ([`super::vectors::needed_vector_segments`]), over every other
-    /// checkout's state and `own`, the state this build publishes, since
-    /// the build's new segment holds no vectors.
+    /// reads (see [`Self::segments_read_by`]). Vector segments follow their
+    /// own rule ([`super::vectors::needed_vector_segments`]), over every
+    /// other checkout's state and `own`, the state this build publishes,
+    /// since the build's new segment holds no vectors.
     fn unneeded_segments(&self, own: &CheckoutState) -> Result<Vec<SegmentId>, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let mut states = Vec::new();
+        for state_ref in snapshot.manifest().checkouts() {
+            if state_ref.checkout == self.checkout {
+                continue;
+            }
+            match snapshot.checkout_state(state_ref.checkout) {
+                Ok(Some(state)) => states.push(state),
+                Ok(None) => {}
+                // A state this build cannot read could need any segment.
+                Err(error) if error.is_unusable_file() => return Ok(Vec::new()),
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        let others = states.iter().collect::<Vec<_>>();
+        let read = self.segments_read_by(&snapshot, &others)?;
+        let mut needed = read.needed;
+        let mut readers = others;
+        readers.push(own);
+        let usable = read
+            .usable
+            .iter()
+            .map(|&index| {
+                read.opened[index]
+                    .as_ref()
+                    .expect("usable segments are open")
+            })
+            .collect::<Vec<_>>();
+        for (&index, vectors) in read
+            .usable
+            .iter()
+            .zip(super::vectors::needed_vector_segments(&usable, &readers)?)
+        {
+            needed[index] |= vectors;
+        }
+        Ok(read
+            .entries
+            .iter()
+            .zip(needed)
+            .filter(|(_, needed)| !needed)
+            .map(|(entry, _)| entry.id)
+            .collect())
+    }
+
+    /// For each segment of `snapshot`, in manifest order, whether a member
+    /// of `states` reads a text unit, content record or call-graph fragment
+    /// from it. For each one a member needs, readers take the newest
+    /// segment that holds it, so only that segment is marked. A member that
+    /// needs something no usable segment holds may find it in one this
+    /// build cannot read (another format version, or damaged), so then
+    /// every such segment is marked too.
+    fn segments_read_by(
+        &self,
+        snapshot: &Snapshot,
+        states: &[&CheckoutState],
+    ) -> Result<SegmentsRead, DataError> {
         let known = known_sections();
         let entries = snapshot.manifest().segments().to_vec();
         // Each segment this build can use, by its place in the manifest;
-        // `None` for one it cannot (another format version, or damaged).
+        // `None` for one it cannot.
         let mut opened = Vec::with_capacity(entries.len());
         for entry in &entries {
             match snapshot.open_segment(entry.id, &known, Arc::clone(&self.layer.cache)) {
@@ -1092,101 +1147,77 @@ impl Checkout {
                 Err(error) => return Err(DataError::store(error)),
             }
         }
-        let usable = opened
-            .iter()
-            .enumerate()
-            .filter_map(|(index, segment)| segment.as_ref().map(|segment| (index, segment)))
+        let usable = (0..opened.len())
+            .filter(|&index| opened[index].is_some())
             .collect::<Vec<_>>();
-        // TextLocator numbers only the segments that have a text section,
-        // so keep each one's place in the manifest beside it.
-        let mut text_index = Vec::new();
-        let mut texts = Vec::new();
-        for (index, segment) in &usable {
-            if let Some(text) = TextSegment::open(segment).map_err(DataError::store)? {
-                text_index.push(*index);
-                texts.push(text);
-            }
-        }
-        let contents = usable
-            .iter()
-            .map(|(_, segment)| ContentSegment::open(segment).map_err(DataError::store))
-            .collect::<Result<Vec<_>, _>>()?;
-        let graphs = usable
-            .iter()
-            .map(|(_, segment)| GraphSegment::open(segment).map_err(DataError::store))
-            .collect::<Result<Vec<_>, _>>()?;
-        let locator = TextLocator::build(&texts).map_err(DataError::store)?;
         let mut needed = vec![false; entries.len()];
-        // Whether another checkout needs something no usable segment holds:
-        // it may be in one this build cannot read, so those all stay.
-        let mut needs_unusable = false;
-        let mut states = Vec::new();
-        for state_ref in snapshot.manifest().checkouts() {
-            if state_ref.checkout == self.checkout {
-                continue;
-            }
-            let state = match snapshot.checkout_state(state_ref.checkout) {
-                Ok(Some(state)) => state,
-                Ok(None) => continue,
-                // A state this build cannot read could need any segment.
-                Err(error) if error.is_unusable_file() => return Ok(Vec::new()),
-                Err(error) => return Err(DataError::store(error)),
-            };
-            for (index, record) in state.paths().iter().enumerate() {
-                match locator.get(record.content) {
-                    Some(Located::Indexed { segment, .. }) => {
-                        needed[text_index[segment as usize]] = true;
-                    }
-                    Some(_) => {}
-                    None if record.kind == PathKind::Text
-                        && record.stat.size <= self.layer.policy.max_indexed_len =>
-                    {
-                        needs_unusable = true;
-                    }
-                    None => {}
-                }
-                if !record.language.is_empty() {
-                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
-                    match newest_holder(&contents, |content| content.find(key))? {
-                        Some(holder) => needed[usable[holder].0] = true,
-                        None => needs_unusable = true,
-                    }
-                }
-                if let Some(fragment) = state.fragment(index) {
-                    let key = FragmentKey::from_digest(fragment);
-                    match newest_holder(&graphs, |graph| graph.find(key))? {
-                        Some(holder) => needed[usable[holder].0] = true,
-                        None => needs_unusable = true,
-                    }
+        {
+            let segment = |index: usize| opened[index].as_ref().expect("usable segments are open");
+            // TextLocator numbers only the segments that have a text
+            // section, so keep each one's place in the manifest beside it.
+            let mut text_index = Vec::new();
+            let mut texts = Vec::new();
+            for &index in &usable {
+                if let Some(text) = TextSegment::open(segment(index)).map_err(DataError::store)? {
+                    text_index.push(index);
+                    texts.push(text);
                 }
             }
-            states.push(state);
-        }
-        let mut readers: Vec<&CheckoutState> = states.iter().collect();
-        readers.push(own);
-        let usable_segments = usable
-            .iter()
-            .map(|(_, segment)| *segment)
-            .collect::<Vec<_>>();
-        for ((index, _), vectors) in usable.iter().zip(super::vectors::needed_vector_segments(
-            &usable_segments,
-            &readers,
-        )?) {
-            needed[*index] |= vectors;
-        }
-        if needs_unusable {
-            for (index, segment) in opened.iter().enumerate() {
-                if segment.is_none() {
-                    needed[index] = true;
+            let contents = usable
+                .iter()
+                .map(|&index| ContentSegment::open(segment(index)).map_err(DataError::store))
+                .collect::<Result<Vec<_>, _>>()?;
+            let graphs = usable
+                .iter()
+                .map(|&index| GraphSegment::open(segment(index)).map_err(DataError::store))
+                .collect::<Result<Vec<_>, _>>()?;
+            let locator = TextLocator::build(&texts).map_err(DataError::store)?;
+            let mut needs_unusable = false;
+            for state in states {
+                for (position, record) in state.paths().iter().enumerate() {
+                    match locator.get(record.content) {
+                        Some(Located::Indexed { segment, .. }) => {
+                            needed[text_index[segment as usize]] = true;
+                        }
+                        Some(_) => {}
+                        None if record.kind == PathKind::Text
+                            && record.stat.size <= self.layer.policy.max_indexed_len =>
+                        {
+                            needs_unusable = true;
+                        }
+                        None => {}
+                    }
+                    if !record.language.is_empty() {
+                        let key =
+                            RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                        match newest_holder(&contents, |content| content.find(key))? {
+                            Some(holder) => needed[usable[holder]] = true,
+                            None => needs_unusable = true,
+                        }
+                    }
+                    if let Some(fragment) = state.fragment(position) {
+                        let key = FragmentKey::from_digest(fragment);
+                        match newest_holder(&graphs, |graph| graph.find(key))? {
+                            Some(holder) => needed[usable[holder]] = true,
+                            None => needs_unusable = true,
+                        }
+                    }
+                }
+            }
+            if needs_unusable {
+                for (index, segment) in opened.iter().enumerate() {
+                    if segment.is_none() {
+                        needed[index] = true;
+                    }
                 }
             }
         }
-        Ok(entries
-            .iter()
-            .zip(needed)
-            .filter(|(_, needed)| !needed)
-            .map(|(entry, _)| entry.id)
-            .collect())
+        Ok(SegmentsRead {
+            entries,
+            opened,
+            usable,
+            needed,
+        })
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -1558,12 +1589,13 @@ impl Checkout {
         let _ = session.reclaim();
         drop(session);
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let read = self.segments_read_by(&snapshot, &[&state])?;
         let report = DeltaReport {
             paths: changes.len(),
             fragments: fragments.len(),
             records: records.len(),
             text_units: text_unit_count,
-            segments: snapshot.manifest().segments().len(),
+            segments: read.needed.iter().filter(|needed| **needed).count(),
             ms: 0.0,
         };
         self.serve_new(snapshot, covered)?;
@@ -2314,6 +2346,18 @@ fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
 }
 
 /// The index of the newest segment `find` locates a key in.
+/// What [`Checkout::segments_read_by`] found in one generation.
+struct SegmentsRead {
+    entries: Vec<aft_store::family::SegmentEntry>,
+    /// Each segment by its place in the manifest; `None` when this build
+    /// cannot use it.
+    opened: Vec<Option<Segment>>,
+    /// The places of the segments in `opened` that are open.
+    usable: Vec<usize>,
+    /// By place in the manifest: some given state reads from it.
+    needed: Vec<bool>,
+}
+
 fn newest_holder<T>(
     segments: &[Option<T>],
     find: impl Fn(&T) -> Result<Option<u32>, aft_store::segment::SegmentError>,

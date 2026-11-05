@@ -138,9 +138,11 @@ pub(crate) enum Fresh {
 /// otherwise when the checkout goes quiet.
 const PUBLISH_AT: usize = 64;
 
-/// A family store holding more segments than this is built again whole,
-/// which writes everything a checkout reads into one segment and retires
-/// the rest; each publication of changes adds one.
+/// A checkout whose text and call graph read from more segments than this
+/// is built again whole, which writes everything it reads into one segment
+/// and retires what no other checkout reads; each publication of its
+/// changes adds one. Vector segments are not counted, since a build does
+/// not fold them.
 const COMPACT_AT: usize = 8;
 
 /// Whether a refresh publishes the changes it resolved.
