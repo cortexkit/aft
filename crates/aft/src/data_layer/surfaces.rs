@@ -579,9 +579,11 @@ mod tests {
             "mod util;\npub fn caller() { util::callee(); }\n",
         );
         write(root, "src/util.rs", "pub fn callee() {}\n");
-        let mut config = crate::config::Config::default();
-        config.project_root = Some(root.to_path_buf());
-        config.storage_dir = Some(storage.to_path_buf());
+        let config = crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            storage_dir: Some(storage.to_path_buf()),
+            ..crate::config::Config::default()
+        };
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx

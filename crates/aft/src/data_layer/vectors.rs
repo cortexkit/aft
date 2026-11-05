@@ -800,9 +800,13 @@ impl VectorPlane {
             });
             let file_index = members.file_of[position];
             let file = &members.files[file_index as usize];
-            if !details.contains_key(&file_index) {
-                let read = Loaded::details(&index, file.holder, file.content, &file.path)?;
-                details.insert(file_index, read);
+            if let std::collections::hash_map::Entry::Vacant(slot) = details.entry(file_index) {
+                slot.insert(Loaded::details(
+                    &index,
+                    file.holder,
+                    file.content,
+                    &file.path,
+                )?);
             }
             let detail = &details[&file_index].chunks[members.chunk_of[position] as usize];
             let kind = kind_of(detail.kind)
@@ -1229,7 +1233,7 @@ mod tests {
     fn vector_of(text: &str) -> Vec<f32> {
         let hash = blake3::hash(text.as_bytes());
         let bytes = hash.as_bytes();
-        if bytes[0] % 4 == 0 {
+        if bytes[0].is_multiple_of(4) {
             return (0..DIMENSIONS).map(|i| 0.25 + i as f32 / 32.0).collect();
         }
         (0..DIMENSIONS)
@@ -1801,7 +1805,7 @@ mod tests {
         );
         let names = |view: &CheckoutView| {
             plane
-                .search(view, &vec![0.0; DIMENSIONS], 1000, &|_| true)
+                .search(view, &[0.0; DIMENSIONS], 1000, &|_| true)
                 .unwrap()
                 .results
                 .into_iter()

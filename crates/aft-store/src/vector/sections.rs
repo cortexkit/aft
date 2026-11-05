@@ -228,8 +228,11 @@ impl FileDetails {
 pub struct VectorSectionsBuilder {
     model: ModelIdentity,
     vectors: BTreeMap<TextDigest, Vec<f32>>,
-    maps: BTreeMap<ChunkMapKey, (Vec<u8>, Vec<Chunk>, Option<FileDetails>)>,
+    maps: BTreeMap<ChunkMapKey, MapEntry>,
 }
+
+/// A chunk map being written: its path, its chunks and their details.
+type MapEntry = (Vec<u8>, Vec<Chunk>, Option<FileDetails>);
 
 impl VectorSectionsBuilder {
     /// A builder for vectors of `model`.
