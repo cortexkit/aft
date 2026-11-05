@@ -659,6 +659,8 @@ mod tests {
         ties_only: usize,
         ties_only_duplicates: usize,
         ties_only_first_page: usize,
+        /// Queries whose first ten rows today hold two equal scores.
+        ties_in_first_ten: usize,
         today: Duration,
         data: Duration,
         examples: Vec<Value>,
@@ -676,6 +678,9 @@ mod tests {
             self.queries += 1;
             self.today += today.1;
             self.data += data.1;
+            let first_ten = &today.0[..today.0.len().min(10)];
+            self.ties_in_first_ten +=
+                usize::from(first_ten.windows(2).any(|pair| pair[0].0 == pair[1].0));
             let examples = match verdict(&today.0, &data.0, k) {
                 Verdict::Same => return,
                 Verdict::TiesOnly {
@@ -718,6 +723,7 @@ mod tests {
                 "allowed_ties_in_path_order": self.ties_only,
                 "ties_between_copies_of_one_chunk": self.ties_only_duplicates,
                 "ties_reordered_in_first_ten": self.ties_only_first_page,
+                "ties_in_first_ten": self.ties_in_first_ten,
                 "today_ms_per_call": per_call(self.today),
                 "data_ms_per_call": per_call(self.data),
                 "examples": self.examples,
@@ -746,7 +752,13 @@ mod tests {
     /// Today's index is built from the files configure's semantic walk
     /// finds, as configure builds it; the plane from the data layer's scan
     /// of the same tree. `AFT_MEANING_PARITY_THREADS` spreads the queries
-    /// over threads (per-call costs then include the contention).
+    /// over threads (per-call costs then include the contention);
+    /// `AFT_MEANING_PARITY_STRIDE=n` asks every nth query only.
+    /// `AFT_MEANING_PARITY_EMBEDDER=local` embeds with the local model AFT
+    /// ships by default instead of [`hashed_embedding`], each distinct text
+    /// once for both sources; it needs the model's ONNX Runtime
+    /// (`ORT_DYLIB_PATH`) and its files or the network to fetch them
+    /// (`FASTEMBED_CACHE_DIR`).
     #[test]
     #[ignore = "reads the checkout and query list named by AFT_MEANING_PARITY_*"]
     fn meaning_lane_matches_todays_index_on_real_queries() {
@@ -763,11 +775,38 @@ mod tests {
             .and_then(|threads| threads.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
+        let stride = variable("AFT_MEANING_PARITY_STRIDE")
+            .and_then(|stride| stride.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
         let config = SemanticBackendConfig::default();
-        let fingerprint = SemanticIndexFingerprint::for_config_dimension(&config, 384);
+        let mut local = (variable("AFT_MEANING_PARITY_EMBEDDER").as_deref() == Some("local"))
+            .then(|| crate::semantic_index::SemanticEmbeddingModel::from_config(&config).unwrap());
+        let fingerprint = match local.as_mut() {
+            Some(model) => model.fingerprint(&config).unwrap(),
+            None => SemanticIndexFingerprint::for_config_dimension(&config, 384),
+        };
         let caps = fingerprint.embed_text_caps;
+        // Both sources embed the same texts; each distinct one is embedded
+        // once and its vector reused, so they score identical vectors.
+        let mut vectors: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
         let mut embed = |texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
-            Ok(texts.iter().map(|text| hashed_embedding(text)).collect())
+            let missing: Vec<String> = texts
+                .iter()
+                .filter(|text| !vectors.contains_key(*text))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if !missing.is_empty() {
+                let embedded = match local.as_mut() {
+                    Some(model) => model.embed(missing.clone())?,
+                    None => missing.iter().map(|text| hashed_embedding(text)).collect(),
+                };
+                vectors.extend(missing.into_iter().zip(embedded));
+            }
+            Ok(texts.iter().map(|text| vectors[text].clone()).collect())
         };
 
         // Today's index, from configure's semantic walk.
@@ -851,6 +890,11 @@ mod tests {
             .lines()
             .map(str::trim)
             .filter(|query| !query.is_empty() && seen.insert(query.to_string()))
+            .step_by(stride)
+            .collect::<Vec<_>>();
+        let query_vectors = queries
+            .chunks(64)
+            .flat_map(|batch| embed(batch.iter().map(|query| query.to_string()).collect()).unwrap())
             .collect::<Vec<_>>();
         let lane_k = crate::commands::semantic_search::SEMANTIC_ENUMERATION_LIMIT + 1;
         let next = AtomicUsize::new(0);
@@ -866,7 +910,7 @@ mod tests {
                         let Some(query) = queries.get(index) else {
                             break;
                         };
-                        let vector = hashed_embedding(query);
+                        let vector = &query_vectors[index];
                         let mut found = Vec::new();
                         for (name, include_tests, k) in [
                             ("lane", false, lane_k),
@@ -883,7 +927,7 @@ mod tests {
                             let ask = |source: MeaningIndex<'_>| {
                                 timed(|| {
                                     source
-                                        .search_filtered(&vector, k, &include)
+                                        .search_filtered(vector, k, &include)
                                         .unwrap()
                                         .iter()
                                         .map(ranked)
@@ -920,6 +964,8 @@ mod tests {
         };
         let mut report = json!({
             "root": root,
+            "embedder": if local.is_some() { "local" } else { "hashed" },
+            "stride": stride,
             "distinct_queries": queries.len(),
             "threads": threads,
             "today_files": today_files.len(),

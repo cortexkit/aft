@@ -49,7 +49,8 @@ Families:
             `EVIDENCE_SHA` in `search_quality_lib.py` pins), semantic lane
             served by the fixture vector pack;
   exact     the exact-recall fixtures on the provisioned corpus repositories,
-            semantic search off, as `run_exact_recall.py` sends them;
+            semantic search off, as `run_exact_recall.py` sends them, or with
+            `--semantic live` on, with the local model AFT ships by default;
   checkout  one query per line of `--queries` on `--root`, semantic search off,
             or with `--semantic hashed` on, served by a loopback embedder
             (`HashedEmbeddingServer`) that gives any text a deterministic
@@ -84,6 +85,7 @@ from run_real_query import (
     AftProtocolError,
     NdjsonClient,
     ensure_binary,
+    live_model_env,
     load_inputs,
     runtime_evidence_tree,
 )
@@ -104,6 +106,8 @@ BUILT = "data layer built"
 # generation carries a random per-process nonce.
 MASKED = (("structuredContent", "plan", "snapshot_generation"),)
 LOG_FILTER = "warn,aft::data_layer=debug"
+# The local embedding model AFT ships by default (`--semantic live`).
+DEFAULT_LOCAL_MODEL = "all-MiniLM-L6-v2"
 # Sent first to every process of the semantic-off families; no row repeats it.
 WARM_UP_QUERY = "data layer parity warm-up request"
 STATUS_BAR = re.compile(r"\n\n\[AFT E[^\]\n]*\](?:\n|$)")
@@ -183,7 +187,9 @@ def without_process_noise(left: JsonObject, right: JsonObject) -> tuple[JsonObje
 class Process:
     """One AFT process reading either today's indexes or the data layer."""
 
-    def __init__(self, binary: Path, root: Path, run_dir: Path, mode: str):
+    def __init__(
+        self, binary: Path, root: Path, run_dir: Path, mode: str, model_env: Optional[JsonObject] = None
+    ):
         self.mode = mode
         self.stderr_path = run_dir / f"{mode}.stderr"
         saved = {name: os.environ.get(name) for name in ("AFT_DATA_LAYER", "RUST_LOG")}
@@ -193,7 +199,7 @@ class Process:
             else:
                 os.environ.pop("AFT_DATA_LAYER", None)
             os.environ["RUST_LOG"] = LOG_FILTER
-            self.client = NdjsonClient(binary, root, run_dir / f"{mode}-storage", self.stderr_path)
+            self.client = NdjsonClient(binary, root, run_dir / f"{mode}-storage", self.stderr_path, model_env)
         finally:
             for name, value in saved.items():
                 if value is None:
@@ -414,6 +420,7 @@ def run_family(
     noise: bool,
     timeout: float,
     warm: JsonObject,
+    model_env: Optional[JsonObject] = None,
 ) -> JsonObject:
     modes = ["legacy", "data"] + (["legacy-again"] if noise else [])
     measures: dict[str, list[JsonObject]] = {}
@@ -422,7 +429,7 @@ def run_family(
     with tempfile.TemporaryDirectory(prefix="aft-data-layer-parity-") as directory:
         replies = {mode: Path(directory) / f"{mode}-replies.jsonl" for mode in modes}
         for mode in modes:
-            process = Process(binary, root, Path(directory), "data" if mode == "data" else mode)
+            process = Process(binary, root, Path(directory), "data" if mode == "data" else mode, model_env)
             try:
                 started = time.monotonic()
                 start(process)
@@ -531,7 +538,11 @@ def exact(args: argparse.Namespace) -> JsonObject:
         ]
 
         def start(process: Process) -> None:
-            process.configure_without_semantic(args.ready_timeout)
+            if args.semantic == "live":
+                process.client.configure(None, DEFAULT_LOCAL_MODEL, args.ready_timeout)
+                process.client.wait_ready(args.ready_timeout)
+            else:
+                process.configure_without_semantic(args.ready_timeout)
 
         reports[name] = run_family(
             args.binary,
@@ -542,6 +553,7 @@ def exact(args: argparse.Namespace) -> JsonObject:
             args.noise,
             args.ready_timeout,
             {"query": WARM_UP_QUERY, "top_k": 5},
+            live_model_env() if args.semantic == "live" else None,
         )
     return reports
 
@@ -628,6 +640,8 @@ def checkout(args: argparse.Namespace) -> JsonObject:
     queries = queries[:: args.stride][: args.limit]
     rows = [{"id": f"checkout:{index}", "request": {"query": query}} for index, query in enumerate(queries)]
     root = Path(args.root).resolve()
+    if args.semantic == "live":
+        raise InputFault("checkout_family_semantic:live_is_for_the_exact_family")
     if args.semantic == "off":
 
         def start(process: Process) -> None:
@@ -668,9 +682,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--limit", type=int, default=None, help="checkout family: replay at most N queries")
     result.add_argument(
         "--semantic",
-        choices=("off", "hashed"),
+        choices=("off", "hashed", "live"),
         default="off",
-        help="checkout family: semantic search off, or on with the deterministic loopback embedder",
+        help=(
+            "checkout family: semantic search off, or on with the deterministic loopback embedder (hashed); "
+            "exact family: off, or on with the local model AFT ships by default (live; its ONNX Runtime and "
+            "files named by ORT_DYLIB_PATH and FASTEMBED_CACHE_DIR, never downloaded mid-run)"
+        ),
     )
     result.add_argument("--noise", action="store_true", help="also replay today's path a second time")
     result.add_argument("--ready-timeout", type=float, default=900.0)
