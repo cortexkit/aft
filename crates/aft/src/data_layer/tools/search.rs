@@ -235,7 +235,7 @@ impl TextIndex<'_> {
                 snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
             }
             Self::Data(text) => {
-                selected_pool(text, query_trigrams, candidate_filter, Rarity::Paths)
+                selected_pool(text, query_trigrams, candidate_filter, paths_holding)
             }
         }
     }
@@ -243,8 +243,8 @@ impl TextIndex<'_> {
     /// Every file holding one of the rarest query trigrams, widened by the
     /// next rarest until at least `depth` files are found, scored and cut to
     /// the best `depth`; as `SearchIndexSnapshot::lexical_rank_at_depth`.
-    /// Rarity is how many of this checkout's paths hold a trigram, as for
-    /// [`Self::lexical_selected_pool`].
+    /// Rarity is how many of this checkout's paths hold a trigram
+    /// ([`paths_holding`]), as for [`Self::lexical_selected_pool`].
     pub(crate) fn lexical_rank_at_depth(
         &self,
         query_trigrams: &[u32],
@@ -319,16 +319,17 @@ impl TextIndex<'_> {
 }
 
 /// The lexical lane's scored pool from the data layer's view, picking the
-/// three rarest query trigrams by `rarity`.
+/// three rarest query trigrams by `rarity` (the lane passes
+/// [`paths_holding`]).
 fn selected_pool(
     text: &DataText,
     query_trigrams: &[u32],
     candidate_filter: Option<&dyn Fn(&Path) -> bool>,
-    rarity: Rarity,
+    rarity: impl Fn(u32, &[Vec<u8>]) -> io::Result<u64>,
 ) -> io::Result<Vec<(PathBuf, f32)>> {
     let unique = unique_trigrams(query_trigrams);
     let postings = text.postings(&unique)?;
-    let picked = rarest(text, &unique, &postings, rarity)?;
+    let picked = rarest(&unique, &postings, rarity)?;
     let selected = picked
         .iter()
         .flat_map(|trigram| postings[trigram].iter())
@@ -348,31 +349,24 @@ fn selected_pool(
     Ok(ranked)
 }
 
-/// How the lexical lane counts a query trigram's rarity.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Rarity {
-    /// By this checkout's paths holding the trigram: what the lane uses.
-    Paths,
-    /// By [`CheckoutView::trigram_frequency`], contents in the family's
-    /// segments; only the tests measure what it would change.
-    #[cfg(test)]
-    Contents,
-}
-
-/// The (at most) three rarest of `unique` that some path holds, rarest
-/// first, ties to the smaller trigram.
-///
-/// Rarity counts this checkout's paths that hold the trigram, not distinct
-/// contents: a content shared by identical files, or one left in older
+/// A query trigram's rarity for the lexical lane: how many of this
+/// checkout's paths hold it (`paths`, its postings), not how many distinct
+/// contents do. A content shared by identical files, or one left in older
 /// segments of the family, is no rarer to an agent than the files it can
 /// actually hit here. Counting contents (`trigram_frequency`) picked another
 /// three trigrams on about one real query in sixty and moved their lexical
 /// ranking; the legacy index counts files, as this does.
+fn paths_holding(_trigram: u32, paths: &[Vec<u8>]) -> io::Result<u64> {
+    Ok(paths.len() as u64)
+}
+
+/// The (at most) three rarest of `unique` that some path holds, by
+/// `rarity` of each trigram and its postings, rarest first, ties to the
+/// smaller trigram.
 fn rarest(
-    text: &DataText,
     unique: &[u32],
     postings: &HashMap<u32, Vec<Vec<u8>>>,
-    rarity: Rarity,
+    rarity: impl Fn(u32, &[Vec<u8>]) -> io::Result<u64>,
 ) -> io::Result<Vec<u32>> {
     let mut held = Vec::new();
     for &trigram in unique {
@@ -380,12 +374,7 @@ fn rarest(
         if paths.is_empty() {
             continue;
         }
-        let count = match rarity {
-            Rarity::Paths => paths.len() as u64,
-            #[cfg(test)]
-            Rarity::Contents => text.frequency(trigram)?,
-        };
-        held.push((count, trigram));
+        held.push((rarity(trigram, paths)?, trigram));
     }
     held.sort_unstable();
     Ok(held
@@ -985,7 +974,10 @@ mod tests {
     /// parity test reports what it would change.
     fn lane_by_content_rarity(text: &DataText, trigrams: &[u32], root: &Path) -> String {
         let filter = include_filter(root, false);
-        let pool = selected_pool(text, trigrams, Some(&filter), Rarity::Contents).unwrap();
+        let pool = selected_pool(text, trigrams, Some(&filter), |trigram, _| {
+            text.frequency(trigram)
+        })
+        .unwrap();
         let lane = CanonicalLexicalLane::from_scored_candidates(
             pool.into_iter()
                 .map(|(path, score)| {
@@ -1108,11 +1100,14 @@ mod tests {
         let postings = pair.data.postings(&unique).unwrap();
         let pack = |text: &[u8]| aft_store::text::pack(text[0], text[1], text[2]);
         assert_eq!(
-            rarest(&pair.data, &unique, &postings, Rarity::Paths).unwrap(),
+            rarest(&unique, &postings, paths_holding).unwrap(),
             vec![pack(b"aaa"), pack(b"bbb"), pack(b"ccc")]
         );
         assert_eq!(
-            rarest(&pair.data, &unique, &postings, Rarity::Contents).unwrap(),
+            rarest(&unique, &postings, |trigram, _| pair
+                .data
+                .frequency(trigram))
+            .unwrap(),
             vec![pack(b"xxx"), pack(b"aaa"), pack(b"bbb")]
         );
         let legacy = pair.legacy.snapshot();
@@ -1231,8 +1226,11 @@ mod tests {
         // Which three trigrams each rarity picks.
         let unique = unique_trigrams(&trigrams);
         let postings = pair.data.postings(&unique).unwrap();
-        let by_files = rarest(&pair.data, &unique, &postings, Rarity::Paths).unwrap();
-        let by_frequency = rarest(&pair.data, &unique, &postings, Rarity::Contents).unwrap();
+        let by_files = rarest(&unique, &postings, paths_holding).unwrap();
+        let by_frequency = rarest(&unique, &postings, |trigram, _| {
+            pair.data.frequency(trigram)
+        })
+        .unwrap();
         let render = |picks: &[u32]| {
             picks
                 .iter()
