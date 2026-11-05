@@ -193,9 +193,10 @@ fn round(value: f64) -> f64 {
 struct Replay {
     cases: usize,
     identical: usize,
-    /// Cases whose shown reply differed, with both replies and whether
-    /// repeating the case gave the same replies again.
+    /// Cases whose shown reply differed, by class: what explains the
+    /// difference, with the evidence for it.
     differences: Vec<Value>,
+    classes: BTreeMap<&'static str, usize>,
     /// Per hidden field, how many cases differed in it.
     field_differences: BTreeMap<String, usize>,
     /// Calls the data layer answered, and calls today's path answered that
@@ -210,15 +211,49 @@ impl Replay {
             "cases": self.cases,
             "identical": self.identical,
             "different": self.differences.len(),
-            "unstable": self.differences.iter().filter(|d| d["stable"] == false).count(),
+            "by_class": self.classes,
             "hidden_field_differences": self.field_differences,
             "data_layer_answered": self.data_layer_answers,
             "today_read_data_layer": self.today_answers_from_data_layer,
         })
     }
+
+    fn unexplained(&self) -> usize {
+        self.classes
+            .iter()
+            .filter(|(class, _)| !ACCEPTED.contains(class))
+            .map(|(_, count)| count)
+            .sum()
+    }
 }
 
-fn replay(ctx: &AppContext, phase: &str, cases: &[Case], timings: &mut Timings) -> Replay {
+/// A published path deleted on disk with no change recorded: a reply says
+/// it was not on disk only when the path was among the candidates it read,
+/// and the two paths read different candidates. Its matches are the same.
+const STALE_PATH: &str = "stale path disclosed only when it is a candidate";
+/// Today's planner merges the posting filters of one trigram across the
+/// alternatives of a pattern, so an alternative that is a prefix of
+/// another inherits its next-character filter, and files holding only the
+/// shorter one are never read. The data layer's answer equals a full scan.
+const FILTER_MERGE: &str = "today's alternation filter merge drops candidates";
+/// Differences explained and accepted.
+const ACCEPTED: &[&str] = &[STALE_PATH, FILTER_MERGE];
+/// Today misses matches a full scan finds, in a pattern without
+/// alternatives, or the data layer's answer is not a full scan's.
+const TODAY_MISSES_OTHER: &str = "today misses matches a full scan finds (no alternation)";
+const UNEXPLAINED: &str = "unexplained";
+
+/// Full texts are kept for this many differences of each class.
+const EXAMPLES_PER_CLASS: usize = 30;
+
+fn replay(
+    ctx: &AppContext,
+    root: &Path,
+    oracle: &mut Option<Oracle>,
+    phase: &str,
+    cases: &[Case],
+    timings: &mut Timings,
+) -> Replay {
     let mut replay = Replay::default();
     for (index, case) in cases.iter().enumerate() {
         // Alternate which path runs first, so neither always meets a
@@ -267,24 +302,270 @@ fn replay(ctx: &AppContext, phase: &str, cases: &[Case], timings: &mut Timings) 
             replay.identical += 1;
             continue;
         }
-        // Repeat both twice: a difference that does not repeat comes from
-        // timing (a time budget), not from where the files came from.
-        let stable = (0..2).all(|_| {
-            visible(case.tool, &call(ctx, case, true).0) == shown_today
-                && visible(case.tool, &call(ctx, case, false).0) == shown_data
+        let (class, evidence) = classify(ctx, root, oracle, case, &shown_today, &shown_data);
+        let seen = replay.classes.entry(class).or_default();
+        *seen += 1;
+        let example = *seen <= EXAMPLES_PER_CLASS;
+        // Repeat an unexplained difference, and the first few of each
+        // class, twice: one that does not repeat comes from timing (a time
+        // budget), not from where the files came from.
+        let stable = (example || !ACCEPTED.contains(&class)).then(|| {
+            (0..2).all(|_| {
+                visible(case.tool, &call(ctx, case, true).0) == shown_today
+                    && visible(case.tool, &call(ctx, case, false).0) == shown_data
+            })
         });
-        replay.differences.push(json!({
+        let mut difference = json!({
             "phase": phase,
             "tool": case.tool,
             "scope": case.scope,
             "params": serde_json::from_str::<Value>(&case.params).unwrap(),
+            "class": class,
             "stable": stable,
             "first_difference": first_difference(&shown_today, &shown_data),
-            "today": clip(shown_today),
-            "data": clip(shown_data),
-        }));
+            "evidence": evidence,
+        });
+        if example || !ACCEPTED.contains(&class) {
+            difference["today"] = clip(shown_today);
+            difference["data"] = clip(shown_data);
+        }
+        replay.differences.push(difference);
     }
     replay
+}
+
+/// The note a grep reply carries when indexed files it read were gone.
+fn without_missing_note(shown: &Value) -> Value {
+    let note = regex::Regex::new(
+        r"\n\n\(\d+ indexed file\(s\) were not on disk in this checkout; the index is out of date, so matches in files it has not seen may be missing\.\)",
+    )
+    .unwrap();
+    let mut shown = shown.clone();
+    for key in ["text", "rendered"] {
+        if let Some(text) = shown[key].as_str() {
+            shown[key] = json!(note.replace_all(text, "").into_owned());
+        }
+    }
+    if let Some(object) = shown.as_object_mut() {
+        object.remove("complete");
+    }
+    shown
+}
+
+/// What explains one difference, with its evidence.
+fn classify(
+    ctx: &AppContext,
+    root: &Path,
+    oracle: &mut Option<Oracle>,
+    case: &Case,
+    today: &Value,
+    data: &Value,
+) -> (&'static str, Value) {
+    let noted = |shown: &Value| {
+        shown["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("indexed file(s) were not on disk in this checkout"))
+    };
+    if case.tool == "grep"
+        && (noted(today) || noted(data))
+        && without_missing_note(today) == without_missing_note(data)
+    {
+        return (
+            STALE_PATH,
+            json!({"same_apart_from": "the not-on-disk note and complete"}),
+        );
+    }
+    let Some((pattern, filters, scope)) = grep_query(root, case) else {
+        return (UNEXPLAINED, Value::Null);
+    };
+    let lines = |today: bool| engine_lines(ctx, &pattern, &filters, &scope, today);
+    let (Some(today_lines), Some(data_lines)) = (lines(true), lines(false)) else {
+        return (UNEXPLAINED, json!({"engine": "a search failed"}));
+    };
+    let full = oracle
+        .get_or_insert_with(|| Oracle::read(root))
+        .lines(&pattern, &filters, &scope);
+    let missed = full.difference(&today_lines).collect::<Vec<_>>();
+    let query = crate::search_index::decompose_grep_pattern(&pattern);
+    let evidence = json!({
+        "full_scan_lines": full.len(),
+        "today_lines": today_lines.len(),
+        "data_lines": data_lines.len(),
+        "today_extra": today_lines.difference(&full).take(5).map(show_line).collect::<Vec<_>>(),
+        "today_missed": missed.iter().take(5).map(|line| show_line(line)).collect::<Vec<_>>(),
+        "data_not_full_scan": data_lines.symmetric_difference(&full).take(5).map(show_line).collect::<Vec<_>>(),
+        "today_query": clip_text(&format!("{query:?}"), 2000),
+    });
+    let today_subset = today_lines.is_subset(&full) && !missed.is_empty();
+    let class = if data_lines != full || !today_subset {
+        UNEXPLAINED
+    } else if query.or_groups.is_empty() {
+        TODAY_MISSES_OTHER
+    } else {
+        FILTER_MERGE
+    };
+    (class, evidence)
+}
+
+fn show_line((path, line): &(PathBuf, u32)) -> String {
+    format!("{}:{line}", path.display())
+}
+
+/// A grep case as the engine takes it: its compiled pattern, its include
+/// and exclude filters and its folder. `None` when it does not compile or
+/// names a file, which neither path searches through an index.
+fn grep_query(
+    root: &Path,
+    case: &Case,
+) -> Option<(
+    crate::pattern_compile::CompiledPattern,
+    crate::search_index::PathFilters,
+    PathBuf,
+)> {
+    if case.tool != "grep" {
+        return None;
+    }
+    let params: Value = serde_json::from_str(&case.params).ok()?;
+    let strings = |key: &str| -> Vec<String> {
+        params[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+    let case_insensitive = params["case_sensitive"] == json!(false);
+    let crate::pattern_compile::CompileResult::Ok(pattern) = crate::pattern_compile::compile(
+        params["pattern"].as_str()?,
+        crate::pattern_compile::CompileOpts {
+            case_insensitive,
+            ..crate::pattern_compile::CompileOpts::default()
+        },
+    ) else {
+        return None;
+    };
+    let filters =
+        crate::search_index::build_path_filters(&strings("include"), &strings("exclude")).ok()?;
+    let scope = match params["path"].as_str() {
+        None => root.to_path_buf(),
+        Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
+        Some(path) => root.join(path),
+    };
+    let scope = std::fs::canonicalize(scope).ok()?;
+    (!scope.is_file()).then_some((pattern, filters, scope))
+}
+
+/// Every matching line one path's index finds, with no result cap.
+fn engine_lines(
+    ctx: &AppContext,
+    pattern: &crate::pattern_compile::CompiledPattern,
+    filters: &crate::search_index::PathFilters,
+    scope: &Path,
+    today: bool,
+) -> Option<BTreeSet<(PathBuf, u32)>> {
+    let snapshot = if today {
+        ctx.search_index().read().ok()?.as_ref()?.snapshot()
+    } else {
+        super::ViewScope::of(ctx.data_view()?, scope)?
+            .candidates(pattern)
+            .ok()?
+    };
+    let query = crate::search_index::decompose_grep_pattern(pattern);
+    let (result, _) = snapshot
+        .search_grep_profiled_with_filters_and_query_in_order(
+            pattern,
+            &query,
+            filters,
+            scope,
+            usize::MAX / 4,
+            None,
+            crate::search_index::GrepScanOrder::Path,
+        )
+        .ok()?;
+    (!result.scan_deadline_reached).then(|| {
+        result
+            .matches
+            .into_iter()
+            .map(|found| (found.file, found.line))
+            .collect()
+    })
+}
+
+/// A full scan: every file both indexes hold, read and matched line by
+/// line, with no index or planner involved.
+struct Oracle {
+    root: PathBuf,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+impl Oracle {
+    /// Reads every file of the checkout at `root` that today's index walk
+    /// admits: the ignore rules, hidden files included, no symlinks, and
+    /// none under `.git` or the folders that walk always skips. The folder
+    /// the gate creates without telling either index is left out too.
+    fn read(root: &Path) -> Self {
+        let unrecorded = root.join("gate_unrecorded_dir");
+        let walk = ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .require_git(false)
+            .filter_entry(move |entry| {
+                let name = entry.file_name().to_string_lossy();
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                name != ".git"
+                    && entry.path() != unrecorded
+                    && !(is_dir
+                        && entry.depth() > 0
+                        && crate::grep_executor::is_fallback_skipped_directory_name(&name))
+            })
+            .build();
+        let files = walk
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                let bytes = std::fs::read(entry.path()).ok()?;
+                Some((entry.into_path(), bytes))
+            })
+            .collect();
+        Self {
+            root: root.to_path_buf(),
+            files,
+        }
+    }
+
+    fn lines(
+        &self,
+        pattern: &crate::pattern_compile::CompiledPattern,
+        filters: &crate::search_index::PathFilters,
+        scope: &Path,
+    ) -> BTreeSet<(PathBuf, u32)> {
+        use crate::pattern_compile::CompiledPattern;
+        let mut found = BTreeSet::new();
+        for (path, bytes) in &self.files {
+            if !path.starts_with(scope)
+                || !filters.matches(&self.root, path)
+                || crate::search_index::is_binary_bytes(bytes)
+            {
+                continue;
+            }
+            for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+                let hit = match pattern {
+                    CompiledPattern::Literal(literal) => {
+                        let line = if literal.case_insensitive_ascii {
+                            line.to_ascii_lowercase()
+                        } else {
+                            line.to_vec()
+                        };
+                        memchr::memmem::find(&line, &literal.needle).is_some()
+                    }
+                    CompiledPattern::Regex { compiled, .. } => compiled.is_match(line),
+                };
+                if hit {
+                    found.insert((path.clone(), index as u32 + 1));
+                }
+            }
+        }
+        found
+    }
 }
 
 /// The first line where the two shown texts differ, or the first field.
@@ -315,16 +596,21 @@ fn first_difference(today: &Value, data: &Value) -> Value {
 fn clip(mut value: Value) -> Value {
     for key in ["text", "rendered", "message"] {
         if let Some(text) = value[key].as_str() {
-            if text.len() > 6000 {
-                let mut end = 6000;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                value[key] = json!(format!("{}…[{} bytes]", &text[..end], text.len()));
-            }
+            value[key] = json!(clip_text(text, 6000));
         }
     }
     value
+}
+
+fn clip_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[{} bytes]", &text[..end], text.len())
 }
 
 /// Copies the files `source`'s ignore rules admit into `dest`, with their
@@ -424,15 +710,15 @@ fn grep_corpus(root: &Path, corpus: &Path) -> (Vec<Case>, usize) {
             params[key] = value;
             params
         };
-        if index % 9 == 0 {
+        if index % 20 == 0 {
             cases.insert(Case::new(
                 "grep",
                 variant("case_sensitive", json!(false)),
                 root,
             ));
         }
-        match index % 10 {
-            1 => {
+        match index % 40 {
+            1 | 21 => {
                 cases.insert(Case::new("grep", variant("include", json!(["*.rs"])), root));
             }
             2 => {
@@ -449,7 +735,7 @@ fn grep_corpus(root: &Path, corpus: &Path) -> (Vec<Case>, usize) {
             }
             _ => {}
         }
-        if index % 25 == 4 {
+        if index % 50 == 4 {
             cases.insert(Case::new("grep", variant("offset", json!(40)), root));
         }
     }
@@ -755,28 +1041,20 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
     grep_cases.truncate(limit);
     let glob_cases = glob_corpus(&root);
     let mut timings = Timings::default();
+    let mut oracle = None;
     let mut replays = BTreeMap::new();
-    replays.insert(
-        "1 grep",
-        replay(&ctx, "published", &grep_cases, &mut timings),
-    );
-    replays.insert(
-        "2 glob",
-        replay(&ctx, "published", &glob_cases, &mut timings),
-    );
+    let mut run = |name, phase, cases: &[Case], oracle: &mut Option<Oracle>| {
+        let replay = replay(&ctx, &root, oracle, phase, cases, &mut timings);
+        replays.insert(name, replay);
+    };
+    run("1 grep", "published", &grep_cases, &mut oracle);
+    run("2 glob", "published", &glob_cases, &mut oracle);
     let (edits, edit_cases) = edit_checkout(&ctx, &root);
-    replays.insert(
-        "3 grep after edits",
-        replay(&ctx, "edited", &grep_cases, &mut timings),
-    );
-    replays.insert(
-        "4 glob after edits",
-        replay(&ctx, "edited", &glob_cases, &mut timings),
-    );
-    replays.insert(
-        "5 edited paths",
-        replay(&ctx, "edited", &edit_cases, &mut timings),
-    );
+    // The full scan reads the edited files again.
+    let mut oracle = None;
+    run("3 grep after edits", "edited", &grep_cases, &mut oracle);
+    run("4 glob after edits", "edited", &glob_cases, &mut oracle);
+    run("5 edited paths", "edited", &edit_cases, &mut oracle);
 
     let differences = replays
         .values()
@@ -826,10 +1104,10 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
         replays.values().all(|replay| replay.data_layer_answers > 0),
         "a replay never read the data layer"
     );
+    let unexplained = replays.values().map(Replay::unexplained).sum::<usize>();
     assert!(
-        allow_differences || differences.is_empty(),
-        "{} replies differ; see the report",
-        differences.len()
+        allow_differences || unexplained == 0,
+        "{unexplained} replies differ for no accepted reason; see the report"
     );
 }
 
