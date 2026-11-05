@@ -858,7 +858,7 @@ pub fn separator() -> char {
         let (mut old_ns, mut new_ns) = (0u128, 0u128);
         let (mut surface, mut body, mut body_packed) = (0usize, 0usize, 0usize);
         let (mut outline_body, mut outline_body_packed) = (0usize, 0usize);
-        let (mut largest_growth, mut largest_file) = (0usize, String::new());
+        let (mut largest_growth, mut largest_file) = (0i64, String::new());
         let mut outline_symbols = 0usize;
         for round in 0..2 {
             for (path, language, bytes) in &contents {
@@ -903,7 +903,9 @@ pub fn separator() -> char {
                     outline_body += b.len();
                     body_packed += zlib_fast(&b0);
                     outline_body_packed += zlib_fast(&b);
-                    let growth = zlib_fast(&b) - zlib_fast(&b0);
+                    // Adding the outline can tip a body into being stored
+                    // packed, so it can also shrink.
+                    let growth = zlib_fast(&b) as i64 - zlib_fast(&b0) as i64;
                     if growth > largest_growth {
                         largest_growth = growth;
                         largest_file = path.clone();
@@ -929,8 +931,8 @@ pub fn separator() -> char {
         );
         println!(
             "stored growth: {} bytes total, {:.0} per file, largest {largest_growth} ({largest_file})",
-            outline_body_packed - body_packed,
-            (outline_body_packed - body_packed) as f64 / records as f64
+            outline_body_packed as i64 - body_packed as i64,
+            (outline_body_packed as f64 - body_packed as f64) / records as f64
         );
 
         // The data layer's checkout of the repository, built, then bound
