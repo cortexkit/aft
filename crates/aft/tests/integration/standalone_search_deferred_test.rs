@@ -53,6 +53,15 @@ fn configure_without_indexes(project: &Path) -> String {
     .expect("serialize configure request")
 }
 
+/// Sends one grep, which starts the data layer's build of the search index.
+/// Status never starts it, and a standalone configure does not either
+/// (`standalone_configure_builds_the_search_index_without_a_query`), so a
+/// test that waits for status to report the index ready sends this first.
+fn bind_search_index(aft: &mut AftProcess) {
+    let grep = aft.send(r#"{"id":"bind-search-index","command":"grep","pattern":"fn"}"#);
+    assert_eq!(grep["success"], true, "binding grep failed: {grep:?}");
+}
+
 fn read_response(aft: &mut AftProcess, request_id: &str, timeout: Duration) -> (Value, Instant) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1054,6 +1063,7 @@ fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
         "configure failed: {configured:?}"
     );
 
+    bind_search_index(&mut aft);
     let ready_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = aft.send(r#"{"id":"freshness-status","command":"status"}"#);
@@ -1172,6 +1182,7 @@ fn mutation_freshness_fixture_with_content(
         .to_string(),
     );
     assert_eq!(configured["success"], true, "{configured:?}");
+    bind_search_index(&mut aft);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let status = aft.send(r#"{"id":"status","command":"status"}"#);
@@ -1617,6 +1628,7 @@ fn standalone_search_on_ready_index_answers_without_waiting_for_the_pending_poll
         "configure failed: {configure:#}"
     );
 
+    bind_search_index(&mut aft);
     let ready_deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let status = aft.send(r#"{"id":"ready-poll","command":"status"}"#);
