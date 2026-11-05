@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds the data-layer gates once and runs them in turn: the parity gate on
 # this checkout against today's join and database, the edit gate on the
-# 430-edit pack, and the reuse gate on the pack's commit ends. Exits nonzero
-# if any gate fails, after running them all.
+# 430-edit pack, the reuse gate on the pack's commit ends, and the extraction
+# gate on every file Git tracks in this checkout. Exits nonzero if any gate
+# fails, after running them all.
 #
 #   bash crates/aft/examples/data/gate-all.sh [sample scale] [threads]
 #
@@ -17,15 +18,16 @@ git log -1 --format=%H
 # A failed build must stop here: the target folder may be shared and warm, so
 # carrying on would run an older commit's gate binaries.
 if ! cargo build --profile ci-storm -p agent-file-tools \
-  --example resolve_gate --example edit_gate --example reuse_gate > "$out/build.txt" 2>&1; then
+  --example resolve_gate --example edit_gate --example reuse_gate \
+  --example extract_gate > "$out/build.txt" 2>&1; then
   tail -30 "$out/build.txt"
   echo "build failed; no gate ran"
   exit 2
 fi
 tail -2 "$out/build.txt"
 bin="${CARGO_TARGET_DIR:-target}/ci-storm/examples"
-ls -l --time-style=+%FT%T "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate" 2>/dev/null \
-  || ls -lT "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate"
+ls -l --time-style=+%FT%T "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate" "$bin/extract_gate" 2>/dev/null \
+  || ls -lT "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate" "$bin/extract_gate"
 status=0
 started=$(date +%s)
 GATE_SAMPLE_SCALE="$scale" "$bin/resolve_gate" . "$threads" > "$out/parity.txt" 2> "$out/parity.err"
@@ -60,4 +62,10 @@ rc=$?; [ "$rc" -eq 0 ] || status=1
 echo "reuse rc=$rc in $(( $(date +%s) - started ))s"
 tail -2 "$out/reuse.err"
 grep -E " diff [0-9]+ [1-9]| diff [1-9]" "$out/reuse.txt" | cut -c1-300 | head -5
+started=$(date +%s)
+"$bin/extract_gate" repo . > "$out/extract.json" 2> "$out/extract.err"
+rc=$?; [ "$rc" -eq 0 ] || status=1
+echo "extract rc=$rc in $(( $(date +%s) - started ))s"
+# The per-language counts, then any failure the gate names.
+head -60 "$out/extract.err"
 exit "$status"
