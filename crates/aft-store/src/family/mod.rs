@@ -95,6 +95,27 @@ pub enum FamilyError {
 }
 
 impl FamilyError {
+    /// True when a file cannot be used as it stands: another build's format
+    /// version wrote it, or its bytes failed their checks. A reader treats
+    /// such a file as absent, and what it held is built again. An I/O
+    /// failure is not one: the file may read fine next time.
+    #[must_use]
+    pub fn is_unusable_file(&self) -> bool {
+        match self {
+            Self::Foreign { .. } | Self::Damaged { .. } => true,
+            Self::Segment(error) => {
+                error.is_corruption()
+                    || matches!(
+                        error.kind(),
+                        crate::segment::ErrorKind::UnsupportedVersion { .. }
+                            | crate::segment::ErrorKind::UnknownRequiredSection { .. }
+                            | crate::segment::ErrorKind::NotASegment
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn io(path: &Path) -> impl FnOnce(io::Error) -> Self + '_ {
         move |source| Self::Io {
             path: path.to_path_buf(),

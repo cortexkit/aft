@@ -9979,8 +9979,12 @@ export function bannerUnused() {}
 
         let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path())
             .expect("bind the checkout");
+        // A first build publishes the text index before the call graph.
         let deadline = Instant::now() + Duration::from_secs(60);
-        while checkout.view().is_none() {
+        while !checkout
+            .view()
+            .is_some_and(|view| view.status().callgraph_published)
+        {
             assert!(Instant::now() < deadline, "the checkout never published");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -10009,13 +10013,16 @@ export function bannerUnused() {}
         other.read_dead_code_from_data_layer(&elsewhere, &checkout);
         assert!(read_job(&other, &views_snapshot_job(&elsewhere, &inspect_dir)).is_none());
 
-        // An edit the data layer has not resolved leaves its call graph
-        // pending: dead code goes back to today's store rather than answer
-        // from the older publication.
+        // An edit the data layer has not resolved yet: dead code waits for
+        // the call graph to resolve it, and never answers from the older
+        // publication.
         let edited = root.join("mod0.ts");
         std::fs::write(&edited, "export function g0() { return 0; }\n").expect("edit");
         checkout.note_paths(std::slice::from_ref(&edited));
-        assert!(read(&manager).is_none(), "a pending change was answered");
+        let (snapshot, verdict, _) = read(&manager).expect("the refreshed data layer answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        let exports = format!("{:?}", snapshot.exported_symbols);
+        assert!(exports.contains("\"g0\""), "{exports}");
     }
 
     #[test]
@@ -10023,8 +10030,12 @@ export function bannerUnused() {}
         fn published(root: &Path, storage: &Path) -> Arc<crate::data_layer::runtime::DataCheckout> {
             let checkout =
                 crate::data_layer::runtime::DataCheckout::open(root, storage).expect("bind");
+            // A first build publishes the text index before the call graph.
             let deadline = Instant::now() + Duration::from_secs(60);
-            while checkout.view().is_none() {
+            while !checkout
+                .view()
+                .is_some_and(|view| view.status().callgraph_published)
+            {
                 assert!(Instant::now() < deadline, "the checkout never published");
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -10093,18 +10104,13 @@ export function bannerUnused() {}
         )
         .expect("edit main");
         checkout.note_paths(std::slice::from_ref(&main));
-        assert!(read(&manager).is_none(), "the pending edit was answered");
-
-        checkout
-            .checkout()
-            .refresh_callgraph()
-            .expect("refresh the call graph");
+        // Dead code waits for the call graph to resolve the edit.
+        let (refreshed, verdict, _) = read(&manager).expect("the refreshed graph answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
         assert_eq!(
             checkout.view().expect("view").status().callgraph,
             crate::data_layer::checkout::PlaneStatus::Ready
         );
-        let (refreshed, verdict, _) = read(&manager).expect("the refreshed graph answers");
-        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
         let (items, aggregate) = dead(&job, &refreshed);
         assert_eq!(items, [r#""src/foo.ts"::"used""#]);
 

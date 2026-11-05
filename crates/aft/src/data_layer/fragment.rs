@@ -125,7 +125,10 @@ pub(crate) fn decode(
     if input.byte()? != FORMAT {
         return Err(DecodeError("unknown fragment format"));
     }
-    let count = input.count()?;
+    // Each row takes at least five bytes (ordinal, kind, status and two
+    // optional strings), so a count the bytes cannot hold fails before
+    // anything is reserved.
+    let count = input.count_of(5)?;
     let mut rows = Vec::with_capacity(count);
     for _ in 0..count {
         let ref_ordinal = input.u32()?;
@@ -153,7 +156,9 @@ pub(crate) fn decode(
     } else {
         None
     };
-    let count = input.count()?;
+    // At least seven bytes per site: ordinal, caller, line, member,
+    // receiver, the dynamic flag and the target count.
+    let count = input.count_of(7)?;
     let mut sites = Vec::with_capacity(count);
     for _ in 0..count {
         let site = SiteHint {

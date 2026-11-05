@@ -32,19 +32,34 @@ pub(crate) fn known_sections() -> Vec<KnownSection> {
         .collect()
 }
 
-/// The key of a fragment: the file's record and path, and the fragment's
-/// own bytes. Two checkouts can resolve the same content at the same path
-/// differently (their other files differ), so the bytes are part of the
-/// key; two that resolve it the same way share one fragment.
+/// The key of a fragment: the file's record and path, the fragment's own
+/// bytes, and the paths its recorded reads consulted (`subjects`, sorted).
+/// Two checkouts can resolve the same content at the same path differently
+/// (their other files differ), so the bytes are part of the key. They can
+/// also record the same answers through different paths, for example
+/// different symlink chains to one target; an update finds the files a
+/// change reaches by those paths, so each checkout needs its own. Two
+/// checkouts that resolved a file the same way through the same paths
+/// share one fragment.
 #[must_use]
-pub(crate) fn fragment_key(record_key: &str, path: &str, bytes: &[u8]) -> FragmentKey {
+pub(crate) fn fragment_key(
+    record_key: &str,
+    path: &str,
+    bytes: &[u8],
+    subjects: &[&[u8]],
+) -> FragmentKey {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aft call-graph fragment 1\0");
+    hasher.update(b"aft call-graph fragment 2\0");
     hasher.update(record_key.as_bytes());
     hasher.update(b"\0");
     hasher.update(path.as_bytes());
     hasher.update(b"\0");
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+    for subject in subjects {
+        hasher.update(&(subject.len() as u64).to_le_bytes());
+        hasher.update(subject);
+    }
     FragmentKey::from_digest(Digest128::from_hash(&hasher.finalize()))
 }
 
@@ -218,7 +233,22 @@ pub(crate) fn write_sections(
         terms.extend(input_terms(resolution, &facts, &mut subjects));
         terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
-        let fragment = fragment_key(key, file, &bytes);
+        // A test stores a fragment that does not decode, as a damaged one
+        // reads back.
+        #[cfg(test)]
+        let bytes = if DAMAGED_FRAGMENT.with(|damaged| damaged.borrow().as_deref() == Some(file)) {
+            vec![0xFF, 0x00]
+        } else {
+            bytes
+        };
+        let mut subjects = terms
+            .iter()
+            .filter(|(kind, _)| *kind == TermKind::FactSubject)
+            .map(|(_, term)| term.as_slice())
+            .collect::<Vec<_>>();
+        subjects.sort_unstable();
+        subjects.dedup();
+        let fragment = fragment_key(key, file, &bytes, &subjects);
         keys.insert(file.clone(), fragment);
         graph.add(
             fragment,
@@ -229,6 +259,13 @@ pub(crate) fn write_sections(
     content.write(writer).map_err(|error| error.to_string())?;
     graph.write(writer).map_err(|error| error.to_string())?;
     Ok(keys)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The file whose fragment a test's build stores damaged.
+    pub(crate) static DAMAGED_FRAGMENT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Where one path's record and fragment are: each as (index into the

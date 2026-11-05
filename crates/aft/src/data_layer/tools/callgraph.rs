@@ -11,6 +11,7 @@ use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, EitherGraph};
 use crate::context::AppContext;
 use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::query::{SliceReader, SliceSource};
+use crate::data_layer::runtime::Fresh;
 
 /// How long a call-graph command waits for recorded edits to be resolved
 /// before it answers that the call graph is still building. The call graph
@@ -32,6 +33,9 @@ pub(crate) enum Access {
     Off,
     /// Edits are still being resolved after the wait.
     Building,
+    /// The last build or refresh failed and nothing is running to replace
+    /// it; the error says why. A build is retried later.
+    Failed(CallGraphStoreError),
     /// Answer from this reader. Keep the view until the answer is built: it
     /// holds the publication the reader reads from.
     Ready(DataGraph, CheckoutView),
@@ -44,8 +48,11 @@ pub(crate) fn access(ctx: &AppContext) -> Access {
         return Access::Off;
     };
     match checkout.fresh_view(READ_WAIT) {
-        Some(view) => Access::Ready(view.callgraph(), view),
-        None => Access::Building,
+        Fresh::Ready(view) => Access::Ready(view.callgraph(), view),
+        Fresh::Building => Access::Building,
+        Fresh::Failed(reason) => Access::Failed(CallGraphStoreError::Unavailable(format!(
+            "the data layer's call graph is unavailable: {reason}"
+        ))),
     }
 }
 
@@ -108,9 +115,16 @@ pub(crate) fn ops_graph(
             ctx,
             &CallgraphStoreAccess::Building,
         )),
+        Access::Failed(error) => Err(store_error_response(req_id, operation, error)),
         Access::Ready(reader, view) => {
             for file in files {
                 if !covers(&view, file) {
+                    // A file whose slice could not be read looks absent;
+                    // say the read failed rather than that it is not
+                    // indexed.
+                    if let Some(error) = read_failure(&view) {
+                        return Err(store_error_response(req_id, operation, error));
+                    }
                     let path = if file.is_relative() {
                         view.root().join(file)
                     } else {

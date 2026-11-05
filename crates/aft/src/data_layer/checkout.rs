@@ -49,6 +49,9 @@ pub enum DataError {
     Resolve(String),
     /// Another process kept the repository's store busy past the wait.
     Busy(String),
+    /// A stored record or fragment could not be read back, or reading it
+    /// stopped the update; the checkout is built again from its files.
+    Damaged(String),
 }
 
 impl std::fmt::Display for DataError {
@@ -58,6 +61,7 @@ impl std::fmt::Display for DataError {
             Self::Scan(error) => write!(f, "checkout scan: {error}"),
             Self::Resolve(error) => write!(f, "call-graph resolution: {error}"),
             Self::Busy(error) => write!(f, "data store busy: {error}"),
+            Self::Damaged(error) => write!(f, "data store damaged: {error}"),
         }
     }
 }
@@ -116,6 +120,18 @@ pub struct Checkout {
 }
 
 /// A checkout's call graph kept up to date between publications.
+/// What a change to one path makes a recording scan again, beyond the
+/// path itself.
+enum IgnoreScope {
+    /// Not an ignore file: only the path.
+    None,
+    /// An ignore file in this folder: the whole folder.
+    Folder(Vec<u8>),
+    /// An ignore file at the root, or Git's own exclude file: the whole
+    /// checkout.
+    Whole,
+}
+
 struct GraphEngine {
     /// The publication the engine started from; a newer one replaces it.
     published: Arc<Published>,
@@ -164,6 +180,12 @@ struct Live {
     /// What the last refresh resolved, for readers that need whole
     /// resolutions rather than slices; `None` until a refresh.
     refreshed: Option<Arc<Refreshed>>,
+    /// Counts the publications served, so a recording whose scan started
+    /// from an earlier one knows to scan again.
+    generation: u64,
+    /// Why the last build or call-graph refresh failed; cleared when one
+    /// succeeds.
+    failure: Option<String>,
 }
 
 /// The files resolved again since a publication, with the paths they were
@@ -315,7 +337,7 @@ impl Checkout {
         )
         .map_err(|error| DataError::Scan(error.to_string()))?;
         let changed = changed_members(&published.state, &scanned.state);
-        {
+        let generation = {
             // The scan compared the files on disk with this publication, so
             // changes recorded against an earlier one are replaced by what it
             // found.
@@ -329,8 +351,17 @@ impl Checkout {
             live.callgraph_pending = Arc::new(BTreeSet::new());
             live.graph = None;
             live.refreshed = None;
-        }
-        self.apply_scan(&published.state, scanned.state, &changed, sink.finish());
+            live.generation += 1;
+            live.generation
+        };
+        let applied = self.apply_scan(
+            &published.state,
+            generation,
+            scanned.state,
+            &changed,
+            sink.finish(),
+        );
+        debug_assert!(applied, "the recording lock keeps the publication");
         Ok(())
     }
 
@@ -375,9 +406,16 @@ impl Checkout {
             .read()
             .expect("no panics while holding it")
             .building;
+        let failed = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .failure
+            .is_some();
         if let Some(view) = self.view() {
             return CheckoutStatus {
                 building,
+                failed,
                 ..view.status()
             };
         }
@@ -396,7 +434,31 @@ impl Checkout {
             callgraph_pending: 0,
             building,
             unparsed: 0,
+            failed,
         }
+    }
+
+    /// Why the last build or call-graph refresh failed, until one succeeds.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .failure
+            .clone()
+    }
+
+    /// Whether the checkout needs a build: nothing is published, or what is
+    /// published has no call graph (a build published the text index first
+    /// and stopped before the call graph, or another process did).
+    #[must_use]
+    pub fn needs_build(&self) -> bool {
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .as_ref()
+            .is_none_or(|published| !published.graph_built)
     }
 
     /// Records that `paths` (relative to the root, such as a watcher or an
@@ -416,40 +478,98 @@ impl Checkout {
             return Ok(());
         }
         let _order = self.recording.lock().expect("no panics while holding it");
-        let base = {
-            let live = self.live.read().expect("no panics while holding it");
-            live.state.clone().or_else(|| {
-                live.published
-                    .as_ref()
-                    .map(|published| Arc::new(published.state.clone()))
-            })
-        };
-        let Some(base) = base else {
-            let mut live = self.write_live();
-            live.sequence += 1;
-            let sequence = live.sequence;
-            for path in paths {
-                live.early.insert(path.clone(), sequence);
+        // An ignore file changes which files under its folder are members,
+        // so that folder is scanned again whole; one at the root (or Git's
+        // own exclude file) means the whole checkout.
+        let mut whole = false;
+        let mut scoped = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.ignore_scope(path) {
+                IgnoreScope::None => scoped.push(path.clone()),
+                IgnoreScope::Folder(folder) => {
+                    scoped.push(path.clone());
+                    scoped.push(folder);
+                }
+                IgnoreScope::Whole => whole = true,
             }
-            return Ok(());
+        }
+        // A build may publish while this scan runs. The scan's state is
+        // built from the publication it started from, so it is applied only
+        // if that publication is still served, and scanned again otherwise.
+        loop {
+            let (base, generation) = {
+                let live = self.live.read().expect("no panics while holding it");
+                let base = live.state.clone().or_else(|| {
+                    live.published
+                        .as_ref()
+                        .map(|published| Arc::new(published.state.clone()))
+                });
+                (base, live.generation)
+            };
+            let Some(base) = base else {
+                let mut live = self.write_live();
+                live.sequence += 1;
+                let sequence = live.sequence;
+                for path in paths {
+                    live.early.insert(path.clone(), sequence);
+                }
+                return Ok(());
+            };
+            let sink = ChangeSink::default();
+            let (state, changed) = if whole {
+                let scanned = scan(&self.root, &self.layer.policy, Some(&base), &sink)
+                    .map_err(|error| DataError::Scan(error.to_string()))?;
+                let changed = changed_members(&base, &scanned.state);
+                (scanned.state, changed)
+            } else {
+                let scanned = scan_paths(&self.root, &self.layer.policy, &base, &scoped, &sink)
+                    .map_err(|error| DataError::Scan(error.to_string()))?;
+                (scanned.state, scanned.changed)
+            };
+            if self.apply_scan(&base, generation, state, &changed, sink.finish()) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Which folder a change to `path` makes a scan cover again, when
+    /// `path` is an ignore file the scan reads.
+    fn ignore_scope(&self, path: &[u8]) -> IgnoreScope {
+        if path == b".git/info/exclude" {
+            return IgnoreScope::Whole;
+        }
+        let (folder, name) = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(index) => (&path[..index], &path[index + 1..]),
+            None => (&path[..0], path),
         };
-        let sink = ChangeSink::default();
-        let scanned = scan_paths(&self.root, &self.layer.policy, &base, paths, &sink)
-            .map_err(|error| DataError::Scan(error.to_string()))?;
-        self.apply_scan(&base, scanned.state, &scanned.changed, sink.finish());
-        Ok(())
+        let is_ignore_file = name == b".gitignore"
+            || name == b".ignore"
+            || self
+                .layer
+                .policy
+                .ignore_files
+                .iter()
+                .any(|file| file.as_bytes() == name);
+        match (is_ignore_file, folder.is_empty()) {
+            (false, _) => IgnoreScope::None,
+            (true, true) => IgnoreScope::Whole,
+            (true, false) => IgnoreScope::Folder(folder.to_vec()),
+        }
     }
 
     /// Makes `state` the checkout's current state, recording each path in
     /// `changed` (compared with `base`) as a change, with the files the scan
     /// read in `read`.
+    /// Returns `false`, applying nothing, when a publication served since
+    /// `generation` replaced the one `base` came from.
     fn apply_scan(
         &self,
         base: &CheckoutState,
+        generation: u64,
         state: CheckoutState,
         changed: &[Vec<u8>],
         read: HashMap<Vec<u8>, Vec<u8>>,
-    ) {
+    ) -> bool {
         // A record the scan read again keeps its language when its content
         // did not change; a changed text file gets the language its path and
         // bytes choose.
@@ -477,8 +597,12 @@ impl Checkout {
         let state = CheckoutState::new(state.git.clone(), state.conversion, records)
             .expect("the scanned state's paths, unchanged");
         if changed.is_empty() {
-            self.write_live().state = Some(Arc::new(state));
-            return;
+            let mut live = self.write_live();
+            if live.generation != generation {
+                return false;
+            }
+            live.state = Some(Arc::new(state));
+            return true;
         }
         let mut entries = Vec::with_capacity(changed.len());
         for path in changed {
@@ -494,6 +618,9 @@ impl Checkout {
             entries.push((path.clone(), entry, record, content));
         }
         let mut live = self.write_live();
+        if live.generation != generation {
+            return false;
+        }
         live.sequence += 1;
         let sequence = live.sequence;
         let mut text = (*live.text).clone();
@@ -522,6 +649,7 @@ impl Checkout {
         live.callgraph_pending = Arc::new(pending);
         live.unparsed = Arc::new(unparsed);
         live.state = Some(Arc::new(state));
+        true
     }
 
     /// Scans the checkout, builds every plane cold, publishes them, and
@@ -534,7 +662,10 @@ impl Checkout {
     pub fn build(&self) -> Result<BuildReport, DataError> {
         self.write_live().building = true;
         let result = self.build_inner();
-        self.write_live().building = false;
+        let mut live = self.write_live();
+        live.building = false;
+        live.failure = result.as_ref().err().map(ToString::to_string);
+        drop(live);
         result
     }
 
@@ -720,7 +851,7 @@ impl Checkout {
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published
     /// this checkout first; the checkout then serves that publication.
-    fn publish_text_first(&self) -> Result<bool, DataError> {
+    pub(crate) fn publish_text_first(&self) -> Result<bool, DataError> {
         let covered = self
             .live
             .read()
@@ -809,6 +940,7 @@ impl Checkout {
             }
             live.unparsed = Arc::new(unparsed);
             live.published = Some(Arc::new(published));
+            live.generation += 1;
             // The new publication's graph replaces the old one and whatever
             // was laid over it; the next refresh starts from it.
             live.graph = None;
@@ -844,59 +976,88 @@ impl Checkout {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let known = known_sections();
         let entries = snapshot.manifest().segments().to_vec();
-        let segments = entries
+        // Each segment this build can use, by its place in the manifest;
+        // `None` for one it cannot (another format version, or damaged).
+        let mut opened = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match snapshot.open_segment(entry.id, &known, Arc::clone(&self.layer.cache)) {
+                Ok(segment) => opened.push(Some(segment)),
+                Err(error) if error.is_unusable_file() => opened.push(None),
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        let usable = opened
             .iter()
-            .map(|entry| {
-                snapshot
-                    .open_segment(entry.id, &known, Arc::clone(&self.layer.cache))
-                    .map_err(DataError::store)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .enumerate()
+            .filter_map(|(index, segment)| segment.as_ref().map(|segment| (index, segment)))
+            .collect::<Vec<_>>();
         // TextLocator numbers only the segments that have a text section,
         // so keep each one's place in the manifest beside it.
         let mut text_index = Vec::new();
         let mut texts = Vec::new();
-        for (index, segment) in segments.iter().enumerate() {
+        for (index, segment) in &usable {
             if let Some(text) = TextSegment::open(segment).map_err(DataError::store)? {
-                text_index.push(index);
+                text_index.push(*index);
                 texts.push(text);
             }
         }
-        let contents = segments
+        let contents = usable
             .iter()
-            .map(|segment| ContentSegment::open(segment).map_err(DataError::store))
+            .map(|(_, segment)| ContentSegment::open(segment).map_err(DataError::store))
             .collect::<Result<Vec<_>, _>>()?;
-        let graphs = segments
+        let graphs = usable
             .iter()
-            .map(|segment| GraphSegment::open(segment).map_err(DataError::store))
+            .map(|(_, segment)| GraphSegment::open(segment).map_err(DataError::store))
             .collect::<Result<Vec<_>, _>>()?;
         let locator = TextLocator::build(&texts).map_err(DataError::store)?;
         let mut needed = vec![false; entries.len()];
+        // Whether another checkout needs something no usable segment holds:
+        // it may be in one this build cannot read, so those all stay.
+        let mut needs_unusable = false;
         for state_ref in snapshot.manifest().checkouts() {
             if state_ref.checkout == self.checkout {
                 continue;
             }
-            let Some(state) = snapshot
-                .checkout_state(state_ref.checkout)
-                .map_err(DataError::store)?
-            else {
-                continue;
+            let state = match snapshot.checkout_state(state_ref.checkout) {
+                Ok(Some(state)) => state,
+                Ok(None) => continue,
+                // A state this build cannot read could need any segment.
+                Err(error) if error.is_unusable_file() => return Ok(Vec::new()),
+                Err(error) => return Err(DataError::store(error)),
             };
             for (index, record) in state.paths().iter().enumerate() {
-                if let Some(Located::Indexed { segment, .. }) = locator.get(record.content) {
-                    needed[text_index[segment as usize]] = true;
+                match locator.get(record.content) {
+                    Some(Located::Indexed { segment, .. }) => {
+                        needed[text_index[segment as usize]] = true;
+                    }
+                    Some(_) => {}
+                    None if record.kind == PathKind::Text
+                        && record.stat.size <= self.layer.policy.max_indexed_len =>
+                    {
+                        needs_unusable = true;
+                    }
+                    None => {}
                 }
                 if !record.language.is_empty() {
                     let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
-                    if let Some(holder) = newest_holder(&contents, |content| content.find(key))? {
-                        needed[holder] = true;
+                    match newest_holder(&contents, |content| content.find(key))? {
+                        Some(holder) => needed[usable[holder].0] = true,
+                        None => needs_unusable = true,
                     }
                 }
                 if let Some(fragment) = state.fragment(index) {
                     let key = FragmentKey::from_digest(fragment);
-                    if let Some(holder) = newest_holder(&graphs, |graph| graph.find(key))? {
-                        needed[holder] = true;
+                    match newest_holder(&graphs, |graph| graph.find(key))? {
+                        Some(holder) => needed[usable[holder].0] = true,
+                        None => needs_unusable = true,
                     }
+                }
+            }
+        }
+        if needs_unusable {
+            for (index, segment) in opened.iter().enumerate() {
+                if segment.is_none() {
+                    needed[index] = true;
                 }
             }
         }
@@ -917,6 +1078,18 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        let result = self.refresh_inner();
+        match &result {
+            // A refresh that applied an update clears an earlier failure; one
+            // that had nothing to do leaves a build's failure standing.
+            Ok(Some(_)) => self.write_live().failure = None,
+            Ok(None) => {}
+            Err(error) => self.write_live().failure = Some(error.to_string()),
+        }
+        result
+    }
+
+    fn refresh_inner(&self) -> Result<Option<UpdateStats>, DataError> {
         let (published, state, changes, covered) = {
             let live = self.live.read().expect("no panics while holding it");
             let Some(published) = live.published.clone() else {
@@ -933,7 +1106,89 @@ impl Checkout {
         if changes.is_empty() || !published.graph_built {
             return Ok(None);
         }
-        let mut slot = self.engine.lock().expect("no panics while holding it");
+        // An update that stopped part way through dropped its engine before
+        // anything else could read the mutex, so a poisoned lock only means
+        // the engine must start again.
+        let mut slot = self.engine.lock().unwrap_or_else(|poisoned| {
+            self.engine.clear_poison();
+            let mut slot = poisoned.into_inner();
+            *slot = None;
+            slot
+        });
+        // A damaged stored record or fragment can stop the update where it
+        // expects one (every file the engine lists has a parse and a
+        // resolution). Such a stop fails this refresh as damage, and the
+        // engine, whose state it may have left half-updated, starts again.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.update_engine(&mut slot, &published, &state, &changes)
+        }));
+        let (stats, served) = match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                *slot = None;
+                return Err(error);
+            }
+            Err(panic) => {
+                *slot = None;
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "no message".to_string());
+                let failures = published.graph.failures();
+                return Err(DataError::Damaged(if failures.is_empty() {
+                    format!("the call-graph update stopped: {message}")
+                } else {
+                    failures.join("; ")
+                }));
+            }
+        };
+        drop(slot);
+        let mut live = self.write_live();
+        if live
+            .published
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &published))
+        {
+            if let Some((overlay, refreshed)) = served {
+                let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
+                live.graph = Some(graph);
+                live.refreshed = Some(Arc::new(refreshed));
+            }
+            let resolved = live
+                .changes
+                .iter()
+                .filter(|(_, change)| change.sequence <= covered)
+                .map(|(path, _)| path.clone())
+                .collect::<BTreeSet<_>>();
+            live.callgraph_pending = Arc::new(
+                live.callgraph_pending
+                    .iter()
+                    .filter(|path| !resolved.contains(*path))
+                    .cloned()
+                    .collect(),
+            );
+        }
+        Ok(stats)
+    }
+
+    /// Applies `changes` to the engine in `slot` (started from `published`
+    /// when it is missing or was started from an older one), returning the
+    /// update's statistics and, when it applied anything, the graph and
+    /// resolutions to serve.
+    fn update_engine(
+        &self,
+        slot: &mut Option<GraphEngine>,
+        published: &Arc<Published>,
+        state: &Arc<CheckoutState>,
+        changes: &BTreeMap<Vec<u8>, Change>,
+    ) -> Result<
+        (
+            Option<UpdateStats>,
+            Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>,
+        ),
+        DataError,
+    > {
         if slot
             .as_ref()
             .is_some_and(|engine| !Arc::ptr_eq(&engine.published, &published))
@@ -941,7 +1196,7 @@ impl Checkout {
             *slot = None;
         }
         if slot.is_none() {
-            *slot = Some(self.start_engine(&published)?);
+            *slot = Some(self.start_engine(published)?);
         }
         let engine = slot.as_mut().expect("started");
         let changed = changes
@@ -951,7 +1206,7 @@ impl Checkout {
             .collect::<BTreeSet<_>>();
         let mut stats = None;
         if !changed.is_empty() {
-            let next = next_inputs(&state, &engine.live.inputs, &changes, &changed);
+            let next = next_inputs(state, &engine.live.inputs, changes, &changed);
             let changed_names = changed
                 .iter()
                 .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
@@ -962,18 +1217,15 @@ impl Checkout {
             let failures = published.graph.failures();
             let update = match update {
                 Ok(update) if failures.is_empty() => update,
-                failed => {
-                    // A failed update may have changed some of the engine's
-                    // state and not the rest, so the next refresh starts a new
-                    // engine from the publication.
-                    *slot = None;
-                    return Err(DataError::Resolve(match failed {
-                        Err(error) => error.to_string(),
-                        Ok(_) => format!(
-                            "reading the stored call graph failed: {}",
-                            failures.join("; ")
-                        ),
-                    }));
+                // A failed update may have changed some of the engine's state
+                // and not the rest; the caller drops it, so the next refresh
+                // starts a new engine from the publication.
+                Err(error) => return Err(DataError::Resolve(error.to_string())),
+                Ok(_) => {
+                    return Err(DataError::Damaged(format!(
+                        "reading the stored call graph failed: {}",
+                        failures.join("; ")
+                    )))
                 }
             };
             // Only the files this update touched get new slices; every file
@@ -1011,32 +1263,7 @@ impl Checkout {
         let served = stats
             .is_some()
             .then(|| (engine.overlay.clone(), engine.refreshed.clone()));
-        let mut live = self.write_live();
-        if live
-            .published
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &published))
-        {
-            if let Some((overlay, refreshed)) = served {
-                let graph: Arc<dyn SliceSource + Send + Sync> = Arc::new(overlay);
-                live.graph = Some(graph);
-                live.refreshed = Some(Arc::new(refreshed));
-            }
-            let resolved = live
-                .changes
-                .iter()
-                .filter(|(_, change)| change.sequence <= covered)
-                .map(|(path, _)| path.clone())
-                .collect::<BTreeSet<_>>();
-            live.callgraph_pending = Arc::new(
-                live.callgraph_pending
-                    .iter()
-                    .filter(|path| !resolved.contains(*path))
-                    .cloned()
-                    .collect(),
-            );
-        }
-        Ok(stats)
+        Ok((stats, served))
     }
 
     /// The incremental state for `published`: every stored resolution, and
@@ -1213,30 +1440,64 @@ impl Checkout {
     /// This checkout's publication in `snapshot`, or `None` when the
     /// snapshot has no state for it.
     fn open_published(&self, snapshot: Snapshot) -> Result<Option<Published>, DataError> {
-        let Some(state) = snapshot
-            .checkout_state(self.checkout)
-            .map_err(DataError::store)?
-        else {
-            return Ok(None);
+        // A state this build cannot read (another format version, or bytes
+        // that fail their checks) is treated as never published: the
+        // checkout is built again.
+        let state = match snapshot.checkout_state(self.checkout) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(None),
+            Err(error) if error.is_unusable_file() => {
+                crate::slog_warn!(
+                    "data layer: {} has a published state this build cannot use; building again: {error}",
+                    self.root.display()
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(DataError::store(error)),
         };
-        let known = known_sections();
-        let segments = snapshot
-            .manifest()
-            .segments()
-            .iter()
-            .map(|entry| {
-                snapshot
-                    .open_segment(entry.id, &known, Arc::clone(&self.layer.cache))
-                    .map(Arc::new)
-                    .map_err(DataError::store)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (segments, unusable) = self.open_segments(&snapshot)?;
         let identity = format!(
             "{}:{}",
             snapshot.generation(),
             Digest128::of(&state.encode())
         );
-        Published::open(self.root.clone(), identity, state, segments, snapshot).map(Some)
+        let published = Published::open(self.root.clone(), identity, state, segments, snapshot);
+        if unusable.is_empty() {
+            return published.map(Some);
+        }
+        // Some segment could not be used. If the rest still hold everything
+        // this checkout's state names, serve them; otherwise build again.
+        match published {
+            Ok(published) if published.membership.missing() == 0 => Ok(Some(published)),
+            outcome => {
+                crate::slog_warn!(
+                    "data layer: {} needs data in segments this build cannot use ({}); building again{}",
+                    self.root.display(),
+                    unusable.join("; "),
+                    outcome.err().map(|error| format!(": {error}")).unwrap_or_default()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Opens every segment of `snapshot` this build can use, and names the
+    /// ones it cannot (another format version, or failing their checks).
+    fn open_segments(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(Vec<Arc<Segment>>, Vec<String>), DataError> {
+        let known = known_sections();
+        let mut segments = Vec::new();
+        let mut unusable = Vec::new();
+        for entry in snapshot.manifest().segments() {
+            match snapshot.open_segment(entry.id, &known, Arc::clone(&self.layer.cache)) {
+                Ok(segment) => segments.push(Arc::new(segment)),
+                Err(error) if error.is_unusable_file() => unusable.push(error.to_string()),
+                Err(error) => return Err(DataError::store(error)),
+            }
+        }
+        Ok((segments, unusable))
     }
 }
 
@@ -1301,6 +1562,9 @@ pub struct CheckoutStatus {
     /// Files in a parsed language that the call graph does not cover,
     /// because extracting them failed. The plane can be ready with some.
     pub unparsed: usize,
+    /// The last build or call-graph refresh failed, and none has succeeded
+    /// since; [`Checkout::failure`] says why.
+    pub failed: bool,
 }
 
 /// A checkout's data as queries see it at one moment: the last publication
@@ -1443,6 +1707,7 @@ impl CheckoutView {
             callgraph_pending: self.callgraph_pending.len(),
             building: false,
             unparsed: self.unparsed.len(),
+            failed: false,
         }
     }
 
@@ -2194,6 +2459,247 @@ pub fn other() { callee(); }
         assert_eq!(fresh.view().unwrap().status().callgraph, PlaneStatus::Ready);
     }
 
+    /// A build that publishes while a recording scans: the recording's
+    /// state came from the older publication, so it must not be applied;
+    /// the recording scans again from the new one.
+    #[test]
+    fn a_recording_that_straddles_a_publication_scans_again() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "main.ts",
+            "import { helper } from './extra';\nexport function main() { helper(); }\n",
+        );
+        write(root.path(), "notes.txt", "nothing\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        write(root.path(), "extra.ts", "export function helper() {}\n");
+        write(root.path(), "notes.txt", "changed\n");
+        // A recording of notes.txt reads its base and scans...
+        let (base, generation) = {
+            let live = checkout.live.read().unwrap();
+            (
+                Arc::new(live.published.as_ref().unwrap().state.clone()),
+                live.generation,
+            )
+        };
+        let sink = ChangeSink::default();
+        let scanned = scan_paths(
+            &checkout.root,
+            &checkout.layer.policy,
+            &base,
+            &[b"notes.txt".to_vec()],
+            &sink,
+        )
+        .unwrap();
+        // ...a build publishes, with extra.ts...
+        checkout.build().unwrap();
+        assert!(checkout.view().unwrap().state().get(b"extra.ts").is_some());
+        // ...and the recording's scan, from the older base, is refused.
+        assert!(!checkout.apply_scan(
+            &base,
+            generation,
+            scanned.state,
+            &scanned.changed,
+            sink.finish()
+        ));
+        checkout.record_paths(&[b"notes.txt".to_vec()]).unwrap();
+        let state = checkout.live.read().unwrap().state.clone();
+        assert!(state.is_none_or(|state| state.get(b"extra.ts").is_some()));
+        // An ordinary edit then resolves over the new publication's files.
+        write(
+            root.path(),
+            "main.ts",
+            "import { helper } from './extra';\nexport function main() { helper(); }\nexport function more() {}\n",
+        );
+        checkout.record_paths(&[b"main.ts".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let ours = callers_of(&checkout.view().unwrap(), "extra.ts", "helper");
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(layer, cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        let theirs = callers_of(&cold.view().unwrap(), "extra.ts", "helper");
+        assert!(theirs.contains("main"), "{theirs}");
+        assert_eq!(ours, theirs);
+    }
+
+    /// A stored resolution that does not decode, met by the method-call
+    /// pass of an update: the refresh fails as damage, every later one does
+    /// too (none panics on a poisoned lock), and a build replaces it.
+    #[test]
+    fn a_damaged_stored_resolution_fails_the_refresh_until_a_build_replaces_it() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), "go.mod", "module example.com/m\n");
+        write(
+            root.path(),
+            "p/t.go",
+            "package p\n\ntype T struct{}\n\nfunc (T) Run() {}\n",
+        );
+        write(
+            root.path(),
+            "p/use.go",
+            "package p\n\nfunc Use(t T) { t.Run(); t.Stop() }\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        super::super::graph_store::DAMAGED_FRAGMENT
+            .with(|damaged| *damaged.borrow_mut() = Some("p/use.go".to_string()));
+        checkout.build().unwrap();
+        super::super::graph_store::DAMAGED_FRAGMENT.with(|damaged| *damaged.borrow_mut() = None);
+        write(
+            root.path(),
+            "p/stop.go",
+            "package p\n\nfunc (T) Stop() {}\n",
+        );
+        checkout.record_paths(&[b"p/stop.go".to_vec()]).unwrap();
+        for attempt in 0..2 {
+            let result = checkout.refresh_callgraph();
+            assert!(
+                matches!(result, Err(DataError::Damaged(_))),
+                "refresh {attempt}: {:?}",
+                result.map(|stats| stats.map(|stats| stats.touched))
+            );
+            assert!(checkout.status().failed);
+            assert!(checkout.failure().is_some());
+        }
+        // A build reads every file again and replaces the damaged fragment.
+        checkout.build().unwrap();
+        assert!(!checkout.status().failed);
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        assert!(view.callgraph_failures().is_empty());
+        let callers = callers_of(&view, "p/stop.go", "Stop");
+        assert!(callers.contains("p/use.go"), "{callers}");
+    }
+
+    /// Editing an ignore file changes which files are members, as a cold
+    /// scan would see them: at the root, and in a folder.
+    #[test]
+    fn an_ignore_file_edit_changes_members_as_a_cold_scan_would() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        write(root.path(), ".gitignore", "gen/\n");
+        write(root.path(), "gen/out.txt", "zzneedle generated\n");
+        write(root.path(), "docs/notes.txt", "zzneedle docs\n");
+        write(root.path(), "pkg/.aftignore", "");
+        write(root.path(), "pkg/a.txt", "zzneedle a\n");
+        write(root.path(), "pkg/b.txt", "zzneedle b\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        assert_eq!(
+            candidates_for(&checkout.view().unwrap(), "zzneedle"),
+            ["docs/notes.txt", "pkg/a.txt", "pkg/b.txt"]
+        );
+        let cold = |layer: &Arc<DataLayer>| {
+            let cold_store = tempfile::tempdir().unwrap();
+            let cold = Checkout::bind(Arc::clone(layer), cold_store.path(), family(), root.path())
+                .unwrap();
+            cold.build().unwrap();
+            candidates_for(&cold.view().unwrap(), "zzneedle")
+        };
+        // At the root: the rule moves from gen/ to docs/.
+        write(root.path(), ".gitignore", "docs/\n");
+        checkout.record_paths(&[b".gitignore".to_vec()]).unwrap();
+        let theirs = cold(&layer);
+        assert_eq!(theirs, ["gen/out.txt", "pkg/a.txt", "pkg/b.txt"]);
+        assert_eq!(
+            candidates_for(&checkout.view().unwrap(), "zzneedle"),
+            theirs
+        );
+        // In a folder: its own ignore file now leaves out one of its files.
+        write(root.path(), "pkg/.aftignore", "a.txt\n");
+        checkout
+            .record_paths(&[b"pkg/.aftignore".to_vec()])
+            .unwrap();
+        let theirs = cold(&layer);
+        assert_eq!(theirs, ["gen/out.txt", "pkg/b.txt"]);
+        assert_eq!(
+            candidates_for(&checkout.view().unwrap(), "zzneedle"),
+            theirs
+        );
+    }
+
+    /// An ignore file that leaves a caller out takes it out of the call
+    /// graph too.
+    #[test]
+    fn an_ignore_file_edit_removes_an_ignored_caller() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(root.path(), ".aftignore", "");
+        write(
+            root.path(),
+            "main.ts",
+            "import { run } from './lib';\nexport function main() { run(); }\n",
+        );
+        write(root.path(), "lib.ts", "export function run() {}\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        assert!(callers_of(&checkout.view().unwrap(), "lib.ts", "run").contains("main"));
+        write(root.path(), ".aftignore", "main.ts\n");
+        checkout.record_paths(&[b".aftignore".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let callers = callers_of(&checkout.view().unwrap(), "lib.ts", "run");
+        assert!(!callers.contains("main"), "{callers}");
+    }
+
+    /// Two checkouts resolve a file to the same answers through different
+    /// symlink chains. Each keeps its own record of the paths it consulted,
+    /// so retargeting a link only one of them consulted reaches its file.
+    #[cfg(unix)]
+    #[test]
+    fn checkouts_that_consulted_different_paths_keep_their_own_fragments() {
+        use std::os::unix::fs::symlink;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        for root in [a.path(), b.path()] {
+            write(
+                root,
+                "main.ts",
+                "import { run } from './alias/lib';\nexport function main() { run(); }\n",
+            );
+            write(root, "real/lib.ts", "export function run() { return 1; }\n");
+            write(
+                root,
+                "other/lib.ts",
+                "export function run() { return 2; }\n",
+            );
+            symlink("real", root.join("hop_a")).unwrap();
+            symlink("real", root.join("hop_b")).unwrap();
+        }
+        symlink("hop_a", a.path().join("alias")).unwrap();
+        symlink("hop_b", b.path().join("alias")).unwrap();
+        let first = Checkout::bind(Arc::clone(&layer), store.path(), family(), a.path()).unwrap();
+        first.build().unwrap();
+        assert!(callers_of(&first.view().unwrap(), "real/lib.ts", "run").contains("main"));
+        drop(first);
+        let second = Checkout::bind(Arc::clone(&layer), store.path(), family(), b.path()).unwrap();
+        second.build().unwrap();
+        drop(second);
+        let first = Checkout::bind(Arc::clone(&layer), store.path(), family(), a.path()).unwrap();
+        assert!(first.check_stored_inputs().unwrap().is_empty());
+        std::fs::remove_file(a.path().join("hop_a")).unwrap();
+        symlink("other", a.path().join("hop_a")).unwrap();
+        first.record_paths(&[b"hop_a".to_vec()]).unwrap();
+        first.refresh_callgraph().unwrap();
+        let ours = callers_of(&first.view().unwrap(), "other/lib.ts", "run");
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(layer, cold_store.path(), family(), a.path()).unwrap();
+        cold.build().unwrap();
+        let theirs = callers_of(&cold.view().unwrap(), "other/lib.ts", "run");
+        assert!(theirs.contains("main"), "{theirs}");
+        assert_eq!(ours, theirs);
+    }
+
     #[test]
     fn a_restart_sees_what_changed_while_nothing_watched() {
         let root = tempfile::tempdir().unwrap();
@@ -2474,7 +2980,10 @@ pub fn other() { callee(); }
             "the refreshed dead-code snapshot equals a cold build's"
         );
         assert!(
-            format!("{refreshed_snapshot:?}").contains("src/extra.rs"),
+            refreshed_snapshot
+                .outbound_calls
+                .iter()
+                .any(|call| call.caller_file.ends_with("src/extra.rs")),
             "the new caller is in the snapshot: {refreshed_snapshot:?}"
         );
     }

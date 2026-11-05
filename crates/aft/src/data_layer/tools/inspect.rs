@@ -74,7 +74,18 @@ impl DeadCodeSources {
             .and_then(Weak::upgrade)?;
         // The call graph is refreshed lazily, so ask for the edits recorded
         // since the last refresh to be resolved, as any exact reader does.
-        let Some(view) = checkout.fresh_view(SNAPSHOT_WAIT) else {
+        let view = match checkout.fresh_view(SNAPSHOT_WAIT) {
+            crate::data_layer::runtime::Fresh::Ready(view) => Some(view),
+            crate::data_layer::runtime::Fresh::Building => None,
+            crate::data_layer::runtime::Fresh::Failed(reason) => {
+                crate::slog_warn!(
+                    "tier2 dead_code: data layer call graph failed for {}: {reason}",
+                    project_root.display()
+                );
+                None
+            }
+        };
+        let Some(view) = view else {
             let state = checkout.view().map_or_else(
                 || "nothing published yet".to_string(),
                 |view| format!("call graph {:?}", view.status().callgraph),
