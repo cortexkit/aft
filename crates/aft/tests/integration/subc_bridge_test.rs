@@ -13404,7 +13404,6 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
         .as_bool()
         .unwrap_or(false));
 
-    aft::context::reset_callgraph_cold_build_spawn_count_for_test();
     let callers_args = json!({
         "file": callgraph_file.to_string_lossy(),
         "symbol": "callee",
@@ -13412,9 +13411,9 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
     });
     send_tool_call(&mut stream, 3, 501, "callers", callers_args.clone()).await;
     send_tool_call(&mut stream, 3, 502, "callers", callers_args.clone()).await;
-    // The single-flight result count is the invariant. Share one arithmetic response
-    // deadline so full-suite scheduler load cannot fail a correct build at 30 seconds,
-    // while two missing responses still terminate as one bounded hang.
+    // Share one arithmetic response deadline so full-suite scheduler load
+    // cannot fail a correct build early, while two missing responses still
+    // end as one bounded hang.
     let cold_deadline = Instant::now() + Duration::from_secs(90);
     let cold_one = read_frame_within(
         &mut stream,
@@ -13430,16 +13429,20 @@ async fn drive_callgraph_maintenance_daemon(input: FakeDaemonInput) {
     )
     .await
     .expect("cold callers response 2 within shared deadline");
-    let cold_responses = [tool_response_json(&cold_one), tool_response_json(&cold_two)];
-    assert_eq!(
-        aft::context::callgraph_cold_build_spawn_count_for_test(),
-        1,
-        "concurrent cold callers through subc must share one background build"
-    );
-    assert!(
-        cold_responses.iter().any(is_callgraph_building),
-        "at least one cold callers response should report callgraph_building: {cold_responses:?}"
-    );
+    // The first query binds the root's checkout in the data layer and starts
+    // its build; a call-graph command waits for that build (up to its read
+    // wait) and answers from it, rather than answering callgraph_building.
+    for cold in [tool_response_json(&cold_one), tool_response_json(&cold_two)] {
+        assert_eq!(
+            cold["success"].as_bool(),
+            Some(true),
+            "a cold callers call waits for the build and answers: {cold:?}"
+        );
+        assert!(
+            cold["total_callers"].as_u64().unwrap_or(0) >= 1,
+            "the cold answer holds the built result: {cold:?}"
+        );
+    }
 
     let ready = poll_callers_until_ready(&mut stream, 3, 510, callers_args).await;
     assert!(ready["success"].as_bool().unwrap_or(false));
@@ -14046,9 +14049,13 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(root.get("actor_count").and_then(Value::as_u64), Some(1));
     assert_eq!(root.get("state").and_then(Value::as_str), Some("ready"));
+    // The data layer serves text search and the call graph; a plane the
+    // bind's configuration switches off reports "off", the word every index
+    // consumer uses (spec/feature-config/consumer-responses.json). Semantic
+    // search still reports its own index.
     assert_eq!(
         root.pointer("/search_index/status").and_then(Value::as_str),
-        Some("disabled")
+        Some("off")
     );
     assert_eq!(
         root.pointer("/semantic_index/status")
@@ -14058,7 +14065,7 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     assert_eq!(
         root.pointer("/callgraph_store/status")
             .and_then(Value::as_str),
-        Some("disabled")
+        Some("off")
     );
     assert_eq!(
         root.pointer("/tier2/status").and_then(Value::as_str),
@@ -16759,10 +16766,6 @@ async fn poll_callers_until_ready(
         attempt += 1;
     }
     panic!("callgraph store did not become ready within 90s; last response: {last_response:?}");
-}
-
-fn is_callgraph_building(response: &Value) -> bool {
-    response.get("code").and_then(Value::as_str) == Some("callgraph_building")
 }
 
 fn control_flags() -> Flags {
