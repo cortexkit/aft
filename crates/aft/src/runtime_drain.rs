@@ -541,7 +541,17 @@ impl StandaloneConfigureMaintenance {
         // A view publication scheduled here detaches instead of running on the
         // standalone request thread; see `install_standalone_scope`.
         let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
-        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
+        let ran =
+            crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner);
+        if ran {
+            // As the daemon's configure tail does: the data layer binds the
+            // root's checkout and catches up, and a rebind rescans it, before
+            // the next request runs. Without this, a standalone checkout was
+            // bound only by its first query and never rescanned on rebind.
+            crate::data_layer::runtime::root_bound(ctx);
+            crate::data_layer::outline::root_bound(ctx);
+        }
+        ran
     }
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
