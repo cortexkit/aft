@@ -1060,13 +1060,13 @@ fn drain_runtime_events_cooperatively(
             return;
         }
     }
-    configure.after_configure_tail(runtime);
 
     drain_non_configure_runtime_events(registry);
 }
 
 fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     let runtime = registry.current();
+    aft::runtime_drain::follow_configure_with_data_layer(runtime);
     // Preserve the dependency order: install finished search artifacts before
     // watcher deltas, then advance the other build channels and diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);

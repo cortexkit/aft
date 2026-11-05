@@ -519,6 +519,21 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::data_layer::outline::root_bound(ctx);
 }
 
+/// Once per configure of a standalone AFT: with the data layer on, the
+/// root's checkout binds and catches up, building and filling as it needs
+/// ([`crate::data_layer::runtime::root_bound`]), as the daemon's configure
+/// tail has it do; otherwise nothing would until the first query. Never
+/// binds again a checkout an idle release dropped since. Does nothing with
+/// the data layer off.
+pub fn follow_configure_with_data_layer(ctx: &AppContext) {
+    if !crate::data_layer::runtime::enabled() {
+        return;
+    }
+    if ctx.note_data_layer_followed_configure() {
+        crate::data_layer::runtime::root_bound(ctx);
+    }
+}
+
 /// Executor-maintenance form of [`drain_deferred_configure_maintenance`]:
 /// returns `true` when the drain stepped aside for a queued interactive
 /// writer on the same root and left the rest parked for a requeued drain.
@@ -531,36 +546,17 @@ pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) ->
 #[derive(Debug)]
 pub struct StandaloneConfigureMaintenance {
     inner: crate::commands::configure::ConfigureMaintenanceState,
-    /// The configure generation whose drained tail was last followed by
-    /// [`Self::after_configure_tail`].
-    followed: Option<u64>,
 }
 
 impl Default for StandaloneConfigureMaintenance {
     fn default() -> Self {
         Self {
             inner: crate::commands::configure::ConfigureMaintenanceState::default(),
-            followed: None,
         }
     }
 }
 
 impl StandaloneConfigureMaintenance {
-    /// Once per configure, after its tail is drained: with the data layer on,
-    /// the root's checkout binds and catches up, building and filling as it
-    /// needs ([`crate::data_layer::runtime::root_bound`]), as the daemon's
-    /// configure tail has it do; otherwise nothing would until the first
-    /// query. Does nothing with the data layer off, and never binds again a
-    /// checkout an idle release dropped since.
-    pub fn after_configure_tail(&mut self, ctx: &AppContext) {
-        let generation = ctx.configure_generation();
-        if self.followed == Some(generation) || self.has_pending(ctx) {
-            return;
-        }
-        self.followed = Some(generation);
-        crate::data_layer::runtime::root_bound(ctx);
-    }
-
     pub fn has_pending(&mut self, ctx: &AppContext) -> bool {
         crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
     }

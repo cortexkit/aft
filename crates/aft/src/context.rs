@@ -4823,6 +4823,10 @@ pub struct AppContext {
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
     /// `data_layer::runtime`).
     data_checkout: parking_lot::Mutex<Option<Arc<crate::data_layer::runtime::DataCheckout>>>,
+    /// The configure generation a standalone AFT last bound the data
+    /// layer's checkout after (see
+    /// [`crate::runtime_drain::follow_configure_with_data_layer`]).
+    data_layer_followed_configure: AtomicU64,
     /// Why the last attempt to bind `data_checkout` failed, until one
     /// succeeds; status and health report it. Kept typed, so a store file a
     /// newer build wrote is reported as that refusal.
@@ -5818,6 +5822,7 @@ impl AppContext {
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
             data_checkout: parking_lot::Mutex::new(None),
+            data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
@@ -10046,6 +10051,18 @@ impl AppContext {
         crate::semantic_admission::admission(&root, &config.index.roots)
             .admits()
             .then(|| config.semantic.clone())
+    }
+
+    /// Records that the data layer followed the current configure; `false`
+    /// when it already had, or no root is configured yet.
+    pub(crate) fn note_data_layer_followed_configure(&self) -> bool {
+        if self.canonical_cache_root_opt().is_none() {
+            return false;
+        }
+        let generation = self.configure_generation();
+        self.data_layer_followed_configure
+            .swap(generation, Ordering::AcqRel)
+            != generation
     }
 
     /// Whether the data layer's meaning plane serves this root's semantic
