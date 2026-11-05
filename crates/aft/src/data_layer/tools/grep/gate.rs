@@ -343,7 +343,12 @@ fn replay(
             "first_difference": first_difference(&shown_today, &shown_data),
             "evidence": evidence,
         });
-        if example || !ACCEPTED.contains(&class) {
+        // An unexplained difference keeps both replies whole, so the report
+        // shows every line that differs.
+        if !ACCEPTED.contains(&class) {
+            difference["today"] = shown_today;
+            difference["data"] = shown_data;
+        } else if example {
             difference["today"] = clip(shown_today);
             difference["data"] = clip(shown_data);
         }
@@ -441,17 +446,26 @@ fn classify(
 }
 
 /// Whether two capped grep replies differ only in their capped count: the
-/// "(capped)" footer's number and `total_matches`, with every row the same.
+/// "(capped)" footer's number, the list trailer's `≥N` lower bound when N
+/// is that reply's own `total_matches`, and `total_matches` itself, with
+/// every row the same.
 fn capped_floors_alone(today: &Value, data: &Value) -> bool {
     let footer =
         regex::Regex::new(r"Found \d+ match(es)? (in|across) (\d+ files?) \(capped\)").unwrap();
     let normalized = |shown: &Value| {
         let mut shown = shown.clone();
+        let floor = shown["total_matches"]
+            .as_u64()
+            .map(|total| format!("≥{total}"));
         for key in ["text", "rendered"] {
             if let Some(text) = shown[key].as_str() {
-                shown[key] = json!(footer
+                let mut text = footer
                     .replace_all(text, "Found # matches $2 $3 (capped)")
-                    .into_owned());
+                    .into_owned();
+                if let Some(floor) = &floor {
+                    text = text.replace(floor.as_str(), "≥#");
+                }
+                shown[key] = json!(text);
             }
         }
         if let Some(object) = shown.as_object_mut() {
