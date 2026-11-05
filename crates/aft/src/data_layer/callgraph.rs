@@ -506,6 +506,55 @@ fn ordinary_calls(
     calls
 }
 
+/// The path `rel` names after following symlinks inside a checkout whose
+/// symlinks, folders and paths `link`, `is_dir` and `exists` report, or
+/// `None` when it leaves the checkout, loops, or names nothing. Shared by
+/// [`CheckoutFacts`] and by the tracing that records which paths an answer
+/// consulted, so the two can never walk differently.
+pub(crate) fn canonical_walk(
+    rel: &[u8],
+    link: impl Fn(&[u8]) -> Option<Vec<u8>>,
+    is_dir: impl Fn(&[u8]) -> bool,
+    exists: impl Fn(&[u8]) -> bool,
+) -> Option<Vec<u8>> {
+    if rel.starts_with(b"/") {
+        return None;
+    }
+    let mut pending = rel
+        .split(|b| *b == b'/')
+        .map(<[u8]>::to_vec)
+        .collect::<std::collections::VecDeque<_>>();
+    let mut components = Vec::<Vec<u8>>::new();
+    let mut seen = BTreeSet::new();
+    let mut followed = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_slice() {
+            b"" | b"." => continue,
+            b".." => {
+                components.pop()?;
+                continue;
+            }
+            _ => components.push(component),
+        }
+        let path = components.join(&b'/');
+        if let Some(target) = link(&path) {
+            // Bound expanding cycles such as a -> a/a as well as exact cycles.
+            followed += 1;
+            if target.starts_with(b"/") || followed > 40 || !seen.insert((path, pending.clone())) {
+                return None;
+            }
+            components.pop();
+            for component in target.split(|b| *b == b'/').rev() {
+                pending.push_front(component.to_vec());
+            }
+        } else if !pending.is_empty() && !is_dir(&path) {
+            return None;
+        }
+    }
+    let path = components.join(&b'/');
+    (exists(&path) || is_dir(&path)).then_some(path)
+}
+
 /// The checkout's paths and configuration, as the resolver asks for them.
 /// Answers what the views manifest answered for the same checkout.
 #[derive(Debug)]
@@ -551,45 +600,12 @@ impl ProjectFacts for CheckoutFacts<'_> {
     /// The path `rel` names after following symlinks inside the checkout,
     /// or `None` when it leaves the checkout, loops, or names nothing.
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
-        if rel.starts_with(b"/") {
-            return None;
-        }
-        let mut pending = rel
-            .split(|b| *b == b'/')
-            .map(<[u8]>::to_vec)
-            .collect::<std::collections::VecDeque<_>>();
-        let mut components = Vec::<Vec<u8>>::new();
-        let mut seen = BTreeSet::new();
-        let mut followed = 0;
-        while let Some(component) = pending.pop_front() {
-            match component.as_slice() {
-                b"" | b"." => continue,
-                b".." => {
-                    components.pop()?;
-                    continue;
-                }
-                _ => components.push(component),
-            }
-            let path = components.join(&b'/');
-            if let Some(target) = self.symlink_target(&path) {
-                // Bound expanding cycles such as a -> a/a as well as exact cycles.
-                followed += 1;
-                if target.starts_with(b"/")
-                    || followed > 40
-                    || !seen.insert((path, pending.clone()))
-                {
-                    return None;
-                }
-                components.pop();
-                for component in target.split(|b| *b == b'/').rev() {
-                    pending.push_front(component.to_vec());
-                }
-            } else if !pending.is_empty() && !self.is_dir(&path) {
-                return None;
-            }
-        }
-        let path = components.join(&b'/');
-        (self.exists(&path) || self.is_dir(&path)).then_some(path)
+        canonical_walk(
+            rel,
+            |path| self.symlink_target(path).map(<[u8]>::to_vec),
+            |path| self.is_dir(path),
+            |path| self.exists(path),
+        )
     }
 
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {

@@ -11,8 +11,10 @@
 //! encodes; this plane does not interpret them. Terms let a query find the
 //! fragments that can hold its answer (the callers of a target, the files
 //! with a reference or symbol of some name, the files of a language)
-//! without reading every fragment. A term is stored as a hash, which can
-//! collide, so a lookup returns candidates the caller confirms in the
+//! without reading every fragment. Further terms name what each resolution
+//! recorded as its inputs, so after an edit the files whose resolution may
+//! have changed are found the same way. A term is stored as a hash, which
+//! can collide, so a lookup returns candidates the caller confirms in the
 //! fragment itself.
 
 use std::collections::BTreeMap;
@@ -31,7 +33,8 @@ const DATA: SectionKind = SectionKind::new(0x0301);
 const INDEX: SectionKind = SectionKind::new(0x0302);
 const TERM_LOOKUP: SectionKind = SectionKind::new(0x0303);
 const TERM_POSTINGS: SectionKind = SectionKind::new(0x0304);
-const VERSION: u16 = 1;
+/// Version 2 added the recorded-input terms.
+const VERSION: u16 = 2;
 const UNIT_KEY_SPACE: KeySpace = KeySpace::new(0);
 
 /// The graph sections this build reads.
@@ -86,14 +89,29 @@ pub enum TermKind {
     SymbolName,
     /// The language the file was parsed as.
     Language,
+    /// An input key the file's binding recorded.
+    BindingKey,
+    /// An input key the file's resolution recorded.
+    ResolutionKey,
+    /// An input key the file's dispatch type targets recorded.
+    DispatchKey,
+    /// An input key the file's method-call sites recorded.
+    SiteKey,
+    /// A path or folder that a recorded checkout read of the file consulted.
+    FactSubject,
 }
 
 impl TermKind {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 9] = [
         Self::CallTarget,
         Self::ReferenceName,
         Self::SymbolName,
         Self::Language,
+        Self::BindingKey,
+        Self::ResolutionKey,
+        Self::DispatchKey,
+        Self::SiteKey,
+        Self::FactSubject,
     ];
 
     const fn key_space(self) -> KeySpace {
@@ -102,6 +120,11 @@ impl TermKind {
             Self::ReferenceName => 2,
             Self::SymbolName => 3,
             Self::Language => 4,
+            Self::BindingKey => 5,
+            Self::ResolutionKey => 6,
+            Self::DispatchKey => 7,
+            Self::SiteKey => 8,
+            Self::FactSubject => 9,
         })
     }
 }

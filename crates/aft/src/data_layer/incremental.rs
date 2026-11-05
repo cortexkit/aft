@@ -177,6 +177,54 @@ struct StaleAnswers {
 }
 
 impl LiveCheckout {
+    /// Checks that `stored`, the publication this engine started from,
+    /// files every resolution under each input key the engine's own reverse
+    /// index holds, and lists every key whose readers the stored terms miss.
+    /// For gates: the engine will look changes up in the stored terms
+    /// instead of keeping this index.
+    pub(crate) fn stored_readers_missing(
+        &self,
+        stored: &super::graph_store::StoredSlices,
+    ) -> Vec<String> {
+        use aft_store::graph::TermKind;
+        let mut missing = Vec::new();
+        let kinds = [
+            (TermKind::BindingKey, &self.reverse.binding),
+            (TermKind::ResolutionKey, &self.reverse.resolution),
+            (TermKind::DispatchKey, &self.reverse.dispatch),
+            (TermKind::SiteKey, &self.reverse.sites),
+        ];
+        for (kind, readers) in kinds {
+            for (key, files) in &readers.by_key {
+                let found = stored.files_recording(kind, key.as_bytes());
+                let lost = files.iter().filter(|file| !found.contains(*file)).count();
+                if lost > 0 && missing.len() < 50 {
+                    missing.push(format!("{kind:?} {key}: {lost} readers not filed"));
+                }
+            }
+        }
+        // Every recorded read is filed under what it consulted.
+        let facts = CheckoutFacts {
+            inputs: &self.inputs,
+        };
+        for (path, file) in &self.resolved {
+            let questions = file
+                .binding
+                .answers()
+                .map(|(question, _)| question)
+                .chain(file.dispatch.iter().flat_map(|d| d.trace.answers.keys()));
+            for question in questions {
+                for subject in super::subjects::subjects(question, &facts) {
+                    let found = stored.files_recording(TermKind::FactSubject, &subject.term());
+                    if !found.contains(path) && missing.len() < 50 {
+                        missing.push(format!("{path}: {question:?} not filed under {subject:?}"));
+                    }
+                }
+            }
+        }
+        missing
+    }
+
     /// Files whose recorded reads or surface answers no longer hold in the
     /// current checkout, whatever changed: an update that left one of them
     /// unchecked missed a file it had to resolve again. Asks everything, so

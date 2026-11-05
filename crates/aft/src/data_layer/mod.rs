@@ -21,4 +21,5 @@ pub(crate) mod query;
 pub mod reuse;
 pub(crate) mod runtime;
 pub(crate) mod slice;
+pub(crate) mod subjects;
 pub(crate) mod tools;

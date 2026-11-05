@@ -61,6 +61,19 @@ fn main() {
                 .join(", ")
         );
     }
+    let started = Instant::now();
+    let missing = checkout.check_stored_inputs().unwrap();
+    println!(
+        "stored input terms: {} missing ({:.0} ms){}",
+        missing.len(),
+        started.elapsed().as_secs_f64() * 1000.0,
+        missing
+            .iter()
+            .take(10)
+            .map(|line| format!("\n  {line}"))
+            .collect::<String>()
+    );
     drop(checkout);
     let _ = std::fs::remove_dir_all(&store);
+    assert!(missing.is_empty(), "the stored input terms miss readers");
 }

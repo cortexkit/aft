@@ -2083,6 +2083,17 @@ impl ViewBindingDependencies {
         finish_binding(self);
     }
 
+    /// The input keys binding recorded, before resolution added its own:
+    /// what [`finish_binding`] gives a freshly bound file.
+    pub(crate) fn binding_keys(&self) -> BTreeSet<String> {
+        self.references
+            .values()
+            .flatten()
+            .cloned()
+            .chain(self.binding_probes.iter().cloned())
+            .collect()
+    }
+
     /// Every checkout read binding and resolution made, with its answer.
     pub(crate) fn answers(
         &self,

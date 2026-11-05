@@ -273,6 +273,12 @@ pub fn run(
     // `None` while the checkout is down for the restart.
     let mut slot = Some(bind()?);
     live(&slot)?.build().map_err(|error| error.to_string())?;
+    let missing = live(&slot)?
+        .check_stored_inputs()
+        .map_err(|error| error.to_string())?;
+    if !missing.is_empty() {
+        return Err(format!("the stored input terms miss readers: {missing:#?}"));
+    }
 
     let commits = edits
         .iter()

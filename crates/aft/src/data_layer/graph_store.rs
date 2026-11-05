@@ -68,6 +68,59 @@ fn slice_terms(slice: &FileSlice) -> Vec<(TermKind, Vec<u8>)> {
     terms
 }
 
+/// The terms that file a resolution under what it recorded as its inputs,
+/// so an update finds the files a change can reach without reading every
+/// fragment. Each kind matches what the incremental engine keeps in memory
+/// for the same resolution. `subjects` memoises what each recorded read
+/// consulted, since many files record the same reads.
+fn input_terms(
+    resolution: &FileResolution,
+    facts: &super::callgraph::CheckoutFacts<'_>,
+    subjects: &mut HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
+) -> Vec<(TermKind, Vec<u8>)> {
+    let binding = &resolution.binding;
+    let mut terms = Vec::new();
+    for key in binding.binding_keys() {
+        terms.push((TermKind::BindingKey, key.into_bytes()));
+    }
+    for key in &binding.dependencies {
+        terms.push((TermKind::ResolutionKey, key.as_bytes().to_vec()));
+    }
+    let mut questions = binding
+        .answers()
+        .map(|(question, _)| question)
+        .collect::<Vec<_>>();
+    if let Some(dispatch) = &resolution.dispatch {
+        let trace = &dispatch.trace;
+        for key in trace
+            .dependencies()
+            .into_iter()
+            .chain(trace.probes().iter().cloned())
+        {
+            terms.push((TermKind::DispatchKey, key.into_bytes()));
+        }
+        questions.extend(trace.answers.keys());
+    }
+    for key in &resolution.site_dependencies {
+        terms.push((TermKind::SiteKey, key.as_bytes().to_vec()));
+    }
+    let mut seen = BTreeSet::new();
+    for question in questions {
+        let filed = subjects.entry(question.clone()).or_insert_with(|| {
+            super::subjects::subjects(question, facts)
+                .iter()
+                .map(super::subjects::Subject::term)
+                .collect()
+        });
+        for term in filed.iter() {
+            if seen.insert(term.clone()) {
+                terms.push((TermKind::FactSubject, term.clone()));
+            }
+        }
+    }
+    terms
+}
+
 fn call_target(file: &str, symbol: &str) -> Vec<u8> {
     format!("{file}\0{symbol}").into_bytes()
 }
@@ -123,6 +176,8 @@ pub(crate) fn write_sections(
     }
     let mut graph = GraphSectionsBuilder::new();
     let mut keys = BTreeMap::new();
+    let facts = super::callgraph::CheckoutFacts { inputs };
+    let mut subjects = HashMap::new();
     for (file, resolution) in resolved {
         let (key, parse) = &inputs.parses[file];
         let (record_key, record) = records
@@ -130,7 +185,8 @@ pub(crate) fn write_sections(
             .ok_or_else(|| format!("no content record for {file}"))?;
         content.add(*record_key, record);
         let slice = FileSlice::build(file, key, parse, resolution);
-        let terms = slice_terms(&slice);
+        let mut terms = slice_terms(&slice);
+        terms.extend(input_terms(resolution, &facts, &mut subjects));
         let bytes = super::fragment::encode(resolution);
         let fragment = fragment_key(key, file, &bytes);
         keys.insert(file.clone(), fragment);
@@ -428,6 +484,13 @@ impl StoredSlices {
 
     /// The files whose current fragment is listed under `term`, in every
     /// segment that has graph sections.
+    /// The files whose stored resolution recorded `key` as an input of
+    /// `kind`. Terms are stored as hashes, so a few files may be listed that
+    /// did not record it; callers check the resolution itself.
+    pub(crate) fn files_recording(&self, kind: TermKind, key: &[u8]) -> BTreeSet<String> {
+        self.files_for(kind, key)
+    }
+
     fn files_for(&self, kind: TermKind, term: &[u8]) -> BTreeSet<String> {
         let mut files = BTreeSet::new();
         for (index, segment) in self.segments.iter().enumerate() {

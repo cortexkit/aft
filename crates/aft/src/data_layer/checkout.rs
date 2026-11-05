@@ -967,6 +967,26 @@ impl Checkout {
         Ok(timings)
     }
 
+    /// Starts the incremental engine for this checkout's publication and
+    /// checks that the publication's stored input terms file every reader
+    /// the engine indexes. Returns what they miss. For gates.
+    ///
+    /// # Errors
+    ///
+    /// When there is no publication, or the engine cannot start.
+    #[doc(hidden)]
+    pub fn check_stored_inputs(&self) -> Result<Vec<String>, DataError> {
+        let published = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .clone()
+            .ok_or_else(|| DataError::Resolve("nothing is published".to_string()))?;
+        let engine = self.start_engine_timed(&published, &mut Vec::new())?;
+        Ok(engine.live.stored_readers_missing(&published.graph))
+    }
+
     fn start_engine_timed(
         &self,
         published: &Arc<Published>,
