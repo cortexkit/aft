@@ -5,17 +5,20 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::callgraph_store::{CallGraphStore, CallGraphStoreError, EitherGraph};
 use crate::context::AppContext;
-use crate::data_layer::checkout::{CheckoutView, PlaneStatus};
+use crate::data_layer::checkout::CheckoutView;
 use crate::data_layer::query::{SliceReader, SliceSource};
 
 /// How long a call-graph command waits for recorded edits to be resolved
-/// before it answers that the call graph is still building, the same bound
-/// reads of today's views use.
-const READ_WAIT: Duration = Duration::from_secs(3);
+/// before it answers that the call graph is still building. The call graph
+/// is refreshed lazily, so the first read after a stretch of edits pays for
+/// all of them in one update (seconds at worst on AFT's own checkout); the
+/// command waits for it rather than answering from a graph that misses
+/// them, and gives up only if the update takes far longer than that.
+const READ_WAIT: Duration = Duration::from_secs(30);
 
 /// The data layer's call-graph reader.
 pub(crate) type DataGraph = SliceReader<Arc<dyn SliceSource + Send + Sync>>;
@@ -40,18 +43,9 @@ pub(crate) fn access(ctx: &AppContext) -> Access {
     let Some(checkout) = ctx.data_checkout() else {
         return Access::Off;
     };
-    checkout.request_refresh();
-    let deadline = Instant::now() + READ_WAIT;
-    loop {
-        if let Some(view) = checkout.view() {
-            if view.status().callgraph == PlaneStatus::Ready {
-                return Access::Ready(view.callgraph(), view);
-            }
-        }
-        if Instant::now() >= deadline {
-            return Access::Building;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    match checkout.fresh_view(READ_WAIT) {
+        Some(view) => Access::Ready(view.callgraph(), view),
+        None => Access::Building,
     }
 }
 
@@ -215,9 +209,11 @@ mod tests {
         );
         let util = write(&root, "src/util.rs", "pub fn callee() {}\n");
         let readme = write(&root, "README.md", "callee\n");
-        let mut config = crate::config::Config::default();
-        config.project_root = Some(root.clone());
-        config.storage_dir = Some(storage.path().to_path_buf());
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..crate::config::Config::default()
+        };
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.clone());
 

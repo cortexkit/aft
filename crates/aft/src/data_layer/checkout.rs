@@ -392,6 +392,8 @@ impl Checkout {
         CheckoutStatus {
             text: plane,
             callgraph: plane,
+            callgraph_published: false,
+            callgraph_pending: 0,
             building,
             unparsed: 0,
         }
@@ -698,7 +700,7 @@ impl Checkout {
     }
 
     /// Waits up to [`WRITER_WAIT`] for the store's writer.
-    fn writer(&self) -> Result<aft_store::family::WriteSession, DataError> {
+    fn writer(&self) -> Result<aft_store::family::WriteSession<'_>, DataError> {
         let deadline = Instant::now() + WRITER_WAIT;
         loop {
             if let Some(session) = self.family.try_write().map_err(DataError::store)? {
@@ -1284,7 +1286,15 @@ pub enum PlaneStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
 pub struct CheckoutStatus {
     pub text: PlaneStatus,
+    /// Ready only when the call graph covers every recorded change, as a
+    /// reader that needs exact answers requires.
     pub callgraph: PlaneStatus,
+    /// A call graph has been published for this checkout. The call graph is
+    /// refreshed lazily, so a published graph with changes pending is its
+    /// normal state between edits, not a graph still being built.
+    pub callgraph_published: bool,
+    /// Recorded changes the call graph has not resolved yet.
+    pub callgraph_pending: usize,
     /// A build is running. Answers still come from the current view, which
     /// covers every change recorded so far.
     pub building: bool,
@@ -1429,6 +1439,8 @@ impl CheckoutView {
         CheckoutStatus {
             text,
             callgraph,
+            callgraph_published: self.published.graph_built,
+            callgraph_pending: self.callgraph_pending.len(),
             building: false,
             unparsed: self.unparsed.len(),
         }

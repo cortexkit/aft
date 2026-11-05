@@ -26,10 +26,6 @@ use crate::parser::LangId;
 /// carry it, so output from another version is extracted again.
 pub const EXTRACTOR_VERSION: &str = crate::views::callgraph::PRODUCER;
 
-/// The language the call graph parses the file at `path` as, `"config"`
-/// for resolver configuration it reads raw, or `None` for a file the call
-/// graph does not read.
-#[must_use]
 /// The scan policy every data-layer scan uses: a source file the call
 /// graph parses is read up to the larger read limit even past the
 /// text-index limit, as the inspect scanners read graph sources, so a large
@@ -56,6 +52,10 @@ fn parsed_path(path: &[u8]) -> bool {
         || crate::views::callgraph::source_language(path).is_some()
 }
 
+/// The language the call graph parses the file at `path` as, `"config"`
+/// for resolver configuration it reads raw, or `None` for a file the call
+/// graph does not read.
+#[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     if crate::views::assembly::is_resolution_input(path.as_bytes()) {
         return Some("config".to_string());

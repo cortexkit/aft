@@ -409,7 +409,12 @@ impl LiveCheckout {
     /// configuration without naming a field), and lists the files with a
     /// read whose answer differs. Files whose reads all hold are filed again
     /// under what those reads consult now.
-    fn stale_answers(&mut self, changed: &BTreeSet<String>, configs_changed: bool) -> StaleAnswers {
+    fn stale_answers(
+        &mut self,
+        old: &CheckoutInputs,
+        changed: &BTreeSet<String>,
+        configs_changed: bool,
+    ) -> StaleAnswers {
         /// Whether any of `answers` differs now; each distinct read is asked
         /// once and kept in `now`.
         fn differs(
@@ -427,8 +432,12 @@ impl LiveCheckout {
             any
         }
         let mut keys = BTreeSet::new();
+        let before = CheckoutFacts { inputs: old };
+        let after = CheckoutFacts {
+            inputs: &self.inputs,
+        };
         for path in changed {
-            for subject in affected_by(path.as_bytes()) {
+            for subject in affected_by(path.as_bytes(), &before, &after) {
                 keys.insert(subject_key(&subject));
             }
         }
@@ -696,7 +705,7 @@ impl LiveCheckout {
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
         } else {
-            self.stale_answers(changed, !configs.is_empty())
+            self.stale_answers(&old, changed, !configs.is_empty())
         };
         let inputs = &self.inputs;
         stats.answers_checked = stale.checked;
@@ -729,7 +738,7 @@ impl LiveCheckout {
         // the engine started, a binding under the old inputs now.
         let unbound = rebind
             .iter()
-            .filter(|path| self.bound.get(path).is_none() && old.parses.contains_key(*path))
+            .filter(|path| self.bound.get(path).is_none() && old.parses.contains_key(path))
             .collect::<Vec<_>>();
         let mut old_bound = bind_all(&old, &unbound)?
             .into_iter()

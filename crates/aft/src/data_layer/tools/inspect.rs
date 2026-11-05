@@ -25,9 +25,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
-use crate::data_layer::checkout::PlaneStatus;
 use crate::data_layer::runtime::DataCheckout;
 use crate::inspect::job::{canonicalize_normalized, CallgraphSnapshot};
+
+/// How long a dead-code run waits for recorded edits to reach the call
+/// graph, as the call-graph commands do.
+const SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The data-layer checkouts dead code reads, by the project root inspect
 /// analyses. Empty unless the process runs the data layer. Holds each
@@ -69,21 +72,19 @@ impl DeadCodeSources {
             .unwrap_or_else(PoisonError::into_inner)
             .get(project_root)
             .and_then(Weak::upgrade)?;
-        let Some(view) = checkout.view() else {
+        // The call graph is refreshed lazily, so ask for the edits recorded
+        // since the last refresh to be resolved, as any exact reader does.
+        let Some(view) = checkout.fresh_view(SNAPSHOT_WAIT) else {
+            let state = checkout.view().map_or_else(
+                || "nothing published yet".to_string(),
+                |view| format!("call graph {:?}", view.status().callgraph),
+            );
             crate::slog_info!(
-                "tier2 dead_code: data layer not used for {}: nothing published yet",
+                "tier2 dead_code: data layer not used for {}: {state}",
                 project_root.display()
             );
             return None;
         };
-        let callgraph = view.status().callgraph;
-        if callgraph != PlaneStatus::Ready {
-            crate::slog_info!(
-                "tier2 dead_code: data layer not used for {}: call graph {callgraph:?}",
-                project_root.display()
-            );
-            return None;
-        }
         let started = Instant::now();
         match view.dead_code_snapshot_shared() {
             Ok(snapshot) => {

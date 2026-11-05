@@ -9,12 +9,21 @@
 //! it through the edit-intent listener, and outside changes through the
 //! watcher's path batches.
 //!
+//! Text queries see a change at once. The call graph is refreshed lazily,
+//! since agents edit far more often than they read it (about 14 edits per
+//! call-graph read in mason sessions): once when a checkout is bound or
+//! built, once [`QUIET`] after the last recorded change, and whenever a
+//! reader that needs exact answers waits for it ([`DataCheckout::fresh_view`]).
+//! A refresh resolves every change recorded since the last one in one pass,
+//! so a burst of edits costs one update.
+//!
 //! The builds here run on plain threads. At cutover they move onto the
 //! root's executor, so an unbound root does no work and a drain cancels it.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use aft_store::ids::{Digest128, FamilyId};
 
@@ -61,12 +70,18 @@ fn family_of(root: &Path) -> FamilyId {
     FamilyId::from_digest(Digest128::of(identity.as_bytes()))
 }
 
+/// How long a checkout goes without a recorded change before its call
+/// graph is refreshed unasked. Edits a few seconds apart, as an agent makes
+/// them, never refresh in between.
+pub(crate) const QUIET: Duration = Duration::from_secs(120);
+
 /// One root's checkout in a running AFT.
 pub(crate) struct DataCheckout {
     checkout: Arc<Checkout>,
     building: Arc<AtomicBool>,
     /// A call-graph refresh is running.
     refreshing: Arc<AtomicBool>,
+    quiet: Arc<QuietTimer>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
@@ -84,16 +99,26 @@ impl DataCheckout {
         let checkout = Arc::new(Checkout::bind(layer(), &family_dir, family, root)?);
         let building = Arc::new(AtomicBool::new(false));
         let refreshing = Arc::new(AtomicBool::new(false));
+        let quiet = {
+            let checkout = Arc::downgrade(&checkout);
+            let refreshing = Arc::clone(&refreshing);
+            Arc::new(QuietTimer::new(QUIET, move || {
+                if let Some(checkout) = checkout.upgrade() {
+                    start_refresh(&checkout, &refreshing);
+                }
+            }))
+        };
         let listener: Arc<dyn WriteIntentListener> = Arc::new(EditListener {
             checkout: Arc::downgrade(&checkout),
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
-            refreshing: Arc::clone(&refreshing),
+            quiet: Arc::clone(&quiet),
         });
         crate::views::intent::register_listener(&listener);
         let handle = Arc::new(Self {
             checkout,
             building,
             refreshing,
+            quiet,
             _listener: listener,
         });
         if handle.checkout.view().is_none() {
@@ -125,13 +150,109 @@ impl DataCheckout {
         let root = std::fs::canonicalize(self.checkout.root())
             .unwrap_or_else(|_| self.checkout.root().to_path_buf());
         record(&self.checkout, &root, paths);
-        start_refresh(&self.checkout, &self.refreshing);
+        self.quiet.changed();
     }
 
     /// Makes sure a call-graph refresh runs if any change is pending, for a
     /// query about to wait for the call graph.
     pub(crate) fn request_refresh(&self) {
         start_refresh(&self.checkout, &self.refreshing);
+    }
+
+    /// A view whose call graph covers every recorded change, for a reader
+    /// that needs exact answers: refreshes now and waits for it, up to
+    /// `wait`. `None` when nothing is published yet, or the refresh did not
+    /// finish in time; the reader then reports the call graph as building.
+    pub(crate) fn fresh_view(&self, wait: Duration) -> Option<CheckoutView> {
+        self.request_refresh();
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(view) = self
+                .checkout
+                .view()
+                .filter(|view| view.status().callgraph == super::checkout::PlaneStatus::Ready)
+            {
+                return Some(view);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            // A refresh that failed leaves its changes pending and stops;
+            // asking again retries it, as the next query would.
+            self.request_refresh();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Calls `fire` once a checkout has gone `quiet` without a recorded change
+/// (for the call graph, [`QUIET`], to refresh it). One timer thread runs per
+/// checkout at most, and only while a change is waiting: each change moves
+/// the deadline on, and the thread sleeps until the latest one.
+struct QuietTimer {
+    quiet: Duration,
+    /// When the last change was recorded, in milliseconds since `epoch`.
+    last_change_ms: AtomicU64,
+    armed: AtomicBool,
+    epoch: Instant,
+    fire: Box<dyn Fn() + Send + Sync>,
+}
+
+impl QuietTimer {
+    fn new(quiet: Duration, fire: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            quiet,
+            last_change_ms: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+            epoch: Instant::now(),
+            fire: Box::new(fire),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Notes a recorded change, and starts the timer thread unless one is
+    /// waiting already.
+    fn changed(self: &Arc<Self>) {
+        self.last_change_ms.store(self.now_ms(), Ordering::Release);
+        if self.armed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let timer = Arc::clone(self);
+        let quiet_ms = u64::try_from(self.quiet.as_millis()).unwrap_or(u64::MAX);
+        let spawned = std::thread::Builder::new()
+            .name("aft-data-quiet".to_string())
+            .spawn(move || loop {
+                let due = timer
+                    .last_change_ms
+                    .load(Ordering::Acquire)
+                    .saturating_add(quiet_ms);
+                let now = timer.now_ms();
+                if now < due {
+                    std::thread::sleep(Duration::from_millis(due - now));
+                    continue;
+                }
+                timer.armed.store(false, Ordering::Release);
+                // A change recorded between the deadline check and letting
+                // go of the flag found the timer armed and started none; if
+                // there was one, this thread keeps waiting for it.
+                if timer
+                    .last_change_ms
+                    .load(Ordering::Acquire)
+                    .saturating_add(quiet_ms)
+                    > timer.now_ms()
+                    && !timer.armed.swap(true, Ordering::AcqRel)
+                {
+                    continue;
+                }
+                (timer.fire)();
+                break;
+            });
+        if spawned.is_err() {
+            self.armed.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -246,7 +367,7 @@ fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
 struct EditListener {
     checkout: Weak<Checkout>,
     root: PathBuf,
-    refreshing: Arc<AtomicBool>,
+    quiet: Arc<QuietTimer>,
 }
 
 impl WriteIntentListener for EditListener {
@@ -266,6 +387,43 @@ impl WriteIntentListener for EditListener {
                 record(&checkout, &self.root, std::slice::from_ref(path))
             }
         }
-        start_refresh(&checkout, &self.refreshing);
+        self.quiet.changed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    #[test]
+    fn the_quiet_timer_fires_once_after_a_burst_of_changes() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&fired);
+        let timer = Arc::new(QuietTimer::new(Duration::from_millis(200), move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        // Changes closer together than the quiet window never fire in
+        // between.
+        for _ in 0..5 {
+            timer.changed();
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // The next change arms it again.
+        timer.changed();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fired.load(Ordering::SeqCst) == 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(fired.load(Ordering::SeqCst), 2, "fired without a change");
     }
 }

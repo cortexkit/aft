@@ -127,11 +127,11 @@ impl<'a> ObjectDispatch<'a> {
             WorkspaceCratePrefixCache::default(),
             Rc::new(DiskFacts::new(root)),
         );
-        index.lazy = Some(Rc::new(LazyDbFileIndexes::new(
-            connection,
-            root,
-            HashSet::new(),
-        )));
+        // The pass below also needs the stored loader's module resolution,
+        // so the same loader goes in both fields.
+        let lazy = Rc::new(LazyDbFileIndexes::new(connection, root, HashSet::new()));
+        index.lazy = Some(Rc::clone(&lazy) as Rc<dyn super::LoadedFileIndexes + 'a>);
+        index.stored_lazy = Some(lazy);
         Self {
             root: root.to_path_buf(),
             index,
