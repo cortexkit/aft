@@ -28,8 +28,10 @@ use crate::parser::LangId;
 /// counts the changes to what records hold since that producer version:
 /// 1 added the file's outline; 2 added the names inside Rust macros that
 /// could not be parsed; 3 added the method-call sites of `self` calls
-/// between the functions a `macro_rules!` template defines.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-3";
+/// between the functions a `macro_rules!` template defines; 4 dropped the
+/// dynamic sites of JavaScript and TypeScript computed member calls whose
+/// member is a string literal.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-4";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index

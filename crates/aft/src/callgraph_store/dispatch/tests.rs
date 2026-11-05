@@ -1027,3 +1027,18 @@ fn rust_template_self_call_to_a_name_the_template_lacks_has_no_site() {
         parsed.dispatch.sites
     );
 }
+
+/// `obj["name"]()` calls `name` as written and is left to ordinary
+/// resolution; only an index that is not a string literal is dynamic.
+#[test]
+fn computed_member_with_a_string_literal_is_not_a_dynamic_site() {
+    for language in ["typescript", "javascript"] {
+        let parsed = parse(
+            "function method() {}\nfunction caller(obj, name) { obj[\"method\"](); obj['method'](); obj[name](); }\n",
+            language,
+        );
+        let sites = &parsed.dispatch.sites;
+        assert_eq!(sites.len(), 1, "{language}: {sites:#?}");
+        assert!(sites[0].dynamic, "{language}: {sites:#?}");
+    }
+}

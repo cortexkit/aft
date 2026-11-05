@@ -249,7 +249,12 @@ fn strip_generic_callee_wrapper<'a>(node: tree_sitter::Node<'a>) -> tree_sitter:
     }
 }
 
-fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+/// The name a computed member access `obj["name"]` spells with a string
+/// literal, or `None` when its index is any other expression.
+pub(crate) fn extract_computed_member_name(
+    node: &tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
     let index = node.child_by_field_name("index")?;
     let text = source[index.byte_range()].trim();
     computed_member_literal(text)

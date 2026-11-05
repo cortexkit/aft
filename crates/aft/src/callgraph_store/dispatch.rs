@@ -1064,6 +1064,15 @@ pub(crate) fn extract_with<'tree>(
             }
         }
         let dynamic = syntactic_dynamic(callee, source, language);
+        // `obj["name"]()` spells its member with a string literal: it is a
+        // call of `name` as written, which ordinary resolution links by that
+        // name, as today's database did. A site would replace that link.
+        if !dynamic
+            && matches!(language, "javascript" | "typescript" | "tsx")
+            && callee.kind() == "subscript_expression"
+        {
+            continue;
+        }
         let receiver_node = field(
             callee,
             &["object", "value", "operand", "expression", "receiver"],
@@ -1336,7 +1345,10 @@ fn template_self_site(
 
 fn syntactic_dynamic(callee: Node<'_>, source: &str, language: &str) -> bool {
     match language {
-        "javascript" | "typescript" | "tsx" => callee.kind() == "subscript_expression",
+        "javascript" | "typescript" | "tsx" => {
+            callee.kind() == "subscript_expression"
+                && crate::calls::extract_computed_member_name(&callee, source).is_none()
+        }
         "python" => {
             callee.kind() == "call"
                 && field(callee, &["function"]).is_some_and(|n| text(n, source) == "getattr")
