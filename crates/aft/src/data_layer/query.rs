@@ -60,7 +60,7 @@ impl<T: SliceSource + ?Sized> SliceSource for Arc<T> {
 }
 
 /// Slices kept in memory, with their lookups.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MemorySlices {
     slices: BTreeMap<String, Arc<FileSlice>>,
     callers: HashMap<(String, String), BTreeSet<String>>,

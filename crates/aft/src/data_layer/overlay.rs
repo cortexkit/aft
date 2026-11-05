@@ -14,6 +14,7 @@ use super::query::{MemorySlices, SliceSource};
 use super::slice::FileSlice;
 
 /// Slices from `base`, with replaced and removed files laid over them.
+#[derive(Clone)]
 pub(crate) struct OverlaySlices<B> {
     base: B,
     /// The files resolved since `base` was published.

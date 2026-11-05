@@ -122,8 +122,12 @@ struct GraphEngine {
     live: LiveCheckout,
     /// Each changed path's change count as the engine last applied it.
     applied: BTreeMap<Vec<u8>, u64>,
-    /// Files whose resolution changed since the publication.
-    dirty: BTreeSet<String>,
+    /// The call graph as of the last refresh: the publication with every
+    /// file resolved since laid over it. Each refresh updates only the files
+    /// its update touched, then serves a copy.
+    overlay: OverlaySlices<Arc<StoredSlices>>,
+    /// What the overlay replaces and removes, for the dead-code snapshot.
+    refreshed: Refreshed,
 }
 
 /// A checkout's current data: its last publication and the changes made
@@ -164,10 +168,11 @@ struct Live {
 
 /// The files resolved again since a publication, with the paths they were
 /// resolved over.
+#[derive(Clone)]
 struct Refreshed {
     state: CheckoutState,
     /// Each re-resolved file's record key, parse and resolution.
-    replaced: BTreeMap<String, (String, Arc<ParseBlob>, FileResolution)>,
+    replaced: BTreeMap<String, (String, Arc<ParseBlob>, Arc<FileResolution>)>,
     /// Files the publication has that the checkout no longer parses.
     removed: BTreeSet<String>,
 }
@@ -827,36 +832,38 @@ impl Checkout {
                 .live
                 .update(next, &changed_names)
                 .map_err(|error| DataError::Resolve(error.to_string()))?;
-            engine.dirty.extend(update.touched.iter().cloned());
+            // Only the files this update touched get new slices; every file
+            // touched by an earlier update keeps the slice it got then.
+            for file in &update.touched {
+                match (
+                    engine.live.resolved.get(file),
+                    engine.live.inputs.parses.get(file),
+                ) {
+                    (Some(resolution), Some((key, parse))) => {
+                        engine
+                            .overlay
+                            .replace(FileSlice::build(file, key, parse, resolution));
+                        engine.refreshed.removed.remove(file);
+                        engine.refreshed.replaced.insert(
+                            file.clone(),
+                            (key.clone(), Arc::clone(parse), Arc::new(resolution.clone())),
+                        );
+                    }
+                    _ => {
+                        engine.overlay.remove(file);
+                        engine.refreshed.replaced.remove(file);
+                        engine.refreshed.removed.insert(file.clone());
+                    }
+                }
+            }
+            engine.refreshed.state = engine.live.inputs.state.clone();
             for path in &changed {
                 engine.applied.insert(path.clone(), changes[path].sequence);
             }
             stats = Some(update);
         }
-        let mut overlay = OverlaySlices::new(Arc::clone(&published.graph));
-        let mut refreshed = Refreshed {
-            state: engine.live.inputs.state.clone(),
-            replaced: BTreeMap::new(),
-            removed: BTreeSet::new(),
-        };
-        for file in &engine.dirty {
-            match (
-                engine.live.resolved.get(file),
-                engine.live.inputs.parses.get(file),
-            ) {
-                (Some(resolution), Some((key, parse))) => {
-                    overlay.replace(FileSlice::build(file, key, parse, resolution));
-                    refreshed.replaced.insert(
-                        file.clone(),
-                        (key.clone(), Arc::clone(parse), resolution.clone()),
-                    );
-                }
-                _ => {
-                    overlay.remove(file);
-                    refreshed.removed.insert(file.clone());
-                }
-            }
-        }
+        let overlay = engine.overlay.clone();
+        let refreshed = engine.refreshed.clone();
         let mut live = self.write_live();
         if live
             .published
@@ -902,7 +909,12 @@ impl Checkout {
             published: Arc::clone(published),
             live,
             applied: BTreeMap::new(),
-            dirty: BTreeSet::new(),
+            overlay: OverlaySlices::new(Arc::clone(&published.graph)),
+            refreshed: Refreshed {
+                state: published.state.clone(),
+                replaced: BTreeMap::new(),
+                removed: BTreeSet::new(),
+            },
         })
     }
 
@@ -1219,7 +1231,7 @@ impl CheckoutView {
                 }
                 for (file, (key, parse, resolution)) in &refreshed.replaced {
                     parses.insert(file.clone(), (key.clone(), Arc::clone(parse)));
-                    resolved.insert(file.clone(), resolution.clone());
+                    resolved.insert(file.clone(), FileResolution::clone(resolution));
                 }
                 refreshed.state.clone()
             }

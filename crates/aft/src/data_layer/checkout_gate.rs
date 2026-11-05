@@ -39,8 +39,14 @@ pub struct CommitRecord {
     pub cold_build_ms: f64,
     /// Call-graph primitives whose answers differ from the cold build's.
     pub differing_primitives: usize,
-    /// Sampled identifiers whose text candidates differ.
-    pub differing_text: usize,
+    /// Sampled identifiers for which one side's candidates miss a file
+    /// that really contains the identifier: a wrong answer.
+    pub missed_text: usize,
+    /// Sampled identifiers whose candidate sets differ only in files that
+    /// do not contain the identifier. Candidates are a superset the reader
+    /// verifies against file contents, so this is not a wrong answer; it
+    /// shows how far the two filters differ.
+    pub differing_false_positives: usize,
     pub text_samples: usize,
     /// The view's status was not ready after the last refresh.
     pub not_ready: bool,
@@ -127,7 +133,13 @@ fn text_samples(files: &Files) -> Vec<String> {
 }
 
 /// Compares `view` with `cold` and fills the record's differences.
-fn compare(view: &CheckoutView, cold: &CheckoutView, files: &Files, record: &mut CommitRecord) {
+fn compare(
+    root: &Path,
+    view: &CheckoutView,
+    cold: &CheckoutView,
+    files: &Files,
+    record: &mut CommitRecord,
+) {
     let inputs = files.inputs();
     let mut queries = BTreeMap::new();
     let mut found = Vec::new();
@@ -153,15 +165,52 @@ fn compare(view: &CheckoutView, cold: &CheckoutView, files: &Files, record: &mut
         let Ok(query) = plan_pattern(&regex::escape(&name), false) else {
             continue;
         };
-        let ours = view.text_candidates(&query, Scope::All);
-        let theirs = cold.text_candidates(&query, Scope::All);
-        let same = matches!((&ours, &theirs), (Ok(a), Ok(b)) if a == b);
-        if !same {
-            record.differing_text += 1;
+        let (ours, theirs) = match (
+            view.text_candidates(&query, Scope::All),
+            cold.text_candidates(&query, Scope::All),
+        ) {
+            (Ok(ours), Ok(theirs)) => (
+                ours.into_iter().collect::<BTreeSet<_>>(),
+                theirs.into_iter().collect::<BTreeSet<_>>(),
+            ),
+            (ours, theirs) => {
+                record.missed_text += 1;
+                record.examples.push(format!(
+                    "text {name}: {:?} vs {:?}",
+                    ours.err(),
+                    theirs.err()
+                ));
+                continue;
+            }
+        };
+        if ours == theirs {
+            continue;
+        }
+        // A file only one side lists is a miss on the other side when it
+        // really contains the name.
+        let contains = |path: &&Vec<u8>| {
+            std::str::from_utf8(path)
+                .ok()
+                .and_then(|path| std::fs::read(root.join(path)).ok())
+                .is_some_and(|bytes| {
+                    bytes
+                        .windows(name.len())
+                        .any(|window| window == name.as_bytes())
+                })
+        };
+        let missed = ours
+            .symmetric_difference(&theirs)
+            .filter(contains)
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect::<Vec<_>>();
+        if missed.is_empty() {
+            record.differing_false_positives += 1;
+        } else {
+            record.missed_text += 1;
             if record.examples.len() < 20 {
                 record
                     .examples
-                    .push(format!("text {name}: {ours:?} vs {theirs:?}"));
+                    .push(format!("text {name}: one side misses {missed:?}"));
             }
         }
     }
@@ -316,13 +365,13 @@ pub fn run(
         record.cold_build_ms = started.elapsed().as_secs_f64() * 1000.0;
         let view = live(&slot)?.view().ok_or("the checkout has no view")?;
         let cold_view = cold.view().ok_or("the cold checkout has no view")?;
-        compare(&view, &cold_view, &files, &mut record);
+        compare(&root, &view, &cold_view, &files, &mut record);
         drop((view, cold_view, cold, cold_store));
         record.segment_files = std::fs::read_dir(store.path().join("segments"))
             .map(|entries| entries.filter_map(Result::ok).count())
             .unwrap_or_default();
         checked += 1;
-        if record.differing_primitives > 0 || record.differing_text > 0 || record.not_ready {
+        if record.differing_primitives > 0 || record.missed_text > 0 || record.not_ready {
             failed += 1;
         }
         writeln!(
