@@ -552,7 +552,7 @@ impl StandingActor {
         let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
             if !contended.iter().any(|claim| claim.covers(&entry)) {
-                self.submit_entry_pass(entry, &snapshot);
+                let _ = self.submit_entry_pass(entry, &snapshot);
             }
         }
     }
@@ -639,10 +639,17 @@ impl StandingActor {
         }
     }
 
-    fn submit_entry_pass(&self, entry: StandingRootEntry, snapshot: &Config) {
-        let Some(root_id) = self.ensure_actor(&entry, snapshot) else {
-            return;
-        };
+    /// Queues one pass over `entry` and returns the receiver of its reply,
+    /// or `None` when the root cannot enter the executor.
+    fn submit_entry_pass(
+        &self,
+        entry: StandingRootEntry,
+        snapshot: &Config,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::protocol::Response>> {
+        let root_id = self.ensure_actor(&entry, snapshot)?;
+        // Read here rather than in the job, so the whole pass follows one
+        // reading of the switch.
+        let data_layer = crate::data_layer::runtime::enabled();
         let roots = self.roots.clone();
         let literal_path = entry.literal_path.clone();
         let executor_request_id = format!("subc-standing-pass-{}", entry.literal_path);
@@ -683,6 +690,8 @@ impl StandingActor {
                 permit.admission_epoch,
                 admission.publication.admission_epoch
             );
+            // One data-layer bind or build covers every kind it builds.
+            let mut data_layer_verified = None;
             for kind in IndexKind::ALL {
                 if !entry.indexes.contains(&kind) {
                     continue;
@@ -694,15 +703,31 @@ impl StandingActor {
                 // boundary. The artifact-specific loader/build code consumes the
                 // plan when a resident or disk artifact is present; a failed or
                 // interrupted attempt intentionally leaves the durable flag set.
-                let verified = strict_verify_current_state(ctx, &entry, kind)
-                    || (kind == IndexKind::Search
-                        && build_missing_search_after_strict_check(
-                            ctx,
-                            &roots,
-                            &entry,
-                            &admission,
-                            permit.admission_epoch,
-                        ));
+                let verified = if data_layer && crate::data_layer::standing::builds(kind) {
+                    // The data layer's own writer orders its publications, so
+                    // no search cache is read or written and no writer lease
+                    // is taken.
+                    *data_layer_verified.get_or_insert_with(|| {
+                        crate::data_layer::standing::verify_current(
+                            &entry.resolved_target,
+                            &ctx.storage_dir(),
+                            || {
+                                !admission.cancellation_requested()
+                                    && !crate::executor::current_job_cancelled()
+                            },
+                        )
+                    })
+                } else {
+                    strict_verify_current_state(ctx, &entry, kind)
+                        || (kind == IndexKind::Search
+                            && build_missing_search_after_strict_check(
+                                ctx,
+                                &roots,
+                                &entry,
+                                &admission,
+                                permit.admission_epoch,
+                            ))
+                };
                 if verified {
                     if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
                         log::warn!(
@@ -719,13 +744,13 @@ impl StandingActor {
                 serde_json::json!({"standing": true, "entry": literal_path}),
             )
         });
-        let _ = self.executor.submit_coalescable_maintenance_async(
+        Some(self.executor.submit_coalescable_maintenance_async(
             root_id,
             Lane::MaintenanceCommit,
             executor_request_id,
             MaintenanceCoalesceKey::StandingPass,
             job,
-        );
+        ))
     }
 
     fn ensure_actor(&self, entry: &StandingRootEntry, snapshot: &Config) -> Option<ProjectRootId> {
@@ -2031,5 +2056,203 @@ mod tests {
             IndexKind::ALL,
             [IndexKind::Search, IndexKind::Semantic, IndexKind::Callgraph]
         );
+    }
+
+    /// A standing entry over a small Rust crate, reconciled but with no
+    /// pass run yet: its first snapshot leaves every kind strict.
+    struct StandingFixture {
+        storage: tempfile::TempDir,
+        _project: tempfile::TempDir,
+        root: std::path::PathBuf,
+        actor: StandingActor,
+        config: Config,
+        entry: StandingRootEntry,
+    }
+
+    impl StandingFixture {
+        fn new(indexes: Vec<IndexKind>) -> Self {
+            use crate::config::{IndexConfig, IndexRootConfig};
+
+            let storage = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(project.path()).unwrap();
+            for (path, text) in [
+                ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+                (
+                    "src/lib.rs",
+                    "mod util;\npub fn caller() { util::callee(); }\n",
+                ),
+                ("src/util.rs", "pub fn callee() {}\n"),
+            ] {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            let ctx = super::super::test_support::test_ctx();
+            let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
+                .with_startup_storage_dir(storage.path());
+            actor.reconcile_at_startup();
+            let config = Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                index: IndexConfig {
+                    roots: vec![IndexRootConfig {
+                        path: root.to_string_lossy().into_owned(),
+                        indexes,
+                    }],
+                },
+                ..Config::default()
+            };
+            let entry = actor.roots.reconcile(&config).unwrap().active_entries[0].clone();
+            Self {
+                storage,
+                _project: project,
+                root,
+                actor,
+                config,
+                entry,
+            }
+        }
+
+        /// Runs one standing pass over the entry and waits for it.
+        fn pass(&self) {
+            let reply = self
+                .actor
+                .submit_entry_pass(self.entry.clone(), &self.config)
+                .expect("the root enters the executor")
+                .blocking_recv()
+                .expect("the pass replies");
+            assert!(reply.success, "{:?}", reply.data);
+            assert_ne!(reply.data["admitted"], false, "{:?}", reply.data);
+        }
+
+        /// The entry's durable strict-verification flag for `kind`.
+        fn strict(&self, kind: IndexKind) -> bool {
+            let conn = crate::db::open(&self.storage.path().join("aft.db")).unwrap();
+            crate::db::standing_roots::needs_strict_verify(&conn, &self.entry.literal_path, kind)
+                .unwrap()
+                .expect("a freshness row")
+        }
+
+        fn search_cache(&self) -> std::path::PathBuf {
+            crate::search_index::resolve_cache_dir_with_key(
+                &self.entry.artifact_key,
+                Some(self.storage.path()),
+            )
+            .join("cache.bin")
+        }
+
+        /// The paths the data layer's publication of the root holds, with
+        /// whether it still matches the files on disk.
+        fn published(&self) -> (usize, bool) {
+            let checkout =
+                crate::data_layer::runtime::bind_foreground(&self.root, self.storage.path())
+                    .unwrap();
+            let view = checkout.view().expect("a publication");
+            (view.state().paths().len(), view.changed_paths().is_empty())
+        }
+
+        /// Every file of the data layer's stores with its size, to tell a
+        /// pass that published from one that only bound. Readers' leases
+        /// come and go with every bind, so they are left out.
+        fn data_files(&self) -> Vec<(std::path::PathBuf, u64)> {
+            fn walk(dir: &std::path::Path, files: &mut Vec<(std::path::PathBuf, u64)>) {
+                for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if entry.file_name() != "leases" {
+                            walk(&path, files);
+                        }
+                    } else {
+                        files.push((path, entry.metadata().unwrap().len()));
+                    }
+                }
+            }
+            let mut files = Vec::new();
+            walk(&self.storage.path().join("data"), &mut files);
+            files.sort();
+            files
+        }
+    }
+
+    #[test]
+    fn with_the_data_layer_a_standing_pass_builds_and_verifies_without_cache_bin() {
+        crate::data_layer::runtime::force_on_for_test();
+        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
+        assert!(fixture.strict(IndexKind::Search));
+        assert!(fixture.strict(IndexKind::Callgraph));
+
+        // The first pass builds the checkout; the build's scan covered it
+        // and published, which clears both kinds the data layer builds.
+        fixture.pass();
+        assert!(!fixture.strict(IndexKind::Search));
+        assert!(!fixture.strict(IndexKind::Callgraph));
+        assert_eq!(fixture.published(), (3, true));
+        assert!(
+            !fixture.search_cache().exists(),
+            "the data layer route wrote today's search cache"
+        );
+
+        // With nothing changed, the bind's scan alone is the proof: the pass
+        // clears the flags and publishes nothing.
+        let before = fixture.data_files();
+        fixture
+            .actor
+            .roots
+            .mark_observation_gap(
+                &fixture.entry.literal_path,
+                &[IndexKind::Search, IndexKind::Callgraph],
+            )
+            .unwrap();
+        fixture.pass();
+        assert!(!fixture.strict(IndexKind::Search));
+        assert!(!fixture.strict(IndexKind::Callgraph));
+        assert_eq!(
+            fixture.data_files(),
+            before,
+            "a pass with nothing to do published"
+        );
+
+        // A file added while nothing watched: the next pass finds it and
+        // publishes the checkout with it.
+        std::fs::write(fixture.root.join("src/extra.rs"), "pub fn extra() {}\n").unwrap();
+        fixture
+            .actor
+            .roots
+            .mark_observation_gap(&fixture.entry.literal_path, &[IndexKind::Search])
+            .unwrap();
+        fixture.pass();
+        assert!(!fixture.strict(IndexKind::Search));
+        assert_eq!(fixture.published(), (4, true));
+        assert!(!fixture.search_cache().exists());
+    }
+
+    #[test]
+    fn with_the_data_layer_a_failed_standing_build_keeps_the_strict_flag() {
+        crate::data_layer::runtime::force_on_for_test();
+        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
+        // A file where the data layer's stores go: no family store opens.
+        std::fs::write(fixture.storage.path().join("data"), "").unwrap();
+
+        fixture.pass();
+        assert!(fixture.strict(IndexKind::Search));
+        assert!(fixture.strict(IndexKind::Callgraph));
+        assert!(
+            !fixture.search_cache().exists(),
+            "a failed data layer build fell back to today's search cache"
+        );
+    }
+
+    #[test]
+    fn with_the_data_layer_off_a_standing_pass_builds_todays_search_cache() {
+        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
+
+        fixture.pass();
+        assert!(fixture.search_cache().is_file());
+        assert!(!fixture.strict(IndexKind::Search));
+        assert!(
+            fixture.strict(IndexKind::Callgraph),
+            "today's pass leaves the call graph's flag to its own loader"
+        );
+        assert!(!fixture.storage.path().join("data").exists());
     }
 }

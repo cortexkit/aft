@@ -2,7 +2,9 @@
 //!
 //! This command deliberately owns no daemon state. It validates the complete
 //! configured snapshot, acquires the same per-artifact leases used by standing
-//! work, builds every selected entry/kind once, and exits.
+//! work, builds every selected entry/kind once, and exits. With the data layer
+//! on, the kinds it builds take no lease and no breaker admission: the data
+//! layer's family store orders its publications with its own writer.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -71,14 +73,32 @@ struct SnapshotPlan {
     notices: Vec<String>,
 }
 
+/// Builds the data layer's checkout at a root (the first path), with its
+/// family store under a storage folder (the second), in the foreground.
+type DataLayerBuild = fn(&Path, &Path) -> Result<aft::data_layer::surfaces::IndexOutcome, String>;
+
 struct SnapshotUnit {
     entry: StandingRootEntry,
     kind: IndexKind,
+    writer: UnitWriter,
+    semantic_files: Option<Vec<PathBuf>>,
+}
+
+/// What builds one unit, and what fences its publication.
+enum UnitWriter {
+    /// Today's stores: a writer lease shared with standing work, a publish
+    /// epoch, and the build breaker's admission.
+    Leased(LeasedWriter),
+    /// The data layer, whose family store orders publications with its own
+    /// writer.
+    DataLayer(DataLayerBuild),
+}
+
+struct LeasedWriter {
     writer_lease: Arc<WriterLease>,
     publish_epoch: ArtifactPublishEpoch,
     publication_epoch: u64,
     admission: UnitAdmission,
-    semantic_files: Option<Vec<PathBuf>>,
 }
 
 enum UnitAdmission {
@@ -140,6 +160,20 @@ fn run_with_paths(
     paths: SnapshotPaths,
     output: &mut impl Write,
 ) -> Result<IndexExit, IndexError> {
+    let data_layer = aft::data_layer::surfaces::enabled()
+        .then_some(aft::data_layer::surfaces::index_root as DataLayerBuild);
+    run_snapshot(args, paths, data_layer, output)
+}
+
+/// Runs the snapshot, building the kinds the data layer builds with
+/// `data_layer` when it is on, and every kind with today's stores when it
+/// is `None`.
+fn run_snapshot(
+    args: Vec<OsString>,
+    paths: SnapshotPaths,
+    data_layer: Option<DataLayerBuild>,
+    output: &mut impl Write,
+) -> Result<IndexExit, IndexError> {
     parse_args(args)?;
 
     let ResolveResult {
@@ -176,7 +210,7 @@ fn run_with_paths(
             warning.message
         )));
     }
-    let plan = prepare_snapshot(config, notices)?;
+    let plan = prepare_snapshot(config, notices, data_layer)?;
 
     writeln!(output, "aft index: snapshot operation").map_err(|error| {
         IndexError::validation(format!("could not write index output: {error}"))
@@ -190,21 +224,22 @@ fn run_with_paths(
     let mut aggregate = SnapshotAggregate::default();
     let mut data_layer_builds = DataLayerBuilds::new();
     for unit in &plan.units {
-        let mut result = match &unit.admission {
-            UnitAdmission::Suspended(reason) => UnitResult::gap(reason.clone()),
-            UnitAdmission::Admitted { .. } if aft::data_layer::surfaces::enabled() => {
-                match unit.kind {
-                    IndexKind::Search | IndexKind::Callgraph => {
-                        build_data_layer_unit(&plan.config, unit, &mut data_layer_builds)
-                    }
-                    IndexKind::Semantic => build_unit(&plan.config, unit),
-                }
+        let mut result = match &unit.writer {
+            UnitWriter::DataLayer(build) => {
+                build_data_layer_unit(&plan.config, unit, *build, &mut data_layer_builds)
             }
-            UnitAdmission::Admitted { .. } => build_unit(&plan.config, unit),
+            UnitWriter::Leased(writer) => match &writer.admission {
+                UnitAdmission::Suspended(reason) => UnitResult::gap(reason.clone()),
+                UnitAdmission::Admitted { .. } => build_unit(&plan.config, unit, writer),
+            },
         };
 
         if result.usable {
-            if let UnitAdmission::Admitted { breaker, key } = &unit.admission {
+            if let UnitWriter::Leased(LeasedWriter {
+                admission: UnitAdmission::Admitted { breaker, key },
+                ..
+            }) = &unit.writer
+            {
                 if let Err(error) = breaker.record_ready_publication(key) {
                     result.gap = Some(format!("could not record breaker publication: {error}"));
                 }
@@ -272,7 +307,11 @@ fn index_notices(warnings: &[ConfigWarning]) -> Vec<String> {
         .collect()
 }
 
-fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan, IndexError> {
+fn prepare_snapshot(
+    config: Config,
+    notices: Vec<String>,
+    data_layer: Option<DataLayerBuild>,
+) -> Result<SnapshotPlan, IndexError> {
     let roots = StandingRoots::default();
     // Reconciliation resolves every configured entry, rejects duplicate artifact
     // identities, and pins all paths in shared aft.db before any build admission.
@@ -295,9 +334,20 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
         })?;
     }
 
+    // The data layer builds a kind when it is on and builds that kind;
+    // today's stores build the rest.
+    let data_layer_for =
+        |kind: IndexKind| data_layer.filter(|_| aft::data_layer::standing::builds(kind));
     let mut semantic_files = BTreeMap::new();
     for entry in &report.active_entries {
-        configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
+        // The write capability only today's writer leases need.
+        if entry
+            .indexes
+            .iter()
+            .any(|kind| data_layer_for(*kind).is_none())
+        {
+            configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
+        }
         if entry.indexes.contains(&IndexKind::Semantic) {
             semantic_files.insert(
                 entry.literal_path.clone(),
@@ -309,6 +359,15 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
     let mut units = Vec::new();
     for entry in report.active_entries {
         for kind in &entry.indexes {
+            if let Some(build) = data_layer_for(*kind) {
+                units.push(SnapshotUnit {
+                    entry: entry.clone(),
+                    kind: *kind,
+                    writer: UnitWriter::DataLayer(build),
+                    semantic_files: None,
+                });
+                continue;
+            }
             let cache_dir = cache_dir_for(storage_dir, &entry.artifact_key, *kind);
             let domain = if *kind == IndexKind::Callgraph {
                 RootCacheDomain::Callgraph
@@ -348,10 +407,12 @@ fn prepare_snapshot(config: Config, notices: Vec<String>) -> Result<SnapshotPlan
                 }),
                 entry: entry.clone(),
                 kind: *kind,
-                writer_lease,
-                publish_epoch,
-                publication_epoch,
-                admission,
+                writer: UnitWriter::Leased(LeasedWriter {
+                    writer_lease,
+                    publish_epoch,
+                    publication_epoch,
+                    admission,
+                }),
             });
         }
     }
@@ -451,12 +512,13 @@ fn cache_dir_for(storage_dir: &Path, artifact_key: &str, kind: IndexKind) -> Pat
 /// builds once.
 type DataLayerBuilds = BTreeMap<String, Result<aft::data_layer::surfaces::IndexOutcome, String>>;
 
-/// The search or call-graph kind of `unit`, built by the data layer when it
-/// runs: the checkout's text and call-graph planes, published to the
+/// The search or call-graph kind of `unit`, built by the data layer with
+/// `build`: the checkout's text and call-graph planes, published to the
 /// repository's family store in the foreground.
 fn build_data_layer_unit(
     config: &Config,
     unit: &SnapshotUnit,
+    build: DataLayerBuild,
     builds: &mut DataLayerBuilds,
 ) -> UnitResult {
     let outcome = builds
@@ -465,7 +527,7 @@ fn build_data_layer_unit(
             let root = std::fs::canonicalize(&unit.entry.resolved_target)
                 .unwrap_or_else(|_| unit.entry.resolved_target.clone());
             let storage = aft::bash_background::storage_dir(config.storage_dir.as_deref());
-            aft::data_layer::surfaces::index_root(&root, &storage)
+            build(&root, &storage)
         });
     match (outcome, unit.kind) {
         (Err(error), _) => UnitResult::gap(error.clone()),
@@ -483,11 +545,11 @@ fn build_data_layer_unit(
     }
 }
 
-fn build_unit(config: &Config, unit: &SnapshotUnit) -> UnitResult {
+fn build_unit(config: &Config, unit: &SnapshotUnit, writer: &LeasedWriter) -> UnitResult {
     let result = match unit.kind {
-        IndexKind::Search => build_search(config, unit),
-        IndexKind::Semantic => build_semantic(config, unit),
-        IndexKind::Callgraph => build_callgraph(config, unit),
+        IndexKind::Search => build_search(config, unit, writer),
+        IndexKind::Semantic => build_semantic(config, unit, writer),
+        IndexKind::Callgraph => build_callgraph(config, unit, writer),
     };
     match result {
         Ok(result) => result,
@@ -495,7 +557,11 @@ fn build_unit(config: &Config, unit: &SnapshotUnit) -> UnitResult {
     }
 }
 
-fn build_search(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
+fn build_search(
+    config: &Config,
+    unit: &SnapshotUnit,
+    writer: &LeasedWriter,
+) -> Result<UnitResult, String> {
     let cache_root = aft::root_cache::cache_root(config);
     let storage_dir = cache_root.as_path();
     let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
@@ -505,18 +571,20 @@ fn build_search(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, Stri
         &cache_dir,
     );
     let head = index.stored_git_head().map(str::to_string);
-    let persisted =
-        publish_if_current(
-            unit,
-            || Ok(index.write_to_disk(&cache_dir, head.as_deref())),
-        )?;
+    let persisted = publish_if_current(unit, writer, || {
+        Ok(index.write_to_disk(&cache_dir, head.as_deref()))
+    })?;
     if !persisted {
         return Err("could not persist search snapshot".to_string());
     }
     Ok(UnitResult::success(index.file_count()))
 }
 
-fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
+fn build_semantic(
+    config: &Config,
+    unit: &SnapshotUnit,
+    writer: &LeasedWriter,
+) -> Result<UnitResult, String> {
     let cache_root = aft::root_cache::cache_root(config);
     let storage_dir = cache_root.as_path();
     let files = unit.semantic_files.as_deref().unwrap_or_default();
@@ -533,7 +601,7 @@ fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, St
         &unit.entry.artifact_key,
     )?;
     index.set_fingerprint(fingerprint);
-    let persisted = publish_if_current(unit, || {
+    let persisted = publish_if_current(unit, writer, || {
         Ok(index.write_to_disk(storage_dir, &unit.entry.artifact_key))
     })?;
     if !persisted {
@@ -542,12 +610,16 @@ fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, St
     Ok(UnitResult::success(index.entry_count()))
 }
 
-fn build_callgraph(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, String> {
+fn build_callgraph(
+    config: &Config,
+    unit: &SnapshotUnit,
+    writer: &LeasedWriter,
+) -> Result<UnitResult, String> {
     let cache_root = aft::root_cache::cache_root(config);
     let storage_dir = cache_root.as_path();
     let files = callgraph::walk_project_files(&unit.entry.resolved_target).collect::<Vec<_>>();
     let cache_dir = cache_dir_for(storage_dir, &unit.entry.artifact_key, unit.kind);
-    let (_store, stats) = publish_if_current(unit, || {
+    let (_store, stats) = publish_if_current(unit, writer, || {
         CallGraphStore::cold_build_with_lease_chunked(
             cache_dir,
             unit.entry.resolved_target.clone(),
@@ -575,13 +647,15 @@ fn build_callgraph(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, S
 /// caller publishing the same artifact.
 fn publish_if_current<R>(
     unit: &SnapshotUnit,
+    writer: &LeasedWriter,
     publish: impl FnOnce() -> Result<R, String>,
 ) -> Result<R, String> {
-    unit.publish_epoch
-        .run_if_current(unit.publication_epoch, || {
-            verify_writer_lease(unit)?;
+    writer
+        .publish_epoch
+        .run_if_current(writer.publication_epoch, || {
+            verify_writer_lease(unit, writer)?;
             let result = publish()?;
-            verify_writer_lease(unit)?;
+            verify_writer_lease(unit, writer)?;
             Ok(result)
         })
         .ok_or_else(|| {
@@ -593,8 +667,9 @@ fn publish_if_current<R>(
         })?
 }
 
-fn verify_writer_lease(unit: &SnapshotUnit) -> Result<(), String> {
-    unit.writer_lease
+fn verify_writer_lease(unit: &SnapshotUnit, writer: &LeasedWriter) -> Result<(), String> {
+    writer
+        .writer_lease
         .verify()
         .map_err(|error| {
             format!(
@@ -663,6 +738,7 @@ impl SnapshotAggregate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft::data_layer::surfaces::IndexOutcome;
     use aft::db::standing_roots::needs_strict_verify;
     use aft::scoped_key::resolve_standing_root;
     use tempfile::tempdir;
@@ -817,5 +893,197 @@ mod tests {
         let mut failed = SnapshotAggregate::default();
         failed.record(&UnitResult::gap("missing"));
         assert_eq!(failed.exit(), IndexExit::Failure);
+    }
+
+    /// A small Rust crate configured as one standing entry with `indexes`;
+    /// returns its literal path in the configuration.
+    fn standing_crate(fixture: &Path, user: &Path, indexes: &str) -> String {
+        let source = fixture.join("source");
+        for (path, text) in [
+            ("Cargo.toml", "[package]\nname = \"demo\"\n"),
+            (
+                "src/lib.rs",
+                "mod util;\npub fn caller() { util::callee(); }\n",
+            ),
+            ("src/util.rs", "pub fn callee() {}\n"),
+        ] {
+            let path = source.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        write_user_config(
+            user,
+            &format!(
+                r#"{{ "index": {{ "roots": [{{ "path": {source:?}, "indexes": {indexes} }}] }} }}"#
+            ),
+        );
+        source.to_string_lossy().into_owned()
+    }
+
+    fn strict(storage: &Path, literal_path: &str, kind: IndexKind) -> Option<bool> {
+        let conn = aft::db::open(&storage.join("aft.db")).unwrap();
+        needs_strict_verify(&conn, literal_path, kind).unwrap()
+    }
+
+    #[test]
+    fn data_layer_snapshot_takes_no_lease_or_breaker_and_clears_strict_state() {
+        let fixture = tempdir().unwrap();
+        let storage = fixture.path().join("storage");
+        let user = fixture.path().join("user-aft.jsonc");
+        let literal_path = standing_crate(fixture.path(), &user, r#"["search", "callgraph"]"#);
+        let mut output = Vec::new();
+
+        let exit = run_snapshot(
+            Vec::new(),
+            paths(fixture.path(), &user, &storage),
+            Some(aft::data_layer::surfaces::index_root),
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(exit, IndexExit::Success, "{output}");
+        assert!(output.starts_with("aft index: snapshot operation\n"));
+        assert!(
+            output.contains("kind=search status=success result_count=3"),
+            "{output}"
+        );
+        assert!(
+            output.contains("kind=callgraph status=success result_count=2"),
+            "{output}"
+        );
+        assert!(storage.join("data").is_dir());
+        // Today's cache folders hold the search cache, the call-graph store,
+        // their writer leases and the build breaker: none is created.
+        let identity = resolve_standing_root(&literal_path).unwrap();
+        for kind in [IndexKind::Search, IndexKind::Callgraph] {
+            let dir = cache_dir_for(&storage, &identity.artifact_key, kind);
+            assert!(!dir.exists(), "{}", dir.display());
+            assert_eq!(strict(&storage, &literal_path, kind), Some(false));
+        }
+    }
+
+    #[test]
+    fn data_layer_snapshot_with_an_unparsed_file_is_partial_and_keeps_its_strict_state() {
+        fn one_unparsed(_root: &Path, _storage: &Path) -> Result<IndexOutcome, String> {
+            Ok(IndexOutcome {
+                files: 3,
+                parsed_files: 1,
+                unparsed_files: 1,
+                published: true,
+            })
+        }
+        let fixture = tempdir().unwrap();
+        let storage = fixture.path().join("storage");
+        let user = fixture.path().join("user-aft.jsonc");
+        let literal_path = standing_crate(fixture.path(), &user, r#"["search", "callgraph"]"#);
+        let mut output = Vec::new();
+
+        let exit = run_snapshot(
+            Vec::new(),
+            paths(fixture.path(), &user, &storage),
+            Some(one_unparsed),
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(exit, IndexExit::Partial, "{output}");
+        assert_eq!(exit.code(), 2);
+        assert!(
+            output.contains("kind=search status=success result_count=3"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "kind=callgraph status=gap usable=true result_count=1 reason=\"callgraph could not parse 1 file(s)\""
+            ),
+            "{output}"
+        );
+        assert_eq!(
+            strict(&storage, &literal_path, IndexKind::Search),
+            Some(false)
+        );
+        assert_eq!(
+            strict(&storage, &literal_path, IndexKind::Callgraph),
+            Some(true),
+            "partial output never clears the flag"
+        );
+    }
+
+    #[test]
+    fn data_layer_snapshot_that_cannot_open_its_store_fails_and_keeps_strict_state() {
+        let fixture = tempdir().unwrap();
+        let storage = fixture.path().join("storage");
+        let user = fixture.path().join("user-aft.jsonc");
+        let literal_path = standing_crate(fixture.path(), &user, r#"["search", "callgraph"]"#);
+        // A file where the data layer's stores go: no family store opens.
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("data"), "").unwrap();
+        let mut output = Vec::new();
+
+        let exit = run_snapshot(
+            Vec::new(),
+            paths(fixture.path(), &user, &storage),
+            Some(aft::data_layer::surfaces::index_root),
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(exit, IndexExit::Failure, "{output}");
+        assert_eq!(exit.code(), 1);
+        let identity = resolve_standing_root(&literal_path).unwrap();
+        for kind in [IndexKind::Search, IndexKind::Callgraph] {
+            assert!(
+                output.contains(&format!(
+                    "kind={} status=gap usable=false result_count=0 reason=",
+                    kind.as_str()
+                )),
+                "{output}"
+            );
+            assert_eq!(strict(&storage, &literal_path, kind), Some(true));
+            let dir = cache_dir_for(&storage, &identity.artifact_key, kind);
+            assert!(
+                !dir.exists(),
+                "fell back to today's stores: {}",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_data_layer_off_a_snapshot_builds_todays_stores_under_leases() {
+        let fixture = tempdir().unwrap();
+        let storage = fixture.path().join("storage");
+        let user = fixture.path().join("user-aft.jsonc");
+        let literal_path = standing_crate(fixture.path(), &user, r#"["search", "callgraph"]"#);
+        let mut output = Vec::new();
+
+        // The process switch, which is off here.
+        let exit = run_with_paths(
+            Vec::new(),
+            paths(fixture.path(), &user, &storage),
+            &mut output,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(exit, IndexExit::Success, "{output}");
+        assert!(output.contains("kind=search status=success"), "{output}");
+        assert!(output.contains("kind=callgraph status=success"), "{output}");
+        assert!(!storage.join("data").exists());
+        let identity = resolve_standing_root(&literal_path).unwrap();
+        let search = cache_dir_for(&storage, &identity.artifact_key, IndexKind::Search);
+        assert!(search.join("cache.bin").is_file());
+        for kind in [IndexKind::Search, IndexKind::Callgraph] {
+            let dir = cache_dir_for(&storage, &identity.artifact_key, kind);
+            assert!(
+                dir.join("build-breaker.sqlite").is_file(),
+                "{}",
+                dir.display()
+            );
+            assert_eq!(strict(&storage, &literal_path, kind), Some(false));
+        }
     }
 }
