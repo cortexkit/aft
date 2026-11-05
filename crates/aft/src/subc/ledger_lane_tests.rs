@@ -161,7 +161,7 @@ impl Fixture {
             .insert((route, corr), admitted_tx);
         let body = json!({
             "name": "read",
-            "arguments": {"filePath": "README.md"},
+            "arguments": {"path": "README.md"},
             "call_key": Self::call_key(route, corr),
         });
         let decoded = DecodedFrame {
