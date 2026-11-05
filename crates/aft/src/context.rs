@@ -9910,8 +9910,12 @@ impl AppContext {
         let root = self.canonical_cache_root_opt()?;
         let mut slot = self.data_checkout.lock();
         if slot.as_ref().is_none_or(|checkout| checkout.root() != root) {
-            *slot = match crate::data_layer::runtime::DataCheckout::open(&root, &self.storage_dir())
-            {
+            let executor = self.callgraph_executor.lock().clone();
+            *slot = match crate::data_layer::runtime::DataCheckout::open(
+                &root,
+                &self.storage_dir(),
+                executor,
+            ) {
                 Ok(checkout) => Some(checkout),
                 Err(error) => {
                     crate::slog_warn!("data layer could not bind {}: {error}", root.display());
@@ -13113,11 +13117,21 @@ impl AppContext {
         &self,
         executor: crate::executor::RootMaintenanceExecutor,
     ) {
-        *self.callgraph_executor.lock() = Some(executor);
+        *self.callgraph_executor.lock() = Some(executor.clone());
+        if let Some(checkout) = self.data_checkout.lock().as_ref() {
+            checkout.set_executor(executor);
+        }
         let retired = self.callgraph_view.lock().take();
         if let Some(view) = retired {
             view.shutdown();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn callgraph_executor_for_test(
+        &self,
+    ) -> Option<crate::executor::RootMaintenanceExecutor> {
+        self.callgraph_executor.lock().clone()
     }
 
     fn cancel_callgraph_acquisition(&self) {

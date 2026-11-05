@@ -52,6 +52,10 @@ pub enum DataError {
     /// A stored record or fragment could not be read back, or reading it
     /// stopped the update; the checkout is built again from its files.
     Damaged(String),
+    /// The executor job running the work was cancelled (its root unbound,
+    /// or AFT is draining): it stopped at a checkpoint, published nothing,
+    /// and is not a failure. The work runs again once the root is bound.
+    Cancelled,
 }
 
 impl std::fmt::Display for DataError {
@@ -62,6 +66,7 @@ impl std::fmt::Display for DataError {
             Self::Resolve(error) => write!(f, "call-graph resolution: {error}"),
             Self::Busy(error) => write!(f, "data store busy: {error}"),
             Self::Damaged(error) => write!(f, "data store damaged: {error}"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -71,6 +76,16 @@ impl std::error::Error for DataError {}
 impl DataError {
     fn store(error: impl std::fmt::Display) -> Self {
         Self::Store(error.to_string())
+    }
+}
+
+/// Stops work that runs as an executor job once the job is cancelled. Long
+/// work calls it between phases; outside a job it never stops anything.
+fn checkpoint() -> Result<(), DataError> {
+    if crate::executor::current_job_cancelled() {
+        Err(DataError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -687,7 +702,12 @@ impl Checkout {
         let result = self.build_inner();
         let mut live = self.write_live();
         live.building = false;
-        live.failure = result.as_ref().err().map(ToString::to_string);
+        match &result {
+            Ok(_) => live.failure = None,
+            // A cancelled build leaves the last outcome standing.
+            Err(DataError::Cancelled) => {}
+            Err(error) => live.failure = Some(error.to_string()),
+        }
         drop(live);
         result
     }
@@ -704,6 +724,7 @@ impl Checkout {
             .expect("no panics while holding it")
             .published
             .is_none();
+        checkpoint()?;
         if unpublished && !self.publish_text_first()? {
             report.superseded = true;
             return Ok(report);
@@ -711,6 +732,7 @@ impl Checkout {
         if unpublished {
             report.text_ready_ms = Some(elapsed_ms(build_started));
         }
+        checkpoint()?;
         // A change recorded before the scan starts is in what the scan
         // reads; one recorded later may not be.
         let covered = self
@@ -772,11 +794,13 @@ impl Checkout {
                 .map_err(DataError::store)?;
         let inputs = collected.inputs(&state);
         report.parsed_files = inputs.parses.len();
+        checkpoint()?;
 
         let started = Instant::now();
         let resolved = resolve_checkout(&inputs, self.layer.threads)
             .map_err(|error| DataError::Resolve(error.to_string()))?;
         report.resolve_ms = elapsed_ms(started);
+        checkpoint()?;
 
         let started = Instant::now();
         let mut session = self.writer()?;
@@ -1107,12 +1131,13 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
+        checkpoint()?;
         let result = self.refresh_inner();
         match &result {
             // A refresh that applied an update clears an earlier failure; one
             // that had nothing to do leaves a build's failure standing.
             Ok(Some(_)) => self.write_live().failure = None,
-            Ok(None) => {}
+            Ok(None) | Err(DataError::Cancelled) => {}
             Err(error) => self.write_live().failure = Some(error.to_string()),
         }
         result

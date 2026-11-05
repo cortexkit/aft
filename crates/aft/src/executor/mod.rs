@@ -1167,6 +1167,26 @@ impl RootMaintenanceExecutor {
         cancellation: JobCancellation,
         job: ExecutorJob,
     ) -> bool {
+        self.submit_maintenance(
+            CALLGRAPH_ACQUISITION_REQUEST_ID,
+            Lane::HeavyInit,
+            cancellation,
+            job,
+        )
+    }
+
+    /// Submits `job` as this root's maintenance on `lane`. The executor
+    /// refuses it, and drops it unrun, while the root is unbound, and a
+    /// root unbinding cancels it at its checkpoints through `cancellation`.
+    /// `false` when the executor has shut down; the caller must not run the
+    /// work some other way, which would reactivate a retired root.
+    pub(crate) fn submit_maintenance(
+        &self,
+        request_id: &str,
+        lane: Lane,
+        cancellation: JobCancellation,
+        job: ExecutorJob,
+    ) -> bool {
         let Some(inner) = self.inner.upgrade() else {
             return false;
         };
@@ -1179,8 +1199,8 @@ impl RootMaintenanceExecutor {
             .submit_with_completion_cancellable(
                 self.root_id.clone(),
                 JobClass::Maintenance,
-                Lane::HeavyInit,
-                CALLGRAPH_ACQUISITION_REQUEST_ID.into(),
+                lane,
+                request_id.into(),
                 job,
                 CompletionSender::Async(tx),
                 Some(cancellation),

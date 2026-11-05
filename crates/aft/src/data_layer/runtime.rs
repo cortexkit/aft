@@ -17,8 +17,10 @@
 //! A refresh resolves every change recorded since the last one in one pass,
 //! so a burst of edits costs one update.
 //!
-//! The builds here run on plain threads. At cutover they move onto the
-//! root's executor, so an unbound root does no work and a drain cancels it.
+//! Builds and refreshes run as the root's maintenance on its executor (see
+//! [`Runner`]), so an unbound root does none and an unbind cancels them at
+//! their checkpoints; a configure asks for them as it binds the root
+//! ([`root_bound`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +30,7 @@ use std::time::{Duration, Instant};
 use aft_store::ids::{Digest128, FamilyId};
 
 use super::checkout::{Checkout, CheckoutView, DataError, DataLayer};
+use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::views::intent::{WriteIntent, WriteIntentListener, WritePhase};
 
 /// Whether this process runs the data layer.
@@ -106,8 +109,8 @@ fn backoff(first: Duration, max: Duration, in_a_row: u32) -> Duration {
         .min(max)
 }
 
-/// Clears a flag when dropped, so a thread that stops, by returning or by
-/// a panic, never leaves its work marked as running.
+/// Clears a flag when dropped, so work that stops, by returning, by a
+/// panic, or by being dropped unrun, never leaves itself marked as running.
 struct ClearOnDrop(Arc<AtomicBool>);
 
 impl Drop for ClearOnDrop {
@@ -147,12 +150,252 @@ enum Publish {
     Always,
 }
 
+/// Executor request ids of a checkout's background work.
+const BUILD_REQUEST: &str = "data-layer-build";
+const REFRESH_REQUEST: &str = "data-layer-refresh";
+
+/// Where a checkout's background work runs. Under the daemon it runs as the
+/// root's maintenance on its executor: the executor runs none while the root
+/// is unbound, and a root that unbinds cancels it at its checkpoints. A
+/// standalone AFT has no executor and serves one root that is always bound,
+/// so there the work runs on a thread of its own.
+struct Runner {
+    root: PathBuf,
+    executor: parking_lot::Mutex<Option<RootMaintenanceExecutor>>,
+}
+
+impl Runner {
+    /// Runs `work` on `lane`. Work the executor refuses (the root is
+    /// unbound, or the executor shut down) is dropped unrun, so anything it
+    /// captured to mark itself running is released with it. Never falls back
+    /// to a thread under the daemon: that would put a retired root to work.
+    fn run(&self, request_id: &'static str, lane: Lane, work: impl FnOnce() + Send + 'static) {
+        let executor = self.executor.lock().clone();
+        let Some(executor) = executor else {
+            if let Err(error) = std::thread::Builder::new()
+                .name(format!("aft-{request_id}"))
+                .spawn(work)
+            {
+                crate::slog_warn!(
+                    "data layer could not start {request_id} for {}: {error}",
+                    self.root.display()
+                );
+            }
+            return;
+        };
+        let cancellation = JobCancellation::new().with_root(&self.root);
+        let token = cancellation.clone();
+        executor.submit_maintenance(
+            request_id,
+            lane,
+            cancellation,
+            Box::new(move |_| {
+                let _cancel = crate::executor::current_job_cancellation()
+                    .is_none()
+                    .then(|| crate::executor::install_job_cancellation(token));
+                work();
+                crate::protocol::Response::success(request_id, serde_json::Value::Null)
+            }),
+        );
+    }
+}
+
+/// When a failed build is tried again.
+#[derive(Default)]
+struct BuildRetry {
+    /// No build starts before this; a waiting thread starts one then.
+    at: Option<Instant>,
+    in_a_row: u32,
+}
+
+/// A checkout and the state of its background work, shared by the work
+/// itself and the handle that starts it.
+struct Work {
+    checkout: Arc<Checkout>,
+    runner: Runner,
+    /// A build is queued or running.
+    building: Arc<AtomicBool>,
+    /// A call-graph refresh is queued or running.
+    refreshing: Arc<AtomicBool>,
+    retry: std::sync::Mutex<BuildRetry>,
+}
+
+impl Work {
+    /// Starts a build unless one is queued or running, or a failed one is
+    /// waiting to be tried again. A build that fails is tried again after a
+    /// wait that doubles each time, until one succeeds or the checkout is
+    /// dropped; the wait is a sleeping thread, never an executor worker.
+    fn start_build(self: &Arc<Self>) {
+        {
+            let retry = self
+                .retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retry.at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+        }
+        if self.building.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.building));
+        let work = Arc::clone(self);
+        self.runner.run(BUILD_REQUEST, Lane::HeavyInit, move || {
+            let result = work.checkout.build();
+            drop(flag);
+            match result {
+                Ok(report) => {
+                    *work
+                        .retry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = BuildRetry::default();
+                    crate::slog_info!(
+                        "data layer built {}: {} files, {} parsed, {} bytes",
+                        work.checkout.root().display(),
+                        report.files,
+                        report.parsed_files,
+                        report.segment_bytes
+                    );
+                    // Changes recorded while the build ran stay laid over its
+                    // publication and wait for the call graph.
+                    work.start_refresh(Publish::WhenMany);
+                }
+                // Runs again when the root is bound and asks for it.
+                Err(DataError::Cancelled) => {}
+                Err(error) => work.retry_build_later(&error),
+            }
+        });
+    }
+
+    fn retry_build_later(self: &Arc<Self>, error: &DataError) {
+        let wait = {
+            let mut retry = self
+                .retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retry.in_a_row += 1;
+            let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
+            retry.at = Some(Instant::now() + wait);
+            wait
+        };
+        crate::slog_warn!(
+            "data layer build failed for {} (trying again in {} s): {error}",
+            self.checkout.root().display(),
+            wait.as_secs()
+        );
+        let weak = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("aft-data-build-retry".to_string())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                if let Some(work) = weak.upgrade() {
+                    work.start_build();
+                }
+            });
+    }
+
+    /// Resolves the call graph again until no recorded change is pending,
+    /// unless a refresh is queued or running already. A change recorded
+    /// while it runs is picked up by its next pass, or, if it was just
+    /// ending, by the check after it lets go of the flag. A refresh that
+    /// finds the stored call graph damaged starts a build, which replaces it.
+    fn start_refresh(self: &Arc<Self>, publish: Publish) {
+        let unpublished = publish == Publish::Always && self.checkout.changed_paths() > 0;
+        if !(pending(&self.checkout) || unpublished) || self.refreshing.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.refreshing));
+        let work = Arc::clone(self);
+        // A refresh changes only the checkout, behind its own lock, so it
+        // runs beside the root's reads, one at a time per root, without
+        // taking a heavy build's slot.
+        self.runner
+            .run(REFRESH_REQUEST, Lane::MaintenanceCommit, move || {
+                let mut flag = Some(flag);
+                loop {
+                    let result = work.checkout.refresh_callgraph();
+                    if matches!(result, Ok(Some(_))) {
+                        continue;
+                    }
+                    match &result {
+                        Err(DataError::Cancelled) => return,
+                        Err(error) => crate::slog_warn!(
+                            "data layer call-graph refresh failed for {}: {error}",
+                            work.checkout.root().display()
+                        ),
+                        Ok(_) => work.maybe_publish(publish),
+                    }
+                    drop(flag.take());
+                    match result {
+                        Err(DataError::Damaged(_)) => {
+                            work.start_build();
+                            return;
+                        }
+                        // The changes stay pending; the next change or query
+                        // that waits for the call graph tries again.
+                        Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    if !pending(&work.checkout) || work.refreshing.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    flag = Some(ClearOnDrop(Arc::clone(&work.refreshing)));
+                }
+            });
+    }
+
+    /// Publishes the changes a refresh resolved, when `publish` asks for it,
+    /// and builds the store again whole once publications of changes have
+    /// piled up.
+    fn maybe_publish(self: &Arc<Self>, publish: Publish) {
+        let changed = self.checkout.changed_paths();
+        if changed == 0 || (publish == Publish::WhenMany && changed < PUBLISH_AT) {
+            return;
+        }
+        match self.checkout.publish_changes() {
+            Ok(Some(report)) => {
+                crate::slog_info!(
+                    "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments, {:.0} ms",
+                    self.checkout.root().display(),
+                    report.paths,
+                    report.fragments,
+                    report.text_units,
+                    report.segments,
+                    report.ms
+                );
+                if report.segments > COMPACT_AT {
+                    self.start_build();
+                }
+            }
+            Ok(None) | Err(DataError::Cancelled) => {}
+            Err(error) => crate::slog_warn!(
+                "data layer could not publish changes for {}: {error}",
+                self.checkout.root().display()
+            ),
+        }
+    }
+
+    /// Builds the checkout if it needs it, and refreshes its call graph
+    /// otherwise.
+    fn catch_up(self: &Arc<Self>, publish: Publish) {
+        if self.checkout.needs_build() {
+            // Nothing published, or only the text index: a build that
+            // published it first stopped before the call graph.
+            self.start_build();
+        } else {
+            self.start_refresh(publish);
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.building.load(Ordering::Acquire) || self.refreshing.load(Ordering::Acquire)
+    }
+}
+
 /// One root's checkout in a running AFT.
 pub(crate) struct DataCheckout {
-    checkout: Arc<Checkout>,
-    building: Arc<AtomicBool>,
-    /// A call-graph refresh is running.
-    refreshing: Arc<AtomicBool>,
+    work: Arc<Work>,
     quiet: Arc<QuietTimer>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
@@ -160,12 +403,18 @@ pub(crate) struct DataCheckout {
 
 impl DataCheckout {
     /// Binds the checkout at `root`, with its family store under
-    /// `storage`, and builds it in the background if it has no publication.
+    /// `storage`, and builds or refreshes it in the background as it needs.
+    /// Under the daemon, `executor` is the root's: the background work runs
+    /// as its maintenance. `None` runs it on threads, for a standalone AFT.
     ///
     /// # Errors
     ///
     /// When the family store cannot be opened.
-    pub(crate) fn open(root: &Path, storage: &Path) -> Result<Arc<Self>, DataError> {
+    pub(crate) fn open(
+        root: &Path,
+        storage: &Path,
+        executor: Option<RootMaintenanceExecutor>,
+    ) -> Result<Arc<Self>, DataError> {
         {
             let failures = bind_failures()
                 .lock()
@@ -202,84 +451,73 @@ impl DataCheckout {
                 return Err(error);
             }
         };
-        let building = Arc::new(AtomicBool::new(false));
-        let refreshing = Arc::new(AtomicBool::new(false));
+        let work = Arc::new(Work {
+            runner: Runner {
+                root: checkout.root().to_path_buf(),
+                executor: parking_lot::Mutex::new(executor),
+            },
+            checkout,
+            building: Arc::new(AtomicBool::new(false)),
+            refreshing: Arc::new(AtomicBool::new(false)),
+            retry: std::sync::Mutex::default(),
+        });
         let quiet = {
-            let checkout = Arc::downgrade(&checkout);
-            let refreshing = Arc::clone(&refreshing);
-            let building = Arc::clone(&building);
+            let work = Arc::downgrade(&work);
             Arc::new(QuietTimer::new(QUIET, move || {
-                if let Some(checkout) = checkout.upgrade() {
-                    start_refresh(&checkout, &refreshing, &building, Publish::Always);
+                if let Some(work) = work.upgrade() {
+                    work.start_refresh(Publish::Always);
                 }
             }))
         };
         let listener: Arc<dyn WriteIntentListener> = Arc::new(EditListener {
-            checkout: Arc::downgrade(&checkout),
+            checkout: Arc::downgrade(&work.checkout),
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
             quiet: Arc::clone(&quiet),
         });
         crate::views::intent::register_listener(&listener);
-        let handle = Arc::new(Self {
-            checkout,
-            building,
-            refreshing,
+        // A bind may have recorded what changed while nothing watched.
+        work.catch_up(Publish::WhenMany);
+        Ok(Arc::new(Self {
+            work,
             quiet,
             _listener: listener,
-        });
-        if handle.checkout.needs_build() {
-            // Nothing published, or only the text index: a build that
-            // published it first stopped before the call graph.
-            start_build(&handle.checkout, &handle.building, &handle.refreshing);
-        } else {
-            // A bind may have recorded what changed while nothing watched.
-            start_refresh(
-                &handle.checkout,
-                &handle.refreshing,
-                &handle.building,
-                Publish::WhenMany,
-            );
-        }
-        Ok(handle)
+        }))
     }
 
     #[must_use]
     pub(crate) fn root(&self) -> &Path {
-        self.checkout.root()
+        self.work.checkout.root()
     }
 
     #[must_use]
     pub(crate) fn view(&self) -> Option<CheckoutView> {
-        self.checkout.view()
+        self.work.checkout.view()
     }
 
     #[cfg(test)]
     #[must_use]
     pub(crate) fn checkout(&self) -> &Checkout {
-        &self.checkout
+        &self.work.checkout
+    }
+
+    /// Runs the checkout's background work on `executor` from now on: the
+    /// root's executor installed after the checkout was bound.
+    pub(crate) fn set_executor(&self, executor: RootMaintenanceExecutor) {
+        *self.work.runner.executor.lock() = Some(executor);
     }
 
     /// Records the watcher's changed `paths` (absolute).
     pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
-        let root = std::fs::canonicalize(self.checkout.root())
-            .unwrap_or_else(|_| self.checkout.root().to_path_buf());
-        record(&self.checkout, &root, paths);
+        let root = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().to_path_buf());
+        record(&self.work.checkout, &root, paths);
         self.quiet.changed();
     }
 
-    /// Makes sure a call-graph refresh runs if any change is pending, for a
-    /// query about to wait for the call graph.
+    /// Builds the checkout if it needs it, and otherwise makes sure a
+    /// call-graph refresh runs if any change is pending: when the root is
+    /// bound, and for a query about to wait for the call graph.
     pub(crate) fn request_refresh(&self) {
-        if self.checkout.needs_build() {
-            start_build(&self.checkout, &self.building, &self.refreshing);
-        } else {
-            start_refresh(
-                &self.checkout,
-                &self.refreshing,
-                &self.building,
-                Publish::WhenMany,
-            );
-        }
+        self.work.catch_up(Publish::WhenMany);
     }
 
     /// A view whose call graph covers every recorded change, for a reader
@@ -291,16 +529,15 @@ impl DataCheckout {
         let deadline = Instant::now() + wait;
         loop {
             if let Some(view) = self
+                .work
                 .checkout
                 .view()
                 .filter(|view| view.status().callgraph == super::checkout::PlaneStatus::Ready)
             {
                 return Fresh::Ready(view);
             }
-            let running =
-                self.building.load(Ordering::Acquire) || self.refreshing.load(Ordering::Acquire);
-            if !running {
-                if let Some(failure) = self.checkout.failure() {
+            if !self.work.running() {
+                if let Some(failure) = self.work.checkout.failure() {
                     return Fresh::Failed(failure);
                 }
             }
@@ -383,99 +620,6 @@ impl QuietTimer {
     }
 }
 
-/// Resolves the call graph again on its own thread until no recorded change
-/// is pending, unless such a thread is already running. A change recorded
-/// while it runs is picked up by its next pass, or, if it was just ending,
-/// by the check after it lets go of the flag. A refresh that finds the
-/// stored call graph damaged starts a build, which replaces it.
-fn start_refresh(
-    checkout: &Arc<Checkout>,
-    refreshing: &Arc<AtomicBool>,
-    building: &Arc<AtomicBool>,
-    publish: Publish,
-) {
-    let unpublished = publish == Publish::Always && checkout.changed_paths() > 0;
-    if !(pending(checkout) || unpublished) || refreshing.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let checkout = Arc::clone(checkout);
-    let running = Arc::clone(refreshing);
-    let building = Arc::clone(building);
-    let spawned = std::thread::Builder::new()
-        .name("aft-data-refresh".to_string())
-        .spawn(move || {
-            let mut flag = Some(ClearOnDrop(Arc::clone(&running)));
-            loop {
-                let result = checkout.refresh_callgraph();
-                if matches!(result, Ok(Some(_))) {
-                    continue;
-                }
-                if let Err(error) = &result {
-                    crate::slog_warn!(
-                        "data layer call-graph refresh failed for {}: {error}",
-                        checkout.root().display()
-                    );
-                } else {
-                    maybe_publish(&checkout, &building, &running, publish);
-                }
-                drop(flag.take());
-                match result {
-                    Err(DataError::Damaged(_)) => {
-                        start_build(&checkout, &building, &running);
-                        break;
-                    }
-                    // The changes stay pending; the next change or query that
-                    // waits for the call graph tries again.
-                    Err(_) => break,
-                    Ok(_) => {}
-                }
-                if !pending(&checkout) || running.swap(true, Ordering::AcqRel) {
-                    break;
-                }
-                flag = Some(ClearOnDrop(Arc::clone(&running)));
-            }
-        });
-    if spawned.is_err() {
-        refreshing.store(false, Ordering::Release);
-    }
-}
-
-/// Publishes the changes a refresh resolved, when `publish` asks for it,
-/// and builds the store again whole once publications of changes have
-/// piled up.
-fn maybe_publish(
-    checkout: &Arc<Checkout>,
-    building: &Arc<AtomicBool>,
-    refreshing: &Arc<AtomicBool>,
-    publish: Publish,
-) {
-    let changed = checkout.changed_paths();
-    if changed == 0 || (publish == Publish::WhenMany && changed < PUBLISH_AT) {
-        return;
-    }
-    match checkout.publish_changes() {
-        Ok(Some(report)) => {
-            crate::slog_info!(
-                "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments, {:.0} ms",
-                checkout.root().display(),
-                report.paths,
-                report.fragments,
-                report.text_units,
-                report.segments,
-                report.ms
-            );
-            if report.segments > COMPACT_AT {
-                start_build(checkout, building, refreshing);
-            }
-        }
-        Ok(None) => {}
-        Err(error) => crate::slog_warn!(
-            "data layer could not publish changes for {}: {error}",
-            checkout.root().display()
-        ),
-    }
-}
-
 /// Whether recorded changes wait for a published call graph. Before one is
 /// published there is nothing to refresh: the build that makes it covers
 /// every change recorded before its scan.
@@ -488,56 +632,14 @@ fn pending(checkout: &Checkout) -> bool {
         )
 }
 
-/// Starts a build on its own thread unless one is running. A build that
-/// fails is tried again after a wait that doubles each time, until one
-/// succeeds or the checkout is dropped.
-fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>, refreshing: &Arc<AtomicBool>) {
-    if building.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let weak = Arc::downgrade(checkout);
-    let running = Arc::clone(building);
-    let refreshing = Arc::clone(refreshing);
-    let spawned = std::thread::Builder::new()
-        .name("aft-data-build".to_string())
-        .spawn(move || {
-            let _flag = ClearOnDrop(Arc::clone(&running));
-            let mut in_a_row = 0;
-            loop {
-                let Some(checkout) = weak.upgrade() else {
-                    return;
-                };
-                match checkout.build() {
-                    Ok(report) => {
-                        crate::slog_info!(
-                            "data layer built {}: {} files, {} parsed, {} bytes",
-                            checkout.root().display(),
-                            report.files,
-                            report.parsed_files,
-                            report.segment_bytes
-                        );
-                        drop(_flag);
-                        // Changes recorded while the build ran stay laid over
-                        // its publication and wait for the call graph.
-                        start_refresh(&checkout, &refreshing, &running, Publish::WhenMany);
-                        return;
-                    }
-                    Err(error) => {
-                        in_a_row += 1;
-                        let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, in_a_row);
-                        crate::slog_warn!(
-                            "data layer build failed for {} (trying again in {} s): {error}",
-                            checkout.root().display(),
-                            wait.as_secs()
-                        );
-                        drop(checkout);
-                        std::thread::sleep(wait);
-                    }
-                }
-            }
-        });
-    if spawned.is_err() {
-        building.store(false, Ordering::Release);
+/// Has a root's checkout catch up as a configure binds the root: binds it on
+/// the root's first bind, then builds it or refreshes its call graph as its
+/// root's maintenance. A configure tail calls it, so the work starts when
+/// the root is bound rather than at the first query, and again on each
+/// rebind for what changed while the root was unbound.
+pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
+    if let Some(checkout) = ctx.data_checkout() {
+        checkout.request_refresh();
     }
 }
 
@@ -633,7 +735,7 @@ mod tests {
             // Nothing to refresh before a call graph is published.
             assert!(!pending(&first));
         }
-        let handle = DataCheckout::open(&root, storage.path()).unwrap();
+        let handle = DataCheckout::open(&root, storage.path(), None).unwrap();
         let view = match handle.fresh_view(Duration::from_secs(60)) {
             Fresh::Ready(view) => view,
             Fresh::Building => panic!("the call graph was never built"),
@@ -641,6 +743,58 @@ mod tests {
         };
         assert!(view.status().callgraph_published);
         assert!(!handle.checkout().needs_build());
+    }
+
+    /// Under the daemon a checkout's build is its root's maintenance: while
+    /// the root is unbound the executor runs none of it, and once the root
+    /// is bound again, the request its configure tail makes builds it.
+    #[test]
+    fn an_unbound_root_builds_nothing_until_it_is_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "mod util;\npub fn caller() { util::callee(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/util.rs"), "pub fn callee() {}\n").unwrap();
+
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ));
+        ctx.mark_subc_bound();
+        let executor = crate::executor::Executor::new();
+        let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
+        assert!(executor.register_actor(root_id, Arc::clone(&ctx)));
+        let maintenance = ctx
+            .callgraph_executor_for_test()
+            .expect("registering the actor installs its executor");
+        ctx.mark_subc_unbound();
+
+        let handle = DataCheckout::open(&root, storage.path(), Some(maintenance)).unwrap();
+        // The executor refuses the build the bind asked for, and drops it
+        // unrun: nothing is published, and nothing stays marked as running.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.work.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!handle.work.running(), "refused work stayed marked running");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(handle.view().is_none(), "an unbound root was built");
+        assert!(handle.checkout().needs_build());
+
+        ctx.mark_subc_bound();
+        handle.request_refresh();
+        let view = match handle.fresh_view(Duration::from_secs(60)) {
+            Fresh::Ready(view) => view,
+            Fresh::Building => panic!("the call graph was never built"),
+            Fresh::Failed(reason) => panic!("the build failed: {reason}"),
+        };
+        assert!(view.status().callgraph_published);
     }
 
     #[test]

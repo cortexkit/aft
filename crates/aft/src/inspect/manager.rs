@@ -9977,7 +9977,7 @@ export function bannerUnused() {}
             "without the data layer, today's view answers, and there is none here"
         );
 
-        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path())
+        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path(), None)
             .expect("bind the checkout");
         // A first build publishes the text index before the call graph.
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -10029,7 +10029,7 @@ export function bannerUnused() {}
     fn dead_code_follows_a_refreshed_data_layer_call_graph_as_a_cold_build_would() {
         fn published(root: &Path, storage: &Path) -> Arc<crate::data_layer::runtime::DataCheckout> {
             let checkout =
-                crate::data_layer::runtime::DataCheckout::open(root, storage).expect("bind");
+                crate::data_layer::runtime::DataCheckout::open(root, storage, None).expect("bind");
             // A first build publishes the text index before the call graph.
             let deadline = Instant::now() + Duration::from_secs(60);
             while !checkout
