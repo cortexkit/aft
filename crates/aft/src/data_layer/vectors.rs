@@ -575,6 +575,166 @@ impl Members {
     }
 }
 
+/// One view's meaning search over one generation of the family's vectors:
+/// what [`VectorPlane::snapshot`] pinned. Every search and coverage read
+/// through it answers from that same generation, however many fills land
+/// meanwhile.
+#[derive(Clone)]
+pub struct MeaningSnapshot {
+    loaded: Arc<Loaded>,
+    members: Arc<Members>,
+    root: PathBuf,
+    dimensions: usize,
+}
+
+impl std::fmt::Debug for MeaningSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MeaningSnapshot")
+            .field("generation", &self.loaded.generation)
+            .field("view", &self.members.view)
+            .field("coverage", &self.members.coverage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MeaningSnapshot {
+    /// How much of the view this generation covers.
+    #[must_use]
+    pub fn coverage(&self) -> &Coverage {
+        &self.members.coverage
+    }
+
+    /// The generation of the family's vectors the snapshot reads.
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.loaded.generation
+    }
+
+    /// The view's text generation the members were read under.
+    #[must_use]
+    pub fn view_generation(&self) -> &str {
+        &self.members.view
+    }
+
+    /// The checkout's root folder, which result paths are joined to.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The model's vector length: a query of another length finds nothing.
+    #[must_use]
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
+    /// Chunks with a vector that a search can return.
+    #[must_use]
+    pub fn chunks(&self) -> usize {
+        self.members.members.len()
+    }
+
+    /// The `top_k` chunks closest to `query`, among files whose absolute
+    /// path `include` accepts: today's `search_filtered` answer over the
+    /// same vectors, as its rows. As today, a query of another dimension or
+    /// with a component that is not finite finds nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read.
+    pub fn search(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        include: &dyn Fn(&Path) -> bool,
+    ) -> Result<Vec<SemanticResult>, DataError> {
+        let mut results = Vec::new();
+        let members = &self.members;
+        let (Some(shared), Some(all)) = (&self.loaded.shared, &members.set) else {
+            return Ok(results);
+        };
+        if top_k == 0
+            || shared.vectors() == 0
+            || query.len() != self.dimensions
+            || query.iter().any(|value| !value.is_finite())
+        {
+            return Ok(results);
+        }
+        let index = shared.index();
+        let root = &self.root;
+        let absolute = |path: &[u8]| root.join(native_path(path).expect("members have one"));
+        let included: Vec<bool> = members
+            .files
+            .iter()
+            .map(|file| include(&absolute(&file.path)))
+            .collect();
+        // Today filters before choosing the top k, so excluded files never
+        // take a place. A subset keeps the members' order, and so their ties.
+        let subset;
+        let (set, positions) = if included.iter().all(|included| *included) {
+            (all, None)
+        } else {
+            let mut kept = Vec::new();
+            let mut positions = Vec::new();
+            for (position, (member, file)) in
+                members.members.iter().zip(&members.file_of).enumerate()
+            {
+                if included[*file as usize] {
+                    kept.push(*member);
+                    positions.push(position);
+                }
+            }
+            subset = index.member_set(kept).map_err(store_error)?;
+            (&subset, Some(positions))
+        };
+        let found = index
+            .search(
+                set,
+                &SearchRequest {
+                    query,
+                    k: top_k,
+                    rescore_limit: None,
+                },
+            )
+            .map_err(store_error)?;
+        let mut details: HashMap<u32, FileDetails> = HashMap::new();
+        for hit in found.hits {
+            let position = positions.as_ref().map_or(hit.member as usize, |positions| {
+                positions[hit.member as usize]
+            });
+            let file_index = members.file_of[position];
+            let file = &members.files[file_index as usize];
+            if let std::collections::hash_map::Entry::Vacant(slot) = details.entry(file_index) {
+                slot.insert(Loaded::details(
+                    &index,
+                    file.holder,
+                    file.content,
+                    &file.path,
+                )?);
+            }
+            let detail = &details[&file_index].chunks[members.chunk_of[position] as usize];
+            let kind = kind_of(detail.kind)
+                .ok_or_else(|| DataError::Store("a chunk's kind code is unknown".to_string()))?;
+            results.push(SemanticResult {
+                file: absolute(&file.path),
+                name: detail.name.clone(),
+                qualified_name: detail.qualified_name.clone(),
+                kind,
+                start_line: detail.start_line,
+                end_line: detail.end_line,
+                exported: members.members[position].exported,
+                snippet: detail.snippet.clone(),
+                score: hit.score,
+                rank_score: hit.score,
+                cap_protected: false,
+                source: "semantic",
+            });
+        }
+        Ok(results)
+    }
+}
+
 /// What a meaning search found, and how much of the checkout it covered.
 #[derive(Debug)]
 pub struct MeaningAnswer {
@@ -724,6 +884,43 @@ impl VectorPlane {
         Ok(self.members(view, &loaded)?.coverage.clone())
     }
 
+    /// `view`'s meaning search over the generation of the family's vectors
+    /// this plane read last, without looking for a newer one: reading the
+    /// family's manifest on every search would cost a directory listing and
+    /// a file read per call. A fill reads the newest generation as it starts
+    /// and after each round it publishes; [`Self::refresh`] reads it on
+    /// demand.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read.
+    pub fn snapshot(&self, view: &CheckoutView) -> Result<MeaningSnapshot, DataError> {
+        let loaded = Arc::clone(&self.loaded.lock().expect("no panics while holding it"));
+        let members = self.members(view, &loaded)?;
+        Ok(MeaningSnapshot {
+            loaded,
+            members,
+            root: view.root().to_path_buf(),
+            dimensions: self.producer.model.dimensions as usize,
+        })
+    }
+
+    /// Reads the family's newest generation, if it is newer than the one
+    /// the plane read last.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be read.
+    pub fn refresh(&self) -> Result<(), DataError> {
+        self.load().map(drop)
+    }
+
+    /// The producer whose vectors this plane reads and fills.
+    #[must_use]
+    pub fn producer(&self) -> &Producer {
+        &self.producer
+    }
+
     /// The `top_k` chunks of `view` closest to `query`, among files whose
     /// absolute path `include` accepts: today's `search_filtered` answer
     /// over the same vectors, as its rows, with the checkout's coverage.
@@ -740,93 +937,12 @@ impl VectorPlane {
         top_k: usize,
         include: &dyn Fn(&Path) -> bool,
     ) -> Result<MeaningAnswer, DataError> {
-        let loaded = self.load()?;
-        let members = self.members(view, &loaded)?;
-        let mut answer = MeaningAnswer {
-            results: Vec::new(),
-            coverage: members.coverage.clone(),
-        };
-        let (Some(shared), Some(all)) = (&loaded.shared, &members.set) else {
-            return Ok(answer);
-        };
-        if top_k == 0
-            || shared.vectors() == 0
-            || query.len() != self.producer.model.dimensions as usize
-            || query.iter().any(|value| !value.is_finite())
-        {
-            return Ok(answer);
-        }
-        let index = shared.index();
-        let root = view.root();
-        let absolute = |path: &[u8]| root.join(native_path(path).expect("members have one"));
-        let included: Vec<bool> = members
-            .files
-            .iter()
-            .map(|file| include(&absolute(&file.path)))
-            .collect();
-        // Today filters before choosing the top k, so excluded files never
-        // take a place. A subset keeps the members' order, and so their ties.
-        let subset;
-        let (set, positions) = if included.iter().all(|included| *included) {
-            (all, None)
-        } else {
-            let mut kept = Vec::new();
-            let mut positions = Vec::new();
-            for (position, (member, file)) in
-                members.members.iter().zip(&members.file_of).enumerate()
-            {
-                if included[*file as usize] {
-                    kept.push(*member);
-                    positions.push(position);
-                }
-            }
-            subset = index.member_set(kept).map_err(store_error)?;
-            (&subset, Some(positions))
-        };
-        let found = index
-            .search(
-                set,
-                &SearchRequest {
-                    query,
-                    k: top_k,
-                    rescore_limit: None,
-                },
-            )
-            .map_err(store_error)?;
-        let mut details: HashMap<u32, FileDetails> = HashMap::new();
-        for hit in found.hits {
-            let position = positions.as_ref().map_or(hit.member as usize, |positions| {
-                positions[hit.member as usize]
-            });
-            let file_index = members.file_of[position];
-            let file = &members.files[file_index as usize];
-            if let std::collections::hash_map::Entry::Vacant(slot) = details.entry(file_index) {
-                slot.insert(Loaded::details(
-                    &index,
-                    file.holder,
-                    file.content,
-                    &file.path,
-                )?);
-            }
-            let detail = &details[&file_index].chunks[members.chunk_of[position] as usize];
-            let kind = kind_of(detail.kind)
-                .ok_or_else(|| DataError::Store("a chunk's kind code is unknown".to_string()))?;
-            answer.results.push(SemanticResult {
-                file: absolute(&file.path),
-                name: detail.name.clone(),
-                qualified_name: detail.qualified_name.clone(),
-                kind,
-                start_line: detail.start_line,
-                end_line: detail.end_line,
-                exported: members.members[position].exported,
-                snippet: detail.snippet.clone(),
-                score: hit.score,
-                rank_score: hit.score,
-                cap_protected: false,
-                source: "semantic",
-            });
-        }
-        Ok(answer)
+        self.refresh()?;
+        let snapshot = self.snapshot(view)?;
+        Ok(MeaningAnswer {
+            results: snapshot.search(query, top_k, include)?,
+            coverage: snapshot.coverage().clone(),
+        })
     }
 }
 
@@ -883,6 +999,23 @@ impl VectorPlane {
         budget: FillBudget,
         progress: &mut dyn FnMut(FillProgress),
     ) -> Result<FillReport, DataError> {
+        self.fill_rounds(embed, budget, usize::MAX, progress)
+    }
+
+    /// [`Self::fill`], stopping after `rounds` rounds; the files it did not
+    /// reach are counted in [`FillReport::files_left`]. A running AFT fills
+    /// one round per job, so other work on the root runs between rounds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fill`].
+    pub fn fill_rounds(
+        &self,
+        embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        budget: FillBudget,
+        rounds: usize,
+        progress: &mut dyn FnMut(FillProgress),
+    ) -> Result<FillReport, DataError> {
         let mut report = FillReport::default();
         let Some(view) = self.checkout.view() else {
             return Ok(report);
@@ -923,7 +1056,13 @@ impl VectorPlane {
         let mut embed_rows = |texts: Vec<String>| embed(texts);
         let mut queue = queue.into_iter().peekable();
         let mut files_done = 0;
+        let mut rounds_run = 0;
         while queue.peek().is_some() {
+            if rounds_run == rounds {
+                report.files_left += queue.count();
+                break;
+            }
+            rounds_run += 1;
             let current = Arc::clone(&loaded);
             let index = current.shared.as_ref().map(SharedVectorIndex::index);
             let stored = |digest: &TextDigest| {

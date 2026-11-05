@@ -10033,6 +10033,21 @@ impl AppContext {
             .filter(|view| view.planes().text)
     }
 
+    /// The semantic configuration the data layer's meaning search fills and
+    /// searches with: `None` when semantic search is switched off
+    /// (`indexes.semantic`) or not admitted for this root, as today's index
+    /// is not built for it then.
+    pub(crate) fn data_meaning_config(&self) -> Option<crate::config::SemanticBackendConfig> {
+        let config = self.config();
+        if !config.indexes.semantic {
+            return None;
+        }
+        let root = self.canonical_cache_root_opt()?;
+        crate::semantic_admission::admission(&root, &config.index.roots)
+            .admits()
+            .then(|| config.semantic.clone())
+    }
+
     /// The planes this root's checkout builds: the text index and the call
     /// graph, as `indexes.trigram` and `indexes.callgraph` switch them.
     pub(crate) fn data_layer_planes(&self) -> crate::data_layer::checkout::Planes {

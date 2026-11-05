@@ -519,38 +519,53 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
             SymbolReadiness, TrigramReadiness,
         };
 
-        let semantic = match try_read_with_budget(
-            self.ctx.semantic_index_status(),
-            INTERACTIVE_ARTIFACT_READ_BUDGET,
-        ) {
-            Some(status) => {
-                let status = status.clone();
-                // A views-on root reports the index its checkout view serves
-                // for the installed snapshot. The fill worker builds it
-                // before the lane is served and after every fill, so a sample
-                // normally finds it built, possibly out of date (the search
-                // itself rebuilds an out-of-date one). Between a publication
-                // and the worker's rebuild there is none; `serving_index`
-                // then builds it, because without a snapshot the semantic
-                // lane would silently drop out of this search. If it cannot
-                // be built, the lane is failed for this search with that
-                // reason, never served from the legacy index, which a
-                // views-on root does not build. A started lane whose view is
-                // still loading, or failed to load, is sampled in that state
-                // even when the shared status was rewritten to ready.
-                // Views-off roots never have a checkout lane.
-                use crate::views::semantic_runtime::CheckoutSemanticState;
-                let lane = matches!(status, SemanticIndexStatus::Ready { .. })
-                    .then(|| self.ctx.checkout_semantic().state())
-                    .flatten();
-                if let Some(lane) = lane {
-                    let unserved = |status| SemanticReadiness {
-                        status,
-                        snapshot: None,
-                        evicted: false,
-                        lock_contended: false,
-                    };
-                    match lane {
+        // With the data layer on and semantic search on for the root, the
+        // lane is the data layer's meaning plane, sampled as it stands now
+        // and retained, so the ranking reads the generation admitted here.
+        let data_semantic = crate::data_layer::tools::search::DataSemantic::current(self.ctx);
+        let semantic =
+            if let Some(data) = data_semantic {
+                SemanticReadiness {
+                    status: data.status(),
+                    snapshot: data
+                        .serving()
+                        .map(|meaning| SemanticSnapshot::from_data(Arc::clone(meaning))),
+                    evicted: false,
+                    lock_contended: false,
+                }
+            } else {
+                match try_read_with_budget(
+                    self.ctx.semantic_index_status(),
+                    INTERACTIVE_ARTIFACT_READ_BUDGET,
+                ) {
+                    Some(status) => {
+                        let status = status.clone();
+                        // A views-on root reports the index its checkout view serves
+                        // for the installed snapshot. The fill worker builds it
+                        // before the lane is served and after every fill, so a sample
+                        // normally finds it built, possibly out of date (the search
+                        // itself rebuilds an out-of-date one). Between a publication
+                        // and the worker's rebuild there is none; `serving_index`
+                        // then builds it, because without a snapshot the semantic
+                        // lane would silently drop out of this search. If it cannot
+                        // be built, the lane is failed for this search with that
+                        // reason, never served from the legacy index, which a
+                        // views-on root does not build. A started lane whose view is
+                        // still loading, or failed to load, is sampled in that state
+                        // even when the shared status was rewritten to ready.
+                        // Views-off roots never have a checkout lane.
+                        use crate::views::semantic_runtime::CheckoutSemanticState;
+                        let lane = matches!(status, SemanticIndexStatus::Ready { .. })
+                            .then(|| self.ctx.checkout_semantic().state())
+                            .flatten();
+                        if let Some(lane) = lane {
+                            let unserved = |status| SemanticReadiness {
+                                status,
+                                snapshot: None,
+                                evicted: false,
+                                lock_contended: false,
+                            };
+                            match lane {
                         CheckoutSemanticState::Ready(runtime) => match runtime.serving_index() {
                             Ok(index) => SemanticReadiness {
                                 status,
@@ -579,49 +594,51 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
                             unserved(SemanticIndexStatus::Failed(reason))
                         }
                     }
-                } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
-                    match try_read_with_budget(
-                        self.ctx.semantic_index(),
-                        INTERACTIVE_ARTIFACT_READ_BUDGET,
-                    ) {
-                        Some(index) => {
-                            let evicted = index.is_none();
-                            let snapshot = (!evicted).then(|| SemanticSnapshot::from_guard(index));
+                        } else if matches!(status, SemanticIndexStatus::Ready { .. }) {
+                            match try_read_with_budget(
+                                self.ctx.semantic_index(),
+                                INTERACTIVE_ARTIFACT_READ_BUDGET,
+                            ) {
+                                Some(index) => {
+                                    let evicted = index.is_none();
+                                    let snapshot =
+                                        (!evicted).then(|| SemanticSnapshot::from_guard(index));
+                                    SemanticReadiness {
+                                        evicted,
+                                        status,
+                                        snapshot,
+                                        lock_contended: false,
+                                    }
+                                }
+                                None => SemanticReadiness {
+                                    status,
+                                    snapshot: None,
+                                    evicted: false,
+                                    lock_contended: true,
+                                },
+                            }
+                        } else {
                             SemanticReadiness {
-                                evicted,
                                 status,
-                                snapshot,
+                                snapshot: None,
+                                evicted: false,
                                 lock_contended: false,
                             }
                         }
-                        None => SemanticReadiness {
-                            status,
-                            snapshot: None,
-                            evicted: false,
-                            lock_contended: true,
-                        },
                     }
-                } else {
-                    SemanticReadiness {
-                        status,
+                    None => SemanticReadiness {
+                        status: SemanticIndexStatus::Building {
+                            stage: "status_lock".to_string(),
+                            files: None,
+                            entries_done: None,
+                            entries_total: None,
+                        },
                         snapshot: None,
                         evicted: false,
-                        lock_contended: false,
-                    }
+                        lock_contended: true,
+                    },
                 }
-            }
-            None => SemanticReadiness {
-                status: SemanticIndexStatus::Building {
-                    stage: "status_lock".to_string(),
-                    files: None,
-                    entries_done: None,
-                    entries_total: None,
-                },
-                snapshot: None,
-                evicted: false,
-                lock_contended: true,
-            },
-        };
+            };
 
         let trigram = if crate::data_layer::tools::search::DataText::ready(self.ctx).is_some() {
             TrigramReadiness {
@@ -748,6 +765,13 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
     fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
         if self.ctx.lexical_views_enabled()
             || crate::data_layer::tools::search::DataText::ready(self.ctx).is_some()
+        {
+            return extensions::ReadinessWait::Completed;
+        }
+        // A data-layer meaning plane that serves answers the search now;
+        // waiting longer would not change what it serves.
+        if crate::data_layer::tools::search::DataSemantic::current(self.ctx)
+            .is_some_and(|data| data.serving().is_some())
         {
             return extensions::ReadinessWait::Completed;
         }
@@ -1476,6 +1500,9 @@ struct SplitSemantic {
     not_ready: Option<SemanticIndexStatus>,
     /// Gaps of a views-on checkout answer, disclosed like a query-only reply.
     checkout_gaps: Option<CheckoutSemanticGaps>,
+    /// The data layer's meaning plane the candidates came from, which then
+    /// scores the pattern's definitions too.
+    data_meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
 }
 
 impl SplitSemantic {
@@ -1489,6 +1516,24 @@ impl SplitSemantic {
             query_vector: None,
             not_ready: None,
             checkout_gaps: None,
+            data_meaning: None,
+        }
+    }
+
+    /// A lane whose index is not ready, `status`, described as the query-only
+    /// paths describe it.
+    fn not_ready(ctx: &AppContext, status: SemanticIndexStatus) -> Self {
+        let state = semantic_lane_state(ctx, semantic_status_label(&status), &status, 0);
+        Self {
+            results: Vec::new(),
+            more_available: false,
+            status: state.semantic_status,
+            gap: state.opening_line(),
+            served: false,
+            query_vector: None,
+            not_ready: Some(status),
+            checkout_gaps: None,
+            data_meaning: None,
         }
     }
 
@@ -1506,7 +1551,11 @@ fn split_semantic_results(
     prose: &str,
     include_tests: bool,
     project_root: &Path,
+    plan: &extensions::LanePlan<'_>,
 ) -> SplitSemantic {
+    if let Some(meaning) = data_meaning_for(ctx, plan) {
+        return split_semantic_from_data(ctx, prose, include_tests, project_root, plan, meaning);
+    }
     // Every disclosure below comes from the functions the query-only paths
     // use, so a split reply words a semantic lane state exactly as a
     // query-only reply against the same index does.
@@ -1521,17 +1570,7 @@ fn split_semantic_results(
         // A query-only request against an index that is not ready is served
         // by `handle_engine_only_search`, which describes the lane with
         // `semantic_lane_state`; a split request describes it the same way.
-        let state = semantic_lane_state(ctx, semantic_status_label(&status), &status, 0);
-        return SplitSemantic {
-            results: Vec::new(),
-            more_available: false,
-            status: state.semantic_status,
-            gap: state.opening_line(),
-            served: false,
-            query_vector: None,
-            not_ready: Some(status),
-            checkout_gaps: None,
-        };
+        return SplitSemantic::not_ready(ctx, status);
     }
     let mass_refresh_pending = status.mass_refresh_pending();
     // With views enabled, the root's own checkout view serves the semantic
@@ -1607,29 +1646,96 @@ fn split_semantic_results(
         query_vector: checkout_semantic.is_none().then_some(query_vector),
         not_ready: None,
         checkout_gaps,
+        data_meaning: None,
+    }
+}
+
+/// [`split_semantic_results`] when the data layer's meaning plane serves the
+/// lane: `meaning` is the plane readiness admitted, `None` when it cannot
+/// serve this request. Worded as the query-only paths word the same state.
+fn split_semantic_from_data(
+    ctx: &AppContext,
+    prose: &str,
+    include_tests: bool,
+    project_root: &Path,
+    plan: &extensions::LanePlan<'_>,
+    meaning: Option<Arc<crate::data_layer::tools::search::DataMeaning>>,
+) -> SplitSemantic {
+    let status = match plan.readiness.semantic_status() {
+        Some(status) => status.clone(),
+        None => crate::data_layer::tools::search::DataSemantic::current(ctx)
+            .map_or_else(SemanticIndexStatus::ready, |data| data.status()),
+    };
+    if !matches!(status, SemanticIndexStatus::Ready { .. }) {
+        return SplitSemantic::not_ready(ctx, status);
+    }
+    let Some(meaning) = meaning else {
+        return SplitSemantic::from_gap(semantic_not_loaded_gap(ctx));
+    };
+    let query_vector = match embed_query_for_data(prose, ctx, &meaning) {
+        Ok(vector) => vector,
+        Err(error) => return SplitSemantic::from_gap(semantic_embed_gap(&error)),
+    };
+    let fetch_limit = SEMANTIC_ENUMERATION_LIMIT.saturating_add(1);
+    let ann_cost = telemetry::CostPhase::start("ann");
+    let (mut results, checkout_gaps) =
+        data_meaning_search(&meaning, &query_vector, fetch_limit, &|file| {
+            path_allowed_by_include_tests(file, project_root, include_tests)
+        });
+    if ctx.shared_artifacts_read_only() {
+        results.retain(|result| result.file.is_file());
+    }
+    let more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
+    drop(ann_cost);
+    results.truncate(SEMANTIC_ENUMERATION_LIMIT);
+    SplitSemantic {
+        results,
+        more_available,
+        status: checkout_gaps
+            .as_ref()
+            .map_or("ready", CheckoutSemanticGaps::status),
+        gap: None,
+        served: true,
+        query_vector: Some(query_vector),
+        not_ready: None,
+        checkout_gaps,
+        data_meaning: Some(meaning),
     }
 }
 
 /// Each given file's best chunk cosine with the query, from the resident
-/// semantic index. A file with no indexed chunk, or an index that stayed
+/// semantic index, or from the data layer's meaning plane `data` when it
+/// served the lane. A file with no indexed chunk, or an index that stayed
 /// busy, is absent.
 fn file_cosines(
     ctx: &AppContext,
     query_vector: &[f32],
     paths: &[PathBuf],
+    data: Option<&crate::data_layer::tools::search::DataMeaning>,
 ) -> HashMap<PathBuf, f32> {
-    let Some(index) = try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-    else {
-        return HashMap::new();
-    };
-    let Some(index) = index.as_ref() else {
-        return HashMap::new();
+    use crate::data_layer::tools::search::MeaningIndex;
+    let guard;
+    let index = match data {
+        Some(meaning) => MeaningIndex::Data(meaning),
+        None => {
+            let Some(read) =
+                try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+            else {
+                return HashMap::new();
+            };
+            guard = read;
+            let Some(index) = guard.as_ref() else {
+                return HashMap::new();
+            };
+            MeaningIndex::Snapshot(index)
+        }
     };
     paths
         .iter()
         .filter_map(|path| {
             index
-                .search_filtered(query_vector, 1, |file| file == path.as_path())
+                .search_filtered(query_vector, 1, &|file| file == path.as_path())
+                .ok()?
                 .first()
                 .map(|result| (path.clone(), result.score))
         })
@@ -1695,10 +1801,13 @@ fn handle_split_search<'a>(
     }
     let semantic = match external {
         Some(corpus) => corpus.semantic_results(ctx, prose, include_tests, &plan),
-        None => split_semantic_results(ctx, prose, include_tests, project_root),
+        None => split_semantic_results(ctx, prose, include_tests, project_root, &plan),
     };
     if search_cancellation_requested() {
         return (plan, cancelled_search_response(req));
+    }
+    if let Some(meaning) = &semantic.data_meaning {
+        meaning.note_read(&req.id);
     }
     let serves = |lane: &SearchLaneKind| match lane {
         SearchLaneKind::Lexical => lexical_ready,
@@ -1718,7 +1827,12 @@ fn handle_split_search<'a>(
         .as_deref()
         .map(|vector| match external {
             Some(corpus) => corpus.cosines(ctx, vector, &definition_paths),
-            None => file_cosines(ctx, vector, &definition_paths),
+            None => file_cosines(
+                ctx,
+                vector,
+                &definition_paths,
+                semantic.data_meaning.as_deref(),
+            ),
         })
         .unwrap_or_default();
     let top_cosine = semantic.results.first().map(|result| result.score);
@@ -2092,7 +2206,17 @@ impl SearchLaneStatus {
                     _ => lane.effective.as_str().to_string(),
                 };
                 let state = if name == "semantic" {
-                    match ctx.semantic_index_status().try_read().ok().as_deref() {
+                    // With the data layer's meaning plane serving the lane,
+                    // its own status words the label.
+                    let status = match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+                        Some(data) => Some(data.status()),
+                        None => ctx
+                            .semantic_index_status()
+                            .try_read()
+                            .ok()
+                            .map(|status| status.clone()),
+                    };
+                    match status.as_ref() {
                         Some(SemanticIndexStatus::Ready { refreshing, .. })
                             if !refreshing.is_empty() && lane.is_ready() =>
                         {
@@ -2181,9 +2305,21 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
-        if let Ok(index) = ctx.semantic_index().try_read() {
-            if let Some(index) = index.as_ref() {
-                disclose_skipped_semantic_rows(data, index);
+        match crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+            Some(semantic) => {
+                if let Some((summary, rows, reason)) = semantic
+                    .serving()
+                    .and_then(|meaning| meaning.skipped_chunks())
+                {
+                    disclose_skipped_chunks(data, &summary, rows, reason);
+                }
+            }
+            None => {
+                if let Ok(index) = ctx.semantic_index().try_read() {
+                    if let Some(index) = index.as_ref() {
+                        disclose_skipped_semantic_rows(data, index);
+                    }
+                }
             }
         }
         // The lanes are observed after the answer was built, so on their own
@@ -2271,7 +2407,23 @@ fn disclose_skipped_semantic_rows(
     let Some(summary) = index.skipped_chunks_summary() else {
         return;
     };
-    append_reply_paragraph(data, &summary);
+    disclose_skipped_chunks(
+        data,
+        &summary,
+        index.skipped_rows(),
+        index.skipped_chunk_reason(),
+    );
+}
+
+/// Marks a reply partial for `rows` chunks the embedder skipped, with
+/// `summary` naming them and `reason` saying why.
+fn disclose_skipped_chunks(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+    rows: usize,
+    reason: crate::semantic_index::SemanticSkipReason,
+) {
+    append_reply_paragraph(data, summary);
     data.insert("complete".to_string(), serde_json::json!(false));
     data.insert("status".to_string(), serde_json::json!("partial"));
     data.insert("semantic_status".to_string(), serde_json::json!("partial"));
@@ -2279,14 +2431,8 @@ fn disclose_skipped_semantic_rows(
         .entry("semantic_gap")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(gap) = gap.as_object_mut() {
-        gap.insert(
-            "skipped_chunks".to_string(),
-            serde_json::json!(index.skipped_rows()),
-        );
-        gap.insert(
-            "reason".to_string(),
-            serde_json::json!(index.skipped_chunk_reason()),
-        );
+        gap.insert("skipped_chunks".to_string(), serde_json::json!(rows));
+        gap.insert("reason".to_string(), serde_json::json!(reason));
         gap.insert("summary".to_string(), serde_json::json!(summary));
     }
 }
@@ -2444,21 +2590,33 @@ fn handle_semantic_search_inner(
             top_k,
         );
     }
-    let semantic_status_snapshot = match try_read_with_budget(
-        ctx.semantic_index_status(),
-        INTERACTIVE_ARTIFACT_READ_BUDGET,
-    ) {
-        Some(status) => status.clone(),
-        None => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                &project_root,
-                top_k,
-                SEMANTIC_STATUS_BUSY,
-            );
+    // With the data layer's meaning plane serving the lane, the reply
+    // reports the status the readiness sample saw for it, the one the plan
+    // was made from, and never today's index status.
+    let data_semantic = crate::data_layer::tools::search::DataSemantic::current(ctx);
+    let semantic_status_snapshot = if let Some(data) = &data_semantic {
+        engine_plan
+            .readiness
+            .semantic_status()
+            .cloned()
+            .unwrap_or_else(|| data.status())
+    } else {
+        match try_read_with_budget(
+            ctx.semantic_index_status(),
+            INTERACTIVE_ARTIFACT_READ_BUDGET,
+        ) {
+            Some(status) => status.clone(),
+            None => {
+                return artifact_contention_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    &project_root,
+                    top_k,
+                    SEMANTIC_STATUS_BUSY,
+                );
+            }
         }
     };
     // The readiness sample can see the semantic lane in a state the shared
@@ -2468,11 +2626,12 @@ fn handle_semantic_search_inner(
     // the reply reports the sampled state, not the shared `ready`. When the
     // lane itself is loaded, its footer also says it was unavailable for this
     // query.
-    let sampled = matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. })
-        .then(|| engine_plan.readiness.semantic_status())
-        .flatten()
-        .filter(|status| !matches!(status, SemanticIndexStatus::Ready { .. }))
-        .cloned();
+    let sampled = (data_semantic.is_none()
+        && matches!(semantic_status_snapshot, SemanticIndexStatus::Ready { .. }))
+    .then(|| engine_plan.readiness.semantic_status())
+    .flatten()
+    .filter(|status| !matches!(status, SemanticIndexStatus::Ready { .. }))
+    .cloned();
     let checkout_failure = match &sampled {
         Some(SemanticIndexStatus::Failed(reason)) => Some(reason.clone()),
         _ => None,
@@ -4308,6 +4467,9 @@ struct CheckoutSemanticGaps {
     unvouched: bool,
     /// The checkout view could not be read at all.
     unavailable: Option<String>,
+    /// Why the data layer's last fill stopped, while files still wait for
+    /// vectors; it is tried again later. Never set for a views-on answer.
+    fill_failure: Option<String>,
 }
 
 /// How many gap paths the response text names before summarizing the rest.
@@ -4328,6 +4490,22 @@ impl CheckoutSemanticGaps {
             failed: answer.failed.clone(),
             unvouched: answer.unvouched,
             unavailable: answer.unavailable.clone(),
+            fill_failure: None,
+        }
+    }
+
+    /// What a data-layer meaning plane whose fill is under way does not
+    /// cover yet: the files waiting for vectors. Files that cannot be cut
+    /// into chunks are accounted for, as today's index leaves them out, and
+    /// chunks the embedder refused are disclosed as today's index discloses
+    /// them.
+    fn from_data(meaning: &crate::data_layer::tools::search::DataMeaning) -> Self {
+        Self {
+            pending: meaning.coverage().pending.clone(),
+            failed: Vec::new(),
+            unvouched: false,
+            unavailable: None,
+            fill_failure: meaning.failure().map(str::to_string),
         }
     }
 
@@ -4337,6 +4515,7 @@ impl CheckoutSemanticGaps {
             failed: Vec::new(),
             unvouched: false,
             unavailable: Some(reason),
+            fill_failure: None,
         }
     }
 
@@ -4391,16 +4570,22 @@ impl CheckoutSemanticGaps {
                     .to_string(),
             );
         }
+        if let Some(error) = &self.fill_failure {
+            lines.push(format!(
+                "semantic: embedding the waiting files stopped and is retried later: {error}"
+            ));
+        }
         extras.insert("complete".into(), serde_json::json!(false));
-        extras.insert(
-            "semantic_gap".into(),
-            serde_json::json!({
-                "pending": pending,
-                "failed": failed,
-                "unvouched": self.unvouched,
-                "unavailable": self.unavailable,
-            }),
-        );
+        let mut gap = serde_json::json!({
+            "pending": pending,
+            "failed": failed,
+            "unvouched": self.unvouched,
+            "unavailable": self.unavailable,
+        });
+        if let Some(error) = &self.fill_failure {
+            gap["fill_failure"] = serde_json::json!(error);
+        }
+        extras.insert("semantic_gap".into(), gap);
         for line in lines {
             text.push('\n');
             text.push_str(&line);
@@ -5303,21 +5488,33 @@ fn run_engine_ranking(
                 .and_then(|guard| guard.as_ref())
         })
         .unwrap_or(&empty_index);
+    // When the data layer's meaning plane served the semantic lane, the
+    // generation names its vectors too, so a fill that lands is never served
+    // a list (or an exact pass) cached over the vectors before it.
+    let meaning_generation = borrowed_index
+        .is_none()
+        .then(|| plan.readiness.retained().data_meaning())
+        .flatten()
+        .map(|meaning| meaning.generation());
+    let with_meaning = |generation: String| match &meaning_generation {
+        Some(meaning) => format!("{generation}|{meaning}"),
+        None => generation,
+    };
     let generation = data_text
         .as_ref()
-        .map(|text| GenerationToken::new_with_str(&text.generation()))
+        .map(|text| GenerationToken::new_with_str(&with_meaning(text.generation())))
         .or_else(|| {
-            view_snapshot
-                .as_ref()
-                .map(|snapshot| GenerationToken::new_with_str(&snapshot.content_generation()))
+            view_snapshot.as_ref().map(|snapshot| {
+                GenerationToken::new_with_str(&with_meaning(snapshot.content_generation()))
+            })
         })
         .or_else(|| borrowed_index.map(|(_, generation)| generation.clone()))
         .unwrap_or_else(|| {
-            GenerationToken::new_with_str(&format!(
+            GenerationToken::new_with_str(&with_meaning(format!(
                 "{}:{}",
                 ctx.search_index_rx_generation(),
                 ctx.semantic_index_rx_generation()
-            ))
+            )))
         });
     let index_ready = data_text.is_some() || view_snapshot.is_some() || index.is_ready();
     let snapshot = view_snapshot.unwrap_or_else(|| index.snapshot());
@@ -6530,9 +6727,22 @@ fn handle_engine_only_search(
         // semantic retrieval would have ranked the targets, which is the
         // question a routing change has to answer before it is made.
         let full_ranking = if semantic_status == "ready" {
-            embed_query(&params.query, ctx).and_then(|vector| {
-                recall_audit_full_semantic(ctx, project_root, params.include_tests, &vector)
-            })
+            match data_meaning_for(ctx, plan) {
+                Some(Some(meaning)) => {
+                    embed_query_for_data(&params.query, ctx, &meaning).and_then(|vector| {
+                        recall_audit_full_semantic_from(
+                            crate::data_layer::tools::search::MeaningIndex::Data(&meaning),
+                            project_root,
+                            params.include_tests,
+                            &vector,
+                        )
+                    })
+                }
+                Some(None) => Err("semantic index not_ready".to_string()),
+                None => embed_query(&params.query, ctx).and_then(|vector| {
+                    recall_audit_full_semantic(ctx, project_root, params.include_tests, &vector)
+                }),
+            }
         } else {
             Err(format!("semantic index {semantic_status}"))
         };
@@ -6700,20 +6910,27 @@ fn handle_semantic_or_hybrid_search(
     // With views enabled, the root's own checkout view serves the semantic
     // lane; it is `None` for every views-off root.
     let checkout_semantic = ctx.checkout_semantic_runtime();
-    let semantic_loaded = match semantic_index_loaded_with_budget(ctx) {
-        Ok(loaded) => loaded,
-        Err(()) => {
-            return artifact_contention_fallback_response(
-                req,
-                ctx,
-                &params,
-                &shape,
-                project_root,
-                top_k,
-                "semantic index remained busy",
-            );
-        }
+    // With the data layer on, its meaning plane serves the lane instead of
+    // today's index: `Some(None)` when it cannot serve this request.
+    let data_meaning = data_meaning_for(ctx, engine_plan);
+    let semantic_loaded = match &data_meaning {
+        Some(meaning) => meaning.is_some(),
+        None => match semantic_index_loaded_with_budget(ctx) {
+            Ok(loaded) => loaded,
+            Err(()) => {
+                return artifact_contention_fallback_response(
+                    req,
+                    ctx,
+                    &params,
+                    &shape,
+                    project_root,
+                    top_k,
+                    "semantic index remained busy",
+                );
+            }
+        },
     };
+    let data_meaning = data_meaning.flatten();
     if !semantic_loaded && checkout_semantic.is_none() {
         let gap = semantic_not_loaded_gap(ctx);
         return semantic_unavailable_or_fallback_response(
@@ -6736,7 +6953,11 @@ fn handle_semantic_or_hybrid_search(
         );
     }
 
-    let query_vector = match embed_query(&params.query, ctx) {
+    let embedded = match &data_meaning {
+        Some(meaning) => embed_query_for_data(&params.query, ctx, meaning),
+        None => embed_query(&params.query, ctx),
+    };
+    let query_vector = match embedded {
         Ok(query_vector) => query_vector,
         Err(error) => {
             if search_cancellation_requested() {
@@ -6774,7 +6995,15 @@ fn handle_semantic_or_hybrid_search(
     let semantic_limit = SEMANTIC_ENUMERATION_LIMIT;
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_gaps = None;
-    let mut semantic_results = if let Some(runtime) = checkout_semantic.as_ref() {
+    let mut semantic_results = if let Some(meaning) = data_meaning.as_deref() {
+        meaning.note_read(&req.id);
+        let (results, gaps) =
+            data_meaning_search(meaning, &query_vector, semantic_fetch_limit, &|file| {
+                path_allowed_by_include_tests(file, project_root, params.include_tests)
+            });
+        semantic_gaps = gaps;
+        results
+    } else if let Some(runtime) = checkout_semantic.as_ref() {
         match runtime.search(&query_vector, semantic_fetch_limit, &|file| {
             path_allowed_by_include_tests(file, project_root, params.include_tests)
         }) {
@@ -6863,8 +7092,17 @@ fn handle_semantic_or_hybrid_search(
     }
     let more_available = engine_ranking.more_available || semantic_more_available;
     if let Some(audit) = engine_ranking.recall_audit.as_mut() {
-        let full_ranking =
-            recall_audit_full_semantic(ctx, project_root, params.include_tests, &query_vector);
+        let full_ranking = match data_meaning.as_deref() {
+            Some(meaning) => recall_audit_full_semantic_from(
+                crate::data_layer::tools::search::MeaningIndex::Data(meaning),
+                project_root,
+                params.include_tests,
+                &query_vector,
+            ),
+            None => {
+                recall_audit_full_semantic(ctx, project_root, params.include_tests, &query_vector)
+            }
+        };
         recall_audit::attach_semantic_coverage(audit, project_root, full_ranking, true);
     }
     let mut results = engine_ranking.results;
@@ -8032,13 +8270,86 @@ fn recall_audit_full_semantic(
     let index = guard
         .as_ref()
         .ok_or_else(|| "semantic index is not loaded".to_string())?;
+    recall_audit_full_semantic_from(
+        crate::data_layer::tools::search::MeaningIndex::Snapshot(index),
+        project_root,
+        include_tests,
+        query_vector,
+    )
+}
+
+/// [`recall_audit_full_semantic`] over `index`, whichever source it reads.
+fn recall_audit_full_semantic_from(
+    index: crate::data_layer::tools::search::MeaningIndex<'_>,
+    project_root: &Path,
+    include_tests: bool,
+    query_vector: &[f32],
+) -> Result<Vec<recall_audit::AuditChunk>, String> {
     Ok(index
-        .search_filtered(query_vector, usize::MAX, |file| {
+        .search_filtered(query_vector, usize::MAX, &|file| {
             path_allowed_by_include_tests(file, project_root, include_tests)
         })
+        .map_err(|error| error.to_string())?
         .iter()
         .map(recall_audit::AuditChunk::from_result)
         .collect())
+}
+
+/// The data layer's meaning plane this request's semantic lane reads, when
+/// the data layer serves the lane: the plane readiness admitted, so ranking
+/// and readiness see one generation of its vectors, or, for a plan whose
+/// readiness was given rather than sampled, the plane as it stands now.
+/// `Some(None)` when the data layer serves the lane but cannot serve this
+/// request; `None` when today's index serves it.
+fn data_meaning_for(
+    ctx: &AppContext,
+    plan: &extensions::LanePlan<'_>,
+) -> Option<Option<Arc<crate::data_layer::tools::search::DataMeaning>>> {
+    let data = crate::data_layer::tools::search::DataSemantic::current(ctx)?;
+    Some(
+        plan.readiness
+            .retained()
+            .data_meaning()
+            .cloned()
+            .or_else(|| data.serving().cloned()),
+    )
+}
+
+/// The query's embedding for a search of the data layer's meaning plane:
+/// as [`embed_query`], checked against the plane's vector length.
+fn embed_query_for_data(
+    query: &str,
+    ctx: &AppContext,
+    meaning: &crate::data_layer::tools::search::DataMeaning,
+) -> Result<Vec<f32>, String> {
+    let _cost = telemetry::CostPhase::start("embedding");
+    let dimension = crate::data_layer::tools::search::MeaningIndex::Data(meaning).dimension();
+    embed_query_for_dimension(query, ctx, dimension)
+}
+
+/// The semantic lane's candidates from the data layer's meaning plane, and
+/// what the answer could not cover: files still waiting for vectors while a
+/// fill is under way, or the plane's store failing to read.
+fn data_meaning_search(
+    meaning: &crate::data_layer::tools::search::DataMeaning,
+    query_vector: &[f32],
+    fetch_limit: usize,
+    include: &dyn Fn(&Path) -> bool,
+) -> (Vec<SemanticResult>, Option<CheckoutSemanticGaps>) {
+    match crate::data_layer::tools::search::MeaningIndex::Data(meaning).search_filtered(
+        query_vector,
+        fetch_limit,
+        include,
+    ) {
+        Ok(results) => (
+            results,
+            (!meaning.complete()).then(|| CheckoutSemanticGaps::from_data(meaning)),
+        ),
+        Err(error) => (
+            Vec::new(),
+            Some(CheckoutSemanticGaps::unavailable(error.to_string())),
+        ),
+    }
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
@@ -8058,10 +8369,9 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
                         INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
                     )
                 })?;
-        semantic_index
-            .as_ref()
-            .filter(|index| index.len() > 0)
-            .map(|index| index.dimension())
+        semantic_index.as_ref().and_then(|index| {
+            crate::data_layer::tools::search::MeaningIndex::Snapshot(index).dimension()
+        })
     };
     embed_query_for_dimension(query, ctx, index_dimension)
 }

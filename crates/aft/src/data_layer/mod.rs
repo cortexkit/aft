@@ -16,6 +16,7 @@ pub(crate) mod graph_store;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
+pub(crate) mod meaning;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;

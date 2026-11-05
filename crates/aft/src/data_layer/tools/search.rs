@@ -1,4 +1,5 @@
-//! aft_search's lexical and exact lanes, read from the data layer.
+//! aft_search's lexical and exact lanes, read from the data layer; its
+//! semantic lane is in [`meaning`].
 //!
 //! The lanes ask the text index four things: which files hold a query's
 //! trigrams and how many distinct trigrams each file has (the lexical
@@ -16,6 +17,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+
+mod meaning;
+
+pub(crate) use meaning::{DataMeaning, DataSemantic, MeaningIndex};
 
 use aft_store::text::{plan_pattern, PathText, Query, Scope};
 

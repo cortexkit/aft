@@ -326,6 +326,25 @@ fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
 }
 
 fn observe_semantic(ctx: &AppContext) -> IndexObservation {
+    // With the data layer on, its meaning plane serves the lane: ready while
+    // it serves (a partial answer says so itself), and otherwise as its fill
+    // stands, whatever today's index status reads.
+    if let Some(data) = crate::data_layer::tools::search::DataSemantic::probe(ctx) {
+        return match data.status() {
+            SemanticIndexStatus::Failed(message) => {
+                IndexObservation::unavailable(semantic_failure_cause(ctx, &message))
+            }
+            _ if ctx
+                .try_semantic_backend_health_snapshot()
+                .is_some_and(|health| !health.available) =>
+            {
+                IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE)
+            }
+            SemanticIndexStatus::Ready { .. } => IndexObservation::ready(),
+            SemanticIndexStatus::Disabled => IndexObservation::off(),
+            SemanticIndexStatus::Building { .. } => IndexObservation::building(),
+        };
+    }
     let status = match ctx.semantic_index_status().try_read() {
         Ok(guard) => guard.clone(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),

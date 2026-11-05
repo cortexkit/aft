@@ -3,10 +3,11 @@
 //! With the data layer on, the status tool and its pushes, daemon health,
 //! the memory census, zoom's call-graph status, and the `aft warmup` and
 //! `aft index` commands describe the root's checkout in the data layer for
-//! the planes it serves: text (grep and glob) and the call graph. Meaning
-//! search keeps reporting today's semantic index until it moves too. With
-//! the data layer off, nothing here runs and every surface reports today's
-//! stores.
+//! the planes it serves: text (grep and glob) and the call graph. The status
+//! tool's `semantic_index` describes the checkout's meaning plane once a
+//! search or a configure has given it the root's semantic configuration:
+//! ready only when every file it applies to is filled. With the data layer
+//! off, nothing here runs and every surface reports today's stores.
 //!
 //! Reading status never binds a checkout, since binding starts a build: a
 //! root that nothing has queried yet reports its planes off, with the
@@ -171,6 +172,11 @@ pub(crate) struct DataStoreReport {
     pub(crate) refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
+    /// Meaning search's plane: the status tool's `semantic_index`. `None`
+    /// while semantic search is off for the checkout, or before anything
+    /// gave it the root's semantic configuration; today's index then
+    /// reports.
+    pub(crate) meaning: Option<Value>,
 }
 
 impl DataStoreReport {
@@ -185,6 +191,7 @@ impl DataStoreReport {
             failure: None,
             refusal: None,
             family_dir: None,
+            meaning: None,
         }
     }
 
@@ -320,12 +327,71 @@ pub(crate) fn refusal_json(refusal: &NewerFormat) -> Value {
 pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
     let status = checkout.checkout().status();
     let files = checkout.view().map(|view| view.state().paths().len());
-    report_from(
+    let mut report = report_from(
         &status,
         files,
         checkout.last_failure(),
         Some(checkout.checkout().family_dir().to_path_buf()),
-    )
+    );
+    report.meaning = meaning_json(checkout);
+    report
+}
+
+/// The status tool's `semantic_index` for `checkout`'s meaning plane: ready
+/// once every file meaning search applies to is filled; building while the
+/// fill is under way (with how many files it has accounted for) or before it
+/// has learned the model; failed when no fill could start. `None` while
+/// semantic search is off for the checkout.
+fn meaning_json(checkout: &DataCheckout) -> Option<Value> {
+    use crate::context::SemanticIndexStatus;
+    use crate::data_layer::tools::search::DataSemantic;
+    let semantic = DataSemantic::of_checkout(checkout)?;
+    let filling = checkout.filling();
+    let mut value = match &semantic {
+        DataSemantic::Serving(meaning) => {
+            let coverage = meaning.coverage();
+            let mut value = json!({
+                "status": if meaning.complete() { READY } else { BUILDING },
+                "files": coverage.files,
+                "files_embedded": coverage.files_embedded,
+                "files_too_large": coverage.files_too_large,
+                "files_failed": coverage.files_failed.len(),
+                "files_pending": coverage.pending.len(),
+                "files_past_cap": coverage.past_cap,
+                "chunks": coverage.chunks,
+                "chunks_embedded": coverage.chunks_embedded,
+                "chunks_failed": coverage.chunks_failed.len(),
+            });
+            if !meaning.complete() {
+                value["stage"] = json!(super::meaning::FILLING_STAGE);
+            }
+            if let Some(error) = meaning.failure() {
+                value["error"] = json!(error);
+            }
+            value
+        }
+        DataSemantic::NotServing(SemanticIndexStatus::Building {
+            stage,
+            files,
+            entries_done,
+            entries_total,
+        }) => json!({
+            "status": BUILDING,
+            "stage": stage,
+            "files": files,
+            "entries_done": entries_done,
+            "entries_total": entries_total,
+        }),
+        DataSemantic::NotServing(SemanticIndexStatus::Failed(error)) => {
+            json!({ "status": "failed", "error": error })
+        }
+        DataSemantic::NotServing(SemanticIndexStatus::Disabled) => json!({ "status": "disabled" }),
+        DataSemantic::NotServing(SemanticIndexStatus::Ready { .. }) => json!({ "status": READY }),
+    };
+    value["state"] = value["status"].clone();
+    value["refreshing_count"] = json!(0);
+    value["filling"] = json!(filling);
+    Some(value)
 }
 
 /// How a bound checkout with `status` stands, given the paths of its view
@@ -374,6 +440,7 @@ fn report_from(
         refusal: failure.as_ref().and_then(|failure| failure.refusal.clone()),
         failure,
         family_dir,
+        meaning: None,
     }
 }
 
@@ -489,6 +556,16 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 /// neither describes what these planes answer from.
 pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
     payload["search_index"] = report.search_index_json();
+    if let Some(meaning) = &report.meaning {
+        // The model and backend labels still come from the configuration.
+        let mut semantic = meaning.clone();
+        for label in ["backend", "model"] {
+            if let Some(value) = payload["semantic_index"].get(label).cloned() {
+                semantic[label] = value;
+            }
+        }
+        payload["semantic_index"] = semantic;
+    }
     payload["callgraph_store"] = report.callgraph_store_json();
     payload["data_store"] = serde_json::to_value(report.health()).unwrap_or(Value::Null);
     if let (Some(disk), Some(dir)) = (

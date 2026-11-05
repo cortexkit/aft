@@ -158,6 +158,7 @@ impl Corpus<'_> {
             query_vector: Some(vector),
             not_ready: None,
             checkout_gaps: None,
+            data_meaning: None,
         }
     }
 

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use aft_store::ids::{Digest128, FamilyId};
 
 use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, Planes};
+use super::meaning::{Meaning, MeaningState, Round};
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 
@@ -169,6 +170,7 @@ enum Publish {
 const BUILD_REQUEST: &str = "data-layer-build";
 const REFRESH_REQUEST: &str = "data-layer-refresh";
 const RESCAN_REQUEST: &str = "data-layer-rescan";
+const FILL_REQUEST: &str = "data-layer-meaning-fill";
 
 /// Where a checkout's background work runs. Under the daemon it runs as the
 /// root's maintenance on its executor: the executor runs none while the root
@@ -236,9 +238,15 @@ struct Work {
     /// A rescan is queued or running.
     rescanning: Arc<AtomicBool>,
     retry: std::sync::Mutex<BuildRetry>,
-    /// Told when a build or refresh ends (see
+    /// Told when a build, refresh or fill round ends (see
     /// [`DataCheckout::on_status_change`]).
     status_listener: std::sync::Mutex<Option<StatusListener>>,
+    /// Meaning search: its vector plane and the fill that embeds for it.
+    meaning: Meaning,
+    /// A fill round is queued or running.
+    filling: Arc<AtomicBool>,
+    /// When a failed fill is tried again.
+    fill_retry: std::sync::Mutex<BuildRetry>,
 }
 
 impl Work {
@@ -283,6 +291,8 @@ impl Work {
                     // Changes recorded while the build ran stay laid over its
                     // publication and wait for the call graph.
                     work.start_refresh(Publish::WhenMany);
+                    // Meaning search fills what the published files need.
+                    work.start_fill();
                 }
                 // Runs again when the root is bound and asks for it.
                 Err(DataError::Cancelled) => {}
@@ -467,6 +477,86 @@ impl Work {
             });
     }
 
+    /// Starts a round of meaning search's fill, unless semantic search is
+    /// off, a round is queued or running, or a failed fill is waiting to be
+    /// tried again. A round that leaves files starts the next one, so a fill
+    /// runs as a chain of jobs and other work on the root runs between
+    /// them. A failed round is tried again after a wait that doubles each
+    /// time, as a failed build is.
+    fn start_fill(self: &Arc<Self>) {
+        if !self.meaning.enabled() {
+            return;
+        }
+        {
+            let retry = self
+                .fill_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retry.at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+        }
+        if self.filling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let flag = ClearOnDrop(Arc::clone(&self.filling));
+        let work = Arc::clone(self);
+        self.runner.run(FILL_REQUEST, Lane::HeavyInit, move || {
+            if crate::executor::current_job_cancelled() {
+                // Runs again when the root is bound and a search asks.
+                return;
+            }
+            let round = work.meaning.round(&work.checkout);
+            drop(flag);
+            work.notify_status_change();
+            match round {
+                Round::More => work.start_fill(),
+                Round::Done => {
+                    *work
+                        .fill_retry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = BuildRetry::default();
+                    let progress = work.meaning.progress().unwrap_or_default();
+                    crate::slog_info!(
+                        "data layer meaning fill finished for {}: {} files, {} chunks embedded",
+                        work.checkout.root().display(),
+                        progress.files_done,
+                        progress.chunks_embedded
+                    );
+                }
+                Round::Idle => {}
+                Round::Failed(error) => work.retry_fill_later(&error),
+            }
+        });
+    }
+
+    fn retry_fill_later(self: &Arc<Self>, error: &str) {
+        let wait = {
+            let mut retry = self
+                .fill_retry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            retry.in_a_row += 1;
+            let wait = backoff(BUILD_RETRY, BUILD_RETRY_MAX, retry.in_a_row);
+            retry.at = Some(Instant::now() + wait);
+            wait
+        };
+        crate::slog_warn!(
+            "data layer meaning fill failed for {} (trying again in {} s): {error}",
+            self.checkout.root().display(),
+            wait.as_secs()
+        );
+        let weak = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("aft-data-fill-retry".to_string())
+            .spawn(move || {
+                std::thread::sleep(wait);
+                if let Some(work) = weak.upgrade() {
+                    work.start_fill();
+                }
+            });
+    }
+
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
@@ -576,12 +666,17 @@ impl DataCheckout {
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
             status_listener: std::sync::Mutex::new(None),
+            meaning: Meaning::default(),
+            filling: Arc::new(AtomicBool::new(false)),
+            fill_retry: std::sync::Mutex::default(),
         });
         let quiet = {
             let work = Arc::downgrade(&work);
             Arc::new(QuietTimer::new(QUIET, move || {
                 if let Some(work) = work.upgrade() {
                     work.start_refresh(Publish::Always);
+                    // Edited files wait for vectors of their new content.
+                    work.start_fill();
                 }
             }))
         };
@@ -783,15 +878,6 @@ fn pending(checkout: &Checkout) -> bool {
     status.callgraph_published && status.callgraph_pending > 0
 }
 
-/// Has a root's checkout catch up as a configure binds the root: binds it on
-/// the root's first bind, then builds it or refreshes its call graph as its
-/// root's maintenance. A configure tail calls it, so the work starts when
-/// the root is bound rather than at the first query.
-///
-/// Opening the checkout compared its files with what was published. A later
-/// bind of the same checkout compares them again: files can change while the
-/// root is unbound and nothing watches it, or just before a configure whose
-/// watcher event has not arrived yet.
 /// Called as a configure of `ctx`'s root succeeds, before its reply: when the
 /// root's checkout was bound before, starts its rescan now, so the call graph
 /// reports building before the reply and a query sent right after it waits
@@ -807,6 +893,16 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
     }
 }
 
+/// Has a root's checkout catch up as a configure binds the root: binds it on
+/// the root's first bind, then builds it or refreshes its call graph, and
+/// fills meaning search's vectors, as its root's maintenance. A configure
+/// tail calls it, so the work starts when the root is bound rather than at
+/// the first query.
+///
+/// Opening the checkout compared its files with what was published. A later
+/// bind of the same checkout compares them again: files can change while the
+/// root is unbound and nothing watches it, or just before a configure whose
+/// watcher event has not arrived yet.
 pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
     if let Some(checkout) = ctx.data_checkout() {
         if checkout.bound_once.swap(true, Ordering::AcqRel) {
@@ -814,6 +910,7 @@ pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
         } else {
             checkout.request_refresh();
         }
+        checkout.configure_meaning(ctx.data_meaning_config().as_ref());
     }
 }
 
@@ -922,9 +1019,9 @@ impl DataCheckout {
         self.work.checkout.note_outcome(stage, result);
     }
 
-    /// Calls `notify` whenever a build or call-graph refresh of this
-    /// checkout ends, so status pushes follow the data layer. Replaces any
-    /// earlier listener.
+    /// Calls `notify` whenever a build, call-graph refresh or meaning fill
+    /// round of this checkout ends, so status pushes follow the data layer.
+    /// Replaces any earlier listener.
     pub(crate) fn on_status_change(&self, notify: StatusListener) {
         *self
             .work
@@ -936,6 +1033,52 @@ impl DataCheckout {
 
 /// What to call when a checkout's status may have changed.
 pub(crate) type StatusListener = Arc<dyn Fn() + Send + Sync>;
+
+impl DataCheckout {
+    /// Gives meaning search the root's semantic configuration, `None` when
+    /// semantic search is off or not admitted for it, as a configure binds
+    /// the root; a changed one is filled under from now on. Starts a fill
+    /// when files wait for vectors.
+    pub(crate) fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>) {
+        self.work.meaning.configure(config);
+        self.meaning(|| None);
+    }
+
+    /// How meaning search stands for the current view. `config` works out
+    /// the root's semantic configuration if no configure has given one yet.
+    /// Starts a fill when files wait for vectors and none is running, or
+    /// none has learned the model yet. `None` before anything is published.
+    pub(crate) fn meaning(
+        &self,
+        config: impl FnOnce() -> Option<crate::config::SemanticBackendConfig>,
+    ) -> Option<(CheckoutView, MeaningState)> {
+        self.work.meaning.configure_once(config);
+        let view = self.view()?;
+        let state = self.work.meaning.state(&view);
+        let wanted = match &state {
+            MeaningState::Off => false,
+            MeaningState::Starting | MeaningState::Failed(_) => true,
+            MeaningState::Serving { snapshot, .. } => super::meaning::waiting(snapshot.coverage()),
+        };
+        if wanted {
+            self.work.start_fill();
+        }
+        Some((view, state))
+    }
+
+    /// How meaning search stands for the current view, for status reads:
+    /// starts nothing. `None` before anything is published.
+    pub(crate) fn meaning_status(&self) -> Option<(CheckoutView, MeaningState)> {
+        let view = self.view()?;
+        let state = self.work.meaning.state(&view);
+        Some((view, state))
+    }
+
+    /// Whether a fill round is queued or running.
+    pub(crate) fn filling(&self) -> bool {
+        self.work.filling.load(Ordering::Acquire)
+    }
+}
 
 #[cfg(test)]
 mod tests {
