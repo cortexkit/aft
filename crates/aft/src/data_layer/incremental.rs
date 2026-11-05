@@ -504,7 +504,7 @@ impl LiveCheckout {
             bound.bind_missing(&inputs, &paths)?;
             let mut resolved = resolve_files(&inputs, &bound, &paths)?;
             let mut calls = MethodCallInputs::build(&inputs, &resolved);
-            for (path, sites, dependencies) in calls.resolve_sites(&inputs, &paths) {
+            for (path, sites, dependencies) in calls.resolve_sites(&inputs, &resolved, &paths) {
                 let file = resolved.get_mut(&path).expect("resolved");
                 file.sites = sites;
                 file.site_dependencies = dependencies;
@@ -555,11 +555,10 @@ impl LiveCheckout {
         threads: usize,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<Self, ManifestJoinError> {
-        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
-        let pool = Arc::new(super::callgraph::pool(threads)?);
         let started = Instant::now();
-        let calls = pool.install(|| MethodCallInputs::build(&inputs, &resolved));
-        timings.push(("method-call inputs", ms(started)));
+        let pool = Arc::new(super::callgraph::pool(threads)?);
+        timings.push(("thread pool", started.elapsed().as_secs_f64() * 1000.0));
+        let calls = MethodCallInputs::stored(Arc::clone(&stored));
         let reverse = ReverseInputs::new(Some(stored));
         Ok(Self {
             inputs,
@@ -741,7 +740,6 @@ impl LiveCheckout {
                 old_bound.insert(path.clone(), bound);
             }
         }
-        drop(old);
         // The Rust module tree changes when a Rust file is added or removed,
         // or a rebound file declares different modules.
         let module_tree_changed = membership.iter().any(|path| path.ends_with(".rs"))
@@ -778,6 +776,11 @@ impl LiveCheckout {
         for path in &removed {
             surfaces_changed.insert(path.clone());
             self.bound.remove(path);
+            self.calls.remember(
+                path,
+                old.parses.get(path).map(|(_, parse)| &**parse),
+                self.resolved.get(path),
+            );
             self.resolved.remove(path);
             self.reverse.remove(path);
         }
@@ -868,6 +871,11 @@ impl LiveCheckout {
         let fresh = resolve_files(inputs, &self.bound, &paths)?;
         stats.resolved = fresh.len();
         for (path, mut file) in fresh {
+            self.calls.remember(
+                &path,
+                old.parses.get(&path).map(|(_, parse)| &**parse),
+                self.resolved.get(&path),
+            );
             // Pass 4 decides below whether its sites change.
             if let Some(old) = self.resolved.remove(&path) {
                 file.sites = old.sites;
@@ -916,6 +924,11 @@ impl LiveCheckout {
         for path in &recompute {
             let (_, parse) = &inputs.parses[path.as_str()];
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
+            self.calls.remember(
+                path,
+                old.parses.get(path).map(|(_, parse)| &**parse),
+                self.resolved.get(path),
+            );
             let file = self.resolved.get_mut(path).expect("kept");
             file.dispatch = dispatch;
             self.reverse
@@ -954,7 +967,7 @@ impl LiveCheckout {
         sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
         let paths = sites.iter().collect::<Vec<_>>();
-        for (path, kept, dependencies) in self.calls.resolve_sites(inputs, &paths) {
+        for (path, kept, dependencies) in self.calls.resolve_sites(inputs, &self.resolved, &paths) {
             let file = self.resolved.get_mut(&path).expect("resolved");
             file.sites = kept;
             file.site_dependencies = dependencies;

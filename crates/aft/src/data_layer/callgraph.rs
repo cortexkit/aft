@@ -30,7 +30,8 @@ use rayon::prelude::*;
 
 use crate::callgraph_store::facts::{BlobKey, DirEntry, EntryKind, ProjectFacts};
 use crate::callgraph_store::join::dispatch::{
-    associated_reference, dependency, MemoizedResolver, Resolution, Resolver, SiteHint,
+    associated_reference, dependency, DispatchFiles, MemoizedResolver, Resolution, Resolver,
+    SiteHint,
 };
 use crate::callgraph_store::join::{
     bind_file, dispatch_type_targets_for, finish_binding, resolve_file, BlobRef, BlobRefKind,
@@ -286,7 +287,7 @@ pub(crate) fn resolve_checkout(
         bound.bind_missing(inputs, &paths)?;
         let mut resolved = resolve_files(inputs, &bound, &paths)?;
         let mut calls = MethodCallInputs::build(inputs, &resolved);
-        for (path, sites, dependencies) in calls.resolve_sites(inputs, &paths) {
+        for (path, sites, dependencies) in calls.resolve_sites(inputs, &resolved, &paths) {
             let file = resolved
                 .get_mut(&path)
                 .expect("every parsed file was resolved");
@@ -448,38 +449,176 @@ pub(crate) struct OrdinaryCalls {
     edges: HashSet<String>,
 }
 
-/// Every file's method-call facts, as pass 4 reads them. Kept by a live
-/// checkout and updated file by file.
-#[derive(Debug, Default)]
-pub(crate) struct MethodCallInputs {
-    pub(crate) facts: BTreeMap<String, FileFacts>,
-    resolver_parses: BTreeMap<String, ParseBlob>,
-    ordinary: HashMap<String, OrdinaryCalls>,
-    import_targets: BTreeMap<(String, String), String>,
-    type_targets: BTreeMap<(String, String), (String, String)>,
-    /// (file, reference key) of every Rust associated-function call.
-    associated: HashSet<(String, u32)>,
+/// One file's pass-4 inputs: its method-call facts, the parse the resolver
+/// reads them as, and its ordinary calls. A function of the file's parse
+/// and resolution alone.
+#[derive(Debug)]
+pub(crate) struct SiteFile {
+    facts: FileFacts,
+    parse: ParseBlob,
+    ordinary: OrdinaryCalls,
 }
 
-/// Below this many files, pass 4 runs on one thread over the kept inputs
-/// instead of copying them for each parallel chunk.
+impl SiteFile {
+    fn new(path: &str, parse: &ParseBlob, resolution: &FileResolution) -> Self {
+        let references = references_by_key(parse);
+        let mut facts = FileFacts::new(parse);
+        facts.import_targets = import_targets(&resolution.rows, &references);
+        if let Some(dispatch) = &resolution.dispatch {
+            facts.type_targets = dispatch.targets.clone();
+        }
+        let ordinary = ordinary_calls(path, parse, &resolution.rows, &references);
+        let parse = facts.resolver_parse();
+        Self {
+            facts,
+            parse,
+            ordinary,
+        }
+    }
+
+    /// The names of the methods the file declares.
+    fn method_names(&self) -> BTreeSet<&str> {
+        self.parse
+            .dispatch
+            .methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect()
+    }
+
+    /// For a Go file, the names of the methods its interfaces require.
+    fn go_required(&self) -> BTreeSet<&str> {
+        if self.parse.language != "go" {
+            return BTreeSet::new();
+        }
+        let dispatch = &self.parse.dispatch;
+        dispatch
+            .methods
+            .iter()
+            .filter(|method| {
+                dispatch
+                    .types
+                    .iter()
+                    .any(|ty| ty.interface && ty.name == method.owner)
+            })
+            .map(|method| method.name.as_str())
+            .collect()
+    }
+}
+
+/// Every file's pass-4 inputs, as a live checkout keeps them.
+///
+/// Built from every file, the inputs are all in memory. Started from a
+/// publication, they are computed per file the first time pass 4 reads a
+/// file, and files are found by method name through the terms the
+/// publication stored (see `graph_store::method_terms`); a file whose
+/// inputs changed since is filed in memory instead.
+#[derive(Default)]
+pub(crate) struct MethodCallInputs {
+    /// Each file's inputs computed so far, for the current checkout.
+    files: HashMap<String, Arc<SiteFile>>,
+    /// The publication whose terms find every file not in `own`.
+    stored: Option<Arc<super::graph_store::StoredSlices>>,
+    /// Files filed in memory: every file when nothing is stored, otherwise
+    /// those whose inputs changed since the publication, removed ones too.
+    own: HashSet<String>,
+    /// Method name to the files of `own` that declare it.
+    methods: HashMap<String, BTreeSet<String>>,
+    /// Method name to the Go files of `own` whose interfaces require it.
+    go_required: HashMap<String, BTreeSet<String>>,
+}
+
+/// Below this many files, pass 4 runs on one thread instead of in parallel
+/// chunks.
 const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
+    /// Every file's inputs, from `resolved`.
     pub(crate) fn build(
         inputs: &CheckoutInputs,
         resolved: &BTreeMap<String, FileResolution>,
     ) -> Self {
         let mut calls = Self::default();
-        for path in inputs.parses.keys() {
-            calls.update(inputs, path, resolved.get(path));
+        let built = inputs
+            .parses
+            .par_iter()
+            .filter_map(|(path, (_, parse))| {
+                let resolution = resolved.get(path)?;
+                Some((
+                    path.clone(),
+                    Arc::new(SiteFile::new(path, parse, resolution)),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (path, file) in built {
+            calls.file(&path, &file);
+            calls.files.insert(path, file);
         }
         calls
     }
 
-    /// The facts of one file as `resolution` leaves them, or none when the
+    /// Inputs found through `stored`'s terms and computed when first read.
+    pub(crate) fn stored(stored: Arc<super::graph_store::StoredSlices>) -> Self {
+        Self {
+            stored: Some(stored),
+            ..Self::default()
+        }
+    }
+
+    /// Files `path` in memory as declaring `file`'s methods.
+    fn file(&mut self, path: &str, file: &SiteFile) {
+        self.own.insert(path.to_string());
+        for name in file.method_names() {
+            self.methods
+                .entry(name.to_string())
+                .or_default()
+                .insert(path.to_string());
+        }
+        for name in file.go_required() {
+            self.go_required
+                .entry(name.to_string())
+                .or_default()
+                .insert(path.to_string());
+        }
+    }
+
+    fn unfile(&mut self, path: &str, file: &SiteFile) {
+        for name in file.method_names() {
+            if let Some(files) = self.methods.get_mut(name) {
+                files.remove(path);
+            }
+        }
+        for name in file.go_required() {
+            if let Some(files) = self.go_required.get_mut(name) {
+                files.remove(path);
+            }
+        }
+    }
+
+    /// Keeps `path`'s inputs as `parse` and `resolution` give them, unless
+    /// they are known already: called before an update replaces either, so
+    /// [`Self::update`] can compare the old inputs with the new.
+    pub(crate) fn remember(
+        &mut self,
+        path: &str,
+        parse: Option<&ParseBlob>,
+        resolution: Option<&FileResolution>,
+    ) {
+        if self.files.contains_key(path) {
+            return;
+        }
+        if let (Some(parse), Some(resolution)) = (parse, resolution) {
+            self.files.insert(
+                path.to_string(),
+                Arc::new(SiteFile::new(path, parse, resolution)),
+            );
+        }
+    }
+
+    /// The inputs of one file as `resolution` leaves them, or none when the
     /// file is gone. Returns the dependency keys whose readers the change
-    /// can affect, and whether the file's own pass-4 inputs changed.
+    /// can affect, and whether the file's own pass-4 inputs changed. The old
+    /// inputs are those [`Self::remember`] kept, or computed earlier.
     pub(crate) fn update(
         &mut self,
         inputs: &CheckoutInputs,
@@ -488,150 +627,230 @@ impl MethodCallInputs {
     ) -> (BTreeSet<String>, bool) {
         let new = resolution
             .zip(inputs.parses.get(path))
-            .map(|(file, (_, parse))| {
-                let references = references_by_key(parse);
-                let mut facts = FileFacts::new(parse);
-                facts.import_targets = import_targets(&file.rows, &references);
-                if let Some(dispatch) = &file.dispatch {
-                    facts.type_targets = dispatch.targets.clone();
-                }
-                (facts, ordinary_calls(path, parse, &file.rows, &references))
-            });
-        let old_facts = self.facts.get(path);
+            .map(|(file, (_, parse))| Arc::new(SiteFile::new(path, parse, file)));
+        let old = self.files.remove(path);
         let mut keys = BTreeSet::new();
         FileFacts::changed_keys_by_method(
             path,
-            old_facts,
-            new.as_ref().map(|(facts, _)| facts),
+            old.as_ref().map(|old| &old.facts),
+            new.as_ref().map(|new| &new.facts),
             &mut keys,
         );
         let own_changed = keys.contains(&dependency::file(path))
-            || self.ordinary.get(path) != new.as_ref().map(|(_, calls)| calls);
-        if let Some(old) = self.facts.remove(path) {
-            for module in old.import_targets.keys() {
-                self.import_targets
-                    .remove(&(path.to_string(), module.clone()));
-            }
-            for name in old.type_targets.keys() {
-                self.type_targets.remove(&(path.to_string(), name.clone()));
-            }
+            || old.as_ref().map(|old| &old.ordinary) != new.as_ref().map(|new| &new.ordinary);
+        if let Some(old) = &old {
+            self.unfile(path, old);
         }
-        if let Some(old) = self.ordinary.remove(path) {
-            for key in old.associated {
-                self.associated.remove(&(path.to_string(), key));
-            }
-        }
-        self.resolver_parses.remove(path);
-        if let Some((facts, calls)) = new {
-            for (module, target) in &facts.import_targets {
-                self.import_targets
-                    .insert((path.to_string(), module.clone()), target.clone());
-            }
-            for (name, target) in &facts.type_targets {
-                self.type_targets
-                    .insert((path.to_string(), name.clone()), target.clone());
-            }
-            for key in &calls.associated {
-                self.associated.insert((path.to_string(), *key));
-            }
-            self.resolver_parses
-                .insert(path.to_string(), facts.resolver_parse());
-            self.facts.insert(path.to_string(), facts);
-            self.ordinary.insert(path.to_string(), calls);
+        // From here on the file is filed in memory, gone or not, so its
+        // stored terms no longer apply.
+        self.own.insert(path.to_string());
+        if let Some(new) = new {
+            self.file(path, &new);
+            self.files.insert(path.to_string(), new);
         }
         (keys, own_changed)
-    }
-
-    fn files(&self) -> BTreeMap<String, &ParseBlob> {
-        self.resolver_parses
-            .iter()
-            .map(|(path, parse)| (path.clone(), parse))
-            .collect()
     }
 
     /// Pass 4 for `paths`: each file's kept method-call sites and the
     /// dependency keys their resolutions read. A few files run on this
     /// thread; more run in parallel chunks, each with its own resolver.
+    /// Inputs computed on the way are kept for later updates.
     pub(crate) fn resolve_sites(
         &mut self,
         inputs: &CheckoutInputs,
+        resolved: &BTreeMap<String, FileResolution>,
         paths: &[&String],
     ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
-        if paths.len() <= SMALL_SITE_RUN {
-            let import_targets = std::mem::take(&mut self.import_targets);
-            let type_targets = std::mem::take(&mut self.type_targets);
-            let associated = std::mem::take(&mut self.associated);
-            let resolver =
-                Resolver::with_parts(self.files(), import_targets, type_targets, associated);
-            let results = self.resolve_chunk(inputs, &resolver, paths);
-            let (import_targets, type_targets, associated) = resolver.into_parts();
-            self.import_targets = import_targets;
-            self.type_targets = type_targets;
-            self.associated = associated;
-            return results;
+        let source = SiteSource::new(inputs, resolved, self);
+        let results = if paths.len() <= SMALL_SITE_RUN {
+            let resolver = Resolver::over(&source);
+            resolve_chunk(inputs, &source, &resolver, paths)
+        } else {
+            let chunk = paths
+                .len()
+                .div_ceil(rayon::current_num_threads() * 4)
+                .max(1);
+            paths
+                .par_chunks(chunk)
+                .map(|chunk| {
+                    // The resolver and its memo are single-threaded caches
+                    // over the shared source: one per chunk of files.
+                    let resolver = Resolver::over(&source);
+                    resolve_chunk(inputs, &source, &resolver, chunk)
+                })
+                .flatten()
+                .collect()
+        };
+        let loaded = source.into_loaded();
+        self.files.extend(loaded);
+        results
+    }
+}
+
+/// The method-call resolver's view of a checkout's pass-4 inputs during one
+/// run: the inputs kept, and any other file's computed the first time it is
+/// read.
+struct SiteSource<'s> {
+    inputs: &'s CheckoutInputs,
+    resolved: &'s BTreeMap<String, FileResolution>,
+    calls: &'s MethodCallInputs,
+    /// Every parsed file whose inputs are not kept, computed on first read.
+    loaded: HashMap<&'s str, std::sync::OnceLock<Option<Arc<SiteFile>>>>,
+}
+
+impl<'s> SiteSource<'s> {
+    fn new(
+        inputs: &'s CheckoutInputs,
+        resolved: &'s BTreeMap<String, FileResolution>,
+        calls: &'s MethodCallInputs,
+    ) -> Self {
+        let loaded = inputs
+            .parses
+            .keys()
+            .filter(|path| !calls.files.contains_key(path.as_str()))
+            .map(|path| (path.as_str(), std::sync::OnceLock::new()))
+            .collect();
+        Self {
+            inputs,
+            resolved,
+            calls,
+            loaded,
         }
-        let chunk = paths
-            .len()
-            .div_ceil(rayon::current_num_threads() * 4)
-            .max(1);
-        paths
-            .par_chunks(chunk)
-            .map(|chunk| {
-                // The resolver and its memo are single-threaded caches over
-                // shared inputs: one per chunk of files.
-                let resolver = Resolver::with_parts(
-                    self.files(),
-                    self.import_targets.clone(),
-                    self.type_targets.clone(),
-                    self.associated.clone(),
-                );
-                self.resolve_chunk(inputs, &resolver, chunk)
+    }
+
+    fn site(&self, path: &str) -> Option<&SiteFile> {
+        if let Some(file) = self.calls.files.get(path) {
+            return Some(file);
+        }
+        self.loaded
+            .get(path)?
+            .get_or_init(|| {
+                let (_, parse) = self.inputs.parses.get(path)?;
+                let resolution = self.resolved.get(path)?;
+                Some(Arc::new(SiteFile::new(path, parse, resolution)))
             })
-            .flatten()
+            .as_deref()
+    }
+
+    /// The stored files filed under `term` that are not filed in memory.
+    fn stored_files(&self, kind: aft_store::graph::TermKind, term: &str) -> BTreeSet<String> {
+        self.calls
+            .stored
+            .as_ref()
+            .map(|stored| {
+                stored
+                    .files_recording(kind, term.as_bytes())
+                    .into_iter()
+                    .filter(|file| !self.calls.own.contains(file))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn into_loaded(self) -> Vec<(String, Arc<SiteFile>)> {
+        self.loaded
+            .into_iter()
+            .filter_map(|(path, slot)| Some((path.to_string(), slot.into_inner()??)))
+            .collect()
+    }
+}
+
+impl<'a, 's: 'a> DispatchFiles<'a> for SiteSource<'s> {
+    fn file(&'a self, path: &str) -> Option<&'a ParseBlob> {
+        self.site(path).map(|file| &file.parse)
+    }
+
+    fn files_with_method(&self, name: &str) -> Vec<String> {
+        let mut files = self.stored_files(aft_store::graph::TermKind::MethodName, name);
+        if let Some(own) = self.calls.methods.get(name) {
+            files.extend(own.iter().cloned());
+        }
+        files.into_iter().collect()
+    }
+
+    fn files_in(&self, directory: &str) -> Vec<String> {
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        self.inputs
+            .parses
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(path, _)| path)
+            .take_while(|path| path.starts_with(&prefix))
+            .filter(|path| !path[prefix.len()..].contains('/'))
+            .cloned()
             .collect()
     }
 
-    fn resolve_chunk(
-        &self,
-        inputs: &CheckoutInputs,
-        resolver: &Resolver<'_>,
-        paths: &[&String],
-    ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
-        let memoized = MemoizedResolver::new(resolver);
-        resolver.take_dependencies();
-        paths
-            .iter()
-            .map(|path| {
-                let (_, parse) = &inputs.parses[path.as_str()];
-                let calls = &self.ordinary[path.as_str()];
-                let mut sites = Vec::new();
-                for site in parse.bound_dispatch_sites() {
-                    let ref_id = format!("view:{path}:{}", site.ordinal);
-                    let resolution = memoized.resolve(path, &site);
-                    // Keep proven self-call and scoped module-function
-                    // bindings when dispatch facts do not identify a
-                    // project receiver type.
-                    if parse.language == "rust"
-                        && resolution.external > 0
-                        && resolution.targets.is_empty()
-                        && calls.edges.contains(&ref_id)
-                        && calls.syntax.contains(&ref_id)
-                    {
-                        continue;
-                    }
-                    sites.push(SiteResolution {
-                        site,
-                        resolution: (*resolution).clone(),
-                    });
-                }
-                // Every file depends on its own facts, which
-                // `Resolver::resolve` reads without recording.
-                let mut dependencies = resolver.take_dependencies();
-                dependencies.insert(dependency::file(path));
-                ((*path).clone(), sites, dependencies)
-            })
-            .collect()
+    fn go_files_requiring(&self, name: &str) -> Vec<String> {
+        let mut files = self.stored_files(aft_store::graph::TermKind::GoRequired, name);
+        if let Some(own) = self.calls.go_required.get(name) {
+            files.extend(own.iter().cloned());
+        }
+        files.into_iter().collect()
     }
+
+    fn import_target(&self, file: &str, module: &str) -> Option<String> {
+        self.site(file)?.facts.import_targets.get(module).cloned()
+    }
+
+    fn type_target(&self, file: &str, name: &str) -> Option<(String, String)> {
+        self.site(file)?.facts.type_targets.get(name).cloned()
+    }
+
+    fn associated_site(&self, file: &str, ordinal: u32) -> bool {
+        self.site(file)
+            .is_some_and(|site| site.ordinary.associated.contains(&ordinal))
+    }
+}
+
+fn resolve_chunk(
+    inputs: &CheckoutInputs,
+    source: &SiteSource<'_>,
+    resolver: &Resolver<'_>,
+    paths: &[&String],
+) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+    let memoized = MemoizedResolver::new(resolver);
+    resolver.take_dependencies();
+    paths
+        .iter()
+        .map(|path| {
+            let (_, parse) = &inputs.parses[path.as_str()];
+            let calls = &source
+                .site(path)
+                .expect("every resolved file has inputs")
+                .ordinary;
+            let mut sites = Vec::new();
+            for site in parse.bound_dispatch_sites() {
+                let ref_id = format!("view:{path}:{}", site.ordinal);
+                let resolution = memoized.resolve(path, &site);
+                // Keep proven self-call and scoped module-function bindings
+                // when dispatch facts do not identify a project receiver type.
+                if parse.language == "rust"
+                    && resolution.external > 0
+                    && resolution.targets.is_empty()
+                    && calls.edges.contains(&ref_id)
+                    && calls.syntax.contains(&ref_id)
+                {
+                    continue;
+                }
+                sites.push(SiteResolution {
+                    site,
+                    resolution: (*resolution).clone(),
+                });
+            }
+            // Every file depends on its own facts, which `Resolver::resolve`
+            // reads without recording.
+            let mut dependencies = resolver.take_dependencies();
+            dependencies.insert(dependency::file(path));
+            ((*path).clone(), sites, dependencies)
+        })
+        .collect()
 }
 
 /// The target file of each module a file imports, from its pass-2 rows.

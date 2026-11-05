@@ -127,6 +127,29 @@ fn input_terms(
     terms
 }
 
+/// The terms that find a file by the methods it declares and, for Go, by
+/// the methods its interfaces require: what the method-call resolver looks
+/// files up by (see `callgraph::MethodCallInputs`).
+fn method_terms(parse: &crate::callgraph_store::join::ParseBlob) -> Vec<(TermKind, Vec<u8>)> {
+    let mut terms = Vec::new();
+    for method in &parse.dispatch.methods {
+        terms.push((TermKind::MethodName, method.name.as_bytes().to_vec()));
+    }
+    if parse.language == "go" {
+        for method in &parse.dispatch.methods {
+            if parse
+                .dispatch
+                .types
+                .iter()
+                .any(|ty| ty.interface && ty.name == method.owner)
+            {
+                terms.push((TermKind::GoRequired, method.name.as_bytes().to_vec()));
+            }
+        }
+    }
+    terms
+}
+
 fn call_target(file: &str, symbol: &str) -> Vec<u8> {
     format!("{file}\0{symbol}").into_bytes()
 }
@@ -193,6 +216,7 @@ pub(crate) fn write_sections(
         let slice = FileSlice::build(file, key, parse, resolution);
         let mut terms = slice_terms(&slice);
         terms.extend(input_terms(resolution, &facts, &mut subjects));
+        terms.extend(method_terms(parse));
         let bytes = super::fragment::encode(resolution);
         let fragment = fragment_key(key, file, &bytes);
         keys.insert(file.clone(), fragment);

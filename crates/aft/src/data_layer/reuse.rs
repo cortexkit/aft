@@ -151,7 +151,7 @@ pub(crate) fn resolve_reusing(
 
         let phase = Instant::now();
         let mut calls = MethodCallInputs::build(inputs, &resolved);
-        for (path, sites, dependencies) in calls.resolve_sites(inputs, &paths) {
+        for (path, sites, dependencies) in calls.resolve_sites(inputs, &resolved, &paths) {
             let file = resolved.get_mut(&path).expect("every file is resolved");
             file.sites = sites;
             file.site_dependencies = dependencies;

@@ -33,8 +33,8 @@ const DATA: SectionKind = SectionKind::new(0x0301);
 const INDEX: SectionKind = SectionKind::new(0x0302);
 const TERM_LOOKUP: SectionKind = SectionKind::new(0x0303);
 const TERM_POSTINGS: SectionKind = SectionKind::new(0x0304);
-/// Version 2 added the recorded-input terms.
-const VERSION: u16 = 2;
+/// Version 2 added the recorded-input terms; version 3 the method terms.
+const VERSION: u16 = 3;
 const UNIT_KEY_SPACE: KeySpace = KeySpace::new(0);
 
 /// The graph sections this build reads.
@@ -99,10 +99,14 @@ pub enum TermKind {
     SiteKey,
     /// A path or folder that a recorded checkout read of the file consulted.
     FactSubject,
+    /// The name of a method the file declares.
+    MethodName,
+    /// The name of a method a Go interface of the file requires.
+    GoRequired,
 }
 
 impl TermKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::CallTarget,
         Self::ReferenceName,
         Self::SymbolName,
@@ -112,6 +116,8 @@ impl TermKind {
         Self::DispatchKey,
         Self::SiteKey,
         Self::FactSubject,
+        Self::MethodName,
+        Self::GoRequired,
     ];
 
     const fn key_space(self) -> KeySpace {
@@ -125,6 +131,8 @@ impl TermKind {
             Self::DispatchKey => 7,
             Self::SiteKey => 8,
             Self::FactSubject => 9,
+            Self::MethodName => 10,
+            Self::GoRequired => 11,
         })
     }
 }

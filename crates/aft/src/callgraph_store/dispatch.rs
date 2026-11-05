@@ -1785,6 +1785,32 @@ pub struct Resolution {
     pub dynamic: usize,
 }
 
+/// Same-named methods in path order, each file's in file order.
+type NamedMethods<'a> = std::rc::Rc<Vec<(String, &'a ParseBlob, &'a MethodHint)>>;
+
+/// What the method-call resolver reads about a checkout's files, when they
+/// are loaded on demand instead of all held in its maps. Each answer must
+/// equal what those maps give for the same files.
+pub(crate) trait DispatchFiles<'a> {
+    /// `path`'s facts, or `None` when it has none.
+    fn file(&'a self, path: &str) -> Option<&'a ParseBlob>;
+    /// Every file with a method named `name`, in path order. May list a few
+    /// that have none; the resolver checks each file's facts.
+    fn files_with_method(&self, name: &str) -> Vec<String>;
+    /// Every file with facts directly in `directory` (`""` for the root), in
+    /// path order.
+    fn files_in(&self, directory: &str) -> Vec<String>;
+    /// Every Go file whose interfaces require a method named `name`, in path
+    /// order. May list a few that do not.
+    fn go_files_requiring(&self, name: &str) -> Vec<String>;
+    /// The target file of `module` as `file` imports it.
+    fn import_target(&self, file: &str, module: &str) -> Option<String>;
+    /// The target file and symbol of `file`'s receiver type `name`.
+    fn type_target(&self, file: &str, name: &str) -> Option<(String, String)>;
+    /// Whether `file`'s reference `ordinal` is an associated-function call.
+    fn associated_site(&self, file: &str, ordinal: u32) -> bool;
+}
+
 /// The ruled resolver operates on a complete manifest's immutable hints. Unknown
 /// receivers protect members by written name and expose interface candidates as
 /// name-only edges, never as proof of a particular implementation.
@@ -1793,11 +1819,16 @@ pub struct Resolver<'a> {
     pub import_targets: BTreeMap<(String, String), String>,
     pub type_targets: BTreeMap<(String, String), (String, String)>,
     associated_sites: HashSet<(String, u32)>,
+    /// When set, every file's facts come from here instead of the maps above,
+    /// which stay empty.
+    source: Option<&'a (dyn DispatchFiles<'a> + 'a)>,
     /// Every method of every file, grouped by method name and in file order,
     /// built on first use. An open or interface receiver then checks only the
     /// same-named methods instead of rescanning the whole manifest per site.
-    methods_by_name:
-        std::cell::OnceCell<HashMap<&'a str, Vec<(String, &'a ParseBlob, &'a MethodHint)>>>,
+    methods_by_name: std::cell::OnceCell<HashMap<&'a str, NamedMethods<'a>>>,
+    /// With a `source`, the same groups, each built the first time its name
+    /// is asked for.
+    methods_loaded: std::cell::RefCell<HashMap<String, NamedMethods<'a>>>,
     /// Inputs read since the last [`Resolver::take_dependencies`], as
     /// [`dependency`] keys. A resolution can change only when one of them does.
     dependencies: std::cell::RefCell<BTreeSet<String>>,
@@ -1855,7 +1886,9 @@ impl<'a> Resolver<'a> {
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
             associated_sites,
+            source: None,
             methods_by_name: std::cell::OnceCell::new(),
+            methods_loaded: Default::default(),
             dependencies: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
@@ -1878,11 +1911,24 @@ impl<'a> Resolver<'a> {
             import_targets,
             type_targets,
             associated_sites,
+            source: None,
             methods_by_name: std::cell::OnceCell::new(),
+            methods_loaded: Default::default(),
             dependencies: Default::default(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
+    }
+    /// A resolver reading every file's facts from `source`, on demand.
+    pub(crate) fn over(source: &'a (dyn DispatchFiles<'a> + 'a)) -> Self {
+        let mut resolver = Self::with_parts(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            HashSet::new(),
+        );
+        resolver.source = Some(source);
+        resolver
     }
     /// The import targets, type targets and associated-function sites given
     /// to [`Resolver::with_parts`].
@@ -1900,7 +1946,78 @@ impl<'a> Resolver<'a> {
         )
     }
     fn associated_site(&self, file: &str, ordinal: u32) -> bool {
-        self.associated_sites.contains(&(file.to_string(), ordinal))
+        match self.source {
+            Some(source) => source.associated_site(file, ordinal),
+            None => self.associated_sites.contains(&(file.to_string(), ordinal)),
+        }
+    }
+    /// The language of `file`, a file being resolved.
+    fn caller_language(&self, file: &str) -> String {
+        self.lookup(file)
+            .expect("resolved file has facts")
+            .language
+            .clone()
+    }
+    /// `path`'s facts without recording a dependency.
+    fn lookup(&self, path: &str) -> Option<&'a ParseBlob> {
+        match self.source {
+            Some(source) => source.file(path),
+            None => self.files.get(path).copied(),
+        }
+    }
+    /// Every file with facts directly in `file`'s directory, in path order.
+    fn directory_files(&self, file: &str) -> Vec<(String, &'a ParseBlob)> {
+        let directory = std::path::Path::new(file).parent();
+        match self.source {
+            Some(source) => {
+                let name = directory
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                source
+                    .files_in(&name)
+                    .into_iter()
+                    .filter_map(|path| source.file(&path).map(|parse| (path, parse)))
+                    .collect()
+            }
+            None => self
+                .files
+                .iter()
+                .filter(|(f, _)| std::path::Path::new(f).parent() == directory)
+                .map(|(f, p)| (f.clone(), *p))
+                .collect(),
+        }
+    }
+    /// Whether some Go file declares an interface requiring a method named
+    /// `name` with `shape`.
+    fn go_interface_requires(&self, name: &str, shape: &str) -> bool {
+        let requires = |p: &ParseBlob| {
+            p.language == "go"
+                && p.dispatch.types.iter().any(|t| {
+                    t.interface
+                        && p.dispatch.methods.iter().any(|required| {
+                            required.owner == t.name
+                                && required.name == name
+                                && required.shape == shape
+                        })
+                })
+        };
+        match self.source {
+            Some(source) => source
+                .go_files_requiring(name)
+                .iter()
+                .filter_map(|path| source.file(path))
+                .any(requires),
+            None => self.files.values().any(|p| requires(p)),
+        }
+    }
+    fn import_target(&self, file: &str, module: &str) -> Option<String> {
+        match self.source {
+            Some(source) => source.import_target(file, module),
+            None => self
+                .import_targets
+                .get(&(file.to_string(), module.to_string()))
+                .cloned(),
+        }
     }
     /// Every key recorded since the previous call.
     pub fn take_dependencies(&self) -> BTreeSet<String> {
@@ -1911,19 +2028,45 @@ impl<'a> Resolver<'a> {
     }
     fn file(&self, path: &str) -> Option<&'a ParseBlob> {
         self.depend(dependency::file(path));
-        self.files.get(path).copied()
+        self.lookup(path)
     }
     /// The facts of a file the caller already found through [`Self::file`]
     /// or a recorded lookup.
     fn known_file(&self, path: &str) -> &'a ParseBlob {
         self.file(path).expect("resolved file has facts")
     }
-    fn type_target(&self, file: &str, name: &str) -> Option<&(String, String)> {
+    fn type_target(&self, file: &str, name: &str) -> Option<(String, String)> {
         self.depend(dependency::file(file));
-        self.type_targets.get(&(file.to_string(), name.to_string()))
+        match self.source {
+            Some(source) => source.type_target(file, name),
+            None => self
+                .type_targets
+                .get(&(file.to_string(), name.to_string()))
+                .cloned(),
+        }
     }
-    fn methods_named(&self, member: &str) -> &[(String, &'a ParseBlob, &'a MethodHint)] {
+    fn methods_named(&self, member: &str) -> NamedMethods<'a> {
         self.depend(dependency::method(member));
+        if let Some(source) = self.source {
+            if let Some(found) = self.methods_loaded.borrow().get(member) {
+                return std::rc::Rc::clone(found);
+            }
+            let mut methods = Vec::new();
+            for file in source.files_with_method(member) {
+                self.note_file_visit();
+                let Some(parse) = source.file(&file) else {
+                    continue;
+                };
+                for method in parse.dispatch.methods.iter().filter(|m| m.name == member) {
+                    methods.push((file.clone(), parse, method));
+                }
+            }
+            let methods = std::rc::Rc::new(methods);
+            self.methods_loaded
+                .borrow_mut()
+                .insert(member.to_string(), std::rc::Rc::clone(&methods));
+            return methods;
+        }
         let index = self.methods_by_name.get_or_init(|| {
             let mut index: HashMap<&'a str, Vec<(String, &'a ParseBlob, &'a MethodHint)>> =
                 HashMap::new();
@@ -1939,8 +2082,11 @@ impl<'a> Resolver<'a> {
                 }
             }
             index
+                .into_iter()
+                .map(|(name, methods)| (name, std::rc::Rc::new(methods)))
+                .collect()
         });
-        index.get(member).map(Vec::as_slice).unwrap_or_default()
+        index.get(member).cloned().unwrap_or_default()
     }
     fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
         self.project_type_at_depth(file, name, 0)
@@ -1971,7 +2117,9 @@ impl<'a> Resolver<'a> {
         }
         if let Some(expression) = name.strip_prefix("@return:") {
             let local;
-            let (target_file, symbol) = if let Some(target) = self.type_target(file, expression) {
+            let target;
+            let (target_file, symbol) = if let Some(found) = self.type_target(file, expression) {
+                target = found;
                 (&target.0, &target.1)
             } else {
                 self.file(file)?
@@ -1998,6 +2146,7 @@ impl<'a> Resolver<'a> {
             return Some((file.to_string(), t));
         }
         if let Some((target_file, symbol)) = self.type_target(file, name) {
+            let (target_file, symbol) = (&target_file, &symbol);
             if let Some(ty) = self
                 .file(target_file)?
                 .dispatch
@@ -2010,14 +2159,12 @@ impl<'a> Resolver<'a> {
         }
         if ["go", "java", "csharp"].contains(&parse.language.as_str()) {
             self.depend(dependency::directory(file));
-            let directory = std::path::Path::new(file).parent();
-            let mut candidates = self
-                .files
+            let in_directory = self.directory_files(file);
+            let mut candidates = in_directory
                 .iter()
                 .filter(|(f, p)| {
                     self.note_file_visit();
                     p.language == parse.language
-                        && std::path::Path::new(f).parent() == directory
                         && (parse.language != "go"
                             || (p.dispatch.go_package == parse.dispatch.go_package
                                 && (file.ends_with("_test.go") || !f.ends_with("_test.go"))))
@@ -2054,11 +2201,8 @@ impl<'a> Resolver<'a> {
                 .unwrap_or(name);
             // The import targets belong to the importing file's facts, which
             // this lookup already recorded.
-            if let Some(target) = self
-                .import_targets
-                .get(&(file.to_string(), import.module_path.clone()))
-            {
-                if let Some(candidate) = self.file(target) {
+            if let Some(target) = self.import_target(file, &import.module_path) {
+                if let Some(candidate) = self.file(&target) {
                     let wanted = if import.default_import.as_deref() == Some(name) {
                         candidate
                             .default_export_symbol
@@ -2100,9 +2244,10 @@ impl<'a> Resolver<'a> {
             candidates.sort();
             for path in candidates {
                 self.depend(dependency::file(&path));
-                let Some((path, candidate)) = self.files.get_key_value(&path) else {
+                let Some(candidate) = self.lookup(&path) else {
                     continue;
                 };
+                let path = &path;
                 self.note_file_visit();
                 if candidate.language != parse.language {
                     continue;
@@ -2402,17 +2547,7 @@ impl<'a> Resolver<'a> {
                                     self.depend(dependency::GO_INTERFACES.to_string());
                                     true
                                 }
-                                && self.files.values().any(|p| {
-                                    p.language == "go"
-                                        && p.dispatch.types.iter().any(|t| {
-                                            t.interface
-                                                && p.dispatch.methods.iter().any(|required| {
-                                                    required.owner == t.name
-                                                        && required.name == m.name
-                                                        && required.shape == m.shape
-                                                })
-                                        })
-                                })
+                                && self.go_interface_requires(&m.name, &m.shape)
                     })
             })
             .map(|(file, symbol)| Target {
@@ -2434,7 +2569,7 @@ impl<'a> Resolver<'a> {
     /// not depend on them beyond the language, and [`MemoizedResolver`] shares
     /// that answer across files. Owners treat every file as depending on itself.
     pub fn resolve(&self, file: &str, site: &SiteHint) -> Resolution {
-        let parse = self.files[file];
+        let parse = self.lookup(file).expect("resolved file has facts");
         if site.dynamic {
             return Resolution {
                 dynamic: 1,
@@ -2561,7 +2696,7 @@ impl<'a> Resolver<'a> {
             })
             .collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
-            for (candidate_file, candidate, method) in self.methods_named(member) {
+            for (candidate_file, candidate, method) in self.methods_named(member).iter() {
                 let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
                 if candidate.language != parse.language {
                     continue;
@@ -2666,23 +2801,24 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             // in different files can reuse the same conservative answer. Typed
             // receiver lookup also depends on the caller's imports and directory.
             scope: if site.receiver.is_none() {
-                self.resolver.files[file].language.clone()
+                self.resolver.caller_language(file)
             } else {
                 file.to_string()
             },
             receiver: site.receiver.clone(),
             member: site.member.clone(),
             dynamic: site.dynamic,
-            associated: self.resolver.files[file].language == "rust"
+            associated: self.resolver.caller_language(file) == "rust"
                 && self.resolver.associated_site(file, site.ordinal),
-            caller_scope: (self.resolver.files[file].language == "rust" && site.receiver.is_some())
-                .then(|| {
-                    site.caller
-                        .as_deref()
-                        .and_then(|name| name.rsplit_once("::"))
-                        .map(|(scope, _)| scope.to_string())
-                })
-                .flatten(),
+            caller_scope: (self.resolver.caller_language(file) == "rust"
+                && site.receiver.is_some())
+            .then(|| {
+                site.caller
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once("::"))
+                    .map(|(scope, _)| scope.to_string())
+            })
+            .flatten(),
         };
         if let Some((resolved, dependencies)) = self.resolved.borrow().get(&key) {
             self.resolver
