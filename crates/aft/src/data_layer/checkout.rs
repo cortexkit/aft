@@ -1730,10 +1730,50 @@ mod tests {
     /// three; the views resolver was found to miss them.
     #[test]
     fn rust_calls_through_module_paths_have_callers() {
+        // AFT's own crate has a binary root beside its library root, a
+        // library name that differs from the package name, and sits in a
+        // workspace; each layout is checked, so a miss names its cause.
+        let mut failures = Vec::new();
+        for workspace in [false, true] {
+            for lib_name in [false, true] {
+                for binary in [false, true] {
+                    let missing = module_path_callers_missing(workspace, lib_name, binary);
+                    if !missing.is_empty() {
+                        failures.push(format!(
+                            "workspace {workspace}, lib name {lib_name}, binary {binary}: {missing:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    fn module_path_callers_missing(workspace: bool, lib_name: bool, binary: bool) -> Vec<String> {
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
-        let r = root.path();
-        write(r, "Cargo.toml", "[package]\nname = \"paths\"\n");
+        let top = root.path();
+        let crate_dir = if workspace {
+            write(
+                top,
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/paths\"]\n",
+            );
+            top.join("crates/paths")
+        } else {
+            top.to_path_buf()
+        };
+        let r = crate_dir.as_path();
+        let mut manifest = String::from("[package]\nname = \"paths-package\"\n");
+        if lib_name {
+            manifest.push_str("\n[lib]\nname = \"paths\"\npath = \"src/lib.rs\"\n");
+        }
+        if binary {
+            manifest.push_str("\n[[bin]]\nname = \"paths\"\npath = \"src/main.rs\"\n");
+            write(r, "src/main.rs", "mod cli;\nfn main() { cli::run(); }\n");
+            write(r, "src/cli.rs", "pub fn run() {}\n");
+        }
+        write(r, "Cargo.toml", &manifest);
         write(
             r,
             "src/lib.rs",
@@ -1756,35 +1796,39 @@ mod tests {
             r,
             "src/user.rs",
             "use crate::graph::{self, Edge};\n\
-             pub fn user() {\n\
-             \x20   if crate::outer::runtime::enabled() {\n\
-             \x20       crate::access::plugin::issue();\n\
+             pub struct Context;\n\
+             impl Context {\n\
+             \x20   pub fn user(&self) {\n\
+             \x20       if crate::outer::runtime::enabled() {\n\
+             \x20           crate::access::plugin::issue();\n\
+             \x20       }\n\
+             \x20       graph::aliases();\n\
+             \x20       let _ = Edge;\n\
              \x20   }\n\
-             \x20   graph::aliases();\n\
-             \x20   let _ = Edge;\n\
              }\n",
         );
         let checkout = Checkout::bind(
             Arc::new(DataLayer::new(8 << 20, 2)),
             store.path(),
             family(),
-            r,
+            top,
         )
         .unwrap();
         checkout.build().unwrap();
         let view = checkout.view().unwrap();
+        let prefix = if workspace { "crates/paths/" } else { "" };
         let mut missing = Vec::new();
         for (file, symbol) in [
             ("src/outer/runtime.rs", "enabled"),
             ("src/access_plugin.rs", "issue"),
             ("src/graph.rs", "aliases"),
         ] {
-            let callers = callers_of(&view, file, symbol);
-            if !callers.contains("src/user.rs") {
+            let callers = callers_of(&view, &format!("{prefix}{file}"), symbol);
+            if !callers.contains(&format!("{prefix}src/user.rs")) {
                 missing.push(format!("{file}::{symbol}: {callers}"));
             }
         }
-        assert!(missing.is_empty(), "{missing:#?}");
+        missing
     }
 
     fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
