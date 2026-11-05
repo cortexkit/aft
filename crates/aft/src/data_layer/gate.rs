@@ -142,8 +142,16 @@ impl ManifestBlobReader for Blobs {
 pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     let started = Instant::now();
     let records = Records::default();
-    let scanned = scan(root, &super::content::scan_policy(), None, &records)
-        .map_err(|error| error.to_string())?;
+    // Today's views read no file past the text-index limit, while the data
+    // layer parses source files up to the larger read limit. This gate
+    // compares resolution and assembly on the same inputs, so it scans with
+    // today's limit; the larger files are the data layer's own improvement,
+    // and the checkout and edit gates cover them against cold builds.
+    let policy = aft_store::scan::ScanPolicy {
+        read_large: None,
+        ..super::content::scan_policy()
+    };
+    let scanned = scan(root, &policy, None, &records).map_err(|error| error.to_string())?;
     let failures = records.failures.into_inner().expect("no panics");
     if !failures.is_empty() {
         return Err(format!("extraction failed: {failures:?}"));
