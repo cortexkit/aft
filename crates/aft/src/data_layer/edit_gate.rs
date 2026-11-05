@@ -415,6 +415,7 @@ pub fn run(
     }
     let mut failures = 0;
     let mut checked = 0;
+    let timing_only = std::env::var_os("EDIT_GATE_TIMING_ONLY").is_some_and(|value| value == "1");
     for (index, edit) in edits.iter().enumerate() {
         let path = edit["path"]
             .as_str()
@@ -450,6 +451,18 @@ pub fn run(
             overlay_check_ms: None,
             examples: Vec::new(),
         };
+        // `EDIT_GATE_TIMING_ONLY=1` skips every check, so a profile of the
+        // run shows only the updates. Such a run proves nothing about
+        // correctness and fails nothing.
+        if timing_only {
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string(&record).map_err(|error| error.to_string())?
+            )
+            .map_err(|error| error.to_string())?;
+            continue;
+        }
         let started = Instant::now();
         let undiscovered = live.stale_recordings();
         record.discovery_ms = started.elapsed().as_secs_f64() * 1000.0;

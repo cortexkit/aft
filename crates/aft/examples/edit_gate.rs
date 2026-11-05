@@ -23,6 +23,10 @@ fn main() {
     )
     .unwrap();
     eprintln!("checked {checked} edits against cold resolutions; {failures} differed");
+    if std::env::var_os("EDIT_GATE_TIMING_ONLY").is_some_and(|value| value == "1") {
+        eprintln!("timing only: nothing was checked");
+        return;
+    }
     assert!(checked > 0, "no edit was checked against a cold resolution");
     assert_eq!(
         failures, 0,

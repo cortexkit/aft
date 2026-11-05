@@ -1367,41 +1367,42 @@ impl ParseBlob {
         }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
-        // Imports can also produce re-export rows. Compute each Python module
-        // path's dependencies once per file, then reuse them for both kinds of row.
-        let mut python_module_dependencies = HashMap::new();
+        // A module path's dependencies are computed once per file and reused
+        // by every reference that names it (imports also produce re-export
+        // rows). The result is a function of the file, the module path and
+        // the checkout, and every read the computation makes is recorded for
+        // this file the first time, so a reuse records nothing new. Each
+        // computation keeps its own memo: a memo shared between module paths
+        // returns cached targets without the candidate paths the dependency
+        // set lists.
+        let mut module_dependencies = HashMap::new();
         for (position, (raw, reference_key)) in
             self.refs.iter().zip(self.reference_keys()).enumerate()
         {
             let position = u32::try_from(position).expect("reference vector fits u32");
-            let dependencies =
-                if let Some(dependencies) = cached.and_then(|cache| cache.get(&position)) {
-                    dependencies.clone()
-                } else if raw.kind == BlobRefKind::Module {
-                    super::rust_external_module_target(
-                        &abs,
-                        raw.path_override.as_deref(),
-                        raw.module_path.as_deref().unwrap_or_default(),
-                        facts,
-                    )
-                    .and_then(|p| facts.canonical(&p))
-                    .map(|p| super::relative_path(facts.root, &p))
-                    .into_iter()
-                    .collect()
-                } else if let Some(module) = &raw.module_path {
-                    if data.lang == LangId::Python {
-                        python_module_dependencies
-                            .entry(module.clone())
-                            .or_insert_with(|| {
-                                super::module_dependencies(facts.root, &abs, module, facts)
-                            })
-                            .clone()
-                    } else {
-                        super::module_dependencies(facts.root, &abs, module, facts)
-                    }
-                } else {
-                    BTreeSet::new()
-                };
+            let dependencies = if let Some(dependencies) =
+                cached.and_then(|cache| cache.get(&position))
+            {
+                dependencies.clone()
+            } else if raw.kind == BlobRefKind::Module {
+                super::rust_external_module_target(
+                    &abs,
+                    raw.path_override.as_deref(),
+                    raw.module_path.as_deref().unwrap_or_default(),
+                    facts,
+                )
+                .and_then(|p| facts.canonical(&p))
+                .map(|p| super::relative_path(facts.root, &p))
+                .into_iter()
+                .collect()
+            } else if let Some(module) = &raw.module_path {
+                module_dependencies
+                    .entry(module.clone())
+                    .or_insert_with(|| super::module_dependencies(facts.root, &abs, module, facts))
+                    .clone()
+            } else {
+                BTreeSet::new()
+            };
             let caller_symbol = raw
                 .caller_symbol
                 .as_ref()

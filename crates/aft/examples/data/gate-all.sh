@@ -14,9 +14,18 @@ threads="${2:-8}"
 out="${TMPDIR:-/tmp}/gate-all"
 mkdir -p "$out"
 git log -1 --format=%H
-cargo build --profile ci-storm -p agent-file-tools \
-  --example resolve_gate --example edit_gate --example reuse_gate 2>&1 | tail -2
+# A failed build must stop here: the target folder may be shared and warm, so
+# carrying on would run an older commit's gate binaries.
+if ! cargo build --profile ci-storm -p agent-file-tools \
+  --example resolve_gate --example edit_gate --example reuse_gate > "$out/build.txt" 2>&1; then
+  tail -30 "$out/build.txt"
+  echo "build failed; no gate ran"
+  exit 2
+fi
+tail -2 "$out/build.txt"
 bin="${CARGO_TARGET_DIR:-target}/ci-storm/examples"
+ls -l --time-style=+%FT%T "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate" 2>/dev/null \
+  || ls -lT "$bin/resolve_gate" "$bin/edit_gate" "$bin/reuse_gate"
 status=0
 started=$(date +%s)
 GATE_SAMPLE_SCALE="$scale" "$bin/resolve_gate" . "$threads" > "$out/parity.txt" 2> "$out/parity.err"
