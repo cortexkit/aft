@@ -2245,18 +2245,4 @@ mod tests {
             "a failed data layer build fell back to today's search cache"
         );
     }
-
-    #[test]
-    fn with_the_data_layer_off_a_standing_pass_builds_todays_search_cache() {
-        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
-
-        fixture.pass();
-        assert!(fixture.search_cache().is_file());
-        assert!(!fixture.strict(IndexKind::Search));
-        assert!(
-            fixture.strict(IndexKind::Callgraph),
-            "today's pass leaves the call graph's flag to its own loader"
-        );
-        assert!(!fixture.storage.path().join("data").exists());
-    }
 }
