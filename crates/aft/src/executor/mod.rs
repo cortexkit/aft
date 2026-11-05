@@ -4059,11 +4059,11 @@ fn dispatch_provider_metadata(
     made_progress
 }
 
-/// Call-ledger jobs are admitted ahead of the interactive DRR pass, on general
-/// workers, without the actor's read cap, epoch gate or writer barrier: a
-/// keyed reply cannot be written until its settlement commits, so it must not
-/// wait for the reads queued or running on its root. Each actor runs one at a
-/// time, in submission order.
+/// Call-ledger jobs are admitted ahead of the interactive deficit round-robin
+/// (DRR) pass, on general workers, without the actor's read cap, epoch gate or
+/// writer barrier: a keyed reply cannot be written until its settlement
+/// commits, so it must not wait for the reads queued or running on its root.
+/// Each actor runs one at a time, in submission order.
 fn dispatch_call_ledger(
     state: &mut SchedulerState,
     heavy: &Arc<HeavySemaphore>,
@@ -4199,8 +4199,8 @@ enum AdmissionPass {
     /// Provider jobs bypass ordinary per-root deficit scheduling and do not
     /// acquire the index epoch gate.
     ProviderMetadata,
-    /// Call-ledger jobs: like provider jobs they bypass the DRR pass and the
-    /// epoch gate, but they use general workers.
+    /// Call-ledger jobs: like provider jobs they bypass the deficit round-robin
+    /// pass and the epoch gate, but they use general workers.
     CallLedger,
     /// The ordinary DRR pass for one job class.
     Class(JobClass),
