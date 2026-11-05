@@ -574,23 +574,22 @@ fn dedup_paths_for_summary(paths: Vec<StoreTracePath>) -> Vec<StoreTracePath> {
 /// then length, then the hops themselves, so the order never depends on how
 /// the walk met them.
 fn trace_path_order(left: &StoreTracePath, right: &StoreTracePath) -> std::cmp::Ordering {
-    let root = |path: &StoreTracePath| {
+    fn root(path: &StoreTracePath) -> (&str, &str) {
         path.hops
             .first()
             .map(|hop| (hop.symbol.as_str(), hop.file.as_str()))
             .unwrap_or(("", ""))
-    };
-    let hops = |path: &StoreTracePath| {
+    }
+    fn hops(path: &StoreTracePath) -> impl Iterator<Item = (&str, &str, u32)> {
         path.hops
             .iter()
             .map(|hop| (hop.file.as_str(), hop.symbol.as_str(), hop.line))
-            .collect::<Vec<_>>()
-    };
+    }
     left.root
         .cmp(&right.root)
         .then_with(|| root(left).cmp(&root(right)))
         .then(left.hops.len().cmp(&right.hops.len()))
-        .then_with(|| hops(left).cmp(&hops(right)))
+        .then_with(|| hops(left).cmp(hops(right)))
 }
 
 /// The path `elems` walked, from its root (the last element) to the traced

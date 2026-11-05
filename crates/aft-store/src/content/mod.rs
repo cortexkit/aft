@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn entry_facts_round_trip_and_older_records_read_without_them() {
         let mut record = sample();
-        let RecordBody::Parsed { surface, body } = &mut record.data else {
+        let RecordBody::Parsed { surface, .. } = &mut record.data else {
             unreachable!("the sample is parsed");
         };
         surface.symbols[0].program_start = true;
