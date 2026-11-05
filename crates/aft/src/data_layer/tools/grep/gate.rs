@@ -455,7 +455,10 @@ fn grep_query(
     (!scope.is_file()).then_some((pattern, filters, scope))
 }
 
-/// Every matching line one path's index finds, with no result cap.
+/// Every matching line one path's index finds, with no result cap. The
+/// scan keeps lines in arrival order: a path-ordered scan keeps only the
+/// rows its row budget allows per file, which is all a capped reply needs
+/// but not every line.
 fn engine_lines(
     ctx: &AppContext,
     pattern: &crate::pattern_compile::CompiledPattern,
@@ -479,7 +482,7 @@ fn engine_lines(
             scope,
             usize::MAX / 4,
             None,
-            crate::search_index::GrepScanOrder::Path,
+            crate::search_index::GrepScanOrder::Arrival,
         )
         .ok()?;
     (!result.scan_deadline_reached).then(|| {
