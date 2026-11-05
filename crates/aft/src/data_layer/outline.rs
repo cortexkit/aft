@@ -659,6 +659,22 @@ pub fn separator() -> char {
         })
     }
 
+    /// Today's call-graph store of `root`, built cold.
+    fn todays_store(
+        root: &Path,
+    ) -> (crate::callgraph_store::CallGraphStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::callgraph_store::CallGraphStore::open(
+            dir.path().join("store"),
+            root.to_path_buf(),
+        )
+        .unwrap();
+        store
+            .cold_build(&crate::callgraph::walk_project_files(root).collect::<Vec<_>>())
+            .unwrap();
+        (store, dir)
+    }
+
     /// After a restart `trace_data` takes its file's symbols from the
     /// file's record, parsing nothing to find them, and answers as it does
     /// when it parses the file, and as today's store does.
@@ -669,14 +685,7 @@ pub fn separator() -> char {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         fixture(&root);
         let (ctx, _storage) = published_then_restarted(&root);
-
-        let store_dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::callgraph_store::CallGraphStore::open(store_dir.path().join("store"), root.clone())
-                .unwrap();
-        store
-            .cold_build(&crate::callgraph::walk_project_files(&root).collect::<Vec<_>>())
-            .unwrap();
+        let (store, _store_dir) = todays_store(&root);
 
         let cases = [
             ("web/data_flow.ts", "transformData", "rawInput"),
@@ -685,7 +694,7 @@ pub fn separator() -> char {
             ("src/store.rs", "Store::open", "path"),
             ("tool/main.py", "run", "value"),
         ];
-        let mut hops = 0;
+        let (mut hops, mut exact) = (0, 0);
         for (file, symbol, expression) in cases {
             let path = root.join(file);
             assert!(!ctx.symbol_cache().read().unwrap().contains_key(&path));
@@ -699,7 +708,10 @@ pub fn separator() -> char {
             );
             assert!(ctx.symbol_cache().read().unwrap().contains_key(&path));
             let answer = trace_fields(&answer.data);
-            hops += answer["hops"].as_array().map_or(0, Vec::len);
+            for hop in answer["hops"].as_array().into_iter().flatten() {
+                hops += 1;
+                exact += usize::from(hop["approximate"] == false);
+            }
 
             let view = ctx.data_view().unwrap();
             let parsing = crate::commands::callgraph_store_adapter::trace_data_result(
@@ -732,6 +744,96 @@ pub fn separator() -> char {
             );
         }
         assert!(hops > 0, "no case traced anything");
+        // Unchanged files are fresh: their hops are exact.
+        assert!(exact > 0, "every hop was approximate");
+    }
+
+    fn impact_fields(
+        store: &impl crate::callgraph_store::CallGraphRead,
+        file: &Path,
+        symbol: &str,
+    ) -> serde_json::Value {
+        let result =
+            crate::commands::callgraph_store_adapter::impact_result(store, file, symbol, 5, true)
+                .unwrap_or_else(|error| panic!("impact of {symbol}: {error}"));
+        serde_json::to_value(&result).unwrap()
+    }
+
+    /// `impact` and `trace_data` on the data layer's graph answer as today's
+    /// store does: exact for files that hold the content the graph was built
+    /// from, and, after an edit no one reported, stale for the edited file:
+    /// call expressions withheld and every hop and caller approximate.
+    #[test]
+    fn impact_and_trace_data_see_fresh_and_edited_files_as_today() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        fixture(&root);
+        let (ctx, _storage) = published_then_restarted(&root);
+        let (store, _store_dir) = todays_store(&root);
+        let checkout = ctx.data_checkout().expect("the data layer binds");
+
+        let targets = [
+            ("web/data_processor.ts", "processInput"),
+            ("src/store.rs", "Store::open"),
+            ("tool/helpers.py", "clean"),
+        ];
+        let callers = |answer: &serde_json::Value| -> Vec<serde_json::Value> {
+            answer["callers"].as_array().cloned().unwrap_or_default()
+        };
+        let mut shown = 0;
+        for (file, symbol) in targets {
+            let path = root.join(file);
+            let view = checkout.view().unwrap();
+            let ours = impact_fields(&view.callgraph(), &path, symbol);
+            assert_eq!(ours, impact_fields(&store, &path, symbol), "{file} {symbol}");
+            shown += callers(&ours)
+                .iter()
+                .filter(|caller| caller["call_expression"].is_string())
+                .count();
+        }
+        // Unchanged files are fresh: their calls are shown.
+        assert!(shown > 0, "no caller showed its call");
+
+        // Edit a caller's file on disk; nothing records the change.
+        let edited = root.join("web/data_flow.ts");
+        let text = std::fs::read_to_string(&edited).unwrap();
+        std::fs::write(&edited, format!("// edited\n{text}")).unwrap();
+        let view = checkout.view().unwrap();
+        let target = root.join("web/data_processor.ts");
+        let ours = impact_fields(&view.callgraph(), &target, "processInput");
+        assert_eq!(ours, impact_fields(&store, &target, "processInput"));
+        let stale = callers(&ours)
+            .into_iter()
+            .filter(|caller| caller["caller_file"] == "web/data_flow.ts")
+            .collect::<Vec<_>>();
+        assert!(!stale.is_empty(), "{ours}");
+        assert!(
+            stale.iter().all(|caller| caller["call_expression"].is_null()
+                && caller["approximate"] == true),
+            "{ours}"
+        );
+
+        let answer = trace_data(&ctx, &edited, "transformData", "rawInput");
+        assert!(answer.success, "{:?}", answer.data);
+        let answer = trace_fields(&answer.data);
+        let today = crate::commands::callgraph_store_adapter::trace_data_result(
+            &store,
+            &edited,
+            "transformData",
+            "rawInput",
+            5,
+            fresh_cache(),
+        )
+        .unwrap();
+        assert_eq!(answer, trace_fields(&serde_json::to_value(&today).unwrap()));
+        assert!(
+            answer["hops"]
+                .as_array()
+                .is_some_and(|hops| !hops.is_empty()
+                    && hops.iter().all(|hop| hop["approximate"] == true)),
+            "{answer}"
+        );
     }
 
     /// The whole path a configure takes: the bind's prewarm fills the cache

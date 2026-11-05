@@ -3193,8 +3193,38 @@ fn content_matches_store(
     Ok(
         stored == crate::cache_freshness::zero_hash().to_hex().as_str()
             || stored == current.to_hex().as_str()
-            || stored == view_blob_key(file, current).unwrap_or_default(),
+            || stored == view_blob_key(file, current).unwrap_or_default()
+            || data_layer_record_keys(file, current).contains(&stored),
     )
+}
+
+/// The data layer's call graph records each file's content-record key, which
+/// is derived from the file's content key (the first 128 bits of the BLAKE3
+/// hash of its bytes), the language it was parsed as and the extractor
+/// version, so the current bytes match exactly when they derive the stored
+/// key. A `.h` header's language comes from parsing its bytes, so a key is
+/// derived for each language it can be parsed as: any of them matching still
+/// proves the record was extracted from these bytes.
+fn data_layer_record_keys(file: &str, current: blake3::Hash) -> Vec<String> {
+    use crate::data_layer::content::{language_for, EXTRACTOR_VERSION};
+    let content =
+        aft_store::ids::ContentKey::from_digest(aft_store::ids::Digest128::from_hash(&current));
+    let languages = if Path::new(file)
+        .extension()
+        .is_some_and(|extension| extension == "h")
+    {
+        vec!["c".to_string(), "cpp".to_string(), "objc".to_string()]
+    } else {
+        language_for(file, &[]).into_iter().collect()
+    };
+    languages
+        .iter()
+        .map(|language| {
+            aft_store::content::RecordKey::new(content, language, EXTRACTOR_VERSION)
+                .digest()
+                .to_string()
+        })
+        .collect()
 }
 
 /// A view-materialized graph records each file's call-graph blob key rather
