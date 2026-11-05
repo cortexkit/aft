@@ -5314,14 +5314,45 @@ pub struct StoreNode {
     pub end_line: u32,
     pub signature: Option<String>,
     pub exported: bool,
+    /// The store's own entry-point guess. `trace_to` and `impact` label the
+    /// roots they reach from [`StoreNode::entry`] instead.
     pub is_entry_point: bool,
     pub lang: LangId,
+    /// What extraction recorded about execution starting at this symbol.
+    pub entry: EntryFacts,
+}
+
+/// What extraction recorded about where execution can start at a symbol.
+/// `trace_to` and `impact` label the roots they reach with these facts.
+/// The data layer's call graph records them; today's database does not,
+/// so its nodes carry the defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryFacts {
+    /// Whether the symbol is test code (a `#[test]` or `#[cfg(test)]`
+    /// item); `None` when extraction could not tell.
+    pub is_test: Option<bool>,
+    /// Whether the program starts here, as the language defines it. For
+    /// Rust this is `fn main` at the top of its file, and the file must also
+    /// be a binary target's root.
+    pub program_start: bool,
+    /// The entry attribute or decorator recorded on the symbol, such as
+    /// `no_mangle` or `tauri::command`.
+    pub entry_attribute: Option<String>,
+    /// Whether the symbol is its module's default export.
+    pub default_export: bool,
 }
 
 impl StoreNode {
     /// The positional node identity, for request-local memo keys.
     pub(crate) fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// This node with `entry` as its entry facts.
+    #[must_use]
+    pub(crate) fn with_entry(mut self, entry: EntryFacts) -> Self {
+        self.entry = entry;
+        self
     }
 
     /// A node from its fields, for stores that do not keep database rows.
@@ -5351,6 +5382,7 @@ impl StoreNode {
             exported,
             is_entry_point,
             lang,
+            entry: EntryFacts::default(),
         }
     }
 }
@@ -5370,6 +5402,7 @@ impl StoreNode {
             exported: is_entry_point,
             is_entry_point,
             lang: LangId::TypeScript,
+            entry: EntryFacts::default(),
         }
     }
 }
@@ -11582,6 +11615,8 @@ fn store_node_from_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
         exported: row.get::<_, i64>(offset + 8)? != 0,
         is_entry_point: row.get::<_, i64>(offset + 9)? != 0,
         lang: lang_from_label(&lang_label_value).unwrap_or(LangId::TypeScript),
+        // Today's database records no entry facts; see `EntryFacts`.
+        entry: EntryFacts::default(),
     })
 }
 

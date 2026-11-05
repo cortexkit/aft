@@ -3858,23 +3858,20 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
         };
         format!("{prefix}{total_paths}")
     };
-    let entry_points = number_field(record, "entry_points_found").unwrap_or(0);
+    let roots = root_counts_summary(record);
     let mut sections = vec![join_non_empty(&[
         Some(format!(
             "{total_paths_str} path{}",
             if total_paths_str == "1" { "" } else { "s" }
         )),
-        Some(format!(
-            "{entry_points} entry point{}",
-            if entry_points == 1 { "" } else { "s" }
-        )),
+        roots.map(|roots| format!("roots: {roots}")),
         (!warning.is_empty()).then_some(warning),
     ])];
     if let Some(summary) = hub_summary {
         sections.push(summary);
     }
     if paths.is_empty() {
-        sections.push("No entry paths found.".to_string());
+        sections.push("No paths found.".to_string());
     }
     for (index, path) in paths.iter().enumerate() {
         let mut lines = Vec::new();
@@ -3889,16 +3886,40 @@ fn format_trace_to_sections(record: &serde_json::Map<String, Value>) -> Vec<Stri
     sections
 }
 
+/// The roots a `trace_to` or `impact` reply reached, from its `root_counts`:
+/// `main, 4 tests, 2 public API functions`.
+fn root_counts_summary(record: &serde_json::Map<String, Value>) -> Option<String> {
+    record
+        .get("root_counts")
+        .and_then(Value::as_object)
+        .and_then(crate::commands::callgraph_roots::summary)
+}
+
+/// The root tag of a path or impact caller that has a `root` kind.
+fn root_tag(record: &serde_json::Map<String, Value>) -> Option<String> {
+    crate::commands::callgraph_roots::tag(
+        string_field(record, "root")?,
+        string_field(record, "attribute"),
+    )
+}
+
 fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines: &mut Vec<String>) {
     lines.push(format!("Path {}", index + 1));
+    let root = root_tag(path);
     for (hop_index, hop) in records_field(path, "hops").iter().enumerate() {
         let symbol = string_field(hop, "symbol").unwrap_or("(unknown)");
         let file = shorten_path(string_field(hop, "file").unwrap_or("(unknown file)"));
         let line = number_field(hop, "line");
-        let entry = if hop.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
-            " [entry]"
+        // The first hop is the root; an exported function further along
+        // stays inside the path and says so.
+        let tag = if hop_index == 0 {
+            root.as_ref()
+                .map(|root| format!(" {root}"))
+                .unwrap_or_default()
+        } else if hop.get("exported").and_then(Value::as_bool) == Some(true) {
+            " [exported]".to_string()
         } else {
-            ""
+            String::new()
         };
         let name_match = name_match_edge_marker(hop);
         let location = match line {
@@ -3907,7 +3928,7 @@ fn render_trace_path(path: &serde_json::Map<String, Value>, index: usize, lines:
         };
         lines.push(tree_line(
             hop_index + 1,
-            &format!("{symbol}{entry} {location}{name_match}"),
+            &format!("{symbol}{tag} {location}{name_match}"),
         ));
     }
 }
@@ -3960,6 +3981,9 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
     if let Some(summary) = hub_summary {
         sections.push(summary);
     }
+    if let Some(roots) = root_counts_summary(record) {
+        sections.push(format!("Reaches {roots}"));
+    }
     if callers.is_empty() {
         sections.push("No impacted callers found.".to_string());
     }
@@ -3967,11 +3991,9 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         let file = shorten_path(string_field(caller, "caller_file").unwrap_or("(unknown file)"));
         let symbol = string_field(caller, "caller_symbol").unwrap_or("(unknown)");
         let line = number_field(caller, "line").unwrap_or(0);
-        let entry = if caller.get("is_entry_point").and_then(Value::as_bool) == Some(true) {
-            " [entry]"
-        } else {
-            ""
-        };
+        let root = root_tag(caller)
+            .map(|root| format!(" {root}"))
+            .unwrap_or_default();
         let name_match = name_match_edge_marker(caller);
         let expression = string_field(caller, "call_expression");
         let params = caller
@@ -3988,7 +4010,7 @@ fn format_impact_sections(record: &serde_json::Map<String, Value>) -> Vec<String
         let mut lines = vec![
             format!("{file}:{line}"),
             format!(
-                "  ↳ {symbol}{entry}{name_match}{}",
+                "  ↳ {symbol}{root}{name_match}{}",
                 if string_field(caller, "relation") == Some("callback_reference") {
                     crate::commands::callgraph_store_adapter::CALLBACK_REFERENCE_LABEL
                 } else {
@@ -5140,7 +5162,7 @@ mod callgraph_format_tests {
             &json!({
                 "total_paths": 7,
                 "total_paths_is_lower_bound": true,
-                "entry_points_found": 2,
+                "root_counts": {"main": 1, "public_api": 1},
                 "hub_summary": {
                     "message": "Next: at least 7 paths — showing 2; traversal capped; narrow with scope"
                 },
@@ -5149,7 +5171,7 @@ mod callgraph_format_tests {
             false,
         );
 
-        assert!(rendered.starts_with("at least 7 paths · 2 entry points"));
+        assert!(rendered.starts_with("at least 7 paths · roots: main, 1 public API function"));
         assert!(rendered.contains("Next: at least 7 paths"));
     }
 
@@ -5159,14 +5181,69 @@ mod callgraph_format_tests {
             "trace_to",
             &json!({
                 "total_paths": 1,
-                "entry_points_found": 1,
+                "root_counts": {"no_caller_found": 1},
                 "paths": []
             }),
             false,
         );
 
-        assert!(rendered.starts_with("1 path · 1 entry point"));
+        assert!(rendered.starts_with("1 path · roots: 1 function with no caller found"));
         assert!(!rendered.contains("at least"));
+    }
+
+    /// A path's first hop carries its root's kind; an exported function
+    /// further along is marked exported and does not end the path.
+    #[test]
+    fn trace_to_renders_root_kinds_and_exported_hops() {
+        let rendered = format_callgraph(
+            "trace_to",
+            &json!({
+                "total_paths": 2,
+                "root_counts": {"main": 1, "attribute": 1},
+                "max_depth_reached": false,
+                "truncated_paths": 0,
+                "paths": [
+                    {"root": "main", "hops": [
+                        {"symbol": "main", "file": "src/main.rs", "line": 1},
+                        {"symbol": "run", "file": "src/lib.rs", "line": 3, "exported": true},
+                        {"symbol": "leaf", "file": "src/lib.rs", "line": 9}
+                    ]},
+                    {"root": "attribute", "attribute": "no_mangle", "hops": [
+                        {"symbol": "ffi_entry", "file": "src/ffi.rs", "line": 2, "exported": true},
+                        {"symbol": "leaf", "file": "src/lib.rs", "line": 9}
+                    ]}
+                ]
+            }),
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "2 paths · roots: main, 1 function with an entry attribute\nPath 1\n  ↳ main [root: main] [src/main.rs:1]\n    ↳ run [exported] [src/lib.rs:3]\n      ↳ leaf [src/lib.rs:9]\nPath 2\n  ↳ ffi_entry [root: attribute no_mangle] [src/ffi.rs:2]\n    ↳ leaf [src/lib.rs:9]"
+        );
+    }
+
+    /// Impact tags the callers that are roots and sums the roots up.
+    #[test]
+    fn impact_renders_root_tags_and_summary() {
+        let rendered = format_callgraph(
+            "impact",
+            &json!({
+                "total_affected": 2,
+                "affected_files": 2,
+                "depth_limited": false,
+                "truncated": 0,
+                "root_counts": {"main": 1, "public_api": 1},
+                "callers": [
+                    {"caller_symbol": "main", "caller_file": "src/main.rs", "line": 4, "root": "main", "parameters": []},
+                    {"caller_symbol": "api", "caller_file": "src/lib.rs", "line": 7, "root": "public_api", "parameters": []}
+                ]
+            }),
+            false,
+        );
+        assert_eq!(
+            rendered,
+            "2 affected call sites · 2 files\nReaches main, 1 public API function\nsrc/main.rs:4\n  ↳ main [root: main]\nsrc/lib.rs:7\n  ↳ api [root: public API]"
+        );
     }
 
     #[test]

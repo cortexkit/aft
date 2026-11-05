@@ -635,6 +635,47 @@ pub struct SymbolMeta {
     /// Attribute that marks the symbol as externally reachable, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_point_attribute: Option<String>,
+    /// Whether the program starts here, as the symbol's language defines
+    /// it (see [`starts_program`]). For Rust this is only half the answer:
+    /// the file must also be the root of a binary target, which depends on
+    /// its path and Cargo manifest, so readers that know those check it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub program_start: bool,
+}
+
+/// Whether the symbol `identity` of `kind` is where a program in `lang`
+/// starts, as the language defines it: `fn main` at the top of a Rust file,
+/// `func main` in a Go `package main` (`go_main_package`), and `main` in C,
+/// C++ and Objective-C. A Python program starts in the module code run as
+/// `__main__`, which [`python_runs_as_main`] finds. JavaScript and
+/// TypeScript define no starting function.
+fn starts_program(lang: LangId, identity: &str, kind: &SymbolKind, go_main_package: bool) -> bool {
+    *kind == SymbolKind::Function
+        && identity == "main"
+        && match lang {
+            LangId::Rust | LangId::C | LangId::Cpp | LangId::ObjC => true,
+            LangId::Go => go_main_package,
+            _ => false,
+        }
+}
+
+/// Whether a Python module has a top-level `if __name__ == "__main__":`
+/// block: the code Python runs only when the module is the program itself.
+/// The module's top-level code then starts the program.
+fn python_runs_as_main(source: &str, root: tree_sitter::Node<'_>) -> bool {
+    root.named_children(&mut root.walk()).any(|node| {
+        node.kind() == "if_statement"
+            && node
+                .child_by_field_name("condition")
+                .is_some_and(|condition| {
+                    let text = source[condition.byte_range()]
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace())
+                        .map(|ch| if ch == '\'' { '"' } else { ch })
+                        .collect::<String>();
+                    text == "__name__==\"__main__\"" || text == "\"__main__\"==__name__"
+                })
+    })
 }
 
 /// Per-file call data: call sites grouped by containing symbol, plus
@@ -1935,6 +1976,7 @@ fn build_file_data_from_tree_observed<'tree>(
         && root.named_children(&mut root.walk()).any(|n| {
             n.kind() == "package_clause" && source[n.byte_range()].trim() == "package main"
         });
+    let python_main = lang == LangId::Python && python_runs_as_main(source, root);
     // Build per-symbol metadata for entry point detection
     let mut symbol_metadata: HashMap<String, SymbolMeta> = symbols
         .iter()
@@ -1965,6 +2007,7 @@ fn build_file_data_from_tree_observed<'tree>(
                             (go_main_package && s.kind == SymbolKind::Variable)
                                 .then(|| "go_package_initializer".to_string())
                         }),
+                    program_start: starts_program(lang, &identity, &s.kind, go_main_package),
                 },
             )
         })
@@ -1980,6 +2023,7 @@ fn build_file_data_from_tree_observed<'tree>(
                 line: default_export.node.start_position().row as u32 + 1,
                 range: crate::parser::node_range(&default_export.node),
                 entry_point_attribute: None,
+                program_start: false,
             });
     }
     // Template calls have a real macro owner. The owner is not a root: only
@@ -2000,6 +2044,7 @@ fn build_file_data_from_tree_observed<'tree>(
                             line: node.start_position().row as u32 + 1,
                             range: crate::parser::node_range(&node),
                             entry_point_attribute: None,
+                            program_start: false,
                         },
                     );
                 }
@@ -2025,6 +2070,7 @@ fn build_file_data_from_tree_observed<'tree>(
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: python_main,
             });
     }
     if lang == LangId::Go {
@@ -2043,6 +2089,7 @@ fn build_file_data_from_tree_observed<'tree>(
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: false,
             },
         );
     }
@@ -5019,6 +5066,7 @@ def right():
                     end_col: 0,
                 },
                 entry_point_attribute: None,
+                program_start: false,
             },
         );
         let file_data = FileCallData {

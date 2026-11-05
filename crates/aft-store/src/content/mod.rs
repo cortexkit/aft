@@ -75,6 +75,12 @@ pub struct Symbol {
     pub end_line: u32,
     pub end_col: u32,
     pub signature: Option<String>,
+    /// Whether the program starts at this symbol, as its language defines
+    /// it (`fn main`, `func main` in a Go `package main`, a C `main`).
+    pub program_start: bool,
+    /// The entry attribute or decorator extraction recorded on the symbol,
+    /// such as `no_mangle` or `tauri::command`.
+    pub entry_attribute: Option<String>,
 }
 
 /// The parse-level class of a reference.
@@ -288,6 +294,13 @@ const CONFIG: u8 = 2;
 /// body's length, says whether an outline follows, so a body cut short
 /// before its outline still fails to decode.
 const PARSED_WITH_OUTLINE: u8 = 3;
+/// [`PARSED`], with each symbol's entry facts ([`Symbol::program_start`],
+/// [`Symbol::entry_attribute`]) after the rest of the surface. Records of
+/// the two kinds above predate those facts and read back without them.
+const PARSED_WITH_ENTRIES: u8 = 4;
+/// [`PARSED_WITH_OUTLINE`], with each symbol's entry facts after the rest
+/// of the surface.
+const PARSED_WITH_ENTRIES_AND_OUTLINE: u8 = 5;
 
 impl ContentRecord {
     /// The surface part's bytes and the body part's bytes. A configuration
@@ -305,11 +318,12 @@ impl ContentRecord {
             }
             RecordBody::Parsed { surface, body } => {
                 head.byte(if body.outline.is_some() {
-                    PARSED_WITH_OUTLINE
+                    PARSED_WITH_ENTRIES_AND_OUTLINE
                 } else {
-                    PARSED
+                    PARSED_WITH_ENTRIES
                 });
                 encode_surface(&mut head, surface);
+                encode_entries(&mut head, surface);
                 let mut tail = Encoder::default();
                 encode_body(&mut tail, body);
                 (head.finish(), tail.finish())
@@ -335,12 +349,18 @@ impl ContentRecord {
                 }
                 RecordBody::Config { source }
             }
-            kind @ (PARSED | PARSED_WITH_OUTLINE) => {
-                let surface = decode_surface(&mut head)?;
+            kind @ (PARSED
+            | PARSED_WITH_OUTLINE
+            | PARSED_WITH_ENTRIES
+            | PARSED_WITH_ENTRIES_AND_OUTLINE) => {
+                let mut surface = decode_surface(&mut head)?;
+                if matches!(kind, PARSED_WITH_ENTRIES | PARSED_WITH_ENTRIES_AND_OUTLINE) {
+                    decode_entries(&mut head, &mut surface)?;
+                }
                 head.finish()?;
                 let mut tail = Decoder::new(body)?;
                 let mut body = decode_body(&mut tail)?;
-                if kind == PARSED_WITH_OUTLINE {
+                if matches!(kind, PARSED_WITH_OUTLINE | PARSED_WITH_ENTRIES_AND_OUTLINE) {
                     body.outline = Some(decode_outline(&mut tail)?);
                 }
                 tail.finish()?;
@@ -436,6 +456,8 @@ fn decode_surface(input: &mut Decoder<'_>) -> Result<Surface, DecodeError> {
             end_line: input.u32()?,
             end_col: input.u32()?,
             signature: input.opt_string()?,
+            program_start: false,
+            entry_attribute: None,
         });
     }
     let default_export_symbol = input.opt_string()?;
@@ -495,6 +517,24 @@ fn decode_surface(input: &mut Decoder<'_>) -> Result<Surface, DecodeError> {
         fields,
         returns,
     })
+}
+
+/// Each symbol's entry facts, in symbol order, after the rest of the
+/// surface of a [`PARSED_WITH_ENTRIES`] or
+/// [`PARSED_WITH_ENTRIES_AND_OUTLINE`] record.
+fn encode_entries(out: &mut Encoder, surface: &Surface) {
+    for symbol in &surface.symbols {
+        out.bool(symbol.program_start);
+        out.opt_str(symbol.entry_attribute.as_deref());
+    }
+}
+
+fn decode_entries(input: &mut Decoder<'_>, surface: &mut Surface) -> Result<(), DecodeError> {
+    for symbol in &mut surface.symbols {
+        symbol.program_start = input.bool()?;
+        symbol.entry_attribute = input.opt_string()?;
+    }
+    Ok(())
 }
 
 fn encode_body(out: &mut Encoder, body: &Body) {
@@ -687,6 +727,8 @@ mod tests {
                         end_line: 9,
                         end_col: 5,
                         signature: Some("fn open() -> Self".into()),
+                        program_start: false,
+                        entry_attribute: Some("no_mangle".into()),
                     }],
                     exported_symbols: vec!["Store".into()],
                     callable_symbols: vec!["Store::open".into()],
@@ -817,7 +859,10 @@ mod tests {
             .filter(|(a, b)| a != b)
             .map(|(a, b)| (*a, *b))
             .collect::<Vec<_>>();
-        assert_eq!(differing, vec![(PARSED_WITH_OUTLINE, PARSED)]);
+        assert_eq!(
+            differing,
+            vec![(PARSED_WITH_ENTRIES_AND_OUTLINE, PARSED_WITH_ENTRIES)]
+        );
 
         // A body without its outline, or with one the kind does not
         // announce, is refused, as is every cut of a body with one.
@@ -863,5 +908,38 @@ mod tests {
         for cut in 0..surface.len() {
             assert!(ContentRecord::decode(&surface[..cut], &body).is_err());
         }
+    }
+
+    /// A record of a kind written before symbols carried entry facts reads
+    /// back with none, and the facts round-trip in the kinds that hold them.
+    #[test]
+    fn entry_facts_round_trip_and_older_records_read_without_them() {
+        let mut record = sample();
+        let RecordBody::Parsed { surface, body } = &mut record.data else {
+            unreachable!("the sample is parsed");
+        };
+        surface.symbols[0].program_start = true;
+        let (head, tail) = record.encode();
+        assert_eq!(ContentRecord::decode(&head, &tail).unwrap(), record);
+
+        // The encoding records had before entry facts: the same surface and
+        // body under the older kind byte, without the facts.
+        let RecordBody::Parsed { surface, body } = &record.data else {
+            unreachable!("the sample is parsed");
+        };
+        let mut old = Encoder::default();
+        old.str(&record.language);
+        old.str(&record.extractor_version);
+        old.byte(PARSED);
+        encode_surface(&mut old, surface);
+        let mut old_tail = Encoder::default();
+        encode_body(&mut old_tail, body);
+        let decoded = ContentRecord::decode(&old.finish(), &old_tail.finish()).unwrap();
+        let RecordBody::Parsed { surface, .. } = decoded.data else {
+            unreachable!("the record is parsed");
+        };
+        assert!(!surface.symbols[0].program_start);
+        assert_eq!(surface.symbols[0].entry_attribute, None);
+        assert_eq!(surface.symbols[0].scoped_name, "Store::open");
     }
 }

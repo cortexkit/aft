@@ -16,8 +16,8 @@ use super::slice::{FileSlice, SliceEdge, SliceNode, SliceRef};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     lang_from_label, lang_label, normalize_file_path, relative_path, CallGraphRead,
-    CallGraphStoreError, Result, StoreCallSite, StoreCallersResult, StoreImpactResult, StoreNode,
-    StoreRefSite, StoreUnresolvedCall, StoredEdge, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
+    CallGraphStoreError, EntryFacts, Result, StoreCallSite, StoreCallersResult, StoreImpactResult,
+    StoreNode, StoreRefSite, StoreUnresolvedCall, StoredEdge, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
 use crate::error::AftError;
 use crate::parser::LangId;
@@ -214,6 +214,12 @@ fn store_node(slice: &FileSlice, node: &SliceNode) -> StoreNode {
         node.entry_point,
         lang_from_label(&slice.language).unwrap_or(LangId::TypeScript),
     )
+    .with_entry(EntryFacts {
+        is_test: node.is_test,
+        program_start: node.program_start,
+        entry_attribute: node.entry_attribute.clone(),
+        default_export: node.is_default_export,
+    })
 }
 
 /// The scoped name after ` for `, with generic arguments removed.

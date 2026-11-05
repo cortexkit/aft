@@ -1229,7 +1229,6 @@ fn merge_impact(
             "caller_symbol": found.symbol,
             "caller_file": found.file,
             "line": found.line,
-            "is_entry_point": false,
             "call_expression": found.text,
             "parameters": [],
             "approximate": true,

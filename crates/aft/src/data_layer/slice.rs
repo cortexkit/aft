@@ -37,6 +37,12 @@ pub(crate) struct SliceNode {
     pub(crate) is_default_export: bool,
     pub(crate) entry_point: bool,
     pub(crate) is_test: Option<bool>,
+    /// Whether the program starts here, as the language defines it. For
+    /// Rust this is `fn main` at the top of the file; whether the file is a
+    /// binary target's root is checked when a root is labelled.
+    pub(crate) program_start: bool,
+    /// The entry attribute extraction recorded on the symbol.
+    pub(crate) entry_attribute: Option<String>,
 }
 
 /// One reference.
@@ -300,6 +306,8 @@ impl FileSlice {
                     symbol.exported
                 },
                 is_test: symbol.is_test,
+                program_start: symbol.program_start,
+                entry_attribute: symbol.entry_attribute.clone(),
             };
             let range = (
                 node.start_line,

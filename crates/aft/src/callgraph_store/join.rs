@@ -206,6 +206,14 @@ pub struct BlobSymbol {
     pub end_line: u32,
     pub end_col: u32,
     pub signature: Option<String>,
+    /// Whether the program starts here, as the symbol's language defines it
+    /// (`SymbolMeta::program_start`).
+    #[serde(default)]
+    pub program_start: bool,
+    /// The entry attribute extraction recorded for the symbol
+    /// (`SymbolMeta::entry_point_attribute`), such as `no_mangle`.
+    #[serde(default)]
+    pub entry_attribute: Option<String>,
 }
 
 /// The parse-level class of a reference.  No target path is present in a blob.
@@ -765,6 +773,8 @@ fn blob_symbol(
         end_line: meta.range.end_line,
         end_col: meta.range.end_col,
         signature: meta.signature.clone(),
+        program_start: meta.program_start,
+        entry_attribute: meta.entry_point_attribute.clone(),
     }
 }
 
@@ -1274,6 +1284,7 @@ impl ParseBlob {
                         .entry_point_symbols
                         .contains(&symbol.scoped_name)
                         .then(|| "initializer_or_attribute".to_string()),
+                    program_start: symbol.program_start,
                 },
             );
         }

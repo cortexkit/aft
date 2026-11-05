@@ -24,6 +24,7 @@ pub(crate) mod blocking_wait;
 pub mod call_tree;
 pub mod callers;
 pub mod callgraph_borrowed;
+pub mod callgraph_roots;
 pub mod callgraph_store_adapter;
 pub mod checkpoint;
 pub mod configure;

@@ -31,8 +31,10 @@ use crate::parser::LangId;
 /// between the functions a `macro_rules!` template defines; 4 dropped the
 /// dynamic sites of JavaScript and TypeScript computed member calls whose
 /// member is a string literal; 5 added C++ member functions and the sites of
-/// C++ member calls whose receiver's type is declared.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-5";
+/// C++ member calls whose receiver's type is declared; 6 added each symbol's
+/// entry facts (where a program starts, its entry attribute), which
+/// `trace_to` and `impact` label roots with.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-6";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -494,6 +496,8 @@ fn symbol(symbol: &BlobSymbol) -> Symbol {
         end_line: symbol.end_line,
         end_col: symbol.end_col,
         signature: symbol.signature.clone(),
+        program_start: symbol.program_start,
+        entry_attribute: symbol.entry_attribute.clone(),
     }
 }
 
@@ -511,6 +515,8 @@ fn blob_symbol(symbol: &Symbol) -> BlobSymbol {
         end_line: symbol.end_line,
         end_col: symbol.end_col,
         signature: symbol.signature.clone(),
+        program_start: symbol.program_start,
+        entry_attribute: symbol.entry_attribute.clone(),
     }
 }
 

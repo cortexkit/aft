@@ -518,6 +518,8 @@ fn complete_members<'tree>(
                     .trim()
                     .to_string(),
             ),
+            program_start: false,
+            entry_attribute: None,
         });
         if field(node, &["body"]).is_some() {
             parse.callable_symbols.push(scoped_name);

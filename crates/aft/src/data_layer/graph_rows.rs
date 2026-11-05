@@ -31,6 +31,11 @@ pub(crate) struct NodeRow {
     pub(crate) is_default_export: bool,
     pub(crate) entry_point: bool,
     pub(crate) is_test: Option<bool>,
+    /// Whether the program starts here, as the language defines it (see
+    /// `SliceNode::program_start`). Dead code does not read it.
+    pub(crate) program_start: bool,
+    /// The entry attribute extraction recorded on the symbol.
+    pub(crate) entry_attribute: Option<String>,
 }
 
 /// One reference.
@@ -199,6 +204,8 @@ pub(crate) fn assemble(
                     symbol.exported
                 },
                 is_test: symbol.is_test,
+                program_start: symbol.program_start,
+                entry_attribute: symbol.entry_attribute.clone(),
             });
             file_nodes.insert(symbol.scoped_name.clone(), id.clone());
             file_nodes.entry(symbol.name.clone()).or_insert(id);
