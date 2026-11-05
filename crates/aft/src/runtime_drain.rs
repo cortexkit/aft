@@ -7105,14 +7105,25 @@ mod tests {
         assert_fresh();
     }
 
-    /// Waits up to 60 s for `ctx`'s checkout in the data layer to publish a
-    /// text plane that aft_search's lanes read.
-    fn wait_for_data_text(ctx: &AppContext) {
+    /// Waits up to 60 s for `ctx`'s checkout in the data layer to publish
+    /// both planes with no recorded edit pending. The text plane is published
+    /// before the call graph, and the call graph's publication is a new one
+    /// that changes the view's text generation, so a test counting the reads
+    /// of one text generation waits for both.
+    fn wait_for_data_layer_settled(ctx: &AppContext) {
+        use crate::data_layer::surfaces::{report, READY};
         let started = Instant::now();
-        while crate::data_layer::tools::search::DataText::ready(ctx).is_none() {
+        loop {
+            let report = report(ctx).expect("the data layer is on");
+            if report.text.status == READY
+                && report.callgraph.status == READY
+                && report.pending_edits == 0
+            {
+                return;
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "the data layer never published the text plane"
+                "the data layer never settled: {report:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -7147,7 +7158,7 @@ mod tests {
         *ctx.semantic_index_status().write().unwrap() =
             crate::context::SemanticIndexStatus::Disabled;
         ctx.data_checkout().expect("the data layer binds the root");
-        wait_for_data_text(&ctx);
+        wait_for_data_layer_settled(&ctx);
         let request = serde_json::from_value(serde_json::json!({
             "id": "exact-memo-publication",
             "command": "semantic_search",
@@ -7199,7 +7210,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         ctx.data_checkout().expect("the data layer binds the root");
-        wait_for_data_text(&ctx);
+        wait_for_data_layer_settled(&ctx);
         let grep = |pattern: &str| {
             let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
                 "id": "rescan-grep",
