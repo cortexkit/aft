@@ -1146,9 +1146,11 @@ fn response_too_large_frame(
     .expect("fixed response_too_large envelope must fit the protocol frame limit")
 }
 
-// No caller-role attestation reaches RouteIdentity. Use exact principals, not
-// harnesses: Thalamus shares `opencode` with AFT's own plugin, and `pi` with
-// AFT's Pi plugin, which need diffs.
+// LLM runners show the model only an ordinary call's text, so their replies
+// drop the structured result (diffs, task records). No caller-role
+// attestation reaches RouteIdentity, so match exact principals, not
+// harnesses: Thalamus binds with the same `opencode` and `pi` harness names
+// as AFT's own OpenCode and Pi plugins, which render those diffs.
 const LLM_RUNNER_PRINCIPALS: &[&str] = &[
     "reserved:broca",
     "reserved:thalamus-harness",
