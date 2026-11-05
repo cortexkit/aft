@@ -3,9 +3,9 @@
 
 Runs the same aft binary on the same checkout twice, once as today
 (AFT_DATA_LAYER unset) and once with AFT_DATA_LAYER=1, sends both the same
-NDJSON requests, and compares every inspect reply byte for byte. The data
-layer changes only where dead code reads its call graph, so every reply must
-be identical. A third run of today's binary (--control) shows which bytes
+newline-delimited JSON (NDJSON) requests, and compares every inspect reply
+byte for byte. The data layer changes only where dead code reads its call
+graph, so every reply must be identical. A third run of today's binary (--control) shows which bytes
 vary between two runs of the same code.
 
 Each process gets fresh, empty caches and storage, runs with the file watcher

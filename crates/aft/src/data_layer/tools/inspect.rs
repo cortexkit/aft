@@ -149,7 +149,7 @@ mod tests {
         ]
     }
 
-    /// A diagnostic for the inspect gate, not a check: on the checkout named
+    /// A diagnostic, not a check: on the checkout named
     /// by `AFT_INSPECT_GATE_ROOT`, builds today's legacy call-graph database
     /// and the data layer's checkout, and prints each dead-code snapshot part
     /// that differs between the database's projection and the data layer's
@@ -165,8 +165,8 @@ mod tests {
         let root = crate::inspect::job::canonicalize_normalized(std::path::Path::new(&root));
         let storage = tempfile::tempdir().expect("storage");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        // Not `<dir>/callgraph`: that names a legacy harness partition, which
-        // today's store refuses to write into.
+        // Not `<dir>/callgraph`: today's store refuses to write to a folder
+        // of that name directly under its storage folder.
         let store = crate::callgraph_store::CallGraphStore::open(
             storage.path().join("today-store"),
             root.clone(),
