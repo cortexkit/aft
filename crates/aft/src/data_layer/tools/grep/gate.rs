@@ -32,14 +32,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use super::test_hooks;
 use crate::context::AppContext;
-use crate::data_layer::checkout::{PathChange, PlaneStatus};
+use crate::data_layer::checkout::PlaneStatus;
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::SearchIndex;
 
@@ -861,10 +860,7 @@ fn edit_checkout(ctx: &AppContext, root: &Path) -> (Vec<String>, Vec<Case>) {
         std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
         std::fs::write(&absolute, &bytes).unwrap();
         if record {
-            changes.push(PathChange::Written {
-                path: path.as_bytes().to_vec(),
-                bytes: Arc::from(bytes),
-            });
+            changes.push(path.as_bytes().to_vec());
             updated.push(absolute);
         }
         done.push(format!("{what}: {path}"));
@@ -926,9 +922,7 @@ fn edit_checkout(ctx: &AppContext, root: &Path) -> (Vec<String>, Vec<Case>) {
     ] {
         let absolute = root.join(path);
         if std::fs::remove_file(&absolute).is_ok() {
-            changes.push(PathChange::Removed {
-                path: path.as_bytes().to_vec(),
-            });
+            changes.push(path.as_bytes().to_vec());
             removed.push(absolute);
             done.push(format!("deleted: {path}"));
         }
@@ -937,10 +931,12 @@ fn edit_checkout(ctx: &AppContext, root: &Path) -> (Vec<String>, Vec<Case>) {
         done.push("deleted, recorded in neither index: crates/aft/src/commands/outline.rs".into());
     }
 
+    // Both indexes learn of the recorded edits once they are on disk.
     ctx.data_checkout()
         .expect("the data layer is bound")
         .checkout()
-        .record_changes(&changes);
+        .record_paths(&changes)
+        .expect("the data layer records the edits");
     {
         let mut index = ctx.search_index().write().unwrap();
         let index = index.as_mut().expect("today's index is installed");
@@ -1044,6 +1040,11 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
     let (mut grep_cases, distinct_patterns) = grep_corpus(&root, &corpus);
     grep_cases.truncate(limit);
     let glob_cases = glob_corpus(&root);
+    eprintln!(
+        "gate: {} grep cases from {distinct_patterns} patterns, {} glob cases",
+        grep_cases.len(),
+        glob_cases.len()
+    );
     let mut timings = Timings::default();
     let mut oracle = None;
     let mut replays = BTreeMap::new();

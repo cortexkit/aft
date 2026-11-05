@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use aft_store::ids::{Digest128, FamilyId};
 
 use super::ViewScope;
-use crate::data_layer::checkout::{Checkout, CheckoutView, DataLayer, PathChange};
+use crate::data_layer::checkout::{Checkout, CheckoutView, DataLayer};
 use crate::pattern_compile::{compile, CompileOpts, CompileResult, CompiledPattern};
 use crate::search_index::{
     decompose_grep_pattern, sort_paths_by_cached_mtime_desc, GrepResult, GrepScanOrder,
@@ -228,24 +228,18 @@ fn changed_paths_are_answered_as_they_are_on_disk() {
     let checkout = fixture.bind();
 
     // A file edited, one created in a folder the publication does not
-    // have, and one deleted, all recorded.
+    // have, and one deleted, all recorded after they are on disk.
     let edited = fixture.write("src/b.rs", b"fn beta() { alpha(); }\n");
     let created = fixture.write("src/fresh/new.rs", b"fn alpha_again() {}\n");
     let deleted = fixture.root.join("src/nested/c.ts");
     std::fs::remove_file(&deleted).unwrap();
-    checkout.record_changes(&[
-        PathChange::Written {
-            path: b"src/b.rs".to_vec(),
-            bytes: Arc::from(std::fs::read(&edited).unwrap()),
-        },
-        PathChange::Written {
-            path: b"src/fresh/new.rs".to_vec(),
-            bytes: Arc::from(std::fs::read(&created).unwrap()),
-        },
-        PathChange::Removed {
-            path: b"src/nested/c.ts".to_vec(),
-        },
-    ]);
+    checkout
+        .record_paths(&[
+            b"src/b.rs".to_vec(),
+            b"src/fresh/new.rs".to_vec(),
+            b"src/nested/c.ts".to_vec(),
+        ])
+        .unwrap();
     today.update_file(&edited);
     today.update_file(&created);
     today.remove_file(&deleted);
@@ -282,6 +276,35 @@ fn changed_paths_are_answered_as_they_are_on_disk() {
         grep_both(&today, &view, &fixture.root, &fixture.root, "beta", false);
     assert_eq!(today_text, data);
     assert!(data.ends_with("missing on disk: 1"), "{data}");
+    drop(view);
+
+    // A recorded file that then goes with no change recorded stays listed,
+    // so a search that reads it says it was not on disk; a recorded symlink
+    // is never listed or read through, as today's index walk never lists
+    // one.
+    std::fs::remove_file(&created).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("b.rs", fixture.root.join("src/link2.rs")).unwrap();
+        checkout.record_paths(&[b"src/link2.rs".to_vec()]).unwrap();
+    }
+    let view = checkout.view().unwrap();
+    let listed = ViewScope::of(view.clone(), &fixture.root)
+        .unwrap()
+        .listing()
+        .file_entries()
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    assert!(listed.contains(&created), "{listed:?}");
+    assert!(
+        !listed.contains(&fixture.root.join("src/link2.rs")),
+        "{listed:?}"
+    );
+    let (_, data, _) = grep_both(&today, &view, &fixture.root, &fixture.root, "alpha", false);
+    assert!(!data.contains("link2"), "{data}");
+    assert!(!data.contains("new.rs"), "{data}");
+    assert!(data.ends_with("missing on disk: 2"), "{data}");
 }
 
 #[test]

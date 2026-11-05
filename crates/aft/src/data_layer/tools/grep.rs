@@ -10,11 +10,12 @@
 //! and reads, matches, filters, orders and bounds them exactly as an
 //! answer from today's index does.
 //!
-//! A path changed since the publication is listed as it is on disk now: its
-//! current modification time when it is still a file, and not at all when
-//! it is gone. A published path that is gone without a recorded change stays
-//! listed, so the reply discloses it as missing on disk, as today's replies
-//! do for an index that is out of date.
+//! A path changed since the publication is listed as it is on disk now:
+//! with its current modification time when it is a file, and not at all
+//! when the change was a deletion or the path is now a symlink or a folder.
+//! A path that went from disk with no change recorded for it stays listed,
+//! so a reply that reads it says it was not on disk, as today's replies do
+//! for an index that is out of date.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -52,9 +53,23 @@ pub(crate) struct ViewScope {
     /// The root as a checkout path, `/`-separated; empty for the whole
     /// checkout.
     relative: Vec<u8>,
-    /// Each path in scope changed since the publication, with its size and
-    /// modification time on disk now, or `None` when it is no longer a file.
-    changed: BTreeMap<Vec<u8>, Option<(u64, SystemTime)>>,
+    /// Each path in scope changed since the publication, as it is on disk
+    /// now.
+    changed: BTreeMap<Vec<u8>, OnDisk>,
+}
+
+/// A changed path as it is on disk now.
+#[derive(Clone, Copy, Debug)]
+enum OnDisk {
+    /// A regular file, with its size and modification time.
+    File(u64, SystemTime),
+    /// No file, though the change recorded one: it went after the change
+    /// was recorded. It stays listed, so a reply that reads it says it was
+    /// not on disk, as today's replies do for a file their index lists.
+    Stale,
+    /// Never listed: the change recorded a deletion, or the path is now a
+    /// symlink or a folder, which today's index never lists as a file.
+    Absent,
 }
 
 impl ViewScope {
@@ -68,13 +83,17 @@ impl ViewScope {
             .into_iter()
             .filter(|path| in_scope(&relative, path))
             .map(|path| {
-                let now = absolute(&root, &path).and_then(|absolute| {
-                    let metadata = std::fs::symlink_metadata(absolute).ok()?;
-                    metadata
-                        .is_file()
-                        .then(|| Some((metadata.len(), metadata.modified().ok()?)))
-                        .flatten()
-                });
+                let now = match absolute(&root, &path).map(std::fs::symlink_metadata) {
+                    Some(Ok(metadata)) if metadata.is_file() => {
+                        OnDisk::File(metadata.len(), metadata.modified().unwrap_or(UNIX_EPOCH))
+                    }
+                    Some(Ok(_)) => OnDisk::Absent,
+                    // The text plane holds nothing for a recorded deletion.
+                    _ => match view.path_text(&path) {
+                        Ok(None) => OnDisk::Absent,
+                        _ => OnDisk::Stale,
+                    },
+                };
                 (path, now)
             })
             .collect();
@@ -129,7 +148,7 @@ impl ViewScope {
         // asked about the file's folder, and only the file is kept.
         let names_file = !self.relative.is_empty()
             && (state.position(&self.relative).is_some()
-                || matches!(self.changed.get(&self.relative), Some(Some(_))));
+                || matches!(self.changed.get(&self.relative), Some(OnDisk::File(..))));
         let folder = if names_file {
             self.relative
                 .iter()
@@ -150,10 +169,10 @@ impl ViewScope {
             .filter(|path| in_scope(&self.relative, path))
             .filter_map(|path| {
                 let (size, modified) = match self.changed.get(&path) {
-                    Some(Some(now)) => *now,
-                    // Gone since it was recorded: the read fails and the
-                    // reply counts it as missing on disk.
-                    Some(None) => (0, UNIX_EPOCH),
+                    Some(OnDisk::File(size, modified)) => (*size, *modified),
+                    // The read fails and the reply says it was not on disk.
+                    Some(OnDisk::Stale) => (0, UNIX_EPOCH),
+                    Some(OnDisk::Absent) => return None,
                     None => {
                         let record = state.get(&path)?;
                         (record.stat.size, modified_at(record.stat.mtime_ns))
@@ -191,8 +210,8 @@ impl ViewScope {
 
     /// The files in scope with their sizes and modification times: the
     /// published files not changed since, then the changed paths that are
-    /// files now. Symlinks are left out, as today's index walk never lists
-    /// one.
+    /// files now or went without a recorded change. Symlinks are left out,
+    /// as today's index walk never lists one.
     fn files(&self) -> impl Iterator<Item = (&[u8], u64, SystemTime)> {
         let state = self.view.state();
         let range = if self.relative.is_empty() {
@@ -213,8 +232,10 @@ impl ViewScope {
                     modified_at(record.stat.mtime_ns),
                 )
             });
-        let changed = self.changed.iter().filter_map(|(path, now)| {
-            now.map(|(size, modified)| (path.as_slice(), size, modified))
+        let changed = self.changed.iter().filter_map(|(path, now)| match now {
+            OnDisk::File(size, modified) => Some((path.as_slice(), *size, *modified)),
+            OnDisk::Stale => Some((path.as_slice(), 0, UNIX_EPOCH)),
+            OnDisk::Absent => None,
         });
         published.chain(changed)
     }
