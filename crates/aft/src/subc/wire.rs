@@ -1147,8 +1147,13 @@ fn response_too_large_frame(
 }
 
 // No caller-role attestation reaches RouteIdentity. Use exact principals, not
-// harnesses: Thalamus shares `opencode` with AFT's own plugin, which needs diffs.
-const LLM_RUNNER_PRINCIPALS: &[&str] = &["reserved:broca", "reserved:thalamus-harness"];
+// harnesses: Thalamus shares `opencode` with AFT's own plugin, and `pi` with
+// AFT's Pi plugin, which need diffs.
+const LLM_RUNNER_PRINCIPALS: &[&str] = &[
+    "reserved:broca",
+    "reserved:thalamus-harness",
+    "reserved:thalamus-pi",
+];
 
 #[derive(Clone)]
 pub(super) struct ToolResponsePolicy {
@@ -2088,8 +2093,12 @@ pub(super) mod tests {
     #[test]
     fn runner_ordinary_edit_has_only_model_content() {
         use subc_protocol::call_mode::CallMode;
-        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
-            let identity = result_route(Some(principal), "opencode", CallMode::Classic);
+        for (principal, harness) in [
+            ("reserved:broca", "opencode"),
+            ("reserved:thalamus-harness", "opencode"),
+            ("reserved:thalamus-pi", "pi"),
+        ] {
+            let identity = result_route(Some(principal), harness, CallMode::Classic);
             assert_eq!(
                 projected_result_body(&display_results()[0], &identity),
                 br#"{"content":[{"type":"text","text":"Edited fixture.rs"}],"isError":false}"#
@@ -2100,8 +2109,12 @@ pub(super) mod tests {
     #[test]
     fn runner_ordinary_bash_has_no_duplicate_output() {
         use subc_protocol::call_mode::CallMode;
-        for principal in ["reserved:broca", "reserved:thalamus-harness"] {
-            let identity = result_route(Some(principal), "opencode", CallMode::Classic);
+        for (principal, harness) in [
+            ("reserved:broca", "opencode"),
+            ("reserved:thalamus-harness", "opencode"),
+            ("reserved:thalamus-pi", "pi"),
+        ] {
+            let identity = result_route(Some(principal), harness, CallMode::Classic);
             assert_eq!(
                 projected_result_body(&display_results()[1], &identity),
                 br#"{"content":[{"type":"text","text":"command output"}],"isError":false}"#

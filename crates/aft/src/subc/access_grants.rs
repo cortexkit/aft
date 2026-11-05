@@ -71,8 +71,12 @@ fn principal_label_for_identity(identity: &RouteIdentity) -> Option<&str> {
 // Core's scope_carriers and worker_runner_module identify these session hosts.
 // The stamp does not carry the recorded runner module: supporting another
 // runner requires adding its authenticated principal to this explicit list.
-const SAVED_GRANT_SESSION_HOSTS: &[&str] =
-    &["direct", "reserved:broca", "reserved:thalamus-harness"];
+const SAVED_GRANT_SESSION_HOSTS: &[&str] = &[
+    "direct",
+    "reserved:broca",
+    "reserved:thalamus-harness",
+    "reserved:thalamus-pi",
+];
 
 pub(super) fn scope_grants_denial(
     identity: &RouteIdentity,

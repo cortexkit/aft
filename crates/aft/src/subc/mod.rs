@@ -1338,10 +1338,13 @@ fn harness_forces_untrusted(harness: &str) -> bool {
 /// `thalamus-harness` (binary `ck-thalamus-harness`) is CortexKit's harness
 /// module, which hosts OpenCode for Alfonso: `opencode` for OpenCode 1 and
 /// `opencode2` for sessions on its OpenCode 2 server (a runner session; see
-/// `Harness::from_str`). Its Pi adapter is not ready, so no Pi pair is listed.
+/// `Harness::from_str`). `thalamus-pi` is its counterpart for Pi: it binds
+/// its Pi sessions with harness `pi`, through core's scoped routes, with
+/// consent through core's held replies as on the OpenCode 2 server.
 const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[
     ("thalamus-harness", "opencode"),
     ("thalamus-harness", "opencode2"),
+    ("thalamus-pi", "pi"),
 ];
 
 fn reserved_module_is_first_party_on_harness(harness: &str, principal: &Option<Principal>) -> bool {
@@ -20202,9 +20205,28 @@ mod tests {
         );
     }
 
-    /// Trust for the harness module is per harness: it hosts only OpenCode
-    /// today, so the same principal binding for any other harness, including
-    /// Pi whose adapter is not ready, must stay untrusted.
+    #[test]
+    fn thalamus_pi_on_pi_is_first_party_and_nowhere_else() {
+        let principal = reserved("thalamus-pi");
+        assert_eq!(trust_for_bind("pi", &principal), BindTrust::FirstParty);
+        for harness in ["opencode", "opencode2", "runner", "Pi", "pi ", "fed:pi", ""] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-pi must stay untrusted on harness {harness:?}"
+            );
+        }
+        // Another reserved module binding for Pi stays untrusted.
+        assert_eq!(
+            trust_for_bind("pi", &reserved("thalamus-harness")),
+            BindTrust::Untrusted
+        );
+        assert_eq!(trust_for_principal(&principal), BindTrust::Untrusted);
+    }
+
+    /// Trust for the harness module is per harness: it hosts only OpenCode,
+    /// so the same principal binding for any other harness, including Pi
+    /// (which `thalamus-pi` hosts), must stay untrusted.
     #[test]
     fn thalamus_harness_stays_untrusted_on_other_harnesses() {
         let principal = reserved("thalamus-harness");
