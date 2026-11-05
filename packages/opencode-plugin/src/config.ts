@@ -706,9 +706,9 @@ const AftConfigFieldsSchema = z.object({
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect: InspectConfigSchema.optional(),
   /**
-   * Idle windows: when an unbound root's indexes are evicted, and when an
-   * unused checkout drops its in-memory index state. User and project tiers,
-   * merged per key.
+   * Idle windows: when the indexes of a root no session is using any more are
+   * evicted, and when an unused checkout drops its in-memory index state. User
+   * and project tiers, merged per key.
    */
   idle: IdleConfigSchema.optional(),
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */

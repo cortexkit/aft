@@ -104,8 +104,9 @@ pub const REMOVED_OPENCODE_PATHS: [(&str, &str); 2] = [
 /// Keys the per-repository data store leaves with nothing to do. A config
 /// file that sets one gets a notice saying it no longer does anything, and
 /// `doctor --fix` deletes it, but the automatic rewrite of the user file
-/// leaves it in place. Until the views and borrow-only code is deleted, the
-/// values a file supplies still reach `ViewsConfig` and `WorktreeConfig`, so
+/// leaves it in place. Until the code that reads them (index views, and the
+/// path that serves a worktree from another checkout's indexes) is deleted,
+/// the values a file supplies still reach `ViewsConfig` and `WorktreeConfig`, so
 /// translation keeps them in the document. From
 /// [`DATA_LAYER_KEYS_REFUSED_FROM`] a config that sets one is refused.
 /// Mirrors the TypeScript `REMOVED_DATA_LAYER_PATHS`.

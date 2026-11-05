@@ -654,7 +654,8 @@ impl Default for ViewsConfig {
 /// `worktree.ram_overlay` is removed from the documented configuration like
 /// the `views` keys above: with one data store per repository every checkout
 /// has its own state, so there is no borrowed snapshot to patch. Until the
-/// borrow-only code is deleted, a value a file supplies still reaches it.
+/// code that serves a worktree from another checkout's indexes is deleted, a
+/// value a file supplies still reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorktreeConfig {
