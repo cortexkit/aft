@@ -265,7 +265,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     if let Some(launch) = remote.as_mut() {
-        if let Err(message) = launch.params.validate_siblings(ctx, &req.id, req.session()) {
+        // Submission counts only the session's saved grants: a worker's plan
+        // grants were saved by its catalog fetch.
+        if let Err(message) = launch
+            .params
+            .validate_siblings(ctx, &req.id, req.session(), &[])
+        {
             return Response::error(
                 &req.id,
                 "remote_run_refused",
