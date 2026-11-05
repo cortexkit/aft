@@ -20,14 +20,23 @@
 //! include or exclude globs, or at an offset. The glob corpus crosses the
 //! common glob shapes with the common scopes.
 //!
+//! It needs an optimized build with debug assertions on (the library's
+//! tests use items that exist only with them), in a profile of its own so
+//! it reuses no other profile's artifacts:
+//!
 //! ```text
 //! AFT_DATA_LAYER=1 AFT_GATE_ROOT=<checkout> AFT_GATE_REPORT=<report.json> \
-//!   cargo test --profile ci-storm -p agent-file-tools --lib -- --ignored --nocapture \
+//!   cargo test --config 'profile.gate.inherits="release"' \
+//!   --config 'profile.gate.lto=false' --config 'profile.gate.codegen-units=16' \
+//!   --config 'profile.gate.debug-assertions=true' --config 'profile.gate.strip=false' \
+//!   --config 'profile.gate.debug=0' --config 'profile.gate.split-debuginfo="off"' \
+//!   --profile gate -p agent-file-tools --lib -- --ignored --nocapture \
 //!   --exact data_layer::tools::grep::gate::grep_and_glob_answer_alike_from_the_data_layer
 //! ```
 //!
-//! `AFT_GATE_LIMIT` keeps the first N grep cases, `AFT_GATE_ALLOW_DIFFS=1`
-//! reports differences without failing.
+//! `AFT_GATE_LIMIT` keeps the first N grep cases; `AFT_GATE_CASES=<file>`
+//! replays a JSON list of grep parameters instead of the corpus;
+//! `AFT_GATE_ALLOW_DIFFS=1` reports differences without failing on them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
@@ -236,11 +245,18 @@ const STALE_PATH: &str = "stale path disclosed only when it is a candidate";
 /// another inherits its next-character filter, and files holding only the
 /// shorter one are never read. The data layer's answer equals a full scan.
 const FILTER_MERGE: &str = "today's alternation filter merge drops candidates";
+/// Both replies stopped at the store cap, so their "(capped)" counts are
+/// floors that depend on which candidate files each read before stopping.
+/// Every printed row is the same, and without the cap both paths find
+/// exactly what a full scan finds.
+const CAPPED_FLOOR: &str = "capped count is a floor that depends on the files read";
 /// Differences explained and accepted.
-const ACCEPTED: &[&str] = &[STALE_PATH, FILTER_MERGE];
+const ACCEPTED: &[&str] = &[STALE_PATH, FILTER_MERGE, CAPPED_FLOOR];
 /// Today misses matches a full scan finds, in a pattern without
 /// alternatives, or the data layer's answer is not a full scan's.
 const TODAY_MISSES_OTHER: &str = "today misses matches a full scan finds (no alternation)";
+/// A difference that did not repeat when both calls ran again.
+const DID_NOT_REPEAT: &str = "did not repeat";
 const UNEXPLAINED: &str = "unexplained";
 
 /// Full texts are kept for this many differences of each class.
@@ -302,19 +318,21 @@ fn replay(
             replay.identical += 1;
             continue;
         }
-        let (class, evidence) = classify(ctx, root, oracle, case, &shown_today, &shown_data);
-        let seen = replay.classes.entry(class).or_default();
-        *seen += 1;
-        let example = *seen <= EXAMPLES_PER_CLASS;
+        let (mut class, evidence) = classify(ctx, root, oracle, case, &shown_today, &shown_data);
         // Repeat an unexplained difference, and the first few of each
         // class, twice: one that does not repeat comes from timing (a time
         // budget), not from reading the data layer instead of today's index.
+        let example = replay.classes.get(class).copied().unwrap_or(0) < EXAMPLES_PER_CLASS;
         let stable = (example || !ACCEPTED.contains(&class)).then(|| {
             (0..2).all(|_| {
                 visible(case.tool, &call(ctx, case, true).0) == shown_today
                     && visible(case.tool, &call(ctx, case, false).0) == shown_data
             })
         });
+        if stable == Some(false) && !ACCEPTED.contains(&class) {
+            class = DID_NOT_REPEAT;
+        }
+        *replay.classes.entry(class).or_default() += 1;
         let mut difference = json!({
             "phase": phase,
             "tool": case.tool,
@@ -397,14 +415,53 @@ fn classify(
         "today_query": clip_text(&format!("{query:?}"), 2000),
     });
     let today_subset = today_lines.is_subset(&full) && !missed.is_empty();
-    let class = if data_lines != full || !today_subset {
+    let class = if data_lines != full {
+        UNEXPLAINED
+    } else if today_lines == full {
+        // The same lines without the cap: the replies may differ only in
+        // the floor their capped count gives.
+        if capped_floors_alone(today, data) {
+            CAPPED_FLOOR
+        } else {
+            UNEXPLAINED
+        }
+    } else if !today_subset {
         UNEXPLAINED
     } else if query.or_groups.is_empty() {
         TODAY_MISSES_OTHER
     } else {
         FILTER_MERGE
     };
+    let mut evidence = evidence;
+    if class == CAPPED_FLOOR {
+        evidence["today_total"] = today["total_matches"].clone();
+        evidence["data_total"] = data["total_matches"].clone();
+    }
     (class, evidence)
+}
+
+/// Whether two capped grep replies differ only in their capped count: the
+/// "(capped)" footer's number and `total_matches`, with every row the same.
+fn capped_floors_alone(today: &Value, data: &Value) -> bool {
+    let footer =
+        regex::Regex::new(r"Found \d+ match(es)? (in|across) (\d+ files?) \(capped\)").unwrap();
+    let normalized = |shown: &Value| {
+        let mut shown = shown.clone();
+        for key in ["text", "rendered"] {
+            if let Some(text) = shown[key].as_str() {
+                shown[key] = json!(footer
+                    .replace_all(text, "Found # matches $2 $3 (capped)")
+                    .into_owned());
+            }
+        }
+        if let Some(object) = shown.as_object_mut() {
+            object.remove("total_matches");
+        }
+        shown
+    };
+    today["truncated"] == json!(true)
+        && data["truncated"] == json!(true)
+        && normalized(today) == normalized(data)
 }
 
 fn show_line((path, line): &(PathBuf, u32)) -> String {
@@ -503,14 +560,16 @@ struct Oracle {
 
 impl Oracle {
     /// Reads every file of the checkout at `root` that today's index walk
-    /// admits: the ignore rules, hidden files included, no symlinks, and
-    /// none under `.git` or the folders that walk always skips. The folder
-    /// the gate creates without telling either index is left out too.
+    /// admits: the ignore rules (`.aftignore` files included), hidden files
+    /// included, no symlinks, and none under `.git` or the folders that walk
+    /// always skips. The folder the gate creates without telling either
+    /// index is left out too.
     fn read(root: &Path) -> Self {
         let unrecorded = root.join("gate_unrecorded_dir");
         let walk = ignore::WalkBuilder::new(root)
             .hidden(false)
             .require_git(false)
+            .add_custom_ignore_filename(".aftignore")
             .filter_entry(move |entry| {
                 let name = entry.file_name().to_string_lossy();
                 let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
@@ -1037,7 +1096,28 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
     let data_files = view.state().paths().len();
     drop(view);
 
-    let (mut grep_cases, distinct_patterns) = grep_corpus(&root, &corpus);
+    let (mut grep_cases, distinct_patterns) = match std::env::var_os("AFT_GATE_CASES") {
+        // A list of grep parameters to replay instead of the corpus, such as
+        // the cases an earlier run found different. A path starting with
+        // `{root}` names a path under this run's copy of the checkout.
+        Some(list) => {
+            let list: Vec<Value> = serde_json::from_slice(&std::fs::read(list).unwrap()).unwrap();
+            let cases = list
+                .into_iter()
+                .map(|mut params| {
+                    if let Some(path) = params["path"].as_str() {
+                        if let Some(rest) = path.strip_prefix("{root}") {
+                            params["path"] = json!(format!("{}{rest}", root.display()));
+                        }
+                    }
+                    Case::new("grep", params, &root)
+                })
+                .collect::<BTreeSet<_>>();
+            let patterns = cases.len();
+            (cases.into_iter().collect::<Vec<_>>(), patterns)
+        }
+        None => grep_corpus(&root, &corpus),
+    };
     grep_cases.truncate(limit);
     let glob_cases = glob_corpus(&root);
     eprintln!(
@@ -1065,6 +1145,19 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
         .values()
         .flat_map(|replay| replay.differences.iter().cloned())
         .collect::<Vec<_>>();
+    let capped = differences
+        .iter()
+        .filter(|difference| difference["class"] == CAPPED_FLOOR)
+        .map(|difference| {
+            json!({
+                "phase": difference["phase"],
+                "params": difference["params"],
+                "today_total": difference["evidence"]["today_total"],
+                "data_total": difference["evidence"]["data_total"],
+                "full_scan_lines": difference["evidence"]["full_scan_lines"],
+            })
+        })
+        .collect::<Vec<_>>();
     let summary = json!({
         "checkout": {
             "source": source.display().to_string(),
@@ -1083,6 +1176,7 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
         "glob_cases": glob_cases.len(),
         "edits": edits,
         "replays": replays.iter().map(|(name, replay)| (name.to_string(), replay.summary())).collect::<serde_json::Map<_, _>>(),
+        "capped_cases": capped,
         "timings": timings.summary(),
     });
     println!("{}", serde_json::to_string_pretty(&summary).unwrap());
