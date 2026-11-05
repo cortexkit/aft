@@ -929,17 +929,65 @@ impl Checkout {
     /// The incremental state for `published`: every stored resolution, and
     /// the parses and configuration the publication was built from.
     fn start_engine(&self, published: &Arc<Published>) -> Result<GraphEngine, DataError> {
-        let (parses, resolved) = published.graph.resolutions().map_err(DataError::Store)?;
+        let mut timings = Vec::new();
+        let engine = self.start_engine_timed(published, &mut timings)?;
+        crate::slog_info!(
+            "perf data_layer engine_start: root={} {}",
+            self.root.display(),
+            timings
+                .iter()
+                .map(|(step, ms)| format!("{step}={ms:.0}ms"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        Ok(engine)
+    }
+
+    /// Starts the incremental engine for this checkout's publication and
+    /// returns each step's time, without keeping the engine. For
+    /// measurement only.
+    ///
+    /// # Errors
+    ///
+    /// When there is no publication, or a step fails.
+    #[doc(hidden)]
+    pub fn measure_engine_start(&self) -> Result<Vec<(&'static str, f64)>, DataError> {
+        let published = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .clone()
+            .ok_or_else(|| DataError::Resolve("nothing is published".to_string()))?;
+        let mut timings = Vec::new();
+        let started = Instant::now();
+        let engine = self.start_engine_timed(&published, &mut timings)?;
+        timings.push(("total", started.elapsed().as_secs_f64() * 1000.0));
+        drop(engine);
+        Ok(timings)
+    }
+
+    fn start_engine_timed(
+        &self,
+        published: &Arc<Published>,
+        timings: &mut Vec<(&'static str, f64)>,
+    ) -> Result<GraphEngine, DataError> {
+        let (parses, resolved) = published
+            .graph
+            .resolutions_timed(timings)
+            .map_err(DataError::Store)?;
+        let started = Instant::now();
         let configs = published
             .graph
             .configs(&published.state)
             .map_err(DataError::Store)?;
+        timings.push(("configs", started.elapsed().as_secs_f64() * 1000.0));
         let inputs = CheckoutInputs {
             state: published.state.clone(),
             parses,
             configs,
         };
-        let live = LiveCheckout::from_resolved(inputs, resolved, self.layer.threads)
+        let live = LiveCheckout::from_resolved_timed(inputs, resolved, self.layer.threads, timings)
             .map_err(|error| DataError::Resolve(error.to_string()))?;
         Ok(GraphEngine {
             published: Arc::clone(published),

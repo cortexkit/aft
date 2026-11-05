@@ -322,13 +322,30 @@ impl LiveCheckout {
         resolved: BTreeMap<String, FileResolution>,
         threads: usize,
     ) -> Result<Self, ManifestJoinError> {
+        Self::from_resolved_timed(inputs, resolved, threads, &mut Vec::new())
+    }
+
+    /// [`Self::from_resolved`], adding each step's time to `timings`.
+    pub(crate) fn from_resolved_timed(
+        inputs: CheckoutInputs,
+        resolved: BTreeMap<String, FileResolution>,
+        threads: usize,
+        timings: &mut Vec<(&'static str, f64)>,
+    ) -> Result<Self, ManifestJoinError> {
+        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
         let pool = Arc::new(super::callgraph::pool(threads)?);
-        let (surfaces, prebound, calls) = pool.install(|| {
+        let (surfaces, prebound, calls, bind_ms, calls_ms) = pool.install(|| {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
+            let started = Instant::now();
             let (surfaces, prebound) = bind_all(&inputs, &paths)?;
+            let bind_ms = ms(started);
+            let started = Instant::now();
             let calls = MethodCallInputs::build(&inputs, &resolved);
-            Ok::<_, ManifestJoinError>((Arc::new(surfaces), prebound, calls))
+            Ok::<_, ManifestJoinError>((Arc::new(surfaces), prebound, calls, bind_ms, ms(started)))
         })?;
+        timings.push(("bind every file", bind_ms));
+        timings.push(("method-call inputs", calls_ms));
+        let started = Instant::now();
         let mut reverse = ReverseInputs::default();
         for (path, binding) in &prebound {
             reverse.note_prebound(path, binding);
@@ -336,6 +353,7 @@ impl LiveCheckout {
         for (path, file) in &resolved {
             reverse.note_resolution(path, file);
         }
+        timings.push(("reverse input index", ms(started)));
         Ok(Self {
             inputs,
             surfaces,
