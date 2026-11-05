@@ -159,9 +159,9 @@ impl Samples {
             .map(Vec::as_slice)
             .unwrap_or_default();
         self.callers_listed += callers.len();
-        // A labelled root: a path's or caller's `root`, or, in answers from
-        // before roots had kinds, the entry-point flag on a path's first hop
-        // or on a caller.
+        // Labelled roots: a path or caller with a `root` field, or, in
+        // answers built before replies had that field, `is_entry_point: true`
+        // on a path's first hop or on a caller.
         self.roots_labelled += paths
             .iter()
             .filter(|path| {

@@ -882,8 +882,8 @@ pub(crate) fn compare_readers(
     // The public operations, as the commands compose them from the
     // primitives above: what an agent's call-graph reply is built from.
     // `impact` and `trace_to` are left out: they label the roots they reach
-    // from entry facts only the data layer records, so they answer
-    // differently from today's views by design.
+    // from entry facts (`EntryFacts`) that only the data layer records, so
+    // over the views database built here they label those roots differently.
     // Every 400th symbol in path order; each operation runs at the depth
     // the commands default to and with tests both left out and included.
     use crate::commands::callgraph_store_adapter as adapter;
@@ -1166,9 +1166,10 @@ fn compare_tables(
     Ok(())
 }
 
-/// `text`, a value's pretty `Debug` form, without the `entry` facts of its
-/// call-graph nodes: only the data layer's graph records them, so today's
-/// views always differ there.
+/// `text`, a value's pretty `Debug` form, without the `entry` facts
+/// (`EntryFacts`) of its call-graph nodes. Only the data layer's graph
+/// records them; nodes read from the views database built here carry the
+/// defaults, so comparing them would flag every node.
 fn without_entry_facts(text: &str) -> String {
     let mut kept = Vec::new();
     let mut skipping: Option<usize> = None;

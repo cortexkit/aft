@@ -135,9 +135,11 @@ fn fixture_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Each command's reply on the fixture. `impact` and `trace_to` are left
-/// out: they label roots from entry facts only the data layer's call graph
-/// records, so their replies over today's database and views no longer
-/// describe what those stores held.
+/// out: they label the functions where their paths start (`main`, a test,
+/// an entry attribute, public API) from per-symbol facts that only the data
+/// layer's call graph stores (`EntryFacts`). The SQLite store and views
+/// built here store none, so those two replies would pin labels these
+/// stores cannot give.
 fn replies(store: &impl CallGraphRead, root: &Path) -> Value {
     let file = root.join("main.ts");
     let target = root.join("helpers.ts");
