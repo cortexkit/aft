@@ -17,12 +17,16 @@ replies naming absolute paths compare as they are. The sequence per process:
    running Tier-2; a call-graph query retried until today's call graph is
    ready; and, with the data layer on, a wait for its first publication
    (its "data layer built" log line);
-3. dead code and unused exports, twice (cold, then warm), each retried while
-   the reply says the call graph is still building;
+3. dead code and unused exports, twice (cold, then warm), each resent until
+   no analysis in the reply is still running;
 4. scripted edits through AFT's own write and edit tools, which leave the
    data layer's call graph pending;
 5. dead code and unused exports again: the first reply as it comes, and the
    reply once settled.
+
+A reply that differs from today's only where the control run's reply
+differs too is reported as varying between runs (`explained`); any other
+difference is `unexplained`.
 
 With the data layer on, the log must show that before the edits every
 dead-code snapshot came from the data layer, and that after them the data
@@ -47,6 +51,10 @@ import threading
 import time
 
 TIMEOUT = 900
+# How long a measured request is resent while an analysis in its reply is
+# still running. A Tier-2 pass on a large checkout outlasts one request's
+# wait budget; the pass keeps running, and a later request reads its result.
+SETTLE = 900
 PROBE_FILE = 'aft_gate_probe.ts'
 PROBE = 'export function aftGateProbe() {\n  return aftGateHelper();\n}\n\nfunction aftGateHelper() {\n  return 1;\n}\n'
 SOURCE_SUFFIXES = ('.rs', '.ts', '.tsx', '.js', '.go', '.py', '.c', '.cpp', '.cs', '.zig')
@@ -60,6 +68,15 @@ def pending_reply(request, reply):
         return True
     graph = (reply.get('index') or {}).get('callgraph') or {}
     return graph.get('reason') == 'identity_provisional' or graph.get('status') in {'building', 'refreshing'}
+
+
+def unsettled(reply):
+    """Whether an inspect reply was sent while one of its analyses was still
+    running: two runs can then differ only in how far each had got."""
+    text = reply.get('text') or ''
+    state = reply.get('scanner_state') or {}
+    return (bool(state.get('pending_categories')) or '"building"' in json.dumps(reply.get('summary') or {})
+            or 'still building' in text or 'did not finish' in text)
 
 
 def tool(name, arguments):
@@ -142,9 +159,14 @@ class Process:
             self.frames.put(line)
         self.frames.put(None)
 
-    def send(self, request_id, body, retry=True):
+    def send(self, request_id, body, retry=True, settle=False):
+        """Sends one request and returns its reply. `retry` resends while the
+        reply asks for a retry; `settle` also resends, for up to SETTLE
+        seconds, while an analysis in the reply was still running."""
         request = dict(body, id=request_id)
-        deadline = time.monotonic() + TIMEOUT
+        started_all = time.monotonic()
+        deadline = started_all + TIMEOUT
+        settle_deadline = started_all + SETTLE
         attempts = 0
         while True:
             attempts += 1
@@ -164,8 +186,13 @@ class Process:
                     raise RuntimeError(f'{request_id} never became ready: {line[:400]!r}')
                 time.sleep(0.1)
                 continue
+            if settle and unsettled(value) and time.monotonic() < settle_deadline:
+                time.sleep(1.0)
+                continue
             self.replies[request_id] = line
-            self.timings[request_id] = {'ms': round(elapsed, 1), 'attempts': attempts}
+            self.timings[request_id] = {'ms': round(elapsed, 1), 'attempts': attempts,
+                                        'total_ms': round((time.monotonic() - started_all) * 1000, 1),
+                                        'settled': not unsettled(value)}
             (self.out / f'{request_id}.reply').write_bytes(line)
             return value
 
@@ -211,7 +238,7 @@ def run(binary, root, cache, config, data_layer, out, target):
         if data_layer:
             process.wait_log(r'data layer built ')
         for request_id, body in measured('cold') + measured('warm'):
-            process.send(request_id, body)
+            process.send(request_id, body, settle=True)
         # The log reaches the file through a queue; let it drain before
         # marking where the edits begin.
         time.sleep(1.0)
@@ -221,7 +248,7 @@ def run(binary, root, cache, config, data_layer, out, target):
         for request_id, body in measured('edited-first'):
             process.send(request_id, body, retry=False)
         for request_id, body in measured('edited'):
-            process.send(request_id, body)
+            process.send(request_id, body, settle=True)
         return process.replies, process.timings, marks, process.log()
     finally:
         process.close()
@@ -255,6 +282,18 @@ def compare(name, left, right):
         if left[request_id] != right[request_id]:
             differing[request_id] = differences(json.loads(left[request_id]), json.loads(right[request_id]))
     return ids, differing
+
+
+def unexplained(differing, control):
+    """The differences from today's replies at places where the control
+    run's replies did not differ from today's."""
+    found = {}
+    for request_id, paths in differing.items():
+        varying = {path.split(':', 1)[0] for path in control.get(request_id, [])}
+        left = [path for path in paths if path.split(':', 1)[0] not in varying]
+        if left:
+            found[request_id] = left
+    return found
 
 
 def data_layer_checks(log, marks):
@@ -303,6 +342,7 @@ def gate_case(binary, name, source, work, modes, control):
                   'data_layer': data_layer_checks(runs['data_layer'][3], runs['data_layer'][2])}
         if control:
             result['control_differing'] = compare(name, runs['today'][0], runs['control'][0])[1]
+            result['unexplained'] = unexplained(differing, result['control_differing'])
         checks = result['data_layer']
         # Before the edits every snapshot must come from the data layer. After
         # them it declines while the edits are pending, or serves a graph
