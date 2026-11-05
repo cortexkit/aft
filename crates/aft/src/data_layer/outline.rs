@@ -460,9 +460,13 @@ pub fn separator() -> char {
 }
 "#,
             ),
+            // `process`, not `run`: today's store also marks callers named
+            // like entry points (`main`, `run`, ...) as entry points, which
+            // the data layer, like the views route, does not; `impact` below
+            // compares the answers whole.
             (
                 "tool/main.py",
-                "from tool.helpers import clean\n\n\nclass Runner:\n    def execute(self, value):\n        copy = value\n        return clean(copy)\n\n\ndef run(value):\n    copy = value\n    return clean(copy)\n",
+                "from tool.helpers import clean\n\n\nclass Runner:\n    def execute(self, value):\n        copy = value\n        return clean(copy)\n\n\ndef process(value):\n    copy = value\n    return clean(copy)\n",
             ),
             (
                 "tool/helpers.py",
@@ -692,12 +696,16 @@ pub fn separator() -> char {
             ("web/data_flow.ts", "complexFlow", "data"),
             ("src/lib.rs", "start", "raw"),
             ("src/store.rs", "Store::open", "path"),
-            ("tool/main.py", "run", "value"),
+            ("tool/main.py", "process", "value"),
         ];
         let (mut hops, mut exact) = (0, 0);
         for (file, symbol, expression) in cases {
             let path = root.join(file);
-            assert!(!ctx.symbol_cache().read().unwrap().contains_key(&path));
+            assert_eq!(
+                ctx.symbol_cache().read().unwrap().contains_key(&path),
+                file == "web/data_flow.ts" && symbol != "transformData",
+                "{file}: only a file traced before is in the cache"
+            );
             let before = work_counters::tree_parses();
             let answer = trace_data(&ctx, &path, symbol, expression);
             assert!(answer.success, "{file} {symbol}: {:?}", answer.data);
