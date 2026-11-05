@@ -997,9 +997,17 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
         .await;
     let status = body(&daemon.reply(1, corr).await).to_string();
     assert!(
-        status.contains("killed") && status.contains("scope_revoked"),
+        status.contains("killed") && status.contains("scope revoked"),
         "{status}"
     );
+    // The legacy wire renders the reason as text; the persisted record keeps
+    // the machine code that distinguishes a scope end from another kill.
+    let revoked = task_metadata(&root)
+        .into_iter()
+        .find(|(_, record)| record["task_id"] == task)
+        .unwrap()
+        .1;
+    assert_eq!(revoked["status_reason"], "scope_revoked");
     daemon
         .assert_foreign_task_is_concealed(task, "session-1")
         .await;
