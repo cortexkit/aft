@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/data_layer/tools/search.rs",
+    "benchmarks/aft-search/compare_data_layer.py"
+  ],
+  "slices": [
+    "data-layer-search-lexical-and-exact-lanes"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/ and crates/aft/src/search_b2/. aft_search's lexical lane, exact passes, anchored lane, missing-literal check and recall audit now read their text index through one interface (data_layer::tools::search::TextIndex). Without AFT_DATA_LAYER=1 it forwards every call to the same SearchIndexSnapshot method as before, so routing, candidates and scores are unchanged and ranked rows must stay byte-identical to the committed reference. With the switch, a ready data-layer view answers instead; benchmarks/aft-search/compare_data_layer.py replays the concept and exact families both ways and compares every reply."
+}
