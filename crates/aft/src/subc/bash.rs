@@ -2041,6 +2041,13 @@ pub(super) fn submit_deferred_bash(
     let program_call = secret_identity
         .as_ref()
         .is_some_and(|identity| identity.run_owner.is_some());
+    // The scope of the route a codemode call acts for: the head agent's for an
+    // agent run, the worker's own for a worker run. A background command the
+    // program starts is recorded under it (see `task_scope` below).
+    let program_owner_scope = secret_identity
+        .as_ref()
+        .and_then(|identity| identity.run_owner.as_ref())
+        .and_then(|owner| owner.owner_route.scope.clone());
     let program_approval = program_call
         && permissions_granted
             .as_ref()
@@ -2444,6 +2451,17 @@ pub(super) fn submit_deferred_bash(
                         }
                     }
                     let settings = bash_settings_from_translated(&translated.args);
+                    // The scope a command is recorded under decides which scope's
+                    // confirmed end stops it. A codemode program usually returns
+                    // right after starting a background command, and its run
+                    // scope ends with it, so a background command belongs to the
+                    // agent the program ran for: the owner route's scope, whose
+                    // own end still stops it. A foreground command stays under
+                    // the run, which is waiting for it.
+                    let task_scope = match &program_owner_scope {
+                        Some(owner_scope) if settings.background => Some(owner_scope.clone()),
+                        _ => scope_stamp.clone(),
+                    };
                     let command_timeout_ms = settings.timeout.unwrap_or_else(|| {
                         crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64
                     });
@@ -2495,7 +2513,7 @@ pub(super) fn submit_deferred_bash(
                                                                 &remote_source,
                                                             ),
                                                          || {
-                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || crate::gh_shim_speech::service::with_launch(speech_seed.clone(),&ctx.storage_dir(),|| {
+                                                              crate::bash_background::registry::with_scope_spawn(task_scope.clone(), || crate::gh_shim_speech::service::with_launch(speech_seed.clone(),&ctx.storage_dir(),|| {
                                                                   let run_dispatch = || {
                                                                       crate::bash_rewrite::with_rewrites_off(run_scoped, || {
                                                                            crate::bash_background::with_call_requester(task_requester, || {
@@ -2513,7 +2531,7 @@ pub(super) fn submit_deferred_bash(
                                                                    let response = refuse_run_permission_ask(response, ask_unavailable);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
-                                                                  if let Some(scope) = &scope_stamp {
+                                                                  if let Some(scope) = &task_scope {
                                                                       ctx.bash_background().kill_scope_if_revoked(scope);
                                                                   }
                                                                   response
@@ -2576,7 +2594,8 @@ pub(super) fn submit_deferred_bash(
                         .unwrap_or("pipes");
                     let is_pty = mode == "pty" || settings.pty;
                     // A codemode program's background launch answers at once like
-                    // a classic one; its task stays under the run's lifetime.
+                    // a classic one; its task belongs to the program's owner
+                    // (see `task_scope`), not to the run.
                     let launch_answers_now =
                         !server_completion || (run_scoped && settings.background);
                     if launch_answers_now && (is_pty || settings.background) {
@@ -7640,6 +7659,366 @@ mod grant_path_tests {
                 .contains(crate::bash_background::registry::remote::PRE_ACCEPTANCE_CANCELLED),
             "{status:?}"
         );
+    }
+
+    /// A codemode agent run's shell call as AFT admits it: the run route,
+    /// bound under the run's `ephemeral` scope, acts for the head route bound
+    /// under the run's parent scope, in the head's session `deadline-session`.
+    /// Returns the admitted identity, the call's wait state as the frame loop
+    /// builds it from that identity, and the run's and the head's scopes.
+    #[cfg(unix)]
+    fn codemode_run_call(
+        root: &ProjectRootId,
+    ) -> (
+        RouteIdentity,
+        BashWaitCancel,
+        subc_protocol::scope::ScopeStamp,
+        subc_protocol::scope::ScopeStamp,
+    ) {
+        use subc_protocol::call_mode::CallMode;
+        let owner = json!({"kind":"reserved", "module_id":"prefrontal-core"});
+        let head: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": owner, "ref": "head-scope", "scope_epoch": 3, "kind": "head",
+            "attributes": {"agent_id": "agent-a"}, "owner_authorized": true,
+        }))
+        .unwrap();
+        let run: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": owner, "ref": "run-scope", "scope_epoch": 1, "kind": "ephemeral",
+            "attributes": {"agent_id": "agent-a", "run_id": "run-1"},
+            "parent": {"owner": owner, "ref": "head-scope", "scope_epoch": 3},
+            "parent_state": "linked", "owner_authorized": true,
+        }))
+        .unwrap();
+        let mut head_route = super::super::test_support::route_identity(root, "deadline-session");
+        let data = Arc::get_mut(&mut head_route.0).unwrap();
+        data.scope = Some(head.clone());
+        data.call_mode = CallMode::Classic;
+        let mut run_route = super::super::test_support::route_identity(root, "program-session");
+        let data = Arc::get_mut(&mut run_route.0).unwrap();
+        data.scope = Some(run.clone());
+        data.call_mode = CallMode::Codemode;
+        let _ = data
+            .run_scope
+            .set(super::super::run_scope::RunScope::for_test(Some(
+                Instant::now() + Duration::from_secs(600),
+            )));
+        let run_channel = RouteChannel {
+            channel: 9,
+            epoch: 1,
+        };
+        let routes = HashMap::from([
+            (
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                head_route,
+            ),
+            (run_channel, run_route),
+        ]);
+        let body = json!({"name":"bash", "arguments":{}});
+        let identity =
+            match super::super::codemode::admit(&routes, run_channel, Some(&body), |_| {
+                Some(Ok(Default::default()))
+            }) {
+                super::super::codemode::Admission::Owner(identity) => identity,
+                _ => panic!("the run's call must act for its head route"),
+            };
+        assert_eq!(identity.session, "deadline-session");
+        let cancel = BashWaitCancel {
+            keepalive: None,
+            speech_seed: None,
+            run_scope: identity.run_scope.get().cloned(),
+            scope: identity.scope.clone(),
+            late_results: false,
+            ledger_carrier: identity
+                .run_owner
+                .as_ref()
+                .map(|owner| owner.ledger_carrier()),
+            connection: PersistentCancelSignal::new(),
+            route: PersistentCancelSignal::new(),
+            drain: drain::ModuleDrainWindow::default(),
+        };
+        (identity, cancel, run, head)
+    }
+
+    /// Send `arguments` as the codemode run call [`codemode_run_call`] built,
+    /// through `dispatch`, and return its launch reply's task id.
+    #[cfg(unix)]
+    async fn codemode_background_launch(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        dispatch: DispatchFn,
+        arguments: Value,
+        identity: &RouteIdentity,
+        cancel: &BashWaitCancel,
+    ) -> String {
+        let mut replies = {
+            let _identity = super::secret_consent::SecretIdentityGuard::install(identity.clone());
+            with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+                deadline_test_call_controlled(
+                    executor,
+                    root,
+                    dispatch,
+                    arguments,
+                    Instant::now(),
+                    false,
+                    false,
+                    Arc::new(DispatchPathMetrics::new()),
+                    cancel.clone(),
+                )
+            })
+        };
+        let reply = tokio::time::timeout(Duration::from_secs(30), replies.recv())
+            .await
+            .expect("a background launch answers at once")
+            .unwrap();
+        let response = reply.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert!(
+            reply
+                .text_for_test()
+                .unwrap()
+                .starts_with("Background task started"),
+            "{:?}",
+            reply.text_for_test()
+        );
+        response.data["task_id"].as_str().unwrap().to_owned()
+    }
+
+    /// What a codemode program's end does once it has its launch reply: the
+    /// run route closes, which cancels the route's signal, and the daemon then
+    /// confirms the run scope ended, which kills that scope's tasks exactly as
+    /// `scope_describe` does on a confirmed end.
+    #[cfg(unix)]
+    async fn end_codemode_run(
+        ctx: &AppContext,
+        cancel: &BashWaitCancel,
+        run: &subc_protocol::scope::ScopeStamp,
+    ) {
+        cancel.route.cancel();
+        let registry = ctx.bash_background().clone();
+        let run = run.clone();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::task::spawn_blocking(move || registry.kill_scope(&run)),
+        )
+        .await
+        .expect("the run's scope-end kill finished")
+        .unwrap();
+    }
+
+    /// The real bash handler, run in the configured project root.
+    #[cfg(unix)]
+    fn local_bash_stub(mut req: RawRequest, ctx: &AppContext) -> Response {
+        req.params
+            .as_object_mut()
+            .unwrap()
+            .entry("workdir")
+            .or_insert_with(|| json!(ctx.config().project_root));
+        crate::commands::bash::handle(&req, ctx)
+    }
+
+    #[cfg(unix)]
+    fn local_codemode_fixture() -> (
+        tempfile::TempDir,
+        ProjectRootId,
+        Arc<Executor>,
+        Arc<AppContext>,
+    ) {
+        let (dir, root) = super::super::test_support::test_root("codemode-background");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+            config.experimental_bash_background = true;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        (dir, root, executor, ctx)
+    }
+
+    /// The task's status as its owner (the head's session) reads it.
+    #[cfg(unix)]
+    fn owner_status(ctx: &AppContext, task_id: &str) -> crate::bash_background::BgTaskInfo {
+        ctx.bash_background()
+            .observed_status(task_id, "deadline-session", 0)
+            .expect("the head's session reads the program's task")
+            .info
+    }
+
+    /// The completion the head's session receives for `task_id`.
+    #[cfg(unix)]
+    async fn owner_completion(
+        ctx: &AppContext,
+        task_id: &str,
+    ) -> crate::bash_background::registry::BgCompletion {
+        wait_for_task_state(ctx, "completion queued for the head", |registry| {
+            registry.has_completions_for_session(Some("deadline-session"))
+        })
+        .await;
+        ctx.bash_background()
+            .drain_completions_for_session(Some("deadline-session"))
+            .into_iter()
+            .find(|completion| completion.task_id == task_id)
+            .expect("the task's completion must reach the head the program ran for")
+    }
+
+    /// A codemode program usually returns right after starting a background
+    /// command. Its run route closing and its run scope's confirmed end must
+    /// not stop that command: it finishes on its own and its completion
+    /// reaches the head the program ran for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codemode_background_task_outlives_its_run_and_wakes_its_head() {
+        let (dir, root, executor, ctx) = local_codemode_fixture();
+        let (identity, cancel, run, _) = codemode_run_call(&root);
+        let release = dir.path().join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done; echo finished",
+            release.display()
+        );
+        let task_id = codemode_background_launch(
+            &executor,
+            &root,
+            local_bash_stub,
+            json!({"command":command, "background":true, "timeout":60_000}),
+            &identity,
+            &cancel,
+        )
+        .await;
+        end_codemode_run(&ctx, &cancel, &run).await;
+        let info = owner_status(&ctx, &task_id);
+        assert_eq!(
+            info.status,
+            crate::bash_background::BgTaskStatus::Running,
+            "the run's end must not stop the head's background task: {info:?}"
+        );
+        std::fs::write(&release, "").unwrap();
+        wait_for_task_state(&ctx, "finished", |registry| {
+            registry.is_task_terminal(&task_id)
+        })
+        .await;
+        assert_eq!(
+            owner_status(&ctx, &task_id).status,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        let completion = owner_completion(&ctx, &task_id).await;
+        assert_eq!(completion.exit_code, Some(0));
+    }
+
+    /// A codemode program's background task belongs to the head, so the
+    /// head's own confirmed scope end still stops it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codemode_background_task_ends_with_its_heads_scope() {
+        let (_dir, root, executor, ctx) = local_codemode_fixture();
+        let (identity, cancel, _, head) = codemode_run_call(&root);
+        let task_id = codemode_background_launch(
+            &executor,
+            &root,
+            local_bash_stub,
+            json!({"command":"sleep 30", "background":true, "timeout":60_000}),
+            &identity,
+            &cancel,
+        )
+        .await;
+        let registry = ctx.bash_background().clone();
+        tokio::task::spawn_blocking(move || registry.kill_scope(&head))
+            .await
+            .unwrap();
+        let info = owner_status(&ctx, &task_id);
+        assert_eq!(info.status, crate::bash_background::BgTaskStatus::Killed);
+        assert_eq!(
+            info.status_reason.as_deref(),
+            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON)
+        );
+    }
+
+    /// The `runon` form of [`codemode_background_task_outlives_its_run_and_wakes_its_head`],
+    /// with the run ending before the build server accepts the job (its
+    /// submission is still in flight) and after it has. Neither must cancel
+    /// the job: it runs to its end and its completion reaches the head.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codemode_background_runon_outlives_its_run_before_and_after_acceptance() {
+        use crate::exec_remote::wire_tests::Script;
+        for accepted_first in [false, true] {
+            let script = if accepted_first {
+                Script::GatedStages { position: 1 }
+            } else {
+                Script::GatedAcceptanceThenExit
+            };
+            let (daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
+            let (identity, cancel, run, _) = codemode_run_call(&root);
+            let task_id = codemode_background_launch(
+                &executor,
+                &root,
+                remote_runon_stub,
+                json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":600_000}),
+                &identity,
+                &cancel,
+            )
+            .await;
+            daemon.wait_for_requests("exec.run", 1).await;
+            if accepted_first {
+                wait_for_task_state(&ctx, "Accepted", |registry| {
+                    registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                })
+                .await;
+            } else {
+                assert!(
+                    ctx.bash_background()
+                        .remote_progress(&task_id, "deadline-session")
+                        .unwrap()
+                        .job_id
+                        .is_none(),
+                    "the runner has not accepted the job yet"
+                );
+            }
+            end_codemode_run(&ctx, &cancel, &run).await;
+            let remote = ctx
+                .bash_background()
+                .task_for_test(&task_id)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .clone()
+                .unwrap();
+            assert!(
+                !remote.cancel_requested,
+                "accepted_first={accepted_first}: the run's end must not cancel the head's job"
+            );
+            assert!(!ctx.bash_background().is_task_terminal(&task_id));
+            daemon.acceptance_gate.notify_one();
+            daemon.output_gate.notify_one();
+            daemon.completion_gate.notify_one();
+            wait_for_task_state(&ctx, "finished", |registry| {
+                registry.is_task_terminal(&task_id)
+            })
+            .await;
+            let info = owner_status(&ctx, &task_id);
+            assert_eq!(
+                info.status,
+                crate::bash_background::BgTaskStatus::Completed,
+                "accepted_first={accepted_first}: {info:?}"
+            );
+            assert!(
+                !daemon
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(header, body)| header.ty == FrameType::Cancel
+                        || body["method"] == "exec.cancel"),
+                "accepted_first={accepted_first}: nothing may cancel the job"
+            );
+            let completion = owner_completion(&ctx, &task_id).await;
+            assert_eq!(completion.exit_code, Some(0));
+        }
     }
 
     /// A runner that is slow to accept a job must not hold a foreground call
