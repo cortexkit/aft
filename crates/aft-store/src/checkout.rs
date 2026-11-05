@@ -51,9 +51,9 @@ pub enum PathKind {
     /// [`PathRecord::link`]; `content` is a stand-in.
     Symlink,
     /// Text larger than the text-index limit, read because its path is one
-    /// a scan reads up to the larger read limit (a file a plane parses or
-    /// embeds); `content` is the key of its bytes. Its text is not indexed,
-    /// so text queries read it directly.
+    /// a scan reads up to the larger read limit (a file the call graph
+    /// parses or meaning search embeds); `content` is the key of its bytes.
+    /// Its text is not indexed, so text queries read it directly.
     Large,
 }
 
