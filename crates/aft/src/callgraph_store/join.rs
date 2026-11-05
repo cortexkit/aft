@@ -2310,6 +2310,13 @@ pub(crate) struct ViewBindingFacts<'a> {
     /// (see [`super::fact_answers`]).
     typed: bool,
     answers: std::cell::RefCell<super::fact_answers::FactAnswers>,
+    /// Every answer this recorder has computed. The checkout does not
+    /// change while a recorder lives, so a read asked again, by any file,
+    /// reuses its answer rather than reading (or parsing a config file)
+    /// again.
+    answer_cache: std::cell::RefCell<
+        HashMap<super::fact_answers::FactQuestion, super::fact_answers::FactAnswer>,
+    >,
 }
 
 impl<'a> ViewBindingFacts<'a> {
@@ -2329,6 +2336,7 @@ impl<'a> ViewBindingFacts<'a> {
             paused: Default::default(),
             typed: false,
             answers: Default::default(),
+            answer_cache: Default::default(),
         }
     }
 
@@ -2354,7 +2362,14 @@ impl<'a> ViewBindingFacts<'a> {
         if !self.typed || self.paused.get() > 0 {
             return;
         }
-        let answer = answer();
+        let cached = self.answer_cache.borrow().get(&question).cloned();
+        let answer = cached.unwrap_or_else(|| {
+            let answer = answer();
+            self.answer_cache
+                .borrow_mut()
+                .insert(question.clone(), answer.clone());
+            answer
+        });
         for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
             trace.answers.insert(question.clone(), answer.clone());
         }
