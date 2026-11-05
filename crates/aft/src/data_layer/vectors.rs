@@ -1683,15 +1683,16 @@ mod tests {
         // A fill that refuses one text, one file per round.
         let mut progress = Vec::new();
         let mut refusing = |texts: Vec<String>| {
+            // Only the symbol's own chunk: the file's summary names it too.
+            let refused = |text: &str| text.starts_with("name:refuse_me ");
             crate::semantic_index::report_build_rows_for_test(&texts, |text| {
-                text.contains("refuse_me")
-                    .then(|| "provider refused the input".to_string())
+                refused(text).then(|| "provider refused the input".to_string())
             });
             Ok::<_, String>(
                 texts
                     .iter()
                     .map(|text| {
-                        if text.contains("refuse_me") {
+                        if refused(text) {
                             Vec::new()
                         } else {
                             vector_of(text)
