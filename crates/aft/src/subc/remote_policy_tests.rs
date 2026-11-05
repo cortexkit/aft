@@ -2299,6 +2299,149 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
     }
 }
 
+/// Answers one held server-completed call on `task` the way the module loop
+/// does once a drain's backstop is due, and returns the error body it sent.
+#[cfg(unix)]
+async fn drained_detached_body(
+    registry: &crate::bash_background::BgTaskRegistry,
+    root: &Path,
+    task: &str,
+    corr: u64,
+) -> Value {
+    let metrics = DispatchPathMetrics::new();
+    let route = route_key(41, 1);
+    metrics.held_bash_calls.insert(route, corr);
+    metrics.held_bash_calls.set_detach_target(
+        route,
+        corr,
+        drain::BashDetachTarget {
+            reply_cache: registry.drain_reply_cache(task, "session"),
+            run_scoped: false,
+            registry: registry.clone(),
+            task_id: task.into(),
+            session_id: "session".into(),
+            wait_mode: false,
+            worker_session: true,
+            server_completion: true,
+            late_results: false,
+            request_id: format!("remote-detach-{corr}"),
+            ver: PROTOCOL_VERSION,
+            flags: control_flags(),
+            format_context: Default::default(),
+        },
+    );
+    metrics
+        .held_bash_calls
+        .set_phase(route, corr, drain::BashHoldPhase::Foreground);
+    let routes = HashMap::from([(route, identity(root, "session", 1, false))]);
+    let (writer, mut frames) = tokio::sync::mpsc::channel(4);
+    assert_eq!(
+        bash::answer_held_bash_calls_from_module_loop(&writer, &routes, &metrics, true)
+            .await
+            .unwrap(),
+        1
+    );
+    let frame = frames.recv().await.unwrap();
+    assert_eq!(frame.header.ty, FrameType::Error);
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+/// A build-server call held when AFT restarts is answered `detached`. The
+/// runner shows the agent only that error's code and message, so the message
+/// names the task and its remote job: before the runner accepts the job, that
+/// its inputs are still being captured; after, the job ID and phase.
+#[cfg(unix)]
+#[tokio::test]
+async fn drained_remote_call_names_its_task_and_remote_job() {
+    let daemon = crate::exec_remote::wire_tests::daemon(
+        crate::exec_remote::wire_tests::Script::GatedAcceptance,
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    init_remote_git_fixture(dir.path());
+    let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
+    let registry = ctx.bash_background().clone();
+    let task = registry
+        .spawn_remote(
+            crate::bash_background::RemoteLaunch {
+                explicit_runon: true,
+                params: Default::default(),
+                connection_file: Some(daemon.connection.clone()),
+                harness: "runner".into(),
+                session: "session".into(),
+                requested_platform: None,
+                requested_vcpus: None,
+                requested_memory_mib: None,
+                requested_network: false,
+                configured_env_names: Vec::new(),
+                return_paths: Vec::new(),
+            },
+            crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            "cargo test",
+            crate::bash_background::registry::resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
+    let capture_warning = crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING;
+
+    let submitting = drained_detached_body(&registry, dir.path(), &task, 1).await;
+    assert_eq!(submitting["code"], "detached", "{submitting}");
+    let message = submitting["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "call detached; command still running in the background as {task}. "
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "\nDetached because AFT is restarting. Remote job: not assigned yet. Phase: submitting to ck-motor (capturing inputs; not accepted yet).\n"
+        ),
+        "{message}"
+    );
+    assert!(message.contains(capture_warning), "{message}");
+
+    daemon.acceptance_gate.notify_one();
+    let progress = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(progress) = registry
+                .remote_progress(&task, "session")
+                .filter(|progress| progress.job_id.is_some())
+            {
+                return progress;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runner's Accepted record assigns a job ID");
+    let accepted = drained_detached_body(&registry, dir.path(), &task, 2).await;
+    let message = accepted["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!(
+            "\nDetached because AFT is restarting. Remote job: {}. Phase: {}.",
+            progress.job_id.unwrap(),
+            progress.phase.describe()
+        )),
+        "{message}"
+    );
+    assert!(!message.contains(capture_warning), "{message}");
+    tokio::task::spawn_blocking(move || registry.kill(&task, "session").unwrap())
+        .await
+        .unwrap();
+}
+
 #[cfg(unix)]
 fn init_remote_git_fixture(root: &Path) {
     std::fs::create_dir_all(root).unwrap();

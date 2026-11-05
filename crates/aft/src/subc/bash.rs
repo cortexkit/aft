@@ -848,29 +848,56 @@ pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, ca
     tokio::task::spawn_blocking(move || detach_held_bash_sync(target, cancelled));
 }
 
+/// The `detached` error for a held call the server completes, answered by the
+/// module loop while AFT restarts. The task ID also goes in the message: the
+/// runner shows the agent only the code and message, so a task ID carried
+/// only in `detail` left the caller unable to watch, read or stop the
+/// command that keeps running.
 fn build_detached_frame(
-    ver: u8,
+    target: &drain::BashDetachTarget,
     channel: u16,
     epoch: u32,
     corr: u64,
-    flags: Flags,
-    task_id: &str,
-    late_results: bool,
 ) -> Result<Frame, SubcError> {
     Frame::build_with_version(
-        ver,
+        target.ver,
         FrameType::Error,
-        flags,
+        target.flags,
         channel,
         epoch,
         corr,
         serde_json::to_vec(
-            &ErrorBody::new("detached", "call detached; command still running")
-                .with_detail(json!({"task_id": task_id, "late_results": late_results})),
+            &ErrorBody::new("detached", detached_call_message(target)).with_detail(
+                json!({"task_id": target.task_id, "late_results": target.late_results}),
+            ),
         )
         .map_err(SubcError::Json)?,
     )
     .map_err(SubcError::FrameBuild)
+}
+
+/// The text of a `detached` error, formatted only from values the task
+/// published with its metadata: the module loop must not read task state.
+fn detached_call_message(target: &drain::BashDetachTarget) -> String {
+    let cached = target.reply_cache.snapshot();
+    format!(
+        "{}{}",
+        crate::commands::bash_orchestrate::format_detached_call_message(
+            &target.task_id,
+            cached.remote.as_ref(),
+            cached.inputs_captured == Some(false),
+            target.worker_session,
+            target
+                .format_context
+                .bash_watch_available
+                .unwrap_or(target.worker_session),
+        ),
+        crate::commands::bash_orchestrate::kill_deadline_note_from_parts(
+            cached.execution_note.as_deref(),
+            cached.deadline,
+            target.worker_session,
+        ),
+    )
 }
 
 fn running_hold_route(identity: &RouteIdentity) -> bool {
@@ -984,18 +1011,9 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 .await?
                 .map(WriterFrame::plain)
             }
-            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => Some(
-                build_detached_frame(
-                    target.ver,
-                    route.channel,
-                    route.epoch,
-                    corr,
-                    target.flags,
-                    &target.task_id,
-                    target.late_results,
-                )?
-                .into(),
-            ),
+            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
+                Some(build_detached_frame(&target, route.channel, route.epoch, corr)?.into())
+            }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
                 let cached = target.reply_cache.snapshot();
                 let response = Response::success(
@@ -5540,22 +5558,36 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
-        let detached = build_detached_frame(
-            PROTOCOL_VERSION,
-            1,
-            1,
-            1,
-            Flags::new(false, Priority::Interactive, false),
-            "task",
-            false,
-        )
-        .unwrap();
+        let ctx = super::super::test_support::test_ctx();
+        let registry = ctx.bash_background().clone();
+        let target = drain::BashDetachTarget {
+            reply_cache: registry.drain_reply_cache("bash-00000000000000aa", "session"),
+            run_scoped: false,
+            task_id: "bash-00000000000000aa".into(),
+            session_id: "session".into(),
+            wait_mode: false,
+            worker_session: false,
+            server_completion: true,
+            late_results: false,
+            registry,
+            request_id: "request".into(),
+            ver: PROTOCOL_VERSION,
+            flags: Flags::new(false, Priority::Interactive, false),
+            format_context: Default::default(),
+        };
+        let detached = build_detached_frame(&target, 1, 1, 1).unwrap();
         assert_eq!(detached.header.ty, FrameType::Error);
         let detached: Value = serde_json::from_slice(&detached.body).unwrap();
         assert_eq!(detached["code"], "detached");
+        // The runner shows only the code and message, so the message names
+        // the task the command became and how to reach it.
+        assert_eq!(
+            detached["message"],
+            "call detached; command still running in the background as bash-00000000000000aa. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-00000000000000aa\" }) to inspect output or bash_kill({ taskId: \"bash-00000000000000aa\" }) to terminate.\nDetached because AFT is restarting.\nThis task has no kill deadline."
+        );
         assert_eq!(
             detached["detail"],
-            json!({"task_id":"task","late_results":false})
+            json!({"task_id":"bash-00000000000000aa","late_results":false})
         );
         for (background, pty) in [(false, false), (true, false), (false, true)] {
             let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");

@@ -893,15 +893,48 @@ pub(crate) fn format_remote_handback_message(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> String {
+    format!(
+        "The remote command did not finish within {}, the longest this call waits, so it now runs in the background as {}\nIt was not killed. {} Its `timeout` counts from when it starts running on ck-motor; a job that waits too long in ck-motor's queue is refused without running.",
+        format_wait_limit(waited_ms),
+        format_background_handoff_tail(task_id, worker_session, bash_watch_available),
+        remote_job_sentence(progress),
+    )
+}
+
+/// `Remote job: <id>. Phase: <where it is>.` for a build-server task; a task
+/// with no progress recorded yet is still submitting.
+fn remote_job_sentence(progress: Option<&RemoteProgress>) -> String {
     let job = progress
         .and_then(|progress| progress.job_id)
         .map_or_else(|| "not assigned yet".to_string(), |id| id.to_string());
     let phase = progress.map_or(RemotePhase::Submitting, |progress| progress.phase);
+    format!("Remote job: {job}. Phase: {}.", phase.describe())
+}
+
+/// The message of the `detached` error that a call the server completes
+/// (a tool-provider v1 route) gets when AFT restarts while the call is held.
+/// The runner shows the agent only that error's code and message, not its
+/// structured detail, so the message itself must name the task, and for a
+/// build-server task its job, or the caller has no ID to pass to
+/// bash_watch, bash_status or bash_kill.
+pub(crate) fn format_detached_call_message(
+    task_id: &str,
+    remote: Option<&RemoteProgress>,
+    inputs_uncaptured: bool,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
+    let remote = remote
+        .map(|progress| format!(" {}", remote_job_sentence(Some(progress))))
+        .unwrap_or_default();
+    let capture = if inputs_uncaptured {
+        format!("\n{REMOTE_INPUT_CAPTURE_WARNING}")
+    } else {
+        String::new()
+    };
     format!(
-        "The remote command did not finish within {}, the longest this call waits, so it now runs in the background as {}\nIt was not killed. Remote job: {job}. Phase: {}. Its `timeout` counts from when it starts running on ck-motor; a job that waits too long in ck-motor's queue is refused without running.",
-        format_wait_limit(waited_ms),
+        "call detached; command still running in the background as {}\nDetached because AFT is restarting.{remote}{capture}",
         format_background_handoff_tail(task_id, worker_session, bash_watch_available),
-        phase.describe(),
     )
 }
 

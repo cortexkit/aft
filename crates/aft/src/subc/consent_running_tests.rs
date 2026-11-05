@@ -275,45 +275,103 @@ async fn running_hold_restart_unknown_and_withdraw_are_honest() {
     assert_ne!(terminal["structuredContent"]["exit_code"], 0);
 }
 
-#[tokio::test]
-async fn head_route_keeps_detached_even_when_it_declares_held_replies() {
-    let _lock = CONSENT_TEST_LOCK.lock().await;
-    let f = fixture(FakeCingulate::up());
-    f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+/// Starts a held head-route shell call with `extra` merged into its
+/// arguments, drains the module while the command still runs, and returns the
+/// running task's ID with the `detached` error body the call received.
+async fn drained_head_shell(f: &Fixture, extra: Value, corr: u64) -> (String, Value) {
     f.ctx
         .update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
     let mut head = identity(&f.head_root, f.head.scope.clone());
     Arc::get_mut(&mut head.0).unwrap().held_reply = true;
     let (command, _) = gated_command(&head.project_root);
+    let mut arguments = json!({"command":command,"timeout":30_000});
+    for (name, value) in extra.as_object().unwrap() {
+        arguments[name] = value.clone();
+    }
     let (writer, mut replies) = f
-        .send_tool_with_writer(
-            &head,
-            "bash",
-            json!({"command":command,"timeout":30_000}),
-            9120,
-            shell_dispatch,
-        )
+        .send_tool_with_writer(&head, "bash", arguments, corr, shell_dispatch)
         .await;
     let task = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(task) = f.ctx.bash_background().list(0).first() {
                 return task.info.task_id.clone();
             }
+            if let Ok(early) = replies.try_recv() {
+                panic!("answered before a task ran: {}", String::from_utf8_lossy(&early.body));
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    let _kill = KillTask(f.ctx.bash_background().clone(), task, head.session.clone());
-    drain_running(&f, &head, 9120, &writer).await;
+    let _kill = KillTask(
+        f.ctx.bash_background().clone(),
+        task.clone(),
+        head.session.clone(),
+    );
+    drain_running(f, &head, corr, &writer).await;
     let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(reply.header.ty, FrameType::Error);
-    let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["code"], "detached");
-    assert_eq!(body["message"], "call detached; command still running");
+    (task, serde_json::from_slice(&reply.body).unwrap())
+}
+
+/// The runner shows the agent a refusal's code and message, not its detail,
+/// so a `detached` message must itself name the task the command became.
+fn assert_detached_names_task(body: &Value, task: &str) {
+    assert_eq!(body["code"], "detached", "{body}");
+    assert_eq!(body["detail"]["task_id"], task, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "call detached; command still running in the background as {task}. "
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("bash_status({{ taskId: \"{task}\" }})"))
+            && message.contains(&format!("bash_kill({{ taskId: \"{task}\" }})")),
+        "{message}"
+    );
+    assert!(
+        message.contains("\nDetached because AFT is restarting."),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn head_route_keeps_detached_even_when_it_declares_held_replies() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+    let (task, body) = drained_head_shell(&f, json!({}), 9120).await;
+    assert_detached_names_task(&body, &task);
+}
+
+/// A `wait: true` call held when AFT restarts is answered `detached`; the
+/// answer names the task so the caller can keep waiting on it.
+#[tokio::test]
+async fn drained_wait_call_names_its_task() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+    let (task, body) = drained_head_shell(&f, json!({"wait": true}), 9121).await;
+    assert_detached_names_task(&body, &task);
+}
+
+/// A server-completed route holds a `background: true` launch rather than
+/// answering it at once; drained before that answer, it names its task.
+#[tokio::test]
+async fn drained_background_launch_names_its_task() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+    f.ctx
+        .update_config(|config| config.experimental_bash_background = true);
+    let (task, body) = drained_head_shell(&f, json!({"background": true}), 9122).await;
+    assert_detached_names_task(&body, &task);
 }
 
 #[tokio::test]
