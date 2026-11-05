@@ -245,10 +245,10 @@ const STALE_PATH: &str = "stale path disclosed only when it is a candidate";
 /// another inherits its next-character filter, and files holding only the
 /// shorter one are never read. The data layer's answer equals a full scan.
 const FILTER_MERGE: &str = "today's alternation filter merge drops candidates";
-/// Both replies stopped at the store cap, so their "(capped)" counts are
-/// floors that depend on which candidate files each read before stopping.
-/// Every printed row is the same, and without the cap both paths find
-/// exactly what a full scan finds.
+/// Both replies stopped at the most matches grep keeps for one request, so
+/// their "(capped)" counts are floors that depend on which candidate files
+/// each read before stopping. Every printed row is the same, and without
+/// that limit both paths find exactly what a full scan finds.
 const CAPPED_FLOOR: &str = "capped count is a floor that depends on the files read";
 /// Differences explained and accepted.
 const ACCEPTED: &[&str] = &[STALE_PATH, FILTER_MERGE, CAPPED_FLOOR];
