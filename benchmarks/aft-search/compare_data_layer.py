@@ -4,9 +4,10 @@
 One AFT process answers from today's indexes. A second runs with
 `AFT_DATA_LAYER=1`, the development switch under which aft_search's lexical
 and exact lanes read the data layer's view of the checkout once it has
-published. Both processes get the same requests in the same order on the same
-tree, each with its own empty storage, and every reply is compared whole:
-text, results and structured content. Only fields that differ between any two
+published, and its semantic lane reads the data layer's meaning plane, which
+that process fills itself. Both processes get the same requests in the same
+order on the same tree, each with its own empty storage, and every reply is
+compared whole: text, results and structured content. Only fields that differ between any two
 processes by construction are masked (`MASKED`). Two parts of a reply come
 from outside aft_search and depend on timing: the status bar line the
 response finaliser appends when background inspection counts change, and the
@@ -24,15 +25,23 @@ only when everything else is identical, the excluded count included, and
 each side's "shown" count is its examined count less the excluded ones; the
 class lists every such reply with both counts.
 
-Every process first answers the same warm-up request, which no row repeats;
-the data-layer process serves from the view only after its first build has
-published, so it then waits until the build's log line appears. Every
-process then waits for the file watcher to go quiet before the replay.
+Every process first waits until its indexes are ready (for the data-layer
+process, its first build published and, with semantic search on, every file
+filled), then answers the same warm-up request, which no row repeats. The
+query embedding cache and the plan's `embedding_calls` and
+`embedding_cache_hits` depend on what a process was asked before, so every
+process must have been asked the same before the replay. Every process then
+waits for the file watcher to go quiet before the replay.
 
-The ranking logs one line each time its lanes read the data layer's view.
-Each replayed row records how many such lines its request added to that
-process's log (`view_reads`), so a data-layer reply that the legacy index
+The ranking logs one line each time its lanes read the data layer's view, and
+one each time its semantic lane reads the meaning plane. Each replayed row
+records how many such lines its request added to that process's log
+(`view_reads`, `meaning_reads`), so a data-layer reply that the legacy index
 answered anyway is reported rather than passing silently.
+
+Replies are written to one file per process as they arrive and compared in a
+stream afterwards; only the differing ones are kept, so a replay of the whole
+real query list fits in memory.
 
 Families:
   concept   the concept-recall fixtures (`fixtures.json`) on the evidence
@@ -41,7 +50,10 @@ Families:
             served by the fixture vector pack;
   exact     the exact-recall fixtures on the provisioned corpus repositories,
             semantic search off, as `run_exact_recall.py` sends them;
-  checkout  one query per line of `--queries` on `--root`, semantic search off.
+  checkout  one query per line of `--queries` on `--root`, semantic search off,
+            or with `--semantic hashed` on, served by a loopback embedder
+            (`HashedEmbeddingServer`) that gives any text a deterministic
+            vector, so both processes embed every chunk and query alike.
 
 Writes a JSON report (`--out`) and exits nonzero when any compared reply
 differs or a data-layer reply did not read the view.
@@ -50,17 +62,20 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
 import statistics
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import ChainMap
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 import bench_rerank
 from run_real_query import (
@@ -81,6 +96,8 @@ JsonObject = dict[str, Any]
 # The ranking logs this line (target `aft::data_layer::tools::search`) each
 # time its lanes read the data layer's view.
 VIEW_READ = "read the data layer view"
+# The semantic lane logs this line each time it reads the meaning plane.
+MEANING_READ = "read the data layer meaning plane"
 # The data layer logs this line when a build has published.
 BUILT = "data layer built"
 # Fields that differ between two processes whatever they read: the snapshot
@@ -184,12 +201,29 @@ class Process:
                 else:
                     os.environ[name] = value
         self.root = root
+        # Where `reads` stopped in the log, and its counts so far.
+        self._log_offset = 0
+        self._reads = {VIEW_READ: 0, MEANING_READ: 0}
+        self._partial_line = ""
 
     def log(self) -> str:
         return self.stderr_path.read_text(encoding="utf-8", errors="replace")
 
-    def view_reads(self) -> int:
-        return self.log().count(VIEW_READ)
+    def reads(self) -> dict[str, int]:
+        """How many view and meaning-plane reads the log holds so far. Reads
+        only what was appended since the last call: the log grows with every
+        request, and reading it whole per row is quadratic over a long
+        replay."""
+        with self.stderr_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(self._log_offset)
+            text = handle.read()
+            self._log_offset = handle.tell()
+        lines = (self._partial_line + text).split("\n")
+        self._partial_line = lines.pop()
+        for line in lines:
+            for marker in self._reads:
+                self._reads[marker] += line.count(marker)
+        return dict(self._reads)
 
     def configure_without_semantic(self, timeout: float) -> None:
         doc = bench_rerank.apply_to_config(
@@ -265,25 +299,51 @@ def send_semantic_search(process: Process, arguments: JsonObject) -> JsonObject:
     return process.client.call("semantic_search", dict(arguments), timeout=120.0)
 
 
-def replay(process: Process, rows: Sequence[JsonObject], send: Any) -> list[JsonObject]:
-    replies = []
-    for row in rows:
-        before = process.view_reads()
-        started = time.perf_counter()
-        response = send(process, row["request"])
-        elapsed = (time.perf_counter() - started) * 1000.0
-        replies.append(
-            {
-                "reply": mask(response),
-                "latency_ms": elapsed,
-                "view_reads": process.view_reads() - before,
-            }
-        )
-    return replies
+def replay(process: Process, rows: Sequence[JsonObject], send: Any, out: Path) -> list[JsonObject]:
+    """Sends every row, writing each masked reply to `out` (one JSON line per
+    row) as it arrives; returns each row's latency and read counts."""
+    measures = []
+    with out.open("w", encoding="utf-8") as replies:
+        for row in rows:
+            before = process.reads()
+            started = time.perf_counter()
+            response = send(process, row["request"])
+            elapsed = (time.perf_counter() - started) * 1000.0
+            after = process.reads()
+            replies.write(json.dumps(mask(response), sort_keys=True) + "\n")
+            measures.append(
+                {
+                    "latency_ms": elapsed,
+                    "view_reads": after[VIEW_READ] - before[VIEW_READ],
+                    "meaning_reads": after[MEANING_READ] - before[MEANING_READ],
+                    "semantic_lane": semantic_lane_ran(response),
+                }
+            )
+    return measures
 
 
-def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Sequence[JsonObject]) -> JsonObject:
+def semantic_lane_ran(response: JsonObject) -> bool:
+    """Whether the reply's plan names the semantic lane among those it ran."""
+    content = response.get("structuredContent")
+    plan = content.get("plan") if isinstance(content, dict) else None
+    lanes = plan.get("lanes_run") if isinstance(plan, dict) else None
+    return isinstance(lanes, list) and "semantic" in lanes
+
+
+def read_replies(path: Path) -> Iterator[JsonObject]:
+    with path.open("r", encoding="utf-8") as replies:
+        for line in replies:
+            yield {"reply": json.loads(line)}
+
+
+# Differing replies a comparison keeps whole; past this many only their ids
+# are kept, so a systematic difference cannot fill memory.
+KEPT_DIFFERENCES = 50
+
+
+def compare(rows: Sequence[JsonObject], left: Iterable[JsonObject], right: Iterable[JsonObject]) -> JsonObject:
     differences = []
+    differing_ids = []
     noise = []
     anchored = []
     for row, a, b in zip(rows, left, right):
@@ -298,7 +358,7 @@ def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Seque
             "diff": list(difflib.unified_diff(a_text, b_text, "first", "second", n=2, lineterm=""))[:200],
         }
         if a_clean == b_clean:
-            noise.append(entry)
+            noise.append({"id": row["id"], "diff": entry["diff"][:40]})
             continue
         a_counts, b_counts = anchored_counts(a_clean), anchored_counts(b_clean)
         if (
@@ -317,12 +377,15 @@ def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Seque
                 }
             )
             continue
-        entry["first"] = a["reply"]
-        entry["second"] = b["reply"]
-        differences.append(entry)
+        differing_ids.append(row["id"])
+        if len(differences) < KEPT_DIFFERENCES:
+            entry["first"] = a["reply"]
+            entry["second"] = b["reply"]
+            differences.append(entry)
     return {
         "rows": len(rows),
-        "differing": len(differences),
+        "differing": len(differing_ids),
+        "differing_ids": differing_ids,
         "process_noise": len(noise),
         "anchored_examined_count": len(anchored),
         "differences": differences,
@@ -353,38 +416,53 @@ def run_family(
     warm: JsonObject,
 ) -> JsonObject:
     modes = ["legacy", "data"] + (["legacy-again"] if noise else [])
-    replies: dict[str, list[JsonObject]] = {}
+    measures: dict[str, list[JsonObject]] = {}
     build_wait: dict[str, float] = {}
+    ready_wait: dict[str, float] = {}
     with tempfile.TemporaryDirectory(prefix="aft-data-layer-parity-") as directory:
+        replies = {mode: Path(directory) / f"{mode}-replies.jsonl" for mode in modes}
         for mode in modes:
             process = Process(binary, root, Path(directory), "data" if mode == "data" else mode)
             try:
+                started = time.monotonic()
                 start(process)
+                ready_wait[mode] = time.monotonic() - started
                 build_wait[mode] = process.warm(warm, send, timeout)
                 process.settle(timeout)
-                replies[mode] = replay(process, rows, send)
+                measures[mode] = replay(process, rows, send, replies[mode])
             finally:
                 process.close()
-    data_rows_without_view = [
-        row["id"]
-        for row, reply in zip(rows, replies["data"])
-        if reply["view_reads"] == 0
-    ]
-    legacy_rows_with_view = [
-        row["id"]
-        for row, reply in zip(rows, replies["legacy"])
-        if reply["view_reads"] != 0
-    ]
-    report: JsonObject = {
-        "rows": len(rows),
-        "legacy_vs_data": compare(rows, replies["legacy"], replies["data"]),
-        "data_rows_without_a_view_read": data_rows_without_view,
-        "legacy_rows_with_a_view_read": legacy_rows_with_view,
-        "data_layer_first_build_seconds": round(build_wait.get("data", 0.0), 3),
-        "latency": {mode: latency(replies[mode]) for mode in modes},
-    }
-    if noise:
-        report["legacy_vs_legacy_again"] = compare(rows, replies["legacy"], replies["legacy-again"])
+        report: JsonObject = {
+            "rows": len(rows),
+            "legacy_vs_data": compare(rows, read_replies(replies["legacy"]), read_replies(replies["data"])),
+        }
+        if noise:
+            report["legacy_vs_legacy_again"] = compare(
+                rows, read_replies(replies["legacy"]), read_replies(replies["legacy-again"])
+            )
+    report.update(
+        {
+            "data_rows_without_a_view_read": [
+                row["id"] for row, measure in zip(rows, measures["data"]) if measure["view_reads"] == 0
+            ],
+            "legacy_rows_with_a_view_read": [
+                row["id"]
+                for row, measure in zip(rows, measures["legacy"])
+                if measure["view_reads"] != 0 or measure["meaning_reads"] != 0
+            ],
+            # A row whose data-layer reply ran the semantic lane without
+            # reading the meaning plane read today's semantic index instead.
+            "data_semantic_rows_without_a_meaning_read": [
+                row["id"]
+                for row, measure in zip(rows, measures["data"])
+                if measure["semantic_lane"] and measure["meaning_reads"] == 0
+            ],
+            "semantic_lane_rows": {mode: sum(measure["semantic_lane"] for measure in measures[mode]) for mode in modes},
+            "data_layer_first_build_seconds": round(build_wait.get("data", 0.0), 3),
+            "ready_seconds": {mode: round(seconds, 3) for mode, seconds in ready_wait.items()},
+            "latency": {mode: latency(measures[mode]) for mode in modes},
+        }
+    )
     return report
 
 
@@ -468,30 +546,115 @@ def exact(args: argparse.Namespace) -> JsonObject:
     return reports
 
 
+class HashedEmbeddingServer(ThreadingHTTPServer):
+    """A loopback OpenAI-compatible embedder that gives any text a
+    deterministic vector: each word (identifiers split at case changes and
+    underscores, lowercased) adds a signed unit to one of `DIMENSIONS`
+    dimensions its digest picks. Texts sharing words point the same way, so
+    the semantic lane ranks as a weak model would, and every process gets
+    exactly the same vector for the same text."""
+
+    DIMENSIONS = 384
+    MODEL = "aft-search-hashed-v1"
+    WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+|[^\W_]+")
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), HashedEmbeddingHandler)
+        self.texts = 0
+
+    @classmethod
+    def vector(cls, text: str) -> list[float]:
+        vector = [0.0] * cls.DIMENSIONS
+        for word in cls.WORD.findall(text):
+            digest = hashlib.blake2b(word.lower().encode(), digest_size=4).digest()
+            slot = int.from_bytes(digest[:2], "little") % cls.DIMENSIONS
+            vector[slot] += 1.0 if digest[2] & 1 == 0 else -1.0
+        return vector
+
+
+class HashedEmbeddingHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        server = self.server
+        if not self.path.endswith("/embeddings") or not isinstance(server, HashedEmbeddingServer):
+            self.send_error(404)
+            return
+        payload = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))))
+        texts = payload.get("input")
+        texts = [texts] if isinstance(texts, str) else texts
+        server.texts += len(texts)
+        body = json.dumps(
+            {
+                "object": "list",
+                "model": payload.get("model", HashedEmbeddingServer.MODEL),
+                "data": [
+                    {"object": "embedding", "index": index, "embedding": HashedEmbeddingServer.vector(text)}
+                    for index, text in enumerate(texts)
+                ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextmanager
+def hashed_embedding_server() -> Iterator[HashedEmbeddingServer]:
+    server = HashedEmbeddingServer()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def checkout(args: argparse.Namespace) -> JsonObject:
     if args.root is None or args.queries is None:
         raise InputFault("checkout_family_needs:--root,--queries")
     queries: list[str] = []
+    seen: set[str] = set()
     for line in Path(args.queries).read_text(encoding="utf-8").splitlines():
         query = line.strip()
-        if query and query not in queries:
+        if query and query not in seen:
+            seen.add(query)
             queries.append(query)
     queries = queries[:: args.stride][: args.limit]
     rows = [{"id": f"checkout:{index}", "request": {"query": query}} for index, query in enumerate(queries)]
+    root = Path(args.root).resolve()
+    if args.semantic == "off":
 
-    def start(process: Process) -> None:
-        process.configure_without_semantic(args.ready_timeout)
+        def start(process: Process) -> None:
+            process.configure_without_semantic(args.ready_timeout)
 
-    return run_family(
-        args.binary,
-        Path(args.root).resolve(),
-        rows,
-        send_search,
-        start,
-        args.noise,
-        args.ready_timeout,
-        {"query": WARM_UP_QUERY},
-    )
+        return run_family(
+            args.binary, root, rows, send_search, start, args.noise, args.ready_timeout, {"query": WARM_UP_QUERY}
+        )
+    with hashed_embedding_server() as server:
+        endpoint = f"http://127.0.0.1:{server.server_port}/v1"
+
+        def start_semantic(process: Process) -> None:
+            process.client.configure(endpoint, HashedEmbeddingServer.MODEL, args.ready_timeout)
+            process.client.wait_ready(args.ready_timeout)
+
+        report = run_family(
+            args.binary,
+            root,
+            rows,
+            send_search,
+            start_semantic,
+            args.noise,
+            args.ready_timeout,
+            {"query": WARM_UP_QUERY},
+        )
+        report["texts_embedded"] = server.texts
+    return report
 
 
 def parser() -> argparse.ArgumentParser:
@@ -503,6 +666,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--queries", help="checkout family: one query per line")
     result.add_argument("--stride", type=int, default=1, help="checkout family: replay every Nth query")
     result.add_argument("--limit", type=int, default=None, help="checkout family: replay at most N queries")
+    result.add_argument(
+        "--semantic",
+        choices=("off", "hashed"),
+        default="off",
+        help="checkout family: semantic search off, or on with the deterministic loopback embedder",
+    )
     result.add_argument("--noise", action="store_true", help="also replay today's path a second time")
     result.add_argument("--ready-timeout", type=float, default=900.0)
     return result
@@ -537,7 +706,16 @@ def main() -> int:
                 f"{args.family}: today's path twice: {again['differing']} differ, "
                 f"{again['process_noise']} only in process noise"
             )
-        failed |= compared["differing"] > 0 or bool(unread) or bool(family["legacy_rows_with_a_view_read"])
+        unread_meaning = family["data_semantic_rows_without_a_meaning_read"]
+        if unread_meaning:
+            print(f"{args.family}: {len(unread_meaning)} data-layer replies ran the semantic lane without the meaning plane")
+        print(f"{args.family}: semantic lane rows {json.dumps(family['semantic_lane_rows'])}")
+        failed |= (
+            compared["differing"] > 0
+            or bool(unread)
+            or bool(unread_meaning)
+            or bool(family["legacy_rows_with_a_view_read"])
+        )
     return 1 if failed else 0
 
 

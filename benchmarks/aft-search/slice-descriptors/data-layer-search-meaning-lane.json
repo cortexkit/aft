@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/data_layer/tools/search/meaning.rs",
+    "benchmarks/aft-search/compare_data_layer.py"
+  ],
+  "slices": [
+    "data-layer-search-meaning-lane"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/. aft_search's semantic lane (query-only and split searches, the split admission cosines and the recall audit) now reads its vectors through one interface (data_layer::tools::search::MeaningIndex), and its readiness and status through DataSemantic. Without AFT_DATA_LAYER=1, DataSemantic is never present, so every call reads today's SemanticIndex and status exactly as before, and ranked rows must stay byte-identical to the committed reference. With the switch, the data layer's meaning plane answers instead; benchmarks/aft-search/compare_data_layer.py replays the concept, exact and real-query families both ways and compares every reply."
+}
