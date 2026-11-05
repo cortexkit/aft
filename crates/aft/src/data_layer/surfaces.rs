@@ -649,6 +649,7 @@ mod tests {
             callgraph_pending,
             building,
             unparsed: 1,
+            failed: false,
         }
     }
 

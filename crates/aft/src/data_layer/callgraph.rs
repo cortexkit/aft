@@ -322,6 +322,11 @@ impl Resolutions {
         );
     }
 
+    /// How many files have a resolution slot, decoded or not.
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
     pub(crate) fn remove(&mut self, path: &str) -> Option<FileResolution> {
         let slot = self.map.remove(path)?;
         slot.read(path);
