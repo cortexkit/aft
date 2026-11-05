@@ -570,15 +570,21 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
     let mut keys = Vec::new();
     let mut complete = true;
     for (root, _) in entries {
-        let stamp = stamp.clone();
         #[cfg(feature = "test-timing-hooks")]
         let submitted_at = std::time::Instant::now();
         let (result, receiver) = oneshot::channel();
+        // The database part runs on the call-ledger lane, where keyed
+        // admissions also run, one job at a time in submission order. Every
+        // admission queued on this root before the scope ended has therefore
+        // committed its row by now, so `end_scope` settles it as not started
+        // instead of leaving a held row that a later approval could dispatch.
+        let ledger_stamp = stamp.clone();
         let job = executor.submit_async(
-            root,
-            Lane::Mutating,
+            root.clone(),
+            Lane::CallLedger,
             "scope-ended".into(),
             Box::new(move |ctx| {
+                let stamp = ledger_stamp;
                 #[cfg(feature = "test-timing-hooks")]
                 crate::slog_info!(
                     "scope diagnostic phase=revoke_admitted scope_epoch={} queue_ms={}",
@@ -629,15 +635,6 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                         Vec::new()
                     }
                 };
-                // Drop the ledger lock before killing: terminal task writes use
-                // the actor's same connection and must not deadlock on it.
-                ctx.bash_background().kill_scope(&stamp);
-                #[cfg(feature = "test-timing-hooks")]
-                crate::slog_info!(
-                    "scope diagnostic phase=revoke_finished scope_epoch={} elapsed_ms={}",
-                    stamp.scope_epoch,
-                    submitted_at.elapsed().as_millis()
-                );
                 let complete = failures.is_empty();
                 let _ = result.send(ScopeRevokeResult { keys, complete });
                 if complete {
@@ -659,6 +656,30 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                 log::warn!("scope-ended cleanup result was lost: {error}");
             }
         }
+        // Kill the scope's shell tasks after the ledger work, as before, even
+        // when that work failed. This stays a separate job on the mutating
+        // lane because it changes task state, not the call ledger. The ledger
+        // job has released the database lock by now, which matters: terminal
+        // task writes use the same connection and must not deadlock on it.
+        let kill_stamp = stamp.clone();
+        let kill = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "scope-ended-kill".into(),
+            Box::new(move |ctx| {
+                ctx.bash_background().kill_scope(&kill_stamp);
+                #[cfg(feature = "test-timing-hooks")]
+                crate::slog_info!(
+                    "scope diagnostic phase=revoke_finished scope_epoch={} elapsed_ms={}",
+                    kill_stamp.scope_epoch,
+                    submitted_at.elapsed().as_millis()
+                );
+                Response::success("scope-ended-kill", json!({}))
+            }),
+        );
+        complete &= await_executor_response(kill, "scope-ended-kill".into())
+            .await
+            .success;
     }
     ScopeRevokeResult { keys, complete }
 }

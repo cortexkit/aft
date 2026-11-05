@@ -82,17 +82,21 @@ pub enum Lane {
     ProviderMetadata,
     /// Call-ledger bookkeeping for keyed tool calls: the row a call writes
     /// before it dispatches, the settlement its terminal reply waits for
-    /// before the transport writer may send it, and the row reads a repeated
-    /// call makes while it waits for that settlement. Each job is one short
-    /// SQLite transaction behind the database's own mutex and touches no index
-    /// state, so it takes no epoch gate and does not wait for readers, LSP or
-    /// maintenance jobs, or a running writer. On the Mutating lane it would
-    /// wait until every read on its root had drained, and each keyed reply
-    /// would wait with it. Jobs run one at a time per actor in submission
-    /// order, so one call's
-    /// ledger writes land in the order they were queued. Unlike
-    /// ProviderMetadata, an unbind does not cancel them: a settlement records
-    /// a call that already ran.
+    /// before the transport writer may send it, the row reads a repeated call
+    /// makes while it waits for that settlement, and the ledger and grant
+    /// writes that end a scope. Each job is one short SQLite transaction
+    /// behind the database's own mutex and touches no index state, so it takes
+    /// no epoch gate and does not wait for readers, LSP or maintenance jobs,
+    /// or a running writer. On the Mutating lane it would wait until every
+    /// read on its root had drained, and each keyed reply would wait with it.
+    /// Running beside a writer such as a configure loses no protection:
+    /// `AppContext::open_db` returns the process-shared database handle and
+    /// replaces it only when the storage path changes, so ledger jobs of other
+    /// roots always ran beside any configure. Jobs run one at a time per actor
+    /// in submission order, so one root's ledger writes land in the order they
+    /// were queued; a scope end therefore settles every admission queued on
+    /// its root before it. Unlike ProviderMetadata, an unbind does not cancel
+    /// them: a settlement records a call that already ran.
     CallLedger,
 }
 
