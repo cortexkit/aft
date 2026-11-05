@@ -205,12 +205,14 @@ fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
     crate::views::parent::route(req, ctx).expect("a parent folder answers this command itself")
 }
 
-/// The reply without what says which children it could not cover: the
-/// `gaps`, and the note `attach_gaps` appends to the text.
+/// The reply without what says which children it could not cover (the
+/// `gaps`, and the note `attach_gaps` appends to the text) and without its
+/// timings.
 fn covered(reply: &Value) -> Value {
     let mut reply = reply.clone();
     let object = reply.as_object_mut().unwrap();
     object.remove("gaps");
+    object.retain(|key, _| !key.ends_with("_ms"));
     if let Some(Value::String(text)) = object.get_mut("text") {
         if let Some(at) = text.find("\n\n(Parent folder: not covered by this answer:") {
             text.truncate(at);
@@ -287,6 +289,19 @@ fn settled<T: std::fmt::Debug>(ask: impl Fn() -> T, done: impl Fn(&T) -> bool) -
         assert!(Instant::now() < deadline, "never settled: {answer:?}");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Median of nine timings of `query`, in milliseconds.
+fn median_ms(mut query: impl FnMut()) -> f64 {
+    let mut samples = (0..9)
+        .map(|_| {
+            let started = Instant::now();
+            query();
+            started.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
 }
 
 fn inspect_request() -> RawRequest {
@@ -407,6 +422,9 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     );
     let today_capped = routed(&parent, &callgraph_request("callers", "zz-60/notes.txt"));
     let today_inspect = routed(&parent, &inspect_request());
+    let today_ms = median_ms(|| {
+        grep(&parent, COMMON);
+    });
     assert!(today_callers.success, "{:?}", today_callers.data);
     // With the data layer off, nothing of it was bound or written.
     assert!(!storage.join("data").exists());
@@ -456,6 +474,12 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     // Every other child builds its checkout on first use.
     let data_grep = settled(|| grep(&parent, COMMON), |reply| child_gaps(reply) == named);
     assert_same(&covered(&data_grep), &covered(&today_grep));
+    let data_ms = median_ms(|| {
+        grep(&parent, COMMON);
+    });
+    eprintln!(
+        "parent grep over 64 children, median of 9: data layer {data_ms:.2} ms, today {today_ms:.2} ms"
+    );
     assert_eq!(gaps(&data_grep), [named.clone(), scope_gaps].concat());
     // The bare children today cannot answer for, past the cap excepted.
     let data_bare = grep(&parent, BARE);
