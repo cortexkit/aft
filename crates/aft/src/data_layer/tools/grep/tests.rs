@@ -228,13 +228,11 @@ fn changed_paths_are_answered_as_they_are_on_disk() {
     let checkout = fixture.bind();
 
     // A file edited, one created in a folder the publication does not
-    // have, one deleted, all recorded; and one deleted that neither index
-    // is told about.
+    // have, and one deleted, all recorded.
     let edited = fixture.write("src/b.rs", b"fn beta() { alpha(); }\n");
     let created = fixture.write("src/fresh/new.rs", b"fn alpha_again() {}\n");
     let deleted = fixture.root.join("src/nested/c.ts");
     std::fs::remove_file(&deleted).unwrap();
-    std::fs::remove_file(fixture.root.join("docs/readme.md")).unwrap();
     checkout.record_changes(&[
         PathChange::Written {
             path: b"src/b.rs".to_vec(),
@@ -258,17 +256,31 @@ fn changed_paths_are_answered_as_they_are_on_disk() {
         &fixture,
         &today,
         &view,
-        &["", "src", "src/fresh", "docs", "src/b.rs"],
+        &[
+            "",
+            "src",
+            "src/fresh",
+            "src/nested",
+            "src/b.rs",
+            "src/fresh/new.rs",
+        ],
     );
+    // The newest file first, and the deleted one gone.
     let (_, data, _) = grep_both(&today, &view, &fixture.root, &fixture.root, "alpha", false);
-    // The newest file first, the recorded deletion gone, and the
-    // unrecorded one disclosed.
     assert!(
         data.starts_with("src/fresh/new.rs\n1: fn alpha_again() {}\n\nsrc/b.rs\n"),
         "{data}"
     );
     assert!(!data.contains("c.ts"), "{data}");
-    let (_, data, _) = grep_both(&today, &view, &fixture.root, &fixture.root, "beta", false);
+    let (_, data) = glob_both(&today, &view, &fixture.root, &fixture.root, "**/*.rs");
+    assert_eq!(data[0], created);
+
+    // A deletion neither index is told about: a search that reads the
+    // file says it was not on disk, from either index.
+    std::fs::remove_file(fixture.root.join("docs/readme.md")).unwrap();
+    let (today_text, data, _) =
+        grep_both(&today, &view, &fixture.root, &fixture.root, "beta", false);
+    assert_eq!(today_text, data);
     assert!(data.ends_with("missing on disk: 1"), "{data}");
 }
 

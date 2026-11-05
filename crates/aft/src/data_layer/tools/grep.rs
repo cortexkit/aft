@@ -124,16 +124,30 @@ impl ViewScope {
             pattern.case_insensitive(),
         )
         .unwrap_or(Query::All);
-        let scope = if self.relative.is_empty() {
+        let state = self.view.state();
+        // A root that names one file searches it alone: the planner is
+        // asked about the file's folder, and only the file is kept.
+        let names_file = !self.relative.is_empty()
+            && (state.position(&self.relative).is_some()
+                || matches!(self.changed.get(&self.relative), Some(Some(_))));
+        let folder = if names_file {
+            self.relative
+                .iter()
+                .rposition(|byte| *byte == b'/')
+                .map_or(&[][..], |slash| &self.relative[..slash])
+        } else {
+            &self.relative
+        };
+        let scope = if folder.is_empty() {
             Scope::All
         } else {
-            Scope::Directory(&self.relative)
+            Scope::Directory(folder)
         };
-        let state = self.view.state();
         let files = self
             .view
             .text_candidates(&query, scope)?
             .into_iter()
+            .filter(|path| in_scope(&self.relative, path))
             .filter_map(|path| {
                 let (size, modified) = match self.changed.get(&path) {
                     Some(Some(now)) => *now,
