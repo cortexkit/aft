@@ -164,6 +164,36 @@ pub(crate) fn read(
     decode(&bytes, kind, family, number).map(<[u8]>::to_vec)
 }
 
+/// The refusal [`read`] gives the record at `path` when it names a format
+/// version above the one this build reads for `kind`, as a newer build
+/// writes it. Only the header is read unless it names such a version; then
+/// the whole record is read, so damaged bytes are told apart from a newer
+/// record exactly as [`read`] tells them. `None` for any other record, or
+/// one that cannot be read: whoever reads it later reports why.
+pub(crate) fn newer_version(
+    path: &Path,
+    kind: Kind,
+    family: FamilyId,
+    number: u64,
+) -> Option<RecordError> {
+    let file = crate::fs::open_read(path).ok()?;
+    let mut header = [0; 12];
+    crate::fs::read_exact_at(&file, &mut header, 0).ok()?;
+    drop(file);
+    if array::<8>(&header, 0) != MAGIC
+        || u16_at(&header, 8) != kind.code()
+        || u16_at(&header, 10) <= kind.version()
+    {
+        return None;
+    }
+    match read(path, kind, family, number) {
+        Err(error @ RecordError::UnsupportedVersion { found, supported }) if found > supported => {
+            Some(error)
+        }
+        _ => None,
+    }
+}
+
 /// A cursor over a record's payload. Every read checks the remaining length
 /// and reports a short payload as invalid instead of panicking.
 #[derive(Debug)]

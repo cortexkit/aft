@@ -38,10 +38,29 @@ use super::query::{SliceReader, SliceSource};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 
+/// The name status gives the data layer's family store when it refuses a
+/// file a newer build wrote: the `store` of its `storage_refusals` entry and
+/// of its `storage_requires_newer_reader:<store>` degraded reason.
+///
+/// It is deliberately not a [`crate::persisted_format::PersistedStore`], so
+/// the store has no reader-floor entry and `aft --formats` does not list it.
+/// `scripts/stage-card.sh` refuses to stage a build whose `--formats` lacks
+/// a store the floor names, so a floor entry would stop an older build from
+/// before the data layer existed from being staged for rollback. Such a
+/// build never reads this store, so it needs no floor to protect it; the
+/// refusal below protects it from builds that do read it.
+pub const INDEX_STORE: &str = "index_store";
+
 /// Why the data layer could not do what was asked.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum DataError {
     /// The family store failed: its files could not be read or written.
+    Store(String),
+    /// A newer build wrote a file of the family store in a format version
+    /// above the highest this build reads. The file is refused: nothing is
+    /// built over it, reclaimed or written in its place, and what needs it
+    /// fails with this until a build that reads it runs.
+    NewerFormat(aft_store::family::NewerFormat),
     Store(String),
     /// The checkout could not be scanned.
     Scan(String),
@@ -69,6 +88,7 @@ impl std::fmt::Display for DataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(error) => write!(f, "AFT's index store could not be read: {error}"),
+            Self::NewerFormat(refusal) => f.write_str(&refusal_message(refusal)),
             Self::Scan(error) => write!(f, "AFT could not scan this checkout: {error}"),
             Self::Resolve(error) => write!(f, "AFT could not build this checkout's call graph: {error}"),
             Self::Busy(_) => f.write_str("Another AFT process is writing this repository's index; try again shortly."),
@@ -83,9 +103,45 @@ impl std::fmt::Display for DataError {
 impl std::error::Error for DataError {}
 
 impl DataError {
-    fn store(error: impl std::fmt::Display) -> Self {
-        Self::Store(error.to_string())
+    /// A store failure. A family-store file a newer build wrote stays typed
+    /// as [`Self::NewerFormat`], whichever store error carries it, so every
+    /// path that reaches the store reports the refusal by name.
+    pub(crate) fn store(error: impl std::fmt::Display + 'static) -> Self {
+        let error_any: &dyn std::any::Any = &error;
+        let refusal = error_any
+            .downcast_ref::<aft_store::family::FamilyError>()
+            .and_then(|error| error.newer_format().cloned())
+            .or_else(|| {
+                error_any
+                    .downcast_ref::<aft_store::segment::SegmentError>()
+                    .and_then(aft_store::family::NewerFormat::of_segment)
+            });
+        match refusal {
+            Some(refusal) => Self::NewerFormat(refusal),
+            None => Self::Store(error.to_string()),
+        }
     }
+
+    /// The refusal, when a newer build wrote a file this work needs.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&aft_store::family::NewerFormat> {
+        match self {
+            Self::NewerFormat(refusal) => Some(refusal),
+            _ => None,
+        }
+    }
+}
+
+/// A refused family-store file, in the words today's stores use for an
+/// artifact they refuse (see [`crate::persisted_format`]).
+pub(crate) fn refusal_message(refusal: &aft_store::family::NewerFormat) -> String {
+    format!(
+        "{}: {INDEX_STORE} at {} has format version {}; this build reads up to {}",
+        crate::persisted_format::CODE,
+        refusal.path.display(),
+        refusal.found,
+        refusal.supported
+    )
 }
 
 /// Stops work that runs as an executor job once the job is cancelled. Long
@@ -246,6 +302,9 @@ pub struct Failure {
     /// `build` or `refresh`.
     pub stage: &'static str,
     pub error: String,
+    /// The family-store file a newer build wrote, when that made it fail;
+    /// `error` is then its refusal message.
+    pub refusal: Option<aft_store::family::NewerFormat>,
     /// Another process held the family store's writer past the wait; the
     /// next attempt may succeed without any change.
     pub busy: bool,
@@ -625,6 +684,7 @@ impl Checkout {
                 live.failure = Some(Failure {
                     stage,
                     error: error.to_string(),
+                    refusal: error.refusal().cloned(),
                     busy: matches!(error, DataError::Busy(_)),
                     at_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -921,8 +981,11 @@ impl Checkout {
     fn build_inner(&self) -> Result<BuildReport, DataError> {
         let mut report = BuildReport::default();
         let build_started = Instant::now();
-        // Below the floor the writer refuses anyway; refuse before the scan
-        // and resolution rather than after them.
+        // A newer build wrote a file the build would retire, reclaim or
+        // need: the writer refuses then, so refuse before the scan and
+        // resolution rather than after them. So does the writer below the
+        // free-disk floor.
+        self.family.check_formats().map_err(DataError::store)?;
         self.check_disk_floor()?;
         if !self.planes.callgraph {
             // Without a call graph, a build is the text scan alone.
@@ -1107,7 +1170,9 @@ impl Checkout {
     }
 
     /// Waits up to [`WRITER_WAIT`] for the store's writer, and refuses it
-    /// below the free-disk floor.
+    /// below the free-disk floor. The store itself refuses it, before
+    /// anything is written, when a newer build wrote a file the newest
+    /// generation names ([`DataError::NewerFormat`]).
     fn writer(&self) -> Result<aft_store::family::WriteSession<'_>, DataError> {
         let deadline = Instant::now() + WRITER_WAIT;
         loop {
@@ -1325,7 +1390,10 @@ impl Checkout {
                 }
                 Ok(Some(state)) => states.push(state),
                 Ok(None) => {}
-                // A state this build cannot read could need any segment.
+                // A state this build cannot read (an older format version,
+                // or damaged) could need any segment. One a newer build
+                // wrote is not among them: it fails the build below with its
+                // refusal, so nothing is retired or reclaimed over it.
                 Err(error) if error.is_unusable_file() => {
                     return Ok(Unneeded {
                         segments: Vec::new(),
@@ -1373,8 +1441,9 @@ impl Checkout {
     /// from it. For each one a member needs, readers take the newest
     /// segment that holds it, so only that segment is marked. A member that
     /// needs something no usable segment holds may find it in one this
-    /// build cannot read (another format version, or damaged), so then
-    /// every such segment is marked too.
+    /// build cannot read (an older format version, or damaged), so then
+    /// every such segment is marked too. A segment a newer build wrote fails
+    /// the call with its refusal instead: none is ever left unmarked.
     fn segments_read_by(
         &self,
         snapshot: &Snapshot,
@@ -2073,9 +2142,10 @@ impl Checkout {
     /// This checkout's publication in `snapshot`, or `None` when the
     /// snapshot has no state for it.
     fn open_published(&self, snapshot: Snapshot) -> Result<Option<Published>, DataError> {
-        // A state this build cannot read (another format version, or bytes
+        // A state this build cannot use (an older format version, or bytes
         // that fail their checks) is treated as never published: the
-        // checkout is built again.
+        // checkout is built again. One a newer build wrote fails with its
+        // refusal instead, and nothing is built over it.
         let state = match snapshot.checkout_state(self.checkout) {
             Ok(Some(state)) => state,
             Ok(None) => return Ok(None),
@@ -2115,7 +2185,8 @@ impl Checkout {
     }
 
     /// Opens every segment of `snapshot` this build can use, and names the
-    /// ones it cannot (another format version, or failing their checks).
+    /// ones it cannot (an older format version, or failing their checks).
+    /// A segment a newer build wrote fails the call with its refusal.
     fn open_segments(
         &self,
         snapshot: &Snapshot,
@@ -4011,6 +4082,154 @@ pub fn other() { callee(); }
 
         drop(low);
         checkout.build().unwrap();
+    }
+
+    /// Rewrites the segment format version of every segment the newest
+    /// generation in `store` names, keeping the length the manifest
+    /// published, and returns each path with its new bytes.
+    fn set_segment_versions(store: &Path, version: u16) -> Vec<(PathBuf, Vec<u8>)> {
+        let snapshot = Family::open(store, family()).unwrap().snapshot().unwrap();
+        snapshot
+            .manifest()
+            .segments()
+            .iter()
+            .map(|entry| {
+                let path = snapshot.segment_path(entry.id).unwrap();
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[8..10].copy_from_slice(&version.to_le_bytes());
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(&path, &bytes).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A segment a newer build wrote, named by a manifest this build reads:
+    /// the checkout that published it refuses to bind, another checkout of
+    /// the family binds but its build refuses before it scans or writes, no
+    /// writer can start to reclaim it, and its bytes stay as they are.
+    #[test]
+    fn a_segment_a_newer_build_wrote_is_refused_and_never_rebuilt_over() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        demo(other.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path())
+            .unwrap()
+            .build()
+            .unwrap();
+        let planted = set_segment_versions(store.path(), 99);
+        assert!(!planted.is_empty());
+        let before =
+            ["", "segments", "tmp", "checkouts"].map(|dir| listing(&store.path().join(dir)));
+        let refused = |error: &DataError| {
+            let refusal = error
+                .refusal()
+                .unwrap_or_else(|| panic!("not refused: {error}"));
+            assert!(
+                planted.iter().any(|(path, _)| *path == refusal.path),
+                "{refusal:?}"
+            );
+            assert_eq!((refusal.found, refusal.supported), (99, 1));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "storage_requires_newer_reader: index_store at {} has format version 99; this build reads up to 1",
+                    refusal.path.display()
+                )
+            );
+        };
+
+        // The checkout that reads the segment cannot bind.
+        let error = Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path())
+            .err()
+            .expect("the bind is refused");
+        refused(&error);
+
+        // One with nothing published binds; its build fails with the
+        // refusal, which its failure record keeps, as does a retry.
+        let second =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), other.path()).unwrap();
+        for _ in 0..2 {
+            let error = second.build().unwrap_err();
+            refused(&error);
+            let failure = second.last_failure().unwrap();
+            assert_eq!(failure.refusal.as_ref(), error.refusal());
+            assert_eq!(failure.error, error.to_string());
+        }
+        assert!(second.view().is_none());
+        drop(second);
+
+        // No writer starts, so nothing can retire or reclaim the segment.
+        let family_store = Family::open(store.path(), family()).unwrap();
+        let error = family_store
+            .try_write()
+            .err()
+            .expect("the writer is refused");
+        refused(&DataError::store(error));
+        drop(family_store);
+
+        let after =
+            ["", "segments", "tmp", "checkouts"].map(|dir| listing(&store.path().join(dir)));
+        assert_eq!(after, before, "a file was written or removed");
+        for (path, bytes) in &planted {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+    }
+
+    /// A segment an older build wrote is unusable, as it always was: the
+    /// checkout treats it as absent, builds again, and the build retires it.
+    #[test]
+    fn a_segment_an_older_build_wrote_is_treated_as_absent_and_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path())
+            .unwrap()
+            .build()
+            .unwrap();
+        let planted = set_segment_versions(store.path(), 0);
+        assert!(!planted.is_empty());
+
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        assert!(checkout.view().is_none(), "nothing usable is served");
+        assert!(checkout.needs_build());
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        assert!(callers_of(&view, "src/util.rs", "callee").contains("src/lib.rs"));
+        drop(view);
+        let snapshot = Family::open(store.path(), family())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        for (path, _) in &planted {
+            assert!(
+                snapshot
+                    .manifest()
+                    .segments()
+                    .iter()
+                    .all(|entry| snapshot.segment_path(entry.id).as_ref() != Some(path)),
+                "{} is still published",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -40,5 +40,12 @@ pub use format::{
 pub use reader::{KnownSection, SectionHandle, SectionInfo, Segment};
 pub use writer::{SectionSpec, SegmentMeta, SegmentSummary, SegmentWriter};
 
+/// The refusal [`Segment::open`] would give the file at `path` because a
+/// newer build wrote it in a format version above [`FORMAT_VERSION`], read
+/// from the header's magic and version alone. `None` for any other file.
+pub(crate) fn newer_version(path: &std::path::Path) -> Option<SegmentError> {
+    format::Header::newer_version(path)
+}
+
 #[cfg(test)]
 mod tests;

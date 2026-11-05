@@ -74,14 +74,23 @@ pub enum FamilyError {
         #[source]
         source: io::Error,
     },
-    /// A record written by another format version or for another family.
+    /// A record written by an older format version or for another family.
     #[error("{}: {reason}", path.display())]
     Foreign { path: PathBuf, reason: String },
     /// A file a manifest names is missing or fails its checks.
     #[error("{}: {reason}", path.display())]
     Damaged { path: PathBuf, reason: String },
+    /// A record or segment a newer build wrote, in a format version above
+    /// the highest this build reads. Unlike every other file this build
+    /// cannot use, it is refused: never read past its version, treated as
+    /// absent, rebuilt over, reclaimed or replaced. Rolling back to an older
+    /// build must not destroy what the newer one wrote.
     #[error(transparent)]
-    Segment(#[from] SegmentError),
+    NewerFormat(NewerFormat),
+    /// A segment failure. A segment in a newer format version is reported
+    /// as [`Self::NewerFormat`] instead, never as this.
+    #[error(transparent)]
+    Segment(SegmentError),
     #[error(
         "no snapshot after {0} tries: each generation read was reclaimed before its lease took hold"
     )]
@@ -95,24 +104,38 @@ pub enum FamilyError {
 }
 
 impl FamilyError {
-    /// True when a file cannot be used as it stands: another build's format
+    /// True when a file cannot be used as it stands: an older build's format
     /// version wrote it, or its bytes failed their checks. A reader treats
     /// such a file as absent, and what it held is built again. An I/O
-    /// failure is not one: the file may read fine next time.
+    /// failure is not one: the file may read fine next time. Neither is a
+    /// file in a newer format version ([`Self::newer_format`]): it is
+    /// refused, and nothing is built in its place.
     #[must_use]
     pub fn is_unusable_file(&self) -> bool {
         match self {
             Self::Foreign { .. } | Self::Damaged { .. } => true,
             Self::Segment(error) => {
                 error.is_corruption()
-                    || matches!(
-                        error.kind(),
-                        crate::segment::ErrorKind::UnsupportedVersion { .. }
-                            | crate::segment::ErrorKind::UnknownRequiredSection { .. }
-                            | crate::segment::ErrorKind::NotASegment
-                    )
+                    || match error.kind() {
+                        crate::segment::ErrorKind::UnsupportedVersion { found, supported } => {
+                            found < supported
+                        }
+                        crate::segment::ErrorKind::UnknownRequiredSection { .. }
+                        | crate::segment::ErrorKind::NotASegment => true,
+                        _ => false,
+                    }
             }
             _ => false,
+        }
+    }
+
+    /// The refusal, when a newer build wrote the file in a format version
+    /// above the highest this build reads.
+    #[must_use]
+    pub fn newer_format(&self) -> Option<&NewerFormat> {
+        match self {
+            Self::NewerFormat(refusal) => Some(refusal),
+            _ => None,
         }
     }
 
@@ -133,6 +156,14 @@ impl FamilyError {
                 path: path.to_path_buf(),
                 reason: format!("the record's bytes do not check ({reason})"),
             },
+            RecordError::UnsupportedVersion { found, supported } if found > supported => {
+                Self::NewerFormat(NewerFormat {
+                    path: path.to_path_buf(),
+                    file: FileKind::Record,
+                    found,
+                    supported,
+                })
+            }
             foreign => Self::Foreign {
                 path: path.to_path_buf(),
                 reason: foreign.to_string(),
@@ -140,6 +171,75 @@ impl FamilyError {
         }
     }
 }
+
+impl From<SegmentError> for FamilyError {
+    fn from(error: SegmentError) -> Self {
+        match NewerFormat::of_segment(&error) {
+            Some(refusal) => Self::NewerFormat(refusal),
+            None => Self::Segment(error),
+        }
+    }
+}
+
+/// Which kind of family file a [`NewerFormat`] refusal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    /// A manifest, horizon, checkout state or lease record.
+    Record,
+    /// A segment.
+    Segment,
+}
+
+/// A family file that a newer build wrote, in a format version above the
+/// highest this build reads (see [`FamilyError::NewerFormat`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewerFormat {
+    pub path: PathBuf,
+    pub file: FileKind,
+    /// The format version the file names.
+    pub found: u16,
+    /// The highest format version of its kind this build reads.
+    pub supported: u16,
+}
+
+impl NewerFormat {
+    /// The refusal a segment error carries, when the segment names a format
+    /// version above the one this build reads.
+    #[must_use]
+    pub fn of_segment(error: &SegmentError) -> Option<Self> {
+        match *error.kind() {
+            crate::segment::ErrorKind::UnsupportedVersion { found, supported }
+                if found > supported =>
+            {
+                Some(Self {
+                    path: error.path().to_path_buf(),
+                    file: FileKind::Segment,
+                    found,
+                    supported,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NewerFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self.file {
+            FileKind::Record => "record",
+            FileKind::Segment => "segment",
+        };
+        write!(
+            f,
+            "{}: {kind} format version {} is not supported; this build reads version {}",
+            self.path.display(),
+            self.found,
+            self.supported
+        )
+    }
+}
+
+impl std::error::Error for NewerFormat {}
 
 /// One family's directory, opened by this process.
 #[derive(Debug)]
@@ -191,7 +291,8 @@ impl Family {
     ///
     /// When the family's files cannot be read, the newest manifest is from
     /// another format version or family, or reclamation kept outrunning the
-    /// lease.
+    /// lease. A manifest or horizon a newer build wrote fails it with
+    /// [`FamilyError::NewerFormat`].
     pub fn snapshot(&self) -> Result<Snapshot, FamilyError> {
         snapshot::take(self)
     }
@@ -215,7 +316,10 @@ impl Family {
     ///
     /// # Errors
     ///
-    /// When the lock file or the family's files cannot be read or cleaned.
+    /// When the lock file or the family's files cannot be read or cleaned,
+    /// and with [`FamilyError::NewerFormat`], before anything is removed or
+    /// written, when a newer build wrote the newest generation or a file it
+    /// names (see [`check_formats`](Self::check_formats)).
     pub fn try_write(&self) -> Result<Option<WriteSession<'_>>, FamilyError> {
         let path = self.layout.writer_lock();
         let mut options = OpenOptions::new();
@@ -231,6 +335,39 @@ impl Family {
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(FamilyError::io(&path)(error)),
         }
+    }
+
+    /// Fails with [`FamilyError::NewerFormat`] when a newer build wrote the
+    /// newest manifest, or a segment or checkout state it names, in a format
+    /// version above the highest this build reads: this build can then
+    /// neither read the family whole nor write it without harming what the
+    /// newer build wrote. Reads only each named file's header unless the
+    /// header names a newer version. A named file that cannot be read is left
+    /// to the reader that needs it, which reports why.
+    ///
+    /// # Errors
+    ///
+    /// That refusal, or a failure to read the newest manifest.
+    pub fn check_formats(&self) -> Result<(), FamilyError> {
+        let (manifest, _) = self.newest_manifest()?;
+        self.check_named_formats(&manifest)
+    }
+
+    /// The [`check_formats`](Self::check_formats) refusal for the files
+    /// `manifest` names.
+    fn check_named_formats(&self, manifest: &Manifest) -> Result<(), FamilyError> {
+        for entry in manifest.segments() {
+            if let Some(error) = crate::segment::newer_version(&self.layout.segment(entry.id)) {
+                return Err(error.into());
+            }
+        }
+        for state in manifest.checkouts() {
+            let path = self.layout.state(state.checkout, state.number);
+            if let Some(error) = record::newer_version(&path, Kind::State, self.id, state.number) {
+                return Err(FamilyError::record(&path, error));
+            }
+        }
+        Ok(())
     }
 
     /// This process's owner file in the family, created on first use.

@@ -583,3 +583,177 @@ fn the_newest_generation_is_read_without_a_lease() {
     assert!(second > first);
     assert_eq!(family.newest_generation().unwrap(), second);
 }
+
+/// Rewrites the record at `from` as a newer or older build would have
+/// written it: `version` in the kind's format version field (bytes 10..12),
+/// `number` in the number field (bytes 32..40), and the checksum over both,
+/// so its bytes check. Writes it to `to`, replacing any file there.
+fn rewrite_record(from: &Path, to: &Path, version: u16, number: u64) -> Vec<u8> {
+    let mut bytes = std::fs::read(from).unwrap();
+    bytes[10..12].copy_from_slice(&version.to_le_bytes());
+    bytes[32..40].copy_from_slice(&number.to_le_bytes());
+    let body = bytes.len() - Digest128::LEN;
+    let checksum = Digest128::of(&bytes[..body]);
+    bytes[body..].copy_from_slice(checksum.as_bytes());
+    let _ = std::fs::remove_file(to);
+    std::fs::write(to, &bytes).unwrap();
+    bytes
+}
+
+/// Rewrites the segment format version (bytes 8..10) of the segment at
+/// `path`, leaving its length as the manifest published it.
+fn rewrite_segment_version(path: &Path, version: u16) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[8..10].copy_from_slice(&version.to_le_bytes());
+    std::fs::remove_file(path).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+fn assert_newer(error: &FamilyError, path: &Path, file: FileKind, found: u16) {
+    assert!(!error.is_unusable_file(), "refused, not unusable: {error}");
+    assert_eq!(
+        error.newer_format(),
+        Some(&NewerFormat {
+            path: path.to_path_buf(),
+            file,
+            found,
+            supported: 1,
+        }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_manifest_a_newer_build_wrote_is_refused_and_nothing_is_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"state");
+    let planted = family.layout.manifest(Generation::new(2));
+    let bytes = rewrite_record(&family.layout.manifest(Generation::new(1)), &planted, 2, 2);
+    // A segment an earlier writer left unpublished, which starting a writer
+    // would otherwise remove.
+    let leftover = family.layout.tmp_segment(SegmentId::new(9));
+    std::fs::write(&leftover, b"leftover").unwrap();
+
+    assert_newer(
+        &family.snapshot().unwrap_err(),
+        &planted,
+        FileKind::Record,
+        2,
+    );
+    assert_newer(
+        &family.check_formats().unwrap_err(),
+        &planted,
+        FileKind::Record,
+        2,
+    );
+    assert_newer(
+        &family.try_write().err().expect("the writer is refused"),
+        &planted,
+        FileKind::Record,
+        2,
+    );
+    assert_eq!(std::fs::read(&planted).unwrap(), bytes);
+    assert!(leftover.exists(), "a refused writer removed nothing");
+}
+
+#[test]
+fn a_manifest_an_older_build_wrote_stays_unusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"state");
+    let planted = family.layout.manifest(Generation::new(2));
+    rewrite_record(&family.layout.manifest(Generation::new(1)), &planted, 0, 2);
+    let error = family.snapshot().unwrap_err();
+    assert!(matches!(error, FamilyError::Foreign { .. }), "{error}");
+    assert!(error.is_unusable_file());
+    assert_eq!(error.newer_format(), None);
+}
+
+#[test]
+fn a_segment_a_newer_build_wrote_is_refused_and_never_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"state");
+    let snapshot = family.snapshot().unwrap();
+    let id = snapshot.manifest().segments()[0].id;
+    let path = family.layout.segment(id);
+    let bytes = rewrite_segment_version(&path, 2);
+
+    assert_newer(
+        &snapshot.open_segment(id, &known(), cache()).unwrap_err(),
+        &path,
+        FileKind::Segment,
+        2,
+    );
+    drop(snapshot);
+    assert_newer(
+        &family.check_formats().unwrap_err(),
+        &path,
+        FileKind::Segment,
+        2,
+    );
+    // No writer starts, so nothing can publish a generation without the
+    // segment or reclaim it.
+    assert_newer(
+        &family.try_write().err().expect("the writer is refused"),
+        &path,
+        FileKind::Segment,
+        2,
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_segment_an_older_build_wrote_stays_unusable_and_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"state");
+    let snapshot = family.snapshot().unwrap();
+    let id = snapshot.manifest().segments()[0].id;
+    let path = family.layout.segment(id);
+    rewrite_segment_version(&path, 0);
+    let error = snapshot.open_segment(id, &known(), cache()).unwrap_err();
+    assert!(error.is_unusable_file(), "{error}");
+    assert_eq!(error.newer_format(), None);
+    drop(snapshot);
+    family.check_formats().unwrap();
+
+    // A writer still starts, replaces the segment, and reclaims it.
+    publish(&family, b"two", b"state");
+    let mut session = family.try_write().unwrap().unwrap();
+    assert_eq!(session.reclaim().unwrap().removed_segments, 1);
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_checkout_state_a_newer_build_wrote_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"state");
+    let path = family.layout.state(checkout("main"), 1);
+    let bytes = rewrite_record(&path, &path, 2, 1);
+    // The manifest named the state's payload, which is unchanged.
+    let snapshot = family.snapshot().unwrap();
+    assert_newer(
+        &snapshot.read_state(checkout("main")).unwrap_err(),
+        &path,
+        FileKind::Record,
+        2,
+    );
+    drop(snapshot);
+    assert_newer(
+        &family.check_formats().unwrap_err(),
+        &path,
+        FileKind::Record,
+        2,
+    );
+    assert_newer(
+        &family.try_write().err().expect("the writer is refused"),
+        &path,
+        FileKind::Record,
+        2,
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}

@@ -3729,14 +3729,21 @@ fn build_health_diagnostic_rollup_from_actors(
         .iter()
         .filter(|candidate| !candidate.busy && !candidate.fully_ready)
         .count();
-    // Roots whose data-layer checkout could not bind, build or refresh.
-    // Present only while the data layer runs.
+    // Roots whose data-layer checkout could not bind, build or refresh, or
+    // whose store a newer build wrote. Present only while the data layer
+    // runs.
     let data_store_failed_roots = candidates
         .iter()
         .filter(|candidate| {
             candidate.health.data_store.as_ref().is_some_and(|store| {
                 store.failure.is_some()
-                    || store.reason == Some(crate::data_layer::surfaces::reason::BIND_FAILED)
+                    || matches!(
+                        store.reason,
+                        Some(
+                            crate::data_layer::surfaces::reason::BIND_FAILED
+                                | crate::data_layer::surfaces::reason::REQUIRES_NEWER_READER
+                        )
+                    )
             })
         })
         .count();

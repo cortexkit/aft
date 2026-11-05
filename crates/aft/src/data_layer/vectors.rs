@@ -219,8 +219,8 @@ pub fn cut_file(root: &Path, path: &[u8], bytes: &[u8], caps: EmbedTextCaps) -> 
     }
 }
 
-fn store_error(error: impl std::fmt::Display) -> DataError {
-    DataError::Store(error.to_string())
+fn store_error(error: impl std::fmt::Display + 'static) -> DataError {
+    DataError::store(error)
 }
 
 /// How much of a checkout meaning search covers, worked out from its

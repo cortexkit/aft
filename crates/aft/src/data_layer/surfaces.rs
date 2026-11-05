@@ -22,10 +22,14 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use super::checkout::{CheckoutMemory, CheckoutStatus, EngineMemory, PlaneStatus};
+use super::checkout::{
+    refusal_message, CheckoutMemory, CheckoutStatus, DataError, EngineMemory, PlaneStatus,
+    INDEX_STORE,
+};
 use super::runtime::{DataCheckout, DataFailure};
 use crate::context::AppContext;
 use crate::memory::MemoryEstimate;
+use aft_store::family::NewerFormat;
 
 /// A plane's state on the status surfaces, in the words the consumers of
 /// `feature_status` already use.
@@ -50,6 +54,10 @@ pub(crate) mod reason {
     /// The store's disk has less free space than AFT's floor, so nothing
     /// new is written; the error is the approved pause sentence.
     pub(crate) const DISK_RESERVE: &str = "disk_reserve";
+    /// A newer build wrote a file of the family store in a format version
+    /// above what this build reads, so the store is refused; the error is
+    /// the refusal message. The same code today's stores use for theirs.
+    pub(crate) const REQUIRES_NEWER_READER: &str = crate::persisted_format::CODE;
     /// Configure leaves the root unindexed: it is too broad to index (a
     /// filesystem or volume root), or it is the home folder.
     pub(crate) const ROOT_TOO_BROAD: &str = crate::feature_status::cause::ROOT_TOO_BROAD;
@@ -64,7 +72,7 @@ pub(crate) enum DataCheckoutProbe {
     /// is briefly held.
     Binding,
     /// The last bind failed, with the error.
-    BindFailed(String),
+    BindFailed(DataError),
     /// The root is never bound; see [`Withheld`].
     Withheld(Withheld),
     Bound(Arc<DataCheckout>),
@@ -110,7 +118,9 @@ impl PlaneReport {
     }
 
     fn failed(failure: &DataFailure) -> Self {
-        let reason = if crate::view_storage_reserve::is_message(&failure.error) {
+        let reason = if failure.refusal.is_some() {
+            reason::REQUIRES_NEWER_READER
+        } else if crate::view_storage_reserve::is_message(&failure.error) {
             reason::DISK_RESERVE
         } else if failure.busy {
             reason::STORE_BUSY
@@ -156,6 +166,9 @@ pub(crate) struct DataStoreReport {
     /// The last build or refresh that failed, until one succeeds; kept even
     /// while an older publication still serves.
     pub(crate) failure: Option<DataFailure>,
+    /// The family-store file a newer build wrote, when the last bind, build
+    /// or refresh refused it; status lists it among its storage refusals.
+    pub(crate) refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
 }
@@ -170,6 +183,7 @@ impl DataStoreReport {
             pending_edits: 0,
             unparsed_files: 0,
             failure: None,
+            refusal: None,
             family_dir: None,
         }
     }
@@ -248,11 +262,20 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
             DataStoreReport::both(PlaneReport::because(OFF, reason::NOT_BOUND, None))
         }
         DataCheckoutProbe::Binding => DataStoreReport::both(PlaneReport::of(BUILDING)),
-        DataCheckoutProbe::BindFailed(error) => DataStoreReport::both(PlaneReport::because(
-            UNAVAILABLE,
-            reason::BIND_FAILED,
-            Some(error),
-        )),
+        DataCheckoutProbe::BindFailed(error) => {
+            let reason = match error.refusal() {
+                Some(_) => reason::REQUIRES_NEWER_READER,
+                None => reason::BIND_FAILED,
+            };
+            DataStoreReport {
+                refusal: error.refusal().cloned(),
+                ..DataStoreReport::both(PlaneReport::because(
+                    UNAVAILABLE,
+                    reason,
+                    Some(error.to_string()),
+                ))
+            }
+        }
         // As today's indexes report these roots.
         DataCheckoutProbe::Withheld(Withheld::TooBroad) => {
             DataStoreReport::both(PlaneReport::because(OFF, reason::ROOT_TOO_BROAD, None))
@@ -264,6 +287,32 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
             DataStoreReport::both(PlaneReport::of(OFF))
         }
         DataCheckoutProbe::Bound(checkout) => report_of(&checkout),
+    })
+}
+
+/// The family-store file a newer build wrote that `ctx`'s checkout refused
+/// at its last bind, build or refresh, without binding it; `None` when the
+/// data layer is off or nothing was refused.
+pub(crate) fn storage_refusal(ctx: &AppContext) -> Option<NewerFormat> {
+    report(ctx)?.refusal
+}
+
+/// The degraded reason status gives a refused family store, in the form
+/// today's stores give theirs: `storage_requires_newer_reader:index_store`.
+pub(crate) fn refusal_reason() -> String {
+    format!("{}:{INDEX_STORE}", crate::persisted_format::CODE)
+}
+
+/// The `storage_refusals` entry status gives a refused family-store file,
+/// shaped as today's stores' entries.
+pub(crate) fn refusal_json(refusal: &NewerFormat) -> Value {
+    json!({
+        "code": crate::persisted_format::CODE,
+        "store": INDEX_STORE,
+        "path": refusal.path.display().to_string(),
+        "found": refusal.found,
+        "supported": refusal.supported,
+        "message": refusal_message(refusal),
     })
 }
 
@@ -322,6 +371,7 @@ fn report_from(
         indexed_files,
         pending_edits: status.callgraph_pending,
         unparsed_files: status.unparsed,
+        refusal: failure.as_ref().and_then(|failure| failure.refusal.clone()),
         failure,
         family_dir,
     }
@@ -524,6 +574,8 @@ fn warm_state(plane: &PlaneReport, files: Option<usize>, indexed: Option<usize>)
         _ => {
             let reason = plane.reason.unwrap_or(plane.status);
             WarmState::Failed(match &plane.error {
+                // A refusal's message already starts with its code.
+                Some(error) if error.starts_with(reason) => error.clone(),
                 Some(error) => format!("{reason}: {error}"),
                 None => reason.to_string(),
             })
@@ -782,6 +834,7 @@ mod tests {
         failure.map(|(stage, busy)| DataFailure {
             stage,
             error: format!("{stage} broke"),
+            refusal: None,
             busy,
             at_ms: 7,
         })
@@ -1274,5 +1327,115 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(report(&ctx).unwrap().files, Some(4));
+    }
+
+    /// A segment a newer build wrote into this root's family store, named
+    /// by a manifest this build reads: the bind refuses it by name, and
+    /// explicit status, status pushes and health report the refusal as
+    /// today's stores report theirs.
+    #[test]
+    fn a_store_file_a_newer_build_wrote_is_refused_on_every_status_surface() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context(&root, storage.path());
+        assert!(ctx.data_checkout().is_some());
+        settled(&ctx);
+        assert!(ctx.try_release_idle_checkout_views());
+
+        // Every segment on disk names segment format version 99, as a newer
+        // build would write it; the length the manifest published holds.
+        let families = std::fs::read_dir(storage.path().join("data"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(families.len(), 1, "{families:?}");
+        let mut segments = std::fs::read_dir(families[0].join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        segments.sort();
+        let mut planted = Vec::new();
+        for path in &segments {
+            let mut bytes = std::fs::read(path).unwrap();
+            bytes[8..10].copy_from_slice(&99u16.to_le_bytes());
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, &bytes).unwrap();
+            planted.push(bytes);
+        }
+
+        assert!(ctx.data_checkout().is_none(), "the bind is refused");
+        let Some(DataCheckoutProbe::BindFailed(error)) = ctx.probe_data_checkout() else {
+            panic!("the bind failure is kept");
+        };
+        let refusal = error.refusal().expect("kept typed").clone();
+        assert!(segments.contains(&refusal.path), "{refusal:?}");
+        assert_eq!(
+            (refusal.file, refusal.found, refusal.supported),
+            (aft_store::family::FileKind::Segment, 99, 1)
+        );
+        let message = format!(
+            "storage_requires_newer_reader: index_store at {} has format version 99; this build reads up to 1",
+            refusal.path.display()
+        );
+        assert_eq!(error.to_string(), message);
+        let entry = json!({
+            "code": "storage_requires_newer_reader",
+            "store": "index_store",
+            "path": refusal.path.display().to_string(),
+            "found": 99,
+            "supported": 1,
+            "message": message,
+        });
+        let reason = json!("storage_requires_newer_reader:index_store");
+
+        let explicit = ctx.build_status_snapshot();
+        assert_eq!(explicit["degraded"], true);
+        assert!(
+            explicit["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&reason),
+            "{explicit:#}"
+        );
+        assert_eq!(explicit["storage_refusals"], json!([entry]));
+        for plane in ["search_index", "callgraph_store"] {
+            assert_eq!(explicit[plane]["status"], UNAVAILABLE, "{plane}");
+            assert_eq!(
+                explicit[plane]["reason"],
+                reason::REQUIRES_NEWER_READER,
+                "{plane}"
+            );
+        }
+        assert_eq!(explicit["data_store"]["error"], message);
+
+        let pushed = ctx.try_build_status_push_snapshot().unwrap();
+        assert_eq!(pushed["degraded"], true);
+        assert!(
+            pushed["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&reason),
+            "{pushed:#}"
+        );
+        assert_eq!(pushed["storage_refusals"], json!([entry]));
+        assert_eq!(pushed["storage_refusals_total"], 1);
+        assert_eq!(pushed["storage_refusals_omitted"], 0);
+
+        let health = ctx.try_health_snapshot(&root).data_store.unwrap();
+        assert_eq!(health.reason, Some(reason::REQUIRES_NEWER_READER));
+        assert_eq!(health.error.as_deref(), Some(message.as_str()));
+
+        // Nothing was rebuilt over the refused segments or reclaimed.
+        let mut after = std::fs::read_dir(families[0].join("segments"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        after.sort();
+        assert_eq!(after, segments);
+        for (path, bytes) in segments.iter().zip(&planted) {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
     }
 }

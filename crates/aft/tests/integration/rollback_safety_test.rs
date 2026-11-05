@@ -258,6 +258,75 @@ fn assert_status_lists(ctx: &AppContext, store: PersistedStore) -> Value {
     status
 }
 
+/// Status names a refused data-layer index store as today's stores are
+/// named: `storage_requires_newer_reader:index_store` among the degraded
+/// reasons, and a `storage_refusals` entry for the refused file.
+fn assert_status_lists_index_store(ctx: &AppContext, path: &Path) -> Value {
+    let status = ctx.build_status_snapshot();
+    let reason = format!("{CODE}:{}", aft::data_layer::checkout::INDEX_STORE);
+    assert_eq!(reason, "storage_requires_newer_reader:index_store");
+    assert!(
+        status["degraded_reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|value| value == &json!(reason))),
+        "degraded_reasons must name {reason}: {}",
+        status["degraded_reasons"]
+    );
+    let entry = json!({
+        "code": CODE,
+        "store": "index_store",
+        "path": path.display().to_string(),
+        "found": FUTURE,
+        "supported": 1,
+        "message": format!(
+            "{CODE}: index_store at {} has format version {FUTURE}; this build reads up to 1",
+            path.display()
+        ),
+    });
+    assert!(
+        status["storage_refusals"]
+            .as_array()
+            .is_some_and(|refusals| refusals.contains(&entry)),
+        "storage_refusals must list {entry}: {}",
+        status["storage_refusals"]
+    );
+    for plane in ["search_index", "callgraph_store"] {
+        assert_eq!(
+            status[plane]["status"], "unavailable",
+            "{plane}: {status:#}"
+        );
+        assert_eq!(status[plane]["reason"], CODE, "{plane}: {status:#}");
+    }
+    assert_eq!(status["data_store"]["error"], entry["message"]);
+    status
+}
+
+/// The names in `dir` and every folder under it, sorted.
+fn tree(dir: &Path) -> Vec<PathBuf> {
+    let mut names = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(folder) = pending.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            names.push(path.strip_prefix(dir).unwrap().to_path_buf());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// The names in the store folders an older build writes to or reclaims
+/// from: everything but the leases a reader takes while it reads.
+fn written(family_dir: &Path) -> Vec<PathBuf> {
+    tree(family_dir)
+        .into_iter()
+        .filter(|path| !path.starts_with("leases") && !path.starts_with("incoming"))
+        .collect()
+}
+
 /// The data layer's index store (`<storage>/data/<family>/`): a manifest a
 /// newer build published is refused, left as it is, and named on status.
 #[test]
@@ -303,8 +372,7 @@ fn future_index_store_manifest_is_refused_by_name_and_left_byte_identical() {
     bytes[body..].copy_from_slice(checksum.as_bytes());
     let planted = family_dir.join(format!("MANIFEST-{}", newest + 1));
     fs::write(&planted, &bytes).unwrap();
-    let family_before = listing(family_dir);
-    let segments_before = listing(&family_dir.join("segments"));
+    let before = written(family_dir);
 
     let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": true }));
     // The first query of the root binds its checkout in the data layer: it
@@ -331,35 +399,125 @@ fn future_index_store_manifest_is_refused_by_name_and_left_byte_identical() {
         "newer manifest was changed"
     );
     assert_eq!(
-        listing(family_dir),
-        family_before,
-        "a new generation was published or a file removed"
+        written(family_dir),
+        before,
+        "a generation, segment or state was written, or a file removed"
     );
-    assert_eq!(
-        listing(&family_dir.join("segments")),
-        segments_before,
-        "a segment was written or removed"
+    // The refusal is named as today's stores name theirs: in the degraded
+    // reasons and storage refusals, and as the reason both planes are
+    // unavailable, rather than as a failed bind.
+    assert_status_lists_index_store(&ctx, &planted);
+}
+
+/// The data layer's index store: a segment in a newer format, named by a
+/// manifest this build reads, is refused by name, never rebuilt over or
+/// reclaimed, and named on status; a foreground build of the root fails
+/// with the same refusal.
+#[test]
+fn future_index_store_segment_is_refused_by_name_and_left_byte_identical() {
+    let fixture = Fixture::new();
+    aft::data_layer::surfaces::index_root(
+        &fixture.project,
+        &fixture.storage,
+        aft::data_layer::checkout::Planes::ALL,
+    )
+    .expect("index the fixture");
+    let families = fs::read_dir(fixture.storage.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(families.len(), 1, "one family store: {families:?}");
+    let family_dir = &families[0];
+    // A segment's header names its format version at bytes 8..10, which a
+    // reader checks before anything else after the magic; see aft-store's
+    // segment/format.rs. Every segment on disk gets the newer version, so
+    // the one the newest manifest names is among them; their lengths, which
+    // the manifest published, are unchanged.
+    let mut planted = fs::read_dir(family_dir.join("segments"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[8..10].copy_from_slice(&u16::try_from(FUTURE).unwrap().to_le_bytes());
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    planted.sort();
+    assert!(!planted.is_empty(), "index_root published a segment");
+    let before = written(family_dir);
+    let unchanged = |when: &str| {
+        for (path, bytes) in &planted {
+            assert_eq!(
+                &fs::read(path).unwrap(),
+                bytes,
+                "{} was changed {when}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            written(family_dir),
+            before,
+            "a file was written or removed {when}"
+        );
+    };
+
+    let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": true }));
+    let grep: RawRequest = serde_json::from_value(json!({
+        "id": "grep-rollback-safety",
+        "command": "grep",
+        "pattern": "greet",
+    }))
+    .expect("grep request");
+    let response = aft::commands::grep::handle_grep(&grep, &ctx);
+    assert!(
+        response.success,
+        "grep still answers, by walking: {:?}",
+        response.data
     );
+    settle(&ctx, "index store", |ctx| {
+        ctx.build_status_snapshot()["search_index"]["status"] == "unavailable"
+    });
+    unchanged("by the bind");
     let status = ctx.build_status_snapshot();
-    for plane in ["search_index", "callgraph_store"] {
-        assert_eq!(
-            status[plane]["status"], "unavailable",
-            "{plane}: {status:#}"
-        );
-        assert_eq!(
-            status[plane]["reason"], "bind_failed",
-            "{plane}: {status:#}"
-        );
-    }
-    let error = status["data_store"]["error"].as_str().unwrap_or_default();
+    let refused = status["storage_refusals"]
+        .as_array()
+        .and_then(|refusals| {
+            refusals
+                .iter()
+                .find(|refusal| refusal["store"] == "index_store")
+        })
+        .and_then(|refusal| refusal["path"].as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("no index_store refusal: {status:#}"));
     assert!(
-        error.contains(&planted.display().to_string()),
-        "the refusal must name {}: {error}",
-        planted.display()
+        planted.iter().any(|(path, _)| *path == refused),
+        "the refusal names {}, not a planted segment",
+        refused.display()
     );
-    assert!(
-        error.contains(&FUTURE.to_string()),
-        "the refusal must carry the version: {error}"
+    assert_status_lists_index_store(&ctx, &refused);
+
+    // A foreground build, as `aft index` runs it, fails with the refusal and
+    // neither rebuilds over the segment nor reclaims it.
+    let error = aft::data_layer::surfaces::index_root(
+        &fixture.project,
+        &fixture.storage,
+        aft::data_layer::checkout::Planes::ALL,
+    )
+    .expect_err("the build is refused");
+    assert_named_index_store(&error, &refused);
+    unchanged("by the foreground build");
+}
+
+/// As [`assert_named`], for the data layer's index store.
+fn assert_named_index_store(reason: &str, path: &Path) {
+    assert_eq!(
+        reason,
+        format!(
+            "{CODE}: index_store at {} has format version {FUTURE}; this build reads up to 1",
+            path.display()
+        )
     );
 }
 

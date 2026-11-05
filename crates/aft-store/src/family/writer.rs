@@ -101,6 +101,11 @@ pub enum ReclaimOutcome {
 impl<'f> WriteSession<'f> {
     pub(super) fn start(family: &'f Family, lock: File) -> Result<Self, FamilyError> {
         let layout = &family.layout;
+        // A generation a newer build wrote, or one naming a file it wrote,
+        // is refused before anything here is removed or written: an older
+        // build must never change what a newer one left.
+        let (base, _) = family.newest_manifest()?;
+        family.check_named_formats(&base)?;
         // Only the lock holder writes `tmp/`, so whatever is there was left
         // by an earlier writer that ended before publishing it.
         let mut next_segment = 1;
@@ -115,7 +120,6 @@ impl<'f> WriteSession<'f> {
                 next_segment = next_segment.max(id + 1);
             }
         }
-        let (base, _) = family.newest_manifest()?;
         next_segment = next_segment.max(base.next_segment().get());
         let manifests = numbered_desc(&layout.dir, MANIFEST_PREFIX)?;
         let next_generation = manifests

@@ -489,7 +489,10 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
     let key = ctx.cached_artifact_cache_key(&canonical);
     let (owned, unattributed) =
         crate::persisted_format::refusals_for_push(&storage, key.as_deref());
-    let total = owned.len();
+    // This root's data-layer family store, refused as today's stores are,
+    // counts and is listed with them.
+    let data_store_refusal = crate::data_layer::surfaces::storage_refusal(ctx);
+    let total = owned.len() + usize::from(data_store_refusal.is_some());
     let mut reasons: Vec<Value> = object
         .get("degraded_reasons")
         .and_then(Value::as_array)
@@ -513,11 +516,16 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
             reasons.push(reason);
         }
     }
+    if data_store_refusal.is_some() {
+        let reason = serde_json::json!(crate::data_layer::surfaces::refusal_reason());
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
     object.insert("degraded".into(), serde_json::json!(!reasons.is_empty()));
     object.insert("degraded_reasons".into(), Value::Array(reasons));
     let details: Vec<_> = owned
         .iter()
-        .take(REFUSAL_DETAILS)
         .map(|refusal| {
             serde_json::json!({
                 "code":crate::persisted_format::CODE,"store":refusal.store.name(),
@@ -525,6 +533,12 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
                 "supported":refusal.supported,"message":refusal.to_string(),
             })
         })
+        .chain(
+            data_store_refusal
+                .as_ref()
+                .map(crate::data_layer::surfaces::refusal_json),
+        )
+        .take(REFUSAL_DETAILS)
         .collect();
     let omitted = total - details.len();
     object.insert("storage_refusals".into(), Value::Array(details));

@@ -111,7 +111,9 @@ fn bind_failures() -> &'static std::sync::Mutex<std::collections::HashMap<PathBu
 struct BindFailure {
     retry_at: Instant,
     in_a_row: u32,
-    error: String,
+    /// Kept whole, so a bind tried again before `retry_at` fails as the
+    /// last one did, a refused store file included.
+    error: DataError,
 }
 
 fn backoff(first: Duration, max: Duration, in_a_row: u32) -> Duration {
@@ -531,7 +533,7 @@ impl DataCheckout {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(failure) = failures.get(root) {
                 if Instant::now() < failure.retry_at {
-                    return Err(DataError::Store(failure.error.clone()));
+                    return Err(failure.error.clone());
                 }
             }
         }
@@ -557,7 +559,7 @@ impl DataCheckout {
                     BindFailure {
                         retry_at: Instant::now() + backoff(BIND_RETRY, BIND_RETRY_MAX, in_a_row),
                         in_a_row,
-                        error: error.to_string(),
+                        error: error.clone(),
                     },
                 );
                 return Err(error);

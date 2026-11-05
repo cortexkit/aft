@@ -4824,8 +4824,9 @@ pub struct AppContext {
     /// `data_layer::runtime`).
     data_checkout: parking_lot::Mutex<Option<Arc<crate::data_layer::runtime::DataCheckout>>>,
     /// Why the last attempt to bind `data_checkout` failed, until one
-    /// succeeds; status and health report it.
-    data_bind_failure: parking_lot::Mutex<Option<String>>,
+    /// succeeds; status and health report it. Kept typed, so a store file a
+    /// newer build wrote is reported as that refusal.
+    data_bind_failure: parking_lot::Mutex<Option<crate::data_layer::checkout::DataError>>,
     /// When this root is a parent folder of repositories, its children's
     /// checkouts in the data layer; empty otherwise (see
     /// `data_layer::parent`).
@@ -9983,7 +9984,7 @@ impl AppContext {
                 }
                 Err(error) => {
                     crate::slog_warn!("data layer could not bind {}: {error}", root.display());
-                    *self.data_bind_failure.lock() = Some(error.to_string());
+                    *self.data_bind_failure.lock() = Some(error);
                     None
                 }
             };

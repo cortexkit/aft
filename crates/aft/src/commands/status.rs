@@ -512,6 +512,15 @@ impl AppContext {
         } else {
             Vec::new()
         };
+        // With the data layer on, its family store refuses a file a newer
+        // build wrote as today's stores refuse theirs, and is listed the
+        // same way, after them. Push projection adds it itself, with this
+        // project's other refusals.
+        let data_store_report = crate::data_layer::surfaces::report(self);
+        let data_store_refusal = data_store_report
+            .as_ref()
+            .and_then(|report| report.refusal.as_ref())
+            .filter(|_| kind == StatusSnapshotKind::Explicit);
         for refusal in &storage_refusals {
             // A single unreadable task does not disable bash for any other
             // task or session. Health still lists it by path below; a floor
@@ -522,6 +531,12 @@ impl AppContext {
                 continue;
             }
             let reason = refusal.reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        if data_store_refusal.is_some() {
+            let reason = crate::data_layer::surfaces::refusal_reason();
             if !degraded_reasons.contains(&reason) {
                 degraded_reasons.push(reason);
             }
@@ -538,6 +553,7 @@ impl AppContext {
                     "message": refusal.to_string(),
                 })
             })
+            .chain(data_store_refusal.map(crate::data_layer::surfaces::refusal_json))
             .collect::<Vec<_>>();
         // Git being off is a machine-wide, per-process fact rather than a
         // property of this root, so it is added here instead of being
@@ -669,8 +685,8 @@ impl AppContext {
         }
         // With the data layer on, its planes replace today's stores for text
         // and the call graph on every status surface.
-        if let Some(report) = crate::data_layer::surfaces::report(self) {
-            crate::data_layer::surfaces::apply_to_status(&mut payload, &report);
+        if let Some(report) = &data_store_report {
+            crate::data_layer::surfaces::apply_to_status(&mut payload, report);
         }
         if kind == StatusSnapshotKind::Push {
             // Read only this root's LSP applicability rather than cloning

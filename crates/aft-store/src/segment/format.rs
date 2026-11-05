@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::error::ErrorKind;
+use super::error::{ErrorKind, SegmentError};
 use crate::ids::{Digest128, FamilyId, SegmentId, WriterIncarnation};
 use crate::le::{array, u16_at, u32_at, u64_at};
 
@@ -157,8 +157,32 @@ impl Header {
         out
     }
 
+    /// The refusal [`Self::decode`] gives a header naming a format version
+    /// above [`FORMAT_VERSION`], which a newer build wrote, read from the
+    /// file at `path` without reading anything past the version. `None` for
+    /// any other file, or one that cannot be read: whoever opens it later
+    /// reports why.
+    pub(crate) fn newer_version(path: &std::path::Path) -> Option<SegmentError> {
+        let file = crate::fs::open_read(path).ok()?;
+        let mut bytes = [0; 10];
+        crate::fs::read_exact_at(&file, &mut bytes, 0).ok()?;
+        let found = u16_at(&bytes, 8);
+        (bytes[0..8] == MAGIC && found > FORMAT_VERSION).then(|| {
+            SegmentError::new(
+                path,
+                ErrorKind::UnsupportedVersion {
+                    found,
+                    supported: FORMAT_VERSION,
+                },
+            )
+        })
+    }
+
     /// Decodes and checks a header. The magic is checked first, so a file
-    /// that is not a segment says so instead of failing a checksum.
+    /// that is not a segment says so instead of failing a checksum. The
+    /// version is checked before the checksum: a newer format version may
+    /// lay out and check its header differently, so its file is refused by
+    /// its version rather than called damaged.
     pub(crate) fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self, ErrorKind> {
         if bytes[0..8] != MAGIC {
             return Err(ErrorKind::NotASegment);
