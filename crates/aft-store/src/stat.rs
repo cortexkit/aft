@@ -245,7 +245,9 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         if (returned as usize) < size_of::<USN_RECORD_V2>() {
-            return Err(io::Error::other("the USN record is shorter than a V2 record"));
+            return Err(io::Error::other(
+                "the USN record is shorter than a V2 record",
+            ));
         }
         // SAFETY: the call wrote at least a whole V2 record into the
         // 8-byte-aligned buffer.

@@ -961,6 +961,81 @@ mod tests {
         assert!(checkout.state.get(b"run.log").is_some());
     }
 
+    /// Windows spells one folder several ways: with the `\\?\` prefix that
+    /// `canonicalize` returns, without it, or with another drive-letter
+    /// case. Every spelling of the root records the same members, and a
+    /// linked worktree whose `.git` file names its Git folder as Git for
+    /// Windows writes it (`C:/...`, forward slashes) stays out.
+    #[cfg(windows)]
+    #[test]
+    fn every_spelling_of_a_windows_root_records_the_same_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim = std::fs::canonicalize(dir.path()).unwrap();
+        let spelled = verbatim.to_str().unwrap();
+        let plain = PathBuf::from(
+            spelled
+                .strip_prefix(r"\\?\")
+                .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+                .unwrap_or_else(|| panic!("not a verbatim drive path: {spelled}")),
+        );
+        let plain_spelled = plain.to_str().unwrap();
+        let other_case = PathBuf::from(format!(
+            "{}{}",
+            if plain_spelled.as_bytes()[0].is_ascii_uppercase() {
+                plain_spelled[..1].to_ascii_lowercase()
+            } else {
+                plain_spelled[..1].to_ascii_uppercase()
+            },
+            &plain_spelled[1..]
+        ));
+        let write = |path: &str, bytes: &[u8]| {
+            let path = plain.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        std::fs::create_dir_all(plain.join(".git/worktrees/w")).unwrap();
+        write(".gitignore", b"ignored/\n");
+        write("src/a.rs", b"fn a() {}\n");
+        write("Docs/Read Me.md", b"a space and capitals\n");
+        write("ignored/x.rs", b"no");
+        let worktree_git_dir = plain
+            .join(".git")
+            .join("worktrees")
+            .join("w")
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        write("w/.git", format!("gitdir: {worktree_git_dir}\n").as_bytes());
+        write("w/inner.rs", b"no");
+
+        let policy = ScanPolicy::default();
+        let sink = Collect::default();
+        let first = scan(&plain, &policy, None, &sink).unwrap();
+        assert_eq!(
+            paths(&first.state),
+            [".gitignore", "Docs/Read Me.md", "src/a.rs"]
+        );
+        for root in [&verbatim, &other_case] {
+            let again = scan(root, &policy, None, &sink).unwrap();
+            assert_eq!(
+                members(&again.state),
+                members(&first.state),
+                "{}",
+                root.display()
+            );
+            // A path scan from this spelling keeps every member as it is.
+            let reported = [b"src".to_vec(), b"Docs/Read Me.md".to_vec(), b"w".to_vec()];
+            let partial = scan_paths(root, &policy, &aged(&first.state), &reported, &sink).unwrap();
+            assert_eq!(
+                members(&partial.state),
+                members(&first.state),
+                "{}",
+                root.display()
+            );
+            assert!(partial.changed.is_empty(), "{:?}", partial.changed);
+        }
+    }
+
     #[test]
     fn admits_what_the_rules_admit_and_reuses_unchanged_files() {
         let dir = tempfile::tempdir().unwrap();
