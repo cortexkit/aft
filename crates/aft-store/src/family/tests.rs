@@ -196,6 +196,58 @@ fn torn_manifests_are_skipped_and_never_reused() {
 }
 
 #[test]
+fn a_manifest_or_horizon_still_being_written_is_skipped_like_a_torn_one() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"one", b"s");
+    // A publication and a reclamation caught mid-write: the writer still
+    // holds each file open for writing, as `record::write` does until the
+    // bytes are synced. Windows refuses to open a file for a reader that
+    // denies writers while a writer has it open.
+    let mut manifest =
+        crate::fs::create_new_private(&family.layout.manifest(Generation::new(2))).unwrap();
+    manifest.write_all(b"half a manifest").unwrap();
+    let mut horizon = crate::fs::create_new_private(&family.layout.horizon(1)).unwrap();
+    horizon.write_all(b"half").unwrap();
+
+    let snapshot = family.snapshot().unwrap();
+    assert_eq!(snapshot.generation(), Generation::new(1));
+    assert_eq!(snapshot.skipped_manifests(), 1);
+    assert_eq!(read_section(&snapshot), b"one");
+    drop((manifest, horizon));
+}
+
+#[test]
+fn a_segment_a_reader_still_has_open_is_reclaimed_and_stays_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    publish(&family, b"old", b"s");
+    let snapshot = family.snapshot().unwrap();
+    let id = snapshot.manifest().segments()[0].id;
+    // Nothing read yet, so every later read goes to the file.
+    let segment = snapshot.open_segment(id, &known(), cache()).unwrap();
+    drop(snapshot);
+    publish(&family, b"new", b"s");
+
+    // The open handle neither stops the removal (on Windows it allows
+    // deletion) nor loses its bytes to it.
+    let mut session = family.try_write().unwrap().unwrap();
+    let report = session.reclaim().unwrap();
+    assert_eq!(report.outcome, ReclaimOutcome::Complete);
+    assert_eq!((report.removed_segments, report.failed_removals), (1, 0));
+    let section = segment
+        .section(SectionId::new(KIND, KeySpace::new(0)))
+        .unwrap();
+    let len = segment.info(section).len;
+    assert_eq!(segment.read_range(section, 0..len).unwrap(), b"old");
+    drop(segment);
+    drop(session);
+    assert_eq!(names(&family.layout.segments_dir()), ["2.seg"]);
+}
+
+#[test]
 fn a_damaged_segment_or_state_is_reported_not_guessed() {
     let dir = tempfile::tempdir().unwrap();
     let family = open(dir.path());

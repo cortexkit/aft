@@ -116,6 +116,12 @@ fn grep_both(
     )
 }
 
+/// A checkout path as the grep tool prints it: with the platform's
+/// separators, as today's index prints it.
+fn printed(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// The same glob from today's index and from the view: the files in the
 /// order the glob tool prints them, newest first.
 fn glob_both(
@@ -210,7 +216,10 @@ fn a_view_answers_grep_and_glob_as_todays_index_does() {
     // reads every file whose content it holds no trigrams for.
     let (_, data, candidates) =
         grep_both(&today, &view, &fixture.root, &fixture.root, "TODO", false);
-    assert!(data.contains("src/a.rs\n2: // TODO: alpha"), "{data}");
+    assert!(
+        data.contains(&format!("{}\n2: // TODO: alpha", printed("src/a.rs"))),
+        "{data}"
+    );
     assert_eq!(candidates, 3, "src/a.rs, and the binary and oversize files");
 
     // Today's index never lists a symlink, and neither does the view.
@@ -262,7 +271,11 @@ fn changed_paths_are_answered_as_they_are_on_disk() {
     // The newest file first, and the deleted one gone.
     let (_, data, _) = grep_both(&today, &view, &fixture.root, &fixture.root, "alpha", false);
     assert!(
-        data.starts_with("src/fresh/new.rs\n1: fn alpha_again() {}\n\nsrc/b.rs\n"),
+        data.starts_with(&format!(
+            "{}\n1: fn alpha_again() {{}}\n\n{}\n",
+            printed("src/fresh/new.rs"),
+            printed("src/b.rs")
+        )),
         "{data}"
     );
     assert!(!data.contains("c.ts"), "{data}");
@@ -341,7 +354,11 @@ fn build_folders_are_left_out_as_today_and_a_file_named_build_is_kept() {
     );
     let (_, data, _) = grep_both(&today, &view, &fixture.root, &fixture.root, "alpha", false);
     assert!(
-        data.starts_with("tools/build\n1: alpha, a file named build\n\nsrc/a.rs\n1: fn alpha() {}\n\nFound 2 match across 2 file"),
+        data.starts_with(&format!(
+            "{}\n1: alpha, a file named build\n\n{}\n1: fn alpha() {{}}\n\nFound 2 match across 2 file",
+            printed("tools/build"),
+            printed("src/a.rs")
+        )),
         "{data}"
     );
 }

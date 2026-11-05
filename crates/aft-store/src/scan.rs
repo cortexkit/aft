@@ -1051,14 +1051,12 @@ mod tests {
         );
         assert_eq!(first.counters.oversize, 1);
 
-        // Unchanged files are reused unread; an edit is read again.
+        // Unchanged files are reused unread; an edit is read again. On
+        // Windows the change journal's USN is what proves them unchanged.
         write("src/a.rs", b"fn changed() {}\n");
         let second = scan(root, &policy, Some(&aged(&first.state)), &sink).unwrap();
-        #[cfg(unix)]
-        {
-            assert_eq!(second.counters.read, 1, "{:?}", second.counters);
-            assert_eq!(second.counters.reused, 8);
-        }
+        assert_eq!(second.counters.read, 1, "{:?}", second.counters);
+        assert_eq!(second.counters.reused, 8);
         assert_ne!(
             get(&second.state, "src/a.rs").content,
             get(&first.state, "src/a.rs").content
@@ -1067,7 +1065,6 @@ mod tests {
         // The file just read is still racy, so it proves nothing and is
         // read again; reused records keep their old evidence.
         let third = scan(root, &policy, Some(&second.state), &sink).unwrap();
-        #[cfg(unix)]
         assert_eq!((third.counters.reused, third.counters.read), (8, 1));
         let contents = |state: &CheckoutState| {
             state
