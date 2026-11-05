@@ -2,9 +2,9 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.14.6",
+      "version": "0.15.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "7d54ebd86c54e15c398e46507efaa83747c393a294bb3f58575c248cc2045bcf",
+      "checksum": "093a173717fa925c337557edb1f2ddddb5ef5cefb57162757f131a2204bd3aca",
       "dependency_kind": "normal",
       "release_tag": "cortexkit-role-tool-provider-v0.13.0"
     },
@@ -17,9 +17,9 @@
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.14.6",
+      "version": "0.15.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "e62a99716342add8a7144e0c0c9ea641217a8998546ceb4cf94c0f2bec6bf07c",
+      "checksum": "eb21d0e8675bb2beb12327f05a8c76bd861db40e631718d156f765cf805ff25e",
       "dependency_kind": "dev",
       "release_tag": "cortexkit-role-tool-provider-conformance-v0.13.1"
     },
@@ -118,7 +118,7 @@
         }
       ],
       "implementation_version": "<built-package-version>",
-      "capabilities": ["tool-catalog-confine/v1", "tool-views/v1"]
+      "capabilities": ["tool-catalog-confine/v1", "tool-catalog-model/v1", "tool-views/v1"]
     },
     "presets": {
       "head": {
@@ -129,6 +129,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -166,6 +167,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -198,6 +201,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -231,6 +235,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -268,6 +274,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -305,6 +312,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -337,6 +346,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -370,6 +380,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -407,6 +419,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -428,6 +441,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
@@ -470,6 +485,7 @@
             "user_commands_catalog",
             "catalog_emits_events_boolean",
             "catalog_listed_presets_served",
+            "catalog_model_malformed_refused",
             "role_describe_shape",
             "role_describe_cacheable",
             "catalog_schemas_flat",
@@ -491,6 +507,8 @@
           ],
           "skipped_cases": [
             "catalog_capability_filter_matches_describe",
+            "catalog_filter_preserves_plan_item",
+            "catalog_filter_model_refused",
             "user_commands_reply",
             "user_commands_repeat",
             "user_commands_codemode_refused",
