@@ -360,6 +360,46 @@ impl TextOverlay {
     }
 }
 
+impl TextOverlay {
+    /// How many paths the overlay holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// An estimate of the bytes the overlay holds in memory, for the memory
+    /// census: each path, its map entry, and the trigrams of each changed
+    /// content. A content shared by several paths is counted once per path,
+    /// so the estimate errs high.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> u64 {
+        // A B-tree's per-entry overhead varies with its fill; one pointer
+        // and one length per entry is a fair middle.
+        const MAP_ENTRY_OVERHEAD: usize = 2 * std::mem::size_of::<usize>();
+        let bytes = self
+            .entries
+            .iter()
+            .map(|(path, entry)| {
+                let content = match entry {
+                    OverlayEntry::Content(trigrams) => {
+                        // The shared allocation's two counters, then the list.
+                        2 * std::mem::size_of::<usize>()
+                            + std::mem::size_of::<ContentTrigrams>()
+                            + std::mem::size_of_val(trigrams.entries())
+                    }
+                    OverlayEntry::Unindexed | OverlayEntry::Deleted => 0,
+                };
+                std::mem::size_of::<Vec<u8>>()
+                    + path.capacity()
+                    + std::mem::size_of::<OverlayEntry>()
+                    + MAP_ENTRY_OVERHEAD
+                    + content
+            })
+            .sum::<usize>();
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+}
+
 /// A conjunct whose posting list is this many times longer than the
 /// candidates left is not read: it would narrow them little, and verifying a
 /// few extra files costs less than reading a long list. Leaving out a

@@ -2454,6 +2454,145 @@ impl Collected {
     }
 }
 
+impl DataLayer {
+    /// The shared block cache's counters, for the memory census.
+    #[must_use]
+    pub fn cache_stats(&self) -> aft_store::cache::CacheStats {
+        self.cache.stats()
+    }
+}
+
+/// What one checkout holds in memory, for the memory census. Taken without
+/// waiting for any lock: a part whose lock was held is reported as busy
+/// rather than delaying the caller.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CheckoutMemory {
+    /// The publication and the changes since; `None` when their lock was
+    /// held.
+    pub live: Option<LiveMemory>,
+    /// The call graph's incremental state between publications.
+    pub engine: EngineMemory,
+}
+
+/// The memory a checkout's publication and recorded changes hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LiveMemory {
+    /// Paths in the published state; zero before the first publication.
+    pub state_paths: usize,
+    /// Estimated bytes of the checkout states held: the publication's, the
+    /// current one while changes are recorded, and the one the last
+    /// call-graph refresh resolved.
+    pub state_bytes: u64,
+    /// Paths whose changed text queries read from memory.
+    pub text_overlay_paths: usize,
+    /// Estimated bytes of those paths and their trigrams.
+    pub text_overlay_bytes: u64,
+    /// Paths changed since the publication.
+    pub changes: usize,
+    /// Changed paths the call graph has not resolved yet.
+    pub pending_callgraph_paths: usize,
+    /// Files the call graph resolved again, or dropped, since the
+    /// publication.
+    pub refreshed_files: usize,
+    /// Files in the dead-code snapshot of the served call graph, once one is
+    /// built; `None` while none is, or while one is being built.
+    pub dead_code_files: Option<usize>,
+}
+
+/// The call graph's incremental engine, as the memory census sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EngineMemory {
+    /// No refresh has started it since the publication.
+    #[default]
+    NotStarted,
+    /// A refresh holds it.
+    Busy,
+    /// Started: its parse and resolution slots (each decoded on first use).
+    Running { parses: usize, resolutions: usize },
+}
+
+impl DeadCodeMemo {
+    /// The built snapshot's file count; `None` when none is built or the
+    /// memo is being built.
+    fn try_files(&self) -> Option<usize> {
+        let slot = self.0.try_lock().ok()?;
+        slot.as_ref().map(|snapshot| snapshot.files.len())
+    }
+}
+
+/// An estimate of the bytes `state` holds in memory.
+fn state_bytes(state: &CheckoutState) -> u64 {
+    let records = state
+        .paths()
+        .iter()
+        .map(|record| {
+            std::mem::size_of::<PathRecord>()
+                + record.path.capacity()
+                + record.link.capacity()
+                + record.language.capacity()
+        })
+        .sum::<usize>();
+    let fragments = if state.has_fragments() {
+        state.paths().len() * std::mem::size_of::<Option<Digest128>>()
+    } else {
+        0
+    };
+    let bytes = std::mem::size_of::<CheckoutState>() + state.git.capacity() + records + fragments;
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
+impl Checkout {
+    /// The folder of the family store this checkout is bound to.
+    #[must_use]
+    pub fn family_dir(&self) -> &Path {
+        self.family.dir()
+    }
+
+    /// What this checkout holds in memory now, for the memory census. Never
+    /// waits: a part whose lock is held is reported as busy.
+    #[must_use]
+    pub fn memory(&self) -> CheckoutMemory {
+        let live = self.live.try_read().ok().map(|live| {
+            let published = live.published.as_ref();
+            let mut bytes = published.map_or(0, |published| state_bytes(&published.state));
+            if let Some(state) = &live.state {
+                bytes = bytes.saturating_add(state_bytes(state));
+            }
+            if let Some(refreshed) = &live.refreshed {
+                bytes = bytes.saturating_add(state_bytes(&refreshed.state));
+            }
+            // The memo of the call graph views serve now.
+            let dead_code_files = match &live.refreshed {
+                Some(refreshed) => refreshed.dead_code.try_files(),
+                None => published.and_then(|published| published.dead_code.try_files()),
+            };
+            LiveMemory {
+                state_paths: published.map_or(0, |published| published.state.paths().len()),
+                state_bytes: bytes,
+                text_overlay_paths: live.text.len(),
+                text_overlay_bytes: live.text.estimated_bytes(),
+                changes: live.changes.len(),
+                pending_callgraph_paths: live.callgraph_pending.len(),
+                refreshed_files: live.refreshed.as_ref().map_or(0, |refreshed| {
+                    refreshed.replaced.len() + refreshed.removed.len()
+                }),
+                dead_code_files,
+            }
+        });
+        let engine = match self.engine.try_lock() {
+            Ok(engine) => match engine.as_ref() {
+                Some(engine) => EngineMemory::Running {
+                    parses: engine.live.inputs.parses.len(),
+                    resolutions: engine.live.resolved.len(),
+                },
+                None => EngineMemory::NotStarted,
+            },
+            Err(_) => EngineMemory::Busy,
+        };
+        CheckoutMemory { live, engine }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

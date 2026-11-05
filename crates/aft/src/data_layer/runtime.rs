@@ -55,9 +55,11 @@ pub(crate) fn force_on_for_test() {
     FORCED_ON.with(|forced| forced.set(true));
 }
 
+/// The process's data layer, once the first checkout binds.
+static LAYER: OnceLock<Arc<DataLayer>> = OnceLock::new();
+
 /// The process's data layer: one block cache for every checkout's reads.
 fn layer() -> Arc<DataLayer> {
-    static LAYER: OnceLock<Arc<DataLayer>> = OnceLock::new();
     Arc::clone(LAYER.get_or_init(|| {
         let threads = std::thread::available_parallelism().map_or(4, usize::from);
         Arc::new(DataLayer::new(256 << 20, threads))
@@ -698,6 +700,137 @@ impl WriteIntentListener for EditListener {
             }
         }
         self.quiet.changed();
+    }
+}
+
+/// The shared block cache's counters, or `None` while no checkout of this
+/// process has bound (asking never creates the data layer).
+#[must_use]
+pub(crate) fn block_cache_stats() -> Option<aft_store::cache::CacheStats> {
+    LAYER.get().map(|layer| layer.cache_stats())
+}
+
+/// Binds the checkout at `root`, with its family store under `storage`,
+/// without the background builds, refreshes and edit listener a running AFT
+/// adds: for a command-line build that publishes in the foreground and
+/// exits.
+///
+/// # Errors
+///
+/// When the family store cannot be opened.
+pub(crate) fn bind_foreground(root: &Path, storage: &Path) -> Result<Checkout, DataError> {
+    let family = family_of(root);
+    let family_dir = storage.join("data").join(family.digest().to_string());
+    Checkout::bind(layer(), &family_dir, family, root)
+}
+
+/// The last build or call-graph refresh of a checkout that failed, kept
+/// until one succeeds, so status and health can say why a plane is not
+/// ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DataFailure {
+    /// `build` or `refresh`.
+    pub(crate) stage: &'static str,
+    pub(crate) error: String,
+    /// Another process held the family store's writer past the wait; the
+    /// next attempt may succeed without any change.
+    pub(crate) busy: bool,
+    /// When it failed, in milliseconds since the Unix epoch.
+    pub(crate) at_ms: u64,
+}
+
+/// Each checkout root's last failure, until a later attempt succeeds. Keyed
+/// by root rather than kept on the handle, so the threads that build and
+/// refresh need nothing but the checkout to report one.
+fn failures() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, DataFailure>> {
+    static FAILURES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, DataFailure>>> =
+        OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+/// Records how a build or refresh of the checkout at `root` ended. A
+/// failure replaces the previous one. A successful build clears any
+/// failure, since it serves a new publication; a successful refresh clears
+/// only a refresh failure, since a failed build still left the checkout
+/// without what it was building.
+pub(crate) fn note_outcome<T>(root: &Path, stage: &'static str, result: &Result<T, DataError>) {
+    let mut failures = failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match result {
+        Err(error) => {
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
+            failures.insert(
+                root.to_path_buf(),
+                DataFailure {
+                    stage,
+                    error: error.to_string(),
+                    busy: matches!(error, DataError::Busy(_)),
+                    at_ms,
+                },
+            );
+        }
+        Ok(_) => {
+            if stage == "build"
+                || failures
+                    .get(root)
+                    .is_some_and(|failure| failure.stage == stage)
+            {
+                failures.remove(root);
+            }
+        }
+    }
+}
+
+impl DataCheckout {
+    /// This checkout's last failed build or refresh, until one succeeds.
+    #[must_use]
+    pub(crate) fn last_failure(&self) -> Option<DataFailure> {
+        failures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(self.root())
+            .cloned()
+    }
+}
+
+/// What to call when a checkout's status may have changed, by root.
+type StatusListener = Arc<dyn Fn() + Send + Sync>;
+
+fn status_listeners(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, StatusListener>> {
+    static LISTENERS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, StatusListener>>,
+    > = OnceLock::new();
+    LISTENERS.get_or_init(Default::default)
+}
+
+/// Tells whoever listens for the checkout at `root` that its status may
+/// have changed: a build or a call-graph refresh ended.
+fn notify_status_change(root: &Path) {
+    let listener = status_listeners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .cloned();
+    if let Some(listener) = listener {
+        listener();
+    }
+}
+
+impl DataCheckout {
+    /// Calls `notify` whenever a build or call-graph refresh of this
+    /// checkout ends, so status pushes follow the data layer. Replaces any
+    /// earlier listener for the same root.
+    pub(crate) fn on_status_change(&self, notify: StatusListener) {
+        status_listeners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.root().to_path_buf(), notify);
     }
 }
 
