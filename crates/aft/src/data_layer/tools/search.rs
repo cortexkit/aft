@@ -196,12 +196,7 @@ fn relative(root: &Path, path: &Path) -> Option<Vec<u8>> {
     }
     #[cfg(not(unix))]
     {
-        Some(
-            relative
-                .to_string_lossy()
-                .replace('\\', "/")
-                .into_bytes(),
-        )
+        Some(relative.to_string_lossy().replace('\\', "/").into_bytes())
     }
 }
 
@@ -393,7 +388,11 @@ fn rarest(
         held.push((count, trigram));
     }
     held.sort_unstable();
-    Ok(held.into_iter().take(3).map(|(_, trigram)| trigram).collect())
+    Ok(held
+        .into_iter()
+        .take(3)
+        .map(|(_, trigram)| trigram)
+        .collect())
 }
 
 impl TextIndex<'_> {
@@ -516,8 +515,7 @@ fn exact_pass(
     if candidates.is_empty() && (phrase.len() < 3 || (content_tokens.is_empty() && !literal)) {
         candidates.extend(text.every_path()?);
     }
-    if let Some(bound) = evidence_bound(text, scope, &norm_phrase, &content_tokens, &mut holders)?
-    {
+    if let Some(bound) = evidence_bound(text, scope, &norm_phrase, &content_tokens, &mut holders)? {
         candidates.retain(|path| {
             bound.contains(path)
                 || member_paths
@@ -813,6 +811,39 @@ mod tests {
             }
         }
 
+        /// Whether this caller keeps declaration evidence, the one place the
+        /// two candidate sets can change the rows (see
+        /// [`Self::extra_declarations_name`]).
+        fn keeps_declarations(self) -> bool {
+            matches!(self, Self::Identifier | Self::DefinitionsMentioning)
+        }
+
+        /// The reviewed difference of the declaration-keeping callers: extra
+        /// declaration rows from the data layer, never a missing row. The
+        /// verifier gives declaration evidence for any declaration a query
+        /// word names, whether or not the file holds the phrase, so the rows
+        /// depend on which files the candidate query admits. Today's index
+        /// ANDs every phrase trigram with its next-character masks; the
+        /// view's candidates skip long conjuncts and hash the masks
+        /// differently, so they admit a few files today's pruning never
+        /// reached. On aft's checkout over the 6,700 real queries:
+        ///
+        /// - `16 GiB`, scope All: `const GIB` in `crates/aft/src/views/eviction.rs`
+        ///   and one in `crates/aft/src/views/base_builder_tests.rs` (the
+        ///   files lack the trigram `16 `);
+        /// - `/pi/model`, scope All: six `model` declarations in
+        ///   `crates/aft/src/commands/semantic_search/rerank/onnx.rs` (it
+        ///   lacks `/pi`);
+        /// - `fn now_ms`, scope All and DefinitionsMentioning: `now_ms`
+        ///   fields and parameters in FILES_NOW_MS (they hold every trigram of
+        ///   the phrase; only today's masks left them out).
+        fn extra_declarations_name(self) -> &'static str {
+            match self {
+                Self::Identifier => "allowed_extra_declarations_identifier_scope_all",
+                _ => "allowed_extra_declarations_definitions_mentioning",
+            }
+        }
+
         fn scope(self, query: &str) -> ExactEvidenceScope {
             match self {
                 Self::Identifier => ExactEvidenceScope::All,
@@ -985,16 +1016,38 @@ mod tests {
     fn the_view_answers_each_lane_question_as_the_legacy_index_does() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, "src/upload.rs", "pub fn retry_upload() {}\n// retries the upload\n");
-        write(root, "src/client.rs", "fn send() { retry_upload(); }\nstruct Client;\n");
-        write(root, "docs/notes.md", "The upload is retried with a backoff.\n");
-        write(root, "tests/upload_test.rs", "fn upload_test() { retry_upload(); }\n");
+        write(
+            root,
+            "src/upload.rs",
+            "pub fn retry_upload() {}\n// retries the upload\n",
+        );
+        write(
+            root,
+            "src/client.rs",
+            "fn send() { retry_upload(); }\nstruct Client;\n",
+        );
+        write(
+            root,
+            "docs/notes.md",
+            "The upload is retried with a backoff.\n",
+        );
+        write(
+            root,
+            "tests/upload_test.rs",
+            "fn upload_test() { retry_upload(); }\n",
+        );
         write(root, "data.bin", "\0\0binary retry_upload\0");
         let pair = pair(root);
         let legacy = pair.legacy.snapshot();
         let legacy = TextIndex::Snapshot(&legacy);
         let data = TextIndex::Data(&pair.data);
-        for query in ["retry upload", "retry_upload", "Client send", "backoff", "zz"] {
+        for query in [
+            "retry upload",
+            "retry_upload",
+            "Client send",
+            "backoff",
+            "zz",
+        ] {
             let trigrams = trigrams(query);
             for include_tests in [false, true] {
                 assert_eq!(
@@ -1004,8 +1057,11 @@ mod tests {
                 );
             }
             assert_eq!(
-                legacy.lexical_rank_at_depth(&trigrams, None, usize::MAX).unwrap(),
-                data.lexical_rank_at_depth(&trigrams, None, usize::MAX).unwrap(),
+                legacy
+                    .lexical_rank_at_depth(&trigrams, None, usize::MAX)
+                    .unwrap(),
+                data.lexical_rank_at_depth(&trigrams, None, usize::MAX)
+                    .unwrap(),
                 "{query}"
             );
             for caller in Caller::ALL {
@@ -1084,7 +1140,10 @@ mod tests {
     type Answer = (String, Duration);
 
     impl Tally {
-        fn record(&mut self, query: &str, legacy: Answer, data: Answer) {
+        /// Counts one query; keeps its lines on both sides for the first
+        /// differences, every line when `every_line` (for the reviewed
+        /// classes, whose report lists what they add).
+        fn record(&mut self, query: &str, legacy: Answer, data: Answer, every_line: bool) {
             self.queries += 1;
             self.legacy += legacy.1;
             self.data += data.1;
@@ -1102,10 +1161,11 @@ mod tests {
             let left_set = left.iter().copied().collect::<BTreeSet<_>>();
             let right_set = right.iter().copied().collect::<BTreeSet<_>>();
             let parted = left.iter().zip(&right).position(|(a, b)| a != b);
+            let keep = if every_line { usize::MAX } else { 12 };
             let clip = |lines: Vec<&str>| {
                 lines
                     .into_iter()
-                    .take(12)
+                    .take(keep)
                     .map(|line| line.chars().take(400).collect::<String>())
                     .collect::<Vec<_>>()
             };
@@ -1122,9 +1182,8 @@ mod tests {
         }
 
         fn summary(&self) -> serde_json::Value {
-            let per_call = |total: Duration| {
-                total.as_secs_f64() * 1000.0 / self.queries.max(1) as f64
-            };
+            let per_call =
+                |total: Duration| total.as_secs_f64() * 1000.0 / self.queries.max(1) as f64;
             serde_json::json!({
                 "queries": self.queries,
                 "differing": self.differing,
@@ -1226,7 +1285,27 @@ mod tests {
             (sorted(&legacy_ranked), legacy_time),
             (sorted(&data_ranked), data_time),
         ));
-        found.push(("unpooled_rank_order", (legacy_ranked, zero), (data_ranked, zero)));
+        // The scores in rank order: equal sequences over equal sets mean the
+        // orders differ only among files with the same score.
+        let scores = |lines: &str| {
+            lines
+                .lines()
+                .map(|line| line.rsplit(' ').next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        found.push((
+            "unpooled_rank_score_sequence",
+            (scores(&legacy_ranked), zero),
+            (scores(&data_ranked), zero),
+        ));
+        // Reviewed and allowed: the audit's ties are in path byte order here
+        // and in the legacy index's file-id order there.
+        found.push((
+            "allowed_audit_ties_in_path_order",
+            (legacy_ranked, zero),
+            (data_ranked, zero),
+        ));
         if !exact_too {
             return found;
         }
@@ -1236,7 +1315,34 @@ mod tests {
             let (legacy_pass, legacy_time) =
                 timed(|| exact(legacy, query, root, Some(&filter), caller));
             let (data_pass, data_time) = timed(|| exact(data, query, root, Some(&filter), caller));
-            found.push((caller.name(), (legacy_pass.0, legacy_time), (data_pass.0, data_time)));
+            if caller.keeps_declarations() {
+                // Strict: every row today returns, in today's order, and no
+                // extra row other than a declaration. The extra declarations
+                // themselves are the reviewed class compared below.
+                let today = legacy_pass.0.lines().collect::<HashSet<_>>();
+                let checked = data_pass
+                    .0
+                    .lines()
+                    .filter(|line| today.contains(line) || !line.contains("kind: Definition,"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                found.push((
+                    caller.name(),
+                    (legacy_pass.0.clone(), legacy_time),
+                    (checked, data_time),
+                ));
+                found.push((
+                    caller.extra_declarations_name(),
+                    (legacy_pass.0, zero),
+                    (data_pass.0, zero),
+                ));
+            } else {
+                found.push((
+                    caller.name(),
+                    (legacy_pass.0, legacy_time),
+                    (data_pass.0, data_time),
+                ));
+            }
             if !matches!(caller, Caller::Identifier) {
                 found.push((
                     match caller {
@@ -1259,8 +1365,16 @@ mod tests {
             (legacy_holding, legacy_time),
             (data_holding, data_time),
         ));
-        found.push(("measure_phrase_possible_holders", (legacy_set, zero), (data_set, zero)));
-        found.push(("measure_phrase_possible_holders_order", (legacy_order, zero), (data_order, zero)));
+        found.push((
+            "measure_phrase_possible_holders",
+            (legacy_set, zero),
+            (data_set, zero),
+        ));
+        found.push((
+            "measure_phrase_possible_holders_order",
+            (legacy_order, zero),
+            (data_order, zero),
+        ));
 
         let runs = split_query(query).retained_runs;
         let count = |files: io::Result<Vec<PathBuf>>| match files {
@@ -1269,7 +1383,14 @@ mod tests {
         };
         found.push((
             "measure_anchored_candidate_count",
-            timed(|| count(discover_anchored_candidate_files(&pair.legacy, root, &runs, false))),
+            timed(|| {
+                count(discover_anchored_candidate_files(
+                    &pair.legacy,
+                    root,
+                    &runs,
+                    false,
+                ))
+            }),
             timed(|| count(anchored_candidate_files(&pair.data, root, &runs, false))),
         ));
         type Anchored = (
@@ -1277,21 +1398,19 @@ mod tests {
             usize,
             usize,
         );
-        let anchored = |executed: &io::Result<Anchored>, with_examined: bool| {
-            match executed {
-                Ok((results, examined, excluded)) => {
-                    let mut lines = results
-                        .iter()
-                        .map(|result| format!("{result:?}"))
-                        .collect::<Vec<_>>();
-                    lines.push(format!("excluded {excluded}"));
-                    if with_examined {
-                        lines.push(format!("examined {examined}"));
-                    }
-                    lines.join("\n")
+        let anchored = |executed: &io::Result<Anchored>, with_examined: bool| match executed {
+            Ok((results, examined, excluded)) => {
+                let mut lines = results
+                    .iter()
+                    .map(|result| format!("{result:?}"))
+                    .collect::<Vec<_>>();
+                lines.push(format!("excluded {excluded}"));
+                if with_examined {
+                    lines.push(format!("examined {examined}"));
                 }
-                Err(error) => format!("error: {error}"),
+                lines.join("\n")
             }
+            Err(error) => format!("error: {error}"),
         };
         let (legacy_anchored, legacy_time) = timed(|| {
             AnchoredLane::new().execute_with_admission_report(&pair.legacy, root, query, false)
@@ -1304,7 +1423,7 @@ mod tests {
             (anchored(&data_anchored, false), data_time),
         ));
         found.push((
-            "measure_anchored_examined_count",
+            "allowed_anchored_examined_count",
             (anchored(&legacy_anchored, true), zero),
             (anchored(&data_anchored, true), zero),
         ));
@@ -1328,7 +1447,8 @@ mod tests {
     fn lanes_match_the_legacy_index_on_real_queries() {
         let variable = |name: &str| std::env::var(name).ok();
         let root = PathBuf::from(variable("AFT_SEARCH_PARITY_ROOT").unwrap());
-        let queries = std::fs::read_to_string(variable("AFT_SEARCH_PARITY_QUERIES").unwrap()).unwrap();
+        let queries =
+            std::fs::read_to_string(variable("AFT_SEARCH_PARITY_QUERIES").unwrap()).unwrap();
         let out = PathBuf::from(variable("AFT_SEARCH_PARITY_OUT").unwrap());
         let exact_limit = variable("AFT_SEARCH_PARITY_EXACT_LIMIT")
             .and_then(|limit| limit.parse::<usize>().ok())
@@ -1375,11 +1495,18 @@ mod tests {
                         let found = compare_query(&pair, legacy, data, query, index < exact_limit);
                         let mut tallies = tallies.lock().unwrap();
                         for (name, legacy, data) in found {
-                            tallies.entry(name).or_default().record(query, legacy, data);
+                            let every_line = name.starts_with("allowed_extra_declarations");
+                            tallies
+                                .entry(name)
+                                .or_default()
+                                .record(query, legacy, data, every_line);
                         }
                         let finished = tallies.get("lexical_lane").map_or(0, |tally| tally.queries);
                         if finished % 500 == 0 {
-                            eprintln!("{finished} queries in {:.0} s", started.elapsed().as_secs_f64());
+                            eprintln!(
+                                "{finished} queries in {:.0} s",
+                                started.elapsed().as_secs_f64()
+                            );
                         }
                     }
                 });
@@ -1406,5 +1533,18 @@ mod tests {
             );
         }
         std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        // `measure_` comparisons report what another choice would change and
+        // `allowed_` ones are reviewed differences whose preconditions the
+        // strict comparisons check; every other one must agree on every query.
+        let failing = tallies
+            .iter()
+            .filter(|(name, tally)| {
+                !name.starts_with("measure_")
+                    && !name.starts_with("allowed_")
+                    && tally.differing > 0
+            })
+            .map(|(name, tally)| format!("{name}: {} of {}", tally.differing, tally.queries))
+            .collect::<Vec<_>>();
+        assert!(failing.is_empty(), "lane answers differ: {failing:?}");
     }
 }

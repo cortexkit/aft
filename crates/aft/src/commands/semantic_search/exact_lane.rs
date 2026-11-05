@@ -613,13 +613,7 @@ impl ExactLane {
 
         self.memo.get_or_verify(&key, offset, top_k, || {
             if let Some(index) = index {
-                Ok(self.execute_ready_mode_index(
-                    index,
-                    project_root,
-                    query,
-                    include_tests,
-                    scope,
-                ))
+                Ok(self.execute_ready_mode_index(index, project_root, query, include_tests, scope))
             } else {
                 let mut fallback =
                     self.execute_fallback_mode(project_root, query, include_tests, fallback_opts);

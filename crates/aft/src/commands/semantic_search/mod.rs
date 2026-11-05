@@ -4545,13 +4545,8 @@ fn literal_presence(
             return Ok(entry.presence);
         }
     }
-    let entry = settle_literal_presence(
-        index,
-        project_root,
-        phrase,
-        &normalized,
-        exact_candidates,
-    )?;
+    let entry =
+        settle_literal_presence(index, project_root, phrase, &normalized, exact_candidates)?;
     let presence = entry.presence;
     store.store_literal_presence(key, entry);
     Ok(presence)
@@ -5108,7 +5103,10 @@ fn definition_line_from_source(
     line_at_offset(&source, symbol_range.start)
 }
 
-pub(crate) fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
+pub(crate) fn definition_matches_identifier_token(
+    candidate: &CandidateResult,
+    query: &str,
+) -> bool {
     let Some(range) = candidate.symbol_range else {
         return false;
     };
@@ -5253,9 +5251,9 @@ fn run_engine_ranking(
     borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
     split: Option<&SplitEngineInput<'_>>,
 ) -> Result<EngineRanking, String> {
+    use crate::data_layer::tools::search::TextIndex;
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, BLOCK_DEPTHS};
     use confidence::{Confidence, ConfidenceEngine};
-    use crate::data_layer::tools::search::TextIndex;
     use lexical_lane::CanonicalLexicalLane;
     use provenance::ObservedProvenance;
     use scoring::ScoringPolicy;
@@ -5291,10 +5289,8 @@ fn run_engine_ranking(
     } else {
         None
     };
-    let context_index =
-        (borrowed_index.is_none() && data_text.is_none() && lexical_view.is_none()).then(|| {
-            try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        });
+    let context_index = (borrowed_index.is_none() && data_text.is_none() && lexical_view.is_none())
+        .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
     let view_snapshot =
         lexical_view.and_then(crate::views::trigram::LexicalViewSnapshot::into_ready);
     let empty_index = SearchIndex::new();
