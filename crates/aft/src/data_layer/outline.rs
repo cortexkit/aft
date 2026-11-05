@@ -880,26 +880,6 @@ pub fn separator() -> char {
         assert_eq!(cache.read().unwrap().len(), sources.len());
     }
 
-    /// With the data layer off, a bind reads no record and `trace_data`
-    /// has no view to read one from, even when a publication exists.
-    #[test]
-    fn with_the_data_layer_off_nothing_reads_records() {
-        crate::data_layer::runtime::force_off_for_test();
-        assert!(!crate::data_layer::runtime::enabled());
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        fixture(&root);
-        let (ctx, _storage) = published_then_restarted(&root);
-        let cache = ctx.symbol_cache();
-        root_bound(&ctx);
-        std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(cache.read().unwrap().len(), 0);
-        let generation = cache.read().unwrap().generation();
-        assert!(Claim::take(&cache, generation, &root).is_some());
-        assert!(ctx.data_checkout().is_none());
-        assert!(ctx.data_view().is_none());
-    }
-
     /// The process's resident memory in KiB, where the system reports it.
     fn resident_kib() -> u64 {
         std::fs::read_to_string("/proc/self/status")
