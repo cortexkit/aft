@@ -354,8 +354,9 @@ fn selected_pool(
 /// contents do. A content shared by identical files, or one left in older
 /// segments of the family, is no rarer to an agent than the files it can
 /// actually hit here. Counting contents (`trigram_frequency`) picked another
-/// three trigrams on about one real query in sixty and moved their lexical
-/// ranking; the legacy index counts files, as this does.
+/// three trigrams for 113 of 6,700 recorded aft_search queries on aft's own
+/// checkout and moved their lexical ranking; the legacy index counts files,
+/// as this does.
 fn paths_holding(_trigram: u32, paths: &[Vec<u8>]) -> io::Result<u64> {
     Ok(paths.len() as u64)
 }
@@ -807,8 +808,10 @@ mod tests {
             matches!(self, Self::Identifier | Self::DefinitionsMentioning)
         }
 
-        /// The reviewed difference of the declaration-keeping callers: extra
-        /// declaration rows from the data layer, never a missing row. The
+        /// The one difference the declaration-keeping callers may show, and
+        /// only as extra declaration rows from the data layer, never a
+        /// missing row; it is allowed because the extra rows pass the
+        /// verifier's own rule. The
         /// verifier gives declaration evidence for any declaration a query
         /// word names, whether or not the file holds the phrase, so the rows
         /// depend on which files the candidate query admits. Today's index
@@ -1143,8 +1146,8 @@ mod tests {
 
     impl Tally {
         /// Counts one query; keeps its lines on both sides for the first
-        /// differences, every line when `every_line` (for the reviewed
-        /// classes, whose report lists what they add).
+        /// differences, or every line when `every_line` is true (for the
+        /// allowed classes whose report lists what they add).
         fn record(&mut self, query: &str, legacy: Answer, data: Answer, every_line: bool) {
             self.queries += 1;
             self.legacy += legacy.1;
@@ -1304,8 +1307,9 @@ mod tests {
             (scores(&legacy_ranked), zero),
             (scores(&data_ranked), zero),
         ));
-        // Reviewed and allowed: the audit's ties are in path byte order here
-        // and in the legacy index's file-id order there.
+        // Allowed: files with equal scores are in path byte order here and
+        // in the legacy index's internal file-id order there, which the view
+        // does not have; the two checks above show only ties move.
         found.push((
             "allowed_audit_ties_in_path_order",
             (legacy_ranked, zero),
@@ -1323,7 +1327,7 @@ mod tests {
             if caller.keeps_declarations() {
                 // Strict: every row today returns, in today's order, and no
                 // extra row other than a declaration. The extra declarations
-                // themselves are the reviewed class compared below.
+                // themselves are the allowed class compared below.
                 let today = legacy_pass.0.lines().collect::<HashSet<_>>();
                 let checked = data_pass
                     .0
@@ -1538,8 +1542,8 @@ mod tests {
             );
         }
         std::fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
-        // `measure_` comparisons report what another choice would change and
-        // `allowed_` ones are reviewed differences whose preconditions the
+        // `measure_` comparisons report what another choice would change, and
+        // `allowed_` ones are known differences whose preconditions the
         // strict comparisons check; every other one must agree on every query.
         let failing = tallies
             .iter()

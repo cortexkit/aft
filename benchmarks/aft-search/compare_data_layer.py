@@ -15,14 +15,14 @@ counted as `process_noise`, apart from `differences`, and `--noise` runs
 today's path a second time to show those parts move between two runs of the
 same binary too.
 
-One difference is reviewed and allowed by name, `anchored_examined_count`:
-the anchored lane's "N of M candidate files" disclosure and
-`anchored_admission_gap.candidates_examined` carry the data layer's true
-candidate count, which is far smaller than the legacy planner's near-total
-count for a case-insensitive run. A reply is put in that class only when
-everything else is identical, the excluded count included, and each side's
-"shown" count is its examined count less the excluded ones; the class lists
-every such reply with both counts.
+One difference is allowed by name, `anchored_examined_count`, because the
+new number is the true one: the anchored lane's "N of M candidate files"
+disclosure and `anchored_admission_gap.candidates_examined` carry the data
+layer's candidate count, which is far smaller than the legacy planner's
+near-total count for a case-insensitive run. A reply is put in that class
+only when everything else is identical, the excluded count included, and
+each side's "shown" count is its examined count less the excluded ones; the
+class lists every such reply with both counts.
 
 Every process first answers the same warm-up request, which no row repeats;
 the data-layer process serves from the view only after its first build has
