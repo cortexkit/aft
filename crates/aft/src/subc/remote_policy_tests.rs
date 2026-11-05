@@ -2634,7 +2634,7 @@ impl SiblingGrantFixture {
     }
 }
 
-/// The approved refusal for a sibling that is not absolute, does not resolve,
+/// The exact agent-visible refusal for a sibling that is not absolute, does not resolve,
 /// or has no `.git` at its top, naming the path as the plan gave it. Spelled out
 /// here so a wording change cannot pass unnoticed.
 fn not_checkout_root(given: &Path) -> String {
@@ -2644,7 +2644,7 @@ fn not_checkout_root(given: &Path) -> String {
     )
 }
 
-/// The approved refusal for a checkout root the session may not read, naming
+/// The exact agent-visible refusal for a checkout root the session may not read, naming
 /// the resolved path.
 fn not_readable(resolved: &Path) -> String {
     format!(
