@@ -1247,6 +1247,13 @@ impl CheckoutView {
         )
     }
 
+    /// Whether the call graph has `file` (relative to the root): a parsed
+    /// file of the checkout.
+    #[must_use]
+    pub fn callgraph_has_file(&self, file: &str) -> bool {
+        self.graph.slice(file).is_some()
+    }
+
     /// Reads of the call graph that failed: a checksum or a malformed
     /// record. A caller that saw a file as absent can check here whether
     /// that was a failure.

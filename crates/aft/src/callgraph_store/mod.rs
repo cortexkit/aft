@@ -10961,6 +10961,237 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
 }
 
+/// One of two call-graph readers, chosen per request: today's store, or the
+/// data layer's view of the same checkout while it is built beside it.
+pub(crate) enum EitherGraph<A, B> {
+    Store(A),
+    Data(B),
+}
+
+impl<A: CallGraphRead, B: CallGraphRead> CallGraphRead for EitherGraph<A, B> {
+    fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
+        match self {
+            Self::Store(store) => store.stored_content_hash(file),
+            Self::Data(data) => data.stored_content_hash(file),
+        }
+    }
+    fn project_root(&self) -> &Path {
+        match self {
+            Self::Store(store) => store.project_root(),
+            Self::Data(data) => data.project_root(),
+        }
+    }
+    fn project_key(&self) -> &str {
+        match self {
+            Self::Store(store) => store.project_key(),
+            Self::Data(data) => data.project_key(),
+        }
+    }
+    fn sqlite_path(&self) -> &Path {
+        match self {
+            Self::Store(store) => store.sqlite_path(),
+            Self::Data(data) => data.sqlite_path(),
+        }
+    }
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Store(store) => store.is_current(),
+            Self::Data(data) => data.is_current(),
+        }
+    }
+    fn edge_snapshot(&self) -> Result<BTreeSet<StoredEdge>> {
+        match self {
+            Self::Store(store) => store.edge_snapshot(),
+            Self::Data(data) => data.edge_snapshot(),
+        }
+    }
+    fn indexed_file_count(&self) -> Result<usize> {
+        match self {
+            Self::Store(store) => store.indexed_file_count(),
+            Self::Data(data) => data.indexed_file_count(),
+        }
+    }
+    fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
+        match self {
+            Self::Store(store) => store.node_for(file_rel, symbol),
+            Self::Data(data) => data.node_for(file_rel, symbol),
+        }
+    }
+    fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
+        match self {
+            Self::Store(store) => store.nodes_for(file_rel, symbol),
+            Self::Data(data) => data.nodes_for(file_rel, symbol),
+        }
+    }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        match self {
+            Self::Store(store) => store.nodes_for_stored(file, symbol),
+            Self::Data(data) => data.nodes_for_stored(file, symbol),
+        }
+    }
+    fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
+        match self {
+            Self::Store(store) => store.nodes_matching(symbol),
+            Self::Data(data) => data.nodes_matching(symbol),
+        }
+    }
+    fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>> {
+        match self {
+            Self::Store(store) => store.direct_callers_of(file_rel, symbol),
+            Self::Data(data) => data.direct_callers_of(file_rel, symbol),
+        }
+    }
+    fn direct_callers_for_symbols(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        match self {
+            Self::Store(store) => store.direct_callers_for_symbols(targets),
+            Self::Data(data) => data.direct_callers_for_symbols(targets),
+        }
+    }
+    fn direct_caller_counts_of(
+        &self,
+        targets: &[(String, String)],
+    ) -> Result<HashMap<(String, String), usize>> {
+        match self {
+            Self::Store(store) => store.direct_caller_counts_of(targets),
+            Self::Data(data) => data.direct_caller_counts_of(targets),
+        }
+    }
+    fn callers_of(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<StoreCallersResult> {
+        match self {
+            Self::Store(store) => store.callers_of(file_rel, symbol, depth),
+            Self::Data(data) => data.callers_of(file_rel, symbol, depth),
+        }
+    }
+    fn impact_of(&self, file_rel: &Path, symbol: &str, depth: usize) -> Result<StoreImpactResult> {
+        match self {
+            Self::Store(store) => store.impact_of(file_rel, symbol, depth),
+            Self::Data(data) => data.impact_of(file_rel, symbol, depth),
+        }
+    }
+    fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        match self {
+            Self::Store(store) => store.outgoing_calls_of(node),
+            Self::Data(data) => data.outgoing_calls_of(node),
+        }
+    }
+    fn outgoing_calls_for_symbols(
+        &self,
+        sources: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Vec<StoreCallSite>>> {
+        match self {
+            Self::Store(store) => store.outgoing_calls_for_symbols(sources),
+            Self::Data(data) => data.outgoing_calls_for_symbols(sources),
+        }
+    }
+    fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
+        match self {
+            Self::Store(store) => store.resolved_self_calls_of(node),
+            Self::Data(data) => data.resolved_self_calls_of(node),
+        }
+    }
+    fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
+        match self {
+            Self::Store(store) => store.unresolved_calls_of(node),
+            Self::Data(data) => data.unresolved_calls_of(node),
+        }
+    }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        match self {
+            Self::Store(store) => store.ref_sites_named(kind, short_name, limit),
+            Self::Data(data) => data.ref_sites_named(kind, short_name, limit),
+        }
+    }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        match self {
+            Self::Store(store) => store.unresolved_method_sites_named(name, language),
+            Self::Data(data) => data.unresolved_method_sites_named(name, language),
+        }
+    }
+    fn unresolved_call_site_count(&self, language: LangId, include_tests: bool) -> Result<usize> {
+        match self {
+            Self::Store(store) => store.unresolved_call_site_count(language, include_tests),
+            Self::Data(data) => data.unresolved_call_site_count(language, include_tests),
+        }
+    }
+    fn unresolved_call_site_count_named(
+        &self,
+        name: &str,
+        language: LangId,
+        include_tests: bool,
+    ) -> Result<usize> {
+        match self {
+            Self::Store(store) => {
+                store.unresolved_call_site_count_named(name, language, include_tests)
+            }
+            Self::Data(data) => {
+                data.unresolved_call_site_count_named(name, language, include_tests)
+            }
+        }
+    }
+    fn call_tree(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        depth: usize,
+    ) -> Result<callgraph::CallTreeNode> {
+        match self {
+            Self::Store(store) => store.call_tree(file_rel, symbol, depth),
+            Self::Data(data) => data.call_tree(file_rel, symbol, depth),
+        }
+    }
+    fn trace_to(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToResult> {
+        match self {
+            Self::Store(store) => store.trace_to(file_rel, symbol, max_depth),
+            Self::Data(data) => data.trace_to(file_rel, symbol, max_depth),
+        }
+    }
+    fn trace_to_symbol_candidates(&self, to_symbol: &str) -> Result<Vec<TraceToSymbolCandidate>> {
+        match self {
+            Self::Store(store) => store.trace_to_symbol_candidates(to_symbol),
+            Self::Data(data) => data.trace_to_symbol_candidates(to_symbol),
+        }
+    }
+    fn trace_to_symbol(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        to_symbol: &str,
+        to_file: Option<&Path>,
+        max_depth: usize,
+    ) -> Result<callgraph::TraceToSymbolResult> {
+        match self {
+            Self::Store(store) => {
+                store.trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
+            }
+            Self::Data(data) => {
+                data.trace_to_symbol(file_rel, symbol, to_symbol, to_file, max_depth)
+            }
+        }
+    }
+}
+
 impl CallGraphRead for ReadonlyCallGraphStore {
     fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
         self.inner.stored_content_hash(file)
@@ -17734,6 +17965,52 @@ fn go_package_files(
     go_files_in_dir(facts, &dir, caller_file.ends_with("_test.go"))
 }
 
+/// The Go module map: each `go.mod`'s module path, by the folder it names,
+/// from a walk of every folder of the checkout. Every reader of a Go import
+/// path depends on it as a whole, through its domain key.
+pub(crate) fn go_module_map(facts: &FactPaths<'_>) -> HashMap<String, String> {
+    let mut modules = HashMap::new();
+    let mut stack = vec![facts.root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if matches!(
+            dir.file_name().and_then(|s| s.to_str()),
+            Some("target" | "node_modules" | ".git")
+        ) {
+            continue;
+        }
+        let manifest = dir.join("go.mod");
+        facts.config_fact(&manifest, "module");
+        if let Some(bytes) = facts.attributed_bytes(&manifest) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                for line in text.lines() {
+                    let mut words = line.split_whitespace();
+                    if words.next() == Some("module") {
+                        if let Some(name) = words.next() {
+                            modules.insert(
+                                name.trim_matches('"').to_string(),
+                                relative_path(facts.root, &dir),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for entry in facts.list_dir(&dir) {
+            if entry.kind == EntryKind::Directory {
+                stack.push(dir.join(byte_path(&entry.name)));
+            }
+        }
+    }
+    modules
+}
+
+/// The Rust crate map: each workspace crate's name, by the prefix of its
+/// source folder, from every `Cargo.toml` of the checkout. Every reader of a
+/// crate path depends on it as a whole, through its domain key.
+pub(crate) fn rust_crate_map(facts: &FactPaths<'_>) -> HashMap<String, String> {
+    build_workspace_crate_prefixes(facts.root, facts)
+}
+
 fn go_package_dir(
     facts: &FactPaths<'_>,
     cache: &WorkspaceCratePrefixCache,
@@ -17748,38 +18025,7 @@ fn go_package_dir(
         facts.facts.record_domain(join::VIEW_GO_MODULES_DOMAIN);
         let modules = cache.1.get_or_init(|| {
             facts.facts.pause_recording();
-            let mut modules = HashMap::new();
-            let mut stack = vec![facts.root.to_path_buf()];
-            while let Some(dir) = stack.pop() {
-                if matches!(
-                    dir.file_name().and_then(|s| s.to_str()),
-                    Some("target" | "node_modules" | ".git")
-                ) {
-                    continue;
-                }
-                let manifest = dir.join("go.mod");
-                facts.config_fact(&manifest, "module");
-                if let Some(bytes) = facts.attributed_bytes(&manifest) {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        for line in text.lines() {
-                            let mut words = line.split_whitespace();
-                            if words.next() == Some("module") {
-                                if let Some(name) = words.next() {
-                                    modules.insert(
-                                        name.trim_matches('"').to_string(),
-                                        relative_path(facts.root, &dir),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                for entry in facts.list_dir(&dir) {
-                    if entry.kind == EntryKind::Directory {
-                        stack.push(dir.join(byte_path(&entry.name)));
-                    }
-                }
-            }
+            let modules = go_module_map(facts);
             facts.facts.resume_recording();
             modules
         });

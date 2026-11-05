@@ -24,7 +24,23 @@ use crate::views::intent::{WriteIntent, WriteIntentListener, WritePhase};
 /// Whether this process runs the data layer.
 #[must_use]
 pub(crate) fn enabled() -> bool {
+    #[cfg(test)]
+    if FORCED_ON.with(std::cell::Cell::get) {
+        return true;
+    }
     std::env::var_os("AFT_DATA_LAYER").is_some_and(|value| value == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turns the data layer on for the calling thread, so a test can run tools
+/// against it without setting the process-wide switch other tests read.
+#[cfg(test)]
+pub(crate) fn force_on_for_test() {
+    FORCED_ON.with(|forced| forced.set(true));
 }
 
 /// The process's data layer: one block cache for every checkout's reads.
@@ -49,6 +65,8 @@ fn family_of(root: &Path) -> FamilyId {
 pub(crate) struct DataCheckout {
     checkout: Arc<Checkout>,
     building: Arc<AtomicBool>,
+    /// A call-graph refresh is running.
+    refreshing: Arc<AtomicBool>,
     /// Kept so the edit-intent listener lives as long as the checkout.
     _listener: Arc<dyn WriteIntentListener>,
 }
@@ -65,19 +83,24 @@ impl DataCheckout {
         let family_dir = storage.join("data").join(family.digest().to_string());
         let checkout = Arc::new(Checkout::bind(layer(), &family_dir, family, root)?);
         let building = Arc::new(AtomicBool::new(false));
+        let refreshing = Arc::new(AtomicBool::new(false));
         let listener: Arc<dyn WriteIntentListener> = Arc::new(EditListener {
             checkout: Arc::downgrade(&checkout),
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
-            building: Arc::clone(&building),
+            refreshing: Arc::clone(&refreshing),
         });
         crate::views::intent::register_listener(&listener);
         let handle = Arc::new(Self {
             checkout,
             building,
+            refreshing,
             _listener: listener,
         });
         if handle.checkout.view().is_none() {
-            start_build(&handle.checkout, &handle.building);
+            start_build(&handle.checkout, &handle.building, &handle.refreshing);
+        } else {
+            // A bind may have recorded what changed while nothing watched.
+            start_refresh(&handle.checkout, &handle.refreshing);
         }
         Ok(handle)
     }
@@ -102,16 +125,67 @@ impl DataCheckout {
         let root = std::fs::canonicalize(self.checkout.root())
             .unwrap_or_else(|_| self.checkout.root().to_path_buf());
         record(&self.checkout, &root, paths);
+        start_refresh(&self.checkout, &self.refreshing);
+    }
+
+    /// Makes sure a call-graph refresh runs if any change is pending, for a
+    /// query about to wait for the call graph.
+    pub(crate) fn request_refresh(&self) {
+        start_refresh(&self.checkout, &self.refreshing);
     }
 }
 
+/// Resolves the call graph again on its own thread until no recorded change
+/// is pending, unless such a thread is already running. A change recorded
+/// while it runs is picked up by its next pass, or, if it was just ending,
+/// by the check after it lets go of the flag.
+fn start_refresh(checkout: &Arc<Checkout>, refreshing: &Arc<AtomicBool>) {
+    if !pending(checkout) || refreshing.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let checkout = Arc::clone(checkout);
+    let running = Arc::clone(refreshing);
+    let spawned = std::thread::Builder::new()
+        .name("aft-data-refresh".to_string())
+        .spawn(move || loop {
+            let result = checkout.refresh_callgraph();
+            if matches!(result, Ok(Some(_))) {
+                continue;
+            }
+            if let Err(error) = &result {
+                // The changes stay pending; the next change or query that
+                // waits for the call graph tries again.
+                crate::slog_warn!(
+                    "data layer call-graph refresh failed for {}: {error}",
+                    checkout.root().display()
+                );
+            }
+            running.store(false, Ordering::Release);
+            if result.is_err() || !pending(&checkout) || running.swap(true, Ordering::AcqRel) {
+                break;
+            }
+        });
+    if spawned.is_err() {
+        refreshing.store(false, Ordering::Release);
+    }
+}
+
+/// Whether recorded changes wait for the call graph.
+fn pending(checkout: &Checkout) -> bool {
+    matches!(
+        checkout.status().callgraph,
+        super::checkout::PlaneStatus::Building { .. }
+    ) && checkout.view().is_some()
+}
+
 /// Starts a build on its own thread unless one is running.
-fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>) {
+fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>, refreshing: &Arc<AtomicBool>) {
     if building.swap(true, Ordering::AcqRel) {
         return;
     }
     let checkout = Arc::clone(checkout);
     let running = Arc::clone(building);
+    let refreshing = Arc::clone(refreshing);
     let spawned = std::thread::Builder::new()
         .name("aft-data-build".to_string())
         .spawn(move || {
@@ -129,6 +203,9 @@ fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>) {
                 ),
             }
             running.store(false, Ordering::Release);
+            // Changes recorded while the build ran stay laid over its
+            // publication and wait for the call graph.
+            start_refresh(&checkout, &refreshing);
         });
     if spawned.is_err() {
         building.store(false, Ordering::Release);
@@ -169,7 +246,7 @@ fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
 struct EditListener {
     checkout: Weak<Checkout>,
     root: PathBuf,
-    building: Arc<AtomicBool>,
+    refreshing: Arc<AtomicBool>,
 }
 
 impl WriteIntentListener for EditListener {
@@ -189,5 +266,6 @@ impl WriteIntentListener for EditListener {
                 record(&checkout, &self.root, std::slice::from_ref(path))
             }
         }
+        start_refresh(&checkout, &self.refreshing);
     }
 }

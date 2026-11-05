@@ -2380,7 +2380,22 @@ pub fn ensure_target_indexed(
         Err(error) => return Err(store_error_response(req_id, operation, error)),
         Ok(false) => {}
     }
-    let path = absolute_file(store, file);
+    Err(not_indexed_response(
+        req_id,
+        operation,
+        ctx,
+        &absolute_file(store, file),
+    ))
+}
+
+/// The refusal for a target file the call graph does not cover, naming
+/// whether the project's ignore rules exclude it.
+pub fn not_indexed_response(
+    req_id: &str,
+    operation: &str,
+    ctx: &AppContext,
+    path: &Path,
+) -> Response {
     let ignored = ctx.gitignore().is_some_and(|matcher| {
         matcher
             .matched_path_or_any_parents(&path, false)
@@ -2391,12 +2406,12 @@ pub fn ensure_target_indexed(
     } else {
         ("not_in_generation", "path is not part of this call graph generation (excluded, unsupported, or not yet indexed)")
     };
-    Err(Response::error_with_data(
+    Response::error_with_data(
         req_id,
         "not_indexed",
         format!("{operation}: not_indexed: {detail}: {}; use grep or aft_search with pattern to find references", path.display()),
         serde_json::json!({ "reason": reason, "file": path, "results": serde_json::Value::Null }),
-    ))
+    )
 }
 
 #[cfg(test)]

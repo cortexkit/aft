@@ -25,13 +25,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::callgraph_store::fact_answers::{FactAnswer, FactAnswers, FactQuestion};
-use crate::callgraph_store::facts::ProjectFacts;
+use crate::callgraph_store::facts::{FactPaths, ProjectFacts};
 use crate::callgraph_store::join::{
     rust_module_key_for_file, ManifestJoinError, ViewBindingDependencies, ViewBindingFacts,
     VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
     VIEW_RUST_CRATES_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
 use crate::callgraph_store::DbFileIndex;
+use crate::callgraph_store::{go_module_map, rust_crate_map};
 
 use super::callgraph::{
     bind_all, dispatch_targets, resolve_files, resolver_index, CheckoutFacts, CheckoutInputs,
@@ -415,6 +416,45 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
+        // Configuration files added or removed. A content change of an
+        // existing one reaches its readers through their recorded field
+        // answers, which are asked again below; only membership changes need
+        // every config reader to bind again.
+        let config_membership = configs
+            .intersection(&membership)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        // The Go module map and the Rust crate map are each built from a
+        // walk of the checkout, and a reader records only the map's key. The
+        // key changes when the map does, so build each map before and after
+        // whenever its inputs can have changed: a go.mod or Cargo.toml edit,
+        // a symlink (a walk may follow it), or for crates any path added or
+        // removed (a crate's `src` folder can appear).
+        let is_named = |path: &String, name: &str| {
+            path == name
+                || path
+                    .strip_suffix(name)
+                    .is_some_and(|parent| parent.ends_with('/'))
+        };
+        let maps_differ = |build: &dyn Fn(&FactPaths<'_>) -> HashMap<String, String>| {
+            let root = std::path::Path::new("/");
+            let before = build(&FactPaths {
+                root,
+                facts: &CheckoutFacts { inputs: &old },
+            });
+            let after = build(&FactPaths {
+                root,
+                facts: &CheckoutFacts { inputs },
+            });
+            before != after
+        };
+        let go_modules_changed = (!links.is_empty()
+            || configs.iter().any(|path| is_named(path, "go.mod")))
+            && maps_differ(&go_module_map);
+        let rust_crates_changed = (!links.is_empty()
+            || !membership.is_empty()
+            || configs.iter().any(|path| is_named(path, "Cargo.toml")))
+            && maps_differ(&rust_crate_map);
         drop(old);
 
         // Every checkout read a resolution made is recorded with its answer.
@@ -436,26 +476,12 @@ impl LiveCheckout {
         // exist, and on configuration it read.
         let started = Instant::now();
         let mut binding_keys = membership.clone();
-        binding_keys.extend(configs.iter().cloned());
-        if !configs.is_empty() {
+        if !config_membership.is_empty() {
             binding_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
-        // The Go module map and the Rust crate map are each built once from
-        // a walk of the checkout's folders; a reader records the map's key,
-        // not the walk's reads. Besides a go.mod or Cargo.toml edit, a
-        // symlink change can redirect a folder a walk follows (a crate's
-        // `src`, a module folder), so it changes both keys too.
-        let go_modules_changed = !links.is_empty()
-            || configs
-                .iter()
-                .any(|path| path == "go.mod" || path.ends_with("/go.mod"));
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
-        let rust_crates_changed = !links.is_empty()
-            || configs
-                .iter()
-                .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
         if rust_crates_changed {
             binding_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
         }
@@ -527,8 +553,7 @@ impl LiveCheckout {
         // What a recorded answer can depend on that changed.
         let mut changed_keys = surfaces_changed.clone();
         changed_keys.extend(membership.iter().cloned());
-        changed_keys.extend(configs.iter().cloned());
-        if !configs.is_empty() {
+        if !config_membership.is_empty() {
             changed_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
         if module_tree_changed {
