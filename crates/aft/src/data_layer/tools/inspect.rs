@@ -153,9 +153,13 @@ mod tests {
         let root = crate::inspect::job::canonicalize_normalized(std::path::Path::new(&root));
         let storage = tempfile::tempdir().expect("storage");
         let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
-        let store =
-            crate::callgraph_store::CallGraphStore::open(storage.path().join("callgraph"), root.clone())
-                .expect("open today's database");
+        // Not `<dir>/callgraph`: that names a legacy harness partition, which
+        // today's store refuses to write into.
+        let store = crate::callgraph_store::CallGraphStore::open(
+            storage.path().join("today-store"),
+            root.clone(),
+        )
+        .expect("open today's database");
         store.cold_build(&files).expect("build today's database");
         let today = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
             .expect("project today's snapshot");
