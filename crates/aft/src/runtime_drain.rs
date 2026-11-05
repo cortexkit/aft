@@ -3819,6 +3819,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     // packages are often gitignored but still change which
                     // TypeScript server a file gets.
                     ctx.lsp_note_watcher_batch(&paths, content_only);
+                    ctx.data_note_paths(&paths);
                     delay_watcher_receive_for_test();
                     if !state.rescan_required {
                         let mut accepted = false;

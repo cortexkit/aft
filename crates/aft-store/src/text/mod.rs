@@ -13,7 +13,8 @@ mod trigrams;
 
 pub use plan::{Query, plan, plan_pattern};
 pub use search::{
-    Located, OverlayEntry, Scope, TextLocator, TextMembership, TextOverlay, candidates,
+    Located, OverlayEntry, PathText, Scope, TextLocator, TextMembership, TextOverlay, candidates,
+    path_text, paths_with_trigram, trigram_frequency,
 };
 pub use sections::{KNOWN, TextSectionsBuilder, TextSegment, TextStatus, TextUnit};
 pub use trigrams::{ContentTrigrams, fold, next_bit, pack};

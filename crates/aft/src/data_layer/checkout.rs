@@ -25,7 +25,7 @@ use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId};
 use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
-    candidates, ContentTrigrams, OverlayEntry, Query, Scope, TextLocator, TextMembership,
+    candidates, ContentTrigrams, OverlayEntry, PathText, Query, Scope, TextLocator, TextMembership,
     TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
@@ -607,6 +607,78 @@ impl CheckoutView {
         .map_err(DataError::store)
     }
 
+    /// What the text plane holds for `path`, with the changes since the
+    /// publication applied; `None` when the checkout has no such path.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn path_text(&self, path: &[u8]) -> Result<Option<PathText>, DataError> {
+        let published = &self.published;
+        let texts = published.texts()?;
+        aft_store::text::path_text(
+            &published.state,
+            &published.membership,
+            &texts,
+            &self.text,
+            path,
+        )
+        .map_err(DataError::store)
+    }
+
+    /// How rare `trigram` is across the family's indexed contents (see
+    /// [`aft_store::text::trigram_frequency`]).
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn trigram_frequency(&self, trigram: u32) -> Result<u64, DataError> {
+        let texts = self.published.texts()?;
+        aft_store::text::trigram_frequency(&texts, trigram).map_err(DataError::store)
+    }
+
+    /// The paths whose indexed content holds `trigram`, in byte order, with
+    /// the changes since the publication applied.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn paths_with_trigram(&self, trigram: u32) -> Result<Vec<Vec<u8>>, DataError> {
+        let published = &self.published;
+        let texts = published.texts()?;
+        aft_store::text::paths_with_trigram(
+            &published.state,
+            &published.membership,
+            &texts,
+            &self.text,
+            trigram,
+        )
+        .map_err(DataError::store)
+    }
+
+    /// The dead-code snapshot `aft_inspect` analyses, built from every
+    /// file's stored record and fragment in one pass.
+    ///
+    /// # Errors
+    ///
+    /// When a record or fragment cannot be read.
+    pub(crate) fn dead_code_snapshot(
+        &self,
+    ) -> Result<crate::inspect::job::CallgraphSnapshot, DataError> {
+        let (parses, resolved) = self
+            .published
+            .graph
+            .resolutions()
+            .map_err(DataError::Store)?;
+        let inputs = CheckoutInputs {
+            state: self.published.state.clone(),
+            parses,
+            configs: HashMap::new(),
+        };
+        let rows = super::graph_rows::assemble(&inputs, &resolved);
+        Ok(super::dead_code::snapshot(&self.published.root, &rows))
+    }
+
     /// The call graph of the publication, as the call-graph commands read
     /// it. Files in [`changed_paths`](Self::changed_paths) answer as they
     /// were published until they are resolved again; the status says so.
@@ -837,6 +909,31 @@ mod tests {
         };
         check(&checkout.view().unwrap());
         assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+
+        // The ranking primitives and the dead-code snapshot.
+        let view = checkout.view().unwrap();
+        let cal = aft_store::text::pack(b'c', b'a', b'l');
+        assert_eq!(
+            view.paths_with_trigram(cal).unwrap(),
+            vec![b"src/lib.rs".to_vec(), b"src/util.rs".to_vec()]
+        );
+        assert!(view.trigram_frequency(cal).unwrap() >= 2);
+        assert!(matches!(
+            view.path_text(b"src/lib.rs").unwrap(),
+            Some(PathText::Indexed { distinct }) if distinct > 10
+        ));
+        assert_eq!(view.path_text(b"missing.rs").unwrap(), None);
+        let snapshot = view.dead_code_snapshot().unwrap();
+        assert_eq!(snapshot.files.len(), 2, "{:?}", snapshot.files);
+        assert!(
+            snapshot
+                .outbound_calls
+                .iter()
+                .any(|call| format!("{call:?}").contains("callee")),
+            "{:?}",
+            snapshot.outbound_calls
+        );
+        drop(view);
 
         // An edit is visible to text queries at once, and the call graph
         // reports it pending until the next build covers it.

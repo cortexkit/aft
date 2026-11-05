@@ -4806,6 +4806,10 @@ pub struct AppContext {
     view_publication_attempt_starts: parking_lot::Mutex<Vec<Instant>>,
     checkout_driver: crate::views::first_load::InstalledDriver,
     lexical_view: parking_lot::Mutex<Option<Arc<crate::views::trigram::LexicalView>>>,
+    /// This root's checkout in the data layer that replaces the views and
+    /// legacy stores; only with `AFT_DATA_LAYER=1` (see
+    /// `data_layer::runtime`).
+    data_checkout: parking_lot::Mutex<Option<Arc<crate::data_layer::runtime::DataCheckout>>>,
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
@@ -5792,6 +5796,7 @@ impl AppContext {
             view_publication_attempt_starts: parking_lot::Mutex::new(Vec::new()),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
+            data_checkout: parking_lot::Mutex::new(None),
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
@@ -9893,6 +9898,43 @@ impl AppContext {
 
     pub fn canonical_cache_root_opt(&self) -> Option<PathBuf> {
         self.canonical_cache_root.lock().clone()
+    }
+
+    /// This root's checkout in the data layer, bound on first use, when
+    /// the process runs it (`AFT_DATA_LAYER=1`); `None` otherwise, or when
+    /// no root is configured or its store cannot be opened.
+    pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
+        if !crate::data_layer::runtime::enabled() {
+            return None;
+        }
+        let root = self.canonical_cache_root_opt()?;
+        let mut slot = self.data_checkout.lock();
+        if slot.as_ref().is_none_or(|checkout| checkout.root() != root) {
+            *slot = match crate::data_layer::runtime::DataCheckout::open(&root, &self.storage_dir())
+            {
+                Ok(checkout) => Some(checkout),
+                Err(error) => {
+                    crate::slog_warn!("data layer could not bind {}: {error}", root.display());
+                    None
+                }
+            };
+        }
+        slot.clone()
+    }
+
+    /// The data layer's current view of this root, when it runs and has
+    /// published; see [`Self::data_checkout`].
+    pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
+        self.data_checkout()?.view()
+    }
+
+    /// Passes the watcher's changed paths to the data layer, if this root
+    /// has a bound checkout there.
+    pub(crate) fn data_note_paths(&self, paths: &[PathBuf]) {
+        let checkout = self.data_checkout.lock().clone();
+        if let Some(checkout) = checkout {
+            checkout.note_paths(paths);
+        }
     }
 
     pub fn set_cache_role(&self, is_worktree_bridge: bool, git_common_dir: Option<PathBuf>) {

@@ -302,6 +302,46 @@ impl StoredSlices {
         ))
     }
 
+    /// Every file's parse and resolution, decoded from its stored record
+    /// and fragment.
+    ///
+    /// # Errors
+    ///
+    /// When a record or fragment cannot be read.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn resolutions(
+        &self,
+    ) -> Result<
+        (
+            BTreeMap<String, (String, Arc<crate::callgraph_store::join::ParseBlob>)>,
+            BTreeMap<String, FileResolution>,
+        ),
+        String,
+    > {
+        let mut parses = BTreeMap::new();
+        let mut resolved = BTreeMap::new();
+        for (file, located) in &self.paths {
+            let record = self
+                .content(located.record.0)?
+                .record(located.record.1)
+                .map_err(|error| error.to_string())?;
+            let CallgraphBlob::Parse(parse) =
+                blob_from_record(&record).map_err(|error| error.to_string())?
+            else {
+                return Err(format!("{file}: its stored record is not a parse"));
+            };
+            let bytes = self
+                .graph(located.fragment.0)?
+                .fragment(located.fragment.1)
+                .map_err(|error| error.to_string())?;
+            let resolution = super::fragment::decode(&located.record_key, file, &bytes)
+                .map_err(|error| error.0.to_string())?;
+            parses.insert(file.clone(), (located.record_key.clone(), Arc::new(parse)));
+            resolved.insert(file.clone(), resolution);
+        }
+        Ok((parses, resolved))
+    }
+
     /// The files whose current fragment is listed under `term`, in every
     /// segment that has graph sections.
     fn files_for(&self, kind: TermKind, term: &[u8]) -> BTreeSet<String> {

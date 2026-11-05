@@ -160,6 +160,127 @@ impl TextMembership {
     }
 }
 
+/// What the text plane holds for one path of a checkout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathText {
+    /// Indexed, with its distinct trigrams.
+    Indexed { distinct: u32 },
+    /// Not indexed: binary, too large, or not read yet.
+    Unindexed,
+    /// A symlink, which text queries never follow.
+    Excluded,
+}
+
+/// What the text plane holds for the path at `index` of `state`, with
+/// `overlay`'s change in its place.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn path_text(
+    state: &CheckoutState,
+    membership: &TextMembership,
+    segments: &[TextSegment<'_>],
+    overlay: &TextOverlay,
+    path: &[u8],
+) -> Result<Option<PathText>, SegmentError> {
+    if let Some(entry) = overlay.entries.get(path) {
+        return Ok(match entry {
+            OverlayEntry::Content(trigrams) => Some(PathText::Indexed {
+                distinct: u32::try_from(trigrams.distinct()).unwrap_or(u32::MAX),
+            }),
+            OverlayEntry::Unindexed => Some(PathText::Unindexed),
+            OverlayEntry::Deleted => None,
+        });
+    }
+    let Some(index) = state.position(path) else {
+        return Ok(None);
+    };
+    Ok(Some(match membership.places[index] {
+        Place::Indexed { segment, ordinal } => {
+            let unit = segments[segment as usize].unit(ordinal)?;
+            PathText::Indexed {
+                distinct: unit.distinct,
+            }
+        }
+        Place::Unchecked => PathText::Unindexed,
+        Place::Excluded => PathText::Excluded,
+    }))
+}
+
+/// How many contents in `segments` hold `trigram`: a member may be counted
+/// once per segment that holds its content, and contents no path of the
+/// checkout uses are counted too, so this ranks trigrams by rarity rather
+/// than counting files.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn trigram_frequency(segments: &[TextSegment<'_>], trigram: u32) -> Result<u64, SegmentError> {
+    segments
+        .iter()
+        .map(|segment| segment.count(trigram).map(u64::from))
+        .sum()
+}
+
+/// The paths of `state`, with `overlay`'s changes, whose content holds
+/// `trigram`, in byte order. Unlike [`candidates`], a path whose content is
+/// not indexed is left out: this answers which indexed contents hold a
+/// trigram, for ranking.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn paths_with_trigram(
+    state: &CheckoutState,
+    membership: &TextMembership,
+    segments: &[TextSegment<'_>],
+    overlay: &TextOverlay,
+    trigram: u32,
+) -> Result<Vec<Vec<u8>>, SegmentError> {
+    let mut members = vec![Vec::<(u32, usize)>::new(); segments.len()];
+    for (index, record) in state.paths().iter().enumerate() {
+        if overlay.contains(&record.path) {
+            continue;
+        }
+        if let Place::Indexed { segment, ordinal } = membership.places[index] {
+            members[segment as usize].push((ordinal, index));
+        }
+    }
+    let mut found = Vec::new();
+    for (segment, mut members) in members.into_iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_unstable();
+        let mut ordinals = members
+            .iter()
+            .map(|(ordinal, _)| *ordinal)
+            .collect::<Vec<_>>();
+        ordinals.dedup();
+        let hits = segments[segment].ordinals(trigram, 0, &ordinals)?;
+        let mut hits = hits.into_iter().peekable();
+        for (ordinal, index) in members {
+            while hits.peek().is_some_and(|hit| *hit < ordinal) {
+                hits.next();
+            }
+            if hits.peek() == Some(&ordinal) {
+                found.push(state.paths()[index].path.clone());
+            }
+        }
+    }
+    for (path, entry) in &overlay.entries {
+        if let OverlayEntry::Content(trigrams) = entry {
+            if trigrams.get(trigram).is_some() {
+                found.push(path.clone());
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
+}
+
 /// Which paths a search covers.
 #[derive(Clone, Copy, Debug)]
 pub enum Scope<'a> {
