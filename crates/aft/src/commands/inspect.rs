@@ -905,6 +905,18 @@ fn handle_inspect_payload(
         None
     };
     let manager = ctx.inspect_manager();
+    // With the data layer on (`AFT_DATA_LAYER=1`), dead code reads its call
+    // graph from the root's checkout while that graph is ready, and from
+    // today's store otherwise (see `data_layer::tools::inspect`).
+    if snapshot
+        .config
+        .inspect
+        .category_enabled(InspectCategory::DeadCode)
+    {
+        if let Some(checkout) = ctx.data_checkout() {
+            manager.read_dead_code_from_data_layer(&snapshot.project_root, &checkout);
+        }
+    }
     // A writer-backed unscoped request must retain contribution reuse. Only
     // requests the legacy scanner cannot serve need an ephemeral view scan.
     let needs_ephemeral_view = (scope_was_provided || !ctx.inspect_writer()) && tier2_enabled;

@@ -1061,6 +1061,9 @@ pub struct InspectManager {
     /// in the inspect cache, so status readers consult this set instead of a
     /// cached count from an earlier pass.
     dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,
+    /// The data-layer checkouts dead code reads its call graph from while
+    /// they are ready; empty unless the process runs the data layer.
+    data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
 }
 
 #[cfg(test)]
@@ -1225,6 +1228,7 @@ impl InspectManager {
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
             dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
+            data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Arc::new(Mutex::new(HashMap::new())),
@@ -2881,6 +2885,17 @@ impl InspectManager {
         .map(|(snapshot, _, _)| snapshot)
     }
 
+    /// Lets dead code at `project_root` read its call graph from the data
+    /// layer's `checkout` whenever that graph is ready, in place of today's
+    /// database (see `data_layer::tools::inspect`).
+    pub(crate) fn read_dead_code_from_data_layer(
+        &self,
+        project_root: &Path,
+        checkout: &Arc<crate::data_layer::runtime::DataCheckout>,
+    ) {
+        self.data_layer_dead_code.bind(project_root, checkout);
+    }
+
     /// Build the dead-code snapshot and report how it was produced, so the
     /// `perf tier2 phases` line can name the projection verdict instead of
     /// leaving the operator to infer it from timings.
@@ -3391,9 +3406,15 @@ impl InspectManager {
             .as_ref()
             .filter(|_| category == InspectCategory::DeadCode)
             .and_then(|store| {
-                crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                    .ok()
-                    .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+                // The data layer's view stands in for the pinned store's
+                // projection while its call graph is ready.
+                self.data_layer_dead_code
+                    .snapshot(&snapshot.project_root)
+                    .or_else(|| {
+                        crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                            .ok()
+                            .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+                    })
             });
         let mut config = (*snapshot.config).clone();
         config.indexes.callgraph = false;
@@ -4727,7 +4748,12 @@ impl InspectManager {
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
         phases.rollup = rollup_started.elapsed();
-        if let Some(verdict) = phases.projection {
+        // The cost estimates predict today's store projections; a snapshot
+        // from the data layer costs something else and is left out of them.
+        if let Some(verdict) = phases
+            .projection
+            .filter(|verdict| *verdict != DATA_LAYER_SNAPSHOT)
+        {
             self.observe_callgraph_projection_cost(
                 &job.project_root,
                 verdict,
@@ -5974,6 +6000,16 @@ fn build_view_callgraph_snapshot(
     Some((snapshot, verdict, cost))
 }
 
+/// The verdict a dead-code snapshot from the data layer reports: a whole
+/// snapshot, not derived from an earlier one, so the rollup recomputes every
+/// verdict rather than patching a previous rollup.
+const DATA_LAYER_SNAPSHOT: ProjectionVerdict = ProjectionVerdict {
+    kind: ProjectionKind::Full,
+    reason: Some("data_layer"),
+    journal_bytes: 0,
+    changed_files: 0,
+};
+
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
     allow_cold_build: bool,
@@ -5987,6 +6023,14 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             "tier2 dead_code: callgraph store disabled; reporting callgraph_unavailable"
         );
         return Ok(None);
+    }
+
+    // With the data layer on, its view answers while its call graph is ready;
+    // otherwise the snapshot is projected from today's store below.
+    if let Some(snapshot) = projection_cache
+        .and_then(|manager| manager.data_layer_dead_code.snapshot(&job.project_root))
+    {
+        return Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())));
     }
 
     if job.config.views.enabled {
@@ -9881,6 +9925,66 @@ export function bannerUnused() {}
             snapshot.is_none(),
             "a cold/mid-build store must surface callgraph_unavailable instead of rebuilding inline"
         );
+    }
+
+    #[test]
+    fn callgraph_snapshot_reads_a_ready_data_layer_checkout_and_never_a_pending_one() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let storage = tempfile::tempdir().expect("storage");
+        let inspect_dir = storage.path().join("inspect");
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let manager = InspectManager::new();
+        let read = |manager: &InspectManager| {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, false, &[])
+                .expect("snapshot readiness")
+        };
+        assert!(
+            read(&manager).is_none(),
+            "without the data layer, today's store answers, and there is none here"
+        );
+
+        let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path())
+            .expect("bind the checkout");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while checkout.view().is_none() {
+            assert!(Instant::now() < deadline, "the checkout never published");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.read_dead_code_from_data_layer(&root, &checkout);
+        let (snapshot, verdict, _) = read(&manager).expect("the ready data layer answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        assert_eq!(
+            snapshot.files,
+            (0..3)
+                .map(|index| root.join(format!("mod{index}.ts")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.exported_symbols.len(), 3, "{snapshot:?}");
+
+        // A checkout of another folder never answers for a root.
+        let other = InspectManager::new();
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonical elsewhere");
+        other.read_dead_code_from_data_layer(&elsewhere, &checkout);
+        assert!(other
+            .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                &snapshot_job(&elsewhere, &inspect_dir, true),
+                false,
+                false,
+                &[],
+            )
+            .expect("snapshot readiness")
+            .is_none());
+
+        // An edit the data layer has not resolved leaves its call graph
+        // pending: dead code goes back to today's store rather than answer
+        // from the older publication.
+        let edited = root.join("mod0.ts");
+        std::fs::write(&edited, "export function g0() { return 0; }\n").expect("edit");
+        checkout.note_paths(std::slice::from_ref(&edited));
+        assert!(read(&manager).is_none(), "a pending change was answered");
     }
 
     #[test]
