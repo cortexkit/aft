@@ -173,7 +173,7 @@ impl<'a> ObjectDispatch<'a> {
         // object facts. Install only imports naming functions whose returned
         // objects are used as receivers.
         if let Some(mut file_index) = self.index.file_index(file).map(|index| (*index).clone()) {
-            let lazy = self.index.lazy.as_ref().unwrap();
+            let lazy = self.index.stored_lazy.as_ref().unwrap();
             let facts = lazy.fact_paths();
             let needed = join::dispatch_type_names(&parse);
             for import in parse.imports.iter().filter(|import| {

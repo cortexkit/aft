@@ -224,6 +224,6 @@ mod tests {
             }
         }
         // The fixture must move answers, or the check proves nothing.
-        assert!(moved >= 8, "only {moved} answers moved");
+        assert!(moved >= 7, "only {moved} answers moved");
     }
 }

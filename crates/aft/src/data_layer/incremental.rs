@@ -31,14 +31,13 @@ use crate::callgraph_store::join::{
     VIEW_CONFIG_MEMBERSHIP_DOMAIN, VIEW_GO_MODULES_DOMAIN, VIEW_GO_PACKAGE_DOMAIN,
     VIEW_RUST_CRATES_DOMAIN, VIEW_RUST_MODULE_DOMAIN,
 };
-use crate::callgraph_store::DbFileIndex;
 use crate::callgraph_store::{go_module_map, rust_crate_map};
 
 use aft_store::graph::TermKind;
 
 use super::callgraph::{
-    bind_all, dispatch_targets, resolve_files, resolver_index, CheckoutFacts, CheckoutInputs,
-    FileResolution, MethodCallInputs, Surfaces,
+    bind_all, dispatch_targets, resolve_files, resolver_index, BindCache, CheckoutFacts,
+    CheckoutInputs, FileResolution, MethodCallInputs,
 };
 use super::graph_store::StoredSlices;
 use super::subjects::{affected_by, subjects, Subject};
@@ -280,9 +279,8 @@ impl ReverseInputs {
 /// A checkout's resolution, with what each pass recorded.
 pub struct LiveCheckout {
     pub(crate) inputs: CheckoutInputs,
-    surfaces: Surfaces,
-    /// Each file's binding as pass 1 left it.
-    prebound: HashMap<String, ViewBindingDependencies>,
+    /// Each file's bound surface and pass-1 binding, bound when first needed.
+    bound: BindCache,
     pub(crate) resolved: BTreeMap<String, FileResolution>,
     calls: MethodCallInputs,
     reverse: ReverseInputs,
@@ -309,17 +307,28 @@ impl LiveCheckout {
     /// For gates: the engine will look changes up in the stored terms
     /// instead of keeping this index.
     pub(crate) fn stored_readers_missing(&self, stored: &StoredSlices) -> Vec<String> {
+        let started = Instant::now();
         // The index a cold engine builds in memory from every file.
         let facts = CheckoutFacts {
             inputs: &self.inputs,
         };
         let mut built = ReverseInputs::new(None);
-        for (path, binding) in &self.prebound {
-            built.note_prebound(path, binding);
+        let paths = self.inputs.parses.keys().collect::<Vec<_>>();
+        if let Err(error) = self.bound.bind_missing(&self.inputs, &paths) {
+            return vec![format!("binding every file failed: {error}")];
+        }
+        for path in paths {
+            if let Some(bound) = self.bound.get(path) {
+                built.note_prebound(path, &bound.binding);
+            }
         }
         for (path, file) in &self.resolved {
             built.note_resolution(path, file, &facts);
         }
+        let built_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let mut lookups = 0usize;
+        let mut postings = 0usize;
         let mut missing = Vec::new();
         let kinds = [
             &built.binding,
@@ -331,6 +340,8 @@ impl LiveCheckout {
         for readers in kinds {
             for (key, files) in &readers.by_key {
                 let found = stored.files_recording(readers.kind, key.as_bytes());
+                lookups += 1;
+                postings += found.len();
                 let lost = files
                     .iter()
                     .filter(|file| !found.contains(*file))
@@ -345,6 +356,15 @@ impl LiveCheckout {
                 }
             }
         }
+        // Measurement, for the gate's log; not a miss.
+        crate::slog_info!(
+            "data layer stored input check: built {built_ms:.0} ms, {lookups} lookups returning {postings} files in {:.0} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "stored input check: built {built_ms:.0} ms, {lookups} lookups returning {postings} files in {:.0} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         missing
     }
 
@@ -356,7 +376,7 @@ impl LiveCheckout {
         let inputs = &self.inputs;
         let checkout = CheckoutFacts { inputs };
         let facts = Rc::new(ViewBindingFacts::new(Rc::new(CheckoutFacts { inputs })));
-        let index = resolver_index(&self.surfaces, &facts);
+        let (index, _files) = resolver_index(inputs, &self.bound, &facts);
         let mut now = HashMap::<&FactQuestion, FactAnswer>::new();
         let mut surface = BTreeMap::new();
         let mut traced = BTreeMap::new();
@@ -478,31 +498,31 @@ impl LiveCheckout {
     /// When resolution fails on a file.
     pub(crate) fn cold(inputs: CheckoutInputs, threads: usize) -> Result<Self, ManifestJoinError> {
         let pool = Arc::new(super::callgraph::pool(threads)?);
-        let (surfaces, prebound, resolved, calls) = pool.install(|| {
+        let bound = BindCache::default();
+        let (resolved, calls) = pool.install(|| {
             let paths = inputs.parses.keys().collect::<Vec<_>>();
-            let (surfaces, prebound) = bind_all(&inputs, &paths)?;
-            let surfaces: Surfaces = Arc::new(surfaces);
-            let mut resolved = resolve_files(&inputs, &surfaces, &prebound, &paths)?;
+            bound.bind_missing(&inputs, &paths)?;
+            let mut resolved = resolve_files(&inputs, &bound, &paths)?;
             let mut calls = MethodCallInputs::build(&inputs, &resolved);
             for (path, sites, dependencies) in calls.resolve_sites(&inputs, &paths) {
                 let file = resolved.get_mut(&path).expect("resolved");
                 file.sites = sites;
                 file.site_dependencies = dependencies;
             }
-            Ok::<_, ManifestJoinError>((surfaces, prebound, resolved, calls))
+            Ok::<_, ManifestJoinError>((resolved, calls))
         })?;
         let mut reverse = ReverseInputs::new(None);
         let facts = CheckoutFacts { inputs: &inputs };
-        for (path, binding) in &prebound {
-            reverse.note_prebound(path, binding);
+        for path in inputs.parses.keys() {
+            let bound = bound.get(path).expect("every parsed file was bound");
+            reverse.note_prebound(path, &bound.binding);
         }
         for (path, file) in &resolved {
             reverse.note_resolution(path, file, &facts);
         }
         Ok(Self {
             inputs,
-            surfaces,
-            prebound,
+            bound,
             resolved,
             calls,
             reverse,
@@ -511,13 +531,12 @@ impl LiveCheckout {
     }
 
     /// A checkout's resolution from what a publication stored: every file's
-    /// resolution as `resolved` holds it. Binds every file again for the
-    /// surfaces and pass-1 bindings later updates compare against, without
-    /// resolving anything.
+    /// resolution as `resolved` holds it. Binds nothing: a file is bound when
+    /// an update or a resolution first needs it.
     ///
     /// # Errors
     ///
-    /// When binding fails on a file.
+    /// When the thread pool cannot start.
     pub(crate) fn from_resolved(
         inputs: CheckoutInputs,
         resolved: BTreeMap<String, FileResolution>,
@@ -538,22 +557,13 @@ impl LiveCheckout {
     ) -> Result<Self, ManifestJoinError> {
         let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
         let pool = Arc::new(super::callgraph::pool(threads)?);
-        let (surfaces, prebound, calls, bind_ms, calls_ms) = pool.install(|| {
-            let paths = inputs.parses.keys().collect::<Vec<_>>();
-            let started = Instant::now();
-            let (surfaces, prebound) = bind_all(&inputs, &paths)?;
-            let bind_ms = ms(started);
-            let started = Instant::now();
-            let calls = MethodCallInputs::build(&inputs, &resolved);
-            Ok::<_, ManifestJoinError>((Arc::new(surfaces), prebound, calls, bind_ms, ms(started)))
-        })?;
-        timings.push(("bind every file", bind_ms));
-        timings.push(("method-call inputs", calls_ms));
+        let started = Instant::now();
+        let calls = pool.install(|| MethodCallInputs::build(&inputs, &resolved));
+        timings.push(("method-call inputs", ms(started)));
         let reverse = ReverseInputs::new(Some(stored));
         Ok(Self {
             inputs,
-            surfaces,
-            prebound,
+            bound: BindCache::default(),
             resolved,
             calls,
             reverse,
@@ -630,6 +640,14 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
+        // Parsed files no longer parsed: removed, or no longer extractable.
+        let removed_parses = changed
+            .iter()
+            .filter(|path| {
+                old.parses.contains_key(path.as_str()) && !inputs.parses.contains_key(path.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         // Configuration files added or removed. A content change of an
         // existing one reaches its readers through their recorded field
         // answers, which are asked again below; only membership changes need
@@ -669,7 +687,6 @@ impl LiveCheckout {
             || !membership.is_empty()
             || configs.iter().any(|path| is_named(path, "Cargo.toml")))
             && maps_differ(&rust_crate_map);
-        drop(old);
 
         // Every checkout read a resolution made is recorded with its answer.
         // When paths, links or configuration changed, each distinct recorded
@@ -706,31 +723,47 @@ impl LiveCheckout {
         rebind.retain(|path| inputs.parses.contains_key(path));
         let rebind = rebind.into_iter().collect::<Vec<_>>();
         let rebind_refs = rebind.iter().collect::<Vec<_>>();
-        let (new_surfaces, new_prebound) = bind_all(inputs, &rebind_refs)?;
+        let new_bound = bind_all(inputs, &rebind_refs)?;
         stats.rebound = rebind.len();
+        // What each rebound file was bound to before: its cached binding,
+        // which holds for the old inputs, or for a file never bound since
+        // the engine started, a binding under the old inputs now.
+        let unbound = rebind
+            .iter()
+            .filter(|path| self.bound.get(path).is_none() && old.parses.contains_key(*path))
+            .collect::<Vec<_>>();
+        let mut old_bound = bind_all(&old, &unbound)?
+            .into_iter()
+            .map(|(path, bound)| (path, Arc::new(bound)))
+            .collect::<HashMap<_, _>>();
+        for path in &rebind {
+            if let Some(bound) = self.bound.get(path) {
+                old_bound.insert(path.clone(), bound);
+            }
+        }
+        drop(old);
         // The Rust module tree changes when a Rust file is added or removed,
         // or a rebound file declares different modules.
         let module_tree_changed = membership.iter().any(|path| path.ends_with(".rs"))
             || rebind.iter().any(|path| {
                 path.ends_with(".rs")
-                    && self
-                        .surfaces
-                        .get(path.as_str())
-                        .map(DbFileIndex::declared_module_targets)
-                        != new_surfaces
-                            .get(path.as_str())
-                            .map(DbFileIndex::declared_module_targets)
+                    && old_bound
+                        .get(path)
+                        .map(|bound| bound.surface.declared_module_targets())
+                        != new_bound
+                            .get(path)
+                            .map(|bound| bound.surface.declared_module_targets())
             });
         let mut surfaces_changed = BTreeSet::new();
         let mut references_changed = BTreeSet::new();
         for path in &rebind {
-            let new = &new_prebound[path.as_str()];
-            match self.prebound.get(path.as_str()) {
+            let new = &new_bound[path.as_str()].binding;
+            match old_bound.get(path) {
                 Some(old) => {
-                    if !old.same_surface(new) {
+                    if !old.binding.same_surface(new) {
                         surfaces_changed.insert(path.clone());
                     }
-                    if old.references != new.references {
+                    if old.binding.references != new.references {
                         references_changed.insert(path.clone());
                     }
                 }
@@ -740,28 +773,21 @@ impl LiveCheckout {
                 }
             }
         }
-        let removed = self
-            .resolved
-            .keys()
-            .filter(|path| !inputs.parses.contains_key(*path))
-            .cloned()
-            .collect::<Vec<_>>();
+        drop(old_bound);
+        let removed = removed_parses;
         for path in &removed {
             surfaces_changed.insert(path.clone());
-            self.prebound.remove(path);
+            self.bound.remove(path);
             self.resolved.remove(path);
             self.reverse.remove(path);
         }
         stats.surfaces_changed = surfaces_changed.len();
-        // No index from the last update is alive, so this edits in place.
-        let surfaces = Arc::make_mut(&mut self.surfaces);
-        for path in &removed {
-            surfaces.remove(path);
+        if !contents.is_empty() || !membership.is_empty() {
+            self.bound.forget_lists();
         }
-        surfaces.extend(new_surfaces);
-        for (path, binding) in new_prebound {
-            self.reverse.note_prebound(&path, &binding);
-            self.prebound.insert(path, binding);
+        for (path, bound) in new_bound {
+            self.reverse.note_prebound(&path, &bound.binding);
+            self.bound.set(path, bound);
         }
         stats.bind_ms = started.elapsed().as_secs_f64() * 1000.0;
 
@@ -790,7 +816,7 @@ impl LiveCheckout {
         // Pass 2.
         let started = Instant::now();
         let facts = Rc::new(ViewBindingFacts::typed(Rc::new(CheckoutFacts { inputs })));
-        let index = resolver_index(&self.surfaces, &facts);
+        let (index, files) = resolver_index(inputs, &self.bound, &facts);
         let mut resolve = contents.clone();
         resolve.extend(references_changed.iter().cloned());
         resolve.extend(stale.binding.iter().cloned());
@@ -826,7 +852,12 @@ impl LiveCheckout {
                 continue;
             }
             if let Some(old) = self.resolved.get_mut(path.as_str()) {
-                let mut binding = self.prebound[path.as_str()].clone();
+                let mut binding = self
+                    .bound
+                    .get(path)
+                    .expect("rebound just now")
+                    .binding
+                    .clone();
                 binding.reuse_resolution(&old.binding);
                 old.binding = binding;
                 self.reverse
@@ -834,7 +865,7 @@ impl LiveCheckout {
             }
         }
         let paths = resolve.iter().collect::<Vec<_>>();
-        let fresh = resolve_files(inputs, &self.surfaces, &self.prebound, &paths)?;
+        let fresh = resolve_files(inputs, &self.bound, &paths)?;
         stats.resolved = fresh.len();
         for (path, mut file) in fresh {
             // Pass 4 decides below whether its sites change.
@@ -892,6 +923,11 @@ impl LiveCheckout {
         }
         stats.dispatch_recomputed = recompute.len();
         stats.dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // A file bound on first use inside passes 2 and 3 cannot return its
+        // error there.
+        if let Some(error) = files.take_error() {
+            return Err(error);
+        }
         drop(index);
         drop(facts);
 

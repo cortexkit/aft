@@ -10,14 +10,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use rayon::prelude::*;
 
 use super::callgraph::{
-    bind_all, resolve_files, resolver_index, thread_facts, CheckoutFacts, CheckoutInputs,
-    FileResolution, MethodCallInputs, Surfaces,
+    resolve_files, resolver_index, thread_facts, BindCache, CheckoutFacts, CheckoutInputs,
+    FileResolution, MethodCallInputs,
 };
 use crate::callgraph_store::fact_answers::{FactAnswer, FactQuestion};
 use crate::callgraph_store::join::{ManifestJoinError, ViewBindingDependencies, ViewSurfaceQuery};
@@ -72,8 +71,8 @@ pub(crate) fn resolve_reusing(
         };
         let paths = inputs.parses.keys().collect::<Vec<_>>();
         let phase = Instant::now();
-        let (surfaces, prebound) = bind_all(inputs, &paths)?;
-        let surfaces: Surfaces = Arc::new(surfaces);
+        let bound = BindCache::default();
+        bound.bind_missing(inputs, &paths)?;
         stats.bind_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
@@ -82,7 +81,7 @@ pub(crate) fn resolve_reusing(
             .map_init(
                 || {
                     let facts = Rc::new(thread_facts(inputs));
-                    let index = resolver_index(&surfaces, &facts);
+                    let (index, _files) = resolver_index(inputs, &bound, &facts);
                     (
                         facts,
                         index,
@@ -96,7 +95,8 @@ pub(crate) fn resolve_reusing(
                     let Some(variants) = pool.get(&(key, path.as_str())) else {
                         return ((*path).clone(), None, Vec::new());
                     };
-                    let bound = &prebound[path.as_str()];
+                    let own = bound.get(path).expect("every parsed file was bound");
+                    let bound = &own.binding;
                     let checkout = CheckoutFacts { inputs };
                     let mut rejections = Vec::new();
                     for variant in variants {
@@ -146,7 +146,7 @@ pub(crate) fn resolve_reusing(
         let phase = Instant::now();
         let fresh_refs = fresh.iter().collect::<Vec<_>>();
         stats.resolved = fresh.len();
-        resolved.extend(resolve_files(inputs, &surfaces, &prebound, &fresh_refs)?);
+        resolved.extend(resolve_files(inputs, &bound, &fresh_refs)?);
         stats.resolve_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();

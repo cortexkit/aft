@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aft_store::checkout::{CheckoutState, PathKind};
 use rayon::prelude::*;
@@ -37,7 +37,9 @@ use crate::callgraph_store::join::{
     DerivedRow, DispatchTypeTargets, ManifestJoinError, ParseBlob, ViewBindingDependencies,
     ViewBindingFacts,
 };
-use crate::callgraph_store::{DbFileIndex, ProjectIndex, WorkspaceCratePrefixCache};
+use crate::callgraph_store::{
+    DbFileIndex, LoadedFileIndexes, LoadedIndex, ProjectIndex, WorkspaceCratePrefixCache,
+};
 use crate::views::materialization::dispatch::FileFacts;
 
 use super::graph_rows::references_by_key;
@@ -78,8 +80,196 @@ pub(crate) struct FileResolution {
     pub(crate) site_dependencies: BTreeSet<String>,
 }
 
-/// The bound surfaces of every parsed file, shared read-only by resolution.
-pub(crate) type Surfaces = Arc<HashMap<String, DbFileIndex>>;
+/// One file's pass-1 results: its bound surface, and its binding before
+/// resolution.
+#[derive(Debug)]
+pub(crate) struct BoundFile {
+    pub(crate) surface: Arc<DbFileIndex>,
+    pub(crate) binding: ViewBindingDependencies,
+}
+
+/// Lists over every parsed file that the resolver's whole-checkout lookups
+/// read.
+#[derive(Debug, Default)]
+struct FileLists {
+    rust: Vec<String>,
+    module_declaring: Vec<String>,
+}
+
+/// The files of one checkout bound so far, shared by every resolver
+/// thread. A file is bound when resolution first reaches it, or when an
+/// update binds it again; an entry stays valid until an update binds the
+/// file again or removes it, since a file whose binding can have changed is
+/// always bound again (see `incremental`).
+#[derive(Debug, Default)]
+pub(crate) struct BindCache {
+    files: Mutex<HashMap<String, Arc<BoundFile>>>,
+    lists: Mutex<Option<Arc<FileLists>>>,
+}
+
+impl BindCache {
+    pub(crate) fn get(&self, path: &str) -> Option<Arc<BoundFile>> {
+        self.files
+            .lock()
+            .expect("no panics while holding it")
+            .get(path)
+            .cloned()
+    }
+
+    /// Records `bound` as `path`'s binding, replacing any earlier one.
+    pub(crate) fn set(&self, path: String, bound: BoundFile) -> Arc<BoundFile> {
+        let bound = Arc::new(bound);
+        self.files
+            .lock()
+            .expect("no panics while holding it")
+            .insert(path, Arc::clone(&bound));
+        bound
+    }
+
+    /// Records `bound` unless another thread bound `path` first; the two are
+    /// equal, since binding reads only the file and the checkout.
+    fn set_new(&self, path: &str, bound: BoundFile) -> Arc<BoundFile> {
+        Arc::clone(
+            self.files
+                .lock()
+                .expect("no panics while holding it")
+                .entry(path.to_string())
+                .or_insert_with(|| Arc::new(bound)),
+        )
+    }
+
+    pub(crate) fn remove(&self, path: &str) {
+        self.files
+            .lock()
+            .expect("no panics while holding it")
+            .remove(path);
+    }
+
+    /// How many files are bound.
+    pub(crate) fn len(&self) -> usize {
+        self.files.lock().expect("no panics while holding it").len()
+    }
+
+    /// Forgets the whole-checkout lists, after parsed files were added,
+    /// removed or rewritten.
+    pub(crate) fn forget_lists(&self) {
+        *self.lists.lock().expect("no panics while holding it") = None;
+    }
+
+    fn lists(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
+        let mut slot = self.lists.lock().expect("no panics while holding it");
+        Arc::clone(slot.get_or_insert_with(|| {
+            let mut lists = FileLists::default();
+            for (path, (_, parse)) in &inputs.parses {
+                if parse.language == "rust" {
+                    lists.rust.push(path.clone());
+                }
+                // As the store's `module_declaring_files`: a module reference
+                // with a module path.
+                if parse.refs.iter().any(|reference| {
+                    reference.kind == BlobRefKind::Module && reference.module_path.is_some()
+                }) {
+                    lists.module_declaring.push(path.clone());
+                }
+            }
+            Arc::new(lists)
+        }))
+    }
+
+    /// Binds, in parallel, every file of `paths` not bound yet.
+    ///
+    /// # Errors
+    ///
+    /// When binding fails on a file.
+    pub(crate) fn bind_missing(
+        &self,
+        inputs: &CheckoutInputs,
+        paths: &[&String],
+    ) -> Result<(), ManifestJoinError> {
+        let missing = paths
+            .iter()
+            .filter(|path| self.get(path).is_none())
+            .copied()
+            .collect::<Vec<_>>();
+        for (path, bound) in bind_all(inputs, &missing)? {
+            self.set_new(&path, bound);
+        }
+        Ok(())
+    }
+}
+
+/// The bound files one resolver thread's index reads, binding a file the
+/// first time resolution reaches it. A file bound here records its reads
+/// into its own binding, never into the facts of the file being resolved.
+pub(crate) struct BoundFiles<'a> {
+    inputs: &'a CheckoutInputs,
+    cache: &'a BindCache,
+    facts: ViewBindingFacts<'a>,
+    lists: std::cell::OnceCell<Arc<FileLists>>,
+    error: std::cell::RefCell<Option<ManifestJoinError>>,
+}
+
+impl<'a> BoundFiles<'a> {
+    pub(crate) fn new(inputs: &'a CheckoutInputs, cache: &'a BindCache) -> Self {
+        Self {
+            inputs,
+            cache,
+            facts: thread_facts(inputs),
+            lists: std::cell::OnceCell::new(),
+            error: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// `path`'s pass-1 results, bound now if no thread has bound it yet.
+    pub(crate) fn bound(&self, path: &str) -> Option<Arc<BoundFile>> {
+        if let Some(bound) = self.cache.get(path) {
+            return Some(bound);
+        }
+        let (_, parse) = self.inputs.parses.get(path)?;
+        match bind_file(path, parse, &self.facts, None) {
+            Ok((surface, binding)) => Some(self.cache.set_new(
+                path,
+                BoundFile {
+                    surface: Arc::new(surface),
+                    binding,
+                },
+            )),
+            Err(error) => {
+                self.error.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    /// The first bind that failed, which a lookup inside resolution cannot
+    /// return; callers check after each file.
+    pub(crate) fn take_error(&self) -> Option<ManifestJoinError> {
+        self.error.borrow_mut().take()
+    }
+
+    fn lists(&self) -> &FileLists {
+        self.lists.get_or_init(|| self.cache.lists(self.inputs))
+    }
+}
+
+impl LoadedFileIndexes for BoundFiles<'_> {
+    fn contains_file(&self, rel_path: &str) -> bool {
+        self.inputs.parses.contains_key(rel_path)
+    }
+
+    fn file_index(&self, rel_path: &str) -> Option<LoadedIndex> {
+        self.bound(rel_path)
+            .map(|bound| LoadedIndex::Shared(Arc::clone(&bound.surface)))
+    }
+
+    fn rust_files(&self) -> Vec<String> {
+        self.lists().rust.clone()
+    }
+
+    fn module_declaring_files(&self) -> Vec<String> {
+        self.lists().module_declaring.clone()
+    }
+}
 
 /// Resolves every parsed file of a checkout on `threads` threads.
 ///
@@ -92,9 +282,9 @@ pub(crate) fn resolve_checkout(
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
     pool(threads)?.install(|| {
         let paths = inputs.parses.keys().collect::<Vec<_>>();
-        let (surfaces, prebound) = bind_all(inputs, &paths)?;
-        let surfaces: Surfaces = Arc::new(surfaces);
-        let mut resolved = resolve_files(inputs, &surfaces, &prebound, &paths)?;
+        let bound = BindCache::default();
+        bound.bind_missing(inputs, &paths)?;
+        let mut resolved = resolve_files(inputs, &bound, &paths)?;
         let mut calls = MethodCallInputs::build(inputs, &resolved);
         for (path, sites, dependencies) in calls.resolve_sites(inputs, &paths) {
             let file = resolved
@@ -122,7 +312,7 @@ pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
 }
 
 /// Pass 1 for `paths`, in parallel: each file's bound surface, and its
-/// binding before resolution.
+/// binding before resolution. Records nothing in any cache.
 ///
 /// # Errors
 ///
@@ -130,42 +320,37 @@ pub(crate) fn thread_facts(inputs: &CheckoutInputs) -> ViewBindingFacts<'_> {
 pub(crate) fn bind_all(
     inputs: &CheckoutInputs,
     paths: &[&String],
-) -> Result<
-    (
-        HashMap<String, DbFileIndex>,
-        HashMap<String, ViewBindingDependencies>,
-    ),
-    ManifestJoinError,
-> {
-    let bound = paths
+) -> Result<HashMap<String, BoundFile>, ManifestJoinError> {
+    paths
         .par_iter()
         .map_init(
             || thread_facts(inputs),
             |facts, path| {
                 let (_, parse) = &inputs.parses[path.as_str()];
-                bind_file(path, parse, facts, None).map(|bound| ((*path).clone(), bound))
+                bind_file(path, parse, facts, None).map(|(surface, binding)| {
+                    (
+                        (*path).clone(),
+                        BoundFile {
+                            surface: Arc::new(surface),
+                            binding,
+                        },
+                    )
+                })
             },
         )
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut surfaces = HashMap::with_capacity(bound.len());
-    let mut prebound = HashMap::with_capacity(bound.len());
-    for (path, (surface, binding)) in bound {
-        surfaces.insert(path.clone(), surface);
-        prebound.insert(path, binding);
-    }
-    Ok((surfaces, prebound))
+        .collect()
 }
 
-/// Passes 2 and 3 for `paths`, in parallel, against every file's bound
-/// surface. Method-call sites are left empty, for [`MethodCallInputs`].
+/// Passes 2 and 3 for `paths`, in parallel, against the surfaces of
+/// `bound`, which binds each file resolution reaches the first time.
+/// Method-call sites are left empty, for [`MethodCallInputs`].
 ///
 /// # Errors
 ///
-/// When resolution fails on a file.
+/// When resolution or binding fails on a file.
 pub(crate) fn resolve_files(
     inputs: &CheckoutInputs,
-    surfaces: &Surfaces,
-    prebound: &HashMap<String, ViewBindingDependencies>,
+    bound: &BindCache,
     paths: &[&String],
 ) -> Result<BTreeMap<String, FileResolution>, ManifestJoinError> {
     paths
@@ -173,15 +358,17 @@ pub(crate) fn resolve_files(
         .map_init(
             || {
                 let facts = Rc::new(thread_facts(inputs));
-                let index = resolver_index(surfaces, &facts);
-                (facts, index)
+                let (index, files) = resolver_index(inputs, bound, &facts);
+                (facts, index, files)
             },
-            |(facts, index), path| {
+            |(facts, index, files), path| {
                 let (key, parse) = &inputs.parses[path.as_str()];
-                let mut binding = prebound
-                    .get(path.as_str())
-                    .cloned()
-                    .expect("every resolved file was bound");
+                let Some(own) = files.bound(path) else {
+                    return Err(files.take_error().unwrap_or_else(|| {
+                        ManifestJoinError::Parse(format!("{path} is not a parsed file"))
+                    }));
+                };
+                let mut binding = own.binding.clone();
                 let mut rows = BTreeSet::new();
                 resolve_file(
                     path,
@@ -195,6 +382,9 @@ pub(crate) fn resolve_files(
                 )?;
                 finish_binding(&mut binding);
                 let dispatch = dispatch_targets(path, parse, index, facts)?;
+                if let Some(error) = files.take_error() {
+                    return Err(error);
+                }
                 Ok((
                     (*path).clone(),
                     FileResolution {
@@ -209,18 +399,22 @@ pub(crate) fn resolve_files(
         .collect()
 }
 
-/// A resolver index over `surfaces`, recording into `facts`.
+/// A resolver index over the files of `bound`, binding each the first time
+/// it is reached, and recording into `facts`. Also returns the index's
+/// loader, whose bind errors callers check after each file.
 pub(crate) fn resolver_index<'a>(
-    surfaces: &Surfaces,
+    inputs: &'a CheckoutInputs,
+    bound: &'a BindCache,
     facts: &Rc<ViewBindingFacts<'a>>,
-) -> ProjectIndex<'a> {
-    ProjectIndex::from_shared(
+) -> (ProjectIndex<'a>, Rc<BoundFiles<'a>>) {
+    let files = Rc::new(BoundFiles::new(inputs, bound));
+    let index = ProjectIndex::from_loaded(
         std::path::Path::new("/"),
-        Arc::clone(surfaces),
-        HashMap::new(),
+        Rc::clone(&files) as Rc<dyn LoadedFileIndexes + 'a>,
         WorkspaceCratePrefixCache::default(),
         facts.clone(),
-    )
+    );
+    (index, files)
 }
 
 /// Pass 3 for one file: for Rust, TypeScript and JavaScript, the targets of

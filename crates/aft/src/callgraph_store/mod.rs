@@ -5681,9 +5681,13 @@ pub(crate) struct ProjectIndex<'a> {
     /// surfaces in their own index with their own memos.
     files: Arc<HashMap<String, DbFileIndex>>,
     caller_data: HashMap<String, &'a FileCallData>,
-    /// Stored file indexes loaded on demand, for an incremental refresh. Files
-    /// in `files` take precedence over it.
-    lazy: Option<Rc<LazyDbFileIndexes<'a>>>,
+    /// File indexes loaded on demand: the legacy store's rows, for an
+    /// incremental refresh, or the data layer's files bound on first use.
+    /// Files in `files` take precedence over it.
+    lazy: Option<Rc<dyn LoadedFileIndexes + 'a>>,
+    /// The same loader as `lazy` when it is the legacy store's, for the
+    /// TypeScript object pass, which also needs its module resolution.
+    stored_lazy: Option<Rc<LazyDbFileIndexes<'a>>>,
     /// Root-scoped maps shared by successive refresh-worker batches. Cargo.toml
     /// and go.mod watcher events replace them before another batch resolves refs.
     /// Cold/direct refreshes use a private cache so each refresh builds and uses
@@ -6224,7 +6228,7 @@ impl ResolverIndex for ProjectIndex<'_> {
                 self.lazy_inline_candidates.get_or_init(|| {
                     // Fresh caller extracts replace stored paths in this batch,
                     // including files whose language or module layout changed.
-                    let mut paths = self.scan_paths(LazyDbFileIndexes::rust_files);
+                    let mut paths = self.scan_paths(|lazy| lazy.rust_files());
                     paths.sort();
                     RustInlineCandidates::build(&paths)
                 })
@@ -6242,7 +6246,7 @@ impl ProjectIndex<'_> {
             let mut parents = HashMap::new();
             // scan_paths excludes stored rows replaced by this refresh's
             // extracts, including declarations that have just been removed.
-            for file in self.scan_paths(LazyDbFileIndexes::module_declaring_files) {
+            for file in self.scan_paths(|lazy| lazy.module_declaring_files()) {
                 #[cfg(test)]
                 rust_module_work::note(|work| work.parent_file_visits += 1);
                 if let Some(index) = self.file_index(&file) {
@@ -6298,7 +6302,7 @@ impl ProjectIndex<'_> {
         #[cfg(test)]
         rust_module_work::note(|work| work.parent_scans += 1);
         let mut parents = self
-            .scan_paths(LazyDbFileIndexes::module_declaring_files)
+            .scan_paths(|lazy| lazy.module_declaring_files())
             .into_iter()
             .filter_map(|file| {
                 #[cfg(test)]
@@ -6376,7 +6380,7 @@ impl ProjectIndex<'_> {
         let src_prefix = rust_src_prefix(caller_file);
         // Stored files outside `files` are limited to Rust ones up front; the
         // language check below still applies to every path.
-        let mut file_paths = self.scan_paths(LazyDbFileIndexes::rust_files);
+        let mut file_paths = self.scan_paths(|lazy| lazy.rust_files());
         file_paths.sort();
         if let Some(position) = file_paths.iter().position(|file| file == caller_file) {
             let caller = file_paths.remove(position);
@@ -19376,6 +19380,24 @@ impl<'a> ProjectIndex<'a> {
         )
     }
 
+    /// An index whose every file index comes from `loaded`, on first use.
+    pub(crate) fn from_loaded(
+        project_root: &Path,
+        loaded: Rc<dyn LoadedFileIndexes + 'a>,
+        workspace_crate_prefixes: WorkspaceCratePrefixCache,
+        facts: Rc<dyn ProjectFacts + 'a>,
+    ) -> Self {
+        let mut index = Self::from_parts(
+            project_root,
+            HashMap::new(),
+            HashMap::new(),
+            workspace_crate_prefixes,
+            facts,
+        );
+        index.lazy = Some(loaded);
+        index
+    }
+
     /// An index over bound surfaces another index or thread also holds.
     pub(crate) fn from_shared(
         project_root: &Path,
@@ -19391,6 +19413,7 @@ impl<'a> ProjectIndex<'a> {
             files,
             caller_data,
             lazy: None,
+            stored_lazy: None,
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
@@ -19441,7 +19464,9 @@ impl<'a> ProjectIndex<'a> {
             workspace_crate_prefixes,
             Rc::new(DiskFacts::new(project_root)),
         );
-        index.lazy = Some(Rc::new(lazy));
+        let lazy = Rc::new(lazy);
+        index.lazy = Some(Rc::clone(&lazy) as Rc<dyn LoadedFileIndexes + 'a>);
+        index.stored_lazy = Some(lazy);
         index
     }
 
@@ -19455,13 +19480,13 @@ impl<'a> ProjectIndex<'a> {
         self.lazy
             .as_ref()
             .and_then(|lazy| lazy.file_index(rel_path))
-            .map(FileIndexRef::Shared)
+            .map(FileIndexRef::Loaded)
     }
 
     /// Row counts and time spent loading stored file indexes so far, or `None`
     /// for an index built entirely in memory.
     fn lazy_load_counts(&self) -> Option<IndexLoadCounts> {
-        self.lazy.as_ref().map(|lazy| lazy.counts.get())
+        self.lazy.as_ref().and_then(|lazy| lazy.load_counts())
     }
 
     /// The first SQLite error a lazy load hit. Loads run inside resolution
@@ -19469,9 +19494,7 @@ impl<'a> ProjectIndex<'a> {
     /// resolution and fails the batch instead of committing a graph built on a
     /// partial read.
     fn take_lazy_load_error(&self) -> Option<rusqlite::Error> {
-        self.lazy
-            .as_ref()
-            .and_then(|lazy| lazy.error.borrow_mut().take())
+        self.lazy.as_ref().and_then(|lazy| lazy.take_error())
     }
 
     fn lang_for(&self, rel_path: &str) -> Option<LangId> {
@@ -19510,12 +19533,12 @@ impl<'a> ProjectIndex<'a> {
     /// in-memory entry (an in-memory entry replaces the stored rows).
     fn scan_paths(
         &self,
-        stored: impl FnOnce(&LazyDbFileIndexes<'a>) -> Vec<String>,
+        stored: impl FnOnce(&dyn LoadedFileIndexes) -> Vec<String>,
     ) -> Vec<String> {
         let mut paths = self.files.keys().cloned().collect::<Vec<_>>();
         if let Some(lazy) = &self.lazy {
             paths.extend(
-                stored(lazy)
+                stored(lazy.as_ref())
                     .into_iter()
                     .filter(|path| !self.files.contains_key(path)),
             );
@@ -19524,10 +19547,10 @@ impl<'a> ProjectIndex<'a> {
     }
 }
 
-/// A file index borrowed from an in-memory map or shared from the lazy memo.
+/// A file index borrowed from an in-memory map or loaded on demand.
 enum FileIndexRef<'a> {
     Borrowed(&'a DbFileIndex),
-    Shared(Rc<DbFileIndex>),
+    Loaded(LoadedIndex),
 }
 
 impl std::ops::Deref for FileIndexRef<'_> {
@@ -19536,14 +19559,81 @@ impl std::ops::Deref for FileIndexRef<'_> {
     fn deref(&self) -> &DbFileIndex {
         match self {
             Self::Borrowed(index) => index,
+            Self::Loaded(index) => index,
+        }
+    }
+}
+
+/// A file index loaded on demand: kept by one thread's loader, or shared
+/// by every thread's.
+#[derive(Clone)]
+pub(crate) enum LoadedIndex {
+    Local(Rc<DbFileIndex>),
+    Shared(Arc<DbFileIndex>),
+}
+
+impl std::ops::Deref for LoadedIndex {
+    type Target = DbFileIndex;
+
+    fn deref(&self) -> &DbFileIndex {
+        match self {
+            Self::Local(index) => index,
             Self::Shared(index) => index,
         }
     }
 }
 
+/// File indexes a [`ProjectIndex`] loads when resolution first reaches
+/// them, instead of holding every file's: the legacy store's rows for an
+/// incremental refresh, or the data layer's files bound on first use.
+pub(crate) trait LoadedFileIndexes {
+    /// Whether `rel_path` is an indexed file.
+    fn contains_file(&self, rel_path: &str) -> bool;
+    /// `rel_path`'s index, or `None` when it is not an indexed file.
+    fn file_index(&self, rel_path: &str) -> Option<LoadedIndex>;
+    /// Every indexed Rust file, in no order.
+    fn rust_files(&self) -> Vec<String>;
+    /// Every indexed file that declares a module, in no order.
+    fn module_declaring_files(&self) -> Vec<String>;
+    /// Rows read and time spent loading so far, when the loader counts them.
+    fn load_counts(&self) -> Option<IndexLoadCounts> {
+        None
+    }
+    /// The first failed read, which loads inside resolution cannot return.
+    fn take_error(&self) -> Option<rusqlite::Error> {
+        None
+    }
+}
+
+impl LoadedFileIndexes for LazyDbFileIndexes<'_> {
+    fn contains_file(&self, rel_path: &str) -> bool {
+        Self::contains_file(self, rel_path)
+    }
+
+    fn file_index(&self, rel_path: &str) -> Option<LoadedIndex> {
+        Self::file_index(self, rel_path).map(LoadedIndex::Local)
+    }
+
+    fn rust_files(&self) -> Vec<String> {
+        Self::rust_files(self)
+    }
+
+    fn module_declaring_files(&self) -> Vec<String> {
+        Self::module_declaring_files(self)
+    }
+
+    fn load_counts(&self) -> Option<IndexLoadCounts> {
+        Some(self.counts.get())
+    }
+
+    fn take_error(&self) -> Option<rusqlite::Error> {
+        self.error.borrow_mut().take()
+    }
+}
+
 /// Rows read and time spent by an incremental refresh's stored-index loads.
 #[derive(Debug, Default, Clone, Copy)]
-struct IndexLoadCounts {
+pub(crate) struct IndexLoadCounts {
     files_loaded: usize,
     rows_read: usize,
     elapsed: Duration,
@@ -32040,6 +32130,7 @@ pub fn run() {
             );
             if eager {
                 project.lazy = None;
+                project.stored_lazy = None;
             }
             let session = rust_module_work::Session::start(false);
             assert_eq!(
@@ -36336,6 +36427,7 @@ mod reexport_resolution_tests {
             files: Arc::new(files.into_iter().collect()),
             caller_data: HashMap::new(),
             lazy: None,
+            stored_lazy: None,
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
