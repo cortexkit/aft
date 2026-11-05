@@ -24,10 +24,11 @@ use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
 /// carry it, so output from another version is extracted again. It is the
-/// call-graph producer's version with the record layout's own suffix: a
-/// record also holds the file's outline, which the producer's output does
-/// not.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+outline-1";
+/// call-graph producer's version with the data layer's own suffix, which
+/// counts the changes to what records hold since that producer version:
+/// 1 added the file's outline; 2 added the names inside Rust macros that
+/// could not be parsed.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-2";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -628,6 +629,7 @@ fn ref_kind(kind: BlobRefKind) -> RefKind {
         BlobRefKind::Module => RefKind::Module,
         BlobRefKind::Reexport => RefKind::Reexport,
         BlobRefKind::ExportAlias => RefKind::ExportAlias,
+        BlobRefKind::MacroMention => RefKind::MacroMention,
     }
 }
 
@@ -641,6 +643,7 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
         RefKind::Module => BlobRefKind::Module,
         RefKind::Reexport => BlobRefKind::Reexport,
         RefKind::ExportAlias => BlobRefKind::ExportAlias,
+        RefKind::MacroMention => BlobRefKind::MacroMention,
     }
 }
 

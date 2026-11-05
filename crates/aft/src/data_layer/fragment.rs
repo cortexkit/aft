@@ -21,7 +21,7 @@ use crate::callgraph_store::join::{BlobRefKind, DerivedRow, ResolutionStatus};
 
 const FORMAT: u8 = 1;
 
-const KINDS: [BlobRefKind; 8] = [
+const KINDS: [BlobRefKind; 9] = [
     BlobRefKind::Construction,
     BlobRefKind::CallbackRef,
     BlobRefKind::Call,
@@ -30,6 +30,7 @@ const KINDS: [BlobRefKind; 8] = [
     BlobRefKind::Module,
     BlobRefKind::Reexport,
     BlobRefKind::ExportAlias,
+    BlobRefKind::MacroMention,
 ];
 
 const PROVENANCES: [&str; 3] = ["exact", "dispatch", "name_match"];

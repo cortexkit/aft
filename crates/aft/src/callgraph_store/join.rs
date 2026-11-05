@@ -220,6 +220,10 @@ pub enum BlobRefKind {
     Module,
     Reexport,
     ExportAlias,
+    /// A name inside a Rust macro whose tokens tree-sitter could not parse:
+    /// a call there is invisible to the graph, so callers of that name note
+    /// where it occurs. Never resolved.
+    MacroMention,
 }
 
 /// An unresolved reference extracted from one source blob.
@@ -800,6 +804,11 @@ fn blob_refs(line_index: &super::LineIndex, data: &FileCallData) -> Vec<BlobRef>
             refs.push(call_ref(caller_symbol, call, BlobRefKind::Call));
         }
     }
+    for (caller_symbol, mentions) in ordered_symbol_sites(&data.macro_mentions_by_symbol) {
+        for mention in mentions {
+            refs.push(call_ref(caller_symbol, mention, BlobRefKind::MacroMention));
+        }
+    }
     for import in &data.import_block.imports {
         refs.push(BlobRef {
             ordinal: 0,
@@ -1195,6 +1204,8 @@ impl ParseBlob {
         let mut value_refs_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
         let mut macro_body_calls_by_macro: HashMap<String, Vec<callgraph::CallSite>> =
             HashMap::new();
+        let mut macro_mentions_by_symbol: HashMap<String, Vec<callgraph::CallSite>> =
+            HashMap::new();
         for raw in &self.refs {
             let map = match raw.kind {
                 BlobRefKind::Call
@@ -1207,6 +1218,7 @@ impl ParseBlob {
                 }
                 BlobRefKind::Call | BlobRefKind::Construction => &mut calls_by_symbol,
                 BlobRefKind::ValueRef | BlobRefKind::CallbackRef => &mut value_refs_by_symbol,
+                BlobRefKind::MacroMention => &mut macro_mentions_by_symbol,
                 _ => continue,
             };
             let Some(caller) = &raw.caller_symbol else {
@@ -1305,7 +1317,7 @@ impl ParseBlob {
             calls_by_symbol,
             value_refs_by_symbol,
             macro_body_calls_by_macro,
-            macro_mentions_by_symbol: HashMap::new(),
+            macro_mentions_by_symbol,
             symbol_metadata,
             exported_symbols: self
                 .exported_symbols
@@ -1464,6 +1476,7 @@ impl ParseBlob {
                     BlobRefKind::Module => "module",
                     BlobRefKind::Reexport => "reexport",
                     BlobRefKind::ExportAlias => "export_alias",
+                    BlobRefKind::MacroMention => super::MACRO_MENTION_REF_KIND,
                 }
                 .to_string(),
                 short_name: raw.short_name.clone(),

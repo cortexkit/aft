@@ -113,6 +113,7 @@ fn disk_rows(root: &Path, manifest: &Manifest, blobs: &MemoryBlobs) -> JoinResul
                 BlobRefKind::Module => "module",
                 BlobRefKind::Reexport => "reexport",
                 BlobRefKind::ExportAlias => "export_alias",
+                BlobRefKind::MacroMention => "macro_mention",
             };
             let bound = extract
                 .raw_refs

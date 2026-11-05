@@ -1670,6 +1670,7 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
         join::BlobRefKind::Module => "module",
         join::BlobRefKind::Reexport => "reexport",
         join::BlobRefKind::ExportAlias => "export_alias",
+        join::BlobRefKind::MacroMention => crate::callgraph_store::MACRO_MENTION_REF_KIND,
     }
 }
 

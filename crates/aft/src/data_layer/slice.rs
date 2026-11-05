@@ -354,5 +354,6 @@ const fn ref_kind(kind: BlobRefKind) -> &'static str {
         BlobRefKind::Module => "module",
         BlobRefKind::Reexport => "reexport",
         BlobRefKind::ExportAlias => "export_alias",
+        BlobRefKind::MacroMention => crate::callgraph_store::MACRO_MENTION_REF_KIND,
     }
 }

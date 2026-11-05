@@ -88,10 +88,13 @@ pub enum RefKind {
     Module,
     Reexport,
     ExportAlias,
+    /// A name inside a Rust macro whose tokens could not be parsed as
+    /// Rust: a possible call the graph cannot see.
+    MacroMention,
 }
 
 impl RefKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Construction,
         Self::CallbackRef,
         Self::Call,
@@ -100,6 +103,7 @@ impl RefKind {
         Self::Module,
         Self::Reexport,
         Self::ExportAlias,
+        Self::MacroMention,
     ];
 
     fn code(self) -> u8 {
