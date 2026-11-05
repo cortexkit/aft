@@ -875,6 +875,30 @@ pub(crate) fn extract_with<'tree>(
                 .any(|w| ["private", "protected", "pub(crate)"].contains(&w)),
         });
     }
+    if language == "cpp" {
+        // C++ member functions, owned by the scope their scoped name places
+        // them in, so a member call whose receiver type is known can be
+        // matched to them by name (see `Resolver::cpp_type_match`).
+        for symbol in &parse.symbols {
+            if !matches!(symbol.kind.as_str(), "method" | "function") {
+                continue;
+            }
+            let Some((owner, _)) = symbol.scoped_name.rsplit_once("::") else {
+                continue;
+            };
+            facts.methods.push(MethodHint {
+                owner: owner.to_string(),
+                trait_name: None,
+                name: symbol.name.clone(),
+                symbol: symbol.scoped_name.clone(),
+                has_body: functions
+                    .get(&(symbol.end_line, symbol.end_col))
+                    .is_some_and(|node| field(*node, &["body"]).is_some()),
+                shape: String::new(),
+                private: false,
+            });
+        }
+    }
     // Some interface grammars expose method signatures without callable symbol
     // metadata. Their declaration still has to be a possible exact target.
     let mut method_names = facts
@@ -1045,6 +1069,12 @@ pub(crate) fn extract_with<'tree>(
         } else {
             callee
         };
+        if language == "cpp" && callee.kind() == "field_expression" {
+            if let Some(site) = cpp_typed_site(call, callee, reference, source, root, nav) {
+                facts.sites.push(site);
+            }
+            continue;
+        }
         let associated = language == "rust"
             && callee.kind() == "scoped_identifier"
             && field(callee, &["name"]).is_some_and(|name| text(name, source) == "new");
@@ -1283,6 +1313,45 @@ fn symbol_callers(parse: &ParseBlob) -> HashMap<(u32, u32), String> {
     }
     callers
 }
+/// The method-call site of the C++ call `receiver.member(...)`, `call`,
+/// whose callee is `callee`, when `receiver` is a plain name declared with
+/// a type in the enclosing function: the site's receiver is that type's
+/// name, read as today's database read it, by scanning back from the call's
+/// line for the declaration. Other member calls get no site and keep their
+/// ordinary resolution, as `receiver->member(...)` does: ordinary resolution
+/// can link that spelling by the member's name alone.
+fn cpp_typed_site<'tree>(
+    call: Node<'tree>,
+    callee: Node<'tree>,
+    reference: &BlobRef,
+    source: &str,
+    root: Node<'tree>,
+    nav: impl Nav<'tree>,
+) -> Option<SiteHint> {
+    if field(callee, &["operator"]).map(|operator| text(operator, source)) != Some(".") {
+        return None;
+    }
+    let receiver = field(callee, &["argument"]).filter(|node| node.kind() == "identifier")?;
+    let member = field(callee, &["field"]).filter(|node| node.kind() == "field_identifier")?;
+    let scope = nav
+        .enclosing(call, &["function_definition"])
+        .unwrap_or(root);
+    let receiver_type = super::super::infer_cpp_receiver_type_from_scope(
+        scope,
+        source,
+        text(receiver, source),
+        reference.line.max(1),
+    )?;
+    Some(SiteHint {
+        ordinal: reference.ordinal,
+        caller: reference.caller_symbol.clone(),
+        line: reference.line,
+        member: Some(text(member, source).to_string()),
+        receiver: Some(receiver_type),
+        dynamic: false,
+    })
+}
+
 /// The receiver a method-call site records for `self.name(...)` written in
 /// a function that a `macro_rules!` template defines, followed by the
 /// scoped name of the one function `name` the same template defines. The
@@ -2594,6 +2663,49 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// A C++ member call on a receiver of type `receiver`: the one C++
+    /// member function `member` whose scoped name ends in `receiver::member`,
+    /// leaving out the calling function `caller` of `file`, as today's
+    /// database type-matched it. Two or more such functions leave the call
+    /// unresolved; none, outside the project.
+    fn cpp_type_match(
+        &self,
+        file: &str,
+        caller: Option<&str>,
+        receiver: &str,
+        member: &str,
+    ) -> Resolution {
+        let exact = format!("{receiver}::{member}");
+        let nested = format!("::{exact}");
+        let targets = self
+            .methods_named(member)
+            .iter()
+            .filter(|(candidate_file, candidate, method)| {
+                candidate.language == "cpp"
+                    && (method.symbol == exact || method.symbol.ends_with(&nested))
+                    && !(candidate_file.as_str() == file && caller == Some(method.symbol.as_str()))
+            })
+            .map(|(candidate_file, _, method)| Target {
+                file: candidate_file.clone(),
+                symbol: method.symbol.clone(),
+                provenance: super::super::PROVENANCE_TYPE_MATCH,
+            })
+            .collect::<BTreeSet<_>>();
+        match targets.len() {
+            0 => Resolution {
+                external: 1,
+                ..Resolution::default()
+            },
+            1 => Resolution {
+                targets,
+                ..Resolution::default()
+            },
+            _ => Resolution {
+                unresolved: 1,
+                ..Resolution::default()
+            },
+        }
+    }
     fn unknown(&self, language: &str, member: &str) -> Resolution {
         // Through `methods_named`, which reads the source when there is one:
         // a resolver over a source holds no files of its own.
@@ -2683,6 +2795,9 @@ impl<'a> Resolver<'a> {
                     ..Resolution::default()
                 };
             }
+        }
+        if parse.language == "cpp" {
+            return self.cpp_type_match(file, site.caller.as_deref(), receiver, member);
         }
         if parse.language == "python" {
             if let Some(owner) = receiver.strip_prefix("@super:") {
@@ -2895,29 +3010,30 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
     }
 
     pub fn resolve(&self, file: &str, site: &SiteHint) -> std::rc::Rc<Resolution> {
+        let language = self.resolver.caller_language(file);
         let key = ResolutionKey {
             // An unknown receiver consults only language membership, so callers
             // in different files can reuse the same conservative answer. Typed
             // receiver lookup also depends on the caller's imports and directory.
             scope: if site.receiver.is_none() {
-                self.resolver.caller_language(file)
+                language.clone()
             } else {
                 file.to_string()
             },
             receiver: site.receiver.clone(),
             member: site.member.clone(),
             dynamic: site.dynamic,
-            associated: self.resolver.caller_language(file) == "rust"
-                && self.resolver.associated_site(file, site.ordinal),
-            caller_scope: (self.resolver.caller_language(file) == "rust"
-                && site.receiver.is_some())
-            .then(|| {
-                site.caller
+            associated: language == "rust" && self.resolver.associated_site(file, site.ordinal),
+            caller_scope: match language.as_str() {
+                "rust" if site.receiver.is_some() => site
+                    .caller
                     .as_deref()
                     .and_then(|name| name.rsplit_once("::"))
-                    .map(|(scope, _)| scope.to_string())
-            })
-            .flatten(),
+                    .map(|(scope, _)| scope.to_string()),
+                // A C++ type match leaves the calling function out.
+                "cpp" => site.caller.clone(),
+                _ => None,
+            },
         };
         if let Some((resolved, dependencies)) = self.resolved.borrow().get(&key) {
             self.resolver

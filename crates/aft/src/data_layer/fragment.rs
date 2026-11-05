@@ -33,7 +33,7 @@ const KINDS: [BlobRefKind; 9] = [
     BlobRefKind::MacroMention,
 ];
 
-const PROVENANCES: [&str; 3] = ["exact", "dispatch", "name_match"];
+const PROVENANCES: [&str; 4] = ["exact", "dispatch", "name_match", "type_match"];
 
 fn kind_code(kind: BlobRefKind) -> u8 {
     KINDS

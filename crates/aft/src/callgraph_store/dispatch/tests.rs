@@ -1042,3 +1042,52 @@ fn computed_member_with_a_string_literal_is_not_a_dynamic_site() {
         assert!(sites[0].dynamic, "{language}: {sites:#?}");
     }
 }
+
+/// A C++ member call on a local whose declaration names its type links the
+/// one member function of that type, by its scoped name, as a type match.
+#[test]
+fn cpp_member_call_on_a_declared_local_type_matches_its_member_function() {
+    let parsed = parse(
+        "namespace api {\nclass Widget {\npublic:\n    int value() { return 42; }\n};\n}\ninline int use_widget() { api::Widget widget; return widget.value(); }\ninline int unknown(api::Widget* pointer, int other) { return other.value(); }\n",
+        "cpp",
+    );
+    assert!(
+        parsed
+            .dispatch
+            .methods
+            .iter()
+            .any(|method| method.symbol == "api::Widget::value" && method.owner == "api::Widget"),
+        "{:#?}",
+        parsed.dispatch.methods
+    );
+    let sites = parsed
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some("value"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 2, "{:#?}", parsed.dispatch.sites);
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    let typed = sites
+        .iter()
+        .find(|site| site.caller.as_deref() == Some("use_widget"))
+        .unwrap();
+    assert_eq!(typed.receiver.as_deref(), Some("Widget"));
+    assert_eq!(
+        resolver.resolve("fixture", typed).targets,
+        BTreeSet::from([Target {
+            file: "fixture".into(),
+            symbol: "api::Widget::value".into(),
+            provenance: "type_match",
+        }])
+    );
+    // `int other` is a type the project does not define a `value` for.
+    let other = sites
+        .iter()
+        .find(|site| site.caller.as_deref() == Some("unknown"))
+        .unwrap();
+    assert_eq!(other.receiver.as_deref(), Some("int"));
+    let resolution = resolver.resolve("fixture", other);
+    assert!(resolution.targets.is_empty());
+    assert_eq!(resolution.external, 1);
+}
