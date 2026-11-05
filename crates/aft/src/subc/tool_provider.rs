@@ -2164,9 +2164,11 @@ impl LedgerEdge {
         );
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let sweep_due = self.sweep_due(&root, std::time::Instant::now());
+        // Admission only writes the ledger row, so it runs on the call-ledger
+        // lane rather than waiting for the root's reads to drain.
         let rx = executor.submit_async(
             root.clone(),
-            crate::executor::Lane::Mutating,
+            crate::executor::Lane::CallLedger,
             request_id.clone(),
             Box::new(move |ctx| {
                 let result = (|| {
@@ -2257,7 +2259,7 @@ impl LedgerEdge {
                     if !admitted {
                         // Drain answered before admission completed. No tool was
                         // dispatched, so leave a durable not-started result for repeats.
-                        drop(repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
+                        drop(repeat_executor.submit_async(root, Lane::CallLedger, "ledger-drained-admission".into(), Box::new(move |ctx| {
                             if let Some(db) = ctx.db() {
                                 if let Ok(conn) = db.lock() {
                                     let recorded = ledger::not_started(&response_key, "cancelled");
@@ -2303,7 +2305,7 @@ impl LedgerEdge {
                         let (row_tx, row_rx) = oneshot::channel();
                         let rx = repeat_executor.submit_async(
                             root.clone(),
-                            Lane::Mutating,
+                            Lane::CallLedger,
                             "ledger-attach".into(),
                             Box::new(move |ctx| {
                                 let row = ctx.db().and_then(|db| {
@@ -3073,9 +3075,12 @@ impl LedgerEdge {
                     body: copy_terminal_body(&outgoing.body),
                 };
                 let record_for_job = recorded;
+                // The reply is held until this settlement commits. On the
+                // call-ledger lane it does not wait for the root's reads,
+                // maintenance or a running writer.
                 let rx = executor.submit_async(
                     call.root.clone(),
-                    Lane::Mutating,
+                    Lane::CallLedger,
                     "ledger-settle".into(),
                     Box::new(move |ctx| {
                         if let Some(error) = projection_error {
@@ -6449,13 +6454,13 @@ pub(in crate::subc) mod route_tests {
                 Some(&Ok(false))
             );
 
-            // Keep the keyed call in the ledger's mutating lane while an older
+            // Keep the keyed call in the call-ledger lane while an older
             // epoch saves a fence inherited by the later epoch with no row.
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let held = executor.submit_async(
                 root,
-                crate::executor::Lane::Mutating,
+                crate::executor::Lane::CallLedger,
                 "held-ledger-lane".into(),
                 Box::new(move |_| {
                     started_tx.send(()).unwrap();
@@ -8694,7 +8699,7 @@ mod ledger_terminal_tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let held = executor.submit_async(
             root.clone(),
-            crate::executor::Lane::Mutating,
+            crate::executor::Lane::CallLedger,
             "held-admission-lane".into(),
             Box::new(move |_| {
                 started_tx.send(()).unwrap();

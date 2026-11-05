@@ -1270,12 +1270,14 @@ async fn tool_result_ledger_records_before_projection_and_replays_by_route() {
             &metrics
         )
         .is_ok());
-    // The actor barrier makes the duplicate observe the pending row before the
-    // original reply settles it, rather than accidentally testing a settled replay.
+    // A barrier on the call-ledger lane, which runs one job at a time in
+    // submission order: once it completes, the duplicate has observed the
+    // pending row before the original reply settles it, rather than
+    // accidentally testing a settled replay.
     executor
         .submit_async(
             root.clone(),
-            Lane::Mutating,
+            Lane::CallLedger,
             "admission-barrier".into(),
             Box::new(|_| Response::success("admission-barrier", json!({}))),
         )
@@ -1423,7 +1425,7 @@ async fn assert_keyed_projection_replay_is_exact(
     executor
         .submit_async(
             root.clone(),
-            Lane::Mutating,
+            Lane::CallLedger,
             "replay-admission-barrier".into(),
             Box::new(|_| Response::success("replay-admission-barrier", json!({}))),
         )
