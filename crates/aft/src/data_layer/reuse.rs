@@ -8,7 +8,7 @@
 //! sites (pass 4) read other files' facts without recording answers yet, so
 //! they are resolved again for every file.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -208,25 +208,4 @@ fn holds<'v>(
         return Err(Rejection::Surface);
     }
     Ok(())
-}
-
-/// Distinct resolutions of `checkouts`, each with the checkouts that made
-/// it, for a pool: equal resolutions of one file are kept once.
-pub(crate) fn distinct_resolutions(
-    checkouts: &[(CheckoutInputs, BTreeMap<String, FileResolution>)],
-) -> HashMap<(&str, &str), Vec<(&FileResolution, BTreeSet<usize>)>> {
-    let mut distinct = HashMap::<(&str, &str), Vec<(&FileResolution, BTreeSet<usize>)>>::new();
-    for (index, (inputs, resolved)) in checkouts.iter().enumerate() {
-        for (path, file) in resolved {
-            let key = inputs.parses[path].0.as_str();
-            let variants = distinct.entry((key, path.as_str())).or_default();
-            match variants.iter_mut().find(|(known, _)| **known == *file) {
-                Some((_, sources)) => {
-                    sources.insert(index);
-                }
-                None => variants.push((file, BTreeSet::from([index]))),
-            }
-        }
-    }
-    distinct
 }

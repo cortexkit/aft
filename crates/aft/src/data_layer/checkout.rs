@@ -2018,6 +2018,7 @@ impl CheckoutView {
         .map_err(DataError::store)
     }
 
+    #[cfg(test)]
     /// The dead-code snapshot `aft_inspect` analyses, built from every
     /// file's stored record and fragment in one pass.
     ///

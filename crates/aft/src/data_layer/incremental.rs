@@ -560,23 +560,14 @@ impl LiveCheckout {
     }
 
     /// A checkout's resolution from what a publication stored: every file's
-    /// resolution as `resolved` holds it. Binds nothing: a file is bound when
-    /// an update or a resolution first needs it.
+    /// resolution as `resolved` holds it, adding each step's time to
+    /// `timings`. Binds nothing: a file is bound when an update or a
+    /// resolution first needs it. The files' reverse inputs are read from
+    /// `stored`'s terms, not built.
     ///
     /// # Errors
     ///
     /// When the thread pool cannot start.
-    pub(crate) fn from_resolved(
-        inputs: CheckoutInputs,
-        resolved: Resolutions,
-        stored: Arc<StoredSlices>,
-        threads: usize,
-    ) -> Result<Self, ManifestJoinError> {
-        Self::from_resolved_timed(inputs, resolved, stored, threads, &mut Vec::new())
-    }
-
-    /// [`Self::from_resolved`], adding each step's time to `timings`. The
-    /// files' reverse inputs are read from `stored`'s terms, not built.
     pub(crate) fn from_resolved_timed(
         inputs: CheckoutInputs,
         resolved: Resolutions,

@@ -144,10 +144,6 @@ impl Parses {
         self.map.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
     /// Every path, in order, without reading any parse.
     pub(crate) fn keys(&self) -> std::collections::btree_map::Keys<'_, String, Arc<ParseSlot>> {
         self.map.keys()
@@ -336,11 +332,8 @@ impl Resolutions {
         self.map.contains_key(path)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.map.len()
-    }
-
     /// Every path, in order, without decoding anything.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.map.keys()
     }
@@ -496,11 +489,6 @@ impl BindCache {
             .lock()
             .expect("no panics while holding it")
             .remove(path);
-    }
-
-    /// How many files are bound.
-    pub(crate) fn len(&self) -> usize {
-        self.files.lock().expect("no panics while holding it").len()
     }
 
     /// Updates the whole-checkout lists, once built, for `paths`, whose

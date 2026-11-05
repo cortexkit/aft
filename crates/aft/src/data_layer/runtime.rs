@@ -253,6 +253,7 @@ impl DataCheckout {
         self.checkout.view()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn checkout(&self) -> &Checkout {
         &self.checkout
