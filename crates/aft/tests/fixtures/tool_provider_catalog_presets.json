@@ -8627,5 +8627,41 @@
         "late_results": true
       }
     }
+  },
+  {
+    "name": "head_preset_gpt_model_no_pwsh",
+    "request": {
+      "preset": "head",
+      "params": {
+        "model": {
+          "provider": "example",
+          "model": "gpt-5.5"
+        }
+      },
+      "system_text": {
+        "preset": "head"
+      }
+    },
+    "disabled_tools": [],
+    "powershell_available": false,
+    "reply": {}
+  },
+  {
+    "name": "head_preset_other_model_no_pwsh",
+    "request": {
+      "preset": "head",
+      "params": {
+        "model": {
+          "provider": "example",
+          "model": "claude-opus-5-5"
+        }
+      },
+      "system_text": {
+        "preset": "head"
+      }
+    },
+    "disabled_tools": [],
+    "powershell_available": false,
+    "reply": {}
   }
 ]

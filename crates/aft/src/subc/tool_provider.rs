@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
-        composition_digest, schema_digest, session_capabilities, system_text_digest, CatalogAnswer,
-        CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
+        check_model_param, composition_digest, schema_digest, session_capabilities,
+        system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -193,6 +193,7 @@ pub(super) fn describe() -> Value {
         )
         .with_capabilities(vec![
             "tool-catalog-confine/v1".into(),
+            cortexkit_role_tool_provider::CATALOG_MODEL.into(),
             "tool-views/v1".into(),
         ]),
     )
@@ -685,7 +686,15 @@ pub(super) fn validate_catalog_request(
         ));
     }
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
-    if let Some((key, _)) = request.params.iter().next() {
+    // `model` is the one parameter this validator accepts: AFT advertises
+    // `tool-catalog-model/v1`, and a `head` catalog picks its edit tools by
+    // it (see `runner_head_keeps`). A malformed selector is refused by name.
+    check_model_param(&request.params)?;
+    if let Some((key, _)) = request
+        .params
+        .iter()
+        .find(|(key, _)| key.as_str() != "model")
+    {
         return Err(errors::invalid_request(
             &format!("params.{key}"),
             "unsupported catalog parameter",
@@ -1095,6 +1104,44 @@ struct CatalogRestrictions {
     rich_ui: bool,
 }
 
+/// Whether a model gets `apply_patch` in place of `edit` and `write`.
+///
+/// This is the rule OpenCode's host uses to choose its edit tools (`usePatch`
+/// in OpenCode's `packages/opencode/src/tool/registry.ts`): the model id
+/// contains `gpt-` and contains neither `oss` nor `gpt-4`. It is applied here
+/// without regard to case, so a runner head and an OpenCode head on the same
+/// model are offered the same edit tools.
+pub(crate) fn model_uses_apply_patch(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.contains("gpt-") && !id.contains("oss") && !id.contains("gpt-4")
+}
+
+/// The model id a catalog request names in `params.model`, whose shape
+/// [`validate_catalog_request`] has already checked.
+fn requested_model_id(request: &CatalogRequest) -> Option<&str> {
+    request.params.get("model")?.get("model")?.as_str()
+}
+
+/// Whether a runner head's `head` catalog keeps `name`.
+///
+/// The model in the request is what marks a runner head. The OpenCode and Pi
+/// plugin heads never fetch this catalog (they register their own tools and
+/// only send calls), and Prefrontal core sends `params.model` only when it
+/// fetches the catalog for a runner head, never on a capability-filter
+/// request. A runner head gets the same AFT tools as an OpenCode head on the
+/// same model: one edit-tool family, chosen by [`model_uses_apply_patch`], and
+/// no `status` tool, which the OpenCode plugin does not register. A request
+/// without a model (an older core, a read-only display route) keeps every
+/// tool, as before.
+fn runner_head_keeps(name: &str, uses_patch: bool) -> bool {
+    match name {
+        "status" => false,
+        "apply_patch" => uses_patch,
+        "edit" | "write" => !uses_patch,
+        _ => true,
+    }
+}
+
 /// `offers` is the session's (`runon`, `revision_reads`) pair: which
 /// enabled-only arguments its catalog carries.
 fn render_catalog(
@@ -1116,6 +1163,14 @@ fn render_catalog(
         runon,
         revision_reads,
     ));
+    if preset == CatalogPreset::Head {
+        if let Some(model) = requested_model_id(&request) {
+            let uses_patch = model_uses_apply_patch(model);
+            answer
+                .tools
+                .retain(|tool| runner_head_keeps(&tool.name, uses_patch));
+        }
+    }
     if request.preset.is_none() {
         answer = answer.with_presets(CatalogPreset::ALL.map(CatalogPreset::name));
     }
@@ -4075,8 +4130,9 @@ mod tests {
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
 
     /// The catalog goldens: the `head` file AFT pinned before presets existed,
-    /// and one file holding a fixture per non-head preset. Both are rewritten by
-    /// the one helper and checked by the one golden test.
+    /// and one file holding the fixtures whose request names a preset: each
+    /// non-head preset, and `head` with and without a model. Both are
+    /// rewritten by the one helper and checked by the one golden test.
     const CATALOG_FIXTURES: &[(&str, &str)] = &[
         (
             "tests/fixtures/tool_provider_catalog.json",
@@ -4721,6 +4777,212 @@ mod tests {
                     "{request} shares a fingerprint"
                 );
             }
+        }
+    }
+
+    /// The rule OpenCode's host uses to give a model `apply_patch` instead of
+    /// `edit` and `write`, checked on real model ids and without regard to case.
+    #[test]
+    fn apply_patch_goes_to_gpt_models_except_oss_and_gpt_4() {
+        for (model, uses_patch) in [
+            ("gpt-6.1-sol", true),
+            ("gpt-6", true),
+            ("gpt-5.5", true),
+            ("GPT-5.5", true),
+            ("gpt-4o", false),
+            ("GPT-4o", false),
+            ("gpt-oss-120b", false),
+            ("claude-opus-5-5", false),
+            ("gemini-3-pro", false),
+            ("kimi-k3", false),
+        ] {
+            assert_eq!(model_uses_apply_patch(model), uses_patch, "{model}");
+        }
+    }
+
+    /// A catalog request in the shape Prefrontal core sends for a runner head.
+    fn model_request(preset: &str, model: &str) -> Value {
+        json!({
+            "preset": preset,
+            "params": {"model": {"provider": "example", "model": model}},
+            "system_text": {"preset": preset},
+        })
+    }
+
+    /// A runner head gets one edit family chosen by its model and no `status`;
+    /// every other tool, every description and the system text are what the
+    /// same catalog without a model serves, and no description names an edit
+    /// tool the head was not offered.
+    #[test]
+    fn a_runner_head_gets_its_models_edit_tools_and_no_status() {
+        const EDIT_FAMILY: [&str; 3] = ["edit", "write", "apply_patch"];
+        for available in [false, true] {
+            let without = catalog(preset_request("head"), &[], available).unwrap();
+            assert!(names(&without).contains(&"status".to_string()));
+            for (model, served_edit_tools) in [
+                ("gpt-5.5", &["apply_patch"][..]),
+                ("gpt-6.1-sol", &["apply_patch"][..]),
+                ("claude-opus-5-5", &["write", "edit"][..]),
+                ("gpt-oss-120b", &["write", "edit"][..]),
+                ("kimi-k3", &["write", "edit"][..]),
+            ] {
+                let reply = catalog(model_request("head", model), &[], available).unwrap();
+                let expected: Vec<String> = names(&without)
+                    .into_iter()
+                    .filter(|name| {
+                        name != "status"
+                            && (!EDIT_FAMILY.contains(&name.as_str())
+                                || served_edit_tools.contains(&name.as_str()))
+                    })
+                    .collect();
+                assert_eq!(names(&reply), expected, "{model} pwsh={available}");
+                for name in &expected {
+                    assert_eq!(
+                        description(&reply, name),
+                        description(&without, name),
+                        "{model}: {name}"
+                    );
+                }
+                let absent: Vec<&str> = EDIT_FAMILY
+                    .into_iter()
+                    .filter(|name| !served_edit_tools.contains(name))
+                    .collect();
+                for tool in reply["tools"].as_array().unwrap() {
+                    let text = tool["description"].as_str().unwrap_or_default();
+                    for name in &absent {
+                        for spelled in [
+                            format!("`{name}` tool"),
+                            format!("aft_{name}"),
+                            format!("use `{name}`"),
+                        ] {
+                            assert!(
+                                !text.contains(&spelled),
+                                "{model}: {} names {spelled}",
+                                tool["name"]
+                            );
+                        }
+                        if *name == "apply_patch" {
+                            assert!(!text.contains(name), "{model}: {}", tool["name"]);
+                        }
+                    }
+                }
+                assert_eq!(unresolved_references(&reply), Vec::<String>::new());
+                assert_eq!(
+                    reply["system_text"]["text"], without["system_text"]["text"],
+                    "{model}"
+                );
+                let mut sorted = expected.clone();
+                sorted.sort();
+                assert_eq!(reply["system_text"]["tool_names"], json!(sorted));
+            }
+        }
+    }
+
+    /// `status` leaves only a runner head's catalog: a head without a model
+    /// (an older core, a read-only display route) and every worker keep it.
+    #[test]
+    fn only_a_runner_head_loses_the_status_tool() {
+        let has_status = |request: Value| {
+            names(&catalog(request, &[], true).unwrap()).contains(&"status".to_string())
+        };
+        assert!(has_status(json!({})));
+        assert!(has_status(preset_request("head")));
+        assert!(has_status(preset_request("worker")));
+        assert!(has_status(model_request("worker", "gpt-5.5")));
+        assert!(!has_status(model_request("head", "gpt-5.5")));
+        assert!(!has_status(model_request("head", "claude-opus-5-5")));
+        let mut presetless = model_request("head", "gemini-3-pro");
+        presetless.as_object_mut().unwrap().remove("preset");
+        presetless.as_object_mut().unwrap().remove("system_text");
+        assert!(!has_status(presetless));
+    }
+
+    /// The model is applied only to the `head` preset. A worker or reader
+    /// request may name one, and is answered byte for byte as without it.
+    #[test]
+    fn a_model_on_a_worker_or_reader_request_changes_nothing() {
+        for preset in ["worker", "reader"] {
+            assert_eq!(
+                catalog(model_request(preset, "gpt-5.5"), &[], true).unwrap(),
+                catalog(preset_request(preset), &[], true).unwrap(),
+                "{preset}"
+            );
+        }
+    }
+
+    /// The catalog digest follows the tool set: models served different tools
+    /// get different digests, and models served the same tools share one, so a
+    /// consumer never reuses one model's catalog for a model that needs
+    /// another.
+    #[test]
+    fn catalog_digests_differ_by_tool_set_and_agree_within_one() {
+        let full = |request: Value| catalog(request, &[], true).unwrap();
+        let digest = |request: &Value| {
+            let mut request = request.clone();
+            request["digest_only"] = json!(true);
+            catalog(request, &[], true).unwrap()["catalog_digest"].clone()
+        };
+        let gpt = model_request("head", "gpt-5.5");
+        let other_gpt = model_request("head", "gpt-6.1-sol");
+        let claude = model_request("head", "claude-opus-5-5");
+        let gemini = model_request("head", "gemini-3-pro");
+        let none = preset_request("head");
+        // Same set: the whole answer, digest included, is the same.
+        assert_eq!(full(gpt.clone()), full(other_gpt.clone()));
+        assert_eq!(full(claude.clone()), full(gemini.clone()));
+        let digests =
+            [&gpt, &claude, &none].map(|request| full(request.clone())["catalog_digest"].clone());
+        assert_ne!(digests[0], digests[1]);
+        assert_ne!(digests[0], digests[2]);
+        assert_ne!(digests[1], digests[2]);
+        for request in [&gpt, &other_gpt, &claude, &gemini, &none] {
+            assert_eq!(
+                digest(request),
+                full(request.clone())["catalog_digest"],
+                "{request}"
+            );
+        }
+    }
+
+    /// `params.model` is exactly `{provider, model}` with non-empty strings;
+    /// anything else is refused naming `params.model`, on every preset. Any
+    /// other param beside a valid model is still refused by its own name.
+    #[test]
+    fn malformed_models_and_other_params_are_refused_by_name() {
+        for preset in CatalogPreset::ALL {
+            for model in [
+                json!("gpt-5.5"),
+                json!({"model": "gpt-5.5"}),
+                json!({"provider": "openai", "model": ""}),
+                json!({"provider": "openai", "model": "gpt-5.5", "variant": "high"}),
+                json!(null),
+            ] {
+                let error = catalog(
+                    json!({"preset": preset.name(), "params": {"model": model}}),
+                    &[],
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    errors::invalid_request_field(&error),
+                    Some("params.model"),
+                    "{} {model}",
+                    preset.name()
+                );
+            }
+            let error = catalog(
+                json!({"preset": preset.name(), "params": {
+                    "model": {"provider": "openai", "model": "gpt-5.5"},
+                    "capabilities": [],
+                }}),
+                &[],
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                errors::invalid_request_field(&error),
+                Some("params.capabilities")
+            );
         }
     }
 
