@@ -4173,7 +4173,11 @@ impl BgTaskRegistry {
             .filter(|row| row.pending_match)
             .filter(|row| {
                 self.task_launching_identity_record(session_id, &row.task_id, Some(&harness))
-                    .is_some_and(|owner| owner.as_ref().is_none_or(|owner| Some(owner) == identity))
+                    .map_or(identity.is_none(), |owner| {
+                        owner
+                            .as_ref()
+                            .is_none_or(|owner| identity.is_none_or(|caller| caller == owner))
+                    })
             })
             .filter_map(|row| {
                 let launching_identity = self.task_launching_identity_in_harness(
@@ -11359,9 +11363,11 @@ impl BgTaskRegistry {
                     .count()
             })
             .unwrap_or(1);
-        if let Some(session_id) = session_id {
-            return completion_count
-                .saturating_add(self.pending_pattern_matches_for_session(session_id).len());
+        if let (Some(session_id), Some(identity)) = (session_id, super::TaskIdentity::current()) {
+            return completion_count.saturating_add(
+                self.pending_pattern_matches_for_identity(session_id, Some(&identity))
+                    .len(),
+            );
         }
         // A session's watches live under its own harness; the root-wide count
         // covers every harness seen on this root.
@@ -26818,7 +26824,22 @@ mod tests {
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashPatternMatch(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashLongRunning(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         drop(notices);
+        with_authenticated_principal(owner.clone(), || {
+            assert!(
+                !registry
+                    .pending_pattern_matches_for_session("session")
+                    .is_empty(),
+                "owner has a durable match before foreign calls"
+            );
+        });
         with_authenticated_principal(other.clone(), || {
+            assert_eq!(
+                registry.write_pty(&task_id, "session", b"input"),
+                Err("task_not_found".to_string())
+            );
+            assert!(registry
+                .unadopted_task_message(&task_id, "session", dir.path())
+                .is_none());
             assert!(registry
                 .drain_completions_for_session(Some("session"))
                 .is_empty());

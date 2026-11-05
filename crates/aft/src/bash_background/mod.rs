@@ -581,8 +581,13 @@ impl TaskIdentity {
 
     pub(crate) fn allows_current(owner: Option<&Self>) -> bool {
         // Records from before ownership was persisted keep session-only access for
-        // tasks in flight across the upgrade. Standalone mode also has no route.
-        owner.is_none_or(|owner| Self::current().as_ref() == Some(owner))
+        // tasks in flight across the upgrade. Standalone's single client and
+        // provider-internal lifecycle work have no route and retain their access.
+        owner.is_none_or(|owner| {
+            Self::current()
+                .as_ref()
+                .is_none_or(|caller| caller == owner)
+        })
     }
 }
 
