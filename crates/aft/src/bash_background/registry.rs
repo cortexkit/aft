@@ -4142,13 +4142,19 @@ impl BgTaskRegistry {
         &self,
         session_id: &str,
     ) -> Vec<BashPatternMatchFrame> {
-        self.pending_pattern_matches_for_identity(
-            session_id,
-            super::TaskIdentity::current().as_ref(),
-        )
+        self.pending_pattern_matches_for_caller(session_id, super::TaskIdentity::current().as_ref())
     }
 
-    fn pending_pattern_matches_for_identity(
+    /// Read pending matches without relying on a request's thread-local scope.
+    /// Maintenance and watchers supply the identity retained from the authenticated bind.
+    pub fn pending_pattern_matches_for_identity(
+        &self,
+        identity: &super::TaskIdentity,
+    ) -> Vec<BashPatternMatchFrame> {
+        self.pending_pattern_matches_for_caller(&identity.session, Some(identity))
+    }
+
+    fn pending_pattern_matches_for_caller(
         &self,
         session_id: &str,
         identity: Option<&super::TaskIdentity>,
@@ -11415,7 +11421,7 @@ impl BgTaskRegistry {
             .unwrap_or(1);
         if let (Some(session_id), Some(identity)) = (session_id, super::TaskIdentity::current()) {
             return completion_count.saturating_add(
-                self.pending_pattern_matches_for_identity(session_id, Some(&identity))
+                self.pending_pattern_matches_for_caller(session_id, Some(&identity))
                     .len(),
             );
         }
@@ -11461,7 +11467,7 @@ impl BgTaskRegistry {
                         .is_none_or(|owner| owner == identity)
             })
         }) || !self
-            .pending_pattern_matches_for_identity(&identity.session, Some(identity))
+            .pending_pattern_matches_for_identity(identity)
             .is_empty()
     }
 
@@ -26893,6 +26899,16 @@ mod tests {
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashPatternMatch(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashLongRunning(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         drop(notices);
+        assert!(registry
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert!(!registry
+            .pending_pattern_matches_for_identity(&identity)
+            .is_empty());
+        let other_identity = super::super::TaskIdentity::from_principal(&other).unwrap();
+        assert!(registry
+            .pending_pattern_matches_for_identity(&other_identity)
+            .is_empty());
         assert!(registry
             .drain_completions_for_session(Some("session"))
             .is_empty());

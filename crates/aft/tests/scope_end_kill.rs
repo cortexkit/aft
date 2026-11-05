@@ -680,7 +680,7 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
         assert_eq!(response["detail"]["late_results"], late);
         tasks.push(response["detail"]["task_id"].as_str().unwrap().to_owned());
     }
-    for task in &tasks {
+    for (index, task) in tasks.iter().enumerate() {
         let records = task_metadata(&root);
         let record = &records
             .iter()
@@ -688,6 +688,14 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
             .unwrap()
             .1;
         assert_eq!(record["status"], "running", "{record}");
+        assert_eq!(
+            record["launching_identity"],
+            json!({
+                "principal": if index == 0 { "reserved:owner" } else { "direct" },
+                "harness": "runner", "session": format!("session-{}", index + 1),
+            }),
+            "{record}"
+        );
     }
     assert!(daemon
         .next_matching(Duration::from_millis(100), |frame| frame.header.ty
@@ -699,7 +707,7 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &[]).await;
     daemon
-        .bind(1, 1, "direct", Some(stamp("owner", 1)), false)
+        .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
         .await;
     daemon.bind(2, 1, "direct", None, false).await;
     daemon
@@ -710,6 +718,26 @@ async fn drain_detaches_keyed_and_keyless_calls_and_retains_only_real_exit() {
             .wait_status(index as u16 + 1, task, "completed (exit 0)")
             .await;
     }
+    daemon
+        .bind_route(4, 1, "direct", None, false, "session-1", true)
+        .await;
+    let foreign = body(
+        &daemon
+            .call(
+                4,
+                json!({
+                    "name":"bash_status", "preset":"head", "arguments":{"taskId":tasks[0]},
+                }),
+            )
+            .await,
+    );
+    assert!(
+        foreign["isError"] == true
+            && foreign
+                .to_string()
+                .contains(&format!("background task not found: {}", tasks[0])),
+        "{foreign}"
+    );
     let page = body(
         &daemon
             .call(3, json!({"name":"late_results","arguments":{}}))

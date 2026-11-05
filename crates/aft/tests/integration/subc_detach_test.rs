@@ -320,7 +320,7 @@ fn subc_undo_and_background_task_survive_restart_after_mixed_harness_binds() {
 }
 
 #[test]
-fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
+fn subc_foreign_harness_cannot_observe_or_recover_task() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -379,7 +379,9 @@ fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
         );
         let text = frame_body(&refused);
         assert!(
-            text.contains("could not be adopted") && text.contains(stdout) && text.contains(stderr),
+            text.contains(&format!("background task not found: {task_id}"))
+                && !text.contains(stdout)
+                && !text.contains(stderr),
             "{text}"
         );
         send_tool_call(
@@ -395,9 +397,9 @@ fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
         let text = frame_body(&refused_watch);
         assert!(
             tool_result_is_error(&refused_watch)
-                && text.contains("could not be adopted")
-                && text.contains(stdout)
-                && text.contains(stderr),
+                && text.contains(&format!("background task not found: {task_id}"))
+                && !text.contains(stdout)
+                && !text.contains(stderr),
             "{text}"
         );
         assert_process_alive(
