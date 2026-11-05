@@ -526,7 +526,12 @@ pub fn separator() -> char {
     fn published_then_restarted(root: &Path) -> (AppContext, tempfile::TempDir) {
         let storage = tempfile::tempdir().unwrap();
         let ctx = context(root, storage.path());
-        let outcome = crate::data_layer::surfaces::index_root(root, &ctx.storage_dir()).unwrap();
+        let outcome = crate::data_layer::surfaces::index_root(
+            root,
+            &ctx.storage_dir(),
+            crate::data_layer::checkout::Planes::ALL,
+        )
+        .unwrap();
         assert!(outcome.published);
         (ctx, storage)
     }
@@ -1054,14 +1059,24 @@ pub fn separator() -> char {
         // again as a restart would.
         let storage = tempfile::tempdir().unwrap();
         let started = Instant::now();
-        let outcome = crate::data_layer::surfaces::index_root(&repo, storage.path()).unwrap();
+        let outcome = crate::data_layer::surfaces::index_root(
+            &repo,
+            storage.path(),
+            crate::data_layer::checkout::Planes::ALL,
+        )
+        .unwrap();
         println!(
             "build: {} files, {} parsed, {:.1} s",
             outcome.files,
             outcome.parsed_files,
             started.elapsed().as_secs_f64()
         );
-        let checkout = crate::data_layer::runtime::bind_foreground(&repo, storage.path()).unwrap();
+        let checkout = crate::data_layer::runtime::bind_foreground(
+            &repo,
+            storage.path(),
+            crate::data_layer::checkout::Planes::ALL,
+        )
+        .unwrap();
         let view = checkout.view().unwrap();
 
         let from_records = fresh_cache();
