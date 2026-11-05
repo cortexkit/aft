@@ -313,7 +313,9 @@ fn compare(
 }
 
 /// A recorded checkout read, with its path as text.
-fn describe_question(question: &crate::callgraph_store::fact_answers::FactQuestion) -> String {
+pub(super) fn describe_question(
+    question: &crate::callgraph_store::fact_answers::FactQuestion,
+) -> String {
     use crate::callgraph_store::fact_answers::FactQuestion as Q;
     let (name, path) = match question {
         Q::IsFile(path) => ("is_file", path),
@@ -457,7 +459,7 @@ pub fn run(
         };
         // `EDIT_GATE_TIMING_ONLY=1` skips every check, so a profile of the
         // run shows only the updates. Such a run proves nothing about
-        // correctness and fails nothing.
+        // correctness; the example says so and exits as a failure.
         if timing_only {
             writeln!(
                 out,

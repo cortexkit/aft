@@ -1921,6 +1921,45 @@ impl Checkout {
         Ok(engine.live.stored_readers_missing(&published.graph))
     }
 
+    /// Runs `inspect` on the incremental engine this checkout's call graph is
+    /// served from: the one the last refresh updated, or, when no refresh has
+    /// started one for the current publication, one started from that
+    /// publication the way the next refresh starts it, dropped afterwards.
+    /// `None` when no call graph is published. For gates.
+    ///
+    /// # Errors
+    ///
+    /// When an engine cannot be started from the publication.
+    #[doc(hidden)]
+    pub(crate) fn inspect_engine<T>(
+        &self,
+        inspect: impl FnOnce(&LiveCheckout) -> T,
+    ) -> Result<Option<T>, DataError> {
+        let published = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .clone();
+        let Some(published) = published.filter(|published| published.graph_built) else {
+            return Ok(None);
+        };
+        {
+            let slot = self
+                .engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(engine) = slot
+                .as_ref()
+                .filter(|engine| Arc::ptr_eq(&engine.published, &published))
+            {
+                return Ok(Some(inspect(&engine.live)));
+            }
+        }
+        let engine = self.start_engine_timed(&published, &mut Vec::new())?;
+        Ok(Some(inspect(&engine.live)))
+    }
+
     /// The references of `file` whose text contains `needle`, each with the
     /// rows its resolution stored, and the callers `callers` reports for
     /// each `(target file, symbol)` in `targets`. For diagnosing a missed

@@ -239,7 +239,15 @@ impl Replay {
 /// A published path deleted on disk with no change recorded: a reply says
 /// it was not on disk only when the path was among the candidates it read,
 /// and the two paths read different candidates. Its matches are the same.
+/// A reply that discloses the stale index says it is not complete; the
+/// data layer may disclose what today's reply does not, but never claims a
+/// complete answer where today's reply discloses a stale index.
 const STALE_PATH: &str = "stale path disclosed only when it is a candidate";
+/// The data layer's reply claims a complete answer where today's reply
+/// discloses that the index is out of date: not a wrong match, but an
+/// answer that hides what it could not see.
+const CLAIMS_COMPLETE: &str =
+    "the data layer claims a complete answer where today's reply discloses a stale index";
 /// Today's planner merges the posting filters of one trigram across the
 /// alternatives of a pattern, so an alternative that is a prefix of
 /// another inherits its next-character filter, and files holding only the
@@ -357,7 +365,8 @@ fn replay(
     replay
 }
 
-/// The note a grep reply carries when indexed files it read were gone.
+/// `shown` without the note a grep reply carries when indexed files it read
+/// were gone. `complete` stays, so the replies' claims are compared.
 fn without_missing_note(shown: &Value) -> Value {
     let note = regex::Regex::new(
         r"\n\n\(\d+ indexed file\(s\) were not on disk in this checkout; the index is out of date, so matches in files it has not seen may be missing\.\)",
@@ -369,10 +378,49 @@ fn without_missing_note(shown: &Value) -> Value {
             shown[key] = json!(note.replace_all(text, "").into_owned());
         }
     }
-    if let Some(object) = shown.as_object_mut() {
-        object.remove("complete");
-    }
     shown
+}
+
+/// Whether a grep difference comes from a stale path one reply disclosed:
+/// [`STALE_PATH`] when the replies are the same apart from that note (and
+/// `complete`, when only the data layer's reply disclosed it), or
+/// [`CLAIMS_COMPLETE`] when they are the same apart from the note and the
+/// data layer's reply claims `complete: true` where today's discloses the
+/// stale index. `None` when neither reply carries the note, or they differ
+/// in more.
+fn stale_path_class(today: &Value, data: &Value) -> Option<(&'static str, Value)> {
+    let noted = |shown: &Value| {
+        shown["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("indexed file(s) were not on disk in this checkout"))
+    };
+    if !noted(today) && !noted(data) {
+        return None;
+    }
+    let (mut today_shown, data_shown) = (without_missing_note(today), without_missing_note(data));
+    // Only the data layer disclosed the stale index, so only its reply says
+    // it is not complete: the more honest answer.
+    let only_data_noted = noted(data) && !noted(today);
+    if only_data_noted && data["complete"] == json!(false) {
+        today_shown["complete"] = json!(false);
+    }
+    if today_shown == data_shown {
+        return Some((
+            STALE_PATH,
+            json!({"same_apart_from": if only_data_noted {
+                "the not-on-disk note, and complete, which only the data layer's note withdrew"
+            } else {
+                "the not-on-disk note"
+            }}),
+        ));
+    }
+    today_shown["complete"] = data_shown["complete"].clone();
+    (noted(today) && data["complete"] == json!(true) && today_shown == data_shown).then(|| {
+        (
+            CLAIMS_COMPLETE,
+            json!({"today_complete": today["complete"], "data_complete": data["complete"]}),
+        )
+    })
 }
 
 /// What explains one difference, with its evidence.
@@ -384,19 +432,10 @@ fn classify(
     today: &Value,
     data: &Value,
 ) -> (&'static str, Value) {
-    let noted = |shown: &Value| {
-        shown["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("indexed file(s) were not on disk in this checkout"))
-    };
-    if case.tool == "grep"
-        && (noted(today) || noted(data))
-        && without_missing_note(today) == without_missing_note(data)
-    {
-        return (
-            STALE_PATH,
-            json!({"same_apart_from": "the not-on-disk note and complete"}),
-        );
+    if case.tool == "grep" {
+        if let Some(found) = stale_path_class(today, data) {
+            return found;
+        }
     }
     let Some((pattern, filters, scope)) = grep_query(root, case) else {
         return (UNEXPLAINED, Value::Null);
@@ -1127,6 +1166,17 @@ fn grep_and_glob_answer_alike_from_the_data_layer() {
     };
     grep_cases.truncate(limit);
     let glob_cases = glob_corpus(&root);
+    // An empty copy or corpus would compare nothing and pass.
+    assert!(
+        copied > 0 && data_files > 0 && today_files > 0,
+        "nothing to compare: {copied} files copied, {data_files} in the data layer, {today_files} in today's index"
+    );
+    assert!(
+        !grep_cases.is_empty() && !glob_cases.is_empty(),
+        "nothing to compare: {} grep cases, {} glob cases",
+        grep_cases.len(),
+        glob_cases.len()
+    );
     eprintln!(
         "gate: {} grep cases from {distinct_patterns} patterns, {} glob cases",
         grep_cases.len(),
@@ -1223,4 +1273,42 @@ fn count_by_scope(cases: &[Case]) -> BTreeMap<&'static str, usize> {
         *counts.entry(case.scope).or_default() += 1;
     }
     counts
+}
+
+/// A stale path disclosed by one reply is accepted only when the data
+/// layer's reply does not claim a complete answer that today's reply
+/// withdraws.
+#[test]
+fn a_stale_path_class_never_accepts_a_data_layer_claim_of_complete() {
+    let note = "\n\n(1 indexed file(s) were not on disk in this checkout; the index is out of date, so matches in files it has not seen may be missing.)";
+    let reply = |noted: bool, complete: bool| {
+        let text = format!("src/a.rs:1: hit{}", if noted { note } else { "" });
+        json!({"text": text, "rendered": text, "complete": complete, "matches": 1})
+    };
+    let class = |today: &Value, data: &Value| stale_path_class(today, data).map(|(class, _)| class);
+    // Today discloses the stale index and so is not complete; the data
+    // layer's reply, without the note, must not claim that it is.
+    assert_eq!(
+        class(&reply(true, false), &reply(false, true)),
+        Some(CLAIMS_COMPLETE)
+    );
+    assert_eq!(
+        class(&reply(true, false), &reply(false, false)),
+        Some(STALE_PATH)
+    );
+    // The data layer disclosing what today's reply does not is accepted.
+    assert_eq!(
+        class(&reply(false, true), &reply(true, false)),
+        Some(STALE_PATH)
+    );
+    assert_eq!(
+        class(&reply(true, false), &reply(true, false)),
+        Some(STALE_PATH)
+    );
+    // Neither reply disclosed anything: another class explains it.
+    assert_eq!(class(&reply(false, true), &reply(false, false)), None);
+    // Matches that differ are not explained by the note.
+    let mut other = reply(false, false);
+    other["matches"] = json!(2);
+    assert_eq!(class(&reply(true, false), &other), None);
 }

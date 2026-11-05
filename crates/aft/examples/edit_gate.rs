@@ -4,7 +4,9 @@
 //! ```text
 //! cargo run --release -p agent-file-tools --example edit_gate -- <pack.jsonl.gz> [threads] [check every N edits]
 //! ```
-//! Writes one JSON line per edit to stdout.
+//! Writes one JSON line per edit to stdout. With `EDIT_GATE_TIMING_ONLY=1`
+//! it skips every check, for profiling the updates alone; such a run checks
+//! nothing, so it says so and exits with status 3, never as a pass.
 
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::print_stderr)]
 
@@ -22,11 +24,14 @@ fn main() {
         &mut out,
     )
     .unwrap();
-    eprintln!("checked {checked} edits against cold resolutions; {failures} differed");
     if std::env::var_os("EDIT_GATE_TIMING_ONLY").is_some_and(|value| value == "1") {
-        eprintln!("timing only: nothing was checked");
-        return;
+        eprintln!(
+            "EDIT_GATE_TIMING_ONLY=1: every check was skipped, so this run checked nothing \
+             and is not a pass; unset it to run the gate"
+        );
+        std::process::exit(3);
     }
+    eprintln!("checked {checked} edits against cold resolutions; {failures} differed");
     assert!(checked > 0, "no edit was checked against a cold resolution");
     assert_eq!(
         failures, 0,

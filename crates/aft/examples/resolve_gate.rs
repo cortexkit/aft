@@ -17,6 +17,22 @@ fn main() {
         .map_or(8, |threads| threads.parse().unwrap());
     let report = aft::data_layer::gate::run(std::path::Path::new(&root), threads).unwrap();
     println!("{report:#?}");
+    // A checkout with nothing parsed, or a sample that ran no query, passes
+    // every comparison below without checking anything.
+    assert!(
+        report.parsed_files > 0 && report.rows > 0,
+        "nothing was compared: {} parsed files, {} rows",
+        report.parsed_files,
+        report.rows
+    );
+    assert!(
+        report.queries.values().any(|(calls, ..)| *calls > 0)
+            && report
+                .segment_queries
+                .values()
+                .any(|(calls, ..)| *calls > 0),
+        "no query was compared"
+    );
     assert_eq!(
         (
             report.rows_only_new,

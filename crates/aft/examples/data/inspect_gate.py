@@ -38,7 +38,8 @@ show that dead code never asked the data layer.
     python3 crates/aft/examples/data/inspect_gate.py BINARY OUT \
         [--root PATH]... [--corpus DIR] [--modes legacy,views] [--control]
 
-Exits nonzero when any reply differs or the data layer was not exercised.
+Exits nonzero when any reply differs, the data layer was not exercised, or
+nothing was compared (no --root or --corpus checkout, or no reply).
 """
 import argparse
 import json
@@ -400,6 +401,10 @@ def main():
         only = set(args.only.split(',')) if args.only else None
         cases += [(f'corpus-{path.name}', path.resolve()) for path in sorted(args.corpus.iterdir())
                   if path.is_dir() and (only is None or path.name in only)]
+    if not cases:
+        # With nothing to analyse every comparison passes vacuously.
+        print('no checkout to compare: pass --root or a --corpus with checkouts in it', file=sys.stderr)
+        sys.exit(2)
     results = []
     for name, source in cases:
         try:
@@ -408,10 +413,13 @@ def main():
             results.append({'case': name, 'error': repr(error)})
             print(json.dumps({'case': name, 'error': repr(error)}), flush=True)
     (work / 'report.json').write_text(json.dumps(results, indent=2) + '\n')
-    failed = [result for result in results if result.get('error') or result['differing'] or not result['exercised']]
-    print(f'{len(results)} case-modes, {sum(result.get("replies_compared", 0) for result in results)} replies compared, '
-          f'{len(failed)} failed', flush=True)
-    sys.exit(1 if failed else 0)
+    # A case-mode that compared no reply checked nothing, so it fails too.
+    failed = [result for result in results
+              if result.get('error') or result['differing'] or not result['exercised']
+              or not result.get('replies_compared')]
+    compared = sum(result.get('replies_compared', 0) for result in results)
+    print(f'{len(results)} case-modes, {compared} replies compared, {len(failed)} failed', flush=True)
+    sys.exit(1 if failed or not compared else 0)
 
 
 if __name__ == '__main__':
