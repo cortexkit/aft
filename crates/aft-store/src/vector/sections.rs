@@ -43,15 +43,18 @@ use crate::segment::{
 };
 use crate::table::{UnitLocation, UnitTable, UnitTableBuilder, UnitTableParts};
 
-const FINGERPRINT: SectionKind = SectionKind::new(0x0300);
-const UNITS: SectionKind = SectionKind::new(0x0301);
-const SCAN: SectionKind = SectionKind::new(0x0302);
-const VECTORS: SectionKind = SectionKind::new(0x0303);
-const CHUNK_MAPS: SectionKind = SectionKind::new(0x0304);
-const CHUNK_MAP_DATA: SectionKind = SectionKind::new(0x0305);
-const CENTER: SectionKind = SectionKind::new(0x0306);
-const DETAILS_INDEX: SectionKind = SectionKind::new(0x0307);
-const DETAILS: SectionKind = SectionKind::new(0x0308);
+// The vector plane's section kinds are 0x04xx; each plane has its own
+// range (text 0x01xx, content records 0x02xx, call graph 0x03xx), so planes
+// can share a segment.
+const FINGERPRINT: SectionKind = SectionKind::new(0x0400);
+const UNITS: SectionKind = SectionKind::new(0x0401);
+const SCAN: SectionKind = SectionKind::new(0x0402);
+const VECTORS: SectionKind = SectionKind::new(0x0403);
+const CHUNK_MAPS: SectionKind = SectionKind::new(0x0404);
+const CHUNK_MAP_DATA: SectionKind = SectionKind::new(0x0405);
+const CENTER: SectionKind = SectionKind::new(0x0406);
+const DETAILS_INDEX: SectionKind = SectionKind::new(0x0407);
+const DETAILS: SectionKind = SectionKind::new(0x0408);
 const KINDS: [SectionKind; 9] = [
     FINGERPRINT,
     UNITS,

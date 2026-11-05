@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::*;
 use crate::cache::BlockCache;
 use crate::ids::{ContentKey, Digest128, FamilyId, SegmentId, WriterIncarnation};
-use crate::segment::{BLOCK_LEN, Segment, SegmentMeta, SegmentWriter};
+use crate::segment::{BLOCK_LEN, KnownSection, Segment, SegmentMeta, SegmentWriter};
 use crate::test_rng::TestRng;
 
 fn family() -> FamilyId {
@@ -1055,4 +1055,27 @@ fn a_shared_index_lends_indexes_that_answer_as_a_built_one() {
         ),
         "rebuilt",
     );
+}
+
+#[test]
+fn no_two_planes_share_a_section_kind() {
+    // Readers find a plane's sections by kind, so a segment holding two
+    // planes' sections would mix them up if any kind were shared.
+    let planes: [(&str, Vec<KnownSection>); 4] = [
+        ("text", crate::text::KNOWN.to_vec()),
+        ("content", crate::content::KNOWN.to_vec()),
+        ("graph", crate::graph::KNOWN.to_vec()),
+        ("vector", KNOWN.to_vec()),
+    ];
+    let mut owner = HashMap::new();
+    for (plane, known) in &planes {
+        for section in known {
+            if let Some(other) = owner.insert(section.kind, *plane) {
+                panic!(
+                    "{plane} and {other} both use section kind {:?}",
+                    section.kind
+                );
+            }
+        }
+    }
 }
