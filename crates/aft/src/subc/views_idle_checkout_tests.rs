@@ -56,15 +56,12 @@ fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_rep
     ctx.set_canonical_cache_root(root.as_path().to_path_buf());
     ctx.set_standing_artifact_exempt(true);
     ctx.note_request();
-    let request: crate::protocol::RawRequest = serde_json::from_value(json!({
-        "id": "idle-checkout-grep", "command": "grep", "pattern": "target"
-    }))
-    .unwrap();
-    let first = crate::commands::grep::handle_grep(&request, &ctx);
-    assert!(first.success, "{:?}", first.data);
-    assert!(checkout_bound(&ctx), "the first query binds the checkout");
-    // Let the bind's build publish, so the release below drops a settled
-    // checkout and the reply after it must come from the publication.
+    // Bind the checkout and let its build publish before the first grep, so
+    // grep answers from the publication and the release below drops a
+    // settled checkout. (A grep that ran before the publication would fall
+    // back to today's search index and start a build of it, which nothing in
+    // this test drains, and which blocks the release as a build in flight.)
+    ctx.data_checkout().expect("the data layer binds the root");
     let started = Instant::now();
     while crate::data_layer::tools::search::DataText::ready(&ctx).is_none() {
         assert!(
@@ -73,6 +70,14 @@ fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_rep
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+        "id": "idle-checkout-grep", "command": "grep", "pattern": "target"
+    }))
+    .unwrap();
+    let first = crate::commands::grep::handle_grep(&request, &ctx);
+    assert!(first.success, "{:?}", first.data);
+    assert_eq!(first.data["index_status"], "Ready", "{:?}", first.data);
+    assert!(checkout_bound(&ctx));
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), ctx.clone()));
     let channels = HashMap::from([(
@@ -125,7 +130,8 @@ fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_rep
         sweep(&mut roots, due);
         assert!(
             Instant::now() < deadline,
-            "the idle connected checkout was not released"
+            "the idle connected checkout was not released; blocker: {:?}",
+            ctx.try_artifact_eviction_blocker(false)
         );
         std::thread::yield_now();
     }
