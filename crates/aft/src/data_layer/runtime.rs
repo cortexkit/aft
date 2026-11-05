@@ -792,14 +792,16 @@ fn pending(checkout: &Checkout) -> bool {
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
 /// Called as a configure of `ctx`'s root succeeds, before its reply: when the
-/// root's checkout was bound before, its call graph reports building from now
-/// on, so a query sent right after the reply waits for the rescan that
-/// [`root_bound`] then runs in the configure tail. Binds nothing.
+/// root's checkout was bound before, starts its rescan now, so the call graph
+/// reports building before the reply and a query sent right after it waits
+/// for what the rescan finds. The rescan job owns that state and ends it
+/// however it ends, even unrun; [`root_bound`] in the configure tail starts
+/// it again only if none is running. Binds nothing.
 pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
     use crate::data_layer::surfaces::DataCheckoutProbe;
     if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
         if checkout.bound_once.load(Ordering::Acquire) {
-            checkout.work.checkout.begin_rescan();
+            checkout.work.start_rescan();
         }
     }
 }
