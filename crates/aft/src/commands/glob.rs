@@ -611,6 +611,14 @@ fn glob_root(
     }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
+    if search_scope.use_index && !ignored_target {
+        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+            if let Some(discovery) = glob_from_view(view, project_root, &search_scope.root, pattern)
+            {
+                return Ok(discovery);
+            }
+        }
+    }
     let view_snapshot = (search_scope.use_index && !ignored_target)
         .then(|| ctx.lexical_view_snapshot("glob"))
         .flatten();
@@ -702,6 +710,47 @@ fn glob_root(
             }
             fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
+    })
+}
+
+/// [`glob_root`] answered from the data layer's view of the checkout: the
+/// view lists the files and their modification times, and today's indexed
+/// glob matches them. `None` when the root is outside the view's checkout,
+/// so today's path answers instead.
+fn glob_from_view(
+    view: crate::data_layer::checkout::CheckoutView,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+) -> Option<GlobDiscovery> {
+    let scope = crate::data_layer::tools::grep::ViewScope::of(view, search_root)?;
+    if !scope.is_whole_checkout() && !scope.has_files() {
+        // The checkout holds no file under this explicitly named directory,
+        // so walk it, as today's path does when its index lacks the directory.
+        return Some(fallback_glob(project_root, search_root, pattern, false));
+    }
+    let snapshot = scope.listing();
+    let (files, scope_has_files, entries_visited) =
+        snapshot.glob_profiled(pattern, search_root, false);
+    let indexed_mtimes = files
+        .iter()
+        .filter_map(|path| {
+            snapshot
+                .file_modified(path)
+                .map(|time| (path.clone(), time))
+        })
+        .collect();
+    Some(GlobDiscovery {
+        entries_visited,
+        files,
+        indexed_mtimes,
+        walk_truncated: false,
+        walk_time_limit_reached: false,
+        source: "index",
+        walk_time: Duration::ZERO,
+        scope_has_files,
+        scope_probe: Duration::ZERO,
+        skipped_foreign_mounts: 0,
     })
 }
 

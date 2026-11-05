@@ -844,6 +844,25 @@ fn execute_root_profiled(
         );
     }
 
+    if root.use_index && !root.ignored_target {
+        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+            if let Some(answer) = execute_root_from_view(
+                ctx,
+                view,
+                pattern,
+                query,
+                root,
+                params,
+                filters,
+                max_results,
+                project_root,
+                order,
+            ) {
+                return answer;
+            }
+        }
+    }
+
     let snapshot_started = Instant::now();
     let ignored_target = root.ignored_target;
     let mut snapshot_timed_out = false;
@@ -977,6 +996,97 @@ fn execute_root_profiled(
             ..GrepExecutionPhaseTimings::default()
         },
     )
+}
+
+/// [`execute_root_profiled`] answered from the data layer's view of the
+/// checkout: the view names the candidate files, and today's indexed search
+/// reads, matches, filters and orders them. `None` when the root is outside
+/// the view's checkout, so today's path answers instead.
+#[allow(clippy::too_many_arguments)]
+fn execute_root_from_view(
+    ctx: &AppContext,
+    view: crate::data_layer::checkout::CheckoutView,
+    pattern: &CompiledPattern,
+    query: &RegexQuery,
+    root: &ResolvedRoot,
+    params: &GrepParams,
+    filters: &PathFilters,
+    max_results: usize,
+    project_root: &Path,
+    order: GrepScanOrder,
+) -> Option<(GrepResult, GrepExecutionPhaseTimings)> {
+    let snapshot_started = Instant::now();
+    let scope = crate::data_layer::tools::grep::ViewScope::of(view, &root.search_root)?;
+    if !scope.is_whole_checkout() && !scope.has_files() {
+        // The checkout holds no file under this explicitly named directory,
+        // so walk it, as below when today's index lacks the directory.
+        let mut counts = ScopeFileCounts::default();
+        let result = fallback_grep_counted(
+            project_root,
+            &root.search_root,
+            &root.filter_root,
+            pattern,
+            filters,
+            max_results,
+            IndexStatus::Fallback,
+            params.path_exclusion,
+            &mut counts,
+            false,
+            order,
+        );
+        return Some((
+            result,
+            GrepExecutionPhaseTimings {
+                snapshot_acquire: snapshot_started.elapsed(),
+                walk_counts: Some(counts),
+                ..GrepExecutionPhaseTimings::default()
+            },
+        ));
+    }
+    let snapshot = match scope.candidates(pattern) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // A view that cannot be read fails the call with its cause; no
+            // walk answers in its place.
+            let error = error.to_string();
+            ctx.note_view_load_failure("trigram", &error);
+            return Some((
+                failed_index_grep(std::io::Error::other(
+                    crate::context::view_load_failure_message(error),
+                )),
+                GrepExecutionPhaseTimings::default(),
+            ));
+        }
+    };
+    let snapshot_acquire = snapshot_started.elapsed();
+    let (result, query_timings) = match snapshot
+        .search_grep_profiled_with_filters_and_query_in_order(
+            pattern,
+            query,
+            filters,
+            &root.search_root,
+            max_results,
+            params.path_exclusion,
+            order,
+        ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Some((
+                failed_index_grep(error),
+                GrepExecutionPhaseTimings::default(),
+            ))
+        }
+    };
+    Some((
+        result,
+        GrepExecutionPhaseTimings {
+            snapshot_acquire,
+            query_decomposition: Duration::ZERO,
+            query: query_timings,
+            indexed_scope_has_files: Some(scope.has_files_matching(filters)),
+            walk_counts: None,
+        },
+    ))
 }
 
 /// True when both paths name the same directory, comparing the given forms
