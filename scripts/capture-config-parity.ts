@@ -1060,6 +1060,25 @@ const CASES: ParityCase[] = [
     name: "idle_non_integer_dropped",
     user: { idle: { root_ttl_minutes: 12.5 } },
   },
+  // --- idle.checkout_hours (formerly views.idle_checkout_hours): same default
+  //     and range, merged per key at both tiers and in harness blocks. ---
+  { name: "idle_checkout_hours_user", user: { idle: { checkout_hours: 48 } } },
+  {
+    name: "idle_checkout_hours_project_per_key",
+    user: { idle: { root_ttl_minutes: 20, checkout_hours: 2 } },
+    project: { idle: { root_ttl_minutes: 15 } },
+  },
+  {
+    name: "idle_checkout_hours_project_override",
+    user: { idle: { checkout_hours: 2 } },
+    project: { idle: { checkout_hours: 72 } },
+  },
+  { name: "idle_checkout_hours_clamped_min", user: { idle: { checkout_hours: 0 } } },
+  { name: "idle_checkout_hours_clamped_max", user: { idle: { checkout_hours: 9000 } } },
+  {
+    name: "idle_checkout_hours_harness_per_key",
+    user: { idle: { root_ttl_minutes: 20 }, harnesses: { opencode: { idle: { checkout_hours: 6 } } } },
+  },
   // --- Retired keys are translated instead of failing the load. These cover
   //     gh_read, gh_shim.enabled, idle.lsp_ttl_minutes and the two removed
   //     inspect keys in both tiers; a project's translated value follows the
@@ -1099,6 +1118,35 @@ const CASES: ParityCase[] = [
     user: { harnesses: { pi: { bridge: { hang_threshold: 5 } } } },
   },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
+  // --- Data-layer keys: views.idle_checkout_hours is translated to
+  //     idle.checkout_hours (clamped); the removed views.enabled,
+  //     views.callgraph_copies and worktree.ram_overlay still reach the engine
+  //     until the code that reads them is deleted. ---
+  {
+    name: "retired_idle_checkout_hours_user",
+    user: { views: { idle_checkout_hours: 72, enabled: true } },
+  },
+  {
+    name: "retired_idle_checkout_hours_project_clamped",
+    user: { idle: { checkout_hours: 2 } },
+    project: { views: { idle_checkout_hours: 9000 } },
+  },
+  {
+    name: "retired_idle_checkout_hours_superseded",
+    user: { views: { idle_checkout_hours: 2 }, idle: { checkout_hours: 5 } },
+  },
+  {
+    name: "retired_idle_checkout_hours_harness",
+    harness: "pi",
+    user: {
+      idle: { root_ttl_minutes: 20 },
+      harnesses: { pi: { views: { idle_checkout_hours: 12 } } },
+    },
+  },
+  {
+    name: "removed_data_layer_keys_still_apply",
+    user: { views: { enabled: true, callgraph_copies: 2 }, worktree: { ram_overlay: false } },
+  },
   ...(["opencode", "pi"] as const).flatMap((harness) =>
     [
       "experimental_lsp_ty",

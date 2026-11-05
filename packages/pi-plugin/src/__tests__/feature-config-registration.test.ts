@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   ADAPTER_UNIMPLEMENTED_TOOLS,
   CANONICAL_TOOLS,
+  REMOVED_DATA_LAYER_NOTES,
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
 
@@ -160,6 +161,26 @@ describe("Pi/OMP feature-config registration", () => {
     const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
     expect(notices.map((notice) => notice.message)).toEqual([
       `${projectFile} uses retired keys (idle.lsp_ttl_minutes, search_index); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file.`,
+    ]);
+  });
+
+  test("idle.checkout_hours loads and merges per key; a user file's removed keys get one notice naming only them", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ idle: { root_ttl_minutes: 15 } }));
+    const user = {
+      idle: { root_ttl_minutes: 20 },
+      views: { idle_checkout_hours: 9000, callgraph_copies: 1 },
+    };
+    const config = loadWithUserConfig(user);
+    expect(config.idle).toEqual({ root_ttl_minutes: 15, checkout_hours: 8760 });
+    expect(config.views).toEqual({ callgraph_copies: 1 });
+    const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
+    const notices = getConfigLoadNotices().filter(
+      (notice) => notice.configPath === userPath && notice.message !== SEMANTIC_COST_NOTICE,
+    );
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${userPath} sets removed keys (views.callgraph_copies); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });

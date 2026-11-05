@@ -226,46 +226,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // off or building index instead of disappearing.
   "indexes": {
     // Trigram index for indexed grep/glob and the lexical aft_search lane.
+    // With false, no text index is built, and grep and glob walk the folder.
     "trigram": true,
     // Semantic index for the semantic aft_search lane. The local default backend
     // may download an ONNX runtime and model and use CPU.
     "semantic": true,
     // Persisted call-graph store for aft_callgraph and enrichment.
     "callgraph": true
-  },
-
-  // Borrow-only checkout reconciliation and RAM overlay. Default: true.
-  // A linked worktree, or a clone or copy of a repository whose live checkout
-  // owns the shared indexes, borrows that checkout's search index read-only.
-  // With this on, the borrowed index is compared with this checkout's own files
-  // before search reports ready, and this checkout's file-watcher events go to
-  // private in-RAM search and semantic deltas (and invalidate the symbol cache)
-  // so search sees local edits. Semantic embeddings are created only for files
-  // changed after bind; corpus catch-up remains disabled. RAM cost scales with
-  // the number of files that differ. The shared indexes are never written, and
-  // the callgraph stays frozen. Setting it false serves the borrowed index as
-  // it is, so glob and search can list the live checkout's files instead of
-  // this one's; it is kept only as an escape hatch. User and project tiers may
-  // both set this.
-  "worktree": {
-    "ram_overlay": true
-  },
-
-  // Content-addressed index views. When enabled, semantic and callgraph artifacts
-  // are assembled from reusable per-file blobs behind an atomic manifest.
-  // User and project tiers may both set these; each tier sets only the keys it
-  // names.
-  "views": {
-    // Default: false.
-    "enabled": false,
-    // How many checkouts of one repository keep their own call graph, besides
-    // the main checkout. Another checkout reads the main checkout's graph, and
-    // its call-graph answers say which of its files differ. 0 makes every other
-    // checkout read the main checkout's graph. Default: 4.
-    "callgraph_copies": 4,
-    // Hours without use after which a checkout's view can be evicted.
-    // Default: 168 (7 days), minimum 1.
-    "idle_checkout_hours": 168
   },
 
   // When project_root is exactly $HOME, every index is force-disabled because the
@@ -308,7 +275,8 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
                                          // With the default max 64 and no successful latency sample, a
                                          // never-answering backend reaches the one-item verdict within 11
                                          // timeout_ms floors (275 s), plus scheduler overhead.
-    "max_files": 20000,                 // max files indexed (default 20000); raise for remote backends
+    "max_files": 20000,                 // most files embedded (default 20000): a limit on embedding
+                                         // cost; files past it are not embedded. Raise for remote backends
     // "max_input_tokens": 512          // advanced: per-row token budget for remote backends; widens the
                                         // symbol-body slice each chunk embeds (default keeps the 512-safe
                                         // caps; fastembed ignores it). Changing it rebuilds the index.
@@ -493,13 +461,18 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     }
   },
 
-  // Idle reclamation. User and project tiers. Values outside the documented
-  // ranges are clamped with a warning; non-integers are dropped with a warning.
-  // Reclaimed indexes rebuild on the next request.
+  // Idle reclamation. User and project tiers, each setting only the keys it
+  // names. Values outside the documented ranges are clamped with a warning;
+  // non-integers are dropped with a warning. Reclaimed indexes rebuild on the
+  // next request.
   "idle": {
     // Minutes without tool traffic before an unbound root's artifacts are
     // evicted. Default 30; clamped to 5..=30.
-    "root_ttl_minutes": 30
+    "root_ttl_minutes": 30,
+    // Hours without use after which a checkout counts as idle and drops its
+    // in-memory index state; its state on disk stays. Default 168 (7 days);
+    // clamped to 1..=8760. Replaces views.idle_checkout_hours. Applies live.
+    "checkout_hours": 168
   },
 
   // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
@@ -782,6 +755,28 @@ Loading translates this retired key in memory, and `doctor --fix` uses the same 
 Heads previously ran without an OS sandbox unless `sandbox.enabled: true` was set. Thus default head `off` preserves default head behavior, while the translation preserves confinement for explicit `true`. The old boolean never controlled the forced stamped-worker jail; explicit `false` does **not** pin workers to strict after this cutover.
 
 ## Config schema migration
+
+### One index store per repository (v0.64)
+
+v0.64 keeps one index store per repository, shared by all its checkouts, and
+retires the settings that chose between the old index routes:
+
+| Key | What happens |
+| --- | --- |
+| `views.idle_checkout_hours` | Renamed to `idle.checkout_hours` (same default, 168, and range, 1..=8760). Translated like the retired keys below: the user file is rewritten on load, a project file gets a notice. |
+| `views.enabled` | Removed: AFT always uses the one store. |
+| `views.callgraph_copies` | Removed: no checkout borrows another checkout's call graph. |
+| `worktree.ram_overlay` | Removed: every worktree has its own index state, so there is no borrowed index to patch in memory. |
+
+The removed keys no longer do anything. AFT ignores them and shows a notice
+naming the file once, for the user file and for a project file alike; it never
+rewrites a file on its own for them. `npx @cortexkit/aft doctor --fix` deletes
+them. From v0.65.0 a config file that still sets any of these four keys is
+refused with `removed_config_key:<key>; run aft doctor --fix`.
+
+`indexes.trigram`, `indexes.semantic` and `indexes.callgraph` stay. With
+`indexes.trigram: false` no text index is built, and grep and glob walk the
+folder. `semantic.max_files` stays as a limit on embedding cost.
 
 ### Feature-based configuration (v0.58)
 
@@ -1117,7 +1112,8 @@ features guard against unbounded work to keep the bridge responsive:
 
 - **Call-graph ops** (`callers`, `trace_to`, `trace_data`, `impact`) use the persisted store and
   are not capped by the removed legacy in-memory reverse-index limit.
-- **Semantic indexing** is capped at `semantic.max_files` source files (default 20,000). Raise it
+- **Semantic indexing** embeds at most `semantic.max_files` source files (default 20,000), a
+  limit on embedding cost and time; files past it are not embedded. Raise it
   when using a remote backend that embeds server-side, or lower it on memory-constrained machines.
 - **`grep`, `glob`, `read`, `edit`, and other tools** work at any size.
 

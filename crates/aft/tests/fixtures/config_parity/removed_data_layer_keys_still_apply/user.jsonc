@@ -1,0 +1,9 @@
+{
+  "views": {
+    "enabled": true,
+    "callgraph_copies": 2
+  },
+  "worktree": {
+    "ram_overlay": false
+  }
+}

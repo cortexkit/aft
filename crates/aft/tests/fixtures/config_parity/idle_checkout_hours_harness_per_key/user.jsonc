@@ -1,0 +1,12 @@
+{
+  "idle": {
+    "root_ttl_minutes": 20
+  },
+  "harnesses": {
+    "opencode": {
+      "idle": {
+        "checkout_hours": 6
+      }
+    }
+  }
+}

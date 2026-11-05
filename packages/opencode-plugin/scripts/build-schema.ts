@@ -192,7 +192,8 @@ function buildSchema(): Record<string, unknown> {
           trigram: {
             type: "boolean",
             default: true,
-            description: "Trigram index for indexed grep/glob and the lexical aft_search lane.",
+            description:
+              "Trigram index for indexed grep/glob and the lexical aft_search lane. With false, no text index is built, and grep and glob walk the folder.",
           },
           semantic: {
             type: "boolean",
@@ -303,24 +304,16 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
           },
-        },
-        additionalProperties: false,
-        description: "Idle reclamation window for unbound-root artifacts.",
-      },
-
-      worktree: {
-        type: "object",
-        properties: {
-          ram_overlay: {
-            type: "boolean",
-            default: true,
+          checkout_hours: {
+            type: "integer",
+            default: 168,
             description:
-              "When true (the default), a borrow-only checkout (a linked worktree, or a clone or copy of a repository whose live checkout owns the shared index) compares the borrowed search index with its own files before reporting ready, then applies its own file-watcher events to an in-RAM delta (and symbol-cache invalidation) so search reflects edits in that checkout. Never writes the shared on-disk index. Semantic embeddings are added only for files changed after bind; the callgraph stays frozen. Setting false serves the borrowed index as it is, listing the live checkout's files; it is kept only as an escape hatch. User and project tiers may both set this; it only spends that machine's RAM.",
+              "Hours without use after which a checkout counts as idle and drops its in-memory index state; its state on disk stays. Default 168 (one week); values outside 1..=8760 are clamped. Replaces views.idle_checkout_hours. User and project tiers. Applies live.",
           },
         },
         additionalProperties: false,
         description:
-          "Borrow-only checkout reconciliation and RAM overlay for the borrowed trigram index. Default on.",
+          "Idle windows: when an unbound root's indexes are evicted, and when an unused checkout drops its in-memory index state.",
       },
 
       backup: {
@@ -718,7 +711,7 @@ function buildSchema(): Record<string, unknown> {
             minimum: 1,
             default: 20000,
             description:
-              "Maximum number of project files to semantically index (default 20000). Guards local fastembed memory on large roots; raise it for remote backends that embed server-side.",
+              "Most project files to embed for semantic search (default 20000): a limit on embedding cost and time; files past it are not embedded. Raise it for remote backends that embed server-side.",
           },
         },
         additionalProperties: false,

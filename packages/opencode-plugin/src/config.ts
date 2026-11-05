@@ -8,6 +8,8 @@ import {
   DEFAULT_DISABLED_TOOLS,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
+  IDLE_CHECKOUT_HOURS_MAX,
+  IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
   isProjectBlockedBashEnvKey,
   legacyConfigNoticeMessage,
@@ -23,6 +25,8 @@ import {
   type ResolvedIndexesConfig,
   readConfigTiers,
   removedConfigKeyErrors,
+  removedConfigKeysNoticeDigest,
+  removedConfigKeysNoticeMessage,
   resolveCortexKitConfigPaths,
   resolveIndexes,
   resolveLegacyAftConfigSources,
@@ -175,7 +179,10 @@ const SemanticConfigSchema = z.object({
    * MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the index.
    */
   max_input_tokens: z.number().int().positive().optional(),
-  /** Maximum number of project files to semantically index (default 20000). */
+  /**
+   * Most project files to embed (default 20000): a limit on embedding cost and
+   * time; files past it are not embedded.
+   */
   max_files: z.number().int().positive().optional(),
 });
 
@@ -491,7 +498,10 @@ const GithubConfigSchema = z.object({
 });
 
 const IndexesConfigSchema = z.object({
-  /** Trigram index for indexed grep/glob and the lexical search lane. Default: true. */
+  /**
+   * Trigram index for indexed grep/glob and the lexical search lane. Default:
+   * true. With false, no text index is built, and grep and glob walk the folder.
+   */
   trigram: z.boolean().optional(),
   /** Semantic (embedding) index for the semantic search lane. Default: true. */
   semantic: z.boolean().optional(),
@@ -565,6 +575,10 @@ function clampIdleRootTtlMinutes(value: number): number {
   return Math.min(30, Math.max(5, value));
 }
 
+function clampIdleCheckoutHours(value: number): number {
+  return Math.min(IDLE_CHECKOUT_HOURS_MAX, Math.max(IDLE_CHECKOUT_HOURS_MIN, value));
+}
+
 const IdleConfigSchema = z.object({
   /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
   root_ttl_minutes: z
@@ -572,29 +586,31 @@ const IdleConfigSchema = z.object({
     .int()
     .optional()
     .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
+  /**
+   * Hours without use after which a checkout counts as idle and drops its
+   * in-memory index state. Default 168; clamped to 1..=8760. Replaces
+   * `views.idle_checkout_hours`.
+   */
+  checkout_hours: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleCheckoutHours(value))),
 });
 
+/**
+ * Removed keys. AFT keeps one index store per repository, so these no longer
+ * do anything; a file that sets them gets a notice, `aft doctor --fix`
+ * deletes them, and from 0.65.0 a config that sets them is refused. They stay
+ * in the schema, undocumented, only so such a file still loads until then.
+ */
 const ViewsConfigSchema = z.object({
-  /** Enable content-addressed index views. Default: false. */
   enabled: z.boolean().optional(),
-  /**
-   * How many checkouts of one repository keep their own call graph, besides
-   * the main checkout. Another checkout reads the main checkout's graph, and
-   * its answers say which of its files differ. 0 makes every other checkout
-   * read the main checkout's graph. Default: 4.
-   */
   callgraph_copies: z.number().int().optional(),
-  /** Hours without use after which a checkout's view can be evicted. Default: 168, minimum 1. */
-  idle_checkout_hours: z.number().int().optional(),
 });
 
+/** Removed key, like the `views` keys above. Kept only so an old file still loads. */
 const WorktreeConfigSchema = z.object({
-  /**
-   * When true, a linked worktree applies local file-watcher events to the
-   * in-RAM trigram delta (and symbol-cache invalidation) so search reflects
-   * edits in that worktree. Default: false. Never writes the shared on-disk
-   * index. Semantic search and callgraph stay frozen.
-   */
   ram_overlay: z.boolean().optional(),
 });
 
@@ -683,20 +699,21 @@ const AftConfigFieldsSchema = z.object({
   index: IndexConfigSchema.optional(),
   /** Only the user config's top level may select this existing directory. Caches live in its `aft` child; an unavailable directory disables caches instead of writing them under the storage root. */
   storage: z.object({ cache_dir: z.string().nullable().optional() }).optional(),
-  /** Content-addressed index views. Disabled by default. */
+  /** Removed: see `ViewsConfigSchema`. */
   views: ViewsConfigSchema.optional(),
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size: z.number().optional(),
   /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect: InspectConfigSchema.optional(),
-  /** Idle reclamation windows for unbound-root artifacts and language servers. User and project tiers. */
+  /**
+   * Idle windows: when an unbound root's indexes are evicted, and when an
+   * unused checkout drops its in-memory index state. User and project tiers,
+   * merged per key.
+   */
   idle: IdleConfigSchema.optional(),
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup: BackupConfigSchema.optional(),
-  /**
-   * Linked-worktree RAM overlay. Default off. A repo may opt its worktrees
-   * in at project tier; it only spends that machine's RAM.
-   */
+  /** Removed: see `WorktreeConfigSchema`. */
   worktree: WorktreeConfigSchema.optional(),
   /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
   sandbox: SandboxConfigSchema.optional(),
@@ -834,6 +851,9 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const indexes = mergeIndexes(base.indexes, override.indexes, !trusted);
   if (indexes === undefined) delete merged.indexes;
   else merged.indexes = indexes;
+  const idle = mergeIdleConfig(base.idle, override.idle);
+  if (idle === undefined) delete merged.idle;
+  else merged.idle = idle;
   // Apply harness values over this file's base values. Project-versus-user
   // hardening happens later in mergeConfigs, after both files' harnesses are applied.
   merged.sandbox = mergeSandboxConfig(base.sandbox, override.sandbox, true);
@@ -1549,15 +1569,26 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
       warn(text);
     }
   }
-  if (translation.legacyInput && tier === "user") {
-    // The AFT binary rewrites the user file to current keys when its
-    // configure next reads the file, and reports that rewrite to the user as
-    // a `config_migrated` configure warning. Queuing a notice here as well
-    // would show the user two notices, so the plugin only logs.
-    log(
-      `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
-    );
-  } else if (translation.legacyInput) {
+  if (tier === "user") {
+    if (translation.legacyInput) {
+      // The AFT binary rewrites the user file to current keys when its
+      // configure next reads the file, and reports that rewrite to the user
+      // as a `config_migrated` configure warning. Queuing a notice here as
+      // well would show the user two notices, so the plugin only logs.
+      log(
+        `Config ${configPath} uses retired keys (${translation.retiredKeys.join(", ")}); applied their current equivalents in memory`,
+      );
+    }
+    if (translation.removedKeys.length > 0) {
+      // That rewrite leaves removed keys in the user file, so its notice never
+      // names them; this one does, once per file identity.
+      configLoadNotices.push({
+        configPath,
+        digest: removedConfigKeysNoticeDigest(translation),
+        message: removedConfigKeysNoticeMessage(configPath, translation),
+      });
+    }
+  } else if (translation.legacyInput || translation.removedKeys.length > 0) {
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
@@ -1688,6 +1719,20 @@ function mergeWorktreeConfig(
   if (overrideWorktree === undefined) return baseWorktree;
   if (baseWorktree === undefined) return overrideWorktree;
   return { ...baseWorktree, ...overrideWorktree };
+}
+
+/** Each tier or harness block sets only the idle keys it names. */
+function mergeIdleConfig(
+  baseIdle: AftConfig["idle"],
+  overrideIdle: AftConfig["idle"],
+): AftConfig["idle"] {
+  if (overrideIdle === undefined) return baseIdle;
+  const merged = { ...baseIdle };
+  if (overrideIdle.root_ttl_minutes !== undefined)
+    merged.root_ttl_minutes = overrideIdle.root_ttl_minutes;
+  if (overrideIdle.checkout_hours !== undefined)
+    merged.checkout_hours = overrideIdle.checkout_hours;
+  return Object.values(merged).some((value) => value !== undefined) ? merged : undefined;
 }
 
 function mergeInspectConfig(
@@ -2102,6 +2147,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   }
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
+  const idle = mergeIdleConfig(base.idle, override.idle);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
   const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
@@ -2122,6 +2168,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.bash;
   delete safeOverride.inspect;
   delete safeOverride.worktree;
+  delete safeOverride.idle;
   delete safeOverride.pi;
   delete safeOverride.views;
 
@@ -2135,6 +2182,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(bash !== undefined ? { bash } : {}),
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
+    ...(idle !== undefined ? { idle } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),

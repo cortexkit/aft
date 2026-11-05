@@ -1737,7 +1737,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
         base.inspect = override_config.inspect;
     }
     if override_config.idle.is_some() {
-        base.idle = override_config.idle;
+        // Per key, so a harness block that sets one idle window keeps the
+        // other window from the file's base block.
+        base.idle = merge_idle_config(base.idle.take(), override_config.idle);
     }
     if override_config.backup.is_some() {
         base.backup = override_config.backup;

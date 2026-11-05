@@ -1,5 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolveCortexKitProjectConfigPath, translateConfigDocument } from "@cortexkit/aft-bridge";
+import {
+  dropRemovedDataLayerKeys,
+  resolveCortexKitProjectConfigPath,
+  translateConfigDocument,
+} from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
 
 /**
@@ -91,7 +95,11 @@ export function diffConfig(before: Json, after: Json, prefix = ""): ConfigChange
   return changes;
 }
 
-/** Files that still use retired keys, with the changes the migration will make to each. */
+/**
+ * Files that still use retired or removed keys, with the changes the
+ * migration will make to each. Removed data-layer keys are kept by load-time
+ * translation but deleted by `doctor --fix`, so the preview deletes them too.
+ */
 export function previewConfigMigration(targets: ConfigMigrationTarget[]): ConfigMigrationPreview[] {
   const previews: ConfigMigrationPreview[] = [];
   for (const target of targets) {
@@ -99,7 +107,8 @@ export function previewConfigMigration(targets: ConfigMigrationTarget[]): Config
     if (!raw) continue;
     const translated = structuredClone(raw);
     const translation = translateConfigDocument(translated, target.tier);
-    if (!translation.legacyInput) continue;
+    if (!translation.legacyInput && translation.removedKeys.length === 0) continue;
+    dropRemovedDataLayerKeys(translated);
     const changes = diffConfig(raw, translated);
     previews.push({ ...target, changes });
   }

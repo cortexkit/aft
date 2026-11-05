@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CANONICAL_TOOLS,
+  REMOVED_DATA_LAYER_NOTES,
   RETIRED_HANG_THRESHOLD_NOTE,
   SEMANTIC_COST_NOTICE,
 } from "@cortexkit/aft-bridge";
@@ -260,6 +261,55 @@ describe("OpenCode feature-config registration", () => {
     expect(loadWithUserConfig({ backup: { enabled: false } }).disabled_tools).toEqual([
       "aft_delete",
       "aft_move",
+    ]);
+  });
+
+  test("idle.checkout_hours loads, clamps and merges per key with the project file", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(projectFile, JSON.stringify({ idle: { root_ttl_minutes: 15 } }));
+    const config = loadWithUserConfig({ idle: { root_ttl_minutes: 20, checkout_hours: 9000 } });
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle).toEqual({ root_ttl_minutes: 15, checkout_hours: 8760 });
+    expect(loadWithUserConfig({ idle: { checkout_hours: 0 } }).idle).toEqual({
+      checkout_hours: 1,
+    });
+  });
+
+  test("a user file's views.idle_checkout_hours becomes idle.checkout_hours; its removed keys get one notice naming only them", () => {
+    const user = {
+      views: { idle_checkout_hours: 72, enabled: true },
+      worktree: { ram_overlay: false },
+    };
+    const config = loadWithUserConfig(user);
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle).toEqual({ checkout_hours: 72 });
+    // The removed keys still reach the engine until the code reading them is deleted.
+    expect(config.views).toEqual({ enabled: true });
+    expect(config.worktree).toEqual({ ram_overlay: false });
+    const userPath = join(root, "xdg", "cortexkit", "aft.jsonc");
+    expect(readFileSync(userPath, "utf8")).toBe(JSON.stringify(user));
+    const notices = getConfigLoadNotices().filter(
+      (notice) => notice.configPath === userPath && notice.message !== SEMANTIC_COST_NOTICE,
+    );
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${userPath} sets removed keys (views.enabled, worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[1]?.[1]} ${REMOVED_DATA_LAYER_NOTES[2]?.[1]}`,
+    ]);
+  });
+
+  test("a project file with data-layer keys gets one notice covering the renamed and the removed keys", () => {
+    const projectFile = join(root, "project", ".cortexkit", "aft.jsonc");
+    mkdirSync(join(root, "project", ".cortexkit"), { recursive: true });
+    writeFileSync(
+      projectFile,
+      JSON.stringify({ views: { idle_checkout_hours: 24, callgraph_copies: 0 } }),
+    );
+    const config = loadWithUserConfig({ idle: { checkout_hours: 2 } });
+    expect(getConfigValidationErrors()).toEqual([]);
+    expect(config.idle?.checkout_hours).toBe(24);
+    const notices = getConfigLoadNotices().filter((notice) => notice.configPath === projectFile);
+    expect(notices.map((notice) => notice.message)).toEqual([
+      `${projectFile} uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours. ${projectFile} sets removed keys (views.callgraph_copies); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[0]?.[1]}`,
     ]);
   });
 });

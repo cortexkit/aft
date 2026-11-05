@@ -5,12 +5,22 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  DATA_LAYER_KEYS_REFUSED_FROM,
+  DATA_LAYER_RETIRED_PATHS,
+  dropRemovedDataLayerKeys,
+  getRunningRelease,
   legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
+  parseRelease,
+  REMOVED_DATA_LAYER_NOTES,
   RETIRED_ENABLED_FALSE_INDEXES_NOTE,
   RETIRED_HANG_THRESHOLD_NOTE,
   removedConfigKeyErrors,
+  removedConfigKeysNoticeDigest,
+  removedConfigKeysNoticeMessage,
+  retiredIdleCheckoutHours,
+  retiredIdleCheckoutHoursNote,
   SEMANTIC_COST_NOTICE,
   semanticCostNotice,
   suppliesSemanticIndexInput,
@@ -38,7 +48,7 @@ const removedKeyFixtures = JSON.parse(
     "utf8",
   ),
 ) as {
-  cases: Array<{ name: string; doc: Record<string, unknown>; errors: string[] }>;
+  cases: Array<{ name: string; release?: string; doc: Record<string, unknown>; errors: string[] }>;
 };
 
 const policy = JSON.parse(
@@ -60,7 +70,10 @@ afterEach(() => {
 describe("feature-config policy", () => {
   test("removed config key checking matches shared Rust/TypeScript fixtures", () => {
     for (const fixture of removedKeyFixtures.cases) {
-      expect(removedConfigKeyErrors(fixture.doc), fixture.name).toEqual(fixture.errors);
+      // A case may name the release that judges it; the data-layer keys are
+      // refused only from DATA_LAYER_KEYS_REFUSED_FROM.
+      const release = fixture.release === undefined ? undefined : parseRelease(fixture.release);
+      expect(removedConfigKeyErrors(fixture.doc, release), fixture.name).toEqual(fixture.errors);
     }
   });
 
@@ -406,6 +419,148 @@ describe("feature-config policy", () => {
       "invalid_resolved_config:missing:indexes.callgraph",
       "invalid_resolved_config:type:indexes.trigram",
     ]);
+  });
+});
+
+describe("data-layer keys", () => {
+  test("release parsing reads major and minor, and the running release is this package's", () => {
+    expect(parseRelease("0.65.0")).toEqual([0, 65]);
+    expect(parseRelease("0.64.12-beta.1")).toEqual([0, 64]);
+    expect(parseRelease("latest")).toBeUndefined();
+    const manifest = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    expect(getRunningRelease()).toEqual(parseRelease(manifest.version) ?? [0, 0]);
+  });
+
+  test("each key is accepted before the refusing release and refused from it", () => {
+    expect(DATA_LAYER_KEYS_REFUSED_FROM).toEqual([0, 65]);
+    for (const path of DATA_LAYER_RETIRED_PATHS) {
+      const [container = "", leaf = ""] = path.split(".");
+      const base = { [container]: { [leaf]: 1 } };
+      const harness = { harnesses: { pi: { [container]: { [leaf]: 1 } } } };
+      expect(removedConfigKeyErrors(base, [0, 64]), path).toEqual([]);
+      expect(removedConfigKeyErrors(harness, [0, 64]), path).toEqual([]);
+      expect(removedConfigKeyErrors(base, [0, 65])).toEqual([
+        `removed_config_key:${path}; run aft doctor --fix`,
+      ]);
+      expect(removedConfigKeyErrors(harness, [0, 65])).toEqual([
+        `removed_config_key:harnesses.pi.${path}; run aft doctor --fix`,
+      ]);
+      expect(removedConfigKeyErrors(base, [1, 0])).toHaveLength(1);
+    }
+  });
+
+  test("views.idle_checkout_hours becomes idle.checkout_hours, clamped, unless that is set", () => {
+    const doc: Record<string, unknown> = {
+      views: { idle_checkout_hours: 48 },
+      idle: { root_ttl_minutes: 20 },
+      harnesses: { pi: { views: { idle_checkout_hours: 0, enabled: true } } },
+    };
+    const out = translateConfigDocument(doc, "user");
+    expect(doc).toEqual({
+      idle: { root_ttl_minutes: 20, checkout_hours: 48 },
+      harnesses: { pi: { views: { enabled: true }, idle: { checkout_hours: 1 } } },
+    });
+    expect(out.legacyInput).toBe(true);
+    expect(out.retiredKeys).toEqual([
+      "harnesses.pi.views.idle_checkout_hours",
+      "views.idle_checkout_hours",
+    ]);
+    expect(out.removedKeys).toEqual(["harnesses.pi.views.enabled"]);
+    expect([9000, 12.0, 12.5, "never"].map(retiredIdleCheckoutHours)).toEqual([8760, 12, 168, 168]);
+
+    const canonical: Record<string, unknown> = {
+      views: { idle_checkout_hours: 2 },
+      idle: { checkout_hours: 5 },
+    };
+    const superseded = translateConfigDocument(canonical, "project");
+    expect(canonical).toEqual({ idle: { checkout_hours: 5 } });
+    expect(superseded.warnings[0]).toMatchObject({
+      code: "superseded_legacy_config",
+      message: "views.idle_checkout_hours is ignored because idle.checkout_hours is set",
+    });
+  });
+
+  test("removed keys stay in the document, are listed apart, and set no legacy input", () => {
+    const doc = {
+      views: { enabled: true, callgraph_copies: 2 },
+      worktree: { ram_overlay: false },
+      harnesses: { opencode: { worktree: { ram_overlay: true } } },
+    };
+    const translated = structuredClone(doc) as Record<string, unknown>;
+    const out = translateConfigDocument(translated, "user");
+    expect(translated).toEqual(doc);
+    expect(out.legacyInput).toBe(false);
+    expect(out.retiredKeys).toEqual([]);
+    expect(out.removedKeys).toEqual([
+      "harnesses.opencode.worktree.ram_overlay",
+      "views.callgraph_copies",
+      "views.enabled",
+      "worktree.ram_overlay",
+    ]);
+    // doctor --fix deletes them; the preview mirrors that.
+    dropRemovedDataLayerKeys(translated);
+    expect(translated).toEqual({ harnesses: { opencode: {} } });
+  });
+
+  test("notices name the file, the keys and the refusing release", () => {
+    const removed = translateConfigDocument(
+      { views: { enabled: true, callgraph_copies: 2 }, worktree: { ram_overlay: false } },
+      "user",
+    );
+    const lead =
+      "/u/aft.jsonc sets removed keys (views.callgraph_copies, views.enabled, worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run `npx @cortexkit/aft doctor --fix` to remove them.";
+    const reasons = REMOVED_DATA_LAYER_NOTES.map(([, note]) => note).join(" ");
+    expect(removedConfigKeysNoticeMessage("/u/aft.jsonc", removed)).toBe(`${lead} ${reasons}`);
+    expect(legacyConfigNoticeMessage("/u/aft.jsonc", removed)).toBe(`${lead} ${reasons}`);
+    expect(removedConfigKeysNoticeMessage("/p", { removedKeys: [] })).toBe("");
+
+    const one = translateConfigDocument(
+      { harnesses: { pi: { worktree: { ram_overlay: true } } } },
+      "project",
+    );
+    expect(removedConfigKeysNoticeMessage("/p", one)).toBe(
+      `/p sets removed keys (harnesses.pi.worktree.ram_overlay); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[2]?.[1]}`,
+    );
+
+    const both = translateConfigDocument(
+      { views: { idle_checkout_hours: 24, enabled: true } },
+      "project",
+    );
+    const idleNote =
+      "views.idle_checkout_hours is now idle.checkout_hours; from 0.65.0 AFT refuses a config file that still sets views.idle_checkout_hours.";
+    expect(retiredIdleCheckoutHoursNote()).toBe(idleNote);
+    expect(legacyConfigNoticeMessage("/p", both)).toBe(
+      `/p uses retired keys (views.idle_checkout_hours); AFT applied their current equivalents, with the same limits a project config has for those keys. Run \`npx @cortexkit/aft doctor --fix\` to update the file. ${idleNote} /p sets removed keys (views.enabled); AFT ignores them, and from 0.65.0 it refuses a config file that sets them. Run \`npx @cortexkit/aft doctor --fix\` to remove them. ${REMOVED_DATA_LAYER_NOTES[1]?.[1]}`,
+    );
+  });
+
+  test("notice identities change when a data-layer key is added, and the user notice follows its keys", () => {
+    const digest = (doc: Record<string, unknown>) => noticeDigest(noticeProjection(doc));
+    const acknowledged = digest({ search_index: false });
+    for (const path of DATA_LAYER_RETIRED_PATHS) {
+      const [container = "", leaf = ""] = path.split(".");
+      expect(digest({ search_index: false, [container]: { [leaf]: 1 } }), path).not.toBe(
+        acknowledged,
+      );
+    }
+    // The user-file notice is keyed by the removed keys alone, so rewriting
+    // the file's other retired keys does not repeat it.
+    const before = translateConfigDocument(
+      { views: { enabled: true, idle_checkout_hours: 3 } },
+      "user",
+    );
+    const after = translateConfigDocument(
+      { views: { enabled: true }, idle: { checkout_hours: 3 } },
+      "user",
+    );
+    expect(removedConfigKeysNoticeDigest(before)).toBe(removedConfigKeysNoticeDigest(after));
+    const more = translateConfigDocument(
+      { views: { enabled: true }, worktree: { ram_overlay: true } },
+      "user",
+    );
+    expect(removedConfigKeysNoticeDigest(more)).not.toBe(removedConfigKeysNoticeDigest(after));
   });
 });
 
