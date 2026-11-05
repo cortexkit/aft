@@ -26,6 +26,7 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
+use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 
 const DEADLINE: Duration = Duration::from_secs(180);
@@ -503,24 +504,6 @@ fn child_callgraph_answer(ctx: &AppContext, root: &Path) -> Value {
     }
 }
 
-/// Waits until the parent serves a call-graph generation of `child` other
-/// than `previous`, and returns it.
-fn wait_parent_callgraph(child: &aft::views::parent::Child, previous: Option<&str>) -> String {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Some(generation) = child.callgraph_generation() {
-            if Some(generation.as_str()) != previous {
-                return generation;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the parent never served the child's call graph view"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn grep(ctx: &AppContext, pattern: &str) -> Value {
     data(aft::commands::grep::handle_grep(
         &request(json!({
@@ -824,34 +807,46 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
         .exists());
 }
 
-/// Child edits made with no child session running reach the parent without
-/// reloading the child: the full-reconcile backstop (shortened here; it runs
-/// every few minutes by default) re-reads only the changed files into the
-/// parent's in-memory copy. The child's artifact is never written, and an
-/// unchanged child is answered without any gap.
+/// Waits until the parent's grep for `pattern` names no child as unavailable:
+/// with the data layer, each child's checkout is built on the first query that
+/// reaches it, and until it publishes the child is named as still loading.
+fn settled_grep(ctx: &AppContext, pattern: &str) -> Value {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let answer = grep(ctx, pattern);
+        if !gap_kinds(&answer).contains(&"parent_child_unavailable".to_string()) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the children never published: {answer:#}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Child edits made outside AFT reach the parent through the parent's own
+/// watcher: each changed path goes to the child checkout that holds it, and
+/// the next grep answers with the edit. No child gets a legacy trigram
+/// artifact (`cache.bin`), and an unchanged child answers without any gap.
 #[test]
-fn parent_backstop_applies_child_edits_and_never_writes_child_artifacts() {
+fn parent_applies_child_edits_from_its_watcher_and_never_writes_child_artifacts() {
     fast_refresh();
     let folder = folder(3);
     std::fs::remove_file(folder.root.join("README.md")).unwrap();
-    for child in &folder.children {
-        let ctx = configure(child, &folder.storage, child_trigram_doc());
-        wait_trigram(&ctx, child, &folder.storage);
-    }
-    let artifact = trigram_artifact(&folder.children[1], &folder.storage);
-    let before = std::fs::read(&artifact).unwrap();
-
-    aft::views::parent::set_backstop_interval_for(&folder.root, Duration::from_millis(200));
     let parent = configure(
         &folder.root,
         &folder.storage,
         config_doc(true, TRIGRAM_ONLY, None),
     );
-    let session = parent_session(&parent);
-    let answer = grep(&parent, COMMON);
+    let _session = parent_session(&parent);
+    let answer = settled_grep(&parent, COMMON);
     assert_eq!(answer["complete"], true, "{answer:#}");
     assert!(answer.get("gaps").is_none(), "{answer:#}");
 
+    // The parent's watcher, fed by hand so the test decides when it reports.
+    let (tx, rx) = crossbeam_channel::unbounded();
+    *parent.watcher_rx().lock() = Some(rx);
     write(
         &folder.children[1],
         "src/fresh.rs",
@@ -862,49 +857,90 @@ fn parent_backstop_applies_child_edits_and_never_writes_child_artifacts() {
         "src/util.rs",
         "pub fn helper() {}\n// edited, FRESH_PARENT_EDIT_NEEDLE\n",
     );
-    let expected = BTreeSet::from([
-        ("repo-01/src/fresh.rs".to_string(), 2),
-        ("repo-01/src/util.rs".to_string(), 2),
-    ]);
-    let deadline = Instant::now() + DEADLINE;
-    let answer = loop {
-        let answer = grep(&parent, "FRESH_PARENT_EDIT_NEEDLE");
-        if grep_rows(&answer, &folder.root, Path::new("")) == expected {
-            break answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "edits never reached the parent: {answer:#}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
+    tx.send(WatcherDispatchEvent::Paths(vec![
+        folder.children[1].join("src/fresh.rs"),
+        folder.children[1].join("src/util.rs"),
+    ]))
+    .unwrap();
+    aft::runtime_drain::drain_watcher_events(&parent);
+    let answer = grep(&parent, "FRESH_PARENT_EDIT_NEEDLE");
+    assert_eq!(
+        grep_rows(&answer, &folder.root, Path::new("")),
+        BTreeSet::from([
+            ("repo-01/src/fresh.rs".to_string(), 2),
+            ("repo-01/src/util.rs".to_string(), 2),
+        ]),
+        "{answer:#}"
+    );
     assert_eq!(answer["complete"], true, "{answer:#}");
     // The edit replaced a line holding the common token.
     let common = grep_rows(&grep(&parent, COMMON), &folder.root, Path::new(""));
     assert!(!common.contains(&("repo-01/src/util.rs".to_string(), 2)));
-    assert_eq!(std::fs::read(&artifact).unwrap(), before);
-    let child = &session.children()[1];
-    assert_eq!(child.loads(), 1, "edits must not reload the child");
-    assert!(child.applied_paths() >= 2);
-    // Unchanged children had nothing applied.
-    assert_eq!(session.children()[0].applied_paths(), 0);
+    assert!(common.contains(&("repo-00/src/util.rs".to_string(), 2)));
+    for child in &folder.children {
+        assert!(!trigram_artifact(child, &folder.storage).exists());
+    }
 }
 
-/// A child whose sessions run with views on publishes its lexical index only
-/// as its v3 lexical view. The parent reads that publication: grep and glob
-/// answer from it, and an edit the child has not published is not claimed by
-/// the parent, which applies no file changes of its own on top.
+/// The watcher reports a batch it lost (an overflowing event queue) as
+/// `RescanRequired`, with no paths. An edit inside that batch must still reach
+/// the parent's grep once the rescan the event asks for has run. The data
+/// layer hears only the watcher's changed-path batches, so it never rescans
+/// and the child checkout keeps serving the old file.
 #[test]
-fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
+#[ignore = "data-layer defect: a watcher RescanRequired (lost events) never reaches the data layer, so edits in the lost batch stay invisible"]
+fn parent_rescan_after_lost_watcher_events_reaches_child_edits() {
+    fast_refresh();
+    let folder = folder(2);
+    std::fs::remove_file(folder.root.join("README.md")).unwrap();
+    let parent = configure(
+        &folder.root,
+        &folder.storage,
+        config_doc(true, TRIGRAM_ONLY, None),
+    );
+    let _session = parent_session(&parent);
+    settled_grep(&parent, COMMON);
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    *parent.watcher_rx().lock() = Some(rx);
+    write(
+        &folder.children[1],
+        "src/lost.rs",
+        "pub fn lost() {}\n// LOST_BATCH_PARENT_EDIT_NEEDLE\n",
+    );
+    tx.send(WatcherDispatchEvent::RescanRequired(
+        aft::watcher_filter::RescanReason::BufferOverflow,
+    ))
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        aft::runtime_drain::drain_watcher_events(&parent);
+        let answer = grep(&parent, "LOST_BATCH_PARENT_EDIT_NEEDLE");
+        if grep_rows(&answer, &folder.root, Path::new(""))
+            == BTreeSet::from([("repo-01/src/lost.rs".to_string(), 2)])
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rescan never reached the edit: {answer:#}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Children whose own sessions run with views on: the parent answers grep and
+/// glob for them from the children's checkouts in the data layer, as for any
+/// other child, and writes no legacy trigram artifact (`cache.bin`) for them.
+#[test]
+fn parent_grep_and_glob_answer_for_views_on_children() {
     fast_refresh();
     let folder = folder(2);
     std::fs::remove_file(folder.root.join("README.md")).unwrap();
     let mut expected_grep = BTreeSet::new();
     let mut children = Vec::new();
     for (index, child) in folder.children.iter().enumerate() {
-        // The child's bind publishes its v3 lexical view.
         let ctx = configure(child, &folder.storage, config_doc(true, TRIGRAM_ONLY, None));
-        assert!(!trigram_artifact(child, &folder.storage).exists());
         let prefix = format!("repo-{index:02}");
         expected_grep.insert((format!("{prefix}/src/lib.rs"), 5));
         expected_grep.insert((format!("{prefix}/src/util.rs"), 2));
@@ -916,47 +952,27 @@ fn parent_grep_and_glob_read_views_on_children_from_their_v3_lexical_view() {
         &folder.storage,
         config_doc(true, TRIGRAM_ONLY, None),
     );
-    let session = parent_session(&parent);
-    assert!(session.children().iter().all(|child| child.trigram_ready()));
-    let answer = grep(&parent, COMMON);
+    let _session = parent_session(&parent);
+    let answer = settled_grep(&parent, COMMON);
     assert_eq!(
         grep_rows(&answer, &folder.root, Path::new("")),
         expected_grep,
         "{answer:#}"
     );
     assert_eq!(answer["complete"], true, "{answer:#}");
-    assert!(session.view_route_counts()[1] >= 1);
     let globbed = glob(&parent, "**/*.rs");
     assert_eq!(
-        globbed["files"].as_array().map(Vec::len),
-        Some(4),
+        glob_rows(&globbed, &folder.root, Path::new("")),
+        BTreeSet::from([
+            "repo-00/src/lib.rs".to_string(),
+            "repo-00/src/util.rs".to_string(),
+            "repo-01/src/lib.rs".to_string(),
+            "repo-01/src/util.rs".to_string(),
+        ]),
         "{globbed:#}"
     );
-    let routed = session.view_route_counts()[1];
-    assert!(routed >= 2, "{routed}");
-
-    // An edit no child session has published: the parent answers as of the
-    // child's publication rather than reading the file itself.
-    write(
-        &folder.children[1],
-        "src/fresh.rs",
-        "pub fn fresh() {}\n// UNPUBLISHED_PARENT_EDIT_NEEDLE\n",
-    );
-    let rounds = session.rounds();
-    assert!(session.wait_rounds(rounds + 2, DEADLINE));
-    let unpublished = grep(&parent, "UNPUBLISHED_PARENT_EDIT_NEEDLE");
-    assert_eq!(
-        grep_rows(&unpublished, &folder.root, Path::new("")),
-        BTreeSet::new(),
-        "{unpublished:#}"
-    );
-    for child in session.children() {
-        assert_eq!(child.loads(), 1, "an unchanged publication is not reloaded");
-        assert_eq!(
-            child.applied_paths(),
-            0,
-            "the parent applied an edit itself"
-        );
+    for child in &folder.children {
+        assert!(!trigram_artifact(child, &folder.storage).exists());
     }
     drop(children);
 }
@@ -1043,12 +1059,34 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
     assert!(aft.shutdown().success());
 }
 
-/// The call graph is served from a child's published v3 view: answers carry
-/// the child prefix and say which publication they are as of, a child without
-/// a view and a file outside every child are named gaps, and the generation
-/// the parent serves stays readable after the child publishes a newer one.
+/// A call-graph command routed by the parent until it answers: the first one
+/// that reaches a child builds the child's checkout, and until it publishes
+/// the child is named as still loading.
+fn settled_route(parent: &AppContext, payload: Value) -> Response {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let answer = aft::views::parent::route(&request(payload.clone()), parent)
+            .expect("the command is routed for a parent folder");
+        if answer.success {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the parent never answered {payload}: {:?}",
+            answer.data
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The call graph is served from each child's checkout in the data layer:
+/// answers carry the child prefix and are current, so they name no
+/// publication they are as of; a child no session ever bound answers once its
+/// checkout is built; a file outside every child is a named gap; inspect fans
+/// out to what the children's own sessions stored; and an AFT edit in a child
+/// reaches the parent's next answer.
 #[test]
-fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
+fn parent_callgraph_answers_from_child_checkouts_and_follows_their_edits() {
     fast_refresh();
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
@@ -1071,61 +1109,38 @@ fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
         callgraph: true,
         semantic: false,
     };
-    // `plain` is never bound to a session, so it has no view at all.
+    // `plain` is never bound to a session of its own.
     let child = configure(&graph, &storage, config_doc(true, with_graph, None));
     child_callgraph_answer(&child, &graph);
 
     let parent = configure(&root, &storage, config_doc(true, with_graph, None));
-    let session = parent_session(&parent);
-    let graph_child = session
-        .children()
-        .iter()
-        .find(|child| child.root == graph)
-        .unwrap()
-        .clone();
-    let first = wait_parent_callgraph(&graph_child, None);
-    assert_eq!(session.view_route_counts()[0], 0);
-
-    let callers = data(
-        aft::views::parent::route(
-            &request(json!({
-                "id": "parent-callers",
-                "command": "callers",
-                "file": "graph/src/lib.rs",
-                "symbol": "target",
-            })),
-            &parent,
-        )
-        .expect("callers is routed for a parent folder"),
-    );
+    let _session = parent_session(&parent);
+    let callers_request = json!({
+        "id": "parent-callers",
+        "command": "callers",
+        "file": "graph/src/lib.rs",
+        "symbol": "target",
+    });
+    let callers = data(settled_route(&parent, callers_request.clone()));
     let text = callers.to_string();
     assert!(text.contains("graph/src/lib.rs"), "{callers:#}");
     assert!(text.contains("caller"), "{callers:#}");
-    // A foreign reader names the publication it answers as of; it never
-    // claims the child's graph is current.
-    assert_eq!(callers["as_of"]["child"], "graph", "{callers:#}");
-    assert_eq!(
-        callers["as_of"]["generation"],
-        first.as_str(),
-        "{callers:#}"
-    );
-    assert!(callers["as_of"]["published_at_ms"].is_u64(), "{callers:#}");
-    assert_eq!(session.view_route_counts()[0], 1);
+    assert!(callers.get("as_of").is_none(), "{callers:#}");
 
-    let missing = aft::views::parent::route(
-        &request(json!({
+    let plain_callers = settled_route(
+        &parent,
+        json!({
             "id": "parent-callers-plain",
             "command": "callers",
             "file": "plain/src/lib.rs",
             "symbol": "alone",
-        })),
-        &parent,
-    )
-    .unwrap();
-    assert!(!missing.success);
-    assert_eq!(missing.data["complete"], false);
-    assert_eq!(missing.data["gaps"][0]["kind"], "parent_child_unavailable");
-    assert_eq!(missing.data["gaps"][0]["path"], "plain");
+        }),
+    );
+    assert!(
+        plain_callers.data.get("gaps").is_none(),
+        "{:?}",
+        plain_callers.data
+    );
     let outside = aft::views::parent::route(
         &request(json!({
             "id": "parent-callers-outside",
@@ -1201,11 +1216,8 @@ fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
     assert_eq!(off.data["summary"]["todos"]["off"], true);
     assert_eq!(parent.inspect_manager().reuse_start_count_for_test(), 0);
 
-    // Hold the served generation while the child publishes an edit: the
-    // parent keeps answering from the generation it holds a marker on, as
-    // of that publication, and follows the child once released.
-    session.pause_refresh(true);
-    // An AFT write through the child's session, which its view records.
+    // An AFT write through the child's session: the parent's checkout of the
+    // child records it too, and its next answer has the new caller.
     let written = aft::commands::write::handle_write(
         &request(json!({
             "id": "child-write",
@@ -1216,42 +1228,9 @@ fn parent_callgraph_reads_child_v3_views_and_answers_as_of_their_publication() {
         &child,
     );
     assert!(written.success, "{:?}", written.data);
-    let edited = child_callgraph_answer(&child, &graph);
-    assert!(edited.to_string().contains("second"), "{edited:#}");
-    let held = data(
-        aft::views::parent::route(
-            &request(json!({
-                "id": "parent-callers-held",
-                "command": "callers",
-                "file": "graph/src/lib.rs",
-                "symbol": "target",
-            })),
-            &parent,
-        )
-        .unwrap(),
-    );
-    assert_eq!(held["as_of"]["generation"], first.as_str(), "{held:#}");
-    assert!(!held.to_string().contains("second"), "{held:#}");
-    session.pause_refresh(false);
-    let second = wait_parent_callgraph(&graph_child, Some(&first));
-    let followed = data(
-        aft::views::parent::route(
-            &request(json!({
-                "id": "parent-callers-followed",
-                "command": "callers",
-                "file": "graph/src/lib.rs",
-                "symbol": "target",
-            })),
-            &parent,
-        )
-        .unwrap(),
-    );
-    assert_eq!(
-        followed["as_of"]["generation"],
-        second.as_str(),
-        "{followed:#}"
-    );
+    let followed = data(settled_route(&parent, callers_request));
     assert!(followed.to_string().contains("second"), "{followed:#}");
+    assert!(followed.get("as_of").is_none(), "{followed:#}");
     // The parent built and wrote no call graph of its own.
     assert!(parent.callgraph_store().read().unwrap().is_none());
     drop(child);
@@ -1557,10 +1536,13 @@ fn precomputed_query_vector_ranks_byte_identically(ctx: &AppContext, query: &str
 }
 
 /// More children than the cap: the first 64 are served and the rest are one
-/// named gap that says how many were skipped. Children with no index yet are
-/// named gaps too, and nothing is built for them.
+/// named gap that says how many were skipped. A served child with nothing
+/// published is named as still loading while the data layer builds its
+/// checkout; once every served child has published, only the skipped
+/// children are left uncovered. No child gets a legacy trigram artifact
+/// (`cache.bin`).
 #[test]
-fn over_cap_parent_names_skipped_and_unindexed_children() {
+fn over_cap_parent_names_skipped_children_and_builds_the_served_ones() {
     fast_refresh();
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
@@ -1577,25 +1559,35 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
         session.children().len(),
         aft::views::parent::DEFAULT_MAX_CHILD_REPOS
     );
-    let answer = grep(&parent, "anything");
-    assert_eq!(answer["complete"], false);
-    let gaps = answer["gaps"].as_array().unwrap();
-    let over_cap = gaps
+    let over_cap_gap = |answer: &Value| {
+        assert_eq!(answer["complete"], false, "{answer:#}");
+        let over_cap = answer["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gap| gap["kind"] == "parent_children_over_cap")
+            .unwrap_or_else(|| panic!("{answer:#}"))
+            .clone();
+        assert!(over_cap["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("2 child repositories beyond the 64-repository cap"));
+        assert!(over_cap["reason"].as_str().unwrap().contains("repo-65"));
+    };
+    let first = grep(&parent, "anything");
+    over_cap_gap(&first);
+    let loading = gap_kinds(&first)
         .iter()
-        .find(|gap| gap["kind"] == "parent_children_over_cap")
-        .unwrap_or_else(|| panic!("{answer:#}"));
-    assert!(over_cap["reason"]
-        .as_str()
-        .unwrap()
-        .starts_with("2 child repositories beyond the 64-repository cap"));
-    assert!(over_cap["reason"].as_str().unwrap().contains("repo-65"));
+        .filter(|kind| *kind == "parent_child_unavailable")
+        .count();
+    assert!(loading <= 64, "{first:#}");
+    let settled = settled_grep(&parent, "anything");
+    over_cap_gap(&settled);
     assert_eq!(
-        gaps.iter()
-            .filter(|gap| gap["kind"] == "parent_child_unavailable")
-            .count(),
-        64
+        gap_kinds(&settled),
+        ["parent_children_over_cap"],
+        "{settled:#}"
     );
-    // Nothing was built for the children: no trigram artifact anywhere.
     for index in 0..66 {
         let child = root.join(format!("repo-{index:02}"));
         assert!(!trigram_artifact(&child, &storage).exists());
