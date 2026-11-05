@@ -19,4 +19,5 @@ pub(crate) mod overlay;
 pub(crate) mod query;
 pub mod reuse;
 pub(crate) mod runtime;
+pub(crate) mod tools;
 pub(crate) mod slice;
