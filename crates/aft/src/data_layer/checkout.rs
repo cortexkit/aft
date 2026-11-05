@@ -245,6 +245,10 @@ pub struct BuildReport {
     pub resolve_ms: f64,
     pub write_ms: f64,
     pub publish_ms: f64,
+    /// For a checkout with nothing published yet, when its text index was
+    /// published, ahead of the call graph: milliseconds from the build's
+    /// start.
+    pub text_ready_ms: Option<f64>,
     pub segment_bytes: u64,
     /// Segments no checkout needs any more, left out of the new generation.
     pub retired_segments: usize,
@@ -533,6 +537,24 @@ impl Checkout {
     }
 
     fn build_inner(&self) -> Result<BuildReport, DataError> {
+        let mut report = BuildReport::default();
+        let build_started = Instant::now();
+        // A checkout with nothing published gets its text index first: a
+        // text-only scan takes about a second where the call graph takes
+        // far longer, and text queries need nothing else.
+        let unpublished = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .is_none();
+        if unpublished && !self.publish_text_first()? {
+            report.superseded = true;
+            return Ok(report);
+        }
+        if unpublished {
+            report.text_ready_ms = Some(elapsed_ms(build_started));
+        }
         // A change recorded before the scan starts is in what the scan
         // reads; one recorded later may not be.
         let covered = self
@@ -550,7 +572,6 @@ impl Checkout {
             .manifest()
             .checkout(self.checkout)
             .cloned();
-        let mut report = BuildReport::default();
         let started = Instant::now();
         let sink = BuildSink::default();
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
@@ -602,19 +623,7 @@ impl Checkout {
         report.resolve_ms = elapsed_ms(started);
 
         let started = Instant::now();
-        let deadline = Instant::now() + WRITER_WAIT;
-        let mut session = loop {
-            if let Some(session) = self.family.try_write().map_err(DataError::store)? {
-                break session;
-            }
-            if Instant::now() >= deadline {
-                return Err(DataError::Busy(format!(
-                    "another process held the store's writer for over {} s",
-                    WRITER_WAIT.as_secs()
-                )));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
+        let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             // Another process published this checkout after the scan began.
             // Its state may be newer than this scan, so this build stands
@@ -684,13 +693,97 @@ impl Checkout {
             .iter()
             .map(|entry| entry.len)
             .sum();
+        self.serve_new(snapshot, covered)?;
+        Ok(report)
+    }
+
+    /// Waits up to [`WRITER_WAIT`] for the store's writer.
+    fn writer(&self) -> Result<aft_store::family::WriteSession, DataError> {
+        let deadline = Instant::now() + WRITER_WAIT;
+        loop {
+            if let Some(session) = self.family.try_write().map_err(DataError::store)? {
+                return Ok(session);
+            }
+            if Instant::now() >= deadline {
+                return Err(DataError::Busy(format!(
+                    "another process held the store's writer for over {} s",
+                    WRITER_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Scans the checkout's text only, then publishes and serves a state
+    /// that names no call-graph fragments, so text queries can start while
+    /// the call graph builds. Returns `false` when another process published
+    /// this checkout first; the checkout then serves that publication.
+    fn publish_text_first(&self) -> Result<bool, DataError> {
+        let covered = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .sequence;
+        let started_from = self
+            .family
+            .snapshot()
+            .map_err(DataError::store)?
+            .manifest()
+            .checkout(self.checkout)
+            .cloned();
+        let sink = BuildSink::text_only();
+        let scanned = scan(&self.root, &self.layer.policy, None, &sink)
+            .map_err(|error| DataError::Scan(error.to_string()))?;
+        let mut collected = sink.finish();
+        for record in scanned.state.paths() {
+            if record.kind == PathKind::Text
+                && record.stat.size > self.layer.policy.max_indexed_len
+                && collected.seen_text.insert(record.content)
+            {
+                collected.text.add_unindexed(
+                    record.content,
+                    record.stat.size,
+                    TextStatus::Oversize,
+                );
+            }
+        }
+        let mut session = self.writer()?;
+        if session.base().checkout(self.checkout) != started_from.as_ref() {
+            drop(session);
+            self.adopt_newest()?;
+            return Ok(false);
+        }
+        let mut pending = session.create_segment().map_err(DataError::store)?;
+        collected
+            .text
+            .write(pending.writer())
+            .map_err(DataError::store)?;
+        let segment = session.finish_segment(pending).map_err(DataError::store)?;
+        let written = session
+            .write_checkout_state(self.checkout, &scanned.state)
+            .map_err(DataError::store)?;
+        session
+            .publish(&Publication {
+                add_segments: vec![segment],
+                states: vec![written],
+                ..Publication::default()
+            })
+            .map_err(DataError::store)?;
+        drop(session);
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        self.serve_new(snapshot, covered)?;
+        Ok(true)
+    }
+
+    /// Serves this checkout's publication in `snapshot`, which a build
+    /// whose scan started at change `covered` just made. The scan read every
+    /// file as it was once the scan started, so the build covers every
+    /// change recorded before then. A change recorded while it ran may be
+    /// newer than what it read, so it stays laid over the new publication.
+    fn serve_new(&self, snapshot: Snapshot, covered: u64) -> Result<(), DataError> {
         let published = self
             .open_published(snapshot)?
             .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
-        // The scan read every file as it was once the scan started, so the
-        // build covers every change recorded before then. A change recorded
-        // while it ran may be newer than what it read, so it stays laid over
-        // the new publication.
         let late = {
             let mut live = self.write_live();
             live.changes.retain(|_, change| change.sequence > covered);
@@ -738,7 +831,7 @@ impl Checkout {
         // Paths reported before anything was published, after the scan
         // started: the scan may have read them before they changed.
         self.record_paths(&late)?;
-        Ok(report)
+        Ok(())
     }
 
     /// Segments of the current generation that no other checkout's state
@@ -833,7 +926,9 @@ impl Checkout {
                 .unwrap_or_else(|| Arc::new(published.state.clone()));
             (published, state, live.changes.clone(), live.sequence)
         };
-        if changes.is_empty() {
+        // Without a call graph there is nothing to update; the build that
+        // makes one covers every change recorded before its scan.
+        if changes.is_empty() || !published.graph_built {
             return Ok(None);
         }
         let mut slot = self.engine.lock().expect("no panics while holding it");
@@ -1158,6 +1253,9 @@ struct Published {
     segments: Vec<Arc<Segment>>,
     membership: TextMembership,
     graph: Arc<StoredSlices>,
+    /// Whether the call graph was built: a checkout's first publication
+    /// can hold its text index alone.
+    graph_built: bool,
     /// Paths in a parsed language with no stored resolution: their
     /// extraction failed.
     unparsed: BTreeSet<Vec<u8>>,
@@ -1231,9 +1329,10 @@ impl Published {
         // language; its fragment is the one the state names.
         let mut files = Vec::new();
         let mut unparsed = BTreeSet::new();
+        let graph_built = state.has_fragments();
         for (index, record) in state.paths().iter().enumerate() {
             let Some(fragment) = state.fragment(index) else {
-                if is_unparsed(record) {
+                if graph_built && is_unparsed(record) {
                     unparsed.insert(record.path.clone());
                 }
                 continue;
@@ -1256,6 +1355,7 @@ impl Published {
             segments,
             membership,
             graph: Arc::new(graph),
+            graph_built,
             unparsed,
             dead_code: DeadCodeMemo::default(),
             _snapshot: snapshot,
@@ -1316,6 +1416,10 @@ impl CheckoutView {
             },
         };
         let callgraph = match self.callgraph_pending.len() {
+            _ if !self.published.graph_built => PlaneStatus::Building {
+                done: 0,
+                total: None,
+            },
             0 => PlaneStatus::Ready,
             pending => PlaneStatus::Building {
                 done: 0,
@@ -1645,6 +1749,8 @@ impl ContentSink for ChangeSink {
 /// What a build's scan collects from the files it reads.
 #[derive(Default)]
 struct BuildSink {
+    /// Whether parsed files are extracted, or only text is indexed.
+    text_only: bool,
     text: Mutex<TextSectionsBuilder>,
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
@@ -1664,6 +1770,13 @@ struct Collected {
 }
 
 impl BuildSink {
+    fn text_only() -> Self {
+        Self {
+            text_only: true,
+            ..Self::default()
+        }
+    }
+
     fn finish(self) -> Collected {
         Collected {
             text: self.text.into_inner().expect("no panics while holding it"),
@@ -1708,7 +1821,7 @@ impl ContentSink for BuildSink {
                     .add_unindexed(key, len, TextStatus::Binary),
             }
         }
-        if kind != ContentKind::Text {
+        if kind != ContentKind::Text || self.text_only {
             return;
         }
         let Ok(path_text) = std::str::from_utf8(path) else {
@@ -1944,6 +2057,67 @@ mod tests {
 
     fn family() -> FamilyId {
         FamilyId::from_digest(Digest128::of(b"demo"))
+    }
+
+    #[test]
+    fn a_first_build_serves_text_before_the_call_graph() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        assert!(checkout.publish_text_first().unwrap());
+        let view = checkout.view().unwrap();
+        let status = view.status();
+        assert_eq!(status.text, PlaneStatus::Ready);
+        assert_eq!(
+            status.callgraph,
+            PlaneStatus::Building {
+                done: 0,
+                total: None
+            }
+        );
+        // No path counts as failing extraction while nothing was extracted.
+        assert_eq!(status.unparsed, 0);
+        assert_eq!(
+            candidates_for(&view, "callee"),
+            ["src/lib.rs", "src/util.rs"]
+        );
+        // An edit is served to text queries at once, and nothing resolves it
+        // while there is no call graph.
+        write(
+            root.path(),
+            "src/util.rs",
+            "pub fn callee() {}
+pub fn other() { callee(); }
+",
+        );
+        checkout.record_paths(&[b"src/util.rs".to_vec()]).unwrap();
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(
+            candidates_for(&checkout.view().unwrap(), "other"),
+            ["src/util.rs"]
+        );
+
+        // The build then publishes the call graph, covering the edit.
+        let report = checkout.build().unwrap();
+        assert!(
+            report.text_ready_ms.is_none(),
+            "a checkout with a publication is rebuilt in one pass"
+        );
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        let callers = callers_of(&view, "src/util.rs", "callee");
+        assert!(callers.contains("src/lib.rs"), "{callers}");
+        assert!(callers.contains("other"), "{callers}");
+
+        // A fresh checkout's build reports when its text was ready.
+        let fresh_store = tempfile::tempdir().unwrap();
+        let fresh = Checkout::bind(layer, fresh_store.path(), family(), root.path()).unwrap();
+        let report = fresh.build().unwrap();
+        assert!(report.text_ready_ms.is_some(), "{report:?}");
+        assert_eq!(fresh.view().unwrap().status().callgraph, PlaneStatus::Ready);
     }
 
     #[test]

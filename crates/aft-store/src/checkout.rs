@@ -173,6 +173,13 @@ impl CheckoutState {
 
     /// The call-graph fragment of the path at `index`, if it has one.
     #[must_use]
+    /// Whether the state names each path's call-graph fragment: a state
+    /// published before the call graph was built names none.
+    #[must_use]
+    pub fn has_fragments(&self) -> bool {
+        !self.fragments.is_empty() || self.paths.is_empty()
+    }
+
     pub fn fragment(&self, index: usize) -> Option<Digest128> {
         self.fragments.get(index).copied().flatten()
     }
