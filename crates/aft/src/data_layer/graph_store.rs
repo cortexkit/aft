@@ -467,6 +467,63 @@ impl StoredSlices {
 
     /// [`Self::resolutions`], adding the time spent reading records,
     /// converting them to parse output, and decoding fragments to `timings`.
+    /// Every file with a stored resolution, with its record key, in path
+    /// order.
+    pub(crate) fn parsed_files(&self) -> impl Iterator<Item = (&String, &str)> {
+        self.paths
+            .iter()
+            .map(|(file, located)| (file, located.record_key.as_str()))
+    }
+
+    /// `file`'s record key and parse, read and decoded now. A read that
+    /// fails is recorded in [`Self::failures`].
+    pub(crate) fn parse_of(
+        &self,
+        file: &str,
+    ) -> Option<(String, Arc<crate::callgraph_store::join::ParseBlob>)> {
+        let located = self.paths.get(file)?;
+        let read = || -> Result<_, String> {
+            let record = self
+                .content(located.record.0)?
+                .record(located.record.1)
+                .map_err(|error| error.to_string())?;
+            match blob_from_record(&record).map_err(|error| error.to_string())? {
+                CallgraphBlob::Parse(parse) => Ok(parse),
+                CallgraphBlob::Config(_) => {
+                    Err(format!("{file}: its stored record is not a parse"))
+                }
+            }
+        };
+        match read() {
+            Ok(parse) => Some((located.record_key.clone(), Arc::new(parse))),
+            Err(error) => {
+                self.fail(format!("parse of {file}: {error}"));
+                None
+            }
+        }
+    }
+
+    /// `file`'s stored resolution, read and decoded now. A read that fails
+    /// is recorded in [`Self::failures`].
+    pub(crate) fn resolution_of(&self, file: &str) -> Option<FileResolution> {
+        let located = self.paths.get(file)?;
+        let read = || -> Result<_, String> {
+            let bytes = self
+                .graph(located.fragment.0)?
+                .fragment(located.fragment.1)
+                .map_err(|error| error.to_string())?;
+            super::fragment::decode(&located.record_key, file, &bytes)
+                .map_err(|error| error.0.to_string())
+        };
+        match read() {
+            Ok(resolution) => Some(resolution),
+            Err(error) => {
+                self.fail(format!("resolution of {file}: {error}"));
+                None
+            }
+        }
+    }
+
     pub(crate) fn resolutions_timed(
         &self,
         timings: &mut Vec<(&'static str, f64)>,

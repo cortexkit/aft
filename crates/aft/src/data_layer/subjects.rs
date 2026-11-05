@@ -110,7 +110,7 @@ pub(crate) fn subjects(question: &FactQuestion, facts: &CheckoutFacts<'_>) -> BT
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
 
     use aft_store::checkout::{CheckoutState, PathKind, PathRecord, StatEvidence};
     use aft_store::ids::{ContentKey, Digest128};
@@ -133,7 +133,7 @@ mod tests {
     fn inputs(records: Vec<PathRecord>) -> CheckoutInputs {
         CheckoutInputs {
             state: CheckoutState::new(Vec::new(), Digest128::of(b""), records).unwrap(),
-            parses: BTreeMap::new(),
+            parses: crate::data_layer::callgraph::Parses::default(),
             configs: HashMap::new(),
         }
     }

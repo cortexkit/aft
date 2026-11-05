@@ -62,7 +62,7 @@ fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> CheckoutInputs {
     records.sort_by(|a, b| a.path.cmp(&b.path));
     CheckoutInputs {
         state: CheckoutState::new(Vec::new(), Digest128::of(b""), records).unwrap(),
-        parses,
+        parses: parses.into(),
         configs,
     }
 }
@@ -87,7 +87,7 @@ fn update_matches_cold(
         live.resolved.keys().collect::<Vec<_>>(),
         cold.keys().collect::<Vec<_>>()
     );
-    for (path, ours) in &live.resolved {
+    for (path, ours) in live.resolved.iter() {
         let theirs = &cold[path];
         assert_eq!(ours.rows, theirs.rows, "{path}: rows");
         assert_eq!(ours.sites, theirs.sites, "{path}: method-call sites");

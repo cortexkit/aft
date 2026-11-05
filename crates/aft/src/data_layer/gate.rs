@@ -160,7 +160,7 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
         .collect::<Result<HashMap<_, _>, _>>()?;
     let mut inputs = CheckoutInputs {
         state: scanned.state,
-        parses: BTreeMap::new(),
+        parses: super::callgraph::Parses::default(),
         configs: HashMap::new(),
     };
     let mut keys_by_path = HashMap::new();

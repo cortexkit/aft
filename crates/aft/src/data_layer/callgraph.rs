@@ -44,6 +44,7 @@ use crate::callgraph_store::{
 use crate::views::materialization::dispatch::FileFacts;
 
 use super::graph_rows::references_by_key;
+use super::graph_store::StoredSlices;
 
 /// What resolving a checkout reads.
 #[derive(Clone, Debug)]
@@ -51,10 +52,336 @@ pub(crate) struct CheckoutInputs {
     /// The checkout's paths.
     pub(crate) state: CheckoutState,
     /// Every parsed file's record key and parse output, by path.
-    pub(crate) parses: BTreeMap<String, (BlobKey, Arc<ParseBlob>)>,
+    pub(crate) parses: Parses,
     /// The raw bytes of every resolver configuration file (`package.json`,
     /// `Cargo.toml`, `go.mod`, `tsconfig*.json`, `.gitignore`), by path.
     pub(crate) configs: HashMap<Vec<u8>, Arc<[u8]>>,
+}
+
+/// Every parsed file's record key and parse output, by path, in path order.
+///
+/// Built in memory, every entry holds its parse. Read from a publication,
+/// an entry is decoded the first time it is read. A read that fails is
+/// recorded in the publication's failures and reads as an empty parse;
+/// whoever reads through a publication fails on any recorded failure.
+#[derive(Clone, Default)]
+pub(crate) struct Parses {
+    map: BTreeMap<String, Arc<ParseSlot>>,
+}
+
+pub(crate) struct ParseSlot {
+    value: std::sync::OnceLock<(BlobKey, Arc<ParseBlob>)>,
+    stored: Option<Arc<StoredSlices>>,
+}
+
+/// A parse with nothing in it, for an entry whose stored read failed.
+fn empty_parse() -> (BlobKey, Arc<ParseBlob>) {
+    (
+        BlobKey::new(),
+        Arc::new(ParseBlob {
+            entry_point_symbols: Vec::new(),
+            dispatch: Default::default(),
+            extractor_version: String::new(),
+            language: String::new(),
+            ast_nodes: Vec::new(),
+            symbols: Vec::new(),
+            default_export_symbol: None,
+            exported_symbols: Vec::new(),
+            callable_symbols: Vec::new(),
+            imports: Vec::new(),
+            python_bindings: Vec::new(),
+            refs: Vec::new(),
+        }),
+    )
+}
+
+impl Parses {
+    /// Every file `stored` has a resolution for, each decoded on first read.
+    pub(crate) fn stored(stored: &Arc<StoredSlices>) -> Self {
+        Self {
+            map: stored
+                .parsed_files()
+                .map(|(path, _)| {
+                    (
+                        path.clone(),
+                        Arc::new(ParseSlot {
+                            value: std::sync::OnceLock::new(),
+                            stored: Some(Arc::clone(stored)),
+                        }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, path: String, value: (BlobKey, Arc<ParseBlob>)) {
+        let slot = ParseSlot {
+            value: std::sync::OnceLock::from(value),
+            stored: None,
+        };
+        self.map.insert(path, Arc::new(slot));
+    }
+
+    pub(crate) fn remove(&mut self, path: &str) {
+        self.map.remove(path);
+    }
+
+    pub(crate) fn get(&self, path: &str) -> Option<&(BlobKey, Arc<ParseBlob>)> {
+        let slot = self.map.get(path)?;
+        Some(slot.value.get_or_init(|| {
+            slot.stored
+                .as_ref()
+                .and_then(|stored| stored.parse_of(path))
+                .unwrap_or_else(empty_parse)
+        }))
+    }
+
+    pub(crate) fn contains_key(&self, path: &str) -> bool {
+        self.map.contains_key(path)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Every path, in order, without reading any parse.
+    pub(crate) fn keys(&self) -> std::collections::btree_map::Keys<'_, String, Arc<ParseSlot>> {
+        self.map.keys()
+    }
+
+    /// Every path at or after `start`, in order, without reading any parse.
+    pub(crate) fn keys_from<'p>(&'p self, start: &str) -> impl Iterator<Item = &'p String> {
+        self.map
+            .range::<str, _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+            .map(|(path, _)| path)
+    }
+
+    /// Every entry, reading each parse.
+    pub(crate) fn iter(&self) -> ParsesIter<'_> {
+        ParsesIter {
+            parses: self,
+            keys: self.map.keys(),
+        }
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &(BlobKey, Arc<ParseBlob>)> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    /// Every entry in parallel, reading each parse.
+    pub(crate) fn par_iter(
+        &self,
+    ) -> impl ParallelIterator<Item = (&String, &(BlobKey, Arc<ParseBlob>))> {
+        self.map
+            .keys()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|path| (path, self.get(path).expect("listed")))
+    }
+}
+
+/// [`Parses::iter`].
+pub(crate) struct ParsesIter<'p> {
+    parses: &'p Parses,
+    keys: std::collections::btree_map::Keys<'p, String, Arc<ParseSlot>>,
+}
+
+impl<'p> Iterator for ParsesIter<'p> {
+    type Item = (&'p String, &'p (BlobKey, Arc<ParseBlob>));
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let path = self.keys.next()?;
+        Some((path, self.parses.get(path).expect("listed")))
+    }
+}
+
+impl<'p> IntoIterator for &'p Parses {
+    type Item = (&'p String, &'p (BlobKey, Arc<ParseBlob>));
+    type IntoIter = ParsesIter<'p>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl std::fmt::Debug for Parses {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Parses({} files)", self.map.len())
+    }
+}
+
+impl std::ops::Index<&str> for Parses {
+    type Output = (BlobKey, Arc<ParseBlob>);
+
+    fn index(&self, path: &str) -> &Self::Output {
+        self.get(path).expect("a parsed file")
+    }
+}
+
+impl std::ops::Index<&String> for Parses {
+    type Output = (BlobKey, Arc<ParseBlob>);
+
+    fn index(&self, path: &String) -> &Self::Output {
+        &self[path.as_str()]
+    }
+}
+
+impl FromIterator<(String, (BlobKey, Arc<ParseBlob>))> for Parses {
+    fn from_iter<I: IntoIterator<Item = (String, (BlobKey, Arc<ParseBlob>))>>(entries: I) -> Self {
+        let mut parses = Self::default();
+        for (path, value) in entries {
+            parses.insert(path, value);
+        }
+        parses
+    }
+}
+
+impl From<BTreeMap<String, (BlobKey, Arc<ParseBlob>)>> for Parses {
+    fn from(map: BTreeMap<String, (BlobKey, Arc<ParseBlob>)>) -> Self {
+        map.into_iter().collect()
+    }
+}
+
+/// Reads one file's resolution: from a map built in memory, or from
+/// [`Resolutions`].
+pub(crate) trait ResolutionLookup {
+    fn resolution(&self, path: &str) -> Option<&FileResolution>;
+}
+
+impl ResolutionLookup for BTreeMap<String, FileResolution> {
+    fn resolution(&self, path: &str) -> Option<&FileResolution> {
+        self.get(path)
+    }
+}
+
+/// Every parsed file's resolution, by path, in path order.
+///
+/// Built in memory, every entry holds its resolution. Read from a
+/// publication, an entry is decoded the first time it is read; a read that
+/// fails is recorded in the publication's failures and the entry reads as
+/// absent, and whoever reads through a publication fails on any recorded
+/// failure.
+#[derive(Default)]
+pub(crate) struct Resolutions {
+    map: BTreeMap<String, ResolutionSlot>,
+}
+
+struct ResolutionSlot {
+    value: std::sync::OnceLock<Option<FileResolution>>,
+    stored: Option<Arc<StoredSlices>>,
+}
+
+impl ResolutionSlot {
+    fn read(&self, path: &str) -> Option<&FileResolution> {
+        self.value
+            .get_or_init(|| {
+                self.stored
+                    .as_ref()
+                    .and_then(|stored| stored.resolution_of(path))
+            })
+            .as_ref()
+    }
+}
+
+impl Resolutions {
+    /// Every file `stored` has a resolution for, each decoded on first read.
+    pub(crate) fn stored(stored: &Arc<StoredSlices>) -> Self {
+        Self {
+            map: stored
+                .parsed_files()
+                .map(|(path, _)| {
+                    (
+                        path.clone(),
+                        ResolutionSlot {
+                            value: std::sync::OnceLock::new(),
+                            stored: Some(Arc::clone(stored)),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn get(&self, path: &str) -> Option<&FileResolution> {
+        self.map.get(path)?.read(path)
+    }
+
+    pub(crate) fn get_mut(&mut self, path: &str) -> Option<&mut FileResolution> {
+        let slot = self.map.get_mut(path)?;
+        slot.read(path);
+        slot.value.get_mut()?.as_mut()
+    }
+
+    pub(crate) fn insert(&mut self, path: String, resolution: FileResolution) {
+        self.map.insert(
+            path,
+            ResolutionSlot {
+                value: std::sync::OnceLock::from(Some(resolution)),
+                stored: None,
+            },
+        );
+    }
+
+    pub(crate) fn remove(&mut self, path: &str) -> Option<FileResolution> {
+        let slot = self.map.remove(path)?;
+        slot.read(path);
+        slot.value.into_inner().flatten()
+    }
+
+    pub(crate) fn contains_key(&self, path: &str) -> bool {
+        self.map.contains_key(path)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Every path, in order, without decoding anything.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
+    }
+
+    /// Every entry, decoding each; one whose read failed is left out.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &FileResolution)> {
+        self.map
+            .iter()
+            .filter_map(|(path, slot)| slot.read(path).map(|resolution| (path, resolution)))
+    }
+
+    /// Every entry, decoded and copied, for comparing with a cold build.
+    pub(crate) fn to_map(&self) -> BTreeMap<String, FileResolution> {
+        self.iter()
+            .map(|(path, resolution)| (path.clone(), resolution.clone()))
+            .collect()
+    }
+}
+
+impl ResolutionLookup for Resolutions {
+    fn resolution(&self, path: &str) -> Option<&FileResolution> {
+        self.get(path)
+    }
+}
+
+impl std::ops::Index<&str> for Resolutions {
+    type Output = FileResolution;
+
+    fn index(&self, path: &str) -> &FileResolution {
+        self.get(path).expect("a resolved file")
+    }
+}
+
+impl From<BTreeMap<String, FileResolution>> for Resolutions {
+    fn from(map: BTreeMap<String, FileResolution>) -> Self {
+        let mut resolutions = Self::default();
+        for (path, resolution) in map {
+            resolutions.insert(path, resolution);
+        }
+        resolutions
+    }
 }
 
 /// One method-call site's resolution, as pass 4 keeps it.
@@ -534,16 +861,13 @@ const SMALL_SITE_RUN: usize = 64;
 
 impl MethodCallInputs {
     /// Every file's inputs, from `resolved`.
-    pub(crate) fn build(
-        inputs: &CheckoutInputs,
-        resolved: &BTreeMap<String, FileResolution>,
-    ) -> Self {
+    pub(crate) fn build(inputs: &CheckoutInputs, resolved: &(dyn ResolutionLookup + Sync)) -> Self {
         let mut calls = Self::default();
         let built = inputs
             .parses
             .par_iter()
             .filter_map(|(path, (_, parse))| {
-                let resolution = resolved.get(path)?;
+                let resolution = resolved.resolution(path)?;
                 Some((
                     path.clone(),
                     Arc::new(SiteFile::new(path, parse, resolution)),
@@ -658,7 +982,7 @@ impl MethodCallInputs {
     pub(crate) fn resolve_sites(
         &mut self,
         inputs: &CheckoutInputs,
-        resolved: &BTreeMap<String, FileResolution>,
+        resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
     ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
         let source = SiteSource::new(inputs, resolved, self);
@@ -692,7 +1016,7 @@ impl MethodCallInputs {
 /// read.
 struct SiteSource<'s> {
     inputs: &'s CheckoutInputs,
-    resolved: &'s BTreeMap<String, FileResolution>,
+    resolved: &'s (dyn ResolutionLookup + Sync),
     calls: &'s MethodCallInputs,
     /// Every parsed file whose inputs are not kept, computed on first read.
     loaded: HashMap<&'s str, std::sync::OnceLock<Option<Arc<SiteFile>>>>,
@@ -701,7 +1025,7 @@ struct SiteSource<'s> {
 impl<'s> SiteSource<'s> {
     fn new(
         inputs: &'s CheckoutInputs,
-        resolved: &'s BTreeMap<String, FileResolution>,
+        resolved: &'s (dyn ResolutionLookup + Sync),
         calls: &'s MethodCallInputs,
     ) -> Self {
         let loaded = inputs
@@ -726,7 +1050,7 @@ impl<'s> SiteSource<'s> {
             .get(path)?
             .get_or_init(|| {
                 let (_, parse) = self.inputs.parses.get(path)?;
-                let resolution = self.resolved.get(path)?;
+                let resolution = self.resolved.resolution(path)?;
                 Some(Arc::new(SiteFile::new(path, parse, resolution)))
             })
             .as_deref()
@@ -776,11 +1100,7 @@ impl<'a, 's: 'a> DispatchFiles<'a> for SiteSource<'s> {
         };
         self.inputs
             .parses
-            .range::<str, _>((
-                std::ops::Bound::Included(prefix.as_str()),
-                std::ops::Bound::Unbounded,
-            ))
-            .map(|(path, _)| path)
+            .keys_from(&prefix)
             .take_while(|path| path.starts_with(&prefix))
             .filter(|path| !path[prefix.len()..].contains('/'))
             .cloned()

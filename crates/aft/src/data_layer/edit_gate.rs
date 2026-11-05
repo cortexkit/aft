@@ -182,7 +182,7 @@ impl Files {
             .expect("paths are unique and short");
         let mut inputs = CheckoutInputs {
             state,
-            parses: BTreeMap::new(),
+            parses: super::callgraph::Parses::default(),
             configs: HashMap::new(),
         };
         for (path, (_, _, parsed)) in &self.entries {
@@ -380,7 +380,7 @@ pub fn run(
             created_unix_ms: 0,
         },
         &base_inputs,
-        &live.resolved,
+        &live.resolved.to_map(),
         &files.contents,
     )?;
     let segment = Arc::new(
@@ -483,7 +483,8 @@ pub fn run(
         if last_of_commit || (index + 1) % check_every.max(1) == 0 {
             let cold =
                 resolve_checkout(&live.inputs, threads).map_err(|error| error.to_string())?;
-            let (answers, recordings) = compare(&live.resolved, &cold, &mut record.examples);
+            let (answers, recordings) =
+                compare(&live.resolved.to_map(), &cold, &mut record.examples);
             record.differing_files = Some(answers);
             record.differing_recordings = Some(recordings);
             checked += 1;

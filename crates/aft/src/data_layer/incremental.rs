@@ -37,7 +37,7 @@ use aft_store::graph::TermKind;
 
 use super::callgraph::{
     bind_all, dispatch_targets, resolve_files, resolver_index, BindCache, CheckoutFacts,
-    CheckoutInputs, FileResolution, MethodCallInputs,
+    CheckoutInputs, FileResolution, MethodCallInputs, Resolutions,
 };
 use super::graph_store::StoredSlices;
 use super::subjects::{affected_by, subjects, Subject};
@@ -281,7 +281,7 @@ pub struct LiveCheckout {
     pub(crate) inputs: CheckoutInputs,
     /// Each file's bound surface and pass-1 binding, bound when first needed.
     bound: BindCache,
-    pub(crate) resolved: BTreeMap<String, FileResolution>,
+    pub(crate) resolved: Resolutions,
     calls: MethodCallInputs,
     reverse: ReverseInputs,
     pool: Arc<rayon::ThreadPool>,
@@ -322,7 +322,7 @@ impl LiveCheckout {
                 built.note_prebound(path, &bound.binding);
             }
         }
-        for (path, file) in &self.resolved {
+        for (path, file) in self.resolved.iter() {
             built.note_resolution(path, file, &facts);
         }
         let built_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -381,7 +381,7 @@ impl LiveCheckout {
         let mut surface = BTreeMap::new();
         let mut traced = BTreeMap::new();
         let mut stale = Vec::new();
-        for (path, file) in &self.resolved {
+        for (path, file) in self.resolved.iter() {
             let mut holds = file.binding.answers().all(|(question, recorded)| {
                 now.entry(question)
                     .or_insert_with(|| question.answer(&checkout))
@@ -523,7 +523,7 @@ impl LiveCheckout {
         Ok(Self {
             inputs,
             bound,
-            resolved,
+            resolved: resolved.into(),
             calls,
             reverse,
             pool,
@@ -539,7 +539,7 @@ impl LiveCheckout {
     /// When the thread pool cannot start.
     pub(crate) fn from_resolved(
         inputs: CheckoutInputs,
-        resolved: BTreeMap<String, FileResolution>,
+        resolved: Resolutions,
         stored: Arc<StoredSlices>,
         threads: usize,
     ) -> Result<Self, ManifestJoinError> {
@@ -550,7 +550,7 @@ impl LiveCheckout {
     /// files' reverse inputs are read from `stored`'s terms, not built.
     pub(crate) fn from_resolved_timed(
         inputs: CheckoutInputs,
-        resolved: BTreeMap<String, FileResolution>,
+        resolved: Resolutions,
         stored: Arc<StoredSlices>,
         threads: usize,
         timings: &mut Vec<(&'static str, f64)>,

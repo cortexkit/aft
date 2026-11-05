@@ -859,10 +859,26 @@ impl Checkout {
                 .iter()
                 .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
                 .collect::<BTreeSet<_>>();
-            let update = engine
-                .live
-                .update(next, &changed_names)
-                .map_err(|error| DataError::Resolve(error.to_string()))?;
+            let update = engine.live.update(next, &changed_names);
+            // The engine reads stored parses and resolutions as it goes; a
+            // read that failed made it work from an empty one.
+            let failures = published.graph.failures();
+            let update = match update {
+                Ok(update) if failures.is_empty() => update,
+                failed => {
+                    // A failed update may have changed some of the engine's
+                    // state and not the rest, so the next refresh starts a new
+                    // engine from the publication.
+                    *slot = None;
+                    return Err(DataError::Resolve(match failed {
+                        Err(error) => error.to_string(),
+                        Ok(_) => format!(
+                            "reading the stored call graph failed: {}",
+                            failures.join("; ")
+                        ),
+                    }));
+                }
+            };
             // Only the files this update touched get new slices; every file
             // touched by an earlier update keeps the slice it got then.
             for file in &update.touched {
@@ -1060,10 +1076,10 @@ impl Checkout {
         published: &Arc<Published>,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<GraphEngine, DataError> {
-        let (parses, resolved) = published
-            .graph
-            .resolutions_timed(timings)
-            .map_err(DataError::Store)?;
+        // Every parse and resolution is decoded the first time an update
+        // reads it.
+        let parses = super::callgraph::Parses::stored(&published.graph);
+        let resolved = super::callgraph::Resolutions::stored(&published.graph);
         let started = Instant::now();
         let configs = published
             .graph
@@ -1445,7 +1461,7 @@ impl CheckoutView {
         };
         let inputs = CheckoutInputs {
             state,
-            parses,
+            parses: parses.into(),
             configs: HashMap::new(),
         };
         let rows = super::graph_rows::assemble(&inputs, &resolved);
@@ -1770,7 +1786,7 @@ impl Collected {
         }
         CheckoutInputs {
             state: state.clone(),
-            parses,
+            parses: parses.into(),
             configs,
         }
     }
