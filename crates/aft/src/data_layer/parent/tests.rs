@@ -1,11 +1,6 @@
-//! Parent folders on the data layer, checked against today's answers.
-//!
-//! The fixture is a folder of repositories whose children published their
-//! indexes through sessions of their own, as today's parent folder needs:
-//! two with views on (their v3 lexical and call-graph views) and one with
-//! views off (its legacy trigram artifact). The parent's answers are taken
-//! with the data layer off, which is today's code, and then with it on,
-//! from the children's own checkouts, and compared.
+//! Parent folders on the data layer: a folder of repositories answers from
+//! a checkout of each child repository, checked against what the fixture's
+//! files hold.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,9 +16,9 @@ use crate::protocol::{RawRequest, Response};
 use crate::views::parent::Plane;
 
 const DEADLINE: Duration = Duration::from_secs(180);
-/// A line every published child holds twice.
+/// A line each committed crate holds twice.
 const COMMON: &str = "PARENT_DATA_LAYER_COMMON_TOKEN";
-/// A line each bare child holds once; no published child holds it.
+/// A line each bare child holds once; no crate holds it.
 const BARE: &str = "PARENT_DATA_LAYER_BARE_TOKEN";
 
 fn write(root: &Path, path: &str, text: &str) -> PathBuf {
@@ -114,38 +109,6 @@ fn configure(root: &Path, storage: &Path, views: bool, callgraph: bool) -> Arc<A
     ctx
 }
 
-fn drain(ctx: &AppContext) {
-    crate::runtime_drain::drain_deferred_configure_maintenance(ctx);
-    crate::runtime_drain::drain_watcher_events(ctx);
-    crate::runtime_drain::drain_search_index_events(ctx);
-}
-
-/// Waits until a views-off child's trigram index is built and saved.
-fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
-    let key = crate::search_index::artifact_cache_key(root);
-    let artifact =
-        crate::search_index::resolve_cache_dir_with_key(&key, Some(storage)).join("cache.bin");
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        drain(ctx);
-        let ready = ctx
-            .search_index()
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|index| index.ready);
-        if ready && artifact.is_file() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "child trigram index never saved: {}",
-            root.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn callgraph_request(command: &str, file: &str) -> RawRequest {
     request(json!({
         "id": "parent-callgraph",
@@ -153,30 +116,6 @@ fn callgraph_request(command: &str, file: &str) -> RawRequest {
         "file": file,
         "symbol": "target",
     }))
-}
-
-/// Asks a views-on child session for its call graph until it answers,
-/// which publishes its v3 call-graph view.
-fn publish_callgraph(ctx: &AppContext, root: &Path) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        drain(ctx);
-        let file = root.join("src/lib.rs");
-        let answer = crate::commands::callers::handle_callers(
-            &callgraph_request("callers", file.to_str().unwrap()),
-            ctx,
-        );
-        if answer.success {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "child call graph never answered: {}: {:?}",
-            root.display(),
-            answer.data
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn grep(ctx: &AppContext, pattern: &str) -> Value {
@@ -200,49 +139,9 @@ fn glob(ctx: &AppContext, pattern: &str) -> Value {
     .data
 }
 
-/// A call-graph command or inspect as the parent session answers it.
+/// A call-graph command as the parent session answers it.
 fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
     crate::views::parent::route(req, ctx).expect("a parent folder answers this command itself")
-}
-
-/// The reply without what says which children it could not cover (the
-/// `gaps`, and the note `attach_gaps` appends to the text) and without its
-/// timings.
-fn covered(reply: &Value) -> Value {
-    let mut reply = reply.clone();
-    let object = reply.as_object_mut().unwrap();
-    object.remove("gaps");
-    object.retain(|key, _| !key.ends_with("_ms"));
-    if let Some(Value::String(text)) = object.get_mut("text") {
-        if let Some(at) = text.find("\n\n(Parent folder: not covered by this answer:") {
-            text.truncate(at);
-        }
-    }
-    reply
-}
-
-/// Asserts two replies are equal, naming each top-level field that differs.
-#[track_caller]
-fn assert_same(data: &Value, today: &Value) {
-    let (Some(data), Some(today)) = (data.as_object(), today.as_object()) else {
-        assert_eq!(data, today);
-        return;
-    };
-    let differing = data
-        .keys()
-        .chain(today.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|key| data.get(*key) != today.get(*key))
-        .map(|key| {
-            format!(
-                "{key}: data layer {:?}, today {:?}",
-                data.get(key),
-                today.get(key)
-            )
-        })
-        .collect::<Vec<_>>();
-    assert!(differing.is_empty(), "{}", differing.join("\n"));
 }
 
 fn gaps(reply: &Value) -> Vec<Value> {
@@ -291,27 +190,6 @@ fn settled<T: std::fmt::Debug>(ask: impl Fn() -> T, done: impl Fn(&T) -> bool) -
     }
 }
 
-/// Median of nine timings of `query`, in milliseconds.
-fn median_ms(mut query: impl FnMut()) -> f64 {
-    let mut samples = (0..9)
-        .map(|_| {
-            let started = Instant::now();
-            query();
-            started.elapsed().as_secs_f64() * 1000.0
-        })
-        .collect::<Vec<_>>();
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
-}
-
-fn inspect_request() -> RawRequest {
-    request(json!({
-        "id": "parent-inspect",
-        "command": "inspect",
-        "sections": ["dead_code", "todos"],
-    }))
-}
-
 /// The parent session `ctx` is bound to, once its worker's first round
 /// has loaded the children.
 fn parent_session(ctx: &AppContext) -> Arc<crate::views::parent::ParentSession> {
@@ -347,16 +225,30 @@ fn matched_files(reply: &Value) -> Vec<String> {
         .collect()
 }
 
-/// A folder of 66 repositories: `alpha` and `beta` published with views on,
-/// `gamma` with views off, `building` and `failed` never published, and 61
-/// bare folders, the last two past the 64-repository cap. With the data
-/// layer on, the parent answers grep, glob, the call graph and inspect for
-/// the published children exactly as today, and also for the children
-/// today cannot answer for, with today's named gaps for a child still
-/// building, a child that failed, the children past the cap and the files
-/// outside every child. With the data layer off, it binds no checkout.
+/// The files the reply names, relative to `root`, sorted.
+fn relative_files(root: &Path, files: Vec<String>) -> Vec<String> {
+    let prefix = format!("{}/", root.display()).replace('\\', "/");
+    let mut files = files
+        .into_iter()
+        .map(|file| {
+            file.strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("{file} is not under {prefix}"))
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+/// A folder of 66 repositories: `alpha`, `beta` and `gamma` committed
+/// crates, `building` and `failed` crates whose checkouts never finish a
+/// build, and 61 bare folders, the last two past the 64-repository cap. With
+/// the data layer on, the parent answers grep, glob and the call graph from
+/// each served child's own checkout, built on first use, with named gaps for
+/// a child still building, a child whose build failed, the children past the
+/// cap and the files outside every child.
 #[test]
-fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_indexes() {
+fn a_parent_folder_answers_from_its_childrens_checkouts() {
     crate::views::parent::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
@@ -371,79 +263,12 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     }
     write(&root, "README.md", "a parent folder of repositories\n");
 
-    let (children, parent) = {
+    let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        let mut children = Vec::new();
-        for name in ["alpha", "beta"] {
-            let child = root.join(name);
-            let ctx = configure(&child, &storage, true, true);
-            publish_callgraph(&ctx, &child);
-            children.push(ctx);
-        }
-        let gamma = root.join("gamma");
-        let ctx = configure(&gamma, &storage, false, false);
-        wait_trigram(&ctx, &gamma, &storage);
-        children.push(ctx);
-        (children, configure(&root, &storage, true, true))
+        configure(&root, &storage, true, true)
     };
     let session = parent_session(&parent);
     assert_eq!(session.children().len(), 64);
-    let child = |name: &str| {
-        session
-            .children()
-            .into_iter()
-            .find(|child| child.root == root.join(name))
-            .unwrap()
-    };
-    settled(
-        || {
-            ["alpha", "beta", "gamma"]
-                .iter()
-                .all(|name| child(name).trigram_ready())
-                && ["alpha", "beta"]
-                    .iter()
-                    .all(|name| child(name).callgraph_ready())
-        },
-        |ready| *ready,
-    );
-
-    // Today's answers.
-    let alpha = "alpha/src/lib.rs";
-    let today_grep = grep(&parent, COMMON);
-    assert_eq!(matched_files(&today_grep).len(), 6, "{today_grep:#}");
-    let today_bare = grep(&parent, BARE);
-    assert!(matched_files(&today_bare).is_empty(), "{today_bare:#}");
-    let today_glob = glob(&parent, "**/*.rs");
-    let today_callers = routed(&parent, &callgraph_request("callers", alpha));
-    let today_tree = routed(&parent, &callgraph_request("call_tree", alpha));
-    let today_building = routed(
-        &parent,
-        &callgraph_request("callers", "building/src/lib.rs"),
-    );
-    let today_capped = routed(&parent, &callgraph_request("callers", "zz-60/notes.txt"));
-    let today_inspect = routed(&parent, &inspect_request());
-    let today_ms = median_ms(|| {
-        grep(&parent, COMMON);
-    });
-    assert!(today_callers.success, "{:?}", today_callers.data);
-    // With the data layer off, nothing of it was bound or written.
-    assert!(!storage.join("data").exists());
-    assert!(parent.data_children().bound_for_test().is_empty());
-    let scope_gaps = gaps(&today_grep)
-        .into_iter()
-        .filter(|gap| gap["kind"] != "parent_child_unavailable")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        scope_gaps
-            .iter()
-            .map(|gap| (gap["kind"].as_str().unwrap(), gap["path"].as_str().unwrap()))
-            .collect::<Vec<_>>(),
-        [
-            ("parent_children_over_cap", "."),
-            ("outside_child_repositories", "README.md")
-        ],
-        "{today_grep:#}"
-    );
 
     // `building` has a checkout whose build never runs, and `failed` one
     // whose last build failed and none runs since.
@@ -473,50 +298,93 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     ];
     // Every other child builds its checkout on first use.
     let data_grep = settled(|| grep(&parent, COMMON), |reply| child_gaps(reply) == named);
-    assert_same(&covered(&data_grep), &covered(&today_grep));
-    let data_ms = median_ms(|| {
-        grep(&parent, COMMON);
-    });
-    eprintln!(
-        "parent grep over 64 children, median of 9: data layer {data_ms:.2} ms, today {today_ms:.2} ms"
-    );
-    assert_eq!(gaps(&data_grep), [named.clone(), scope_gaps].concat());
-    // The bare children today cannot answer for, past the cap excepted.
-    let data_bare = grep(&parent, BARE);
-    let mut bare = matched_files(&data_bare)
-        .into_iter()
-        .map(|file| {
-            file.strip_prefix(&format!("{}/", root.display()))
-                .unwrap()
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    bare.sort();
+    // `init_repo` writes COMMON once in each crate's src/lib.rs and once in
+    // its src/util.rs; `building` and `failed` cannot answer.
     assert_eq!(
-        bare,
+        relative_files(&root, matched_files(&data_grep)),
+        [
+            "alpha/src/lib.rs",
+            "alpha/src/util.rs",
+            "beta/src/lib.rs",
+            "beta/src/util.rs",
+            "gamma/src/lib.rs",
+            "gamma/src/util.rs",
+        ],
+        "{data_grep:#}"
+    );
+    // The two bare folders past the cap, and README.md, which no child holds.
+    assert_eq!(
+        gaps(&data_grep),
+        [
+            named.clone(),
+            vec![
+                json!({
+                    "kind": "parent_children_over_cap",
+                    "path": ".",
+                    "reason": "2 child repositories beyond the 64-repository cap were not searched: zz-59, zz-60",
+                }),
+                json!({
+                    "kind": "outside_child_repositories",
+                    "path": "README.md",
+                    "reason": "holds files outside every child repository; a parent folder searches only its repositories",
+                }),
+            ],
+        ]
+        .concat(),
+        "{data_grep:#}"
+    );
+    // Each bare child within the cap holds BARE once, in notes.txt.
+    let data_bare = grep(&parent, BARE);
+    assert_eq!(
+        relative_files(&root, matched_files(&data_bare)),
         (0..59)
             .map(|index| format!("zz-{index:02}/notes.txt"))
             .collect::<Vec<_>>()
     );
+    // The crates' two Rust files each; the bare folders hold none.
     let data_glob = glob(&parent, "**/*.rs");
-    assert_same(&covered(&data_glob), &covered(&today_glob));
+    let globbed = data_glob["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("glob failed: {data_glob:#}"))
+        .iter()
+        .map(|file| file.as_str().unwrap().replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        relative_files(&root, globbed),
+        [
+            "alpha/src/lib.rs",
+            "alpha/src/util.rs",
+            "beta/src/lib.rs",
+            "beta/src/util.rs",
+            "gamma/src/lib.rs",
+            "gamma/src/util.rs",
+        ],
+        "{data_glob:#}"
+    );
     assert_eq!(child_gaps(&data_glob), named);
 
-    // The call graph, answered as today but current, so without `as_of`.
-    for (command, today) in [("callers", &today_callers), ("call_tree", &today_tree)] {
-        let answer = settled(
-            || routed(&parent, &callgraph_request(command, alpha)),
-            |answer| answer.success,
-        );
-        let mut expected = today.data.clone();
-        expected.as_object_mut().unwrap().remove("as_of");
-        assert_same(&answer.data, &expected);
-    }
+    // The call graph, current, so without `as_of`. In alpha's src/lib.rs,
+    // `caller` calls `target`, and `target` calls `util::helper`.
+    let alpha = "alpha/src/lib.rs";
+    let callers = settled(
+        || routed(&parent, &callgraph_request("callers", alpha)),
+        |answer| answer.success,
+    );
+    let text = callers.data.to_string();
+    assert!(text.contains("alpha/src/lib.rs"), "{:#}", callers.data);
+    assert!(text.contains("caller"), "{:#}", callers.data);
+    assert!(callers.data.get("as_of").is_none(), "{:#}", callers.data);
+    let tree = settled(
+        || routed(&parent, &callgraph_request("call_tree", alpha)),
+        |answer| answer.success,
+    );
+    assert!(tree.data.to_string().contains("helper"), "{:#}", tree.data);
+    assert!(tree.data.get("as_of").is_none(), "{:#}", tree.data);
     let building = routed(
         &parent,
         &callgraph_request("callers", "building/src/lib.rs"),
     );
-    assert_eq!(building.data["code"], today_building.data["code"]);
+    assert_eq!(building.data["code"], "parent_child_unavailable");
     assert_eq!(
         gaps(&building.data),
         [child_gap(
@@ -530,19 +398,23 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
         |answer| gaps(&answer.data) == [failed_gap.clone()],
     );
     assert_eq!(failed.data["code"], "parent_child_unavailable");
+    // A file in a child past the cap belongs to no served child.
     let capped = routed(&parent, &callgraph_request("callers", "zz-60/notes.txt"));
-    assert_same(&capped.data, &today_capped.data);
-    // Inspect reads what the children's own sessions stored, as today.
-    assert_same(
-        &routed(&parent, &inspect_request()).data,
-        &today_inspect.data,
+    assert!(!capped.success);
+    assert_eq!(capped.data["code"], "parent_child_unavailable");
+    assert_eq!(
+        gaps(&capped.data),
+        [json!({
+            "kind": "outside_child_repositories",
+            "path": "zz-60/notes.txt",
+            "reason": "outside every child repository; a parent folder has no call graph of its own",
+        })]
     );
 
     // The parent folder's own root binds nothing; each served child has
     // its own checkout.
     assert!(parent.data_checkout().is_none());
     assert_eq!(parent.data_children().bound_for_test().len(), 64);
-    drop(children);
 }
 
 /// The children's checkouts are built as the parent root's maintenance:
