@@ -829,13 +829,15 @@ mod tests {
         ///   `crates/aft/src/commands/semantic_search/rerank/onnx.rs` (it has
         ///   no `/pi`);
         /// - `fn now_ms`, scope All and scope DefinitionsMentioning (two
-        ///   pairs): 18 `now_ms` fields and parameters, among them in
-        ///   `crates/aft/src/bash_background/gc_memo.rs`,
-        ///   `crates/aft/src/build_breaker.rs`,
-        ///   `crates/aft/src/build_breaker_audit_tests.rs` and
-        ///   `crates/aft/src/gc/mod.rs` (they hold every trigram of the
-        ///   phrase; only today's masks left them out). With 7,453 paths the
-        ///   two sources agreed on this query.
+        ///   pairs): 18 `now_ms` fields and parameters, one in
+        ///   `crates/aft/src/bash_background/gc_memo.rs`, six in
+        ///   `crates/aft/src/build_breaker.rs`, one in
+        ///   `crates/aft/src/build_breaker_audit_tests.rs`, nine in
+        ///   `crates/aft/src/gc/mod.rs` and one in
+        ///   `crates/aft/src/gh_shim_speech/scope.rs` (they hold every
+        ///   trigram of the phrase; only today's masks left them out). In one
+        ///   run whose tree held a few more files the two sources agreed on
+        ///   this query.
         fn extra_declarations_name(self) -> &'static str {
             match self {
                 Self::Identifier => "allowed_extra_declarations_identifier_scope_all",
