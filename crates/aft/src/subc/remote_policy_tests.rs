@@ -2560,10 +2560,11 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     );
 }
 
-/// Prefrontal core checks a worker plan on the head's scope but over its own
-/// connection, so the route's principal is core's rather than a session
-/// host's. The head's saved grants then decide what it may delegate through
-/// allow_paths, but not what the route's own file tools may read.
+/// The head's checks of a worker plan arrive over the orchestrator's own
+/// connection (module `prefrontal-core`) rather than the head's session host,
+/// so the route's principal is not a session host. The head's saved grants
+/// then decide what it may delegate through allow_paths, but not what the
+/// route's own file tools may read.
 fn core_head(root: &Path, scope_ref: &str) -> RouteIdentity {
     let mut head = identity(root, scope_ref, 7, true);
     let data = Arc::get_mut(&mut head.0).unwrap();
@@ -2597,6 +2598,15 @@ impl SiblingGrantFixture {
         let ctx = context(&root, &dir.path().join("store"), None);
         let head = core_head(&root, scope_ref);
         access_grants::register(&head, &ctx).unwrap();
+        // Heads default to full access, which reads outside the project
+        // without asking; asking leaves the saved grant as the head's only
+        // access outside its project.
+        catalog(
+            json!({"preset":"head", "params":{"mode":"ask"}}),
+            &head,
+            &ctx,
+        )
+        .unwrap();
         let head_grant = AccessGrant {
             path: crate::access_policy::policy_path(&dir.path().join("granted")),
             kind: GrantKind::Subtree,
@@ -2621,6 +2631,7 @@ impl SiblingGrantFixture {
     }
 }
 
+#[track_caller]
 fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>) {
     let error = result.unwrap_err();
     assert_eq!(error.code, "invalid_request");
