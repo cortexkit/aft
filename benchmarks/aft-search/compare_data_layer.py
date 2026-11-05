@@ -7,12 +7,18 @@ and exact lanes read the data layer's view of the checkout once it has
 published. Both processes get the same requests in the same order on the same
 tree, each with its own empty storage, and every reply is compared whole:
 text, results and structured content. Only fields that differ between any two
-processes by construction are masked (`MASKED`); `--noise` runs today's path
-a second time to show that those are the only ones.
+processes by construction are masked (`MASKED`). Two parts of a reply come
+from outside aft_search and depend on timing: the status bar line the
+response finaliser appends when background inspection counts change, and the
+`watcher_pending` gap with its notice. A reply that differs only there is
+counted as `process_noise`, apart from `differences`, and `--noise` runs
+today's path a second time to show those parts move between two runs of the
+same binary too.
 
-The data-layer process serves from the view only after its first build has
-published, so it is warmed with one request and the replay waits until the
-build's log line appears. Each request then logs one line per ranking that
+Every process first answers the same warm-up request, which no row repeats;
+the data-layer process serves from the view only after its first build has
+published, so it then waits until the build's log line appears. Every
+process then waits for the file watcher to go quiet before the replay. Each request then logs one line per ranking that
 read the view, and every row records how many it saw, so a reply that came
 from the legacy index anyway is visible rather than a silent pass.
 
@@ -32,6 +38,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import statistics
 import sys
 import tempfile
@@ -66,6 +73,13 @@ BUILT = "data layer built"
 # generation carries a random per-process nonce.
 MASKED = (("structuredContent", "plan", "snapshot_generation"),)
 LOG_FILTER = "warn,aft::data_layer=debug"
+# Sent first to every process of the semantic-off families; no row repeats it.
+WARM_UP_QUERY = "data layer parity warm-up request"
+STATUS_BAR = re.compile(r"\n\n\[AFT E[^\]\n]*\](?:\n|$)")
+WATCHER_NOTICE = (
+    "Watcher changes pending: indexed or cached results may omit unapplied file changes. "
+    "Retry after maintenance catches up; a missing result is not evidence of absence."
+)
 
 
 def mask(response: JsonObject) -> JsonObject:
@@ -79,6 +93,30 @@ def mask(response: JsonObject) -> JsonObject:
         if isinstance(node, dict) and path[-1] in node:
             node[path[-1]] = "<masked>"
     return reply
+
+
+def without_process_noise(left: JsonObject, right: JsonObject) -> tuple[JsonObject, JsonObject]:
+    """Both replies without the status bar line and the watcher gap."""
+    pair = [json.loads(json.dumps(left)), json.loads(json.dumps(right))]
+    watcher = False
+    for reply in pair:
+        text = reply.get("text")
+        if isinstance(text, str):
+            text = STATUS_BAR.sub("", text)
+            text = text.replace("\n" + WATCHER_NOTICE, "").replace(WATCHER_NOTICE, "")
+            reply["text"] = text
+        gaps = reply.get("gaps")
+        if isinstance(gaps, list):
+            kept = [gap for gap in gaps if not (isinstance(gap, dict) and gap.get("kind") == "watcher_pending")]
+            watcher |= len(kept) != len(gaps)
+            if kept:
+                reply["gaps"] = kept
+            else:
+                reply.pop("gaps")
+    if watcher:
+        for reply in pair:
+            reply.pop("complete", None)
+    return pair[0], pair[1]
 
 
 class Process:
@@ -136,20 +174,37 @@ class Process:
             time.sleep(0.2)
         raise AftProtocolError(f"index_ready_timeout:{self.client.stderr_text()}")
 
-    def wait_for_data_layer(self, warm: JsonObject, send: Any, timeout: float) -> float:
-        """Warm the data layer with one request and wait for its first build."""
-        if self.mode != "data":
-            return 0.0
+    def warm(self, warm: JsonObject, send: Any, timeout: float) -> float:
+        """Answer the warm-up request; the data-layer process then waits for its
+        first build to publish. Returns how long that build took to appear."""
         started = time.monotonic()
         send(self, warm)
+        if self.mode != "data":
+            return 0.0
         deadline = started + timeout
         while time.monotonic() < deadline:
-            if BUILT in self.log():
+            log = self.log()
+            if BUILT in log:
                 return time.monotonic() - started
-            if "data layer build failed" in self.log() or "data layer could not bind" in self.log():
+            if "data layer build failed" in log or "data layer could not bind" in log:
                 raise AftProtocolError(f"data_layer_failed:{self.client.stderr_text()}")
             time.sleep(0.2)
         raise AftProtocolError(f"data_layer_build_timeout:{self.client.stderr_text()}")
+
+    def settle(self, timeout: float) -> None:
+        """Wait until the watcher has seen no new event for three seconds."""
+        deadline = time.monotonic() + timeout
+        last: Any = None
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            watcher = self.client.call("status", timeout=30.0).get("watcher")
+            events = watcher.get("raw_events_total") if isinstance(watcher, dict) else None
+            if events != last:
+                last = events
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= 3.0:
+                return
+            time.sleep(0.5)
 
     def close(self) -> None:
         self.client.close()
@@ -184,15 +239,32 @@ def replay(process: Process, rows: Sequence[JsonObject], send: Any) -> list[Json
 
 
 def compare(rows: Sequence[JsonObject], left: Sequence[JsonObject], right: Sequence[JsonObject]) -> JsonObject:
-    differing = []
+    differences = []
+    noise = []
     for row, a, b in zip(rows, left, right):
         if a["reply"] == b["reply"]:
             continue
+        a_clean, b_clean = without_process_noise(a["reply"], b["reply"])
         a_text = json.dumps(a["reply"], indent=1, sort_keys=True).splitlines()
         b_text = json.dumps(b["reply"], indent=1, sort_keys=True).splitlines()
-        diff = list(difflib.unified_diff(a_text, b_text, "legacy", "data", n=2, lineterm=""))
-        differing.append({"id": row["id"], "request": row["request"], "diff": diff[:200]})
-    return {"rows": len(rows), "differing": len(differing), "differences": differing}
+        entry = {
+            "id": row["id"],
+            "request": row["request"],
+            "diff": list(difflib.unified_diff(a_text, b_text, "first", "second", n=2, lineterm=""))[:200],
+        }
+        if a_clean == b_clean:
+            noise.append(entry)
+        else:
+            entry["first"] = a["reply"]
+            entry["second"] = b["reply"]
+            differences.append(entry)
+    return {
+        "rows": len(rows),
+        "differing": len(differences),
+        "process_noise": len(noise),
+        "differences": differences,
+        "noise": noise,
+    }
 
 
 def latency(replies: Sequence[JsonObject]) -> JsonObject:
@@ -214,6 +286,7 @@ def run_family(
     start: Any,
     noise: bool,
     timeout: float,
+    warm: JsonObject,
 ) -> JsonObject:
     modes = ["legacy", "data"] + (["legacy-again"] if noise else [])
     replies: dict[str, list[JsonObject]] = {}
@@ -223,7 +296,8 @@ def run_family(
             process = Process(binary, root, Path(directory), "data" if mode == "data" else mode)
             try:
                 start(process)
-                build_wait[mode] = process.wait_for_data_layer(rows[0]["request"], send, timeout)
+                build_wait[mode] = process.warm(warm, send, timeout)
+                process.settle(timeout)
                 replies[mode] = replay(process, rows, send)
             finally:
                 process.close()
@@ -285,7 +359,8 @@ def concept(args: argparse.Namespace) -> JsonObject:
                 process.client.configure(endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
                 process.client.wait_ready(args.ready_timeout)
 
-            report = run_family(args.binary, root, rows, send_search, start, args.noise, args.ready_timeout)
+            warm = {"query": bench_rerank.burn_in_queries()[0], "topK": PAGE_SIZE, "includeTests": INCLUDE_TESTS}
+            report = run_family(args.binary, root, rows, send_search, start, args.noise, args.ready_timeout, warm)
             report["vector_refusals"] = list(server.refused)
     return report
 
@@ -317,7 +392,14 @@ def exact(args: argparse.Namespace) -> JsonObject:
             process.configure_without_semantic(args.ready_timeout)
 
         reports[name] = run_family(
-            args.binary, clone_root / name, rows, send_semantic_search, start, args.noise, args.ready_timeout
+            args.binary,
+            clone_root / name,
+            rows,
+            send_semantic_search,
+            start,
+            args.noise,
+            args.ready_timeout,
+            {"query": WARM_UP_QUERY, "top_k": 5},
         )
     return reports
 
@@ -336,7 +418,16 @@ def checkout(args: argparse.Namespace) -> JsonObject:
     def start(process: Process) -> None:
         process.configure_without_semantic(args.ready_timeout)
 
-    return run_family(args.binary, Path(args.root).resolve(), rows, send_search, start, args.noise, args.ready_timeout)
+    return run_family(
+        args.binary,
+        Path(args.root).resolve(),
+        rows,
+        send_search,
+        start,
+        args.noise,
+        args.ready_timeout,
+        {"query": WARM_UP_QUERY},
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -371,11 +462,16 @@ def main() -> int:
         compared = family["legacy_vs_data"]
         unread = family["data_rows_without_a_view_read"]
         print(
-            f"{args.family}: {compared['differing']} of {compared['rows']} replies differ; "
+            f"{args.family}: {compared['differing']} of {compared['rows']} replies differ, "
+            f"{compared['process_noise']} only in process noise; "
             f"{len(unread)} data-layer replies read no view; latency {json.dumps(family['latency'])}"
         )
         if "legacy_vs_legacy_again" in family:
-            print(f"{args.family}: noise {family['legacy_vs_legacy_again']['differing']} of {compared['rows']}")
+            again = family["legacy_vs_legacy_again"]
+            print(
+                f"{args.family}: today's path twice: {again['differing']} differ, "
+                f"{again['process_noise']} only in process noise"
+            )
         failed |= compared["differing"] > 0 or bool(unread) or bool(family["legacy_rows_with_a_view_read"])
     return 1 if failed else 0
 
