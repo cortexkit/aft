@@ -7242,11 +7242,20 @@ mod tests {
             1,
             "the rescan ran"
         );
-        assert_eq!(
-            grep("overflow_rescan_marker"),
-            1,
-            "a file changed during the overflow must reach grep after the rescan"
-        );
+        // The checkout compares its files with its state in the background,
+        // so grep finds the file once that comparison has recorded it.
+        let started = Instant::now();
+        loop {
+            let found = grep("overflow_rescan_marker");
+            if found == 1 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "a file changed during the overflow must reach grep after the rescan: {found}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
