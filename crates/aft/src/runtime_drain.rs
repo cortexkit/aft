@@ -507,6 +507,7 @@ fn delay_watcher_receive_for_test() {}
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
     crate::data_layer::runtime::root_bound(ctx);
+    crate::data_layer::outline::root_bound(ctx);
 }
 
 /// Executor-maintenance form of [`drain_deferred_configure_maintenance`]:

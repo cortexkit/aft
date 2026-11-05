@@ -118,6 +118,11 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(graph) => graph,
         Err(response) => return response,
     };
+    // With the data layer on, the file's symbols come from its stored
+    // record, when the file still holds that content, instead of a parse.
+    if let Some(view) = data_view.as_ref() {
+        crate::data_layer::outline::warm_file(view, &ctx.symbol_cache(), &file_path);
+    }
     let outcome = trace_data_result(
         &snapshot,
         &file_path,

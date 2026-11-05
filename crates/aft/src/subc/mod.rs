@@ -12515,6 +12515,7 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
     runtime_drain::drain_configure_warning_events(ctx);
     if !stepped_aside {
         crate::data_layer::runtime::root_bound(ctx);
+        crate::data_layer::outline::root_bound(ctx);
     }
     let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
         .then(|| crate::provisional_identity_retry::poll(ctx))

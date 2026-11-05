@@ -32,16 +32,18 @@ pub(super) fn extract(
     let lang = language_id(language)
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
     let tree = parse_source(source, lang)?;
-    extract_tree(source, language, extractor_version, &tree)
+    extract_tree(source, language, extractor_version, &tree, None)
 }
 
 /// Extracts the parse output of `source` from `tree`, its syntax tree in
-/// `language`.
+/// `language`. With `outline`, also fills it with the file's symbols as the
+/// parser extracts them, before the call graph changes any.
 pub(super) fn extract_tree(
     source: &str,
     language: &str,
     extractor_version: String,
     tree: &tree_sitter::Tree,
+    outline: Option<&mut Vec<crate::symbols::Symbol>>,
 ) -> Result<CallgraphBlob, ManifestJoinError> {
     let lang = language_id(language)
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
@@ -56,6 +58,7 @@ pub(super) fn extract_tree(
         tree,
         &line_index,
         &index,
+        outline,
     )
     .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
     if lang == LangId::Rust {

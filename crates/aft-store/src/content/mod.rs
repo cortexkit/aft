@@ -221,13 +221,38 @@ pub struct Surface {
     pub returns: Vec<ReturnFact>,
 }
 
-/// What only the file's own resolution reads.
+/// One symbol as outline lists it. Outline reads the parser's own symbol
+/// table for a file, which differs from [`Surface::symbols`]: the call graph
+/// qualifies, adds and merges symbols for resolution, outline shows them as
+/// written. Lines and columns are zero-based.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OutlineSymbol {
+    pub name: String,
+    /// The parser's symbol kind, in its snake-case name (`function`,
+    /// `type_alias`).
+    pub kind: String,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub signature: Option<String>,
+    /// The enclosing scopes, outermost first.
+    pub scope_chain: Vec<String>,
+    pub exported: bool,
+    pub parent: Option<String>,
+}
+
+/// What only reads of this one file need: its own resolution, and its
+/// outline.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Body {
     pub imports: Vec<Import>,
     pub python_bindings: Vec<PythonBinding>,
     pub references: Vec<Reference>,
     pub call_sites: Vec<CallSite>,
+    /// The file's symbols as outline lists them, in the parser's order.
+    /// `None` in a record from an extractor that did not store them.
+    pub outline: Option<Vec<OutlineSymbol>>,
 }
 
 /// What a content record holds.
@@ -251,8 +276,14 @@ pub struct ContentRecord {
     pub data: RecordBody,
 }
 
+/// A parsed record whose body holds no outline. Records of this kind encode
+/// exactly as they did before records could hold one.
 const PARSED: u8 = 1;
 const CONFIG: u8 = 2;
+/// A parsed record whose body ends with its outline. The kind byte, not the
+/// body's length, says whether an outline follows, so a body cut short
+/// before its outline still fails to decode.
+const PARSED_WITH_OUTLINE: u8 = 3;
 
 impl ContentRecord {
     /// The surface part's bytes and the body part's bytes. A configuration
@@ -269,7 +300,11 @@ impl ContentRecord {
                 (head.finish(), Vec::new())
             }
             RecordBody::Parsed { surface, body } => {
-                head.byte(PARSED);
+                head.byte(if body.outline.is_some() {
+                    PARSED_WITH_OUTLINE
+                } else {
+                    PARSED
+                });
                 encode_surface(&mut head, surface);
                 let mut tail = Encoder::default();
                 encode_body(&mut tail, body);
@@ -296,11 +331,14 @@ impl ContentRecord {
                 }
                 RecordBody::Config { source }
             }
-            PARSED => {
+            kind @ (PARSED | PARSED_WITH_OUTLINE) => {
                 let surface = decode_surface(&mut head)?;
                 head.finish()?;
                 let mut tail = Decoder::new(body)?;
-                let body = decode_body(&mut tail)?;
+                let mut body = decode_body(&mut tail)?;
+                if kind == PARSED_WITH_OUTLINE {
+                    body.outline = Some(decode_outline(&mut tail)?);
+                }
                 tail.finish()?;
                 RecordBody::Parsed {
                     surface: Box::new(surface),
@@ -509,6 +547,21 @@ fn encode_body(out: &mut Encoder, body: &Body) {
         out.opt_str(site.receiver.as_deref());
         out.bool(site.dynamic);
     }
+    if let Some(outline) = &body.outline {
+        out.usize(outline.len());
+        for symbol in outline {
+            out.str(&symbol.name);
+            out.str(&symbol.kind);
+            out.u32(symbol.start_line);
+            out.u32(symbol.start_col);
+            out.u32(symbol.end_line);
+            out.u32(symbol.end_col);
+            out.opt_str(symbol.signature.as_deref());
+            out.strs(&symbol.scope_chain);
+            out.bool(symbol.exported);
+            out.opt_str(symbol.parent.as_deref());
+        }
+    }
 }
 
 fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
@@ -582,7 +635,29 @@ fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
         python_bindings,
         references,
         call_sites,
+        outline: None,
     })
+}
+
+/// The outline a body of a [`PARSED_WITH_OUTLINE`] record ends with.
+fn decode_outline(input: &mut Decoder<'_>) -> Result<Vec<OutlineSymbol>, DecodeError> {
+    let count = input.count()?;
+    let mut outline = Vec::with_capacity(count);
+    for _ in 0..count {
+        outline.push(OutlineSymbol {
+            name: input.string()?,
+            kind: input.string()?,
+            start_line: input.u32()?,
+            start_col: input.u32()?,
+            end_line: input.u32()?,
+            end_col: input.u32()?,
+            signature: input.opt_string()?,
+            scope_chain: input.strings()?,
+            exported: input.bool()?,
+            parent: input.opt_string()?,
+        });
+    }
+    Ok(outline)
 }
 
 #[cfg(test)]
@@ -681,9 +756,81 @@ mod tests {
                         receiver: Some("self.path".into()),
                         dynamic: false,
                     }],
+                    outline: None,
                 }),
             },
         }
+    }
+
+    fn outline() -> Vec<OutlineSymbol> {
+        vec![
+            OutlineSymbol {
+                name: "Store".into(),
+                kind: "struct".into(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 33,
+                signature: Some("pub struct Store".into()),
+                scope_chain: Vec::new(),
+                exported: true,
+                parent: None,
+            },
+            OutlineSymbol {
+                name: "open".into(),
+                kind: "method".into(),
+                start_line: 3,
+                start_col: 4,
+                end_line: 9,
+                end_col: 5,
+                signature: Some("fn open() -> Self".into()),
+                scope_chain: vec!["Store".into()],
+                exported: true,
+                parent: Some("Store".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn an_outline_round_trips_and_its_absence_is_told_by_the_record_kind() {
+        let without = sample();
+        let mut with = sample();
+        let RecordBody::Parsed { body, .. } = &mut with.data else {
+            unreachable!("the sample is parsed");
+        };
+        body.outline = Some(outline());
+        let (surface, body) = with.encode();
+        assert_eq!(ContentRecord::decode(&surface, &body).unwrap(), with);
+        let (plain_surface, plain_body) = without.encode();
+        let decoded = ContentRecord::decode(&plain_surface, &plain_body).unwrap();
+        assert_eq!(decoded, without);
+
+        // The two surfaces differ only in the record kind.
+        assert_eq!(surface.len(), plain_surface.len());
+        let differing = surface
+            .iter()
+            .zip(&plain_surface)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (*a, *b))
+            .collect::<Vec<_>>();
+        assert_eq!(differing, vec![(PARSED_WITH_OUTLINE, PARSED)]);
+
+        // A body without its outline, or with one the kind does not
+        // announce, is refused, as is every cut of a body with one.
+        assert!(ContentRecord::decode(&surface, &plain_body).is_err());
+        assert!(ContentRecord::decode(&plain_surface, &body).is_err());
+        for cut in 0..body.len() {
+            assert!(ContentRecord::decode(&surface, &body[..cut]).is_err());
+        }
+
+        // An empty outline is still an outline.
+        let mut empty = sample();
+        let RecordBody::Parsed { body, .. } = &mut empty.data else {
+            unreachable!("the sample is parsed");
+        };
+        body.outline = Some(Vec::new());
+        let (surface, body) = empty.encode();
+        assert_eq!(ContentRecord::decode(&surface, &body).unwrap(), empty);
     }
 
     #[test]

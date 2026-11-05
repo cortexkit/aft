@@ -2934,6 +2934,53 @@ impl CheckoutView {
     }
 }
 
+/// Outline's symbols for one file, from its stored content record.
+impl CheckoutView {
+    /// The symbols outline lists for the file at `path` (relative to the
+    /// root, `/`-separated), as the record of its published content holds
+    /// them, with that content's key and language. `None` when the path
+    /// changed since the publication, is not parsed, or its record holds no
+    /// outline. The file on disk may still have moved on: compare its bytes
+    /// with the key before using the symbols.
+    ///
+    /// # Errors
+    ///
+    /// When the record cannot be read.
+    pub(crate) fn outline_symbols(
+        &self,
+        path: &[u8],
+    ) -> Result<Option<super::outline::StoredOutline>, DataError> {
+        let Some(published) = self.published.state.get(path) else {
+            return Ok(None);
+        };
+        let unchanged = self.current_state().get(path).is_some_and(|current| {
+            current.content == published.content && current.language == published.language
+        });
+        if !unchanged || published.language.is_empty() || published.language == "config" {
+            return Ok(None);
+        }
+        let key = RecordKey::new(published.content, &published.language, EXTRACTOR_VERSION);
+        for segment in self.published.segments.iter().rev() {
+            let Some(content) = ContentSegment::open(segment).map_err(DataError::store)? else {
+                continue;
+            };
+            let Some(ordinal) = content.find(key).map_err(DataError::store)? else {
+                continue;
+            };
+            let record = content.record(ordinal).map_err(DataError::store)?;
+            let RecordBody::Parsed { body, .. } = record.data else {
+                return Ok(None);
+            };
+            return Ok(body.outline.map(|symbols| super::outline::StoredOutline {
+                content: published.content,
+                language: published.language.clone(),
+                symbols,
+            }));
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

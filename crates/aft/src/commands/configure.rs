@@ -6061,6 +6061,10 @@ fn schedule_artifact_loads_admitted(
     } else {
         0
     };
+    // With the data layer on, the symbol cache is pre-warmed from its
+    // content records (`data_layer::outline`) and the disk symbol cache is
+    // neither read nor written.
+    let legacy_symbol_prewarm = !crate::data_layer::runtime::enabled();
     let mut search_artifact_load_start = None;
     let mut semantic_artifact_load_start = None;
 
@@ -6187,17 +6191,19 @@ fn schedule_artifact_loads_admitted(
                         search_generation,
                         || {
                             let sent = tx.send(index).is_ok();
-                            spawn_symbol_cache_prewarm(
-                                root_for_search,
-                                symbol_cache,
-                                symbol_storage,
-                                symbol_project_key,
-                                symbol_cache_generation,
-                                symbol_files,
-                                prewarm_stop,
-                                true,
-                                log_ctx::current_session(),
-                            );
+                            if legacy_symbol_prewarm {
+                                spawn_symbol_cache_prewarm(
+                                    root_for_search,
+                                    symbol_cache,
+                                    symbol_storage,
+                                    symbol_project_key,
+                                    symbol_cache_generation,
+                                    symbol_files,
+                                    prewarm_stop,
+                                    true,
+                                    log_ctx::current_session(),
+                                );
+                            }
                             sent
                         },
                     );
@@ -6400,17 +6406,19 @@ fn schedule_artifact_loads_admitted(
                     search_generation,
                     || {
                         let sent = tx.send(index).is_ok();
-                        spawn_symbol_cache_prewarm(
-                            root_for_search,
-                            symbol_cache,
-                            symbol_storage,
-                            symbol_project_key,
-                            symbol_cache_generation,
-                            symbol_files,
-                            prewarm_stop,
-                            false,
-                            log_ctx::current_session(),
-                        );
+                        if legacy_symbol_prewarm {
+                            spawn_symbol_cache_prewarm(
+                                root_for_search,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                prewarm_stop,
+                                false,
+                                log_ctx::current_session(),
+                            );
+                        }
                         sent
                     },
                 );
@@ -9119,9 +9127,11 @@ fn run_configure_maintenance_unit_inner(
                         continuation.defer_lexical_bind(Instant::now());
                         return ConfigureMaintenanceUnitResult::Continue;
                     }
-                    // The symbol prewarm follows the files the view verified.
+                    // The symbol prewarm follows the files the view verified;
+                    // with the data layer on, it reads the data layer's
+                    // records instead.
                     Some(Ok(crate::views::trigram::LexicalViewSnapshot::Ready(snapshot)))
-                        if ctx.views_route_root() =>
+                        if ctx.views_route_root() && !crate::data_layer::runtime::enabled() =>
                     {
                         spawn_symbol_view_prewarm(ctx, &snapshot);
                     }

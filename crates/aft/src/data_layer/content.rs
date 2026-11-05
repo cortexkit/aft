@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use aft_store::content::{
-    Body, CallSite, ContentRecord, FieldFact, Import, MethodFact, PythonBinding, RecordBody,
-    RefKind, Reference, ReturnFact, Surface, Symbol, TypeFact,
+    Body, CallSite, ContentRecord, FieldFact, Import, MethodFact, OutlineSymbol, PythonBinding,
+    RecordBody, RefKind, Reference, ReturnFact, Surface, Symbol, TypeFact,
 };
 
 use crate::callgraph::python::CallBinding;
@@ -23,8 +23,11 @@ use crate::callgraph_store::join::{
 use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
-/// carry it, so output from another version is extracted again.
-pub const EXTRACTOR_VERSION: &str = crate::callgraph_extractor::PRODUCER;
+/// carry it, so output from another version is extracted again. It is the
+/// call-graph producer's version with the record layout's own suffix: a
+/// record also holds the file's outline, which the producer's output does
+/// not.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+outline-1";
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -91,6 +94,14 @@ pub fn extract(source: &[u8], language: &str) -> Result<ContentRecord, ManifestJ
 pub struct SyntaxTree {
     tree: tree_sitter::Tree,
     language: LangId,
+}
+
+#[cfg(test)]
+impl SyntaxTree {
+    /// The tree-sitter tree, for tests that extract from it directly.
+    pub(crate) fn tree_for_test(&self) -> &tree_sitter::Tree {
+        &self.tree
+    }
 }
 
 /// The text the extractor parses for `source`. A source that is not valid
@@ -192,9 +203,17 @@ pub fn extract_parsed(
             tree.language
         )));
     }
-    let blob =
-        CallgraphBlob::extract_tree(parsed_text(source), language, EXTRACTOR_VERSION, &tree.tree)?;
-    Ok(record_from_blob(&blob))
+    let (blob, outline) = CallgraphBlob::extract_tree_with_outline(
+        parsed_text(source),
+        language,
+        EXTRACTOR_VERSION,
+        &tree.tree,
+    )?;
+    let mut record = record_from_blob(&blob);
+    if let RecordBody::Parsed { body, .. } = &mut record.data {
+        body.outline = Some(outline.iter().map(outline_symbol).collect());
+    }
+    Ok(record)
 }
 
 /// Extracts the record of `source` after an edit from `previous_source`,
@@ -219,7 +238,9 @@ pub fn extract_incremental(
 }
 
 /// The stored record of a parse output. Lossless apart from the extractor's
-/// temporary syntax-tree index, which no reader uses after extraction.
+/// temporary syntax-tree index, which no reader uses after extraction. Parse
+/// output carries no outline, so the record holds none; [`extract_parsed`]
+/// adds it.
 #[must_use]
 pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
     match blob {
@@ -311,6 +332,7 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
                             dynamic: site.dynamic,
                         })
                         .collect(),
+                    outline: None,
                 }),
             },
         },
@@ -487,6 +509,80 @@ fn blob_symbol(symbol: &Symbol) -> BlobSymbol {
     }
 }
 
+/// The stored form of one symbol of the parser's table.
+#[must_use]
+pub fn outline_symbol(symbol: &crate::symbols::Symbol) -> OutlineSymbol {
+    OutlineSymbol {
+        name: symbol.name.clone(),
+        kind: outline_kind_name(&symbol.kind).to_string(),
+        start_line: symbol.range.start_line,
+        start_col: symbol.range.start_col,
+        end_line: symbol.range.end_line,
+        end_col: symbol.range.end_col,
+        signature: symbol.signature.clone(),
+        scope_chain: symbol.scope_chain.clone(),
+        exported: symbol.exported,
+        parent: symbol.parent.clone(),
+    }
+}
+
+/// The parser's symbol a stored outline symbol holds, or `None` when its
+/// kind is not one this build knows.
+#[must_use]
+pub fn symbol_from_outline(symbol: &OutlineSymbol) -> Option<crate::symbols::Symbol> {
+    Some(crate::symbols::Symbol {
+        name: symbol.name.clone(),
+        kind: outline_kind(&symbol.kind)?,
+        range: crate::symbols::Range {
+            start_line: symbol.start_line,
+            start_col: symbol.start_col,
+            end_line: symbol.end_line,
+            end_col: symbol.end_col,
+        },
+        signature: symbol.signature.clone(),
+        scope_chain: symbol.scope_chain.clone(),
+        exported: symbol.exported,
+        parent: symbol.parent.clone(),
+    })
+}
+
+/// The name a record stores a parser symbol kind under: its serialized
+/// name.
+fn outline_kind_name(kind: &crate::symbols::SymbolKind) -> &'static str {
+    use crate::symbols::SymbolKind;
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
+        SymbolKind::Class => "class",
+        SymbolKind::Method => "method",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Enum => "enum",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Variable => "variable",
+        SymbolKind::Heading => "heading",
+        SymbolKind::FileSummary => "file_summary",
+    }
+}
+
+fn outline_kind(name: &str) -> Option<crate::symbols::SymbolKind> {
+    use crate::symbols::SymbolKind;
+    Some(match name {
+        "function" => SymbolKind::Function,
+        "kernel" => SymbolKind::Kernel,
+        "class" => SymbolKind::Class,
+        "method" => SymbolKind::Method,
+        "struct" => SymbolKind::Struct,
+        "interface" => SymbolKind::Interface,
+        "enum" => SymbolKind::Enum,
+        "type_alias" => SymbolKind::TypeAlias,
+        "variable" => SymbolKind::Variable,
+        "heading" => SymbolKind::Heading,
+        "file_summary" => SymbolKind::FileSummary,
+        _ => return None,
+    })
+}
+
 fn import(import: &BlobImport) -> Import {
     Import {
         ordinal: import.ordinal,
@@ -551,6 +647,138 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record's version names the call-graph producer it extracts with,
+    /// so a producer bump cannot leave records of its old output under the
+    /// new name; the suffix keeps them apart from views' blobs of the same
+    /// producer, which hold no outline.
+    #[test]
+    fn the_extractor_version_follows_the_call_graph_producer() {
+        let producer = crate::callgraph_extractor::PRODUCER;
+        assert!(
+            EXTRACTOR_VERSION.starts_with(producer) && EXTRACTOR_VERSION != producer,
+            "{EXTRACTOR_VERSION} does not extend {producer}"
+        );
+    }
+
+    /// Every stored kind name is the parser's serialized name, and reads
+    /// back as the same kind.
+    #[test]
+    fn outline_kinds_round_trip_under_their_serialized_names() {
+        use crate::symbols::SymbolKind;
+        for kind in [
+            SymbolKind::Function,
+            SymbolKind::Kernel,
+            SymbolKind::Class,
+            SymbolKind::Method,
+            SymbolKind::Struct,
+            SymbolKind::Interface,
+            SymbolKind::Enum,
+            SymbolKind::TypeAlias,
+            SymbolKind::Variable,
+            SymbolKind::Heading,
+            SymbolKind::FileSummary,
+        ] {
+            let name = outline_kind_name(&kind);
+            assert_eq!(serde_json::to_value(&kind).unwrap(), name);
+            assert_eq!(outline_kind(name), Some(kind));
+        }
+        assert_eq!(outline_kind("macro"), None);
+    }
+
+    /// Files of many languages: the repository's test fixtures and a sample
+    /// of AFT's own sources, among them files with `#[cfg(unix)]` and
+    /// `#[cfg(windows)]` twins and Rust impl methods.
+    pub(crate) fn sample_files() -> Vec<std::path::PathBuf> {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixtures = crate_dir.join("tests/fixtures");
+        let mut files = Vec::new();
+        for dir in [fixtures.clone(), fixtures.join("callgraph")] {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+        for source in [
+            "../aft-store/src/stat.rs",
+            "../aft-store/src/content/mod.rs",
+            "src/effective_path.rs",
+            "src/format.rs",
+            "src/symbols.rs",
+            "src/data_layer/runtime.rs",
+            "src/data_layer/content.rs",
+        ] {
+            files.push(crate_dir.join(source));
+        }
+        files.sort();
+        files
+    }
+
+    /// How many symbols carry each name.
+    fn name_counts<'a>(
+        names: impl Iterator<Item = &'a str>,
+    ) -> std::collections::HashMap<&'a str, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for name in names {
+            *counts.entry(name).or_default() += 1;
+        }
+        counts
+    }
+
+    /// A record's outline is exactly the table a parse of the file gives
+    /// outline, while the record's call-graph symbols are not: the call
+    /// graph keeps one of each scoped name, so platform twins collapse.
+    #[test]
+    fn stored_outlines_equal_the_parsers_symbol_table() {
+        let mut compared = 0;
+        let mut collapsed = Vec::new();
+        for path in sample_files() {
+            let bytes = std::fs::read(&path).unwrap();
+            let name = path.display().to_string();
+            let Some(language) = language_for(&name, &bytes) else {
+                continue;
+            };
+            if language == "config" {
+                continue;
+            }
+            let record = extract(&bytes, &language).unwrap();
+            let RecordBody::Parsed { surface, body } = &record.data else {
+                panic!("{name}: a parsed language gives a parsed record");
+            };
+            let stored = body
+                .outline
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: no outline"))
+                .iter()
+                .map(|symbol| symbol_from_outline(symbol).unwrap())
+                .collect::<Vec<_>>();
+            let parsed = crate::parser::FileParser::new()
+                .extract_symbols(&path)
+                .unwrap();
+            assert_eq!(stored, parsed, "{name}");
+            let (surface_part, body_part) = record.encode();
+            assert_eq!(
+                ContentRecord::decode(&surface_part, &body_part).unwrap(),
+                record,
+                "{name}"
+            );
+            let in_surface = name_counts(surface.symbols.iter().map(|s| s.name.as_str()));
+            if name_counts(parsed.iter().map(|s| s.name.as_str()))
+                .iter()
+                .any(|(symbol, n)| in_surface.get(symbol).copied().unwrap_or(0) < *n)
+            {
+                collapsed.push(name);
+            }
+            compared += 1;
+        }
+        assert!(compared >= 40, "only {compared} files compared");
+        assert!(
+            collapsed.iter().any(|name| name.ends_with("stat.rs")),
+            "the platform twins of stat.rs should outnumber the call graph's symbols: {collapsed:?}"
+        );
+    }
 
     #[test]
     fn files_meaning_search_embeds_are_read_past_the_text_index_limit() {

@@ -1280,7 +1280,9 @@ pub(crate) struct CachedOutline {
     pub(crate) facts: Arc<crate::commands::outline::OutlineParseFacts>,
 }
 
-fn content_hash_for_source(source: &str) -> blake3::Hash {
+/// The content hash a symbol-cache entry records for `source`: none (zero)
+/// past the hashing size cap.
+pub(crate) fn content_hash_for_source(source: &str) -> blake3::Hash {
     if source.len() as u64 > cache_freshness::CONTENT_HASH_SIZE_CAP {
         cache_freshness::zero_hash()
     } else {

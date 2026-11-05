@@ -1423,7 +1423,7 @@ pub(crate) fn build_file_data_with_typescript_objects(
     }
     let (tree, lang) = crate::parser::parse_resolved_source(path, source, lang)?;
     let lines = SourceLineIndex::new(source);
-    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true, Direct)
+    build_file_data_from_tree_observed(path, source, lang, &tree, &lines, true, Direct, None)
 }
 
 #[derive(Debug)]
@@ -1750,12 +1750,14 @@ pub(crate) fn build_file_data_from_tree(
     tree: &tree_sitter::Tree,
     line_index: &SourceLineIndex,
 ) -> Result<FileCallData, AftError> {
-    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, Direct)
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, Direct, None)
         .map(|(data, _)| data)
 }
 
 /// Like [`build_file_data_from_tree`], with `index`, the tree's syntax
-/// index, answering every walk and parent or sibling lookup.
+/// index, answering every walk and parent or sibling lookup. With
+/// `outline`, also fills it with the file's symbols as the parser extracts
+/// them, before the call graph qualifies, adds or merges any.
 pub(crate) fn build_file_data_from_index<'tree>(
     path: &Path,
     source: &str,
@@ -1763,11 +1765,13 @@ pub(crate) fn build_file_data_from_index<'tree>(
     tree: &'tree tree_sitter::Tree,
     line_index: &SourceLineIndex,
     index: &SyntaxIndex<'tree>,
+    outline: Option<&mut Vec<Symbol>>,
 ) -> Result<FileCallData, AftError> {
-    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, index)
+    build_file_data_from_tree_observed(path, source, lang, tree, line_index, false, index, outline)
         .map(|(data, _)| data)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_file_data_from_tree_observed<'tree>(
     path: &Path,
     source: &str,
@@ -1776,6 +1780,7 @@ fn build_file_data_from_tree_observed<'tree>(
     line_index: &SourceLineIndex,
     collect_objects: bool,
     nav: impl Nav<'tree>,
+    outline: Option<&mut Vec<Symbol>>,
 ) -> Result<
     (
         FileCallData,
@@ -1793,6 +1798,9 @@ fn build_file_data_from_tree_observed<'tree>(
 
     // Get symbols (for call site extraction and export detection)
     let mut symbols = crate::parser::extract_symbols_from_tree_with(&source, &tree, lang, nav)?;
+    if let Some(outline) = outline {
+        outline.clone_from(&symbols);
+    }
     let object_nodes = crate::callgraph_store::join::dispatch::complete_typescript_symbols(
         source,
         lang,
