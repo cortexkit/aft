@@ -296,6 +296,9 @@ async fn drained_head_shell(f: &Fixture, extra: Value, corr: u64) -> (String, Va
             if let Some(task) = f.ctx.bash_background().list(0).first() {
                 return task.info.task_id.clone();
             }
+            if let Ok(early) = replies.try_recv() {
+                panic!("answered before a task ran: {}", String::from_utf8_lossy(&early.body));
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -365,6 +368,8 @@ async fn drained_background_launch_names_its_task() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
+    f.ctx
+        .update_config(|config| config.experimental_bash_background = true);
     let (task, body) = drained_head_shell(&f, json!({"background": true}), 9122).await;
     assert_detached_names_task(&body, &task);
 }
