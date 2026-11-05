@@ -26,7 +26,7 @@ use aft_store::scan::{scan, scan_paths, ContentKind, ContentSink, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
     candidates, ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator,
-    TextMembership, TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
+    TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
 use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
@@ -491,6 +491,7 @@ impl Checkout {
             published,
             planes: self.planes,
             text: Arc::clone(&live.text),
+            text_members: Arc::default(),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
             graph,
             refreshed: live.refreshed.clone(),
@@ -2010,6 +2011,10 @@ struct Published {
     identity: String,
     state: CheckoutState,
     segments: Vec<Arc<Segment>>,
+    /// Each segment's text sections that hold any, checked when the
+    /// publication was opened, in `segments` order: a text query rebuilds
+    /// its [`TextSegment`]s from them without reading the segments again.
+    texts: Vec<(usize, TextSections)>,
     membership: TextMembership,
     graph: Arc<StoredSlices>,
     /// Whether the call graph was built: a checkout's first publication
@@ -2074,6 +2079,9 @@ pub struct CheckoutView {
     published: Arc<Published>,
     planes: Planes,
     text: Arc<TextOverlay>,
+    /// The publication's indexed paths not in `text`, grouped by segment,
+    /// built on the first trigram lookup and shared by this view's clones.
+    text_members: Arc<std::sync::OnceLock<aft_store::text::TextMembers>>,
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
     graph: Arc<dyn SliceSource + Send + Sync>,
     /// What the call graph resolved since the publication.
@@ -2094,11 +2102,14 @@ impl Published {
         segments: Vec<Arc<Segment>>,
         snapshot: Snapshot,
     ) -> Result<Self, DataError> {
-        let texts = segments
-            .iter()
-            .filter_map(|segment| TextSegment::open(segment).transpose())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DataError::store)?;
+        let mut sections = Vec::new();
+        let mut texts = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            if let Some(text) = TextSegment::open(segment).map_err(DataError::store)? {
+                sections.push((index, text.sections()));
+                texts.push(text);
+            }
+        }
         let text = TextLocator::build(&texts).map_err(DataError::store)?;
         let membership = TextMembership::build(&state, &text);
         drop(texts);
@@ -2130,6 +2141,7 @@ impl Published {
             identity,
             state,
             segments,
+            texts: sections,
             membership,
             graph: Arc::new(graph),
             graph_built,
@@ -2139,12 +2151,13 @@ impl Published {
         })
     }
 
+    /// The text segments, in the order the membership indexes them.
     fn texts(&self) -> Result<Vec<TextSegment<'_>>, DataError> {
-        self.segments
+        Ok(self
+            .texts
             .iter()
-            .filter_map(|segment| TextSegment::open(segment).transpose())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DataError::store)
+            .map(|(index, sections)| TextSegment::with_sections(&self.segments[*index], *sections))
+            .collect())
     }
 }
 
@@ -2288,9 +2301,17 @@ impl CheckoutView {
     pub fn paths_with_trigram(&self, trigram: u32) -> Result<Vec<Vec<u8>>, DataError> {
         let published = &self.published;
         let texts = published.texts()?;
-        aft_store::text::paths_with_trigram(
+        let members = self.text_members.get_or_init(|| {
+            aft_store::text::TextMembers::build(
+                &published.state,
+                &published.membership,
+                texts.len(),
+                &self.text,
+            )
+        });
+        aft_store::text::paths_with_trigram_among(
             &published.state,
-            &published.membership,
+            members,
             &texts,
             &self.text,
             trigram,

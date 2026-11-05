@@ -306,6 +306,20 @@ impl<'s> LookupTable<'s> {
         })
     }
 
+    pub(crate) fn section(&self) -> SectionHandle {
+        self.section
+    }
+
+    /// The table [`Self::open`] checked as `section` of the same `segment`,
+    /// without checking it again.
+    pub(crate) fn reopen(segment: &'s Segment, section: SectionHandle) -> Self {
+        Self {
+            segment,
+            section,
+            count: segment.info(section).item_count,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> u64 {
         self.count

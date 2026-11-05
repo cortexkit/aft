@@ -241,29 +241,77 @@ pub fn paths_with_trigram(
     overlay: &TextOverlay,
     trigram: u32,
 ) -> Result<Vec<Vec<u8>>, SegmentError> {
-    let mut members = vec![Vec::<(u32, usize)>::new(); segments.len()];
-    for (index, record) in state.paths().iter().enumerate() {
-        if overlay.contains(&record.path) {
-            continue;
+    let members = TextMembers::build(state, membership, segments.len(), overlay);
+    paths_with_trigram_among(state, &members, segments, overlay, trigram)
+}
+
+/// The indexed paths of one checkout state, without those an overlay
+/// replaces, grouped by the segment their content is in: what
+/// [`paths_with_trigram_among`] reads for each trigram. Build it once for
+/// many trigrams over the same state and overlay.
+#[derive(Debug)]
+pub struct TextMembers {
+    /// Per segment: its members as (ordinal, path index), sorted, and their
+    /// distinct ordinals ascending.
+    segments: Vec<(Vec<(u32, usize)>, Vec<u32>)>,
+}
+
+impl TextMembers {
+    /// Groups the indexed paths of `state` across `segment_count` segments,
+    /// leaving out the paths `overlay` replaces.
+    #[must_use]
+    pub fn build(
+        state: &CheckoutState,
+        membership: &TextMembership,
+        segment_count: usize,
+        overlay: &TextOverlay,
+    ) -> Self {
+        let mut members = vec![Vec::<(u32, usize)>::new(); segment_count];
+        for (index, record) in state.paths().iter().enumerate() {
+            if overlay.contains(&record.path) {
+                continue;
+            }
+            if let Place::Indexed { segment, ordinal } = membership.places[index] {
+                members[segment as usize].push((ordinal, index));
+            }
         }
-        if let Place::Indexed { segment, ordinal } = membership.places[index] {
-            members[segment as usize].push((ordinal, index));
-        }
+        let segments = members
+            .into_iter()
+            .map(|mut members| {
+                members.sort_unstable();
+                let mut ordinals = members
+                    .iter()
+                    .map(|(ordinal, _)| *ordinal)
+                    .collect::<Vec<_>>();
+                ordinals.dedup();
+                (members, ordinals)
+            })
+            .collect();
+        Self { segments }
     }
+}
+
+/// [`paths_with_trigram`], with the paths grouped once in `members`, which
+/// was built from the same `state`, membership and `overlay`.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn paths_with_trigram_among(
+    state: &CheckoutState,
+    members: &TextMembers,
+    segments: &[TextSegment<'_>],
+    overlay: &TextOverlay,
+    trigram: u32,
+) -> Result<Vec<Vec<u8>>, SegmentError> {
     let mut found = Vec::new();
-    for (segment, mut members) in members.into_iter().enumerate() {
+    for (segment, (members, ordinals)) in members.segments.iter().enumerate() {
         if members.is_empty() {
             continue;
         }
-        members.sort_unstable();
-        let mut ordinals = members
-            .iter()
-            .map(|(ordinal, _)| *ordinal)
-            .collect::<Vec<_>>();
-        ordinals.dedup();
-        let hits = segments[segment].ordinals(trigram, 0, &ordinals)?;
+        let hits = segments[segment].ordinals(trigram, 0, ordinals)?;
         let mut hits = hits.into_iter().peekable();
-        for (ordinal, index) in members {
+        for &(ordinal, index) in members {
             while hits.peek().is_some_and(|hit| *hit < ordinal) {
                 hits.next();
             }

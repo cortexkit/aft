@@ -18,7 +18,9 @@ use crate::segment::{
     Alignment, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
     SectionKind, SectionSpec, Segment, SegmentError, SegmentWriter,
 };
-use crate::table::{LookupTable, LookupTableBuilder, UnitLocation, UnitTable, UnitTableBuilder};
+use crate::table::{
+    LookupTable, LookupTableBuilder, UnitLocation, UnitTable, UnitTableBuilder, UnitTableParts,
+};
 
 use super::trigrams::ContentTrigrams;
 
@@ -199,6 +201,18 @@ pub struct TextSegment<'s> {
     postings: SectionHandle,
 }
 
+/// A segment's text sections as [`TextSegment::open`] found and checked
+/// them, kept without the segment so a reader that holds the segment can
+/// rebuild the [`TextSegment`] for each query without reading it again
+/// (see [`TextSegment::with_sections`]).
+#[derive(Clone, Copy, Debug)]
+pub struct TextSections {
+    units: UnitTableParts,
+    data: SectionHandle,
+    lookup: SectionHandle,
+    postings: SectionHandle,
+}
+
 impl<'s> TextSegment<'s> {
     /// The segment's text sections, or `None` when it has none.
     ///
@@ -231,6 +245,33 @@ impl<'s> TextSegment<'s> {
             lookup: LookupTable::open(segment, lookup)?,
             postings,
         }))
+    }
+
+    /// What [`Self::open`] found and checked.
+    #[must_use]
+    pub fn sections(&self) -> TextSections {
+        TextSections {
+            units: self.units.parts(),
+            data: self.data,
+            lookup: self.lookup.section(),
+            postings: self.postings,
+        }
+    }
+
+    /// The text sections of `segment`, from what [`Self::sections`] took
+    /// from the same segment, without reading or checking them again.
+    ///
+    /// `sections` must come from `segment` itself: a section handle panics
+    /// on any other segment.
+    #[must_use]
+    pub fn with_sections(segment: &'s Segment, sections: TextSections) -> Self {
+        Self {
+            segment,
+            units: UnitTable::attach(segment, sections.units),
+            data: sections.data,
+            lookup: LookupTable::reopen(segment, sections.lookup),
+            postings: sections.postings,
+        }
     }
 
     /// How many contents the segment holds.
