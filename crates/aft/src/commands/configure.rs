@@ -3917,6 +3917,16 @@ fn handle_configure_prepared(
     ctx: &AppContext,
     prepared: Option<&Config>,
 ) -> Response {
+    let response = configure_prepared(req, ctx, prepared);
+    if response.success {
+        // The rebind's rescan runs in the configure tail, after this reply;
+        // marking it now keeps a query sent at once from answering without it.
+        crate::data_layer::runtime::rebind_configured(ctx);
+    }
+    response
+}
+
+fn configure_prepared(req: &RawRequest, ctx: &AppContext, prepared: Option<&Config>) -> Response {
     // The configuration active before a connect, kept only to recognise a
     // refused connect that left it in place.
     let active_before = prepared.is_none().then(|| ctx.config_unpinned());

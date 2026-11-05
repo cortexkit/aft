@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(payload["callgraph_store"]["reason"], "refresh_failed");
         assert_eq!(
             payload["callgraph_store"]["error"],
-            "call-graph resolution: resolver gave up"
+            "AFT could not build this checkout's call graph: resolver gave up"
         );
         assert_eq!(payload["search_index"]["status"], "ready");
         let health = ctx.try_health_snapshot(&root);
@@ -1083,7 +1083,7 @@ mod tests {
         assert!(payload["data_store"]["error"]
             .as_str()
             .unwrap()
-            .contains("data store"));
+            .contains("index store"));
         let health = ctx.try_health_snapshot(&root);
         assert_eq!(health.search_index.unwrap().status, "unavailable");
         assert_eq!(health.data_store.unwrap().reason, Some(reason::BIND_FAILED));
