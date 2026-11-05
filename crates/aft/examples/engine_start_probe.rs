@@ -61,6 +61,26 @@ fn main() {
                 .join(", ")
         );
     }
+    // AFT_PROBE_REFS="caller file|needle|target file:symbol,..." prints a
+    // caller's references and the callers reported for the targets.
+    if let Ok(spec) = std::env::var("AFT_PROBE_REFS") {
+        for probe in spec.split(';') {
+            let mut parts = probe.split('|');
+            let (Some(file), Some(needle), Some(targets)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let targets = targets
+                .split(',')
+                .filter_map(|target| target.split_once(':'))
+                .map(|(file, symbol)| (file.to_string(), symbol.to_string()))
+                .collect::<Vec<_>>();
+            for line in checkout.probe_references(file, needle, &targets).unwrap() {
+                println!("{line}");
+            }
+        }
+    }
     let started = Instant::now();
     let missing = checkout.check_stored_inputs().unwrap();
     println!(

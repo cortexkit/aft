@@ -105,6 +105,12 @@ fn input_terms(
         terms.push((TermKind::SiteKey, key.as_bytes().to_vec()));
     }
     let mut seen = BTreeSet::new();
+    if binding.unattributed {
+        terms.push((
+            TermKind::FactSubject,
+            super::incremental::UNATTRIBUTED_TERM.to_vec(),
+        ));
+    }
     for question in questions {
         let filed = subjects.entry(question.clone()).or_insert_with(|| {
             super::subjects::subjects(question, facts)

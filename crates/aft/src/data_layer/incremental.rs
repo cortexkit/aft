@@ -34,10 +34,14 @@ use crate::callgraph_store::join::{
 use crate::callgraph_store::DbFileIndex;
 use crate::callgraph_store::{go_module_map, rust_crate_map};
 
+use aft_store::graph::TermKind;
+
 use super::callgraph::{
     bind_all, dispatch_targets, resolve_files, resolver_index, CheckoutFacts, CheckoutInputs,
     FileResolution, MethodCallInputs, Surfaces,
 };
+use super::graph_store::StoredSlices;
+use super::subjects::{affected_by, subjects, Subject};
 
 /// What one update did, for measurement.
 #[derive(Clone, Debug, Default)]
@@ -69,13 +73,30 @@ pub struct UpdateStats {
 
 /// Which files recorded each input key, for one kind of recording: the
 /// reverse inputs a change is looked up in.
-#[derive(Debug, Default)]
+///
+/// An engine started from a publication keeps in memory only the files it
+/// filed since; every other file is found through the terms the
+/// publication stored for it (see `graph_store::input_terms`). A file set
+/// again or removed here replaces its stored terms.
+#[derive(Debug)]
 struct Readers {
+    kind: TermKind,
     by_key: HashMap<String, HashSet<String>>,
     keys_of: HashMap<String, BTreeSet<String>>,
+    /// Files whose stored terms of this kind no longer apply.
+    replaced: HashSet<String>,
 }
 
 impl Readers {
+    fn new(kind: TermKind) -> Self {
+        Self {
+            kind,
+            by_key: HashMap::new(),
+            keys_of: HashMap::new(),
+            replaced: HashSet::new(),
+        }
+    }
+
     fn set(&mut self, file: &str, keys: BTreeSet<String>) {
         self.remove(file);
         for key in &keys {
@@ -88,6 +109,7 @@ impl Readers {
     }
 
     fn remove(&mut self, file: &str) {
+        self.replaced.insert(file.to_string());
         let Some(keys) = self.keys_of.remove(file) else {
             return;
         };
@@ -101,18 +123,45 @@ impl Readers {
         }
     }
 
-    /// The files that recorded one of `keys`.
-    fn of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
-        keys.into_iter()
-            .filter_map(|key| self.by_key.get(key))
-            .flatten()
-            .cloned()
-            .collect()
+    /// The files that recorded one of `keys`: those filed in memory, and
+    /// those `stored` files under it that were not filed again since. A
+    /// stored term is a hash, so a few extra files may be listed; every
+    /// caller checks or redoes a listed file, so an extra one costs work,
+    /// never correctness.
+    fn of<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k String>,
+        stored: Option<&StoredSlices>,
+    ) -> BTreeSet<String> {
+        let mut files = BTreeSet::new();
+        for key in keys {
+            if let Some(found) = self.by_key.get(key) {
+                files.extend(found.iter().cloned());
+            }
+            if let Some(stored) = stored {
+                files.extend(
+                    stored
+                        .files_recording(self.kind, key.as_bytes())
+                        .into_iter()
+                        .filter(|file| !self.replaced.contains(file)),
+                );
+            }
+        }
+        files
     }
 }
 
+/// The key a [`Subject`] is filed under in memory: the bytes of its stored
+/// term.
+fn subject_key(subject: &Subject) -> String {
+    String::from_utf8_lossy(&subject.term()).into_owned()
+}
+
+/// Filed under this key: files with a configuration read attributed to no
+/// field, which any configuration change may change.
+pub(crate) const UNATTRIBUTED_TERM: &[u8] = b"u\0";
+
 /// Every reverse input of a checkout's resolution.
-#[derive(Debug, Default)]
 struct ReverseInputs {
     /// What each file's binding probed or read (pass 1).
     binding: Readers,
@@ -122,14 +171,57 @@ struct ReverseInputs {
     dispatch: Readers,
     /// The method-call dependency keys each file's sites recorded (pass 4).
     sites: Readers,
+    /// The paths and folders each file's recorded checkout reads consulted,
+    /// and [`UNATTRIBUTED_TERM`] for files with an unattributed
+    /// configuration read.
+    subjects: Readers,
+    /// The publication the engine started from, whose stored terms file
+    /// every file not filed again in memory.
+    stored: Option<Arc<StoredSlices>>,
 }
 
 impl ReverseInputs {
+    fn new(stored: Option<Arc<StoredSlices>>) -> Self {
+        Self {
+            binding: Readers::new(TermKind::BindingKey),
+            resolution: Readers::new(TermKind::ResolutionKey),
+            dispatch: Readers::new(TermKind::DispatchKey),
+            sites: Readers::new(TermKind::SiteKey),
+            subjects: Readers::new(TermKind::FactSubject),
+            stored,
+        }
+    }
+
+    fn binding_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        self.binding.of(keys, self.stored.as_deref())
+    }
+
+    fn resolution_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        self.resolution.of(keys, self.stored.as_deref())
+    }
+
+    fn dispatch_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        self.dispatch.of(keys, self.stored.as_deref())
+    }
+
+    fn sites_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        self.sites.of(keys, self.stored.as_deref())
+    }
+
+    fn subjects_of<'k>(&self, keys: impl IntoIterator<Item = &'k String>) -> BTreeSet<String> {
+        self.subjects.of(keys, self.stored.as_deref())
+    }
+
     fn note_prebound(&mut self, file: &str, binding: &ViewBindingDependencies) {
         self.binding.set(file, binding.dependencies.clone());
     }
 
-    fn note_resolution(&mut self, file: &str, resolution: &FileResolution) {
+    fn note_resolution(
+        &mut self,
+        file: &str,
+        resolution: &FileResolution,
+        facts: &CheckoutFacts<'_>,
+    ) {
         self.resolution
             .set(file, resolution.binding.dependencies.clone());
         match &resolution.dispatch {
@@ -141,6 +233,39 @@ impl ReverseInputs {
             None => self.dispatch.remove(file),
         }
         self.sites.set(file, resolution.site_dependencies.clone());
+        self.note_subjects(file, resolution, facts);
+    }
+
+    /// Files `file` under what its recorded reads consult in the checkout
+    /// `facts` answers for. Called again whenever its reads are asked
+    /// again: a read that still holds can consult other paths than it did
+    /// (a symlink on its way now points elsewhere).
+    fn note_subjects(
+        &mut self,
+        file: &str,
+        resolution: &FileResolution,
+        facts: &CheckoutFacts<'_>,
+    ) {
+        let questions = resolution
+            .binding
+            .answers()
+            .map(|(question, _)| question)
+            .chain(
+                resolution
+                    .dispatch
+                    .iter()
+                    .flat_map(|d| d.trace.answers.keys()),
+            );
+        let mut keys = BTreeSet::new();
+        for question in questions {
+            for subject in subjects(question, facts) {
+                keys.insert(subject_key(&subject));
+            }
+        }
+        if resolution.binding.unattributed {
+            keys.insert(String::from_utf8_lossy(UNATTRIBUTED_TERM).into_owned());
+        }
+        self.subjects.set(file, keys);
     }
 
     fn remove(&mut self, file: &str) {
@@ -148,6 +273,7 @@ impl ReverseInputs {
         self.resolution.remove(file);
         self.dispatch.remove(file);
         self.sites.remove(file);
+        self.subjects.remove(file);
     }
 }
 
@@ -182,43 +308,40 @@ impl LiveCheckout {
     /// index holds, and lists every key whose readers the stored terms miss.
     /// For gates: the engine will look changes up in the stored terms
     /// instead of keeping this index.
-    pub(crate) fn stored_readers_missing(
-        &self,
-        stored: &super::graph_store::StoredSlices,
-    ) -> Vec<String> {
-        use aft_store::graph::TermKind;
-        let mut missing = Vec::new();
-        let kinds = [
-            (TermKind::BindingKey, &self.reverse.binding),
-            (TermKind::ResolutionKey, &self.reverse.resolution),
-            (TermKind::DispatchKey, &self.reverse.dispatch),
-            (TermKind::SiteKey, &self.reverse.sites),
-        ];
-        for (kind, readers) in kinds {
-            for (key, files) in &readers.by_key {
-                let found = stored.files_recording(kind, key.as_bytes());
-                let lost = files.iter().filter(|file| !found.contains(*file)).count();
-                if lost > 0 && missing.len() < 50 {
-                    missing.push(format!("{kind:?} {key}: {lost} readers not filed"));
-                }
-            }
-        }
-        // Every recorded read is filed under what it consulted.
+    pub(crate) fn stored_readers_missing(&self, stored: &StoredSlices) -> Vec<String> {
+        // The index a cold engine builds in memory from every file.
         let facts = CheckoutFacts {
             inputs: &self.inputs,
         };
+        let mut built = ReverseInputs::new(None);
+        for (path, binding) in &self.prebound {
+            built.note_prebound(path, binding);
+        }
         for (path, file) in &self.resolved {
-            let questions = file
-                .binding
-                .answers()
-                .map(|(question, _)| question)
-                .chain(file.dispatch.iter().flat_map(|d| d.trace.answers.keys()));
-            for question in questions {
-                for subject in super::subjects::subjects(question, &facts) {
-                    let found = stored.files_recording(TermKind::FactSubject, &subject.term());
-                    if !found.contains(path) && missing.len() < 50 {
-                        missing.push(format!("{path}: {question:?} not filed under {subject:?}"));
-                    }
+            built.note_resolution(path, file, &facts);
+        }
+        let mut missing = Vec::new();
+        let kinds = [
+            &built.binding,
+            &built.resolution,
+            &built.dispatch,
+            &built.sites,
+            &built.subjects,
+        ];
+        for readers in kinds {
+            for (key, files) in &readers.by_key {
+                let found = stored.files_recording(readers.kind, key.as_bytes());
+                let lost = files
+                    .iter()
+                    .filter(|file| !found.contains(*file))
+                    .collect::<Vec<_>>();
+                if !lost.is_empty() && missing.len() < 50 {
+                    missing.push(format!(
+                        "{:?} {key:?}: {} readers not filed, e.g. {}",
+                        readers.kind,
+                        lost.len(),
+                        lost[0]
+                    ));
                 }
             }
         }
@@ -261,61 +384,90 @@ impl LiveCheckout {
         stale
     }
 
-    /// Asks every distinct recorded checkout read again of `inputs`, and
-    /// lists the files with a read whose answer differs.
-    fn stale_answers(&self, inputs: &CheckoutInputs, configs_changed: bool) -> StaleAnswers {
+    /// Asks again each recorded checkout read of the files whose reads
+    /// consulted something in `changed` (or, when `configs_changed`, read a
+    /// configuration without naming a field), and lists the files with a
+    /// read whose answer differs. Files whose reads all hold are filed again
+    /// under what those reads consult now.
+    fn stale_answers(&mut self, changed: &BTreeSet<String>, configs_changed: bool) -> StaleAnswers {
         /// Whether any of `answers` differs now; each distinct read is asked
         /// once and kept in `now`.
-        fn differs<'a>(
-            answers: &'a FactAnswers,
-            now: &mut HashMap<&'a FactQuestion, FactAnswer>,
+        fn differs(
+            answers: &FactAnswers,
+            now: &mut HashMap<FactQuestion, FactAnswer>,
             facts: &dyn ProjectFacts,
         ) -> bool {
             let mut any = false;
             for (question, recorded) in answers {
                 let answer = now
-                    .entry(question)
+                    .entry(question.clone())
                     .or_insert_with(|| question.answer(facts));
                 any |= answer != recorded;
             }
             any
         }
+        let mut keys = BTreeSet::new();
+        for path in changed {
+            for subject in affected_by(path.as_bytes()) {
+                keys.insert(subject_key(&subject));
+            }
+        }
+        if configs_changed {
+            keys.insert(String::from_utf8_lossy(UNATTRIBUTED_TERM).into_owned());
+        }
+        let files = self.reverse.subjects_of(&keys);
+        let inputs = &self.inputs;
         let facts = CheckoutFacts { inputs };
-        let mut now = HashMap::<&FactQuestion, FactAnswer>::new();
+        let mut now = HashMap::<FactQuestion, FactAnswer>::new();
         let mut stale = StaleAnswers::default();
-        let files = self.resolved.iter().collect::<Vec<_>>();
-        for (path, file) in &files {
+        let mut held = Vec::new();
+        for path in &files {
+            let Some(file) = self.resolved.get(path) else {
+                continue;
+            };
+            let mut any = false;
             // A configuration read the resolver attributed to no field is
             // recorded without its answer, so any configuration change may
             // change it.
             if differs(&file.binding.binding_answers, &mut now, &facts)
                 || (configs_changed && file.binding.unattributed)
             {
-                stale.binding.insert((*path).clone());
+                stale.binding.insert(path.clone());
+                any = true;
             }
             if differs(&file.binding.resolution_answers, &mut now, &facts) {
-                stale.resolution.insert((*path).clone());
+                stale.resolution.insert(path.clone());
+                any = true;
             }
             if let Some(dispatch) = &file.dispatch {
                 if differs(&dispatch.trace.answers, &mut now, &facts) {
-                    stale.dispatch.insert((*path).clone());
+                    stale.dispatch.insert(path.clone());
+                    any = true;
                 }
+            }
+            if !any {
+                held.push(path.clone());
             }
         }
         stale.checked = now.len();
         stale.changed = files
             .iter()
-            .flat_map(|(_, file)| {
+            .filter_map(|path| self.resolved.get(path))
+            .flat_map(|file| {
                 file.binding
                     .answers()
                     .chain(file.dispatch.iter().flat_map(|d| d.trace.answers.iter()))
             })
             .filter(|(question, recorded)| {
-                now.get(question).is_some_and(|answer| answer != *recorded)
+                now.get(*question).is_some_and(|answer| answer != *recorded)
             })
             .map(|(question, _)| question)
             .collect::<BTreeSet<_>>()
             .len();
+        for path in held {
+            let file = &self.resolved[&path];
+            self.reverse.note_subjects(&path, file, &facts);
+        }
         stale
     }
 
@@ -339,12 +491,13 @@ impl LiveCheckout {
             }
             Ok::<_, ManifestJoinError>((surfaces, prebound, resolved, calls))
         })?;
-        let mut reverse = ReverseInputs::default();
+        let mut reverse = ReverseInputs::new(None);
+        let facts = CheckoutFacts { inputs: &inputs };
         for (path, binding) in &prebound {
             reverse.note_prebound(path, binding);
         }
         for (path, file) in &resolved {
-            reverse.note_resolution(path, file);
+            reverse.note_resolution(path, file, &facts);
         }
         Ok(Self {
             inputs,
@@ -368,15 +521,18 @@ impl LiveCheckout {
     pub(crate) fn from_resolved(
         inputs: CheckoutInputs,
         resolved: BTreeMap<String, FileResolution>,
+        stored: Arc<StoredSlices>,
         threads: usize,
     ) -> Result<Self, ManifestJoinError> {
-        Self::from_resolved_timed(inputs, resolved, threads, &mut Vec::new())
+        Self::from_resolved_timed(inputs, resolved, stored, threads, &mut Vec::new())
     }
 
-    /// [`Self::from_resolved`], adding each step's time to `timings`.
+    /// [`Self::from_resolved`], adding each step's time to `timings`. The
+    /// files' reverse inputs are read from `stored`'s terms, not built.
     pub(crate) fn from_resolved_timed(
         inputs: CheckoutInputs,
         resolved: BTreeMap<String, FileResolution>,
+        stored: Arc<StoredSlices>,
         threads: usize,
         timings: &mut Vec<(&'static str, f64)>,
     ) -> Result<Self, ManifestJoinError> {
@@ -393,15 +549,7 @@ impl LiveCheckout {
         })?;
         timings.push(("bind every file", bind_ms));
         timings.push(("method-call inputs", calls_ms));
-        let started = Instant::now();
-        let mut reverse = ReverseInputs::default();
-        for (path, binding) in &prebound {
-            reverse.note_prebound(path, binding);
-        }
-        for (path, file) in &resolved {
-            reverse.note_resolution(path, file);
-        }
-        timings.push(("reverse input index", ms(started)));
+        let reverse = ReverseInputs::new(Some(stored));
         Ok(Self {
             inputs,
             surfaces,
@@ -532,8 +680,9 @@ impl LiveCheckout {
         let stale = if membership.is_empty() && links.is_empty() && configs.is_empty() {
             StaleAnswers::default()
         } else {
-            self.stale_answers(inputs, !configs.is_empty())
+            self.stale_answers(changed, !configs.is_empty())
         };
+        let inputs = &self.inputs;
         stats.answers_checked = stale.checked;
         stats.answers_changed = stale.changed;
         stats.facts_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -551,7 +700,7 @@ impl LiveCheckout {
         if rust_crates_changed {
             binding_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
         }
-        let mut rebind = self.reverse.binding.of(&binding_keys);
+        let mut rebind = self.reverse.binding_of(&binding_keys);
         rebind.extend(contents.iter().cloned());
         rebind.extend(stale.binding.iter().cloned());
         rebind.retain(|path| inputs.parses.contains_key(path));
@@ -653,7 +802,7 @@ impl LiveCheckout {
             }
         }
         let mut answers = BTreeMap::new();
-        for path in self.reverse.resolution.of(&changed_keys) {
+        for path in self.reverse.resolution_of(&changed_keys) {
             if resolve.contains(&path) {
                 continue;
             }
@@ -680,7 +829,8 @@ impl LiveCheckout {
                 let mut binding = self.prebound[path.as_str()].clone();
                 binding.reuse_resolution(&old.binding);
                 old.binding = binding;
-                self.reverse.note_resolution(path, old);
+                self.reverse
+                    .note_resolution(path, old, &CheckoutFacts { inputs });
             }
         }
         let paths = resolve.iter().collect::<Vec<_>>();
@@ -692,7 +842,8 @@ impl LiveCheckout {
                 file.sites = old.sites;
                 file.site_dependencies = old.site_dependencies;
             }
-            self.reverse.note_resolution(&path, &file);
+            self.reverse
+                .note_resolution(&path, &file, &CheckoutFacts { inputs });
             self.resolved.insert(path, file);
         }
         stats.resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -708,7 +859,7 @@ impl LiveCheckout {
                 recompute.push(path.clone());
             }
         }
-        for path in self.reverse.dispatch.of(&trace_keys) {
+        for path in self.reverse.dispatch_of(&trace_keys) {
             if resolve.contains(&path) {
                 continue;
             }
@@ -736,7 +887,8 @@ impl LiveCheckout {
             let dispatch = dispatch_targets(path, parse, &index, &facts)?;
             let file = self.resolved.get_mut(path).expect("kept");
             file.dispatch = dispatch;
-            self.reverse.note_resolution(path, file);
+            self.reverse
+                .note_resolution(path, file, &CheckoutFacts { inputs });
         }
         stats.dispatch_recomputed = recompute.len();
         stats.dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -763,7 +915,7 @@ impl LiveCheckout {
                 sites.insert(path.clone());
             }
         }
-        sites.extend(self.reverse.sites.of(&site_keys));
+        sites.extend(self.reverse.sites_of(&site_keys));
         sites.retain(|path| inputs.parses.contains_key(path));
         let paths = sites.iter().collect::<Vec<_>>();
         for (path, kept, dependencies) in self.calls.resolve_sites(inputs, &paths) {

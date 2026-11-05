@@ -987,6 +987,74 @@ impl Checkout {
         Ok(engine.live.stored_readers_missing(&published.graph))
     }
 
+    /// The references of `file` whose text contains `needle`, each with the
+    /// rows its resolution stored, and the callers `callers` reports for
+    /// each `(target file, symbol)` in `targets`. For diagnosing a missed
+    /// edge on a real checkout.
+    ///
+    /// # Errors
+    ///
+    /// When there is no publication, or the engine cannot start.
+    #[doc(hidden)]
+    pub fn probe_references(
+        &self,
+        file: &str,
+        needle: &str,
+        targets: &[(String, String)],
+    ) -> Result<Vec<String>, DataError> {
+        let published = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .published
+            .clone()
+            .ok_or_else(|| DataError::Resolve("nothing is published".to_string()))?;
+        let engine = self.start_engine_timed(&published, &mut Vec::new())?;
+        let live = &engine.live;
+        let mut lines = Vec::new();
+        if let (Some((_, parse)), Some(resolution)) =
+            (live.inputs.parses.get(file), live.resolved.get(file))
+        {
+            for reference in &parse.refs {
+                let text = format!("{reference:?}");
+                if !text.contains(needle) {
+                    continue;
+                }
+                lines.push(format!(
+                    "ref {}",
+                    text.chars().take(400).collect::<String>()
+                ));
+                for row in resolution
+                    .rows
+                    .iter()
+                    .filter(|row| row.ref_ordinal == reference.ordinal)
+                {
+                    lines.push(format!("  row {row:?}"));
+                }
+            }
+        } else {
+            lines.push(format!("{file}: no parse or resolution"));
+        }
+        let view = self
+            .view()
+            .ok_or_else(|| DataError::Resolve("nothing is published".to_string()))?;
+        for (target, symbol) in targets {
+            let callers = crate::commands::callgraph_store_adapter::callers_result(
+                &view.callgraph(),
+                &view.root().join(target),
+                symbol,
+                1,
+                true,
+            );
+            let text = format!("{callers:?}");
+            lines.push(format!(
+                "callers of {target}::{symbol}: {}",
+                text.chars().take(600).collect::<String>()
+            ));
+        }
+        Ok(lines)
+    }
+
     fn start_engine_timed(
         &self,
         published: &Arc<Published>,
@@ -1007,8 +1075,14 @@ impl Checkout {
             parses,
             configs,
         };
-        let live = LiveCheckout::from_resolved_timed(inputs, resolved, self.layer.threads, timings)
-            .map_err(|error| DataError::Resolve(error.to_string()))?;
+        let live = LiveCheckout::from_resolved_timed(
+            inputs,
+            resolved,
+            Arc::clone(&published.graph),
+            self.layer.threads,
+            timings,
+        )
+        .map_err(|error| DataError::Resolve(error.to_string()))?;
         Ok(GraphEngine {
             published: Arc::clone(published),
             live,
