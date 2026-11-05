@@ -136,9 +136,14 @@ mod tests {
             ("entry_points", lines(&snapshot.entry_points)),
             (
                 "entry_point_symbols",
-                lines(snapshot.entry_point_symbols.iter().flat_map(|(file, symbols)| {
-                    symbols.iter().map(move |symbol| (file, symbol))
-                })),
+                lines(
+                    snapshot
+                        .entry_point_symbols
+                        .iter()
+                        .flat_map(|(file, symbols)| {
+                            symbols.iter().map(move |symbol| (file, symbol))
+                        }),
+                ),
             ),
             ("go_initializers", lines(&snapshot.go_initializers)),
         ]
