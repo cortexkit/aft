@@ -884,6 +884,7 @@ pub fn separator() -> char {
     /// has no view to read one from, even when a publication exists.
     #[test]
     fn with_the_data_layer_off_nothing_reads_records() {
+        crate::data_layer::runtime::force_off_for_test();
         assert!(!crate::data_layer::runtime::enabled());
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

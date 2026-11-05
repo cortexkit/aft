@@ -3743,6 +3743,72 @@ pub fn other() { callee(); }
         assert!(callers.contains("src/extra.rs"), "{callers}");
     }
 
+    /// A workspace package renamed to the name a caller imports: the caller's
+    /// recorded miss must reach it through the published store, after a
+    /// restart as well as in the process that built it.
+    #[test]
+    fn a_workspace_package_rename_reaches_its_importer_through_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write(
+            root.path(),
+            "packages/pkg/package.json",
+            r#"{"name":"@scope/old"}"#,
+        );
+        write(
+            root.path(),
+            "packages/pkg/src/index.ts",
+            "export function target(): string { return 'ok'; }\n",
+        );
+        write(
+            root.path(),
+            "packages/app/package.json",
+            r#"{"name":"app"}"#,
+        );
+        write(
+            root.path(),
+            "packages/app/src/main.ts",
+            "import { target } from '@scope/new';\nexport function run(): string { return target(); }\n",
+        );
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let built =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        built.build().unwrap();
+        let index = "packages/pkg/src/index.ts";
+        assert!(
+            !callers_of(&built.view().unwrap(), index, "target").contains("main.ts"),
+            "no package has the imported name yet"
+        );
+        write(
+            root.path(),
+            "packages/pkg/package.json",
+            r#"{"name":"@scope/new"}"#,
+        );
+
+        // In the process that built it: the change is recorded.
+        built
+            .record_paths(&[b"packages/pkg/package.json".to_vec()])
+            .unwrap();
+        built.refresh_callgraph().unwrap();
+        let live = callers_of(&built.view().unwrap(), index, "target");
+        drop(built);
+
+        // After a restart: the bind finds the change against the publication.
+        let restarted = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        restarted.refresh_callgraph().unwrap();
+        let after_restart = callers_of(&restarted.view().unwrap(), index, "target");
+        assert!(live.contains("main.ts"), "recorded change: {live}");
+        assert!(
+            after_restart.contains("main.ts"),
+            "after restart: {after_restart}"
+        );
+    }
+
     #[test]
     fn a_rescan_records_what_changed_unreported_while_bound() {
         let root = tempfile::tempdir().unwrap();

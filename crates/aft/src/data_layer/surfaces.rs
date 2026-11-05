@@ -1278,6 +1278,7 @@ mod tests {
 
     #[test]
     fn with_the_data_layer_off_every_surface_reports_todays_stores() {
+        crate::data_layer::runtime::force_off_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

@@ -37,8 +37,8 @@ use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 #[must_use]
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
-    if FORCED_ON.with(std::cell::Cell::get) {
-        return true;
+    if let Some(forced) = FORCED.with(std::cell::Cell::get) {
+        return forced;
     }
     // On by default while the cutover removes today's stores; `AFT_DATA_LAYER=0`
     // runs today's route, so a test run can tell a new failure from an old one.
@@ -47,14 +47,21 @@ pub(crate) fn enabled() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    static FORCED_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Turns the data layer on for the calling thread, so a test can run tools
 /// against it without setting the process-wide switch other tests read.
 #[cfg(test)]
 pub(crate) fn force_on_for_test() {
-    FORCED_ON.with(|forced| forced.set(true));
+    FORCED.with(|forced| forced.set(Some(true)));
+}
+
+/// Turns the data layer off for the calling thread, for a test of today's
+/// route now that the data layer is on by default.
+#[cfg(test)]
+pub(crate) fn force_off_for_test() {
+    FORCED.with(|forced| forced.set(Some(false)));
 }
 
 /// The process's data layer, once the first checkout binds.
