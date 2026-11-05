@@ -210,6 +210,11 @@ impl TextOverlay {
         self.entries.remove(path);
     }
 
+    /// Keeps only the paths `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&[u8]) -> bool) {
+        self.entries.retain(|path, _| keep(path));
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

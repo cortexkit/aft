@@ -11,7 +11,7 @@
 //! until the view drops. A view answers text and call-graph queries; it is
 //! immutable, so a query never sees a half-applied change.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -25,8 +25,8 @@ use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId};
 use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
-    candidates, ContentTrigrams, Query, Scope, TextLocator, TextMembership, TextOverlay,
-    TextSectionsBuilder, TextSegment, TextStatus,
+    candidates, ContentTrigrams, OverlayEntry, Query, Scope, TextLocator, TextMembership,
+    TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
 use super::callgraph::{resolve_checkout, CheckoutInputs};
@@ -99,7 +99,43 @@ pub struct Checkout {
     root: PathBuf,
     family: Family,
     checkout: CheckoutId,
-    view: RwLock<Option<Arc<CheckoutView>>>,
+    /// The last published generation, and the changes made since.
+    live: RwLock<Live>,
+}
+
+/// A checkout's current data: its last publication and the changes made
+/// since, which queries see in place of the published records.
+#[derive(Default)]
+struct Live {
+    published: Option<Arc<Published>>,
+    /// Changed contents' trigrams by path, which text queries see at once.
+    text: Arc<TextOverlay>,
+    /// Paths changed since the publication whose call graph is not
+    /// resolved yet.
+    callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
+    /// Whether a build is running.
+    building: bool,
+    /// Counts recorded changes; each changed path keeps the count of its
+    /// latest change, so a build knows which changes its scan covered.
+    sequence: u64,
+    changed_at: BTreeMap<Vec<u8>, u64>,
+}
+
+/// One changed path, as an edit or the watcher reports it.
+#[derive(Clone, Debug)]
+pub enum PathChange {
+    /// The file at the path now holds these bytes.
+    Written { path: Vec<u8>, bytes: Arc<[u8]> },
+    /// The path no longer exists.
+    Removed { path: Vec<u8> },
+}
+
+impl PathChange {
+    fn path(&self) -> &[u8] {
+        match self {
+            Self::Written { path, .. } | Self::Removed { path } => path,
+        }
+    }
 }
 
 /// What a build did.
@@ -139,11 +175,11 @@ impl Checkout {
             root: root.to_path_buf(),
             family,
             checkout,
-            view: RwLock::new(None),
+            live: RwLock::new(Live::default()),
         };
         let snapshot = handle.family.snapshot().map_err(DataError::store)?;
-        if let Some(view) = handle.open_view(&snapshot)? {
-            *handle.view.write().expect("no panics while holding it") = Some(Arc::new(view));
+        if let Some(published) = handle.open_published(&snapshot)? {
+            handle.write_live().published = Some(Arc::new(published));
         }
         Ok(handle)
     }
@@ -154,13 +190,85 @@ impl Checkout {
         &self.root
     }
 
-    /// The published view, if the checkout has been built.
+    fn write_live(&self) -> std::sync::RwLockWriteGuard<'_, Live> {
+        self.live.write().expect("no panics while holding it")
+    }
+
+    /// The checkout's data as queries see it now: the last publication with
+    /// the changes made since laid over it. `None` until the first build
+    /// publishes.
     #[must_use]
-    pub fn view(&self) -> Option<Arc<CheckoutView>> {
-        self.view
+    pub fn view(&self) -> Option<CheckoutView> {
+        let live = self.live.read().expect("no panics while holding it");
+        Some(CheckoutView {
+            published: Arc::clone(live.published.as_ref()?),
+            text: Arc::clone(&live.text),
+            callgraph_pending: Arc::clone(&live.callgraph_pending),
+        })
+    }
+
+    /// How each plane stands, for status and for replies that disclose
+    /// what they could not cover.
+    #[must_use]
+    pub fn status(&self) -> CheckoutStatus {
+        if let Some(view) = self.view() {
+            return view.status();
+        }
+        let plane = if self
+            .live
             .read()
             .expect("no panics while holding it")
-            .clone()
+            .building
+        {
+            PlaneStatus::Building {
+                done: 0,
+                total: None,
+            }
+        } else {
+            PlaneStatus::Off
+        };
+        CheckoutStatus {
+            text: plane,
+            callgraph: plane,
+        }
+    }
+
+    /// Records changed paths, so queries see them at once: text queries
+    /// read each written file's new trigrams, and the call graph reports
+    /// the paths as pending until they are resolved again.
+    pub fn record_changes(&self, changes: &[PathChange]) {
+        if changes.is_empty() {
+            return;
+        }
+        let max = self.layer.policy.max_indexed_len;
+        let entries = changes
+            .iter()
+            .map(|change| {
+                let entry = match change {
+                    PathChange::Removed { .. } => OverlayEntry::Deleted,
+                    PathChange::Written { bytes, .. } => {
+                        if bytes.len() as u64 > max || bytes.contains(&0) {
+                            OverlayEntry::Unindexed
+                        } else {
+                            OverlayEntry::Content(Arc::new(ContentTrigrams::of(bytes)))
+                        }
+                    }
+                };
+                (change.path().to_vec(), entry)
+            })
+            .collect::<Vec<_>>();
+        let mut live = self.write_live();
+        live.sequence += 1;
+        let sequence = live.sequence;
+        let mut text = (*live.text).clone();
+        let mut pending = (*live.callgraph_pending).clone();
+        for (path, entry) in entries {
+            pending.insert(path.clone());
+            live.changed_at.insert(path.clone(), sequence);
+            text.set(path, entry);
+        }
+        live.text = Arc::new(text);
+        live.callgraph_pending = Arc::new(pending);
     }
 
     /// Scans the checkout, builds every plane cold, publishes them, and
@@ -171,6 +279,20 @@ impl Checkout {
     /// When the scan, resolution or store fails. Nothing is published then,
     /// and the previous view, if any, keeps serving.
     pub fn build(&self) -> Result<BuildReport, DataError> {
+        self.write_live().building = true;
+        let result = self.build_inner();
+        self.write_live().building = false;
+        result
+    }
+
+    fn build_inner(&self) -> Result<BuildReport, DataError> {
+        // A change recorded before the scan starts is in what the scan
+        // reads; one recorded later may not be.
+        let covered = self
+            .live
+            .read()
+            .expect("no panics while holding it")
+            .sequence;
         let mut report = BuildReport::default();
         let started = Instant::now();
         let sink = BuildSink::default();
@@ -265,8 +387,8 @@ impl Checkout {
         report.publish_ms = elapsed_ms(started);
 
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        let view = self
-            .open_view(&snapshot)?
+        let published = self
+            .open_published(&snapshot)?
             .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
         report.segment_bytes = snapshot
             .manifest()
@@ -274,13 +396,30 @@ impl Checkout {
             .iter()
             .map(|entry| entry.len)
             .sum();
-        *self.view.write().expect("no panics while holding it") = Some(Arc::new(view));
+        // The scan read every file as it was once the scan started, so the
+        // build covers every change recorded before then. A change recorded
+        // while it ran may be newer than what it read, so it stays laid over
+        // the new publication.
+        let mut live = self.write_live();
+        live.published = Some(Arc::new(published));
+        live.changed_at.retain(|_, sequence| *sequence > covered);
+        let kept = live.changed_at.keys().cloned().collect::<BTreeSet<_>>();
+        let mut text = (*live.text).clone();
+        text.retain(|path| kept.contains(path));
+        live.text = Arc::new(text);
+        live.callgraph_pending = Arc::new(
+            live.callgraph_pending
+                .iter()
+                .filter(|path| kept.contains(*path))
+                .cloned()
+                .collect(),
+        );
         Ok(report)
     }
 
-    /// The view of this checkout in `snapshot`, or `None` when the
+    /// This checkout's publication in `snapshot`, or `None` when the
     /// snapshot has no state for it.
-    fn open_view(&self, snapshot: &Snapshot) -> Result<Option<CheckoutView>, DataError> {
+    fn open_published(&self, snapshot: &Snapshot) -> Result<Option<Published>, DataError> {
         let Some(state) = snapshot
             .checkout_state(self.checkout)
             .map_err(DataError::store)?
@@ -299,7 +438,7 @@ impl Checkout {
                     .map_err(DataError::store)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        CheckoutView::open(self.root.clone(), state, segments).map(Some)
+        Published::open(self.root.clone(), state, segments).map(Some)
     }
 }
 
@@ -308,8 +447,9 @@ fn elapsed_ms(started: Instant) -> f64 {
 }
 
 /// A published generation of one checkout: its state and segments, and
-/// what each plane needs to answer from them.
-pub struct CheckoutView {
+/// what each plane needs to answer from them. Immutable: its segments stay
+/// readable for as long as anything holds it.
+struct Published {
     root: PathBuf,
     state: CheckoutState,
     segments: Vec<Arc<Segment>>,
@@ -317,7 +457,37 @@ pub struct CheckoutView {
     graph: Arc<StoredSlices>,
 }
 
-impl CheckoutView {
+/// How one plane of a checkout stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PlaneStatus {
+    /// Not built, and no build running.
+    Off,
+    /// Being built or brought up to date: `done` of `total` items, when the
+    /// total is known.
+    Building { done: usize, total: Option<usize> },
+    /// Answers cover every path of the checkout.
+    Ready,
+}
+
+/// How each plane of a checkout stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct CheckoutStatus {
+    pub text: PlaneStatus,
+    pub callgraph: PlaneStatus,
+}
+
+/// A checkout's data as queries see it at one moment: the last publication
+/// with the changes recorded since. Cheap to take; it holds the publication
+/// open until it drops, so a query never sees a half-applied change.
+#[derive(Clone)]
+pub struct CheckoutView {
+    published: Arc<Published>,
+    text: Arc<TextOverlay>,
+    callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
+}
+
+impl Published {
     fn open(
         root: PathBuf,
         state: CheckoutState,
@@ -358,29 +528,63 @@ impl CheckoutView {
         })
     }
 
+    fn texts(&self) -> Result<Vec<TextSegment<'_>>, DataError> {
+        self.segments
+            .iter()
+            .filter_map(|segment| TextSegment::open(segment).transpose())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DataError::store)
+    }
+}
+
+impl CheckoutView {
     /// The checkout's root folder.
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.published.root
     }
 
-    /// The checkout's paths, in byte order, with their contents and stat
-    /// evidence.
+    /// The checkout's paths as last published, in byte order, with their
+    /// contents and stat evidence. Paths changed since are in
+    /// [`changed_paths`](Self::changed_paths).
     #[must_use]
     pub fn state(&self) -> &CheckoutState {
-        &self.state
+        &self.published.state
     }
 
-    /// How many members' contents no segment indexes yet; they are always
-    /// candidates.
+    /// The paths changed since the publication, which queries answer from
+    /// the changes rather than from [`state`](Self::state).
     #[must_use]
-    pub fn unindexed_text(&self) -> usize {
-        self.membership.missing()
+    pub fn changed_paths(&self) -> Vec<Vec<u8>> {
+        self.callgraph_pending.iter().cloned().collect()
     }
 
-    /// The paths in `scope` that may match `query`, plus `overlay`'s paths
-    /// in scope that may, in byte order. Every match is among them; some
-    /// may not match, so the caller reads each and checks.
+    /// How each plane stands in this view.
+    #[must_use]
+    pub fn status(&self) -> CheckoutStatus {
+        let paths = self.published.state.paths().len();
+        let text = match self.published.membership.missing() {
+            0 => PlaneStatus::Ready,
+            missing => PlaneStatus::Building {
+                done: paths.saturating_sub(missing),
+                total: Some(paths),
+            },
+        };
+        let callgraph = match self.callgraph_pending.len() {
+            0 => PlaneStatus::Ready,
+            pending => PlaneStatus::Building {
+                done: 0,
+                total: Some(pending),
+            },
+        };
+        CheckoutStatus { text, callgraph }
+    }
+
+    /// The paths in `scope` that may match `query`, in byte order, with the
+    /// changes since the publication applied. Every match is among them;
+    /// some may not match, so the caller reads each and checks. A path
+    /// whose content is not indexed (binary, too large, not yet read) is
+    /// always a candidate.
     ///
     /// # Errors
     ///
@@ -389,26 +593,29 @@ impl CheckoutView {
         &self,
         query: &Query,
         scope: Scope<'_>,
-        overlay: &TextOverlay,
     ) -> Result<Vec<Vec<u8>>, DataError> {
-        let texts = self
-            .segments
-            .iter()
-            .filter_map(|segment| TextSegment::open(segment).transpose())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DataError::store)?;
-        candidates(&self.state, &self.membership, &texts, overlay, query, scope)
-            .map_err(DataError::store)
+        let published = &self.published;
+        let texts = published.texts()?;
+        candidates(
+            &published.state,
+            &published.membership,
+            &texts,
+            &self.text,
+            query,
+            scope,
+        )
+        .map_err(DataError::store)
     }
 
-    /// The call graph of this generation, as the call-graph commands read
-    /// it.
+    /// The call graph of the publication, as the call-graph commands read
+    /// it. Files in [`changed_paths`](Self::changed_paths) answer as they
+    /// were published until they are resolved again; the status says so.
     #[must_use]
     pub(crate) fn callgraph(&self) -> SliceReader<Arc<StoredSlices>> {
         SliceReader::new(
-            Arc::clone(&self.graph),
-            self.root.clone(),
-            self.root.display().to_string(),
+            Arc::clone(&self.published.graph),
+            self.published.root.clone(),
+            self.published.root.display().to_string(),
         )
     }
 
@@ -417,7 +624,7 @@ impl CheckoutView {
     /// that was a failure.
     #[must_use]
     pub fn callgraph_failures(&self) -> Vec<String> {
-        self.graph.failures()
+        self.published.graph.failures()
     }
 }
 
@@ -621,9 +828,7 @@ mod tests {
 
         let check = |view: &CheckoutView| {
             let query = plan_pattern("callee", false).unwrap();
-            let found = view
-                .text_candidates(&query, Scope::All, &TextOverlay::new())
-                .unwrap();
+            let found = view.text_candidates(&query, Scope::All).unwrap();
             assert_eq!(found, vec![b"src/lib.rs".to_vec(), b"src/util.rs".to_vec()]);
             let callers = callers_of(view, "src/util.rs", "callee");
             assert!(callers.contains("caller"), "{callers}");
@@ -631,15 +836,51 @@ mod tests {
             assert!(view.callgraph_failures().is_empty());
         };
         check(&checkout.view().unwrap());
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+
+        // An edit is visible to text queries at once, and the call graph
+        // reports it pending until the next build covers it.
+        write(root.path(), "notes.txt", "now mentions callee\n");
+        checkout.record_changes(&[PathChange::Written {
+            path: b"notes.txt".to_vec(),
+            bytes: Arc::from(&b"now mentions callee\n"[..]),
+        }]);
+        let query = plan_pattern("callee", false).unwrap();
+        let three = vec![
+            b"notes.txt".to_vec(),
+            b"src/lib.rs".to_vec(),
+            b"src/util.rs".to_vec(),
+        ];
+        let view = checkout.view().unwrap();
+        assert_eq!(view.text_candidates(&query, Scope::All).unwrap(), three);
+        assert_eq!(
+            checkout.status().callgraph,
+            PlaneStatus::Building {
+                done: 0,
+                total: Some(1)
+            }
+        );
+        drop(view);
+        checkout.build().unwrap();
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let view = checkout.view().unwrap();
+        assert!(view.changed_paths().is_empty());
+        assert_eq!(
+            view.text_candidates(&query, Scope::All).unwrap(),
+            three,
+            "the rebuild indexed the edit"
+        );
+        drop(view);
 
         // A restarted process binds the same checkout and serves the
         // published generation without building.
         drop(checkout);
         let restarted = Checkout::bind(layer, store.path(), family, root.path()).unwrap();
-        check(
-            &restarted
-                .view()
-                .expect("the published view is served at bind"),
-        );
+        let view = restarted
+            .view()
+            .expect("the published view is served at bind");
+        assert_eq!(view.text_candidates(&query, Scope::All).unwrap(), three);
+        let callers = callers_of(&view, "src/util.rs", "callee");
+        assert!(callers.contains("src/lib.rs"), "{callers}");
     }
 }
