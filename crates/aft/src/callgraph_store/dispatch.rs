@@ -1096,7 +1096,8 @@ pub(crate) fn extract_with<'tree>(
         let dynamic = syntactic_dynamic(callee, source, language);
         // `obj["name"]()` spells its member with a string literal: it is a
         // call of `name` as written, which ordinary resolution links by that
-        // name, as today's database did. A site would replace that link.
+        // name, as the SQLite call-graph store does. A site would replace
+        // that link.
         if !dynamic
             && matches!(language, "javascript" | "typescript" | "tsx")
             && callee.kind() == "subscript_expression"
@@ -1316,10 +1317,11 @@ fn symbol_callers(parse: &ParseBlob) -> HashMap<(u32, u32), String> {
 /// The method-call site of the C++ call `receiver.member(...)`, `call`,
 /// whose callee is `callee`, when `receiver` is a plain name declared with
 /// a type in the enclosing function: the site's receiver is that type's
-/// name, read as today's database read it, by scanning back from the call's
-/// line for the declaration. Other member calls get no site and keep their
-/// ordinary resolution, as `receiver->member(...)` does: ordinary resolution
-/// can link that spelling by the member's name alone.
+/// name, found by scanning back from the call's line for the declaration
+/// (the scan the SQLite call-graph store's dispatch pass uses). Other member
+/// calls get no site and keep their ordinary resolution, as
+/// `receiver->member(...)` does: ordinary resolution can link that spelling
+/// by the member's name alone.
 fn cpp_typed_site<'tree>(
     call: Node<'tree>,
     callee: Node<'tree>,
@@ -1357,8 +1359,8 @@ fn cpp_typed_site<'tree>(
 /// scoped name of the one function `name` the same template defines. The
 /// template's functions are stamped into whatever impl invokes the macro,
 /// so `self` there has no type the file names, but `self.name` can only be
-/// the template's own `name`. Resolved by that name, as today's database
-/// matched it.
+/// the template's own `name`. The resolver links the site to that function
+/// with name-match provenance.
 pub(crate) const TEMPLATE_SELF_RECEIVER: &str = "@template-self:";
 
 /// The method-call site of `reference` when it is a `self.name(...)` call
@@ -2665,8 +2667,8 @@ impl<'a> Resolver<'a> {
 
     /// A C++ member call on a receiver of type `receiver`: the one C++
     /// member function `member` whose scoped name ends in `receiver::member`,
-    /// leaving out the calling function `caller` of `file`, as today's
-    /// database type-matched it. Two or more such functions leave the call
+    /// leaving out the calling function `caller` of `file`, linked with
+    /// type-match provenance. Two or more such functions leave the call
     /// unresolved; none, outside the project.
     fn cpp_type_match(
         &self,
