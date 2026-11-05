@@ -2502,19 +2502,13 @@ impl<'a> Resolver<'a> {
     }
 
     fn unknown(&self, language: &str, member: &str) -> Resolution {
-        self.depend(dependency::method(member));
+        // Through `methods_named`, which reads the source when there is one:
+        // a resolver over a source holds no files of its own.
         let protected: BTreeSet<_> = self
-            .files
+            .methods_named(member)
             .iter()
-            .filter(|(_, p)| p.language == language)
-            .inspect(|_| self.note_file_visit())
-            .flat_map(|(file, p)| {
-                p.dispatch
-                    .methods
-                    .iter()
-                    .filter(move |m| m.name == member)
-                    .map(move |m| (file.clone(), m.symbol.clone()))
-            })
+            .filter(|(_, parse, _)| parse.language == language)
+            .map(|(file, _, method)| (file.clone(), method.symbol.clone()))
             .collect();
         if ["go", "python"].contains(&language) {
             return Resolution {

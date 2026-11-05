@@ -149,7 +149,11 @@ fn checkouts(
     use rayon::prelude::*;
     let storage = ctx.storage_dir();
     let executor = ctx.data_executor();
-    let planes = ctx.data_layer_planes();
+    // Not the parent context's own index switches: configure turns those
+    // off for a folder of repositories, which builds nothing itself. A plane
+    // the user switched off never reaches here; the parent route answers it
+    // as switched off before asking any child.
+    let planes = Planes::ALL;
     let slots = children
         .iter()
         .map(|child| ctx.data_children().slot(parent, child))

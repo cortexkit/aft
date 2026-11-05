@@ -1215,3 +1215,45 @@ fn sample_scale() -> usize {
         .filter(|scale| *scale > 0)
         .unwrap_or(1)
 }
+
+#[cfg(test)]
+mod unknown_receiver_tests {
+    /// A method call on a receiver of unknown type (`console.log`) protects
+    /// every project method of that name, and in TypeScript links to it as
+    /// a name match. The data layer's resolver reads files through a source
+    /// and holds none of its own, so a lookup that listed only the
+    /// resolver's own files found no candidates and left the call
+    /// unresolved. The edit, reuse and checkout gates compare the data layer
+    /// with itself and cannot see that; this compares with today's views.
+    #[test]
+    fn typescript_calls_on_unknown_receivers_match_todays_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for (path, text) in [
+            ("package.json", "{\"name\":\"demo\"}\n"),
+            (
+                "src/logger.ts",
+                "export class Logger {\n  log(message: string): void {}\n}\n",
+            ),
+            (
+                "src/other.ts",
+                "export class Other {\n  log(message: string): void {}\n}\n",
+            ),
+            (
+                "src/cli.ts",
+                "export function main(): void {\n  console.log(\"hi\");\n}\n",
+            ),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let report = super::run(&root, 2).unwrap();
+        let differing = report
+            .tables
+            .iter()
+            .filter(|(_, (_, _, differing))| *differing > 0)
+            .collect::<Vec<_>>();
+        assert!(differing.is_empty(), "{differing:?}\n{report:#?}");
+    }
+}
