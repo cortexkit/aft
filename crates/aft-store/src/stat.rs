@@ -203,9 +203,9 @@ mod platform {
         })
     }
 
-    /// The file's USN and its volume's journal id, each with the error that
-    /// kept it from being read, for tests to tell an absent journal from a
-    /// refused read.
+    /// The file's update sequence number (USN) and its volume's journal id,
+    /// each with the error that kept it from being read, for tests to tell
+    /// an absent journal from a refused read.
     #[cfg(test)]
     pub(super) fn journal_reads(path: &Path) -> io::Result<(io::Result<u64>, io::Result<u64>)> {
         let file = OpenOptions::new()
