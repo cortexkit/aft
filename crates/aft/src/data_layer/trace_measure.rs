@@ -185,21 +185,15 @@ impl Samples {
     }
 }
 
-/// Builds the call graph of the checkout at `root` and runs `trace_to`
-/// (depth 10, tests left out) and `impact` (depth 5, tests left out) on
-/// `sample` function and method symbols spread evenly over it. Returns the
-/// measurements as JSON.
-///
-/// # Errors
-///
-/// When the checkout cannot be scanned, extracted or resolved, or the
-/// segment cannot be written or read.
-pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> {
-    use aft_store::cache::BlockCache;
-    use aft_store::ids::{FamilyId, SegmentId, WriterIncarnation};
-    use aft_store::segment::{Segment, SegmentMeta};
+/// A checkout's call graph as the data layer builds it: every file scanned
+/// and extracted to a content record, and every parsed file resolved.
+struct Built {
+    inputs: CheckoutInputs,
+    resolved: BTreeMap<String, super::callgraph::FileResolution>,
+    records: HashMap<RecordKey, Arc<ContentRecord>>,
+}
 
-    let started = Instant::now();
+fn build(root: &Path, threads: usize) -> Result<Built, String> {
     let records = Records::default();
     let scanned = scan(root, &super::content::scan_policy(), None, &records)
         .map_err(|error| error.to_string())?;
@@ -233,10 +227,48 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
             }
         }
     }
-    let build_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let started = Instant::now();
     let resolved = resolve_checkout(&inputs, threads).map_err(|error| error.to_string())?;
-    let resolve_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(Built {
+        inputs,
+        resolved,
+        records: by_key,
+    })
+}
+
+/// The data layer's call graph of the checkout at `root`, held in memory,
+/// for tests of the commands built on it.
+#[cfg(test)]
+pub(crate) fn memory_reader(root: &Path) -> super::query::SliceReader<super::query::MemorySlices> {
+    let built = build(root, 2).unwrap_or_else(|error| panic!("build {}: {error}", root.display()));
+    let mut slices = super::query::MemorySlices::default();
+    for (path, file) in &built.resolved {
+        let (key, parse) = &built.inputs.parses[path];
+        slices.insert(super::slice::FileSlice::build(path, key, parse, file));
+    }
+    super::query::SliceReader::new(slices, root.to_path_buf(), "test".to_string())
+}
+
+/// Builds the call graph of the checkout at `root` and runs `trace_to`
+/// (depth 10, tests left out) and `impact` (depth 5, tests left out) on
+/// `sample` function and method symbols spread evenly over it. Returns the
+/// measurements as JSON.
+///
+/// # Errors
+///
+/// When the checkout cannot be scanned, extracted or resolved, or the
+/// segment cannot be written or read.
+pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> {
+    use aft_store::cache::BlockCache;
+    use aft_store::ids::{FamilyId, SegmentId, WriterIncarnation};
+    use aft_store::segment::{Segment, SegmentMeta};
+
+    let started = Instant::now();
+    let Built {
+        inputs,
+        resolved,
+        records: by_key,
+    } = build(root, threads)?;
+    let build_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let records = by_key
         .iter()
@@ -353,7 +385,6 @@ pub fn run(root: &Path, threads: usize, sample: usize) -> Result<Value, String> 
         "functions_and_methods": symbols.len(),
         "sampled": chosen.len(),
         "build_ms": build_ms,
-        "resolve_ms": resolve_ms,
         "ops": by_op
             .iter()
             .map(|(op, samples)| ((*op).to_string(), samples.report()))
