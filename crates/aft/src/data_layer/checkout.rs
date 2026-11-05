@@ -86,7 +86,7 @@ impl DataLayer {
         Self {
             cache: Arc::new(BlockCache::new(cache_bytes)),
             threads: threads.max(1),
-            policy: ScanPolicy::default(),
+            policy: super::content::scan_policy(),
         }
     }
 }
@@ -1675,13 +1675,15 @@ fn changed_members(before: &CheckoutState, after: &CheckoutState) -> Vec<Vec<u8>
 /// resolution: given that it has none, its extraction failed. Resolver
 /// configuration files are read raw and never resolved.
 fn is_unparsed(record: &PathRecord) -> bool {
-    record.kind == PathKind::Text && !record.language.is_empty() && record.language != "config"
+    matches!(record.kind, PathKind::Text | PathKind::Large)
+        && !record.language.is_empty()
+        && record.language != "config"
 }
 
 /// The language a changed file is parsed as, and what the call graph reads
 /// from it. As in a build, a file the extractor fails on is not parsed.
 fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
-    if record.kind != PathKind::Text {
+    if !matches!(record.kind, PathKind::Text | PathKind::Large) {
         return (String::new(), Extracted::Nothing);
     }
     let Some(language) = std::str::from_utf8(&record.path)
@@ -1737,7 +1739,7 @@ impl ChangeSink {
 
 impl ContentSink for ChangeSink {
     fn read(&self, path: &[u8], _key: ContentKey, kind: ContentKind, bytes: &[u8]) {
-        if kind == ContentKind::Text {
+        if kind != ContentKind::Binary {
             self.read
                 .lock()
                 .expect("no panics while holding it")
@@ -1819,9 +1821,15 @@ impl ContentSink for BuildSink {
                     .lock()
                     .expect("no panics while holding it")
                     .add_unindexed(key, len, TextStatus::Binary),
+                // Read only to be parsed; text queries read it directly.
+                ContentKind::Large => self
+                    .text
+                    .lock()
+                    .expect("no panics while holding it")
+                    .add_unindexed(key, len, TextStatus::Oversize),
             }
         }
-        if kind != ContentKind::Text || self.text_only {
+        if kind == ContentKind::Binary || self.text_only {
             return;
         }
         let Ok(path_text) = std::str::from_utf8(path) else {
@@ -2060,6 +2068,60 @@ mod tests {
     }
 
     #[test]
+    fn a_source_file_past_the_text_index_limit_still_has_its_calls() {
+        // AFT's own context.rs and callgraph_store/mod.rs are over 1 MiB; a
+        // scan that never read them left every call they make out of the
+        // graph, and their callees looked dead.
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let padding = "// padding\n".repeat(120_000);
+        write(
+            root.path(),
+            "src/big.rs",
+            &format!("pub fn big_caller() {{ crate::util::callee(); }}\n{padding}"),
+        );
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod big;\npub fn caller() { util::callee(); }\n",
+        );
+        assert!(
+            std::fs::metadata(root.path().join("src/big.rs"))
+                .unwrap()
+                .len()
+                > 1 << 20
+        );
+        let checkout = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            store.path(),
+            family(),
+            root.path(),
+        )
+        .unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let callers = callers_of(&view, "src/util.rs", "callee");
+        assert!(callers.contains("src/big.rs"), "{callers}");
+        assert!(callers.contains("src/lib.rs"), "{callers}");
+        // Its text is not indexed, so text queries read it directly.
+        assert!(candidates_for(&view, "big_caller").contains(&"src/big.rs".to_string()));
+        assert_eq!(view.status().unparsed, 0);
+
+        // An edit to it is parsed too.
+        write(
+            root.path(),
+            "src/big.rs",
+            &format!("pub fn big_caller() {{}}\n{padding}"),
+        );
+        checkout.record_paths(&[b"src/big.rs".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(!callers.contains("src/big.rs"), "{callers}");
+        assert!(callers.contains("src/lib.rs"), "{callers}");
+    }
+
+    #[test]
     fn a_first_build_serves_text_before_the_call_graph() {
         let root = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
@@ -2273,10 +2335,11 @@ pub fn other() { callee(); }
         checkout.record_paths(&[b"docs".to_vec()]).unwrap();
         assert!(candidates_for(&checkout.view().unwrap(), "zzfolder").is_empty());
 
-        // A file over the size limit is a member that is not parsed, as in a
-        // build.
+        // A source file over the read limit is a member that is not parsed,
+        // as in a build. (One over only the text-index limit is parsed; see
+        // a_source_file_past_the_text_index_limit_still_has_its_calls.)
         let mut big = String::from("use crate::util;\npub fn big() { util::callee(); }\n");
-        while big.len() <= 1024 * 1024 {
+        while big.len() <= 4 * 1024 * 1024 {
             big.push_str("// padding padding padding padding padding padding\n");
         }
         write(root.path(), "src/big.rs", &big);

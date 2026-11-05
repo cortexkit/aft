@@ -133,7 +133,10 @@ impl TextMembership {
                 match record.kind {
                     PathKind::Text => {}
                     PathKind::Symlink => return Place::Excluded,
-                    PathKind::Binary | PathKind::Oversize | PathKind::Unreadable => {
+                    PathKind::Binary
+                    | PathKind::Oversize
+                    | PathKind::Unreadable
+                    | PathKind::Large => {
                         return Place::Unchecked;
                     }
                 }

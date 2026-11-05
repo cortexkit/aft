@@ -40,8 +40,9 @@ pub enum PathKind {
     Text,
     /// Read and found to be binary; `content` is the key of its bytes.
     Binary,
-    /// Larger than the indexing limit and not read; `content` is a
-    /// stand-in derived from its path and evidence.
+    /// Larger than the read limit, or than the text-index limit when its
+    /// path is not one a scan reads past that limit, and not read;
+    /// `content` is a stand-in derived from its path and evidence.
     Oversize,
     /// Could not be read; `content` is a stand-in. Grep reads it directly
     /// and reports the error.
@@ -49,6 +50,11 @@ pub enum PathKind {
     /// A symbolic link, never followed. Its target is in
     /// [`PathRecord::link`]; `content` is a stand-in.
     Symlink,
+    /// Text larger than the text-index limit, read because its path is one
+    /// a scan reads up to the larger read limit (a source file to parse);
+    /// `content` is the key of its bytes. Its text is not indexed, so text
+    /// queries read it directly.
+    Large,
 }
 
 impl PathKind {
@@ -59,6 +65,7 @@ impl PathKind {
             Self::Oversize => 2,
             Self::Unreadable => 3,
             Self::Symlink => 4,
+            Self::Large => 5,
         }
     }
 
@@ -69,6 +76,7 @@ impl PathKind {
             2 => Some(Self::Oversize),
             3 => Some(Self::Unreadable),
             4 => Some(Self::Symlink),
+            5 => Some(Self::Large),
             _ => None,
         }
     }
@@ -76,7 +84,7 @@ impl PathKind {
     /// Whether `content` is the key of the path's real bytes.
     #[must_use]
     pub const fn has_content(self) -> bool {
-        matches!(self, Self::Text | Self::Binary)
+        matches!(self, Self::Text | Self::Binary | Self::Large)
     }
 }
 

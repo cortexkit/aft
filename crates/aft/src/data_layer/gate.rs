@@ -11,7 +11,7 @@ use std::time::Instant;
 use aft_store::checkout::PathKind;
 use aft_store::content::{ContentRecord, RecordBody, RecordKey};
 use aft_store::ids::ContentKey;
-use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
+use aft_store::scan::{scan, ContentKind, ContentSink};
 
 use super::callgraph::{resolve_checkout, CheckoutInputs};
 use super::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
@@ -80,7 +80,7 @@ struct Records {
 
 impl ContentSink for Records {
     fn read(&self, path: &[u8], content: ContentKey, kind: ContentKind, bytes: &[u8]) {
-        if kind != ContentKind::Text {
+        if kind == ContentKind::Binary {
             return;
         }
         let Ok(path) = std::str::from_utf8(path) else {
@@ -142,8 +142,8 @@ impl ManifestBlobReader for Blobs {
 pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
     let started = Instant::now();
     let records = Records::default();
-    let scanned =
-        scan(root, &ScanPolicy::default(), None, &records).map_err(|error| error.to_string())?;
+    let scanned = scan(root, &super::content::scan_policy(), None, &records)
+        .map_err(|error| error.to_string())?;
     let failures = records.failures.into_inner().expect("no panics");
     if !failures.is_empty() {
         return Err(format!("extraction failed: {failures:?}"));

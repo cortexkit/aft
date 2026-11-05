@@ -30,6 +30,32 @@ pub const EXTRACTOR_VERSION: &str = crate::views::callgraph::PRODUCER;
 /// for resolver configuration it reads raw, or `None` for a file the call
 /// graph does not read.
 #[must_use]
+/// The scan policy every data-layer scan uses: a source file the call
+/// graph parses is read up to the larger read limit even past the
+/// text-index limit, as the inspect scanners read graph sources, so a large
+/// source file still has its calls in the graph.
+#[must_use]
+pub fn scan_policy() -> aft_store::scan::ScanPolicy {
+    aft_store::scan::ScanPolicy {
+        read_large: Some(parsed_path),
+        ..aft_store::scan::ScanPolicy::default()
+    }
+}
+
+/// Whether [`language_for`] can choose a language for `path` (relative to
+/// the root): a resolver configuration file or a source file.
+fn parsed_path(path: &[u8]) -> bool {
+    if crate::views::assembly::is_resolution_input(path) {
+        return true;
+    }
+    let Ok(path) = std::str::from_utf8(path) else {
+        return false;
+    };
+    let path = Path::new(path);
+    path.extension().is_some_and(|extension| extension == "h")
+        || crate::views::callgraph::source_language(path).is_some()
+}
+
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     if crate::views::assembly::is_resolution_input(path.as_bytes()) {
         return Some("config".to_string());

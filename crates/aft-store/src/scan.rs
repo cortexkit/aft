@@ -29,8 +29,16 @@ use crate::stat::observe;
 /// What a scan admits and how much of a file it indexes.
 #[derive(Clone, Debug)]
 pub struct ScanPolicy {
-    /// Files larger than this are members whose bytes are not read.
+    /// Files larger than this have no text index; unless `read_large`
+    /// admits their path, their bytes are not read at all.
     pub max_indexed_len: u64,
+    /// Paths `read_large` admits are read up to this size even past
+    /// `max_indexed_len`, and handed to the sink as
+    /// [`ContentKind::Large`]; larger ones are not read.
+    pub max_read_len: u64,
+    /// Which paths (relative to the root) are read past `max_indexed_len`,
+    /// such as source files a plane parses. `None` reads none.
+    pub read_large: Option<fn(&[u8]) -> bool>,
     /// Ignore files read beside `.gitignore`, such as `.aftignore`.
     pub ignore_files: Vec<String>,
     /// File names that are never members, such as `.DS_Store`.
@@ -45,6 +53,8 @@ impl Default for ScanPolicy {
     fn default() -> Self {
         Self {
             max_indexed_len: 1024 * 1024,
+            max_read_len: 4 * 1024 * 1024,
+            read_large: None,
             ignore_files: vec![".aftignore".to_string()],
             skip_names: [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"]
                 .map(String::from)
@@ -71,6 +81,48 @@ impl Default for ScanPolicy {
 pub enum ContentKind {
     Text,
     Binary,
+    /// Text larger than the text-index limit, read for a path the policy's
+    /// `read_large` admits: planes that parse read it, the text index
+    /// does not index it.
+    Large,
+}
+
+/// How much of a file a scan's policy reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SizeClass {
+    /// Read, and indexed when text.
+    Indexed,
+    /// Read past the text-index limit; never indexed.
+    Large,
+    /// Not read.
+    Unread,
+}
+
+impl ScanPolicy {
+    fn class(&self, relative: &[u8], size: u64) -> SizeClass {
+        if size <= self.max_indexed_len {
+            SizeClass::Indexed
+        } else if size <= self.max_read_len && self.read_large.is_some_and(|admit| admit(relative))
+        {
+            SizeClass::Large
+        } else {
+            SizeClass::Unread
+        }
+    }
+
+    /// The class `record` was scanned under, by what it holds: a policy
+    /// whose limits changed since then may classify the same file anew.
+    fn class_of(&self, record: &PathRecord) -> SizeClass {
+        match record.kind {
+            PathKind::Oversize => SizeClass::Unread,
+            PathKind::Large => SizeClass::Large,
+            // A binary read past the text-index limit was read as large.
+            PathKind::Binary if record.stat.size > self.max_indexed_len => SizeClass::Large,
+            PathKind::Text | PathKind::Binary | PathKind::Unreadable | PathKind::Symlink => {
+                SizeClass::Indexed
+            }
+        }
+    }
 }
 
 /// Receives every file a scan reads, from several threads at once.
@@ -431,15 +483,13 @@ fn record_file(
         Err(_) => return Some(unreadable(relative, StatEvidence::default(), counters)),
     };
     let mode = file_mode(path);
-    // Unchanged bytes are reused, but whether a file is indexed at all is
-    // this scan's policy: a size limit raised or lowered since the earlier
-    // scan reclassifies the file, and an oversize file must now be read.
-    let same_class = |previous: &PathRecord| {
-        (previous.kind == PathKind::Oversize) == (stat.size > policy.max_indexed_len)
-    };
+    // Unchanged bytes are reused, but whether a file is read and indexed is
+    // this scan's policy: a limit raised or lowered since the earlier scan
+    // reclassifies the file, and an unread file may now have to be read.
+    let class = policy.class(&relative, stat.size);
     if let Some(previous) = previous
         && previous.stat.proves_unchanged(&stat)
-        && same_class(previous)
+        && policy.class_of(previous) == class
     {
         counters.reused.fetch_add(1, Ordering::Relaxed);
         return Some(PathRecord {
@@ -449,7 +499,7 @@ fn record_file(
             ..previous.clone()
         });
     }
-    if stat.size > policy.max_indexed_len {
+    if class == SizeClass::Unread {
         counters.oversize.fetch_add(1, Ordering::Relaxed);
         let content = ContentKey::stand_in(&relative, &evidence_bytes(&stat));
         return Some(PathRecord {
@@ -462,14 +512,19 @@ fn record_file(
             language: String::new(),
         });
     }
-    let Ok(bytes) = read_bounded(path, policy.max_indexed_len) else {
+    let limit = match class {
+        SizeClass::Large => policy.max_read_len,
+        SizeClass::Indexed | SizeClass::Unread => policy.max_indexed_len,
+    };
+    let Ok(bytes) = read_bounded(path, limit) else {
         return Some(unreadable(relative, stat, counters));
     };
     counters.read.fetch_add(1, Ordering::Relaxed);
+    if class == SizeClass::Large {
+        counters.oversize.fetch_add(1, Ordering::Relaxed);
+    }
     counters.bytes_read.fetch_add(
-        bytes
-            .as_ref()
-            .map_or(policy.max_indexed_len, |bytes| bytes.len() as u64),
+        bytes.as_ref().map_or(limit, |bytes| bytes.len() as u64),
         Ordering::Relaxed,
     );
     let mut stat = stat;
@@ -501,6 +556,8 @@ fn record_file(
     let content = ContentKey::of(&bytes);
     let kind = if content_inspector::inspect(&bytes).is_binary() {
         ContentKind::Binary
+    } else if bytes.len() as u64 > policy.max_indexed_len {
+        ContentKind::Large
     } else {
         ContentKind::Text
     };
@@ -511,6 +568,7 @@ fn record_file(
         kind: match kind {
             ContentKind::Text => PathKind::Text,
             ContentKind::Binary => PathKind::Binary,
+            ContentKind::Large => PathKind::Large,
         },
         content,
         link: Vec::new(),
@@ -1051,5 +1109,79 @@ mod tests {
         let lowered = scan(root, &limit(1024), Some(&aged(&raised.state)), &sink).unwrap();
         assert_eq!(kind(&lowered.state, "big.txt"), PathKind::Oversize);
         assert_eq!((lowered.counters.read, lowered.counters.reused), (0, 1));
+    }
+
+    fn admits_rust(path: &[u8]) -> bool {
+        path.ends_with(b".rs")
+    }
+
+    #[test]
+    fn admitted_paths_are_read_past_the_index_limit_up_to_the_read_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("big.rs"), vec![b'x'; 2048]).unwrap();
+        std::fs::write(root.join("big.txt"), vec![b'x'; 2048]).unwrap();
+        std::fs::write(root.join("huge.rs"), vec![b'x'; 8192]).unwrap();
+        let policy = |read_large: Option<fn(&[u8]) -> bool>| ScanPolicy {
+            max_indexed_len: 1024,
+            max_read_len: 4096,
+            read_large,
+            ..ScanPolicy::default()
+        };
+        let get = |state: &CheckoutState, path: &str| state.get(path.as_bytes()).unwrap().clone();
+        let sink = Collect::default();
+        let first = scan(root, &policy(Some(admits_rust)), None, &sink).unwrap();
+
+        // An admitted path past the index limit is read whole, with the key
+        // of its bytes, and handed over as large text.
+        let big = get(&first.state, "big.rs");
+        assert_eq!(big.kind, PathKind::Large);
+        assert_eq!(big.content, ContentKey::of(&vec![b'x'; 2048]));
+        let read = sink.read.lock().unwrap()[&b"big.rs"[..]].clone();
+        assert_eq!((read.1, read.2.len()), (ContentKind::Large, 2048));
+        // A path not admitted, or one past the read limit, is not read.
+        assert_eq!(get(&first.state, "big.txt").kind, PathKind::Oversize);
+        assert_eq!(get(&first.state, "huge.rs").kind, PathKind::Oversize);
+        assert!(!sink.read.lock().unwrap().contains_key(&b"huge.rs"[..]));
+        assert_eq!(first.counters.read, 1);
+
+        // Unchanged, the large file is reused unread with its key.
+        let again = scan(
+            root,
+            &policy(Some(admits_rust)),
+            Some(&aged(&first.state)),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(again.counters.read, 0);
+        let reused = get(&again.state, "big.rs");
+        assert_eq!((reused.kind, reused.content), (big.kind, big.content));
+
+        // A policy that stops admitting it makes it unread, and admitting it
+        // again reads it, though its bytes never changed.
+        let unread = scan(root, &policy(None), Some(&aged(&again.state)), &sink).unwrap();
+        assert_eq!(get(&unread.state, "big.rs").kind, PathKind::Oversize);
+        assert_eq!(unread.counters.read, 0);
+        let reread = scan(
+            root,
+            &policy(Some(admits_rust)),
+            Some(&aged(&unread.state)),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(get(&reread.state, "big.rs").kind, PathKind::Large);
+        assert_eq!(reread.counters.read, 1);
+
+        // Raising the index limit past it makes it ordinary indexed text.
+        let raised = ScanPolicy {
+            max_indexed_len: 4096,
+            ..policy(Some(admits_rust))
+        };
+        let indexed = scan(root, &raised, Some(&aged(&reread.state)), &sink).unwrap();
+        assert_eq!(get(&indexed.state, "big.rs").kind, PathKind::Text);
+        assert_eq!(
+            indexed.counters.read, 2,
+            "big.rs and big.txt are read again"
+        );
     }
 }

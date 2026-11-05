@@ -26,9 +26,9 @@ use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 /// does not depend on it.
 const GATE_VERSION: &str = "extract-gate";
 
-/// Files larger than this are not read by a checkout scan, so neither
-/// extractor ever sees them.
-const MAX_FILE_LEN: u64 = 1024 * 1024;
+/// Source files larger than this are not read by a checkout scan, so
+/// neither extractor ever sees them (the scan policy's read limit).
+const MAX_FILE_LEN: u64 = 4 * 1024 * 1024;
 
 /// One parsed file of a repository.
 pub struct CorpusFile {

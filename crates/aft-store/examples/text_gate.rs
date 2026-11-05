@@ -65,6 +65,12 @@ impl ContentSink for Collect {
                     .unwrap()
                     .add_unindexed(key, len, TextStatus::Binary)
             }
+            ContentKind::Large => {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .add_unindexed(key, len, TextStatus::Oversize)
+            }
         }
     }
 }

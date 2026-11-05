@@ -30,7 +30,7 @@ use aft::callgraph_store::join::CallgraphBlob;
 use aft::data_layer::content::{blob_from_record, extract, language_for, EXTRACTOR_VERSION};
 use aft_store::content::{ContentRecord, RecordBody};
 use aft_store::ids::ContentKey;
-use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
+use aft_store::scan::{scan, ContentKind, ContentSink};
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
@@ -66,7 +66,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 
 impl ContentSink for Gate {
     fn read(&self, path: &[u8], key: ContentKey, kind: ContentKind, bytes: &[u8]) {
-        if kind != ContentKind::Text {
+        if kind == ContentKind::Binary {
             return;
         }
         let Ok(path) = std::str::from_utf8(path) else {
@@ -147,7 +147,13 @@ fn main() {
     let root = std::env::args().nth(1).unwrap();
     let gate = Gate::default();
     let started = Instant::now();
-    let report = scan(Path::new(&root), &ScanPolicy::default(), None, &gate).unwrap();
+    let report = scan(
+        Path::new(&root),
+        &aft::data_layer::content::scan_policy(),
+        None,
+        &gate,
+    )
+    .unwrap();
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut decode = gate.decode_ns.into_inner().unwrap();
     let mut json_decode = gate.json_decode_ns.into_inner().unwrap();
