@@ -341,8 +341,14 @@ fn future_index_store_manifest_is_refused_by_name_and_left_byte_identical() {
     );
     let status = ctx.build_status_snapshot();
     for plane in ["search_index", "callgraph_store"] {
-        assert_eq!(status[plane]["status"], "unavailable", "{plane}: {status:#}");
-        assert_eq!(status[plane]["reason"], "bind_failed", "{plane}: {status:#}");
+        assert_eq!(
+            status[plane]["status"], "unavailable",
+            "{plane}: {status:#}"
+        );
+        assert_eq!(
+            status[plane]["reason"], "bind_failed",
+            "{plane}: {status:#}"
+        );
     }
     let error = status["data_store"]["error"].as_str().unwrap_or_default();
     assert!(
