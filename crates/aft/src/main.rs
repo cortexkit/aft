@@ -1052,13 +1052,6 @@ fn drain_runtime_events_cooperatively(
     if configure.has_pending(runtime) {
         configure.drain_prefix(runtime);
         let has_more = configure.has_pending(runtime) && configure.drain_one(runtime);
-        if !has_more {
-            // The configure's tail is done: the data layer, when it runs,
-            // binds the root and starts its build and fill now, as the
-            // daemon's configure tail has it do, rather than at the first
-            // query.
-            aft::runtime_drain::configure_tail_finished(runtime);
-        }
         let queued = queued_requests();
         if queued > 0 && has_more {
             aft::runtime_drain::note_configure_maintenance_yield(queued);
@@ -1067,6 +1060,7 @@ fn drain_runtime_events_cooperatively(
             return;
         }
     }
+    configure.after_configure_tail(runtime);
 
     drain_non_configure_runtime_events(registry);
 }
