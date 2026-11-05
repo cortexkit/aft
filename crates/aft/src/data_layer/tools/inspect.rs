@@ -2,12 +2,18 @@
 //!
 //! Dead code analyses a snapshot of the call graph: every file, exported
 //! symbol, outbound call and entry point (`CallgraphSnapshot`). Today that
-//! snapshot is projected from the call-graph database. When the process runs
-//! the data layer and the root's checkout has published a call graph with no
-//! changes pending, the snapshot comes from the checkout's view instead. In
-//! every other case dead code projects it from the database as before, so a
-//! change the view has not resolved yet is never answered from the older
-//! publication.
+//! snapshot is projected from a call-graph database: the checkout's view
+//! database with views on, the legacy store with views off. When the process
+//! runs the data layer, views are on, and the root's checkout has published a
+//! call graph with no changes pending, the snapshot comes from the checkout's
+//! view instead. In every other case dead code projects it from the database
+//! as before, so a change the view has not resolved yet is never answered
+//! from the older publication.
+//!
+//! The data layer stands in only for the views database, whose snapshot it
+//! reproduces. The legacy store answers differently on some checkouts, so
+//! with views off dead code keeps it, and no result computed from the data
+//! layer reaches the legacy store's caches.
 //!
 //! Only the snapshot's source changes. Unused exports and the Tier-1
 //! categories do not read the call graph. Cached results keep their keys: a
@@ -139,11 +145,12 @@ mod tests {
     }
 
     /// A diagnostic for the inspect gate, not a check: on the checkout named
-    /// by `AFT_INSPECT_GATE_ROOT`, builds today's call-graph database and the
-    /// data layer's checkout, and prints each dead-code snapshot part that
-    /// differs between the database's projection and the data layer's
-    /// snapshot, with the items found on one side only. Run it with `--ignored
-    /// --nocapture`.
+    /// by `AFT_INSPECT_GATE_ROOT`, builds today's legacy call-graph database
+    /// and the data layer's checkout, and prints each dead-code snapshot part
+    /// that differs between the database's projection and the data layer's
+    /// snapshot, with the items found on one side only; then every item dead
+    /// code reports from one snapshot and not the other. Run it with
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore = "a diagnostic run on a named checkout"]
     fn print_how_dead_code_snapshots_differ_on_a_checkout() {
@@ -193,6 +200,66 @@ mod tests {
             for line in only_ours.iter().take(12) {
                 println!("  data layer: {line}");
             }
+        }
+
+        // What dead code reports from each snapshot, every item. JavaScript
+        // and TypeScript read the Oxc engine's facts in a real pass and are
+        // left out here, where neither side has them.
+        let dead = |snapshot: CallgraphSnapshot| {
+            let job = crate::inspect::InspectJob {
+                job_id: 1,
+                key: crate::inspect::JobKey::for_project_category(
+                    crate::inspect::InspectCategory::DeadCode,
+                ),
+                category: crate::inspect::InspectCategory::DeadCode,
+                scope_files: files.clone(),
+                project_root: root.clone(),
+                inspect_dir: storage.path().join("inspect"),
+                config: Arc::new(crate::config::Config {
+                    project_root: Some(root.clone()),
+                    ..crate::config::Config::default()
+                }),
+                symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+                inspect_writer: true,
+                callgraph_writer: true,
+                callgraph_snapshot: Some(Arc::new(snapshot)),
+            };
+            let aggregate = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+                .outcome
+                .expect("dead-code scan")
+                .aggregate;
+            let mut found = BTreeSet::new();
+            for (list, label) in [("items", "dead"), ("test_only_items", "test-only")] {
+                for item in aggregate[list].as_array().into_iter().flatten() {
+                    let file = item["file"].as_str().unwrap_or_default();
+                    if [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]
+                        .iter()
+                        .any(|suffix| file.ends_with(suffix))
+                    {
+                        continue;
+                    }
+                    found.insert(format!(
+                        "{label} {file}::{} ({}, line {})",
+                        item["symbol"].as_str().unwrap_or_default(),
+                        item["kind"].as_str().unwrap_or_default(),
+                        item["line"]
+                    ));
+                }
+            }
+            found
+        };
+        let theirs = dead(today);
+        let mine = dead(ours);
+        println!(
+            "dead code: {} items from today's snapshot, {} from the data layer's",
+            theirs.len(),
+            mine.len()
+        );
+        for item in theirs.difference(&mine) {
+            println!("  only today:      {item}");
+        }
+        for item in mine.difference(&theirs) {
+            println!("  only data layer: {item}");
         }
     }
 }

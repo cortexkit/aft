@@ -3407,9 +3407,14 @@ impl InspectManager {
             .filter(|_| category == InspectCategory::DeadCode)
             .and_then(|store| {
                 // The data layer's view stands in for the pinned store's
-                // projection while its call graph is ready.
-                self.data_layer_dead_code
-                    .snapshot(&snapshot.project_root)
+                // projection while its call graph is ready. It follows the
+                // views store, so it never answers with views off.
+                snapshot
+                    .config
+                    .views
+                    .enabled
+                    .then(|| self.data_layer_dead_code.snapshot(&snapshot.project_root))
+                    .flatten()
                     .or_else(|| {
                         let started = Instant::now();
                         let projected =
@@ -6041,15 +6046,15 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         return Ok(None);
     }
 
-    // With the data layer on, its view answers while its call graph is ready;
-    // otherwise the snapshot is projected from today's store below.
-    if let Some(snapshot) = projection_cache
-        .and_then(|manager| manager.data_layer_dead_code.snapshot(&job.project_root))
-    {
-        return Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())));
-    }
-
     if job.config.views.enabled {
+        // With the data layer on, its view stands in for today's view while
+        // its call graph is ready. Only here: it follows the views store,
+        // and with views off the legacy store answers exactly as before.
+        if let Some(snapshot) = projection_cache
+            .and_then(|manager| manager.data_layer_dead_code.snapshot(&job.project_root))
+        {
+            return Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())));
+        }
         return Ok(build_view_callgraph_snapshot(
             job,
             projection_cache,
@@ -9943,22 +9948,33 @@ export function bannerUnused() {}
         );
     }
 
+    /// `snapshot_job` with views on: the data layer stands in only for the
+    /// views database.
+    fn views_snapshot_job(root: &Path, inspect_dir: &Path) -> InspectJob {
+        let mut job = snapshot_job(root, inspect_dir, true);
+        let mut config = (*job.config).clone();
+        config.views.enabled = true;
+        job.config = Arc::new(config);
+        job
+    }
+
     #[test]
     fn callgraph_snapshot_reads_a_ready_data_layer_checkout_and_never_a_pending_one() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
         let storage = tempfile::tempdir().expect("storage");
         let inspect_dir = storage.path().join("inspect");
-        let job = snapshot_job(&root, &inspect_dir, true);
+        let job = views_snapshot_job(&root, &inspect_dir);
         let manager = InspectManager::new();
-        let read = |manager: &InspectManager| {
+        let read_job = |manager: &InspectManager, job: &InspectJob| {
             manager
-                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, false, &[])
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(job, false, false, &[])
                 .expect("snapshot readiness")
         };
+        let read = |manager: &InspectManager| read_job(manager, &job);
         assert!(
             read(&manager).is_none(),
-            "without the data layer, today's store answers, and there is none here"
+            "without the data layer, today's view answers, and there is none here"
         );
 
         let checkout = crate::data_layer::runtime::DataCheckout::open(&root, storage.path())
@@ -9979,20 +9995,19 @@ export function bannerUnused() {}
         );
         assert_eq!(snapshot.exported_symbols.len(), 3, "{snapshot:?}");
 
+        // With views off, the legacy store answers exactly as before (there
+        // is none here): the data layer stands in only for the views store.
+        assert!(
+            read_job(&manager, &snapshot_job(&root, &inspect_dir, true)).is_none(),
+            "the data layer answered with views off"
+        );
+
         // A checkout of another folder never answers for a root.
         let other = InspectManager::new();
         let elsewhere = tempfile::tempdir().expect("elsewhere");
         let elsewhere = std::fs::canonicalize(elsewhere.path()).expect("canonical elsewhere");
         other.read_dead_code_from_data_layer(&elsewhere, &checkout);
-        assert!(other
-            .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
-                &snapshot_job(&elsewhere, &inspect_dir, true),
-                false,
-                false,
-                &[],
-            )
-            .expect("snapshot readiness")
-            .is_none());
+        assert!(read_job(&other, &views_snapshot_job(&elsewhere, &inspect_dir)).is_none());
 
         // An edit the data layer has not resolved leaves its call graph
         // pending: dead code goes back to today's store rather than answer
@@ -10059,7 +10074,7 @@ export function bannerUnused() {}
         let checkout = published(&root, storage.path());
         let manager = InspectManager::new();
         manager.read_dead_code_from_data_layer(&root, &checkout);
-        let mut job = snapshot_job(&root, &storage.path().join("inspect"), true);
+        let mut job = views_snapshot_job(&root, &storage.path().join("inspect"));
         job.scope_files = vec![root.join("src/foo.ts"), main.clone()];
         let read = |manager: &InspectManager| {
             manager

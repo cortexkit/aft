@@ -28,10 +28,12 @@ A reply that differs from today's only where the control run's reply
 differs too is reported as varying between runs (`explained`); any other
 difference is `unexplained`.
 
-With the data layer on, the log must show that before the edits every
-dead-code snapshot came from the data layer, and that after them the data
-layer either declined because the edits were pending or served a graph that
-includes them (the replies, equal to today's, show that it was current).
+With views on and the data layer on, the log must show that before the
+edits every dead-code snapshot came from the data layer, and that after them
+the data layer either declined because the edits were pending or served a
+graph that includes them (the replies, equal to today's, show that it was
+current). With views off, dead code keeps the legacy store, and the log must
+show that dead code never asked the data layer.
 
     python3 crates/aft/examples/data/inspect_gate.py BINARY OUT \
         [--root PATH]... [--corpus DIR] [--modes legacy,views] [--control]
@@ -220,7 +222,8 @@ class Process:
 
 
 def run(binary, root, cache, config, data_layer, out, target):
-    """One process through the whole sequence; returns its replies, timings and log marks."""
+    """One process through the whole sequence; returns its replies, timings and log marks.
+    With views off, dead code does not use the data layer, so nothing waits for it."""
     process = Process(binary, root, cache, data_layer, out)
     marks = {}
     try:
@@ -235,7 +238,7 @@ def run(binary, root, cache, config, data_layer, out, target):
         # still reports building in the same reply.
         process.send('callgraph-ready', tool('callgraph', {'op': 'callers', 'path': target,
                                                            'symbol': 'aftGateNoSuchSymbol'}))
-        if data_layer:
+        if data_layer and config['views']['enabled']:
             process.wait_log(r'data layer built ')
         for request_id, body in measured('cold') + measured('warm'):
             process.send(request_id, body, settle=True)
@@ -355,13 +358,19 @@ def gate_case(binary, name, source, work, modes, control):
             result['control_differing'] = compare(name, runs['today'][0], runs['control'][0])[1]
             result['unexplained'] = unexplained(differing, result['control_differing'])
         checks = result['data_layer']
-        # Before the edits every snapshot must come from the data layer. After
-        # them it declines while the edits are pending, or serves a graph
-        # that includes them; the replies, equal to today's, tell which is
-        # current.
-        result['exercised'] = (checks['served_before_edits'] > 0 and checks['declined_before_edits'] == 0
-                               and checks['today_projections_before_edits'] == 0
-                               and checks['served_after_edits'] + checks['declined_pending_after_edits'] > 0)
+        if mode == 'views':
+            # Before the edits every snapshot must come from the data layer.
+            # After them it declines while the edits are pending, or serves a
+            # graph that includes them; the replies, equal to today's, tell
+            # which is current.
+            result['exercised'] = (checks['served_before_edits'] > 0 and checks['declined_before_edits'] == 0
+                                   and checks['today_projections_before_edits'] == 0
+                                   and checks['served_after_edits'] + checks['declined_pending_after_edits'] > 0)
+        else:
+            # With views off dead code keeps the legacy store: the data layer
+            # must not have been asked at all.
+            result['exercised'] = (checks['served_before_edits'] + checks['declined_before_edits']
+                                   + checks['served_after_edits'] + checks['declined_pending_after_edits'] == 0)
         results.append(result)
         print(json.dumps({key: result[key] for key in ('case', 'mode', 'replies_compared', 'exercised')}
                          | {'differing': sorted(differing)}), flush=True)
