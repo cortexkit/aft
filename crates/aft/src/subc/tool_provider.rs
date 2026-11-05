@@ -6288,7 +6288,17 @@ pub(in crate::subc) mod route_tests {
                         if request.command == "bash_drain_completions" {
                             crate::commands::bash_drain_completions::handle(&request, ctx)
                         } else {
-                            Response::success(request.id, json!({"content":"plain response"}))
+                            let mut response = Response::success(&request.id, json!({}));
+                            crate::response_finalize::attach_bg_completions(
+                                &mut response,
+                                ctx,
+                                request.session(),
+                                "read",
+                            );
+                            // Legacy replies carry rendered text, not metadata added
+                            // after rendering. Expose the finalizer's selection here.
+                            response.data = json!({"content": response.data.to_string()});
+                            response
                         }
                     },
                 )
