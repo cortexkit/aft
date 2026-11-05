@@ -874,11 +874,10 @@ mod tests {
 
         let literal_path = source.to_string_lossy().into_owned();
         let identity = resolve_standing_root(&literal_path).unwrap();
-        assert!(storage
-            .join("index")
-            .join(identity.artifact_key)
-            .join("cache.bin")
-            .exists());
+        // The empty root's snapshot is the data layer's store, not today's
+        // search cache.
+        assert!(storage.join("data").is_dir());
+        assert!(!cache_dir_for(&storage, &identity.artifact_key, IndexKind::Search).exists());
         let conn = aft::db::open(&storage.join("aft.db")).unwrap();
         assert_eq!(
             needs_strict_verify(&conn, &literal_path, IndexKind::Search).unwrap(),
@@ -1061,41 +1060,6 @@ mod tests {
                 "fell back to today's stores: {}",
                 dir.display()
             );
-        }
-    }
-
-    #[test]
-    fn with_the_data_layer_off_a_snapshot_builds_todays_stores_under_leases() {
-        let fixture = tempdir().unwrap();
-        let storage = fixture.path().join("storage");
-        let user = fixture.path().join("user-aft.jsonc");
-        let literal_path = standing_crate(fixture.path(), &user, r#"["search", "callgraph"]"#);
-        let mut output = Vec::new();
-
-        // The process switch, which is off here.
-        let exit = run_with_paths(
-            Vec::new(),
-            paths(fixture.path(), &user, &storage),
-            &mut output,
-        )
-        .unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(exit, IndexExit::Success, "{output}");
-        assert!(output.contains("kind=search status=success"), "{output}");
-        assert!(output.contains("kind=callgraph status=success"), "{output}");
-        assert!(!storage.join("data").exists());
-        let identity = resolve_standing_root(&literal_path).unwrap();
-        let search = cache_dir_for(&storage, &identity.artifact_key, IndexKind::Search);
-        assert!(search.join("cache.bin").is_file());
-        for kind in [IndexKind::Search, IndexKind::Callgraph] {
-            let dir = cache_dir_for(&storage, &identity.artifact_key, kind);
-            assert!(
-                dir.join("build-breaker.sqlite").is_file(),
-                "{}",
-                dir.display()
-            );
-            assert_eq!(strict(&storage, &literal_path, kind), Some(false));
         }
     }
 }
