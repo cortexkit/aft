@@ -25,9 +25,12 @@ pub(crate) fn create_new_private(path: &Path) -> io::Result<File> {
 
 /// Opens a stored file for reading.
 ///
-/// On Windows the handle lets the file be deleted while it is open. Without
-/// that, one reader holding a segment open would stop reclamation from
-/// removing it, which Unix never does.
+/// On Windows the handle lets the file be deleted, and written, while it is
+/// open, as Unix does. Without deletion, one reader holding a segment open
+/// would stop reclamation from removing it. Without writing, Windows refuses
+/// the open itself while the writer still has a new file open: a reader
+/// taking a snapshot during a publication would fail on the manifest being
+/// written instead of skipping it as an incomplete record, as on Unix.
 pub(crate) fn open_read(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -35,8 +38,9 @@ pub(crate) fn open_read(path: &Path) -> io::Result<File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
         const FILE_SHARE_DELETE: u32 = 0x4;
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     }
     options.open(path)
 }
