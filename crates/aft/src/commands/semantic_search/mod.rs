@@ -5269,6 +5269,9 @@ fn run_engine_ranking(
         .is_none()
         .then(|| crate::data_layer::tools::search::DataText::ready(ctx))
         .flatten();
+    if let Some(text) = &data_text {
+        text.note_read(request_id);
+    }
     // Semantic readiness can admit a request before the borrowed search index
     // finishes loading. Wait up to the first-search budget before exact
     // verification falls back to filesystem search, without holding the search

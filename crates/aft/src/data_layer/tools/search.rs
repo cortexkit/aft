@@ -76,6 +76,16 @@ impl DataText {
         self.view.text_generation()
     }
 
+    /// Logs, at debug level, that a ranking read this view. The data-layer
+    /// parity harness (`benchmarks/aft-search/compare_data_layer.py`) counts
+    /// these lines to show which source answered each request.
+    pub(crate) fn note_read(&self, request_id: &str) {
+        crate::slog_debug!(
+            "aft_search {request_id} read the data layer view at {}",
+            self.generation()
+        );
+    }
+
     fn absolute(&self, relative: &[u8]) -> PathBuf {
         absolute(&self.root, relative)
     }
