@@ -29,4 +29,5 @@ pub mod standing;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub(crate) mod tools;
+pub mod trace_measure;
 pub mod vectors;
