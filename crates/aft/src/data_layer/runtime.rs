@@ -220,6 +220,9 @@ struct Work {
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
     retry: std::sync::Mutex<BuildRetry>,
+    /// Told when a build or refresh ends (see
+    /// [`DataCheckout::on_status_change`]).
+    status_listener: std::sync::Mutex<Option<StatusListener>>,
 }
 
 impl Work {
@@ -245,6 +248,9 @@ impl Work {
         self.runner.run(BUILD_REQUEST, Lane::HeavyInit, move || {
             let result = work.checkout.build();
             drop(flag);
+            if !matches!(result, Err(DataError::Cancelled)) {
+                work.notify_status_change();
+            }
             match result {
                 Ok(report) => {
                     *work
@@ -317,6 +323,9 @@ impl Work {
                 let mut flag = Some(flag);
                 loop {
                     let result = work.checkout.refresh_callgraph();
+                    if !matches!(result, Ok(None) | Err(DataError::Cancelled)) {
+                        work.notify_status_change();
+                    }
                     if matches!(result, Ok(Some(_))) {
                         continue;
                     }
@@ -393,6 +402,19 @@ impl Work {
     fn running(&self) -> bool {
         self.building.load(Ordering::Acquire) || self.refreshing.load(Ordering::Acquire)
     }
+
+    /// Tells the status listener, if any, that the checkout's status may
+    /// have changed.
+    fn notify_status_change(&self) {
+        let listener = self
+            .status_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
 }
 
 /// One root's checkout in a running AFT.
@@ -462,6 +484,7 @@ impl DataCheckout {
             building: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),
+            status_listener: std::sync::Mutex::new(None),
         });
         let quiet = {
             let work = Arc::downgrade(&work);
@@ -724,115 +747,41 @@ pub(crate) fn bind_foreground(root: &Path, storage: &Path) -> Result<Checkout, D
     Checkout::bind(layer(), &family_dir, family, root)
 }
 
-/// The last build or call-graph refresh of a checkout that failed, kept
-/// until one succeeds, so status and health can say why a plane is not
-/// ready.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DataFailure {
-    /// `build` or `refresh`.
-    pub(crate) stage: &'static str,
-    pub(crate) error: String,
-    /// Another process held the family store's writer past the wait; the
-    /// next attempt may succeed without any change.
-    pub(crate) busy: bool,
-    /// When it failed, in milliseconds since the Unix epoch.
-    pub(crate) at_ms: u64,
-}
-
-/// Each checkout root's last failure, until a later attempt succeeds. Keyed
-/// by root rather than kept on the handle, so the threads that build and
-/// refresh need nothing but the checkout to report one.
-fn failures() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, DataFailure>> {
-    static FAILURES: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, DataFailure>>> =
-        OnceLock::new();
-    FAILURES.get_or_init(Default::default)
-}
-
-/// Records how a build or refresh of the checkout at `root` ended. A
-/// failure replaces the previous one. A successful build clears any
-/// failure, since it serves a new publication; a successful refresh clears
-/// only a refresh failure, since a failed build still left the checkout
-/// without what it was building.
-pub(crate) fn note_outcome<T>(root: &Path, stage: &'static str, result: &Result<T, DataError>) {
-    let mut failures = failures()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match result {
-        Err(error) => {
-            let at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| {
-                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-                });
-            failures.insert(
-                root.to_path_buf(),
-                DataFailure {
-                    stage,
-                    error: error.to_string(),
-                    busy: matches!(error, DataError::Busy(_)),
-                    at_ms,
-                },
-            );
-        }
-        Ok(_) => {
-            if stage == "build"
-                || failures
-                    .get(root)
-                    .is_some_and(|failure| failure.stage == stage)
-            {
-                failures.remove(root);
-            }
-        }
-    }
-}
+/// The last failed build or call-graph refresh of a checkout.
+pub(crate) type DataFailure = super::checkout::Failure;
 
 impl DataCheckout {
     /// This checkout's last failed build or refresh, until one succeeds.
     #[must_use]
     pub(crate) fn last_failure(&self) -> Option<DataFailure> {
-        failures()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(self.root())
-            .cloned()
+        self.work.checkout.last_failure()
     }
-}
 
-/// What to call when a checkout's status may have changed, by root.
-type StatusListener = Arc<dyn Fn() + Send + Sync>;
-
-fn status_listeners(
-) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, StatusListener>> {
-    static LISTENERS: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, StatusListener>>,
-    > = OnceLock::new();
-    LISTENERS.get_or_init(Default::default)
-}
-
-/// Tells whoever listens for the checkout at `root` that its status may
-/// have changed: a build or a call-graph refresh ended.
-fn notify_status_change(root: &Path) {
-    let listener = status_listeners()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(root)
-        .cloned();
-    if let Some(listener) = listener {
-        listener();
+    /// Records an outcome as a build or refresh of this checkout would, for
+    /// a test of what status reports for it.
+    #[cfg(test)]
+    pub(crate) fn note_outcome_for_test<T>(
+        &self,
+        stage: &'static str,
+        result: &Result<T, DataError>,
+    ) {
+        self.work.checkout.note_outcome(stage, result);
     }
-}
 
-impl DataCheckout {
     /// Calls `notify` whenever a build or call-graph refresh of this
     /// checkout ends, so status pushes follow the data layer. Replaces any
-    /// earlier listener for the same root.
+    /// earlier listener.
     pub(crate) fn on_status_change(&self, notify: StatusListener) {
-        status_listeners()
+        *self
+            .work
+            .status_listener
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.root().to_path_buf(), notify);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
     }
 }
+
+/// What to call when a checkout's status may have changed.
+pub(crate) type StatusListener = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 mod tests {

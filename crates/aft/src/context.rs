@@ -1339,6 +1339,11 @@ pub struct RootHealthSnapshot {
     pub bash: Option<BgTaskHealthCounts>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
+    /// The data layer's pending edits and failures for this root's
+    /// checkout; present only while the data layer runs, when
+    /// `search_index` and `callgraph_store` describe its planes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_store: Option<crate::data_layer::surfaces::DataStoreHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1360,6 +1365,7 @@ pub(crate) struct RootHealthSummary {
     tier2_retry_paused: Vec<Tier2RetryPausedHealthSnapshot>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
+    data_store: Option<crate::data_layer::surfaces::DataStoreHealth>,
 }
 
 impl RootHealthSummary {
@@ -1382,6 +1388,7 @@ impl RootHealthSummary {
             tier2_retry_paused: Vec::new(),
             bash: None,
             suspended_domains: Vec::new(),
+            data_store: None,
         }
     }
 
@@ -1390,7 +1397,9 @@ impl RootHealthSummary {
     }
 
     pub(crate) fn is_fully_ready(&self) -> bool {
-        let component_is_satisfied = |status: &str| matches!(status, "ready" | "disabled");
+        // `off` is the data layer's plane on a root nothing has queried yet:
+        // nothing is built and nothing is pending.
+        let component_is_satisfied = |status: &str| matches!(status, "ready" | "disabled" | "off");
         matches!(self.state, RootHealthState::Ready)
             && self.view_storage_reserve.is_empty()
             && self.search_index_status.is_some_and(component_is_satisfied)
@@ -1459,6 +1468,7 @@ impl RootHealthSummary {
             }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
+            data_store: self.data_store,
         }
     }
 }
@@ -1483,12 +1493,15 @@ impl RootHealthSnapshot {
             tier2: None,
             bash: None,
             suspended_domains: Vec::new(),
+            data_store: None,
         }
     }
 
     pub fn is_fully_ready(&self) -> bool {
-        let component_is_satisfied =
-            |status: &HealthComponentSnapshot| matches!(status.status, "ready" | "disabled");
+        // `off` as in `RootHealthSummary::is_fully_ready`.
+        let component_is_satisfied = |status: &HealthComponentSnapshot| {
+            matches!(status.status, "ready" | "disabled" | "off")
+        };
         let tier2_is_satisfied =
             |tier2: &Tier2HealthSnapshot| matches!(tier2.status, "ready" | "disabled");
 
@@ -4810,6 +4823,9 @@ pub struct AppContext {
     /// legacy stores; only with `AFT_DATA_LAYER=1` (see
     /// `data_layer::runtime`).
     data_checkout: parking_lot::Mutex<Option<Arc<crate::data_layer::runtime::DataCheckout>>>,
+    /// Why the last attempt to bind `data_checkout` failed, until one
+    /// succeeds; status and health report it.
+    data_bind_failure: parking_lot::Mutex<Option<String>>,
     lexical_load_retry: parking_lot::Mutex<crate::views::contracts::LoadRetry<String>>,
     lexical_routes: [AtomicU64; 3],
     callgraph_view: parking_lot::Mutex<Option<Arc<crate::views::callgraph::CallgraphView>>>,
@@ -5797,6 +5813,7 @@ impl AppContext {
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             lexical_view: parking_lot::Mutex::new(None),
             data_checkout: parking_lot::Mutex::new(None),
+            data_bind_failure: parking_lot::Mutex::new(None),
             lexical_load_retry: parking_lot::Mutex::new(Default::default()),
             lexical_routes: Default::default(),
             callgraph_view: parking_lot::Mutex::new(None),
@@ -6200,6 +6217,12 @@ impl AppContext {
         } else {
             None
         };
+        // With the data layer on, its checkout's planes stand in for the
+        // search index and call-graph store below, and the views object is
+        // left out. Read here, ahead of the guards: it takes the checkout's
+        // own locks.
+        let data_store = crate::data_layer::surfaces::report(self);
+        let views = if data_store.is_some() { None } else { views };
         // View load failures are recorded on every query that loads a view,
         // independent of the v1 publication runtime above: checkout-routed
         // roots report them even while `views` is `None`.
@@ -6483,6 +6506,10 @@ impl AppContext {
             (None, None, None)
         };
 
+        let (search_index_status, callgraph_store_status) = match &data_store {
+            Some(report) => (report.text.status, report.callgraph.status),
+            None => (search_index_status, callgraph_store_status),
+        };
         RootHealthSummary {
             cache_unavailable: cache_unavailable_reason,
             state: RootHealthState::Ready,
@@ -6501,6 +6528,7 @@ impl AppContext {
             tier2_retry_paused,
             bash: Some(bash),
             suspended_domains,
+            data_store: data_store.map(|report| report.health()),
         }
     }
 
@@ -9916,9 +9944,26 @@ impl AppContext {
                 &self.storage_dir(),
                 executor,
             ) {
-                Ok(checkout) => Some(checkout),
+                Ok(checkout) => {
+                    *self.data_bind_failure.lock() = None;
+                    // Status pushes follow the data layer's builds and
+                    // refreshes. Only a context its transport owns can push.
+                    let context = self
+                        .status_emitter
+                        .context
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    checkout.on_status_change(Arc::new(move || {
+                        if let Some(context) = context.upgrade() {
+                            context.signal_status_changed();
+                        }
+                    }));
+                    Some(checkout)
+                }
                 Err(error) => {
                     crate::slog_warn!("data layer could not bind {}: {error}", root.display());
+                    *self.data_bind_failure.lock() = Some(error.to_string());
                     None
                 }
             };
@@ -9926,10 +9971,47 @@ impl AppContext {
         slot.clone()
     }
 
+    /// This root's checkout in the data layer as status, health and the
+    /// memory census see it: never binds one (binding starts a build) and
+    /// never waits for a bind in progress. `None` when the data layer is
+    /// off.
+    pub(crate) fn probe_data_checkout(
+        &self,
+    ) -> Option<crate::data_layer::surfaces::DataCheckoutProbe> {
+        use crate::data_layer::surfaces::DataCheckoutProbe;
+        if !crate::data_layer::runtime::enabled() {
+            return None;
+        }
+        let Some(slot) = self.data_checkout.try_lock() else {
+            return Some(DataCheckoutProbe::Binding);
+        };
+        let root = self.canonical_cache_root_opt();
+        if let Some(checkout) = slot
+            .as_ref()
+            .filter(|checkout| root.as_deref() == Some(checkout.root()))
+        {
+            return Some(DataCheckoutProbe::Bound(Arc::clone(checkout)));
+        }
+        drop(slot);
+        Some(match self.data_bind_failure.lock().clone() {
+            Some(error) => DataCheckoutProbe::BindFailed(error),
+            None => DataCheckoutProbe::NotBound,
+        })
+    }
+
     /// The data layer's current view of this root, when it runs and has
     /// published; see [`Self::data_checkout`].
     pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
         self.data_checkout()?.view()
+    }
+
+    /// Holds the slot a bind holds while it scans, so a test sees the
+    /// checkout as binding.
+    #[cfg(test)]
+    pub(crate) fn hold_data_checkout_slot_for_test(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, Option<Arc<crate::data_layer::runtime::DataCheckout>>> {
+        self.data_checkout.lock()
     }
 
     /// Passes the watcher's changed paths to the data layer, if this root
@@ -18290,6 +18372,7 @@ impl AppContext {
     /// status control path.
     pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
         Self::memory_root_snapshot_from(self.memory_estimates())
+            .with_data_layer(crate::data_layer::surfaces::memory_estimate(self))
     }
 
     fn memory_root_snapshot_from(
@@ -18316,21 +18399,11 @@ impl AppContext {
     /// the rich per-subsystem detail that the status command returns.
     fn memory_root_rollup_from(
         estimates: &[crate::memory::MemoryEstimate; 12],
+        data_layer: Option<&crate::memory::MemoryEstimate>,
     ) -> crate::memory::RootMemoryRollup {
-        crate::memory::RootMemoryRollup::from_estimates(&[
-            &estimates[0],
-            &estimates[1],
-            &estimates[2],
-            &estimates[3],
-            &estimates[4],
-            &estimates[5],
-            &estimates[6],
-            &estimates[7],
-            &estimates[8],
-            &estimates[9],
-            &estimates[10],
-            &estimates[11],
-        ])
+        let mut all = estimates.iter().collect::<Vec<_>>();
+        all.extend(data_layer);
+        crate::memory::RootMemoryRollup::from_estimates(&all)
     }
 
     /// Return both [`Self::memory_root_snapshot`] and the health rollup's
@@ -18415,9 +18488,13 @@ impl AppContext {
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / index shape checks and cached estimates");
         let estimates = self.memory_estimates_from(walked);
-        let rollup =
-            Self::memory_root_rollup_from(&estimates).with_measured_age_ms(measured_age_ms);
-        (Self::memory_root_snapshot_from(estimates), rollup)
+        let data_layer = crate::data_layer::surfaces::memory_estimate(self);
+        let rollup = Self::memory_root_rollup_from(&estimates, data_layer.as_ref())
+            .with_measured_age_ms(measured_age_ms);
+        (
+            Self::memory_root_snapshot_from(estimates).with_data_layer(data_layer),
+            rollup,
+        )
     }
 
     /// Attribute all actor roots registered in this process. Standalone mode
@@ -26449,5 +26526,48 @@ mod directory_arrival_pending_tests {
             !ctx.watcher_query_has_pending_changes(),
             "an empty arrival leaves no pending files"
         );
+    }
+}
+
+#[cfg(test)]
+mod data_layer_health_tests {
+    use super::*;
+
+    fn summary(search: &'static str, callgraph: &'static str) -> RootHealthSummary {
+        RootHealthSummary {
+            state: RootHealthState::Ready,
+            search_index_status: Some(search),
+            semantic_index: Some(SemanticHealthComponentSnapshot {
+                status: "disabled",
+                reason: None,
+                since_ms: None,
+                next_retry_ms: None,
+                paused_until_ms: None,
+                stage: None,
+                embedded_chunks: None,
+                total_chunks: None,
+                current_batch: None,
+                total_batches: None,
+            }),
+            callgraph_store_status: Some(callgraph),
+            tier2_status: Some("ready"),
+            ..RootHealthSummary::busy()
+        }
+    }
+
+    #[test]
+    fn a_root_nothing_queried_is_settled_and_a_building_plane_is_not() {
+        // `off` is the data layer's plane on a root whose checkout nothing
+        // has bound: settled, like `disabled`.
+        assert!(summary("off", "off").is_fully_ready());
+        assert!(summary("off", "off")
+            .into_snapshot(Path::new("/r"))
+            .is_fully_ready());
+        for (search, callgraph) in [("building", "ready"), ("ready", "unavailable")] {
+            assert!(!summary(search, callgraph).is_fully_ready());
+            assert!(!summary(search, callgraph)
+                .into_snapshot(Path::new("/r"))
+                .is_fully_ready());
+        }
     }
 }

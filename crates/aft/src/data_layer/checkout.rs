@@ -198,9 +198,24 @@ struct Live {
     /// Counts the publications served, so a recording whose scan started
     /// from an earlier one knows to scan again.
     generation: u64,
-    /// Why the last build or call-graph refresh failed; cleared when one
-    /// succeeds.
-    failure: Option<String>,
+    /// Why the last build or call-graph refresh failed, until one succeeds
+    /// (see [`Checkout::note_outcome`]).
+    failure: Option<Failure>,
+}
+
+/// Why the last build or call-graph refresh of a checkout failed, kept until
+/// a later one succeeds, so status and health can say why a plane is not
+/// ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// `build` or `refresh`.
+    pub stage: &'static str,
+    pub error: String,
+    /// Another process held the family store's writer past the wait; the
+    /// next attempt may succeed without any change.
+    pub busy: bool,
+    /// When it failed, in milliseconds since the Unix epoch.
+    pub at_ms: u64,
 }
 
 /// The files resolved again since a publication, with the paths they were
@@ -473,11 +488,51 @@ impl Checkout {
     /// Why the last build or call-graph refresh failed, until one succeeds.
     #[must_use]
     pub fn failure(&self) -> Option<String> {
+        self.last_failure().map(|failure| failure.error)
+    }
+
+    /// The last failed build or call-graph refresh, until one succeeds.
+    #[must_use]
+    pub fn last_failure(&self) -> Option<Failure> {
         self.live
             .read()
             .expect("no panics while holding it")
             .failure
             .clone()
+    }
+
+    /// Records how a build or refresh (`stage`) ended. A failure replaces
+    /// the previous one; a cancelled run changes nothing. A successful build
+    /// clears any failure, since it serves a new publication. A successful
+    /// refresh clears only a refresh failure: a failed build still left the
+    /// checkout without what it was building.
+    pub(crate) fn note_outcome<T>(&self, stage: &'static str, result: &Result<T, DataError>) {
+        let mut live = self.write_live();
+        match result {
+            Err(DataError::Cancelled) => {}
+            Err(error) => {
+                live.failure = Some(Failure {
+                    stage,
+                    error: error.to_string(),
+                    busy: matches!(error, DataError::Busy(_)),
+                    at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| {
+                            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                });
+            }
+            Ok(_) => {
+                if stage == "build"
+                    || live
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.stage == stage)
+                {
+                    live.failure = None;
+                }
+            }
+        }
     }
 
     /// Whether the checkout needs a build: nothing is published, or what is
@@ -700,15 +755,8 @@ impl Checkout {
     pub fn build(&self) -> Result<BuildReport, DataError> {
         self.write_live().building = true;
         let result = self.build_inner();
-        let mut live = self.write_live();
-        live.building = false;
-        match &result {
-            Ok(_) => live.failure = None,
-            // A cancelled build leaves the last outcome standing.
-            Err(DataError::Cancelled) => {}
-            Err(error) => live.failure = Some(error.to_string()),
-        }
-        drop(live);
+        self.write_live().building = false;
+        self.note_outcome("build", &result);
         result
     }
 
@@ -1133,13 +1181,7 @@ impl Checkout {
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
         checkpoint()?;
         let result = self.refresh_inner();
-        match &result {
-            // A refresh that applied an update clears an earlier failure; one
-            // that had nothing to do leaves a build's failure standing.
-            Ok(Some(_)) => self.write_live().failure = None,
-            Ok(None) | Err(DataError::Cancelled) => {}
-            Err(error) => self.write_live().failure = Some(error.to_string()),
-        }
+        self.note_outcome("refresh", &result);
         result
     }
 

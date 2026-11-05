@@ -188,9 +188,18 @@ fn run_with_paths(
     }
 
     let mut aggregate = SnapshotAggregate::default();
+    let mut data_layer_builds = DataLayerBuilds::new();
     for unit in &plan.units {
         let mut result = match &unit.admission {
             UnitAdmission::Suspended(reason) => UnitResult::gap(reason.clone()),
+            UnitAdmission::Admitted { .. } if aft::data_layer::surfaces::enabled() => {
+                match unit.kind {
+                    IndexKind::Search | IndexKind::Callgraph => {
+                        build_data_layer_unit(&plan.config, unit, &mut data_layer_builds)
+                    }
+                    IndexKind::Semantic => build_unit(&plan.config, unit),
+                }
+            }
             UnitAdmission::Admitted { .. } => build_unit(&plan.config, unit),
         };
 
@@ -434,6 +443,43 @@ fn cache_dir_for(storage_dir: &Path, artifact_key: &str, kind: IndexKind) -> Pat
         IndexKind::Search => resolve_cache_dir_with_key(artifact_key, Some(storage_dir)),
         IndexKind::Semantic => storage_dir.join("semantic").join(artifact_key),
         IndexKind::Callgraph => storage_dir.join("callgraph").join(artifact_key),
+    }
+}
+
+/// Each entry's data-layer build, by literal path: one build publishes both
+/// the text and the call-graph plane, so an entry that selects both kinds
+/// builds once.
+type DataLayerBuilds = BTreeMap<String, Result<aft::data_layer::surfaces::IndexOutcome, String>>;
+
+/// The search or call-graph kind of `unit`, built by the data layer when it
+/// runs: the checkout's text and call-graph planes, published to the
+/// repository's family store in the foreground.
+fn build_data_layer_unit(
+    config: &Config,
+    unit: &SnapshotUnit,
+    builds: &mut DataLayerBuilds,
+) -> UnitResult {
+    let outcome = builds
+        .entry(unit.entry.literal_path.clone())
+        .or_insert_with(|| {
+            let root = std::fs::canonicalize(&unit.entry.resolved_target)
+                .unwrap_or_else(|_| unit.entry.resolved_target.clone());
+            let storage = aft::bash_background::storage_dir(config.storage_dir.as_deref());
+            aft::data_layer::surfaces::index_root(&root, &storage)
+        });
+    match (outcome, unit.kind) {
+        (Err(error), _) => UnitResult::gap(error.clone()),
+        (Ok(outcome), IndexKind::Callgraph) if outcome.unparsed_files > 0 => {
+            UnitResult::usable_gap(
+                outcome.parsed_files,
+                format!(
+                    "callgraph could not parse {} file(s)",
+                    outcome.unparsed_files
+                ),
+            )
+        }
+        (Ok(outcome), IndexKind::Callgraph) => UnitResult::success(outcome.parsed_files),
+        (Ok(outcome), _) => UnitResult::success(outcome.files),
     }
 }
 

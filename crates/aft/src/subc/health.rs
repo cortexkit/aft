@@ -1999,14 +1999,17 @@ fn ordinary_ready_health_root(root: &Value) -> bool {
             .as_object()
             .is_none_or(serde_json::Map::is_empty)
         && root["state"] == "ready"
+        // `off` is the data layer's plane on a root nothing has queried yet:
+        // settled, with nothing built or pending.
         && ["search_index", "semantic_index", "callgraph_store", "tier2"]
             .iter()
             .all(|component| {
                 matches!(
                     root[component]["status"].as_str(),
-                    Some("ready" | "disabled")
+                    Some("ready" | "disabled" | "off")
                 )
             })
+        && root["data_store"]["failure"].is_null()
         && root["suspended_domains"]
             .as_array()
             .is_none_or(Vec::is_empty)
@@ -2095,6 +2098,7 @@ fn abbreviate_health_root(root: &mut Value) -> bool {
                 | "callgraph_store"
                 | "tier2"
                 | "bash"
+                | "data_store"
         )
     });
     for field in ["project_root", "root_id", "standing_entry"] {
@@ -3725,6 +3729,17 @@ fn build_health_diagnostic_rollup_from_actors(
         .iter()
         .filter(|candidate| !candidate.busy && !candidate.fully_ready)
         .count();
+    // Roots whose data-layer checkout could not bind, build or refresh.
+    // Present only while the data layer runs.
+    let data_store_failed_roots = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.health.data_store.as_ref().is_some_and(|store| {
+                store.failure.is_some()
+                    || store.reason == Some(crate::data_layer::surfaces::reason::BIND_FAILED)
+            })
+        })
+        .count();
     let standing_refusals = candidates
         .iter()
         .filter(|candidate| {
@@ -3916,11 +3931,14 @@ fn build_health_diagnostic_rollup_from_actors(
     let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
     rollup_mark!(timer, "lifecycle OS probes");
     shared_app.publish_lifecycle_census(lifecycle.clone());
-    let (status, detail) = root_health_rollup_state(
-        busy_roots,
-        standing_refusals,
-        warming_roots,
-        disk_reserve_detail,
+    let (status, detail) = with_data_store_failures(
+        root_health_rollup_state(
+            busy_roots,
+            standing_refusals,
+            warming_roots,
+            disk_reserve_detail,
+        ),
+        data_store_failed_roots,
     );
 
     let storage_retention = lifecycle_contexts
@@ -3988,6 +4006,9 @@ fn build_health_diagnostic_rollup_from_actors(
         "roots": roots,
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
+    if data_store_failed_roots > 0 {
+        metrics["data_store_failed_roots"] = json!(data_store_failed_roots);
+    }
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
     if log::log_enabled!(log::Level::Debug) && cache.step_log_due() {
@@ -4022,6 +4043,24 @@ fn build_health_diagnostic_rollup_from_actors(
         #[cfg(test)]
         tick,
     }
+}
+
+/// The fleet state with roots whose data-layer checkout failed: such a root
+/// is not warming, so a fleet otherwise ok (or only warming) is degraded
+/// and says why. A degraded state for another reason keeps its detail.
+fn with_data_store_failures(
+    state: (HealthStatus, Option<String>),
+    failed_roots: usize,
+) -> (HealthStatus, Option<String>) {
+    if failed_roots == 0 || state.0 != HealthStatus::Ok {
+        return state;
+    }
+    (
+        HealthStatus::Degraded,
+        Some(format!(
+            "{failed_roots} root(s) could not build or refresh their data store; see roots[].data_store"
+        )),
+    )
 }
 
 fn root_health_rollup_state(
@@ -4997,6 +5036,46 @@ mod tests {
             detail.as_deref(),
             Some("1 root(s) warming background indexes (serving normally)")
         );
+    }
+
+    #[test]
+    fn a_failed_data_store_degrades_the_fleet_and_keeps_its_root_in_detail() {
+        // Warming alone is ok; a root whose data store failed is not warming.
+        let (status, detail) = with_data_store_failures(root_health_rollup_state(0, 0, 1, None), 1);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some("1 root(s) could not build or refresh their data store; see roots[].data_store")
+        );
+        // A fleet already degraded for another reason keeps that reason.
+        let (status, detail) = with_data_store_failures(root_health_rollup_state(2, 0, 0, None), 1);
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some("2 root actor(s) could not be snapshotted without contention")
+        );
+        // No failure: unchanged.
+        assert_eq!(
+            with_data_store_failures(root_health_rollup_state(0, 0, 0, None), 0),
+            (HealthStatus::Ok, None)
+        );
+
+        let mut root = json!({
+            "project_root": "project", "state": "ready",
+            "search_index": {"status": "off"}, "semantic_index": {"status": "disabled"},
+            "callgraph_store": {"status": "off"}, "tier2": {"status": "ready"},
+            "data_store": {"reason": "not_bound", "pending_edits": 0, "unparsed_files": 0},
+        });
+        assert!(ordinary_ready_health_root(&root), "not bound is settled");
+        root["callgraph_store"]["status"] = json!("ready");
+        root["data_store"]["failure"] =
+            json!({"stage": "build", "error": "x", "busy": false, "at_ms": 1});
+        assert!(
+            !ordinary_ready_health_root(&root),
+            "a recorded failure stays in detail"
+        );
+        assert!(abbreviate_health_root(&mut root));
+        assert_eq!(root["data_store"]["failure"]["stage"], "build");
     }
 
     #[test]
@@ -10233,6 +10312,7 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),
+        data_store: None,
     }
 }
 

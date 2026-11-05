@@ -667,6 +667,11 @@ impl AppContext {
             payload["views"] = serde_json::to_value(self.view_health_snapshot())
                 .unwrap_or(serde_json::Value::Null);
         }
+        // With the data layer on, its planes replace today's stores for text
+        // and the call graph on every status surface.
+        if let Some(report) = crate::data_layer::surfaces::report(self) {
+            crate::data_layer::surfaces::apply_to_status(&mut payload, &report);
+        }
         if kind == StatusSnapshotKind::Push {
             // Read only this root's LSP applicability rather than cloning
             // applicability for every root and the other lifecycle details.

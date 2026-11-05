@@ -109,6 +109,14 @@ pub(crate) fn render_memory_census_with_roots(
         },
         "process_io": process_io,
     });
+    // The data layer's block cache is shared by every checkout, so it is
+    // attributed once here, never on a root row. Present only once a
+    // checkout of this process has bound.
+    if let Some(cache) = &snapshot.data_layer_block_cache {
+        result["process"]["data_layer_block_cache_bytes"] =
+            json!(process.data_layer_block_cache_bytes);
+        result["process"]["data_layer_block_cache"] = json!(cache);
+    }
     // The rows are already JSON. Move them into the reply rather than
     // serializing and allocating a second copy of every root's object.
     result["roots"] = Value::Object(roots);
@@ -140,9 +148,10 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
         &detail.parser_pool,
     ]
     .into_iter()
+    .chain(detail.data_layer.as_ref())
     .filter_map(|estimate| estimate.estimated_bytes)
     .fold(0u64, u64::saturating_add);
-    json!({
+    let mut row = json!({
         "root": root,
         "root_id": root,
         "bound_routes": 0,
@@ -172,7 +181,14 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
         "semantic_overlay_bytes": detail.semantic.counts.get("checkout_overlay_bytes").copied().unwrap_or(0),
         "evictable_bytes": detail.evictable_bytes(),
         "lsp_children": { "count": 0, "rss_bytes": 0 },
-    })
+    });
+    // Present only while the data layer runs: the root's checkout there,
+    // with its gaps named, so a partial figure never reads as complete.
+    if let Some(data_layer) = &detail.data_layer {
+        row["planes"]["data_layer"] = json!(data_layer.estimated_bytes.unwrap_or(0));
+        row["data_layer"] = json!(data_layer);
+    }
+    row
 }
 
 /// Cache only snapshot-derived rows. Process counters and lifecycle overlays

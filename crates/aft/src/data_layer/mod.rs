@@ -22,4 +22,5 @@ pub mod reuse;
 pub(crate) mod runtime;
 pub(crate) mod slice;
 pub(crate) mod subjects;
+pub mod surfaces;
 pub(crate) mod tools;

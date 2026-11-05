@@ -186,7 +186,26 @@ fn summary(source: &Value, string_limit: usize) -> Value {
                 "callgraph_store",
             ],
         ),
-        ("search_index", &["status", "files", "trigrams"]),
+        (
+            "search_index",
+            &["status", "files", "trigrams", "indexed_files"],
+        ),
+        // Present only while the data layer runs (see
+        // `data_layer::surfaces::apply_to_status`).
+        (
+            "callgraph_store",
+            &[
+                "status",
+                "pending_edits",
+                "unparsed_files",
+                "reason",
+                "error",
+            ],
+        ),
+        (
+            "data_store",
+            &["reason", "error", "pending_edits", "unparsed_files"],
+        ),
         (
             "semantic_index",
             &[
@@ -213,7 +232,12 @@ fn summary(source: &Value, string_limit: usize) -> Value {
         ("semantic_config", &["backend", "model"]),
         (
             "disk",
-            &["storage_dir", "trigram_disk_bytes", "semantic_disk_bytes"],
+            &[
+                "storage_dir",
+                "trigram_disk_bytes",
+                "semantic_disk_bytes",
+                "data_store_bytes",
+            ],
         ),
         (
             "runtime",
@@ -427,6 +451,8 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
                 | "watcher"
                 | "artifact_owner"
                 | "callgraph_refresh"
+                | "callgraph_store"
+                | "data_store"
                 | "lsp"
         )
     });
@@ -556,6 +582,30 @@ mod tests {
     use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
     use crate::protocol::StatusChangedFrame;
     use std::path::PathBuf;
+
+    #[test]
+    fn data_layer_status_fields_reach_pushes_and_their_compact_summary() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let full = serde_json::json!({
+            "search_index": {"status": "building", "files": 9, "indexed_files": 4},
+            "callgraph_store": {"status": "ready", "pending_edits": 2, "unparsed_files": 1},
+            "data_store": {"pending_edits": 2, "unparsed_files": 1, "reason": "refresh_failed"},
+            "disk": {"storage_dir": "/s", "data_store_bytes": 2048, "data_store_dir": "/s/data/f"},
+        });
+        let frame = StatusChangedFrame::new(None, project(&ctx, full.clone()));
+        assert_eq!(frame.snapshot["callgraph_store"], full["callgraph_store"]);
+        assert_eq!(frame.snapshot["data_store"], full["data_store"]);
+        assert_eq!(frame.snapshot["search_index"], full["search_index"]);
+
+        let compact = summary(&full, 256);
+        assert_eq!(compact["callgraph_store"], full["callgraph_store"]);
+        assert_eq!(compact["data_store"], full["data_store"]);
+        assert_eq!(compact["search_index"]["indexed_files"], 4);
+        assert_eq!(compact["disk"]["data_store_bytes"], 2048);
+    }
 
     #[test]
     fn status_push_busy_projection_is_root_local_and_small() {

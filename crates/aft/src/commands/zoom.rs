@@ -1846,6 +1846,11 @@ fn zoom_one_symbol_inner(
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    // With the data layer on, its call graph is the one the call-graph
+    // commands answer from, so its readiness decides the field.
+    if let Some(field) = crate::data_layer::surfaces::zoom_callgraph_field(ctx) {
+        return field;
+    }
     // Timing hooks for the read-bound test. Unconfigured test contexts have no
     // cache root, so the hooks are skipped there instead of panicking.
     #[cfg(test)]

@@ -96,6 +96,11 @@ pub struct RootMemorySnapshot {
     pub pending_install: MemoryEstimate,
     pub exact_memo: MemoryEstimate,
     pub compression_filters: MemoryEstimate,
+    /// The root's checkout in the data layer, apart from the block cache
+    /// every checkout shares (counted once per process). Present only while
+    /// the data layer runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer: Option<MemoryEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -191,7 +196,18 @@ impl RootMemorySnapshot {
             pending_install: MemoryEstimate::estimated(0),
             exact_memo: MemoryEstimate::estimated(0),
             compression_filters: MemoryEstimate::estimated(0),
+            data_layer: None,
         }
+    }
+
+    /// Attach the data layer's estimate for this root, when it runs, and
+    /// fold it into the root's status and attributed total.
+    pub fn with_data_layer(mut self, data_layer: Option<MemoryEstimate>) -> Self {
+        self.data_layer = data_layer;
+        let rollup = self.rollup();
+        self.status = rollup.status;
+        self.attributed_bytes = rollup.attributed_bytes;
+        self
     }
 
     /// Attach the finished-but-uninstalled load estimate and fold it into the
@@ -218,7 +234,7 @@ impl RootMemorySnapshot {
     }
 
     fn rollup(&self) -> RootMemoryRollup {
-        RootMemoryRollup::from_estimates(&[
+        let mut estimates = vec![
             &self.semantic,
             &self.trigram,
             &self.symbols,
@@ -231,7 +247,9 @@ impl RootMemorySnapshot {
             &self.pending_install,
             &self.exact_memo,
             &self.compression_filters,
-        ])
+        ];
+        estimates.extend(self.data_layer.as_ref());
+        RootMemoryRollup::from_estimates(&estimates)
     }
 
     pub fn busy_subsystem_count(&self) -> usize {
@@ -403,6 +421,11 @@ pub struct ProcessMemorySnapshot {
     /// Embedded chunks resident in those arenas. Each holds one embedding
     /// vector, so it can be checked against an allocator's block counts.
     pub semantic_resident_chunks: u64,
+    /// Bytes resident in the data layer's block cache, shared by every
+    /// checkout and counted once here. Included in `total_attributed_bytes`.
+    /// Present only once a checkout of this process has bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer_block_cache_bytes: Option<u64>,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
     pub busy_subsystems: usize,
@@ -594,6 +617,7 @@ impl ProcessMemorySnapshot {
             roots.len(),
             shared_semantic_bases,
             &SemanticArenaCensus::measure(),
+            crate::data_layer::surfaces::block_cache_estimate().as_ref(),
             AllocatorObservation::measure(),
         )
     }
@@ -603,6 +627,7 @@ impl ProcessMemorySnapshot {
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
         semantic_arenas: &SemanticArenaCensus,
+        data_layer_block_cache: Option<&MemoryEstimate>,
         allocator_observation: AllocatorObservation,
     ) -> Self {
         let mut root_attributed_bytes = 0u64;
@@ -620,9 +645,12 @@ impl ProcessMemorySnapshot {
             snapshot: allocator,
             age_ms: allocator_observation_age_ms,
         } = allocator_observation;
+        let data_layer_block_cache_bytes =
+            data_layer_block_cache.and_then(|cache| cache.estimated_bytes);
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
             .saturating_add(semantic_arenas.bytes)
+            .saturating_add(data_layer_block_cache_bytes.unwrap_or(0))
             .saturating_add(embedding.model_bytes)
             .saturating_add(sqlite.memory_used_bytes);
         let rss_bytes = process_rss_bytes();
@@ -653,6 +681,7 @@ impl ProcessMemorySnapshot {
             embedding_sessions: embedding.sessions,
             embedding_model_bytes: embedding.model_bytes,
             semantic_resident_chunks: semantic_arenas.resident_chunks,
+            data_layer_block_cache_bytes,
             unattributed_bytes,
             root_count,
             busy_subsystems,
@@ -690,6 +719,11 @@ pub struct MemorySnapshot {
     /// Views-on semantic arenas, one row per family, attributed once
     /// process-wide (`process.semantic_arena_bytes`).
     pub semantic_arenas: SemanticArenaCensus,
+    /// The data layer's block cache, shared by every checkout and attributed
+    /// once process-wide (`process.data_layer_block_cache_bytes`). Present
+    /// only once a checkout of this process has bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_layer_block_cache: Option<MemoryEstimate>,
     pub process: ProcessMemorySnapshot,
 }
 
@@ -699,6 +733,7 @@ pub struct MemorySnapshot {
 pub(crate) struct SharedProcessMemory {
     pub(crate) shared_semantic_bases: MemoryEstimate,
     pub(crate) semantic_arenas: SemanticArenaCensus,
+    pub(crate) data_layer_block_cache: Option<MemoryEstimate>,
 }
 
 impl SharedProcessMemory {
@@ -706,6 +741,7 @@ impl SharedProcessMemory {
         Self {
             shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
             semantic_arenas: SemanticArenaCensus::measure(),
+            data_layer_block_cache: crate::data_layer::surfaces::block_cache_estimate(),
         }
     }
 }
@@ -748,6 +784,7 @@ impl MemoryRollupSnapshot {
             roots.len(),
             &shared.shared_semantic_bases,
             &shared.semantic_arenas,
+            shared.data_layer_block_cache.as_ref(),
             allocator,
         );
         let roots_total = roots.len();
@@ -818,6 +855,7 @@ impl MemorySnapshot {
         let SharedProcessMemory {
             shared_semantic_bases,
             semantic_arenas,
+            data_layer_block_cache,
         } = shared;
         // Totals cover EVERY root before the detail map is capped.
         let rollups: Vec<_> = roots.values().map(RootMemorySnapshot::rollup).collect();
@@ -826,6 +864,7 @@ impl MemorySnapshot {
             roots.len(),
             &shared_semantic_bases,
             &semantic_arenas,
+            data_layer_block_cache.as_ref(),
             allocator,
         );
         let roots_total = roots.len();
@@ -842,6 +881,7 @@ impl MemorySnapshot {
             roots_omitted_bytes,
             shared_semantic_bases,
             semantic_arenas,
+            data_layer_block_cache,
             process,
         }
     }

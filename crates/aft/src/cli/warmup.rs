@@ -76,7 +76,11 @@ fn run_with_storage(
     // background cold build. A configured-disabled store is terminal here, so a
     // HOME root reports disabled instead of entering a retry loop. `None` means
     // poll for readiness; `Some(_)` is a terminal state captured at trigger.
-    let callgraph_override = if args.areas.callgraph {
+    let callgraph_override = if args.areas.callgraph && aft::data_layer::surfaces::enabled() {
+        // The data layer's call graph is built with its text plane once the
+        // checkout binds; see `data_layer_states`.
+        None
+    } else if args.areas.callgraph {
         trigger_callgraph_warm(&ctx)
     } else {
         Some(SubsystemState::Disabled)
@@ -358,7 +362,7 @@ fn wait_until_ready(
     loop {
         drain_search_index_events(ctx);
         drain_semantic_index_events(ctx);
-        if areas.callgraph {
+        if areas.callgraph && !aft::data_layer::surfaces::enabled() {
             drain_callgraph_store_events(ctx);
             if callgraph_override.is_none()
                 && ctx.callgraph_store_rx().lock().is_none()
@@ -432,10 +436,16 @@ struct WarmupSnapshot {
 
 impl WarmupSnapshot {
     fn from_context(ctx: &AppContext, callgraph_override: &Option<SubsystemState>) -> Self {
-        let search_index = search_index_state(ctx);
+        let (search_index, callgraph_store) = if aft::data_layer::surfaces::enabled() {
+            data_layer_states(ctx, callgraph_override)
+        } else {
+            (
+                search_index_state(ctx),
+                callgraph_store_state(ctx, callgraph_override),
+            )
+        };
         let semantic_index = semantic_index_state(ctx);
         let symbol_cache = symbol_cache_state(&search_index);
-        let callgraph_store = callgraph_store_state(ctx, callgraph_override);
         Self {
             search_index,
             semantic_index,
@@ -618,6 +628,47 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
 /// cold build in flight), or `Some(state)` for a terminal outcome that won't
 /// change by polling (configured-disabled, worktree/unconfigured = terminal no-op,
 /// or a hard build error).
+/// The search index and call-graph store as the data layer builds them,
+/// when it runs: its checkout's text and call-graph planes. Binding the
+/// checkout starts both, so it is bound only when either is wanted.
+fn data_layer_states(
+    ctx: &AppContext,
+    callgraph_override: &Option<SubsystemState>,
+) -> (SubsystemState, SubsystemState) {
+    if let Some(reason) = ctx.cache_unavailable_reason() {
+        let failed = SubsystemState::Failed(format!("cache_dir_unavailable: {reason}"));
+        return (failed.clone(), failed);
+    }
+    let search = ctx.config().indexes.trigram;
+    let callgraph = callgraph_override.is_none() && ctx.config().indexes.callgraph;
+    if !search && !callgraph {
+        return (
+            SubsystemState::Disabled,
+            callgraph_override
+                .clone()
+                .unwrap_or(SubsystemState::Disabled),
+        );
+    }
+    let convert = |state: aft::data_layer::surfaces::WarmState| match state {
+        aft::data_layer::surfaces::WarmState::Pending(detail) => SubsystemState::Pending(detail),
+        aft::data_layer::surfaces::WarmState::Ready => SubsystemState::Ready,
+        aft::data_layer::surfaces::WarmState::Failed(error) => SubsystemState::Failed(error),
+    };
+    let (text, graph) = aft::data_layer::surfaces::warm(ctx);
+    (
+        if search {
+            convert(text)
+        } else {
+            SubsystemState::Disabled
+        },
+        match callgraph_override {
+            Some(state) => state.clone(),
+            None if callgraph => convert(graph),
+            None => SubsystemState::Disabled,
+        },
+    )
+}
+
 fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return Some(SubsystemState::Failed(format!(
