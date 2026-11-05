@@ -417,11 +417,36 @@ pub(crate) struct BoundFile {
 }
 
 /// Lists over every parsed file that the resolver's whole-checkout lookups
-/// read.
-#[derive(Debug, Default)]
+/// read, each in path order.
+#[derive(Clone, Debug, Default)]
 struct FileLists {
     rust: Vec<String>,
     module_declaring: Vec<String>,
+}
+
+impl FileLists {
+    /// Whether `parse` is a Rust file, and whether it declares modules: as
+    /// the store's `module_declaring_files`, a module reference with a
+    /// module path.
+    fn kinds(parse: &ParseBlob) -> (bool, bool) {
+        (
+            parse.language == "rust",
+            parse.refs.iter().any(|reference| {
+                reference.kind == BlobRefKind::Module && reference.module_path.is_some()
+            }),
+        )
+    }
+
+    /// Puts `path` in `list`, kept in path order, or takes it out.
+    fn place(list: &mut Vec<String>, path: &String, member: bool) {
+        match (list.binary_search(path), member) {
+            (Ok(_), true) | (Err(_), false) => {}
+            (Ok(index), false) => {
+                list.remove(index);
+            }
+            (Err(index), true) => list.insert(index, path.clone()),
+        }
+    }
 }
 
 /// The files of one checkout bound so far, shared by every resolver
@@ -478,10 +503,28 @@ impl BindCache {
         self.files.lock().expect("no panics while holding it").len()
     }
 
-    /// Forgets the whole-checkout lists, after parsed files were added,
-    /// removed or rewritten.
-    pub(crate) fn forget_lists(&self) {
-        *self.lists.lock().expect("no panics while holding it") = None;
+    /// Updates the whole-checkout lists, once built, for `paths`, whose
+    /// parse in `inputs` changed, appeared or went away. Reading every parse
+    /// to build them again would decode every stored one.
+    pub(crate) fn update_lists<'p>(
+        &self,
+        inputs: &CheckoutInputs,
+        paths: impl Iterator<Item = &'p String>,
+    ) {
+        let mut slot = self.lists.lock().expect("no panics while holding it");
+        let Some(current) = slot.as_ref() else {
+            return;
+        };
+        let mut lists = FileLists::clone(current);
+        for path in paths {
+            let (rust, declaring) = inputs
+                .parses
+                .get(path)
+                .map_or((false, false), |(_, parse)| FileLists::kinds(parse));
+            FileLists::place(&mut lists.rust, path, rust);
+            FileLists::place(&mut lists.module_declaring, path, declaring);
+        }
+        *slot = Some(Arc::new(lists));
     }
 
     fn lists(&self, inputs: &CheckoutInputs) -> Arc<FileLists> {
@@ -489,14 +532,11 @@ impl BindCache {
         Arc::clone(slot.get_or_insert_with(|| {
             let mut lists = FileLists::default();
             for (path, (_, parse)) in &inputs.parses {
-                if parse.language == "rust" {
+                let (rust, declaring) = FileLists::kinds(parse);
+                if rust {
                     lists.rust.push(path.clone());
                 }
-                // As the store's `module_declaring_files`: a module reference
-                // with a module path.
-                if parse.refs.iter().any(|reference| {
-                    reference.kind == BlobRefKind::Module && reference.module_path.is_some()
-                }) {
+                if declaring {
                     lists.module_declaring.push(path.clone());
                 }
             }
@@ -985,6 +1025,11 @@ impl MethodCallInputs {
         resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
     ) -> Vec<(String, Vec<SiteResolution>, BTreeSet<String>)> {
+        // Most updates reach no method-call site; the source below lists
+        // every parsed file, so skip it then.
+        if paths.is_empty() {
+            return Vec::new();
+        }
         let source = SiteSource::new(inputs, resolved, self);
         let results = if paths.len() <= SMALL_SITE_RUN {
             let resolver = Resolver::over(&source);

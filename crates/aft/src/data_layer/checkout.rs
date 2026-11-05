@@ -589,14 +589,20 @@ impl Checkout {
     ) -> bool {
         // A record the scan read again keeps its language when its content
         // did not change; a changed text file gets the language its path and
-        // bytes choose.
+        // bytes choose. Only changed paths are extracted: a file read again
+        // only because its stat moved (a touch, a copied checkout) has the
+        // content it had.
+        let changed_set = changed.iter().collect::<HashSet<_>>();
         let mut extracted = HashMap::new();
         let records = state
             .paths()
             .iter()
             .map(|record| {
                 let mut record = record.clone();
-                if let Some(bytes) = read.get(&record.path) {
+                if let Some(bytes) = read
+                    .get(&record.path)
+                    .filter(|_| changed_set.contains(&record.path))
+                {
                     let (language, content) = extract_changed(&record, bytes);
                     record.language = language;
                     extracted.insert(record.path.clone(), content);

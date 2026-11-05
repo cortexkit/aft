@@ -814,9 +814,10 @@ impl LiveCheckout {
             self.reverse.remove(path);
         }
         stats.surfaces_changed = surfaces_changed.len();
-        if !contents.is_empty() || !membership.is_empty() {
-            self.bound.forget_lists();
-        }
+        // The whole-checkout file lists change only for the files whose
+        // parse changed, appeared or went away.
+        self.bound
+            .update_lists(&self.inputs, contents.iter().chain(&membership));
         for (path, bound) in new_bound {
             self.reverse.note_prebound(&path, &bound.binding);
             self.bound.set(path, bound);
