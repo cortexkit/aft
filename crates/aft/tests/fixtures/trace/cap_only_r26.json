@@ -3,12 +3,12 @@
   "target_file": "src/leaf.ts",
   "paths": [
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_1",
           "file": "src/entry_1.ts",
-          "line": 10,
-          "is_entry_point": true
+          "line": 10
         },
         {
           "symbol": "hub_leaf",
@@ -18,12 +18,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_2",
           "file": "src/entry_2.ts",
-          "line": 12,
-          "is_entry_point": true
+          "line": 12
         },
         {
           "symbol": "hub_leaf",
@@ -33,12 +33,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_3",
           "file": "src/entry_3.ts",
-          "line": 15,
-          "is_entry_point": true
+          "line": 15
         },
         {
           "symbol": "hub_leaf",
@@ -48,12 +48,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_4",
           "file": "src/entry_4.ts",
-          "line": 20,
-          "is_entry_point": true
+          "line": 20
         },
         {
           "symbol": "hub_leaf",
@@ -63,12 +63,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_5",
           "file": "src/entry_5.ts",
-          "line": 22,
-          "is_entry_point": true
+          "line": 22
         },
         {
           "symbol": "hub_leaf",
@@ -78,12 +78,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_6",
           "file": "src/entry_6.ts",
-          "line": 25,
-          "is_entry_point": true
+          "line": 25
         },
         {
           "symbol": "hub_leaf",
@@ -93,12 +93,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_7",
           "file": "src/entry_7.ts",
-          "line": 30,
-          "is_entry_point": true
+          "line": 30
         },
         {
           "symbol": "hub_leaf",
@@ -108,12 +108,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_8",
           "file": "src/entry_8.ts",
-          "line": 32,
-          "is_entry_point": true
+          "line": 32
         },
         {
           "symbol": "hub_leaf",
@@ -123,12 +123,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_9",
           "file": "src/entry_9.ts",
-          "line": 35,
-          "is_entry_point": true
+          "line": 35
         },
         {
           "symbol": "hub_leaf",
@@ -138,12 +138,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_10",
           "file": "src/entry_10.ts",
-          "line": 40,
-          "is_entry_point": true
+          "line": 40
         },
         {
           "symbol": "hub_leaf",
@@ -153,12 +153,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_11",
           "file": "src/entry_11.ts",
-          "line": 42,
-          "is_entry_point": true
+          "line": 42
         },
         {
           "symbol": "hub_leaf",
@@ -168,12 +168,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_12",
           "file": "src/entry_12.ts",
-          "line": 45,
-          "is_entry_point": true
+          "line": 45
         },
         {
           "symbol": "hub_leaf",
@@ -183,12 +183,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_13",
           "file": "src/entry_13.ts",
-          "line": 50,
-          "is_entry_point": true
+          "line": 50
         },
         {
           "symbol": "hub_leaf",
@@ -198,12 +198,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_14",
           "file": "src/entry_14.ts",
-          "line": 52,
-          "is_entry_point": true
+          "line": 52
         },
         {
           "symbol": "hub_leaf",
@@ -213,12 +213,12 @@
       ]
     },
     {
+      "root": "public_api",
       "hops": [
         {
           "symbol": "entry_15",
           "file": "src/entry_15.ts",
-          "line": 55,
-          "is_entry_point": true
+          "line": 55
         },
         {
           "symbol": "hub_leaf",
@@ -230,7 +230,9 @@
   ],
   "total_paths": 60,
   "total_paths_is_lower_bound": false,
-  "entry_points_found": 15,
+  "root_counts": {
+    "public_api": 15
+  },
   "max_depth_reached": false,
   "truncated_paths": 0,
   "paths_list_envelope": {

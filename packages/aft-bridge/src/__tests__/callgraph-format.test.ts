@@ -310,27 +310,47 @@ describe("formatCallgraphSections", () => {
     expect(text).toContain("main");
   });
 
-  test("trace_to renders paths", () => {
+  test("trace_to renders paths with their root kinds", () => {
     const text = formatCallgraphSections("trace_to", {
-      total_paths: 1,
-      entry_points_found: 1,
-      paths: [{ hops: [{ symbol: "main", file: "/repo/a.ts", line: 1, is_entry_point: true }] }],
+      total_paths: 2,
+      root_counts: { main: 1, attribute: 1 },
+      paths: [
+        {
+          root: "main",
+          hops: [
+            { symbol: "main", file: "/repo/src/main.rs", line: 1 },
+            { symbol: "run", file: "/repo/src/lib.rs", line: 3, exported: true },
+            { symbol: "leaf", file: "/repo/src/lib.rs", line: 9 },
+          ],
+        },
+        {
+          root: "attribute",
+          attribute: "no_mangle",
+          hops: [
+            { symbol: "ffi_entry", file: "/repo/src/ffi.rs", line: 2, exported: true },
+            { symbol: "leaf", file: "/repo/src/lib.rs", line: 9 },
+          ],
+        },
+      ],
     }).join("\n");
-    expect(text).toContain("1 path");
-    expect(text).toContain("Path 1");
+    expect(text).toContain("2 paths · roots: main, 1 function with an entry attribute");
+    expect(text).toContain("main [root: main]");
+    expect(text).toContain("run [exported]");
+    expect(text).toContain("ffi_entry [root: attribute no_mangle]");
+    expect(text).not.toContain("ffi_entry [exported]");
   });
 
   test("trace_to renders budgeted path counts as lower bounds", () => {
     const text = formatCallgraphSections("trace_to", {
       total_paths: 7,
       total_paths_is_lower_bound: true,
-      entry_points_found: 2,
+      root_counts: { public_api: 2 },
       hub_summary: {
         message: "Next: at least 7 paths — showing 2; traversal capped; narrow with scope",
       },
       paths: [],
     }).join("\n");
-    expect(text).toContain("at least 7 paths");
+    expect(text).toContain("at least 7 paths · roots: 2 public API functions");
     expect(text).toContain("Next: at least 7 paths");
   });
 
@@ -344,11 +364,14 @@ describe("formatCallgraphSections", () => {
           caller_file: "/repo/a.ts",
           line: 7,
           call_expression: "run()",
+          root: "public_api",
         },
       ],
+      root_counts: { public_api: 1 },
     }).join("\n");
     expect(text).toContain("1 affected call site");
-    expect(text).toContain("↳ main");
+    expect(text).toContain("Reaches 1 public API function");
+    expect(text).toContain("↳ main [root: public API]");
     expect(text).toContain("run()");
   });
 

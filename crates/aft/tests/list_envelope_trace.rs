@@ -603,9 +603,10 @@ fn setup_real_callgraph_context() -> (tempfile::TempDir, aft::context::AppContex
 fn handle_trace_to_attaches_envelope_when_depth_capped() {
     let (_temp, ctx) = setup_real_callgraph_context();
 
-    // Target 'validate' in helpers.ts is 2 hops from entrypoint 'main' in main.ts
-    // (main -> processData -> validate). With depth: 1, search cuts off at
-    // processData and fails to reach 'main', setting max_depth_reached.
+    // Target 'validate' in helpers.ts is 2 hops from 'main' in main.ts
+    // (main -> processData -> validate). With depth: 1, the trace cuts off at
+    // processData, which has callers, setting max_depth_reached; it still
+    // reaches the roots one hop away, runCheck and testValidation.
     let req = RawRequest {
         id: "trace-to-live-depth".into(),
         command: "trace_to".into(),
@@ -632,9 +633,9 @@ fn handle_trace_to_attaches_envelope_when_depth_capped() {
 
     let envelope: ListEnvelope =
         serde_json::from_value(envelope_val.unwrap().clone()).expect("valid ListEnvelope");
-    assert_eq!(envelope.shown, 4);
+    assert_eq!(envelope.shown, 2);
     assert!(envelope.total.is_at_least(), "total.kind must be at_least");
-    assert_eq!(envelope.total, Total::AtLeast(4));
+    assert_eq!(envelope.total, Total::AtLeast(2));
     assert_eq!(envelope.unit, Unit::Paths);
     assert_eq!(envelope.reason, Some(Reason::Depth));
     assert_eq!(envelope.causes, vec![Reason::Depth]);
@@ -645,7 +646,7 @@ fn handle_trace_to_attaches_envelope_when_depth_capped() {
         ..Default::default()
     };
     let formatted = format_response_with_context("callgraph", &response, &fmt_ctx);
-    let expected_trailer = "shown 4 of ≥4 paths (depth) · narrow: depth, includeTests";
+    let expected_trailer = "shown 2 of ≥2 paths (depth) · narrow: depth, includeTests";
     assert!(
         formatted.contains(expected_trailer),
         "formatted output must contain (depth) trailer:\nexpected: {expected_trailer}\ngot: {formatted}"
@@ -693,29 +694,27 @@ fn handle_trace_to_untruncated_produces_no_envelope_and_matches_pre_spec() {
         "untruncated trace_to must not render any trailer"
     );
 
-    // Baseline rendering expected for untruncated traces, verifying no envelope trailer is rendered.
-    // Captured from origin/main at commit bc936c0b2943aac994f7bc51804df7cd63bc6480.
+    // Rendering expected for untruncated traces, verifying no envelope
+    // trailer is rendered. Every path runs to a root nothing calls; the
+    // exported functions on the way (processData, validate) stay in the
+    // paths, marked exported. TypeScript defines no starting function, so
+    // the exported roots are public API.
     let expected_rendering = "\
-6 paths · 6 entry points · (depth limited, 4 truncated)
+4 paths · roots: 3 public API functions, 1 function with no caller found
 Path 1
-  ↳ handleRequest [entry] [service.ts:3]
-    ↳ processData [utils.ts:3]
-      ↳ validate [helpers.ts:1]
+  ↳ handleRequest [root: public API] [service.ts:3]
+    ↳ processData [exported] [utils.ts:3]
+      ↳ validate [exported] [helpers.ts:1]
 Path 2
-  ↳ main [entry] [main.ts:3]
-    ↳ processData [utils.ts:3]
-      ↳ validate [helpers.ts:1]
+  ↳ main [root: public API] [main.ts:3]
+    ↳ processData [exported] [utils.ts:3]
+      ↳ validate [exported] [helpers.ts:1]
 Path 3
-  ↳ processData [entry] [utils.ts:3]
-    ↳ validate [helpers.ts:1]
+  ↳ runCheck [root: public API] [aliased.ts:3]
+    ↳ validate [exported] [helpers.ts:1]
 Path 4
-  ↳ runCheck [entry] [aliased.ts:3]
-    ↳ validate [helpers.ts:1]
-Path 5
-  ↳ testValidation [entry] [test_helpers.ts:3]
-    ↳ validate [helpers.ts:1]
-Path 6
-  ↳ validate [entry] [helpers.ts:1]";
+  ↳ testValidation [root: no caller found] [test_helpers.ts:3]
+    ↳ validate [exported] [helpers.ts:1]";
     assert_eq!(
         formatted, expected_rendering,
         "rendered text must equal pre-spec rendering"

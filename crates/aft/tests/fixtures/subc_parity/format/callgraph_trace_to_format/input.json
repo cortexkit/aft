@@ -4,7 +4,9 @@
     "id": "1",
     "success": true,
     "total_paths": 2,
-    "entry_points_found": 1,
+    "root_counts": {
+      "public_api": 1
+    },
     "max_depth_reached": true,
     "truncated_paths": 1,
     "hub_summary": {
@@ -12,12 +14,12 @@
     },
     "paths": [
       {
+        "root": "public_api",
         "hops": [
           {
             "symbol": "entry",
             "file": "<PROJECT_ROOT>/src/entry.ts",
-            "line": 1,
-            "is_entry_point": true
+            "line": 1
           },
           {
             "symbol": "leaf",

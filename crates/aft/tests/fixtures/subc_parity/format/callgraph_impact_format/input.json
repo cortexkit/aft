@@ -14,7 +14,7 @@
         "caller_file": "<PROJECT_ROOT>/src/main.ts",
         "caller_symbol": "entry",
         "line": 10,
-        "is_entry_point": true,
+        "root": "public_api",
         "call_expression": "run(value)",
         "parameters": [
           "value: string",
@@ -22,7 +22,10 @@
         ],
         "resolved_by": "name_match"
       }
-    ]
+    ],
+    "root_counts": {
+      "public_api": 1
+    }
   },
   "ctx": {
     "agent_args": {

@@ -1,3 +1,3 @@
-at least 61 paths · 3 entry points
+at least 61 paths · roots: main, 2 public API functions
 Next: at least 61 paths — showing 15; traversal capped; narrow with scope
-No entry paths found.
+No paths found.
