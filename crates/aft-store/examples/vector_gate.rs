@@ -159,6 +159,7 @@ fn load_dir(dir: &Path, chunks_path: &Path) -> Dataset {
             Chunk {
                 text: TextDigest::of(&text),
                 exported: chunk["exported"].as_bool().unwrap(),
+                failed: false,
             },
             text,
         )
@@ -271,6 +272,7 @@ fn load_packs(paths: &[PathBuf]) -> Dataset {
             Chunk {
                 text,
                 exported: false,
+                failed: false,
             },
             digest.to_vec(),
         )
@@ -786,6 +788,7 @@ fn add_bytes(a: SectionBytes, b: SectionBytes) -> SectionBytes {
         scan: a.scan + b.scan,
         vectors: a.vectors + b.vectors,
         chunk_maps: a.chunk_maps + b.chunk_maps,
+        chunk_details: a.chunk_details + b.chunk_details,
     }
 }
 

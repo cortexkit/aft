@@ -12,22 +12,36 @@
 //! | f32 rows | per vector, by ordinal: the vector as the embedder returned it, read only to rescore; 64-byte aligned |
 //! | chunk maps | a unit table: each (content, path) key in ascending order, located at its map |
 //! | chunk map data | per map: the path, then each chunk's text digest and flags, in chunk order |
+//! | chunk details index | per map, by the map's ordinal: where its details are and how they are packed |
+//! | chunk details | per map: what a search shows for each chunk, and why chunking or embedding failed, each map's bytes compressed on their own |
 //!
 //! A chunk map lists text digests, not ordinals, so a file whose chunks were
-//! embedded earlier can name vectors that live in an older segment.
+//! embedded earlier can name vectors that live in an older segment. A search
+//! reads only chunk maps to choose its members; it reads a map's details only
+//! for the files its answer names.
+//!
+//! A map's details unpack to one record ([`FileDetails::encode`]): a string
+//! table, then the file's failure (an optional string), the chunk count,
+//! and per chunk its kind code, start and end line, name, optional qualified
+//! name, snippet and optional failure, all as varints and string indexes.
+//! A map added without details has an empty record.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::VectorError;
 use super::model::{ChunkMapKey, ModelIdentity, TextDigest};
 use super::score::{ScanParams, mean, quantize};
+use crate::content::DecodeError;
+use crate::content::codec::{Decoder, Encoder};
 use crate::ids::{ContentKey, Digest128};
 use crate::le::u32_at;
+use crate::packed::{self, INDEX_ENTRY_LEN, PackedBuilder};
 use crate::segment::{
     Alignment, BLOCK_LEN, ErrorKind, KeySpace, KnownSection, Requirement, SectionHandle, SectionId,
     SectionKind, SectionSpec, Segment, SegmentError, SegmentWriter,
 };
-use crate::table::{UnitLocation, UnitTable, UnitTableBuilder};
+use crate::table::{UnitLocation, UnitTable, UnitTableBuilder, UnitTableParts};
 
 const FINGERPRINT: SectionKind = SectionKind::new(0x0300);
 const UNITS: SectionKind = SectionKind::new(0x0301);
@@ -36,7 +50,9 @@ const VECTORS: SectionKind = SectionKind::new(0x0303);
 const CHUNK_MAPS: SectionKind = SectionKind::new(0x0304);
 const CHUNK_MAP_DATA: SectionKind = SectionKind::new(0x0305);
 const CENTER: SectionKind = SectionKind::new(0x0306);
-const KINDS: [SectionKind; 7] = [
+const DETAILS_INDEX: SectionKind = SectionKind::new(0x0307);
+const DETAILS: SectionKind = SectionKind::new(0x0308);
+const KINDS: [SectionKind; 9] = [
     FINGERPRINT,
     UNITS,
     CENTER,
@@ -44,6 +60,8 @@ const KINDS: [SectionKind; 7] = [
     VECTORS,
     CHUNK_MAPS,
     CHUNK_MAP_DATA,
+    DETAILS_INDEX,
+    DETAILS,
 ];
 const VERSION: u16 = 1;
 const KEY_SPACE: KeySpace = KeySpace::new(0);
@@ -53,12 +71,13 @@ const SCAN_HEADER_LEN: usize = 16;
 /// Bytes per chunk in a chunk map: its text digest and one flags byte.
 const CHUNK_ENTRY_LEN: usize = Digest128::LEN + 1;
 const FLAG_EXPORTED: u8 = 1;
+const FLAG_FAILED: u8 = 2;
 
 /// Dimensions above this are refused, as today's index refuses them.
 pub const MAX_DIMENSIONS: u32 = 8192;
 
 /// The vector sections this build reads.
-pub const KNOWN: [KnownSection; 7] = [
+pub const KNOWN: [KnownSection; 9] = [
     KnownSection {
         kind: FINGERPRINT,
         version: VERSION,
@@ -87,6 +106,14 @@ pub const KNOWN: [KnownSection; 7] = [
         kind: CHUNK_MAP_DATA,
         version: VERSION,
     },
+    KnownSection {
+        kind: DETAILS_INDEX,
+        version: VERSION,
+    },
+    KnownSection {
+        kind: DETAILS,
+        version: VERSION,
+    },
 ];
 
 /// Bytes of one scan row for vectors of `dimensions`.
@@ -105,6 +132,8 @@ pub struct SectionBytes {
     pub vectors: u64,
     /// The chunk map table and data.
     pub chunk_maps: u64,
+    /// The chunk details index and their packed bytes.
+    pub chunk_details: u64,
 }
 
 /// One chunk of a file, as its chunk map records it.
@@ -114,6 +143,81 @@ pub struct Chunk {
     pub text: TextDigest,
     /// Whether today's exported-chunk boost applies to its score.
     pub exported: bool,
+    /// The embedder refused this chunk's text, so it has no vector and never
+    /// will under this model; its details say why.
+    pub failed: bool,
+}
+
+/// What a search shows for one chunk of a file, recorded by whoever cut the
+/// file into chunks. The store keeps it as given.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ChunkDetail {
+    /// The producer's code for the chunk's kind.
+    pub kind: u8,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub snippet: String,
+    /// Why the embedder refused the chunk's text; set exactly for a chunk
+    /// whose map entry is [`Chunk::failed`].
+    pub failure: Option<String>,
+}
+
+/// The details of one file's chunks, in chunk order.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct FileDetails {
+    /// Why the file could not be cut into chunks. Its chunk map is then
+    /// empty: the file is accounted for, and has nothing to search.
+    pub failure: Option<String>,
+    pub chunks: Vec<ChunkDetail>,
+}
+
+impl FileDetails {
+    /// The record a map's details are stored as, before packing.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.opt_str(self.failure.as_deref());
+        encoder.usize(self.chunks.len());
+        for chunk in &self.chunks {
+            encoder.byte(chunk.kind);
+            encoder.u32(chunk.start_line);
+            encoder.u32(chunk.end_line);
+            encoder.str(&chunk.name);
+            encoder.opt_str(chunk.qualified_name.as_deref());
+            encoder.str(&chunk.snippet);
+            encoder.opt_str(chunk.failure.as_deref());
+        }
+        encoder.finish()
+    }
+
+    /// Reads a record [`encode`](Self::encode) wrote.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are not such a record.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut decoder = Decoder::new(bytes)?;
+        let failure = decoder.opt_string()?;
+        // Each chunk takes at least its kind byte, two line varints and four
+        // string indexes.
+        let count = decoder.count_of(7)?;
+        let mut chunks = Vec::with_capacity(count);
+        for _ in 0..count {
+            chunks.push(ChunkDetail {
+                kind: decoder.byte()?,
+                start_line: decoder.u32()?,
+                end_line: decoder.u32()?,
+                name: decoder.string()?,
+                qualified_name: decoder.opt_string()?,
+                snippet: decoder.string()?,
+                failure: decoder.opt_string()?,
+            });
+        }
+        decoder.finish()?;
+        Ok(Self { failure, chunks })
+    }
 }
 
 /// Collects vectors and chunk maps for the vector sections of one segment.
@@ -121,7 +225,7 @@ pub struct Chunk {
 pub struct VectorSectionsBuilder {
     model: ModelIdentity,
     vectors: BTreeMap<TextDigest, Vec<f32>>,
-    maps: BTreeMap<ChunkMapKey, (Vec<u8>, Vec<Chunk>)>,
+    maps: BTreeMap<ChunkMapKey, (Vec<u8>, Vec<Chunk>, Option<FileDetails>)>,
 }
 
 impl VectorSectionsBuilder {
@@ -184,7 +288,37 @@ impl VectorSectionsBuilder {
     pub fn add_chunk_map(&mut self, content: ContentKey, path: &[u8], chunks: &[Chunk]) {
         self.maps
             .entry(ChunkMapKey::new(content, path))
-            .or_insert_with(|| (path.to_vec(), chunks.to_vec()));
+            .or_insert_with(|| (path.to_vec(), chunks.to_vec(), None));
+    }
+
+    /// [`add_chunk_map`](Self::add_chunk_map), with what a search shows for
+    /// each chunk and why any part failed.
+    ///
+    /// # Errors
+    ///
+    /// [`VectorError::DetailsMismatch`] when the details do not describe
+    /// these chunks: another count, a failure on a chunk not flagged failed
+    /// or none on one that is, or chunks beside a file failure.
+    pub fn add_chunk_map_with_details(
+        &mut self,
+        content: ContentKey,
+        path: &[u8],
+        chunks: &[Chunk],
+        details: FileDetails,
+    ) -> Result<(), VectorError> {
+        let matches = details.chunks.len() == chunks.len()
+            && (details.failure.is_none() || chunks.is_empty())
+            && chunks
+                .iter()
+                .zip(&details.chunks)
+                .all(|(chunk, detail)| chunk.failed == detail.failure.is_some());
+        if !matches {
+            return Err(VectorError::DetailsMismatch);
+        }
+        self.maps
+            .entry(ChunkMapKey::new(content, path))
+            .or_insert_with(|| (path.to_vec(), chunks.to_vec(), Some(details)));
+        Ok(())
     }
 
     /// How many vectors it holds.
@@ -199,7 +333,7 @@ impl VectorSectionsBuilder {
         self.maps.len()
     }
 
-    /// Writes the seven sections into `writer`.
+    /// Writes the nine sections into `writer`.
     ///
     /// # Errors
     ///
@@ -274,7 +408,9 @@ impl VectorSectionsBuilder {
 
         let mut table = UnitTableBuilder::new(ChunkMapKey::LEN);
         let mut data = Vec::new();
-        for (key, (path, chunks)) in &self.maps {
+        let mut details = PackedBuilder::with_capacity(self.maps.len());
+        for (key, (path, chunks, file_details)) in &self.maps {
+            details.push(&file_details.as_ref().map_or_else(Vec::new, FileDetails::encode));
             let start = data.len();
             let path_len = u32::try_from(path.len()).expect("a path is shorter than 4 GiB");
             data.extend_from_slice(&path_len.to_le_bytes());
@@ -283,7 +419,14 @@ impl VectorSectionsBuilder {
             data.extend_from_slice(&chunk_count.to_le_bytes());
             for chunk in chunks {
                 data.extend_from_slice(chunk.text.digest().as_bytes());
-                data.push(if chunk.exported { FLAG_EXPORTED } else { 0 });
+                let mut flags = 0;
+                if chunk.exported {
+                    flags |= FLAG_EXPORTED;
+                }
+                if chunk.failed {
+                    flags |= FLAG_FAILED;
+                }
+                data.push(flags);
             }
             table.push(
                 &key.to_bytes(),
@@ -295,7 +438,10 @@ impl VectorSectionsBuilder {
         }
         let (table, maps) = table.finish();
         writer.write_section(spec(CHUNK_MAPS, Alignment::Word), &table, maps)?;
-        writer.write_section(spec(CHUNK_MAP_DATA, Alignment::Word), &data, maps)
+        writer.write_section(spec(CHUNK_MAP_DATA, Alignment::Word), &data, maps)?;
+        let (details, index) = details.finish();
+        writer.write_section(spec(DETAILS_INDEX, Alignment::Word), &index, maps)?;
+        writer.write_section(spec(DETAILS, Alignment::Word), &details, maps)
     }
 }
 
@@ -315,12 +461,30 @@ pub struct VectorSegment<'s> {
     model: ModelIdentity,
     units: UnitTable<'s>,
     /// Decoded once: every search needs all of it, and it is one vector.
-    center: Vec<f32>,
+    center: Arc<[f32]>,
     scan: SectionHandle,
     vectors: SectionHandle,
     maps: UnitTable<'s>,
     map_data: SectionHandle,
+    details_index: SectionHandle,
+    details: SectionHandle,
     dimensions: usize,
+}
+
+/// What opening a segment's vector sections read and checked, kept so the
+/// same open segment can be read again without repeating any of it (see
+/// [`VectorSegment::reopen`]).
+#[derive(Clone, Debug)]
+pub struct VectorSegmentParts {
+    model: ModelIdentity,
+    units: UnitTableParts,
+    center: Arc<[f32]>,
+    scan: SectionHandle,
+    vectors: SectionHandle,
+    maps: UnitTableParts,
+    map_data: SectionHandle,
+    details_index: SectionHandle,
+    details: SectionHandle,
 }
 
 impl<'s> VectorSegment<'s> {
@@ -340,6 +504,8 @@ impl<'s> VectorSegment<'s> {
             Some(vectors),
             Some(maps),
             Some(map_data),
+            Some(details_index),
+            Some(details),
         ] = handles
         else {
             if handles.iter().any(Option::is_some) {
@@ -371,7 +537,7 @@ impl<'s> VectorSegment<'s> {
         }
         let mut center_bytes = vec![0; dimensions * 4];
         segment.read(center, 0, &mut center_bytes)?;
-        let center = f32s(&center_bytes);
+        let center: Arc<[f32]> = f32s(&center_bytes).into();
         if center.iter().any(|value| !value.is_finite()) {
             return Err(malformed(segment, "the scan center is not finite"));
         }
@@ -396,6 +562,16 @@ impl<'s> VectorSegment<'s> {
                 "chunk map data does not match the chunk map table",
             ));
         }
+        let index_info = segment.info(details_index);
+        if index_info.item_count != u64::from(maps.len())
+            || index_info.len != u64::from(maps.len()) * INDEX_ENTRY_LEN as u64
+            || segment.info(details).item_count != u64::from(maps.len())
+        {
+            return Err(malformed(
+                segment,
+                "chunk details do not match the chunk map table",
+            ));
+        }
         Ok(Some(Self {
             segment,
             model,
@@ -405,8 +581,53 @@ impl<'s> VectorSegment<'s> {
             vectors,
             maps,
             map_data,
+            details_index,
+            details,
             dimensions,
         }))
+    }
+
+    /// What this open read and checked, to [`reopen`](Self::reopen) the same
+    /// open segment later at no cost.
+    #[must_use]
+    pub fn parts(&self) -> VectorSegmentParts {
+        VectorSegmentParts {
+            model: self.model.clone(),
+            units: self.units.parts(),
+            center: Arc::clone(&self.center),
+            scan: self.scan,
+            vectors: self.vectors,
+            maps: self.maps.parts(),
+            map_data: self.map_data,
+            details_index: self.details_index,
+            details: self.details,
+        }
+    }
+
+    /// The vector sections of `segment` as an earlier [`open`](Self::open)
+    /// of this same open segment found them, without reading or checking
+    /// anything again. `None` when `parts` came from another open segment,
+    /// even one of the same file.
+    #[must_use]
+    pub fn reopen(segment: &'s Segment, parts: &VectorSegmentParts) -> Option<Self> {
+        // A section handle names the open segment it came from, so this
+        // compares instances, not files.
+        if segment.section(SectionId::new(UNITS, KEY_SPACE)) != Some(parts.units.section) {
+            return None;
+        }
+        Some(Self {
+            segment,
+            model: parts.model.clone(),
+            units: UnitTable::attach(segment, parts.units),
+            center: Arc::clone(&parts.center),
+            scan: parts.scan,
+            vectors: parts.vectors,
+            maps: UnitTable::attach(segment, parts.maps),
+            map_data: parts.map_data,
+            details_index: parts.details_index,
+            details: parts.details,
+            dimensions: parts.model.dimensions as usize,
+        })
     }
 
     #[must_use]
@@ -459,12 +680,29 @@ impl<'s> VectorSegment<'s> {
             .segment
             .section(SectionId::new(CHUNK_MAPS, KEY_SPACE))
             .map_or(0, len);
+        let details_index = len(self.details_index);
         SectionBytes {
             units,
             scan: len(self.scan),
             vectors: len(self.vectors),
             chunk_maps: maps + len(self.map_data),
+            chunk_details: details_index + len(self.details),
         }
+    }
+
+    /// The key of every chunk map, in ordinal order.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails.
+    pub fn chunk_map_keys(&self) -> Result<Vec<ChunkMapKey>, SegmentError> {
+        (0..self.maps.len())
+            .map(|ordinal| {
+                let (key, _) = self.maps.entry(ordinal)?;
+                ChunkMapKey::from_bytes(&key)
+                    .ok_or_else(|| self.malformed("a chunk map key is not a content and path"))
+            })
+            .collect()
     }
 
     /// The text digest of every vector, in ordinal order.
@@ -548,8 +786,53 @@ impl<'s> VectorSegment<'s> {
         content: ContentKey,
         path: &[u8],
     ) -> Result<Option<Vec<Chunk>>, SegmentError> {
+        Ok(self
+            .locate_map(content, path)?
+            .map(|(_, chunks)| chunks))
+    }
+
+    /// The details recorded with the chunk map of the file at `path` with
+    /// `content`: `None` when the segment has no such map, or the map was
+    /// added without details.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails, or the details are malformed or do not describe
+    /// the map's chunks.
+    pub fn chunk_details(
+        &self,
+        content: ContentKey,
+        path: &[u8],
+    ) -> Result<Option<FileDetails>, SegmentError> {
+        let Some((ordinal, chunks)) = self.locate_map(content, path)? else {
+            return Ok(None);
+        };
+        let bytes = packed::read(self.segment, self.details, self.details_index, ordinal)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let details = FileDetails::decode(&bytes)
+            .map_err(|_| self.malformed("chunk details do not decode"))?;
+        let matches = details.chunks.len() == chunks.len()
+            && chunks
+                .iter()
+                .zip(&details.chunks)
+                .all(|(chunk, detail)| chunk.failed == detail.failure.is_some());
+        if !matches {
+            return Err(self.malformed("chunk details do not match their chunk map"));
+        }
+        Ok(Some(details))
+    }
+
+    /// The ordinal and chunks of the map of the file at `path` with
+    /// `content`, if the segment has one.
+    fn locate_map(
+        &self,
+        content: ContentKey,
+        path: &[u8],
+    ) -> Result<Option<(u32, Vec<Chunk>)>, SegmentError> {
         let key = ChunkMapKey::new(content, path);
-        let Some((_, location)) = self.maps.get(&key.to_bytes())? else {
+        let Some((ordinal, location)) = self.maps.get(&key.to_bytes())? else {
             return Ok(None);
         };
         let end = location
@@ -565,7 +848,7 @@ impl<'s> VectorSegment<'s> {
             // the other file's chunks.
             return Err(self.malformed("a chunk map is stored under another path"));
         }
-        Ok(Some(chunks))
+        Ok(Some((ordinal, chunks)))
     }
 
     fn decode_map<'b>(&self, bytes: &'b [u8]) -> Result<(&'b [u8], Vec<Chunk>), SegmentError> {
@@ -590,7 +873,7 @@ impl<'s> VectorSegment<'s> {
             .iter()
             .map(|entry| {
                 let flags = entry[Digest128::LEN];
-                if flags & !FLAG_EXPORTED != 0 {
+                if flags & !(FLAG_EXPORTED | FLAG_FAILED) != 0 {
                     return Err(fail());
                 }
                 Ok(Chunk {
@@ -598,6 +881,7 @@ impl<'s> VectorSegment<'s> {
                         entry, 0,
                     ))),
                     exported: flags & FLAG_EXPORTED != 0,
+                    failed: flags & FLAG_FAILED != 0,
                 })
             })
             .collect::<Result<_, _>>()?;
@@ -781,6 +1065,15 @@ mod tests {
             .unwrap();
         writer
             .write_section(spec(CHUNK_MAP_DATA, Alignment::Word), &data, count)
+            .unwrap();
+        let mut details = PackedBuilder::with_capacity(1);
+        details.push(&[]);
+        let (details, index) = details.finish();
+        writer
+            .write_section(spec(DETAILS_INDEX, Alignment::Word), &index, count)
+            .unwrap();
+        writer
+            .write_section(spec(DETAILS, Alignment::Word), &details, count)
             .unwrap();
         writer.finish().unwrap();
         Segment::open(

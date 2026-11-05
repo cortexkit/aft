@@ -202,6 +202,36 @@ impl<'s> UnitTable<'s> {
             len: u32_at(entry, self.key_width + 8),
         }
     }
+
+    /// What [`open`](Self::open) read and checked, so the table can be
+    /// attached to the same open segment again without reading it.
+    pub(crate) fn parts(&self) -> UnitTableParts {
+        UnitTableParts {
+            section: self.section,
+            key_width: self.key_width,
+            count: self.count,
+        }
+    }
+
+    /// The table [`parts`](Self::parts) came from, attached to `segment`,
+    /// which must be the very segment it was opened on: its section handle
+    /// panics on any other.
+    pub(crate) fn attach(segment: &'s Segment, parts: UnitTableParts) -> Self {
+        Self {
+            segment,
+            section: parts.section,
+            key_width: parts.key_width,
+            count: parts.count,
+        }
+    }
+}
+
+/// A [`UnitTable`] detached from its segment (see [`UnitTable::parts`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct UnitTableParts {
+    pub(crate) section: SectionHandle,
+    key_width: usize,
+    count: u32,
 }
 
 const LOOKUP_ENTRY_LEN: usize = 20;

@@ -233,14 +233,17 @@ fn vectors_and_chunk_maps_round_trip() {
         Chunk {
             text: text(5),
             exported: true,
+            failed: false,
         },
         Chunk {
             text: text(1),
             exported: false,
+            failed: false,
         },
         Chunk {
             text: TextDigest::of(b"never embedded"),
             exported: false,
+            failed: false,
         },
     ];
     builder.add_chunk_map(content, b"src/a.rs", &chunks);
@@ -605,6 +608,7 @@ fn vectors_in_older_segments_serve_newer_chunk_maps() {
         .map(|i| Chunk {
             text: text(i),
             exported: i % 3 == 0,
+            failed: false,
         })
         .collect();
     newer.add_chunk_map(content, b"lib.rs", &chunks);
@@ -808,4 +812,209 @@ fn concurrent_searches_share_the_block_cache() {
         "blocks are read once and shared: {stats:?}"
     );
     assert!(stats.hits > stats.misses);
+}
+
+fn detail(name: &str, failure: Option<&str>) -> ChunkDetail {
+    ChunkDetail {
+        kind: 3,
+        start_line: 10,
+        end_line: 24,
+        name: name.to_string(),
+        qualified_name: Some(format!("Outer.{name}")),
+        snippet: format!("fn {name}() {{\n    body();\n}}").repeat(8),
+        failure: failure.map(str::to_string),
+    }
+}
+
+#[test]
+fn chunk_details_and_failures_round_trip() {
+    let mut store = Store::new();
+    let mut rng = TestRng::new(23);
+    let vectors = clustered(&mut rng, 4, 16);
+    let mut builder = VectorSectionsBuilder::new(model(16)).unwrap();
+    for (index, vector) in vectors.iter().enumerate() {
+        builder.add_vector(text(index), vector).unwrap();
+    }
+    let content = ContentKey::of(b"fn a() {}");
+    let chunks = [
+        Chunk {
+            text: text(0),
+            exported: true,
+            failed: false,
+        },
+        Chunk {
+            text: TextDigest::of(b"refused"),
+            exported: false,
+            failed: true,
+        },
+    ];
+    let details = FileDetails {
+        failure: None,
+        chunks: vec![detail("a", None), detail("b", Some("provider refused"))],
+    };
+    // Details that do not describe the chunks are refused.
+    for wrong in [
+        FileDetails {
+            failure: None,
+            chunks: vec![detail("a", None)],
+        },
+        FileDetails {
+            failure: None,
+            chunks: vec![detail("a", None), detail("b", None)],
+        },
+        FileDetails {
+            failure: Some("not UTF-8".to_string()),
+            chunks: details.chunks.clone(),
+        },
+    ] {
+        assert!(matches!(
+            builder.add_chunk_map_with_details(content, b"src/a.rs", &chunks, wrong),
+            Err(VectorError::DetailsMismatch)
+        ));
+    }
+    builder
+        .add_chunk_map_with_details(content, b"src/a.rs", &chunks, details.clone())
+        .unwrap();
+    // A file that could not be chunked: no chunks, and why.
+    let broken = ContentKey::of(b"\xff\xfe");
+    let failed_file = FileDetails {
+        failure: Some("stream did not contain valid UTF-8".to_string()),
+        chunks: Vec::new(),
+    };
+    builder
+        .add_chunk_map_with_details(broken, b"src/b.rs", &[], failed_file.clone())
+        .unwrap();
+    // A map added without details has none.
+    builder.add_chunk_map(content, b"src/c.rs", &chunks[..1]);
+    let path = store.write(builder);
+    let segment = store.open(&path);
+    segment.verify().unwrap();
+    let opened = VectorSegment::open(&segment).unwrap().unwrap();
+    assert_eq!(
+        opened.chunk_map(content, b"src/a.rs").unwrap(),
+        Some(chunks.to_vec())
+    );
+    assert_eq!(
+        opened.chunk_details(content, b"src/a.rs").unwrap(),
+        Some(details.clone())
+    );
+    assert_eq!(
+        opened.chunk_details(broken, b"src/b.rs").unwrap(),
+        Some(failed_file)
+    );
+    assert_eq!(opened.chunk_map(broken, b"src/b.rs").unwrap(), Some(Vec::new()));
+    assert_eq!(opened.chunk_details(content, b"src/c.rs").unwrap(), None);
+    assert_eq!(opened.chunk_details(content, b"src/d.rs").unwrap(), None);
+    let mut keys = opened.chunk_map_keys().unwrap();
+    keys.sort();
+    let mut expected = vec![
+        ChunkMapKey::new(content, b"src/a.rs"),
+        ChunkMapKey::new(broken, b"src/b.rs"),
+        ChunkMapKey::new(content, b"src/c.rs"),
+    ];
+    expected.sort();
+    assert_eq!(keys, expected);
+    // The repeated snippets are stored compressed.
+    let bytes = opened.section_bytes();
+    assert!(
+        bytes.chunk_details < details.encode().len() as u64,
+        "{bytes:?}"
+    );
+    // An index finds the details beside the map it serves.
+    drop(opened);
+    let segments = [segment];
+    let index = index_of(&segments, 16);
+    assert_eq!(
+        index.chunk_details(content, b"src/a.rs").unwrap(),
+        Some(details)
+    );
+    let map = index.chunk_map(content, b"src/a.rs").unwrap().unwrap();
+    assert!(map[0].unit.is_some() && map[1].unit.is_none() && map[1].chunk.failed);
+}
+
+#[test]
+fn file_details_refuse_damaged_records() {
+    let details = FileDetails {
+        failure: None,
+        chunks: vec![detail("a", None), detail("b", Some("refused"))],
+    };
+    let bytes = details.encode();
+    assert_eq!(FileDetails::decode(&bytes).unwrap(), details);
+    for cut in 0..bytes.len() {
+        assert!(FileDetails::decode(&bytes[..cut]).is_err(), "cut at {cut}");
+    }
+    let mut longer = bytes;
+    longer.push(0);
+    assert!(FileDetails::decode(&longer).is_err());
+}
+
+#[test]
+fn a_shared_index_lends_indexes_that_answer_as_a_built_one() {
+    let mut store = Store::new();
+    let mut rng = TestRng::new(29);
+    let vectors = clustered(&mut rng, 300, 24);
+    let mut older = VectorSectionsBuilder::new(model(24)).unwrap();
+    let mut newer = VectorSectionsBuilder::new(model(24)).unwrap();
+    for (index, vector) in vectors.iter().enumerate() {
+        if index < 150 {
+            older.add_vector(text(index), vector).unwrap();
+        } else {
+            newer.add_vector(text(index), vector).unwrap();
+        }
+    }
+    // Another model's segment is left out.
+    let mut foreign = VectorSectionsBuilder::new(model(8)).unwrap();
+    foreign.add_vector(text(0), &[1.0; 8]).unwrap();
+    let paths = [store.write(older), store.write(foreign), store.write(newer)];
+    let segments: Vec<Arc<Segment>> = paths.iter().map(|p| Arc::new(store.open(p))).collect();
+    let shared = SharedVectorIndex::build(segments.iter().cloned(), &model(24)).unwrap();
+    assert_eq!(shared.vectors(), 300);
+    assert_eq!(shared.segments().count(), 2);
+    let plain: Vec<&Segment> = segments.iter().map(|segment| &**segment).collect();
+    let built = VectorIndex::build(
+        plain
+            .iter()
+            .filter_map(|segment| VectorSegment::open(segment).unwrap()),
+        &model(24),
+    )
+    .unwrap();
+    let lent = shared.index();
+    let members: Vec<Member> = (0..300)
+        .map(|i| Member {
+            unit: lent.locate(text(i)).unwrap(),
+            exported: i % 4 == 0,
+        })
+        .collect();
+    for (i, member) in members.iter().enumerate() {
+        assert_eq!(built.locate(text(i)), Some(member.unit), "vector {i}");
+    }
+    let set = lent.member_set(members.clone()).unwrap();
+    let built_set = built.member_set(members.clone()).unwrap();
+    // Members prepared through one lent index serve another, even from
+    // another thread; the built index refuses them.
+    let again = shared.index();
+    for query in clustered(&mut rng, 8, 24) {
+        for k in [1, 7, 300] {
+            let expected = built.search(&built_set, &request(&query, k)).unwrap();
+            let found = again.search(&set, &request(&query, k)).unwrap();
+            assert_same(&answer(&found), &answer(&expected), &format!("k {k}"));
+            assert_eq!(found.report, expected.report);
+        }
+    }
+    assert!(matches!(
+        built.search(&set, &request(&vectors[0], 3)),
+        Err(VectorError::ForeignMembers)
+    ));
+    std::thread::scope(|scope| {
+        let (shared, set, query) = (&shared, &set, &vectors[5]);
+        scope.spawn(move || {
+            let result = shared.index().search(set, &request(query, 1)).unwrap();
+            assert_eq!(result.hits[0].member, 5);
+        });
+    });
+    // Parts belong to the open segment they came from, not to its file.
+    let parts = VectorSegment::open(&segments[0]).unwrap().unwrap().parts();
+    let other_open = store.open(&paths[0]);
+    assert!(VectorSegment::reopen(&other_open, &parts).is_none());
+    assert!(VectorSegment::reopen(&segments[0], &parts).is_some());
 }

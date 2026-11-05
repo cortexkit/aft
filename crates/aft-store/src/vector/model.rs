@@ -204,4 +204,16 @@ impl ChunkMapKey {
         out[Digest128::LEN..].copy_from_slice(self.path.as_bytes());
         out
     }
+
+    /// A key read back from a chunk map table; `None` when the bytes are
+    /// not one.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::LEN {
+            return None;
+        }
+        Some(Self {
+            content: ContentKey::from_digest(Digest128::from_bytes(crate::le::array(bytes, 0))),
+            path: Digest128::from_bytes(crate::le::array(bytes, Digest128::LEN)),
+        })
+    }
 }

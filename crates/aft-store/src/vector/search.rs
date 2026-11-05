@@ -15,14 +15,18 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use super::VectorError;
 use super::model::{ModelId, ModelIdentity, TextDigest};
 use super::score::{QueryTerms, approx_kernel, dot_product, rank_order, score};
-use super::sections::{Chunk, VectorSegment, f32s, scan_codes, scan_params, scan_row_len};
+use super::sections::{
+    Chunk, FileDetails, VectorSegment, VectorSegmentParts, f32s, scan_codes, scan_params,
+    scan_row_len,
+};
 use crate::ids::ContentKey;
-use crate::segment::BLOCK_LEN;
+use crate::segment::{BLOCK_LEN, Segment};
 
 /// Bytes of scan rows or f32 rows read per call while scanning: one block,
 /// so the copy stays in the core's own cache while the scan reads it.
@@ -48,7 +52,8 @@ pub struct VectorIndex<'s> {
     model: ModelIdentity,
     model_id: ModelId,
     segments: Vec<VectorSegment<'s>>,
-    by_text: HashMap<TextDigest, UnitRef>,
+    /// Shared with every index lent by the same [`SharedVectorIndex`].
+    by_text: Arc<HashMap<TextDigest, UnitRef>>,
 }
 
 impl<'s> VectorIndex<'s> {
@@ -91,7 +96,7 @@ impl<'s> VectorIndex<'s> {
             model: model.clone(),
             model_id: model.id(),
             segments,
-            by_text,
+            by_text: Arc::new(by_text),
         })
     }
 
@@ -152,6 +157,26 @@ impl<'s> VectorIndex<'s> {
                         })
                         .collect(),
                 ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The details recorded with the chunk map [`chunk_map`](Self::chunk_map)
+    /// returns for the same file: `None` when no segment has a map for it,
+    /// or its map was stored without details.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails or the details are malformed.
+    pub fn chunk_details(
+        &self,
+        content: ContentKey,
+        path: &[u8],
+    ) -> Result<Option<FileDetails>, VectorError> {
+        for segment in self.segments.iter().rev() {
+            if segment.chunk_map(content, path)?.is_some() {
+                return Ok(segment.chunk_details(content, path)?);
             }
         }
         Ok(None)
@@ -502,6 +527,100 @@ impl<'s> VectorIndex<'s> {
             .filter(|segment| unit.ordinal < segment.len())
             .ok_or(VectorError::UnknownUnit(unit))
     }
+}
+
+/// A [`VectorIndex`] that owns its segments, so it can be kept between
+/// searches and shared by threads. Building it opens and checks every
+/// segment and reads every vector key once; [`index`](Self::index) then
+/// lends an index over the same open segments without reading anything.
+/// Member sets prepared through one lent index serve every other.
+#[derive(Debug)]
+pub struct SharedVectorIndex {
+    token: u64,
+    model: ModelIdentity,
+    model_id: ModelId,
+    /// This model's segments, in the order given, each with what opening its
+    /// vector sections found.
+    segments: Vec<(Arc<Segment>, VectorSegmentParts)>,
+    by_text: Arc<HashMap<TextDigest, UnitRef>>,
+}
+
+impl SharedVectorIndex {
+    /// The vectors of `model` in `segments`, which are in the order a
+    /// snapshot lists them (see [`VectorIndex::build`]). Segments without
+    /// vector sections, or with another model's, are left out.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn build(
+        segments: impl IntoIterator<Item = Arc<Segment>>,
+        model: &ModelIdentity,
+    ) -> Result<Self, VectorError> {
+        let mut kept = Vec::new();
+        for segment in segments {
+            let parts = match VectorSegment::open(&segment)? {
+                Some(opened) if opened.model() == model => opened.parts(),
+                _ => continue,
+            };
+            kept.push((segment, parts));
+        }
+        let (token, model_id, by_text) = {
+            let index = VectorIndex::build(
+                kept.iter()
+                    .map(|(segment, parts)| reopened(segment, parts)),
+                model,
+            )?;
+            (index.token, index.model_id, Arc::clone(&index.by_text))
+        };
+        Ok(Self {
+            token,
+            model: model.clone(),
+            model_id,
+            segments: kept,
+            by_text,
+        })
+    }
+
+    /// An index over the same open segments, sharing everything building
+    /// this one read. Cheap: it reads nothing.
+    #[must_use]
+    pub fn index(&self) -> VectorIndex<'_> {
+        VectorIndex {
+            token: self.token,
+            model: self.model.clone(),
+            model_id: self.model_id,
+            segments: self
+                .segments
+                .iter()
+                .map(|(segment, parts)| reopened(segment, parts))
+                .collect(),
+            by_text: Arc::clone(&self.by_text),
+        }
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &ModelIdentity {
+        &self.model
+    }
+
+    /// How many distinct vectors of the model the segments hold.
+    #[must_use]
+    pub fn vectors(&self) -> usize {
+        self.by_text.len()
+    }
+
+    /// The segments holding this model's vectors, in index order: a
+    /// [`UnitRef::segment`] is a position in this list.
+    pub fn segments(&self) -> impl Iterator<Item = &Arc<Segment>> {
+        self.segments.iter().map(|(segment, _)| segment)
+    }
+}
+
+/// `segment`'s vector sections from `parts`, which opening that very segment
+/// produced.
+fn reopened<'s>(segment: &'s Segment, parts: &VectorSegmentParts) -> VectorSegment<'s> {
+    VectorSegment::reopen(segment, parts).expect("the parts came from opening this segment")
 }
 
 /// Each member's lower and upper score bound, and whether every bound is

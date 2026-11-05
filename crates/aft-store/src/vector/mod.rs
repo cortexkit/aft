@@ -34,10 +34,12 @@ pub use model::{ChunkMapKey, ModelId, ModelIdentity, TextDigest};
 pub use score::{dot_product, rank_order, score, vector_norm};
 pub use search::{
     Coverage, FileMembers, FullScan, Hit, MappedChunk, Member, MemberSet, ScoreBounds,
-    SearchReport, SearchRequest, SearchResult, UnitRef, VectorIndex, default_rescore_limit,
+    SearchReport, SearchRequest, SearchResult, SharedVectorIndex, UnitRef, VectorIndex,
+    default_rescore_limit,
 };
 pub use sections::{
-    Chunk, KNOWN, MAX_DIMENSIONS, SectionBytes, VectorSectionsBuilder, VectorSegment,
+    Chunk, ChunkDetail, FileDetails, KNOWN, MAX_DIMENSIONS, SectionBytes, VectorSectionsBuilder,
+    VectorSegment, VectorSegmentParts,
 };
 
 use crate::segment::SegmentError;
@@ -65,4 +67,7 @@ pub enum VectorError {
     TooManyMembers,
     #[error("more segments than an index can hold")]
     TooManySegments,
+    /// Details given with a chunk map do not describe its chunks.
+    #[error("chunk details do not describe the chunk map's chunks")]
+    DetailsMismatch,
 }
