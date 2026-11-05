@@ -1592,6 +1592,69 @@ mod tests {
         format!("{callers:?}")
     }
 
+    /// Rust calls to free functions through module paths: a full `crate::`
+    /// path into a `pub(crate) mod`, a module declared with `#[path]`, and a
+    /// module imported with `{self, ...}`. Today's legacy store resolves all
+    /// three; the views resolver was found to miss them.
+    #[test]
+    fn rust_calls_through_module_paths_have_callers() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let r = root.path();
+        write(r, "Cargo.toml", "[package]\nname = \"paths\"\n");
+        write(
+            r,
+            "src/lib.rs",
+            "pub mod outer;\npub mod access;\npub mod graph;\npub mod user;\n",
+        );
+        write(r, "src/outer/mod.rs", "pub(crate) mod runtime;\n");
+        write(
+            r,
+            "src/outer/runtime.rs",
+            "pub fn enabled() -> bool { true }\n",
+        );
+        write(
+            r,
+            "src/access.rs",
+            "#[path = \"access_plugin.rs\"]\npub(crate) mod plugin;\n",
+        );
+        write(r, "src/access_plugin.rs", "pub fn issue() {}\n");
+        write(r, "src/graph.rs", "pub fn aliases() {}\npub struct Edge;\n");
+        write(
+            r,
+            "src/user.rs",
+            "use crate::graph::{self, Edge};\n\
+             pub fn user() {\n\
+             \x20   if crate::outer::runtime::enabled() {\n\
+             \x20       crate::access::plugin::issue();\n\
+             \x20   }\n\
+             \x20   graph::aliases();\n\
+             \x20   let _ = Edge;\n\
+             }\n",
+        );
+        let checkout = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            store.path(),
+            family(),
+            r,
+        )
+        .unwrap();
+        checkout.build().unwrap();
+        let view = checkout.view().unwrap();
+        let mut missing = Vec::new();
+        for (file, symbol) in [
+            ("src/outer/runtime.rs", "enabled"),
+            ("src/access_plugin.rs", "issue"),
+            ("src/graph.rs", "aliases"),
+        ] {
+            let callers = callers_of(&view, file, symbol);
+            if !callers.contains("src/user.rs") {
+                missing.push(format!("{file}::{symbol}: {callers}"));
+            }
+        }
+        assert!(missing.is_empty(), "{missing:#?}");
+    }
+
     fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
         let query = plan_pattern(pattern, false).unwrap();
         view.text_candidates(&query, Scope::All)
