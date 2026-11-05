@@ -1346,45 +1346,36 @@ mod tests {
             .map(str::trim)
             .filter(|query| !query.is_empty() && seen.insert(query.to_string()))
             .collect::<Vec<_>>();
+        // Each worker records its answers as it goes; keeping every answer
+        // until the end would hold gigabytes of rendered lists.
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let done = std::sync::atomic::AtomicUsize::new(0);
+        let tallies =
+            std::sync::Mutex::new(std::collections::BTreeMap::<&'static str, Tally>::new());
         let started = Instant::now();
-        let mut answers = std::thread::scope(|scope| {
-            let workers = (0..threads)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let legacy = TextIndex::Snapshot(&snapshot);
-                        let data = TextIndex::Data(&pair.data);
-                        let mut answered = Vec::new();
-                        loop {
-                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(query) = queries.get(index) else {
-                                break;
-                            };
-                            let found = compare_query(&pair, legacy, data, query, index < exact_limit);
-                            answered.push((index, found));
-                            let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if finished % 500 == 0 {
-                                eprintln!("{finished} queries in {:.0} s", started.elapsed().as_secs_f64());
-                            }
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let legacy = TextIndex::Snapshot(&snapshot);
+                    let data = TextIndex::Data(&pair.data);
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(query) = queries.get(index) else {
+                            break;
+                        };
+                        let found = compare_query(&pair, legacy, data, query, index < exact_limit);
+                        let mut tallies = tallies.lock().unwrap();
+                        for (name, legacy, data) in found {
+                            tallies.entry(name).or_default().record(query, legacy, data);
                         }
-                        answered
-                    })
-                })
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .flat_map(|worker| worker.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        answers.sort_by_key(|(index, _)| *index);
-
-        let mut tallies = std::collections::BTreeMap::<&'static str, Tally>::new();
-        for (index, found) in answers {
-            for (name, legacy, data) in found {
-                tallies.entry(name).or_default().record(queries[index], legacy, data);
+                        let finished = tallies.get("lexical_lane").map_or(0, |tally| tally.queries);
+                        if finished % 500 == 0 {
+                            eprintln!("{finished} queries in {:.0} s", started.elapsed().as_secs_f64());
+                        }
+                    }
+                });
             }
-        }
+        });
+        let tallies = tallies.into_inner().unwrap();
         let mut report = serde_json::json!({
             "root": root,
             "distinct_queries": queries.len(),
