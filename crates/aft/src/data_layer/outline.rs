@@ -664,9 +664,7 @@ pub fn separator() -> char {
     }
 
     /// Today's call-graph store of `root`, built cold.
-    fn todays_store(
-        root: &Path,
-    ) -> (crate::callgraph_store::CallGraphStore, tempfile::TempDir) {
+    fn todays_store(root: &Path) -> (crate::callgraph_store::CallGraphStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::callgraph_store::CallGraphStore::open(
             dir.path().join("store"),
@@ -794,7 +792,11 @@ pub fn separator() -> char {
             let path = root.join(file);
             let view = checkout.view().unwrap();
             let ours = impact_fields(&view.callgraph(), &path, symbol);
-            assert_eq!(ours, impact_fields(&store, &path, symbol), "{file} {symbol}");
+            assert_eq!(
+                ours,
+                impact_fields(&store, &path, symbol),
+                "{file} {symbol}"
+            );
             shown += callers(&ours)
                 .iter()
                 .filter(|caller| caller["call_expression"].is_string())
@@ -817,8 +819,9 @@ pub fn separator() -> char {
             .collect::<Vec<_>>();
         assert!(!stale.is_empty(), "{ours}");
         assert!(
-            stale.iter().all(|caller| caller["call_expression"].is_null()
-                && caller["approximate"] == true),
+            stale
+                .iter()
+                .all(|caller| caller["call_expression"].is_null() && caller["approximate"] == true),
             "{ours}"
         );
 
@@ -836,10 +839,9 @@ pub fn separator() -> char {
         .unwrap();
         assert_eq!(answer, trace_fields(&serde_json::to_value(&today).unwrap()));
         assert!(
-            answer["hops"]
-                .as_array()
-                .is_some_and(|hops| !hops.is_empty()
-                    && hops.iter().all(|hop| hop["approximate"] == true)),
+            answer["hops"].as_array().is_some_and(
+                |hops| !hops.is_empty() && hops.iter().all(|hop| hop["approximate"] == true)
+            ),
             "{answer}"
         );
     }
@@ -907,8 +909,7 @@ pub fn separator() -> char {
 
     fn zlib_fast(bytes: &[u8]) -> usize {
         use std::io::Write;
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
         encoder.write_all(bytes).unwrap();
         let packed = encoder.finish().unwrap().len();
         // The store keeps a body packed only when that saves a tenth.
@@ -933,8 +934,8 @@ pub fn separator() -> char {
             extract_parsed, extract_with_tree, language_for, record_from_blob, EXTRACTOR_VERSION,
         };
 
-        let repo = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-            .unwrap();
+        let repo =
+            std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
 
         #[derive(Default)]
         struct Contents(Mutex<Vec<(String, String, Vec<u8>)>>);
@@ -947,7 +948,10 @@ pub fn separator() -> char {
                     return;
                 };
                 if let Some(language) = language_for(path, bytes).filter(|l| l != "config") {
-                    self.0.lock().unwrap().push((path.to_string(), language, bytes.to_vec()));
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((path.to_string(), language, bytes.to_vec()));
                 }
             }
         }
@@ -962,7 +966,8 @@ pub fn separator() -> char {
         let mut contents = contents.0.into_inner().unwrap();
         contents.sort();
         let mut seen = std::collections::HashSet::new();
-        contents.retain(|(_, language, bytes)| seen.insert((ContentKey::of(bytes), language.clone())));
+        contents
+            .retain(|(_, language, bytes)| seen.insert((ContentKey::of(bytes), language.clone())));
 
         // Extraction with and without the outline, from the same trees.
         let (mut old_ns, mut new_ns) = (0u128, 0u128);
@@ -1117,8 +1122,9 @@ pub fn separator() -> char {
         let key = "outline-measure";
         crate::symbol_cache_disk::write_to_disk(&parsed.read().unwrap(), storage.path(), key)
             .unwrap();
-        let disk_bytes = std::fs::metadata(crate::symbol_cache_disk::cache_path(storage.path(), key))
-            .map_or(0, |metadata| metadata.len());
+        let disk_bytes =
+            std::fs::metadata(crate::symbol_cache_disk::cache_path(storage.path(), key))
+                .map_or(0, |metadata| metadata.len());
         drop(parsed);
         let from_disk = fresh_cache();
         let before = resident_kib();
@@ -1155,7 +1161,10 @@ pub fn separator() -> char {
                 _ => {}
             }
         }
-        println!("tables compared: {same} equal, {} differing", differing.len());
+        println!(
+            "tables compared: {same} equal, {} differing",
+            differing.len()
+        );
         assert!(differing.is_empty(), "{differing:?}");
         assert!(same > 1000, "only {same} files compared");
     }
