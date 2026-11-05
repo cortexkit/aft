@@ -9988,6 +9988,109 @@ export function bannerUnused() {}
     }
 
     #[test]
+    fn dead_code_follows_a_refreshed_data_layer_call_graph_as_a_cold_build_would() {
+        fn published(root: &Path, storage: &Path) -> Arc<crate::data_layer::runtime::DataCheckout> {
+            let checkout =
+                crate::data_layer::runtime::DataCheckout::open(root, storage).expect("bind");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while checkout.view().is_none() {
+                assert!(Instant::now() < deadline, "the checkout never published");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            checkout
+        }
+        fn parts(snapshot: &CallgraphSnapshot) -> [String; 6] {
+            [
+                format!("{:#?}", snapshot.files),
+                format!("{:#?}", snapshot.exported_symbols),
+                format!("{:#?}", snapshot.outbound_calls),
+                format!("{:#?}", snapshot.entry_points),
+                format!("{:#?}", snapshot.entry_point_symbols),
+                format!("{:#?}", snapshot.go_initializers),
+            ]
+        }
+        let dead = |job: &InspectJob, snapshot: &Arc<CallgraphSnapshot>| {
+            let mut job = job.clone();
+            job.callgraph_snapshot = Some(Arc::clone(snapshot));
+            let aggregate = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+                .outcome
+                .expect("dead-code scan")
+                .aggregate;
+            let items = aggregate["items"]
+                .as_array()
+                .expect("dead-code items")
+                .iter()
+                .map(|item| format!("{}::{}", item["file"], item["symbol"]))
+                .collect::<Vec<_>>();
+            (items, aggregate)
+        };
+
+        let dir = tempfile::tempdir().expect("project");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("src/foo.ts"),
+            "export function used() {}\nexport function spare() {}\n",
+        )
+        .expect("foo");
+        let main = root.join("src/main.ts");
+        std::fs::write(
+            &main,
+            "import { used } from './foo';\nexport function main() {\n  used();\n}\n",
+        )
+        .expect("main");
+        let storage = tempfile::tempdir().expect("storage");
+        let checkout = published(&root, storage.path());
+        let manager = InspectManager::new();
+        manager.read_dead_code_from_data_layer(&root, &checkout);
+        let mut job = snapshot_job(&root, &storage.path().join("inspect"), true);
+        job.scope_files = vec![root.join("src/foo.ts"), main.clone()];
+        let read = |manager: &InspectManager| {
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(&job, false, false, &[])
+                .expect("snapshot readiness")
+        };
+
+        let (before, verdict, _) = read(&manager).expect("the published graph answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        assert_eq!(dead(&job, &before).0, [r#""src/foo.ts"::"spare""#]);
+
+        // `spare` gains the only caller `used` had.
+        std::fs::write(
+            &main,
+            "import { spare } from './foo';\nexport function main() {\n  spare();\n}\n",
+        )
+        .expect("edit main");
+        checkout.note_paths(std::slice::from_ref(&main));
+        assert!(read(&manager).is_none(), "the pending edit was answered");
+
+        checkout
+            .checkout()
+            .refresh_callgraph()
+            .expect("refresh the call graph");
+        assert_eq!(
+            checkout.view().expect("view").status().callgraph,
+            crate::data_layer::checkout::PlaneStatus::Ready
+        );
+        let (refreshed, verdict, _) = read(&manager).expect("the refreshed graph answers");
+        assert_eq!(verdict, DATA_LAYER_SNAPSHOT);
+        let (items, aggregate) = dead(&job, &refreshed);
+        assert_eq!(items, [r#""src/foo.ts"::"used""#]);
+
+        // The same answer as a cold build of the edited checkout.
+        let cold_storage = tempfile::tempdir().expect("cold storage");
+        let cold = Arc::new(
+            published(&root, cold_storage.path())
+                .view()
+                .expect("cold view")
+                .dead_code_snapshot()
+                .expect("cold snapshot"),
+        );
+        assert_eq!(parts(&refreshed), parts(&cold));
+        assert_eq!(aggregate, dead(&job, &cold).1);
+    }
+
+    #[test]
     fn suspended_callgraph_build_sets_distinct_builder_state() {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).expect("canonical root");
