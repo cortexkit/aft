@@ -445,26 +445,19 @@ fn classify(
     (class, evidence)
 }
 
-/// Whether two capped grep replies differ only in their capped count: the
-/// "(capped)" footer's number, the list trailer's `≥N` lower bound when N
-/// is that reply's own `total_matches`, and `total_matches` itself, with
-/// every row the same.
+/// Whether two capped grep replies differ only in their capped count: each
+/// reply's own `total_matches` where its footer ("Found N matches …") and
+/// its list trailer's `≥N` lower bound print it, and `total_matches`
+/// itself, with every row the same.
 fn capped_floors_alone(today: &Value, data: &Value) -> bool {
-    let footer =
-        regex::Regex::new(r"Found \d+ match(es)? (in|across) (\d+ files?) \(capped\)").unwrap();
     let normalized = |shown: &Value| {
         let mut shown = shown.clone();
-        let floor = shown["total_matches"]
-            .as_u64()
-            .map(|total| format!("≥{total}"));
+        let total = shown["total_matches"].as_u64();
         for key in ["text", "rendered"] {
-            if let Some(text) = shown[key].as_str() {
-                let mut text = footer
-                    .replace_all(text, "Found # matches $2 $3 (capped)")
-                    .into_owned();
-                if let Some(floor) = &floor {
-                    text = text.replace(floor.as_str(), "≥#");
-                }
+            if let (Some(text), Some(total)) = (shown[key].as_str(), total) {
+                let text = text
+                    .replace(&format!("Found {total} match"), "Found # match")
+                    .replace(&format!("≥{total}"), "≥#");
                 shown[key] = json!(text);
             }
         }
