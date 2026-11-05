@@ -16013,6 +16013,55 @@ fn expired_gap_unverified_line_is_the_approved_text() {
 }
 
 #[tokio::test]
+async fn runon_return_v3_keeps_default_cap_for_small_or_missing_local_files() {
+    for existing in [false, true] {
+        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+            Script::ReturnVector("two-files-one-empty"),
+            &[
+                "exec-remote/v1",
+                "exec-remote-return/v2",
+                "exec-remote-return/v3",
+                exec::types::SUBMISSION_KEY_CAPABILITY,
+            ],
+            1,
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        if existing {
+            fs::create_dir(dir.path().join("dist")).unwrap();
+            fs::write(dir.path().join("dist/hello.txt"), b"hello").unwrap();
+        }
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            return_call(&["dist/hello.txt", "dist/empty.txt"]),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let saved = read_task(&task.paths.json).unwrap();
+        let remote = saved.remote.unwrap();
+        assert_eq!(remote.return_max_bytes, 10_485_760);
+        let restored =
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+        assert_eq!(restored.return_max_bytes, Some(10_485_760));
+    }
+}
+
+fn seed_large_local_return_output(root: &Path) {
+    fs::create_dir(root.join("dist")).unwrap();
+    fs::File::create(root.join("dist/empty.txt"))
+        .unwrap()
+        .set_len(5 * 1024 * 1024 + 1)
+        .unwrap();
+}
+
+#[tokio::test]
 async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
     for retry in [false, true] {
         let script = if retry {
@@ -16039,6 +16088,7 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
         .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context(dir.path());
+        seed_large_local_return_output(dir.path());
         let (reply, _) = orchestrated_reply(
             &ctx,
             &daemon,
@@ -16097,6 +16147,7 @@ async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
+    seed_large_local_return_output(dir.path());
     let (reply, _) = orchestrated_reply(
         &ctx,
         &daemon,
