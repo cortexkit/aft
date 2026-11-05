@@ -253,6 +253,7 @@ pub(super) fn health_from_census(
 pub(crate) fn stalled_route_eviction(frame: BashPatternMatchFrame) -> Option<Candidate> {
     let metrics = DispatchPathMetrics::new();
     let key = push::ReplayKey {
+        principal: Some("direct".to_string()),
         root: ProjectRootId::from_path(std::env::current_dir().unwrap()).unwrap(),
         harness: "opencode".to_string(),
         session: frame.session_id.clone(),

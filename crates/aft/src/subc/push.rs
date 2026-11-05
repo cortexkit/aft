@@ -1540,6 +1540,7 @@ pub(super) fn process_lossy_push_envelope_batch(
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::protocol::{BashLongRunningFrame, BashPatternMatchFrame};
 
     fn caller_route(root: &ProjectRootId, principal: &str, harness: &str) -> RouteIdentity {
         let mut route =
@@ -2330,7 +2331,7 @@ mod tests {
         let (_root_dir, root) = test_root("pattern-match-bg-wake-root");
         assert_eq!(
             durable_bg_session_key(&root, &pattern_match),
-            Some((root, "session-c".to_string())),
+            Some((root, "session-c".to_string(), None)),
             "a durable pattern match needs the same repeating bg_events wake as a completion"
         );
 

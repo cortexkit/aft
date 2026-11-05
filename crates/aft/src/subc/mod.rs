@@ -15151,6 +15151,7 @@ pub(crate) mod test_support {
 
     pub(super) fn completion_frame_with_session(task_id: &str, session_id: &str) -> PushFrame {
         PushFrame::BashCompleted(BashCompletedFrame {
+            launching_identity: None,
             changed_files: None,
             frame_type: "bash_completed",
             task_id: task_id.to_string(),
@@ -15183,6 +15184,7 @@ pub(crate) mod test_support {
         elapsed_ms: u64,
     ) -> PushFrame {
         PushFrame::BashLongRunning(BashLongRunningFrame {
+            launching_identity: None,
             frame_type: "bash_long_running",
             task_id: task_id.to_string(),
             session_id: session_id.to_string(),
@@ -15193,6 +15195,7 @@ pub(crate) mod test_support {
 
     pub(super) fn pattern_match_frame(session_id: &str) -> PushFrame {
         PushFrame::BashPatternMatch(BashPatternMatchFrame {
+            launching_identity: None,
             batch: None,
             frame_type: "bash_pattern_match",
             task_id: "task-pattern".to_string(),
