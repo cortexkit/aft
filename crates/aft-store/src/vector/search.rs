@@ -557,18 +557,50 @@ impl SharedVectorIndex {
         segments: impl IntoIterator<Item = Arc<Segment>>,
         model: &ModelIdentity,
     ) -> Result<Self, VectorError> {
+        Self::assemble(segments, model, None)
+    }
+
+    /// The vectors of the same model in `segments`, reusing what building
+    /// this index read for each segment it already holds (the same open
+    /// segment, not just the same file), so only the others are opened and
+    /// checked. Member sets prepared for this index do not serve the new one.
+    ///
+    /// # Errors
+    ///
+    /// When a segment cannot be read.
+    pub fn rebuild(
+        &self,
+        segments: impl IntoIterator<Item = Arc<Segment>>,
+    ) -> Result<Self, VectorError> {
+        Self::assemble(segments, &self.model, Some(self))
+    }
+
+    fn assemble(
+        segments: impl IntoIterator<Item = Arc<Segment>>,
+        model: &ModelIdentity,
+        previous: Option<&Self>,
+    ) -> Result<Self, VectorError> {
         let mut kept = Vec::new();
         for segment in segments {
-            let parts = match VectorSegment::open(&segment)? {
-                Some(opened) if opened.model() == model => opened.parts(),
-                _ => continue,
+            let reused = previous.and_then(|previous| {
+                previous
+                    .segments
+                    .iter()
+                    .find(|(held, _)| Arc::ptr_eq(held, &segment))
+                    .map(|(_, parts)| parts.clone())
+            });
+            let parts = match reused {
+                Some(parts) => parts,
+                None => match VectorSegment::open(&segment)? {
+                    Some(opened) if opened.model() == model => opened.parts(),
+                    _ => continue,
+                },
             };
             kept.push((segment, parts));
         }
         let (token, model_id, by_text) = {
             let index = VectorIndex::build(
-                kept.iter()
-                    .map(|(segment, parts)| reopened(segment, parts)),
+                kept.iter().map(|(segment, parts)| reopened(segment, parts)),
                 model,
             )?;
             (index.token, index.model_id, Arc::clone(&index.by_text))

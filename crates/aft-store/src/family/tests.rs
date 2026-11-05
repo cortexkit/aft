@@ -557,3 +557,29 @@ fn a_reader_binding_during_a_scan_keeps_its_lease_and_data() {
         "the held generation's segment was reclaimed"
     );
 }
+
+#[test]
+fn the_newest_generation_is_read_without_a_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let family = open(dir.path());
+    assert_eq!(family.newest_generation().unwrap(), Generation::EMPTY);
+    let first = publish(&family, b"one", b"state one");
+    assert_eq!(family.newest_generation().unwrap(), first);
+    let leases = || {
+        std::fs::read_dir(dir.path().join("leases"))
+            .unwrap()
+            .count()
+    };
+    let before = leases();
+    for _ in 0..3 {
+        family.newest_generation().unwrap();
+    }
+    assert_eq!(leases(), before, "asking writes no lease");
+    // A snapshot of the same generation does write one.
+    let held = family.snapshot().unwrap();
+    assert!(leases() > before);
+    drop(held);
+    let second = publish(&family, b"two", b"state two");
+    assert!(second > first);
+    assert_eq!(family.newest_generation().unwrap(), second);
+}

@@ -196,6 +196,20 @@ impl Family {
         snapshot::take(self)
     }
 
+    /// The newest generation a [`snapshot`](Self::snapshot) would read now,
+    /// without taking a lease on it: for a reader that keeps a snapshot and
+    /// wants to know, cheaply, whether a newer one has been published. The
+    /// answer protects nothing; read the generation's files only through a
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`snapshot`](Self::snapshot).
+    pub fn newest_generation(&self) -> Result<Generation, FamilyError> {
+        self.newest_manifest()
+            .map(|(manifest, _)| manifest.generation())
+    }
+
     /// Starts writing the family, if no other process is writing it.
     /// Returns `None` while another process holds the writer lock.
     ///

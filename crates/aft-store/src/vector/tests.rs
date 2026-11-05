@@ -902,7 +902,10 @@ fn chunk_details_and_failures_round_trip() {
         opened.chunk_details(broken, b"src/b.rs").unwrap(),
         Some(failed_file)
     );
-    assert_eq!(opened.chunk_map(broken, b"src/b.rs").unwrap(), Some(Vec::new()));
+    assert_eq!(
+        opened.chunk_map(broken, b"src/b.rs").unwrap(),
+        Some(Vec::new())
+    );
     assert_eq!(opened.chunk_details(content, b"src/c.rs").unwrap(), None);
     assert_eq!(opened.chunk_details(content, b"src/d.rs").unwrap(), None);
     let mut keys = opened.chunk_map_keys().unwrap();
@@ -1017,4 +1020,39 @@ fn a_shared_index_lends_indexes_that_answer_as_a_built_one() {
     let other_open = store.open(&paths[0]);
     assert!(VectorSegment::reopen(&other_open, &parts).is_none());
     assert!(VectorSegment::reopen(&segments[0], &parts).is_some());
+    // A rebuild over fewer segments keeps what it can and answers the same
+    // as a build over them.
+    let rebuilt = shared.rebuild([Arc::clone(&segments[2])]).unwrap();
+    let fresh = SharedVectorIndex::build([Arc::clone(&segments[2])], &model(24)).unwrap();
+    assert_eq!((rebuilt.vectors(), fresh.vectors()), (150, 150));
+    let (rebuilt_index, fresh_index) = (rebuilt.index(), fresh.index());
+    let newer: Vec<Member> = (150..300)
+        .map(|i| Member {
+            unit: fresh_index.locate(text(i)).unwrap(),
+            exported: false,
+        })
+        .collect();
+    assert_eq!(
+        (150..300)
+            .map(|i| rebuilt_index.locate(text(i)))
+            .collect::<Vec<_>>(),
+        newer.iter().map(|m| Some(m.unit)).collect::<Vec<_>>()
+    );
+    let query = &vectors[200];
+    assert_same(
+        &answer(
+            &rebuilt_index
+                .search(
+                    &rebuilt_index.member_set(newer.clone()).unwrap(),
+                    &request(query, 5),
+                )
+                .unwrap(),
+        ),
+        &answer(
+            &fresh_index
+                .search(&fresh_index.member_set(newer).unwrap(), &request(query, 5))
+                .unwrap(),
+        ),
+        "rebuilt",
+    );
 }

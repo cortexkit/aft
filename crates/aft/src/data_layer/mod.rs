@@ -24,3 +24,4 @@ pub(crate) mod slice;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub(crate) mod tools;
+pub mod vectors;

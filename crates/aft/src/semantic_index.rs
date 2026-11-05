@@ -1664,6 +1664,26 @@ fn take_http_build_metadata() -> Option<Vec<BuildEmbeddingRowMetadata>> {
     LAST_HTTP_BUILD_METADATA.with(|slot| slot.borrow_mut().take())
 }
 
+/// Makes the batch an embedding function is answering report `texts` the
+/// way an HTTP backend does, with `skipped` naming why a text was refused
+/// (its row then carries an empty vector). For tests of callers of
+/// [`execute_build_embedding_batch`].
+#[cfg(test)]
+pub(crate) fn report_build_rows_for_test(
+    texts: &[String],
+    skipped: impl Fn(&str) -> Option<String>,
+) {
+    set_http_build_metadata(
+        texts
+            .iter()
+            .map(|text| BuildEmbeddingRowMetadata {
+                embedded_text: text.clone(),
+                skipped_reason: skipped(text),
+            })
+            .collect(),
+    );
+}
+
 /// Test-only probe counter for the managed-ONNX resolver (see
 /// `find_managed_onnx_runtime`). Counts storage-tree reads so a negative-control
 /// test can assert a pre-set ORT_DYLIB_PATH short-circuits the resolver.

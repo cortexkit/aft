@@ -115,6 +115,7 @@ fn known_sections() -> Vec<KnownSection> {
     aft_store::text::KNOWN
         .into_iter()
         .chain(super::graph_store::known_sections())
+        .chain(aft_store::vector::KNOWN)
         .collect()
 }
 
@@ -441,6 +442,7 @@ impl Checkout {
             refreshed: live.refreshed.clone(),
             sequence: live.sequence,
             unparsed: Arc::clone(&live.unparsed),
+            current: live.state.clone(),
         })
     }
 
@@ -896,7 +898,7 @@ impl Checkout {
         // The new segment holds everything this checkout's new state needs,
         // so an older segment stays only while another checkout reads from
         // it.
-        let retired = self.unneeded_segments()?;
+        let retired = self.unneeded_segments(&state)?;
         report.retired_segments = retired.len();
         session
             .publish(&Publication {
@@ -1072,8 +1074,11 @@ impl Checkout {
     /// Segments of the current generation that no other checkout's state
     /// reads: for every text unit, content record and fragment another
     /// checkout needs, readers take the newest segment that holds it, so
-    /// only those segments are kept.
-    fn unneeded_segments(&self) -> Result<Vec<SegmentId>, DataError> {
+    /// only those segments are kept. Vector segments follow their own rule
+    /// ([`super::vectors::needed_vector_segments`]), over every other
+    /// checkout's state and `own`, the state this build publishes, since
+    /// the build's new segment holds no vectors.
+    fn unneeded_segments(&self, own: &CheckoutState) -> Result<Vec<SegmentId>, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let known = known_sections();
         let entries = snapshot.manifest().segments().to_vec();
@@ -1115,6 +1120,7 @@ impl Checkout {
         // Whether another checkout needs something no usable segment holds:
         // it may be in one this build cannot read, so those all stay.
         let mut needs_unusable = false;
+        let mut states = Vec::new();
         for state_ref in snapshot.manifest().checkouts() {
             if state_ref.checkout == self.checkout {
                 continue;
@@ -1154,6 +1160,19 @@ impl Checkout {
                     }
                 }
             }
+            states.push(state);
+        }
+        let mut readers: Vec<&CheckoutState> = states.iter().collect();
+        readers.push(own);
+        let usable_segments = usable
+            .iter()
+            .map(|(_, segment)| *segment)
+            .collect::<Vec<_>>();
+        for ((index, _), vectors) in usable.iter().zip(super::vectors::needed_vector_segments(
+            &usable_segments,
+            &readers,
+        )?) {
+            needed[*index] |= vectors;
         }
         if needs_unusable {
             for (index, segment) in opened.iter().enumerate() {
@@ -1879,6 +1898,9 @@ pub struct CheckoutView {
     /// The checkout's change count when the view was taken.
     sequence: u64,
     unparsed: Arc<BTreeSet<Vec<u8>>>,
+    /// The checkout's state when the view was taken, when it differs from
+    /// the publication's: the changes recorded since applied.
+    current: Option<Arc<CheckoutState>>,
 }
 
 impl Published {
@@ -2632,6 +2654,33 @@ impl Checkout {
             Err(_) => EngineMemory::Busy,
         };
         CheckoutMemory { live, engine }
+    }
+}
+
+/// The vector plane's access to the store: it publishes vector segments of
+/// its own, in generations that change no checkout's state.
+impl Checkout {
+    /// The family store and the block cache every segment read shares, for
+    /// [`super::vectors`], which reads vector segments from the newest
+    /// generation and publishes through the family's writer.
+    pub(crate) fn vector_parts(&self) -> super::vectors::VectorParts<'_> {
+        super::vectors::VectorParts {
+            family: &self.family,
+            cache: &self.layer.cache,
+            root: &self.root,
+            known: known_sections(),
+        }
+    }
+}
+
+/// The checkout's state as of a view, for planes that read every member.
+impl CheckoutView {
+    /// The checkout's state when the view was taken: the publication's
+    /// ([`state`](Self::state)) with every change recorded since applied, so
+    /// a path changed since holds its new content.
+    #[must_use]
+    pub fn current_state(&self) -> &CheckoutState {
+        self.current.as_deref().unwrap_or(&self.published.state)
     }
 }
 

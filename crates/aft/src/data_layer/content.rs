@@ -26,21 +26,24 @@ use crate::parser::LangId;
 /// carry it, so output from another version is extracted again.
 pub const EXTRACTOR_VERSION: &str = crate::views::callgraph::PRODUCER;
 
-/// The scan policy every data-layer scan uses: a source file the call
-/// graph parses is read up to the larger read limit even past the
-/// text-index limit, as the inspect scanners read graph sources, so a large
-/// source file still has its calls in the graph.
+/// The scan policy every data-layer scan uses: a file a plane parses or
+/// embeds is read up to the larger read limit even past the text-index
+/// limit, as the inspect scanners read graph sources and today's semantic
+/// index reads what it embeds, so a large source file still has its calls
+/// in the graph and its chunks in meaning search.
 #[must_use]
 pub fn scan_policy() -> aft_store::scan::ScanPolicy {
     aft_store::scan::ScanPolicy {
-        read_large: Some(parsed_path),
+        read_large: Some(parsed_or_embedded_path),
         ..aft_store::scan::ScanPolicy::default()
     }
 }
 
-/// Whether [`language_for`] can choose a language for `path` (relative to
-/// the root): a resolver configuration file or a source file.
-fn parsed_path(path: &[u8]) -> bool {
+/// Whether a plane reads the file at `path` (relative to the root) whole:
+/// [`language_for`] can choose a language for it (a resolver configuration
+/// file or a source file), or today's semantic index embeds files with its
+/// name or extension.
+fn parsed_or_embedded_path(path: &[u8]) -> bool {
     if crate::views::assembly::is_resolution_input(path) {
         return true;
     }
@@ -50,6 +53,7 @@ fn parsed_path(path: &[u8]) -> bool {
     let path = Path::new(path);
     path.extension().is_some_and(|extension| extension == "h")
         || crate::views::callgraph::source_language(path).is_some()
+        || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
 /// The language the call graph parses the file at `path` as, `"config"`
@@ -548,6 +552,55 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 mod tests {
     use super::*;
 
+    #[test]
+    fn files_meaning_search_embeds_are_read_past_the_text_index_limit() {
+        struct Kinds(std::sync::Mutex<Vec<(Vec<u8>, aft_store::scan::ContentKind)>>);
+        impl aft_store::scan::ContentSink for Kinds {
+            fn read(
+                &self,
+                path: &[u8],
+                _key: aft_store::ids::ContentKey,
+                kind: aft_store::scan::ContentKind,
+                _bytes: &[u8],
+            ) {
+                self.0.lock().unwrap().push((path.to_vec(), kind));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // YAML is embedded by meaning search, and not parsed by the call
+        // graph: only the semantic extension test admits it.
+        let line = "key: value with some words in it\n";
+        let text_of = |bytes: usize| line.repeat(bytes / line.len() + 1);
+        let large = text_of(2 << 20);
+        let huge = text_of(5 << 20);
+        std::fs::write(dir.path().join("large.yaml"), &large).unwrap();
+        std::fs::write(dir.path().join("huge.yaml"), &huge).unwrap();
+        // A 2 MiB file with no plane reading it stays unread.
+        std::fs::write(dir.path().join("large.txt"), &large).unwrap();
+        let sink = Kinds(std::sync::Mutex::new(Vec::new()));
+        let scanned = aft_store::scan::scan(dir.path(), &scan_policy(), None, &sink).unwrap();
+        let record = |path: &[u8]| scanned.state.get(path).unwrap().clone();
+        let read = record(b"large.yaml");
+        assert_eq!(read.kind, aft_store::checkout::PathKind::Large);
+        assert_eq!(
+            read.content,
+            aft_store::ids::ContentKey::of(large.as_bytes()),
+            "a Large file is keyed by its real bytes"
+        );
+        assert_eq!(
+            record(b"huge.yaml").kind,
+            aft_store::checkout::PathKind::Oversize,
+            "past the 4 MiB read limit a file is not read"
+        );
+        assert_eq!(
+            record(b"large.txt").kind,
+            aft_store::checkout::PathKind::Oversize
+        );
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![(b"large.yaml".to_vec(), aft_store::scan::ContentKind::Large)]
+        );
+    }
     #[test]
     fn a_header_language_comes_from_its_own_bytes() {
         // Bytes no other test parses, so no earlier parse can have chosen

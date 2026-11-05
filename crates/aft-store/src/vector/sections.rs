@@ -410,7 +410,11 @@ impl VectorSectionsBuilder {
         let mut data = Vec::new();
         let mut details = PackedBuilder::with_capacity(self.maps.len());
         for (key, (path, chunks, file_details)) in &self.maps {
-            details.push(&file_details.as_ref().map_or_else(Vec::new, FileDetails::encode));
+            details.push(
+                &file_details
+                    .as_ref()
+                    .map_or_else(Vec::new, FileDetails::encode),
+            );
             let start = data.len();
             let path_len = u32::try_from(path.len()).expect("a path is shorter than 4 GiB");
             data.extend_from_slice(&path_len.to_le_bytes());
@@ -786,9 +790,7 @@ impl<'s> VectorSegment<'s> {
         content: ContentKey,
         path: &[u8],
     ) -> Result<Option<Vec<Chunk>>, SegmentError> {
-        Ok(self
-            .locate_map(content, path)?
-            .map(|(_, chunks)| chunks))
+        Ok(self.locate_map(content, path)?.map(|(_, chunks)| chunks))
     }
 
     /// The details recorded with the chunk map of the file at `path` with
