@@ -1760,6 +1760,11 @@ pub(super) fn dispatch_type_names(parse: &ParseBlob) -> BTreeSet<String> {
     names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
     for site in &parse.dispatch.sites {
         if let Some(receiver) = &site.receiver {
+            // A self call in a macro template names its target already;
+            // there is no type name to bind.
+            if receiver.starts_with(dispatch::TEMPLATE_SELF_RECEIVER) {
+                continue;
+            }
             let mut name = receiver.as_str();
             while let Some(expression) = name.strip_prefix("@field:") {
                 name = expression

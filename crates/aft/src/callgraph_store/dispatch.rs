@@ -985,11 +985,12 @@ pub(crate) fn extract_with<'tree>(
     let references = parse
         .refs
         .iter()
-        .filter(|r| r.kind == BlobRefKind::Call)
+        .enumerate()
+        .filter(|(_, r)| r.kind == BlobRefKind::Call)
         .collect::<Vec<_>>();
     let queries = references
         .iter()
-        .map(|r| (r.byte_start, r.byte_end))
+        .map(|(_, r)| (r.byte_start, r.byte_end))
         .collect::<Vec<_>>();
     let targets = super::extraction_index::range_minima(
         &call_ranges,
@@ -1006,8 +1007,28 @@ pub(crate) fn extract_with<'tree>(
         .iter()
         .map(|ty| ty.name.as_str())
         .collect::<HashSet<_>>();
-    for (reference, target) in references.into_iter().zip(targets) {
+    // `macro_rules!` definitions, whose templates hold calls no call node
+    // covers, with the reference keys those calls' sites are named by.
+    let templates = all
+        .iter()
+        .copied()
+        .filter(|node| language == "rust" && nav.kind(*node) == "macro_definition")
+        .collect::<Vec<_>>();
+    let reference_keys = if templates.is_empty() {
+        Vec::new()
+    } else {
+        parse.reference_keys()
+    };
+    for ((position, reference), target) in references.into_iter().zip(targets) {
         let Some(call) = target.map(|i| calls[i]) else {
+            if let Some(site) = template_self_site(
+                reference,
+                reference_keys.get(position).copied(),
+                &templates,
+                &parse.symbols,
+            ) {
+                facts.sites.push(site);
+            }
             continue;
         };
         let Some(callee) = field(call, &["function", "name", "macro"]).or_else(|| {
@@ -1253,6 +1274,66 @@ fn symbol_callers(parse: &ParseBlob) -> HashMap<(u32, u32), String> {
     }
     callers
 }
+/// The receiver a method-call site records for `self.name(...)` written in
+/// a function that a `macro_rules!` template defines, followed by the
+/// scoped name of the one function `name` the same template defines. The
+/// template's functions are stamped into whatever impl invokes the macro,
+/// so `self` there has no type the file names, but `self.name` can only be
+/// the template's own `name`. Resolved by that name, as today's database
+/// matched it.
+pub(crate) const TEMPLATE_SELF_RECEIVER: &str = "@template-self:";
+
+/// The method-call site of `reference` when it is a `self.name(...)` call
+/// written inside a function that a `macro_rules!` template among
+/// `templates` defines, and the same template defines exactly one other
+/// function `name`. Such a call has no call node in the file's syntax tree
+/// (a template stays tokens until the macro is expanded); calls.rs finds it
+/// by parsing the template. The site is named by the reference's `key`.
+fn template_self_site(
+    reference: &BlobRef,
+    key: Option<u32>,
+    templates: &[Node<'_>],
+    symbols: &[BlobSymbol],
+) -> Option<SiteHint> {
+    // A call outside every item the template defines has the macro, `name!`,
+    // as its caller; it is a macro-body call, not a method call.
+    let caller = reference
+        .caller_symbol
+        .as_deref()
+        .filter(|caller| !caller.ends_with('!'))?;
+    let member = reference.full_ref.as_deref()?.strip_prefix("self.")?;
+    if member.is_empty() || !member.chars().all(|ch| ch == '_' || ch.is_alphanumeric()) {
+        return None;
+    }
+    let template = templates.iter().find(|template| {
+        template.start_byte() <= reference.byte_start && reference.byte_end <= template.end_byte()
+    })?;
+    let (first, last) = (
+        template.start_position().row as u32,
+        template.end_position().row as u32,
+    );
+    let mut defined = symbols.iter().filter(|symbol| {
+        symbol.name == member
+            && matches!(symbol.kind.as_str(), "function" | "method")
+            && symbol.scoped_name != caller
+            && !symbol.scoped_name.ends_with('!')
+            && first <= symbol.start_line
+            && symbol.end_line <= last
+    });
+    let target = defined.next()?;
+    if defined.next().is_some() {
+        return None;
+    }
+    Some(SiteHint {
+        ordinal: key?,
+        caller: Some(caller.to_string()),
+        line: reference.line,
+        member: Some(member.to_string()),
+        receiver: Some(format!("{TEMPLATE_SELF_RECEIVER}{}", target.scoped_name)),
+        dynamic: false,
+    })
+}
+
 fn syntactic_dynamic(callee: Node<'_>, source: &str, language: &str) -> bool {
     match language {
         "javascript" | "typescript" | "tsx" => callee.kind() == "subscript_expression",
@@ -2579,6 +2660,18 @@ impl<'a> Resolver<'a> {
         let Some(receiver) = &site.receiver else {
             return self.unknown(&parse.language, member);
         };
+        if parse.language == "rust" {
+            if let Some(symbol) = receiver.strip_prefix(TEMPLATE_SELF_RECEIVER) {
+                return Resolution {
+                    targets: BTreeSet::from([Target {
+                        file: file.to_string(),
+                        symbol: symbol.to_string(),
+                        provenance: "name_match",
+                    }]),
+                    ..Resolution::default()
+                };
+            }
+        }
         if parse.language == "python" {
             if let Some(owner) = receiver.strip_prefix("@super:") {
                 return self.python_super(file, owner, member);

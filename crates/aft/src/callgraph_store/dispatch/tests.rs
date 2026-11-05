@@ -969,3 +969,61 @@ fn rust_colliding_inline_members_retain_positional_declaration_facts() {
     );
     assert!(methods.iter().all(|method| method.owner == "nested::T"));
 }
+
+/// Functions a `macro_rules!` template stamps into an impl call each other
+/// through `self`. The template is tokens in the file's tree, so the call
+/// has no call node; its site names the template's own function, and the
+/// resolver links it by that name.
+#[test]
+fn rust_template_self_call_links_the_function_its_template_defines() {
+    let parsed = parse(
+        "macro_rules! runtime_methods {\n    () => {\n        async fn poll_session(&self, id: &str) {\n            if self.handle_refusal(id).await {\n                return;\n            }\n        }\n\n        async fn handle_refusal(&self, id: &str) -> bool {\n            id.is_empty()\n        }\n    };\n}\n\npub struct Runtime;\n\nimpl Runtime {\n    runtime_methods!();\n}\n",
+        "rust",
+    );
+    let sites = parsed
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some("handle_refusal"))
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 1, "{:#?}", parsed.dispatch.sites);
+    assert_eq!(sites[0].caller.as_deref(), Some("poll_session"));
+    assert_eq!(sites[0].line, 4);
+    let resolver = Resolver::new(BTreeMap::from([("fixture".into(), &parsed)]));
+    assert_eq!(
+        resolver.resolve("fixture", sites[0]).targets,
+        BTreeSet::from([Target {
+            file: "fixture".into(),
+            symbol: "handle_refusal".into(),
+            provenance: "name_match",
+        }])
+    );
+    // `id.is_empty()` has a receiver the template does not define: no site.
+    assert!(
+        parsed
+            .dispatch
+            .sites
+            .iter()
+            .all(|site| site.member.as_deref() != Some("is_empty")),
+        "{:#?}",
+        parsed.dispatch.sites
+    );
+}
+
+/// A `self` call to a name the template does not define is left to
+/// ordinary resolution.
+#[test]
+fn rust_template_self_call_to_a_name_the_template_lacks_has_no_site() {
+    let parsed = parse(
+        "macro_rules! m { () => { fn a(&self) { self.missing(); } }; }\nfn missing() {}\n",
+        "rust",
+    );
+    assert!(
+        parsed.dispatch.sites.iter().all(|site| !site
+            .receiver
+            .as_deref()
+            .is_some_and(|receiver| receiver.starts_with(TEMPLATE_SELF_RECEIVER))),
+        "{:#?}",
+        parsed.dispatch.sites
+    );
+}
