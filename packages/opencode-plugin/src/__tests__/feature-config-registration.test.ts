@@ -271,7 +271,9 @@ describe("OpenCode feature-config registration", () => {
     const config = loadWithUserConfig({ idle: { root_ttl_minutes: 20, checkout_hours: 9000 } });
     expect(getConfigValidationErrors()).toEqual([]);
     expect(config.idle).toEqual({ root_ttl_minutes: 15, checkout_hours: 8760 });
+    // The project file still sets root_ttl_minutes; the user's 0 clamps to 1.
     expect(loadWithUserConfig({ idle: { checkout_hours: 0 } }).idle).toEqual({
+      root_ttl_minutes: 15,
       checkout_hours: 1,
     });
   });

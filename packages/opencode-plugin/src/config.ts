@@ -1725,14 +1725,14 @@ function mergeWorktreeConfig(
 function mergeIdleConfig(
   baseIdle: AftConfig["idle"],
   overrideIdle: AftConfig["idle"],
-): AftConfig["idle"] {
-  if (overrideIdle === undefined) return baseIdle;
-  const merged = { ...baseIdle };
-  if (overrideIdle.root_ttl_minutes !== undefined)
-    merged.root_ttl_minutes = overrideIdle.root_ttl_minutes;
-  if (overrideIdle.checkout_hours !== undefined)
-    merged.checkout_hours = overrideIdle.checkout_hours;
-  return Object.values(merged).some((value) => value !== undefined) ? merged : undefined;
+): { root_ttl_minutes: number | undefined; checkout_hours: number | undefined } | undefined {
+  const merged = {
+    root_ttl_minutes: overrideIdle?.root_ttl_minutes ?? baseIdle?.root_ttl_minutes,
+    checkout_hours: overrideIdle?.checkout_hours ?? baseIdle?.checkout_hours,
+  };
+  return merged.root_ttl_minutes === undefined && merged.checkout_hours === undefined
+    ? undefined
+    : merged;
 }
 
 function mergeInspectConfig(
