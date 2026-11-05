@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use aft_store::ids::{Digest128, FamilyId};
 
-use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, PathChange};
+use super::checkout::{Checkout, CheckoutView, DataError, DataLayer};
 use crate::views::intent::{WriteIntent, WriteIntentListener, WritePhase};
 
 /// Whether this process runs the data layer.
@@ -101,7 +101,7 @@ impl DataCheckout {
     pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
         let root = std::fs::canonicalize(self.checkout.root())
             .unwrap_or_else(|_| self.checkout.root().to_path_buf());
-        record(&self.checkout, &self.building, &root, paths);
+        record(&self.checkout, &root, paths);
     }
 }
 
@@ -135,11 +135,11 @@ fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>) {
     }
 }
 
-/// Records changed absolute `paths` under `root`: each file's current bytes,
-/// or its removal. A path that is a directory (a directory created, moved or
-/// removed) cannot be enumerated from here, so the checkout builds again.
-fn record(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>, root: &Path, paths: &[PathBuf]) {
-    let mut changes = Vec::new();
+/// Records changed absolute `paths` under `root`. The checkout scans each
+/// one again, a folder with everything under it, under the same rules as a
+/// build, so this only turns the paths into checkout-relative form.
+fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
+    let mut relative_paths = Vec::with_capacity(paths.len());
     for path in paths {
         let canonical_parent = path
             .parent()
@@ -152,42 +152,17 @@ fn record(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>, root: &Path, pat
         let Some(relative) = relative.to_str().map(|text| text.replace('\\', "/")) else {
             continue;
         };
-        if relative.is_empty() || relative.starts_with(".git/") || relative == ".git" {
+        if relative.is_empty() {
             continue;
         }
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() => {
-                start_build(checkout, building);
-                return;
-            }
-            Ok(metadata) if metadata.is_file() => match std::fs::read(path) {
-                Ok(bytes) => changes.push(PathChange::Written {
-                    path: relative.into_bytes(),
-                    bytes: Arc::from(bytes),
-                }),
-                // Unreadable now: a rebuild reads it, or records why not.
-                Err(_) => {
-                    start_build(checkout, building);
-                    return;
-                }
-            },
-            Ok(_) => {
-                // A symlink or special file: the scan decides what it is.
-                start_build(checkout, building);
-                return;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                changes.push(PathChange::Removed {
-                    path: relative.into_bytes(),
-                });
-            }
-            Err(_) => {
-                start_build(checkout, building);
-                return;
-            }
-        }
+        relative_paths.push(relative.into_bytes());
     }
-    checkout.record_changes(&changes);
+    if let Err(error) = checkout.record_paths(&relative_paths) {
+        crate::slog_warn!(
+            "data layer could not record changes under {}: {error}",
+            checkout.root().display()
+        );
+    }
 }
 
 /// Hears AFT's own edits.
@@ -208,8 +183,11 @@ impl WriteIntentListener for EditListener {
             return;
         };
         match change {
-            WriteIntent::Paths(paths) => record(&checkout, &self.building, &self.root, paths),
-            WriteIntent::Directory(_) => start_build(&checkout, &self.building),
+            WriteIntent::Paths(paths) => record(&checkout, &self.root, paths),
+            // A folder is scanned again whole, under the scan's rules.
+            WriteIntent::Directory(path) => {
+                record(&checkout, &self.root, std::slice::from_ref(path))
+            }
         }
     }
 }

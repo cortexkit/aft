@@ -18,15 +18,15 @@ use std::time::Instant;
 
 use aft_store::cache::BlockCache;
 use aft_store::checkout::{CheckoutState, PathKind, PathRecord};
-use aft_store::content::{ContentRecord, RecordBody, RecordKey};
+use aft_store::content::{ContentRecord, ContentSegment, RecordBody, RecordKey};
 use aft_store::family::{Family, Publication, Snapshot};
-use aft_store::graph::FragmentKey;
-use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId};
-use aft_store::scan::{scan, ContentKind, ContentSink, ScanPolicy};
+use aft_store::graph::{FragmentKey, GraphSegment};
+use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId, SegmentId};
+use aft_store::scan::{scan, scan_paths, ContentKind, ContentSink, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
-    candidates, ContentTrigrams, OverlayEntry, PathText, Query, Scope, TextLocator, TextMembership,
-    TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
+    candidates, ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator,
+    TextMembership, TextOverlay, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
 use super::callgraph::{resolve_checkout, CheckoutInputs, FileResolution};
@@ -107,6 +107,9 @@ pub struct Checkout {
     /// The call graph's incremental state between publications, built from
     /// the publication on the first refresh.
     engine: Mutex<Option<GraphEngine>>,
+    /// Orders recordings: each one brings the state the previous left up to
+    /// date.
+    recording: Mutex<()>,
 }
 
 /// A checkout's call graph kept up to date between publications.
@@ -114,9 +117,8 @@ struct GraphEngine {
     /// The publication the engine started from; a newer one replaces it.
     published: Arc<Published>,
     live: LiveCheckout,
-    /// Each changed path's bytes as the engine last applied them; `None`
-    /// for a removed path.
-    applied: BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    /// Each changed path's change count as the engine last applied it.
+    applied: BTreeMap<Vec<u8>, u64>,
     /// Files whose resolution changed since the publication.
     dirty: BTreeSet<String>,
 }
@@ -136,10 +138,15 @@ struct Live {
     /// Counts recorded changes; each changed path keeps the count of its
     /// latest change, so a build knows which changes its scan covered.
     sequence: u64,
-    changed_at: BTreeMap<Vec<u8>, u64>,
-    /// Each changed path's latest bytes, `None` once removed, for the call
-    /// graph to resolve again.
-    changed_bytes: BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    /// The checkout's state now: the publication's, with every change
+    /// recorded since applied. `None` while it equals the publication's.
+    state: Option<Arc<CheckoutState>>,
+    /// Each path changed since the publication.
+    changes: BTreeMap<Vec<u8>, Change>,
+    /// Paths reported while nothing was published, with their change
+    /// counts: a build's scan covers those reported before it started, and
+    /// the rest are recorded once it publishes.
+    early: BTreeMap<Vec<u8>, u64>,
     /// The call graph with the files resolved since the publication laid
     /// over it; `None` until the first refresh.
     graph: Option<Arc<dyn SliceSource + Send + Sync>>,
@@ -158,21 +165,26 @@ struct Refreshed {
     removed: BTreeSet<String>,
 }
 
-/// One changed path, as an edit or the watcher reports it.
-#[derive(Clone, Debug)]
-pub enum PathChange {
-    /// The file at the path now holds these bytes.
-    Written { path: Vec<u8>, bytes: Arc<[u8]> },
-    /// The path no longer exists.
-    Removed { path: Vec<u8> },
+/// One path changed since the publication.
+#[derive(Clone)]
+struct Change {
+    /// The change count of its latest change.
+    sequence: u64,
+    /// Its record now; `None` once it left the checkout.
+    record: Option<PathRecord>,
+    /// What the call graph reads from it now.
+    extracted: Extracted,
 }
 
-impl PathChange {
-    fn path(&self) -> &[u8] {
-        match self {
-            Self::Written { path, .. } | Self::Removed { path } => path,
-        }
-    }
+/// What the call graph reads from one changed path.
+#[derive(Clone)]
+enum Extracted {
+    /// Nothing: not a parsed language, not text, or gone.
+    Nothing,
+    /// A parsed file: its parse key and parse.
+    Parse(String, Arc<ParseBlob>),
+    /// A resolver configuration file's bytes.
+    Config(Arc<[u8]>),
 }
 
 /// What a build did.
@@ -187,6 +199,12 @@ pub struct BuildReport {
     pub write_ms: f64,
     pub publish_ms: f64,
     pub segment_bytes: u64,
+    /// Segments no checkout needs any more, left out of the new generation.
+    pub retired_segments: usize,
+    /// Files the reclamation after publishing removed, or why it could not
+    /// run (the publication stands either way).
+    pub reclaimed_files: usize,
+    pub reclaim_error: Option<String>,
 }
 
 impl Checkout {
@@ -214,10 +232,27 @@ impl Checkout {
             checkout,
             live: RwLock::new(Live::default()),
             engine: Mutex::new(None),
+            recording: Mutex::new(()),
         };
         let snapshot = handle.family.snapshot().map_err(DataError::store)?;
-        if let Some(published) = handle.open_published(&snapshot)? {
-            handle.write_live().published = Some(Arc::new(published));
+        if let Some(published) = handle.open_published(snapshot)? {
+            let published = Arc::new(published);
+            // Files may have changed while no process watched them. Before
+            // the first view is served, compare the checkout with what was
+            // published: the scan reads only files whose stat no longer
+            // proves their recorded content, and every difference is
+            // recorded as a change.
+            let sink = ChangeSink::default();
+            let scanned = scan(
+                &handle.root,
+                &handle.layer.policy,
+                Some(&published.state),
+                &sink,
+            )
+            .map_err(|error| DataError::Scan(error.to_string()))?;
+            let changed = changed_members(&published.state, &scanned.state);
+            handle.write_live().published = Some(Arc::clone(&published));
+            handle.apply_scan(&published.state, scanned.state, &changed, sink.finish());
         }
         Ok(handle)
     }
@@ -279,49 +314,120 @@ impl Checkout {
         }
     }
 
-    /// Records changed paths, so queries see them at once: text queries
-    /// read each written file's new trigrams, and the call graph reports
-    /// the paths as pending until they are resolved again.
-    pub fn record_changes(&self, changes: &[PathChange]) {
-        if changes.is_empty() {
-            return;
+    /// Records that `paths` (relative to the root, such as a watcher or an
+    /// edit reports them) may have changed, so queries see them at once.
+    /// Each path, and everything under it when it is a folder, is scanned
+    /// again under the same rules a build's scan applies: ignored files,
+    /// build folders, files over the size limit and binary files are
+    /// treated as a build treats them. Text queries then read each changed
+    /// file's new trigrams, and the call graph reports the paths as pending
+    /// until they are resolved again.
+    ///
+    /// # Errors
+    ///
+    /// When a path's folder cannot be walked. Nothing is recorded then.
+    pub fn record_paths(&self, paths: &[Vec<u8>]) -> Result<(), DataError> {
+        if paths.is_empty() {
+            return Ok(());
         }
-        let max = self.layer.policy.max_indexed_len;
-        let entries = changes
+        let _order = self.recording.lock().expect("no panics while holding it");
+        let base = {
+            let live = self.live.read().expect("no panics while holding it");
+            live.state.clone().or_else(|| {
+                live.published
+                    .as_ref()
+                    .map(|published| Arc::new(published.state.clone()))
+            })
+        };
+        let Some(base) = base else {
+            let mut live = self.write_live();
+            live.sequence += 1;
+            let sequence = live.sequence;
+            for path in paths {
+                live.early.insert(path.clone(), sequence);
+            }
+            return Ok(());
+        };
+        let sink = ChangeSink::default();
+        let scanned = scan_paths(&self.root, &self.layer.policy, &base, paths, &sink)
+            .map_err(|error| DataError::Scan(error.to_string()))?;
+        self.apply_scan(&base, scanned.state, &scanned.changed, sink.finish());
+        Ok(())
+    }
+
+    /// Makes `state` the checkout's current state, recording each path in
+    /// `changed` (compared with `base`) as a change, with the files the scan
+    /// read in `read`.
+    fn apply_scan(
+        &self,
+        base: &CheckoutState,
+        state: CheckoutState,
+        changed: &[Vec<u8>],
+        read: HashMap<Vec<u8>, Vec<u8>>,
+    ) {
+        // A record the scan read again keeps its language when its content
+        // did not change; a changed text file gets the language its path and
+        // bytes choose.
+        let mut extracted = HashMap::new();
+        let records = state
+            .paths()
             .iter()
-            .map(|change| {
-                let entry = match change {
-                    PathChange::Removed { .. } => OverlayEntry::Deleted,
-                    PathChange::Written { bytes, .. } => {
-                        if bytes.len() as u64 > max || bytes.contains(&0) {
-                            OverlayEntry::Unindexed
-                        } else {
-                            OverlayEntry::Content(Arc::new(ContentTrigrams::of(bytes)))
-                        }
+            .map(|record| {
+                let mut record = record.clone();
+                if let Some(bytes) = read.get(&record.path) {
+                    let (language, content) = extract_changed(&record, bytes);
+                    record.language = language;
+                    extracted.insert(record.path.clone(), content);
+                } else if record.language.is_empty() {
+                    if let Some(before) = base
+                        .get(&record.path)
+                        .filter(|before| before.content == record.content)
+                    {
+                        record.language.clone_from(&before.language);
                     }
-                };
-                (change.path().to_vec(), entry)
+                }
+                record
             })
             .collect::<Vec<_>>();
+        let state = CheckoutState::new(state.git.clone(), state.conversion, records)
+            .expect("the scanned state's paths, unchanged");
+        if changed.is_empty() {
+            self.write_live().state = Some(Arc::new(state));
+            return;
+        }
+        let mut entries = Vec::with_capacity(changed.len());
+        for path in changed {
+            let record = state.get(path).cloned();
+            let entry = match (&record, read.get(path)) {
+                (None, _) => OverlayEntry::Deleted,
+                (Some(record), Some(bytes)) if record.kind == PathKind::Text => {
+                    OverlayEntry::Content(Arc::new(ContentTrigrams::of(bytes)))
+                }
+                (Some(_), _) => OverlayEntry::Unindexed,
+            };
+            let content = extracted.remove(path).unwrap_or(Extracted::Nothing);
+            entries.push((path.clone(), entry, record, content));
+        }
         let mut live = self.write_live();
         live.sequence += 1;
         let sequence = live.sequence;
         let mut text = (*live.text).clone();
         let mut pending = (*live.callgraph_pending).clone();
-        for (path, entry) in entries {
+        for (path, entry, record, content) in entries {
             pending.insert(path.clone());
-            live.changed_at.insert(path.clone(), sequence);
-            text.set(path, entry);
-        }
-        for change in changes {
-            let bytes = match change {
-                PathChange::Written { bytes, .. } => Some(Arc::clone(bytes)),
-                PathChange::Removed { .. } => None,
-            };
-            live.changed_bytes.insert(change.path().to_vec(), bytes);
+            text.set(path.clone(), entry);
+            live.changes.insert(
+                path,
+                Change {
+                    sequence,
+                    record,
+                    extracted: content,
+                },
+            );
         }
         live.text = Arc::new(text);
         live.callgraph_pending = Arc::new(pending);
+        live.state = Some(Arc::new(state));
     }
 
     /// Scans the checkout, builds every plane cold, publishes them, and
@@ -429,50 +535,156 @@ impl Checkout {
         let written = session
             .write_checkout_state(self.checkout, &state)
             .map_err(DataError::store)?;
+        // The new segment holds everything this checkout's new state needs,
+        // so an older segment stays only while another checkout reads from
+        // it.
+        let retired = self.unneeded_segments()?;
+        report.retired_segments = retired.len();
         session
             .publish(&Publication {
                 add_segments: vec![segment],
+                remove_segments: retired,
                 states: vec![written],
                 ..Publication::default()
             })
             .map_err(DataError::store)?;
+        // Removes what no generation at or above the horizon names. A view
+        // still reading an older generation holds a lease on it, so its
+        // files stay until the view drops.
+        match session.reclaim() {
+            Ok(reclaimed) => {
+                report.reclaimed_files = reclaimed.removed_segments
+                    + reclaimed.removed_states
+                    + reclaimed.removed_manifests;
+            }
+            Err(error) => report.reclaim_error = Some(error.to_string()),
+        }
         drop(session);
         report.publish_ms = elapsed_ms(started);
 
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        let published = self
-            .open_published(&snapshot)?
-            .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
         report.segment_bytes = snapshot
             .manifest()
             .segments()
             .iter()
             .map(|entry| entry.len)
             .sum();
+        let published = self
+            .open_published(snapshot)?
+            .ok_or_else(|| DataError::Store("the published state is missing".to_string()))?;
         // The scan read every file as it was once the scan started, so the
         // build covers every change recorded before then. A change recorded
         // while it ran may be newer than what it read, so it stays laid over
         // the new publication.
-        let mut live = self.write_live();
-        live.published = Some(Arc::new(published));
-        live.changed_at.retain(|_, sequence| *sequence > covered);
-        let kept = live.changed_at.keys().cloned().collect::<BTreeSet<_>>();
-        live.changed_bytes.retain(|path, _| kept.contains(path));
-        // The new publication's graph replaces the old one and whatever was
-        // laid over it; the next refresh starts from it.
-        live.graph = None;
-        live.refreshed = None;
-        let mut text = (*live.text).clone();
-        text.retain(|path| kept.contains(path));
-        live.text = Arc::new(text);
-        live.callgraph_pending = Arc::new(
-            live.callgraph_pending
-                .iter()
-                .filter(|path| kept.contains(*path))
-                .cloned()
-                .collect(),
-        );
+        let late = {
+            let mut live = self.write_live();
+            live.changes.retain(|_, change| change.sequence > covered);
+            let kept = live.changes.keys().cloned().collect::<BTreeSet<_>>();
+            // The changes the scan may have missed stay laid over the new
+            // publication, and so does the state they describe.
+            live.state = if kept.is_empty() {
+                None
+            } else {
+                Some(Arc::new(with_changes(&published.state, &live.changes)))
+            };
+            live.published = Some(Arc::new(published));
+            // The new publication's graph replaces the old one and whatever
+            // was laid over it; the next refresh starts from it.
+            live.graph = None;
+            live.refreshed = None;
+            let mut text = (*live.text).clone();
+            text.retain(|path| kept.contains(path));
+            live.text = Arc::new(text);
+            live.callgraph_pending = Arc::new(
+                live.callgraph_pending
+                    .iter()
+                    .filter(|path| kept.contains(*path))
+                    .cloned()
+                    .collect(),
+            );
+            let early = std::mem::take(&mut live.early);
+            early
+                .into_iter()
+                .filter(|(_, sequence)| *sequence > covered)
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        };
+        // Paths reported before anything was published, after the scan
+        // started: the scan may have read them before they changed.
+        self.record_paths(&late)?;
         Ok(report)
+    }
+
+    /// Segments of the current generation that no other checkout's state
+    /// reads: for every text unit, content record and fragment another
+    /// checkout needs, readers take the newest segment that holds it, so
+    /// only those segments are kept.
+    fn unneeded_segments(&self) -> Result<Vec<SegmentId>, DataError> {
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let known = known_sections();
+        let entries = snapshot.manifest().segments().to_vec();
+        let segments = entries
+            .iter()
+            .map(|entry| {
+                snapshot
+                    .open_segment(entry.id, &known, Arc::clone(&self.layer.cache))
+                    .map_err(DataError::store)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // TextLocator numbers only the segments that have a text section,
+        // so keep each one's place in the manifest beside it.
+        let mut text_index = Vec::new();
+        let mut texts = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            if let Some(text) = TextSegment::open(segment).map_err(DataError::store)? {
+                text_index.push(index);
+                texts.push(text);
+            }
+        }
+        let contents = segments
+            .iter()
+            .map(|segment| ContentSegment::open(segment).map_err(DataError::store))
+            .collect::<Result<Vec<_>, _>>()?;
+        let graphs = segments
+            .iter()
+            .map(|segment| GraphSegment::open(segment).map_err(DataError::store))
+            .collect::<Result<Vec<_>, _>>()?;
+        let locator = TextLocator::build(&texts).map_err(DataError::store)?;
+        let mut needed = vec![false; entries.len()];
+        for state_ref in snapshot.manifest().checkouts() {
+            if state_ref.checkout == self.checkout {
+                continue;
+            }
+            let Some(state) = snapshot
+                .checkout_state(state_ref.checkout)
+                .map_err(DataError::store)?
+            else {
+                continue;
+            };
+            for (index, record) in state.paths().iter().enumerate() {
+                if let Some(Located::Indexed { segment, .. }) = locator.get(record.content) {
+                    needed[text_index[segment as usize]] = true;
+                }
+                if !record.language.is_empty() {
+                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+                    if let Some(holder) = newest_holder(&contents, |content| content.find(key))? {
+                        needed[holder] = true;
+                    }
+                }
+                if let Some(fragment) = state.fragment(index) {
+                    let key = FragmentKey::from_digest(fragment);
+                    if let Some(holder) = newest_holder(&graphs, |graph| graph.find(key))? {
+                        needed[holder] = true;
+                    }
+                }
+            }
+        }
+        Ok(entries
+            .iter()
+            .zip(needed)
+            .filter(|(_, needed)| !needed)
+            .map(|(entry, _)| entry.id)
+            .collect())
     }
 
     /// Resolves the call graph again for the paths changed since the
@@ -484,12 +696,16 @@ impl Checkout {
     /// When a stored record or fragment cannot be read, or resolution
     /// fails. The pending paths stay pending then.
     pub fn refresh_callgraph(&self) -> Result<Option<UpdateStats>, DataError> {
-        let (published, changes, covered) = {
+        let (published, state, changes, covered) = {
             let live = self.live.read().expect("no panics while holding it");
             let Some(published) = live.published.clone() else {
                 return Ok(None);
             };
-            (published, live.changed_bytes.clone(), live.sequence)
+            let state = live
+                .state
+                .clone()
+                .unwrap_or_else(|| Arc::new(published.state.clone()));
+            (published, state, live.changes.clone(), live.sequence)
         };
         if changes.is_empty() {
             return Ok(None);
@@ -507,12 +723,12 @@ impl Checkout {
         let engine = slot.as_mut().expect("started");
         let changed = changes
             .iter()
-            .filter(|(path, bytes)| engine.applied.get(*path) != Some(*bytes))
+            .filter(|(path, change)| engine.applied.get(*path) != Some(&change.sequence))
             .map(|(path, _)| path.clone())
             .collect::<BTreeSet<_>>();
         let mut stats = None;
         if !changed.is_empty() {
-            let next = next_inputs(&published.state, &engine.live.inputs, &changes, &changed);
+            let next = next_inputs(&state, &engine.live.inputs, &changes, &changed);
             let changed_names = changed
                 .iter()
                 .filter_map(|path| std::str::from_utf8(path).ok().map(str::to_string))
@@ -523,7 +739,7 @@ impl Checkout {
                 .map_err(|error| DataError::Resolve(error.to_string()))?;
             engine.dirty.extend(update.touched.iter().cloned());
             for path in &changed {
-                engine.applied.insert(path.clone(), changes[path].clone());
+                engine.applied.insert(path.clone(), changes[path].sequence);
             }
             stats = Some(update);
         }
@@ -561,9 +777,9 @@ impl Checkout {
             live.graph = Some(graph);
             live.refreshed = Some(Arc::new(refreshed));
             let resolved = live
-                .changed_at
+                .changes
                 .iter()
-                .filter(|(_, sequence)| **sequence <= covered)
+                .filter(|(_, change)| change.sequence <= covered)
                 .map(|(path, _)| path.clone())
                 .collect::<BTreeSet<_>>();
             live.callgraph_pending = Arc::new(
@@ -602,7 +818,7 @@ impl Checkout {
 
     /// This checkout's publication in `snapshot`, or `None` when the
     /// snapshot has no state for it.
-    fn open_published(&self, snapshot: &Snapshot) -> Result<Option<Published>, DataError> {
+    fn open_published(&self, snapshot: Snapshot) -> Result<Option<Published>, DataError> {
         let Some(state) = snapshot
             .checkout_state(self.checkout)
             .map_err(DataError::store)?
@@ -626,7 +842,7 @@ impl Checkout {
             snapshot.generation(),
             Digest128::of(&state.encode())
         );
-        Published::open(self.root.clone(), identity, state, segments).map(Some)
+        Published::open(self.root.clone(), identity, state, segments, snapshot).map(Some)
     }
 }
 
@@ -645,6 +861,9 @@ struct Published {
     segments: Vec<Arc<Segment>>,
     membership: TextMembership,
     graph: Arc<StoredSlices>,
+    /// Holds the lease that keeps this generation's files on disk while any
+    /// view reads them.
+    _snapshot: Snapshot,
 }
 
 /// How one plane of a checkout stands.
@@ -688,6 +907,7 @@ impl Published {
         identity: String,
         state: CheckoutState,
         segments: Vec<Arc<Segment>>,
+        snapshot: Snapshot,
     ) -> Result<Self, DataError> {
         let texts = segments
             .iter()
@@ -722,6 +942,7 @@ impl Published {
             segments,
             membership,
             graph: Arc::new(graph),
+            _snapshot: snapshot,
         })
     }
 
@@ -925,46 +1146,15 @@ impl CheckoutView {
     }
 }
 
-/// The resolver's inputs after `changed` paths of `changes` (each path's
-/// bytes since the publication, `None` once removed): the published state
-/// with every change applied, and `previous`'s parses and configuration with
-/// the changed paths extracted again.
+/// The resolver's inputs for the checkout's current `state`: `previous`'s
+/// parses and configuration, with each path in `changed` taken from what its
+/// change extracted.
 fn next_inputs(
-    published: &CheckoutState,
+    state: &CheckoutState,
     previous: &CheckoutInputs,
-    changes: &BTreeMap<Vec<u8>, Option<Arc<[u8]>>>,
+    changes: &BTreeMap<Vec<u8>, Change>,
     changed: &BTreeSet<Vec<u8>>,
 ) -> CheckoutInputs {
-    let mut records = published
-        .paths()
-        .iter()
-        .filter(|record| !changes.contains_key(&record.path))
-        .cloned()
-        .collect::<Vec<_>>();
-    for (path, bytes) in changes {
-        let Some(bytes) = bytes else {
-            continue;
-        };
-        let language = std::str::from_utf8(path)
-            .ok()
-            .and_then(|text| language_for(text, bytes))
-            .unwrap_or_default();
-        records.push(PathRecord {
-            path: path.clone(),
-            mode: 0o100_644,
-            kind: if bytes.contains(&0) {
-                PathKind::Binary
-            } else {
-                PathKind::Text
-            },
-            content: ContentKey::of(bytes),
-            link: Vec::new(),
-            stat: aft_store::checkout::StatEvidence::default(),
-            language,
-        });
-    }
-    let state = CheckoutState::new(published.git.clone(), published.conversion, records)
-        .expect("paths are unique: published paths without the changed ones, plus the changes");
     let mut parses = previous.parses.clone();
     let mut configs = previous.configs.clone();
     for path in changed {
@@ -973,38 +1163,124 @@ fn next_inputs(
         };
         parses.remove(name);
         configs.remove(path);
-        let Some(Some(bytes)) = changes.get(path) else {
-            continue;
-        };
-        let Some(record) = state.get(path) else {
-            continue;
-        };
-        if record.language.is_empty() || record.kind != PathKind::Text {
-            continue;
-        }
-        let Ok(extracted) = extract(bytes, &record.language) else {
-            // As in a build: a file the extractor fails on is not parsed.
-            continue;
-        };
-        match &extracted.data {
-            RecordBody::Config { source } => {
-                configs.insert(path.clone(), Arc::from(source.as_slice()));
+        match changes.get(path).map(|change| &change.extracted) {
+            Some(Extracted::Parse(key, parse)) => {
+                parses.insert(name.to_string(), (key.clone(), Arc::clone(parse)));
             }
-            RecordBody::Parsed { .. } => {
-                if let Ok(CallgraphBlob::Parse(parse)) = blob_from_record(&extracted) {
-                    let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
-                    parses.insert(
-                        name.to_string(),
-                        (key.digest().to_string(), Arc::new(parse)),
-                    );
-                }
+            Some(Extracted::Config(source)) => {
+                configs.insert(path.clone(), Arc::clone(source));
             }
+            Some(Extracted::Nothing) | None => {}
         }
     }
     CheckoutInputs {
-        state,
+        state: state.clone(),
         parses,
         configs,
+    }
+}
+
+/// `base` with every change's record in place of the base's.
+fn with_changes(base: &CheckoutState, changes: &BTreeMap<Vec<u8>, Change>) -> CheckoutState {
+    let mut records = base
+        .paths()
+        .iter()
+        .filter(|record| !changes.contains_key(&record.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    records.extend(changes.values().filter_map(|change| change.record.clone()));
+    CheckoutState::new(base.git.clone(), base.conversion, records)
+        .expect("base paths without the changed ones, plus the changed ones")
+}
+
+/// Paths whose member differs between two states of one checkout: added,
+/// removed, or changed in content, kind, mode or link target.
+fn changed_members(before: &CheckoutState, after: &CheckoutState) -> Vec<Vec<u8>> {
+    let same = |a: &PathRecord, b: &PathRecord| {
+        a.kind == b.kind && a.content == b.content && a.mode == b.mode && a.link == b.link
+    };
+    let mut changed = BTreeSet::new();
+    for record in before.paths() {
+        match after.get(&record.path) {
+            Some(now) if same(record, now) => {}
+            _ => {
+                changed.insert(record.path.clone());
+            }
+        }
+    }
+    for record in after.paths() {
+        if before.get(&record.path).is_none() {
+            changed.insert(record.path.clone());
+        }
+    }
+    changed.into_iter().collect()
+}
+
+/// The language a changed file is parsed as, and what the call graph reads
+/// from it. As in a build, a file the extractor fails on is not parsed.
+fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
+    if record.kind != PathKind::Text {
+        return (String::new(), Extracted::Nothing);
+    }
+    let Some(language) = std::str::from_utf8(&record.path)
+        .ok()
+        .and_then(|path| language_for(path, bytes))
+    else {
+        return (String::new(), Extracted::Nothing);
+    };
+    let Ok(extracted) = extract(bytes, &language) else {
+        return (language, Extracted::Nothing);
+    };
+    let content = match &extracted.data {
+        RecordBody::Config { source } => Extracted::Config(Arc::from(source.as_slice())),
+        RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
+            Ok(CallgraphBlob::Parse(parse)) => {
+                let key = RecordKey::new(record.content, &language, EXTRACTOR_VERSION);
+                Extracted::Parse(key.digest().to_string(), Arc::new(parse))
+            }
+            _ => Extracted::Nothing,
+        },
+    };
+    (language, content)
+}
+
+/// The index of the newest segment `find` locates a key in.
+fn newest_holder<T>(
+    segments: &[Option<T>],
+    find: impl Fn(&T) -> Result<Option<u32>, aft_store::segment::SegmentError>,
+) -> Result<Option<usize>, DataError> {
+    for (index, segment) in segments.iter().enumerate().rev() {
+        let Some(segment) = segment else {
+            continue;
+        };
+        if find(segment).map_err(DataError::store)?.is_some() {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// Keeps the bytes of every text file a change scan reads, for the text
+/// overlay and the call graph.
+#[derive(Default)]
+struct ChangeSink {
+    read: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl ChangeSink {
+    fn finish(self) -> HashMap<Vec<u8>, Vec<u8>> {
+        self.read.into_inner().expect("no panics while holding it")
+    }
+}
+
+impl ContentSink for ChangeSink {
+    fn read(&self, path: &[u8], _key: ContentKey, kind: ContentKind, bytes: &[u8]) {
+        if kind == ContentKind::Text {
+            self.read
+                .lock()
+                .expect("no panics while holding it")
+                .insert(path.to_vec(), bytes.to_vec());
+        }
     }
 }
 
@@ -1180,6 +1456,169 @@ mod tests {
         format!("{callers:?}")
     }
 
+    fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
+        let query = plan_pattern(pattern, false).unwrap();
+        view.text_candidates(&query, Scope::All)
+            .unwrap()
+            .into_iter()
+            .map(|path| String::from_utf8(path).unwrap())
+            .collect()
+    }
+
+    /// A small Rust crate whose `caller` calls `util::callee`.
+    fn demo(root: &Path) {
+        write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write(
+            root,
+            "src/lib.rs",
+            "mod util;\npub fn caller() { util::callee(); }\n",
+        );
+        write(root, "src/util.rs", "pub fn callee() {}\n");
+        write(root, "notes.txt", "nothing to see\n");
+    }
+
+    fn family() -> FamilyId {
+        FamilyId::from_digest(Digest128::of(b"demo"))
+    }
+
+    #[test]
+    fn a_restart_sees_what_changed_while_nothing_watched() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Changed while no process ran: a text edit, and a new caller.
+        write(root.path(), "notes.txt", "newneedle\n");
+        write(
+            root.path(),
+            "src/extra.rs",
+            "use crate::util;\npub fn other() { util::callee(); }\n",
+        );
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod extra;\npub fn caller() { util::callee(); }\n",
+        );
+
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        let view = checkout.view().unwrap();
+        assert_eq!(candidates_for(&view, "newneedle"), vec!["notes.txt"]);
+        // The call graph reports the changed files pending, not ready.
+        assert!(
+            matches!(view.status().callgraph, PlaneStatus::Building { .. }),
+            "{:?}",
+            view.status()
+        );
+        drop(view);
+        checkout.refresh_callgraph().unwrap();
+        assert_eq!(checkout.status().callgraph, PlaneStatus::Ready);
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(callers.contains("src/extra.rs"), "{callers}");
+    }
+
+    #[test]
+    fn rebuilds_retire_old_segments_and_a_held_view_keeps_reading() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        let held = checkout.view().unwrap();
+
+        let second = checkout.build().unwrap();
+        assert_eq!(second.retired_segments, 1, "{second:?}");
+        assert!(second.reclaim_error.is_none(), "{second:?}");
+        let third = checkout.build().unwrap();
+        assert_eq!(third.retired_segments, 1, "{third:?}");
+        let snapshot = Family::open(store.path(), family())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snapshot.manifest().segments().len(), 1);
+        drop(snapshot);
+
+        // The view taken before the rebuilds still reads its generation.
+        assert_eq!(
+            candidates_for(&held, "callee"),
+            vec!["src/lib.rs", "src/util.rs"]
+        );
+        drop(held);
+
+        // Once nothing reads the old generations, a build reclaims their
+        // files. What remains is the new segment and the one the checkout
+        // served while it built: its own publication holds a lease until the
+        // swap, so the next build removes it.
+        let fourth = checkout.build().unwrap();
+        assert!(fourth.reclaimed_files > 0, "{fourth:?}");
+        let segments = std::fs::read_dir(store.path().join("segments"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn recorded_changes_follow_the_scan_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        write(root.path(), "docs/needle.txt", "zzfolder\n");
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+
+        // Build output never becomes a member.
+        write(root.path(), "target/debug/gen.rs", "fn zzbuild() {}\n");
+        checkout
+            .record_paths(&[b"target/debug/gen.rs".to_vec()])
+            .unwrap();
+        assert!(candidates_for(&checkout.view().unwrap(), "zzbuild").is_empty());
+
+        // A removed folder takes its files with it.
+        std::fs::remove_dir_all(root.path().join("docs")).unwrap();
+        checkout.record_paths(&[b"docs".to_vec()]).unwrap();
+        assert!(candidates_for(&checkout.view().unwrap(), "zzfolder").is_empty());
+
+        // A file over the size limit is a member that is not parsed, as in a
+        // build.
+        let mut big = String::from("use crate::util;\npub fn big() { util::callee(); }\n");
+        while big.len() <= 1024 * 1024 {
+            big.push_str("// padding padding padding padding padding padding\n");
+        }
+        write(root.path(), "src/big.rs", &big);
+        write(
+            root.path(),
+            "src/lib.rs",
+            "mod util;\nmod big;\npub fn caller() { util::callee(); }\n",
+        );
+        checkout
+            .record_paths(&[b"src/big.rs".to_vec(), b"src/lib.rs".to_vec()])
+            .unwrap();
+        checkout.refresh_callgraph().unwrap();
+        let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "callee");
+        assert!(!callers.contains("src/big.rs"), "{callers}");
+        // A cold build of the same files agrees.
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold = Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            cold_store.path(),
+            family(),
+            root.path(),
+        )
+        .unwrap();
+        cold.build().unwrap();
+        assert_eq!(
+            callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
+            callers
+        );
+    }
+
     #[test]
     fn an_edit_updates_the_call_graph_without_a_rebuild() {
         let root = tempfile::tempdir().unwrap();
@@ -1206,16 +1645,9 @@ mod tests {
         let lib = "mod util;\nmod extra;\npub fn caller() {}\n";
         write(root.path(), "src/extra.rs", extra);
         write(root.path(), "src/lib.rs", lib);
-        checkout.record_changes(&[
-            PathChange::Written {
-                path: b"src/extra.rs".to_vec(),
-                bytes: Arc::from(extra.as_bytes()),
-            },
-            PathChange::Written {
-                path: b"src/lib.rs".to_vec(),
-                bytes: Arc::from(lib.as_bytes()),
-            },
-        ]);
+        checkout
+            .record_paths(&[b"src/extra.rs".to_vec(), b"src/lib.rs".to_vec()])
+            .unwrap();
         assert!(matches!(
             checkout.status().callgraph,
             PlaneStatus::Building { .. }
@@ -1242,11 +1674,14 @@ mod tests {
         let generation = checkout.view().unwrap().text_generation();
         assert!(checkout.refresh_callgraph().unwrap().is_none());
         assert_eq!(checkout.view().unwrap().text_generation(), generation);
-        checkout.record_changes(&[PathChange::Written {
-            path: b"src/extra.rs".to_vec(),
-            bytes: Arc::from(extra.as_bytes()),
-        }]);
+        // Recording a path whose content did not change changes nothing.
+        checkout.record_paths(&[b"src/extra.rs".to_vec()]).unwrap();
+        assert_eq!(checkout.view().unwrap().text_generation(), generation);
+        let extra_again = "use crate::util;\npub fn other() { util::callee(); util::callee(); }\n";
+        write(root.path(), "src/extra.rs", extra_again);
+        checkout.record_paths(&[b"src/extra.rs".to_vec()]).unwrap();
         assert_ne!(checkout.view().unwrap().text_generation(), generation);
+        checkout.refresh_callgraph().unwrap();
 
         // The dead-code snapshot follows the refreshed graph: `callee` is
         // still called (from src/extra.rs), and the snapshot equals a cold
@@ -1347,10 +1782,7 @@ mod tests {
         // An edit is visible to text queries at once, and the call graph
         // reports it pending until the next build covers it.
         write(root.path(), "notes.txt", "now mentions callee\n");
-        checkout.record_changes(&[PathChange::Written {
-            path: b"notes.txt".to_vec(),
-            bytes: Arc::from(&b"now mentions callee\n"[..]),
-        }]);
+        checkout.record_paths(&[b"notes.txt".to_vec()]).unwrap();
         let query = plan_pattern("callee", false).unwrap();
         let three = vec![
             b"notes.txt".to_vec(),

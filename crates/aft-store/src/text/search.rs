@@ -270,10 +270,10 @@ pub fn paths_with_trigram(
         }
     }
     for (path, entry) in &overlay.entries {
-        if let OverlayEntry::Content(trigrams) = entry {
-            if trigrams.get(trigram).is_some() {
-                found.push(path.clone());
-            }
+        if let OverlayEntry::Content(trigrams) = entry
+            && trigrams.get(trigram).is_some()
+        {
+            found.push(path.clone());
         }
     }
     found.sort_unstable();

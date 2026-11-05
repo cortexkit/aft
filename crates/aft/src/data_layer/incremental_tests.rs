@@ -177,3 +177,31 @@ fn a_go_module_rename_resolves_like_a_cold_build() {
         "the rename did not change what the caller resolves to"
     );
 }
+
+#[test]
+fn a_crate_src_symlink_retarget_resolves_like_a_cold_build() {
+    // `dep`'s sources sit behind a link, so the crate map finds them only by
+    // following it; retargeting the link moves `dep::run`.
+    let files = [
+        ("Cargo.toml", "[workspace]\nmembers = [\"app\", \"dep\"]\n"),
+        (
+            "app/Cargo.toml",
+            "[package]\nname = \"app\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        ),
+        ("app/src/lib.rs", "pub fn start() { dep::run(); }\n"),
+        ("dep/Cargo.toml", "[package]\nname = \"dep\"\n"),
+        ("old/src/lib.rs", "pub fn run() {}\n"),
+        ("new/src/lib.rs", "pub fn run() {}\n"),
+    ];
+    let rows = update_matches_cold(
+        checkout(&files, &[("dep/src", "../old/src")]),
+        checkout(&files, &[("dep/src", "../new/src")]),
+        &["dep/src"],
+        "app/src/lib.rs",
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, path, _)| path.as_deref() == Some("new/src/lib.rs")),
+        "the fixture must move the call: {rows:?}"
+    );
+}

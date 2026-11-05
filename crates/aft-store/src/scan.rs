@@ -12,12 +12,13 @@
 //! of its side files (opening any of those from a process that holds a
 //! connection drops that process's locks on them).
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ignore::{WalkBuilder, WalkState};
 
@@ -128,6 +129,155 @@ pub fn scan(
     previous: Option<&CheckoutState>,
     sink: &dyn ContentSink,
 ) -> Result<Scan, ScanError> {
+    let (records, mut counters) = walk_records(root, policy, previous, None, sink)?;
+    counters.files = records.len();
+    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?;
+    Ok(Scan { state, counters })
+}
+
+/// What [`scan_paths`] found: the checkout's whole state with the given
+/// paths brought up to date, and which paths' records changed.
+#[derive(Debug)]
+pub struct PathScan {
+    pub state: CheckoutState,
+    /// Paths whose record was added, removed, or changed in content, kind,
+    /// mode or link target, in byte order.
+    pub changed: Vec<Vec<u8>>,
+    pub counters: ScanCounters,
+}
+
+/// Brings `previous` up to date for `paths` (relative, such as a watcher or
+/// an edit reports them): each path, and everything under it when it is a
+/// folder, is walked again under exactly the rules a full [`scan`] applies.
+/// A path that is gone, ignored, or inside a skipped folder leaves the
+/// state; a folder that appeared is walked whole. Every other record is kept
+/// as it is. Files are read only when their stat no longer proves the
+/// recorded content.
+///
+/// # Errors
+///
+/// As [`scan`].
+pub fn scan_paths(
+    root: &Path,
+    policy: &ScanPolicy,
+    previous: &CheckoutState,
+    paths: &[Vec<u8>],
+    sink: &dyn ContentSink,
+) -> Result<PathScan, ScanError> {
+    let restrict = Arc::new(Restrict::new(paths));
+    let (walked, mut counters) = walk_records(
+        root,
+        policy,
+        Some(previous),
+        Some(Arc::clone(&restrict)),
+        sink,
+    )?;
+    let mut records = previous
+        .paths()
+        .iter()
+        .filter(|record| !restrict.covers(&record.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = BTreeSet::new();
+    for record in previous.paths() {
+        if restrict.covers(&record.path) {
+            changed.insert(record.path.clone());
+        }
+    }
+    for record in &walked {
+        changed.insert(record.path.clone());
+    }
+    let walked_by_path = walked
+        .iter()
+        .map(|record| (record.path.as_slice(), record))
+        .collect::<std::collections::HashMap<_, _>>();
+    changed.retain(|path| {
+        let before = previous.get(path);
+        let after = walked_by_path.get(path.as_slice()).copied();
+        match (before, after) {
+            (Some(before), Some(after)) => !same_member(before, after),
+            (None, None) => false,
+            _ => true,
+        }
+    });
+    drop(walked_by_path);
+    records.extend(walked);
+    counters.files = records.len();
+    let state = CheckoutState::new(previous.git.clone(), previous.conversion, records)?;
+    Ok(PathScan {
+        state,
+        changed: changed.into_iter().collect(),
+        counters,
+    })
+}
+
+/// Whether two records of one path describe the same member: stat evidence
+/// alone may differ.
+fn same_member(before: &PathRecord, after: &PathRecord) -> bool {
+    before.kind == after.kind
+        && before.content == after.content
+        && before.mode == after.mode
+        && before.link == after.link
+}
+
+/// The paths a [`scan_paths`] walk is limited to.
+#[derive(Debug)]
+struct Restrict {
+    paths: BTreeSet<Vec<u8>>,
+}
+
+impl Restrict {
+    fn new(paths: &[Vec<u8>]) -> Self {
+        Self {
+            paths: paths
+                .iter()
+                .map(|path| {
+                    let mut path = path.clone();
+                    while path.last() == Some(&b'/') {
+                        path.pop();
+                    }
+                    path
+                })
+                .filter(|path| !path.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether `path` is one of the paths or under one of them.
+    fn covers(&self, path: &[u8]) -> bool {
+        if self.paths.contains(path) {
+            return true;
+        }
+        path.iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'/')
+            .any(|(index, _)| self.paths.contains(&path[..index]))
+    }
+
+    /// Whether the walk must enter or keep `path`: it is covered, or it is a
+    /// folder on the way to a covered path.
+    fn admits(&self, path: &[u8]) -> bool {
+        if self.covers(path) {
+            return true;
+        }
+        let mut prefix = path.to_vec();
+        prefix.push(b'/');
+        self.paths
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|next| next.starts_with(&prefix))
+    }
+}
+
+/// Walks `root` under the scan's rules, limited to `restrict` when given,
+/// and records every member it reaches.
+fn walk_records(
+    root: &Path,
+    policy: &ScanPolicy,
+    previous: Option<&CheckoutState>,
+    restrict: Option<Arc<Restrict>>,
+    sink: &dyn ContentSink,
+) -> Result<(Vec<PathRecord>, ScanCounters), ScanError> {
     let common_dir = git_common_dir(root);
     let mut builder = WalkBuilder::new(root);
     builder
@@ -158,10 +308,19 @@ pub fn scan(
         if is_dir && entry.depth() > 0 && skip_dirs.iter().any(|skip| OsStr::new(skip) == name) {
             return false;
         }
-        !(is_dir
+        if is_dir
             && entry.depth() > 0
             && entry.path() != nested_root
-            && is_nested_worktree(entry.path(), common_dir.as_deref()))
+            && is_nested_worktree(entry.path(), common_dir.as_deref())
+        {
+            return false;
+        }
+        match (&restrict, entry.path().strip_prefix(&nested_root)) {
+            (Some(restrict), Ok(relative)) if entry.depth() > 0 => {
+                restrict.admits(&os_bytes(relative.as_os_str()))
+            }
+            _ => true,
+        }
     });
 
     let records = Mutex::new(Vec::new());
@@ -223,10 +382,7 @@ pub fn scan(
         return Err(error);
     }
     let records = records.into_inner().expect("no panics while holding it");
-    let mut counters = counters.finish();
-    counters.files = records.len();
-    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?;
-    Ok(Scan { state, counters })
+    Ok((records, counters.finish()))
 }
 
 #[derive(Default)]
@@ -594,6 +750,121 @@ mod tests {
             })
             .collect();
         CheckoutState::new(Vec::new(), state.conversion, records).unwrap()
+    }
+
+    /// One member: its path, kind, content and link target.
+    type Member = (String, PathKind, ContentKey, Vec<u8>);
+
+    /// One step of a path-scan test: what it changes on disk, the paths a
+    /// watcher would report, and the paths whose record must change.
+    type Step<'a> = (Box<dyn Fn() + 'a>, Vec<&'a str>, Vec<&'a str>);
+
+    /// The members of `state` with what identifies each, for comparing a
+    /// path scan with a full scan.
+    fn members(state: &CheckoutState) -> Vec<Member> {
+        state
+            .paths()
+            .iter()
+            .map(|record| {
+                (
+                    String::from_utf8_lossy(&record.path).into_owned(),
+                    record.kind,
+                    record.content,
+                    record.link.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_path_scan_equals_a_full_scan_under_the_same_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |path: &str, bytes: &[u8]| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        write(".gitignore", b"ignored/\n*.log\n");
+        write("src/a.rs", b"fn a() {}\n");
+        write("docs/one.txt", b"one\n");
+        write("docs/two.txt", b"two\n");
+        let policy = ScanPolicy {
+            max_indexed_len: 2048,
+            ..ScanPolicy::default()
+        };
+        let sink = Collect::default();
+        let mut state = aged(&scan(root, &policy, None, &sink).unwrap().state);
+
+        // Each step changes the tree, then brings the state up to date for
+        // the paths a watcher would report, and must match a full scan.
+        let mut late_nul = vec![b'x'; 1500];
+        late_nul[1400] = 0;
+        let steps: Vec<Step<'_>> = vec![
+            (
+                Box::new(|| write("src/a.rs", b"fn changed() {}\n")),
+                vec!["src/a.rs"],
+                vec!["src/a.rs"],
+            ),
+            (
+                // Build output and ignored files never become members.
+                Box::new(|| {
+                    write("target/debug/gen.rs", b"fn gen() {}\n");
+                    write("ignored/x.rs", b"no\n");
+                    write("run.log", b"no\n");
+                }),
+                vec!["target/debug/gen.rs", "ignored/x.rs", "run.log", "target"],
+                vec![],
+            ),
+            (
+                Box::new(|| write("src/big.rs", &vec![b'y'; 4096])),
+                vec!["src/big.rs"],
+                vec!["src/big.rs"],
+            ),
+            (
+                // A NUL past the first KiB is judged as the full scan judges it.
+                Box::new(move || write("src/late.rs", &late_nul)),
+                vec!["src/late.rs"],
+                vec!["src/late.rs"],
+            ),
+            (
+                // A removed folder takes its files with it.
+                Box::new(|| std::fs::remove_dir_all(root.join("docs")).unwrap()),
+                vec!["docs"],
+                vec!["docs/one.txt", "docs/two.txt"],
+            ),
+            (
+                // A folder that appears is walked whole.
+                Box::new(|| {
+                    write("lib/nested/deep.rs", b"fn deep() {}\n");
+                    write("lib/top.rs", b"fn top() {}\n");
+                }),
+                vec!["lib"],
+                vec!["lib/nested/deep.rs", "lib/top.rs"],
+            ),
+        ];
+        for (index, (mutate, reported, expected)) in steps.into_iter().enumerate() {
+            mutate();
+            let reported = reported
+                .iter()
+                .map(|path| path.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            let partial = scan_paths(root, &policy, &state, &reported, &sink).unwrap();
+            let full = scan(root, &policy, None, &sink).unwrap();
+            assert_eq!(
+                members(&partial.state),
+                members(&full.state),
+                "step {index}"
+            );
+            let changed = partial
+                .changed
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(changed, expected, "step {index}");
+            state = aged(&partial.state);
+        }
+        assert_eq!(state.get(b"src/big.rs").unwrap().kind, PathKind::Oversize);
     }
 
     #[test]

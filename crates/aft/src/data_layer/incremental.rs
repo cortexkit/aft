@@ -440,15 +440,22 @@ impl LiveCheckout {
         if !configs.is_empty() {
             binding_keys.insert(VIEW_CONFIG_MEMBERSHIP_DOMAIN.to_string());
         }
-        let go_modules_changed = configs
-            .iter()
-            .any(|path| path == "go.mod" || path.ends_with("/go.mod"));
+        // The Go module map and the Rust crate map are each built once from
+        // a walk of the checkout's folders; a reader records the map's key,
+        // not the walk's reads. Besides a go.mod or Cargo.toml edit, a
+        // symlink change can redirect a folder a walk follows (a crate's
+        // `src`, a module folder), so it changes both keys too.
+        let go_modules_changed = !links.is_empty()
+            || configs
+                .iter()
+                .any(|path| path == "go.mod" || path.ends_with("/go.mod"));
         if go_modules_changed {
             binding_keys.insert(VIEW_GO_MODULES_DOMAIN.to_string());
         }
-        let rust_crates_changed = configs
-            .iter()
-            .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
+        let rust_crates_changed = !links.is_empty()
+            || configs
+                .iter()
+                .any(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
         if rust_crates_changed {
             binding_keys.insert(VIEW_RUST_CRATES_DOMAIN.to_string());
         }
