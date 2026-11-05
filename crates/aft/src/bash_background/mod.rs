@@ -553,6 +553,39 @@ pub struct TaskCallKey {
     pub minted: bool,
 }
 
+/// A consumer's session namespace, attested by the transport rather than tool arguments.
+/// Route channels and epochs are deliberately excluded so reconnects retain ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TaskIdentity {
+    pub principal: Option<String>,
+    pub harness: String,
+    pub session: String,
+}
+
+impl TaskIdentity {
+    pub(crate) fn current() -> Option<Self> {
+        match current_authenticated_principal() {
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+                principal_id,
+                harness,
+                session_id,
+                ..
+            } => Some(Self {
+                principal: principal_id,
+                harness,
+                session: session_id,
+            }),
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,
+        }
+    }
+
+    pub(crate) fn allows_current(owner: Option<&Self>) -> bool {
+        // Records from before ownership was persisted keep session-only access for
+        // tasks in flight across the upgrade. Standalone mode also has no route.
+        owner.is_none_or(|owner| Self::current().as_ref() == Some(owner))
+    }
+}
+
 thread_local! {
     /// The `call_key` of the tool call whose dispatch is running on this
     /// thread. Installed around the dispatch like the authenticated principal

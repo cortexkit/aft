@@ -9,6 +9,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReplayKey {
     pub(super) root: ProjectRootId,
+    pub(super) principal: Option<String>,
     pub(super) harness: String,
     pub(super) session: String,
 }
@@ -17,6 +18,7 @@ impl ReplayKey {
     pub(super) fn from_identity(identity: &RouteIdentity) -> Self {
         Self {
             root: identity.root.clone(),
+            principal: identity.task_identity().principal,
             harness: identity.harness.clone(),
             session: identity.session.clone(),
         }
@@ -60,6 +62,15 @@ fn frame_session(frame: &PushFrame) -> Option<&str> {
     }
 }
 
+fn frame_task_identity(frame: &PushFrame) -> Option<&crate::bash_background::TaskIdentity> {
+    match frame {
+        PushFrame::BashCompleted(frame) => frame.launching_identity.as_ref(),
+        PushFrame::BashLongRunning(frame) => frame.launching_identity.as_ref(),
+        PushFrame::BashPatternMatch(frame) => frame.launching_identity.as_ref(),
+        _ => None,
+    }
+}
+
 fn root_broadcast_kind(frame: &PushFrame) -> Option<&'static str> {
     match frame {
         PushFrame::StatusChanged(status) if status.session_id.is_none() => Some("status_changed"),
@@ -98,12 +109,22 @@ fn completed_task_id(frame: &PushFrame) -> Option<&str> {
 fn durable_bg_session_key(
     root: &ProjectRootId,
     frame: &PushFrame,
-) -> Option<(ProjectRootId, String)> {
+) -> Option<(
+    ProjectRootId,
+    String,
+    Option<crate::bash_background::TaskIdentity>,
+)> {
     match frame {
-        PushFrame::BashCompleted(completed) => Some((root.clone(), completed.session_id.clone())),
-        PushFrame::BashPatternMatch(pattern_match) => {
-            Some((root.clone(), pattern_match.session_id.clone()))
-        }
+        PushFrame::BashCompleted(completed) => Some((
+            root.clone(),
+            completed.session_id.clone(),
+            completed.launching_identity.clone(),
+        )),
+        PushFrame::BashPatternMatch(pattern_match) => Some((
+            root.clone(),
+            pattern_match.session_id.clone(),
+            pattern_match.launching_identity.clone(),
+        )),
         _ => None,
     }
 }
@@ -561,23 +582,23 @@ fn emit_bg_event_wakes_at(
 /// wake that was armed after the maintenance snapshot was taken.
 pub(super) fn arm_bg_wake(
     root: ProjectRootId,
-    session: String,
+    session: crate::bash_background::TaskIdentity,
     channel: RouteChannel,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     metrics: &DispatchPathMetrics,
 ) {
-    metrics.record_bg_arm_hit(&root, &session, channel);
+    metrics.record_bg_arm_hit(&root, &session.session, channel);
     *bg_wake_epoch.entry((root, session)).or_default() += 1;
     bg_wake_pending.insert(channel, BgWakeState::armed(Instant::now()));
 }
 
 pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
     root_id: &ProjectRootId,
-    empty_bg_sessions: &[(String, u64)],
+    empty_bg_sessions: &[(crate::bash_background::TaskIdentity, u64)],
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
 ) {
     for (session, epoch_at_submit) in empty_bg_sessions {
         let key = (root_id.clone(), session.clone());
@@ -800,6 +821,15 @@ fn matching_route_channels(
         frame_session(frame),
         frame_is_bash_observation(frame),
     )
+    .into_iter()
+    .filter(|channel| {
+        frame_task_identity(frame).is_none_or(|owner| {
+            routes
+                .get(channel)
+                .is_some_and(|route| route.task_identity() == *owner)
+        })
+    })
+    .collect()
 }
 
 fn matching_session_route_channels(
@@ -845,6 +875,24 @@ fn buffer_detached_reliable_push_frame(
         );
         return;
     };
+
+    if let Some(owner) = frame_task_identity(frame) {
+        buffer_push_frame(
+            metrics,
+            push_buffer,
+            ReplayKey {
+                root: root.clone(),
+                principal: owner.principal.clone(),
+                harness: owner.harness.clone(),
+                session: owner.session.clone(),
+            },
+            frame.clone(),
+        );
+        if let (Some(probe), Some(task_id)) = (lifecycle_probe, completed_task_id(frame)) {
+            probe.reliable_completion_retained(task_id, session);
+        }
+        return;
+    }
 
     if let Some((key, trust)) = replay_key_for_session(session_identity, root, session) {
         if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
@@ -1069,7 +1117,11 @@ fn process_reliable_push_frame(
     root: ProjectRootId,
     frame: PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
-) -> Option<(ProjectRootId, String)> {
+) -> Option<(
+    ProjectRootId,
+    String,
+    Option<crate::bash_background::TaskIdentity>,
+)> {
     let durable_bg_session = durable_bg_session_key(&root, &frame);
     if let Some(task_id) = completed_task_id(&frame) {
         completed_tasks.remember(task_id);
@@ -1093,19 +1145,29 @@ fn arm_durable_bg_wake(
     metrics: &DispatchPathMetrics,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     root: ProjectRootId,
     session: String,
+    owner: Option<crate::bash_background::TaskIdentity>,
 ) {
-    if let Some(channels) = bg_sub_by_session.get(&(root.clone(), session.clone())) {
+    let mut matched = false;
+    for ((sub_root, identity), channels) in bg_sub_by_session {
+        if sub_root != &root
+            || identity.session != session
+            || owner.as_ref().is_some_and(|owner| owner != identity)
+        {
+            continue;
+        }
+        matched = true;
         *bg_wake_epoch
-            .entry((root.clone(), session.clone()))
+            .entry((root.clone(), identity.clone()))
             .or_default() += 1;
         for channel in channels {
             metrics.record_bg_arm_hit(&root, &session, *channel);
             bg_wake_pending.insert(*channel, BgWakeState::armed(Instant::now()));
         }
-    } else {
+    }
+    if !matched {
         let live_root_subscriptions = bg_sub_by_session
             .keys()
             .filter(|(sub_root, _)| sub_root == &root)
@@ -1126,12 +1188,12 @@ fn process_reliable_push_and_arm_bg_wake(
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
-    bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
+    bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     root: ProjectRootId,
     frame: PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
-    if let Some((root, session)) = process_reliable_push_frame(
+    if let Some((root, session, owner)) = process_reliable_push_frame(
         writer_tx,
         metrics,
         routes,
@@ -1151,6 +1213,7 @@ fn process_reliable_push_and_arm_bg_wake(
             bg_wake_epoch,
             root,
             session,
+            owner,
         );
     }
 }
@@ -2198,6 +2261,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-bound-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -2232,6 +2296,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-replay-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -2278,6 +2343,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-buffer-replay-untrusted-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "mcp".to_string(),
             session: "session-1".to_string(),
         };
@@ -2968,6 +3034,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-incremental-replay-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -3036,6 +3103,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-goodbye-migration-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
@@ -3072,6 +3140,7 @@ mod tests {
         let (_root_dir, root) = test_root("subc-permanent-failure-root");
         let key = ReplayKey {
             root,
+            principal: Some("direct".to_string()),
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
