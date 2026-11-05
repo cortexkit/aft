@@ -447,6 +447,14 @@ pub(crate) struct DataCheckout {
     _listener: Arc<dyn WriteIntentListener>,
 }
 
+impl Drop for DataCheckout {
+    // An evicted checkout must not leave its quiet-timer thread asleep for
+    // up to `QUIET`: its refresh would find nothing to refresh anyway.
+    fn drop(&mut self) {
+        self.quiet.stop();
+    }
+}
+
 impl DataCheckout {
     /// [`Self::open_planes`] with every plane.
     #[cfg(test)]
@@ -621,6 +629,10 @@ struct QuietTimer {
     armed: AtomicBool,
     epoch: Instant,
     fire: Box<dyn Fn() + Send + Sync>,
+    /// Set when the checkout is dropped: the waiting thread ends at once
+    /// instead of sleeping out its deadline.
+    stopped: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
 }
 
 impl QuietTimer {
@@ -631,7 +643,32 @@ impl QuietTimer {
             armed: AtomicBool::new(false),
             epoch: Instant::now(),
             fire: Box::new(fire),
+            stopped: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
         }
+    }
+
+    /// Ends the waiting thread, if any, without firing; later changes start
+    /// none.
+    fn stop(&self) {
+        *self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.wake.notify_all();
+    }
+
+    /// Sleeps up to `duration`, or until [`Self::stop`]; true once stopped.
+    fn sleep(&self, duration: Duration) -> bool {
+        let stopped = self
+            .stopped
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (stopped, _) = self
+            .wake
+            .wait_timeout_while(stopped, duration, |stopped| !*stopped)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *stopped
     }
 
     fn now_ms(&self) -> u64 {
@@ -642,7 +679,7 @@ impl QuietTimer {
     /// waiting already.
     fn changed(self: &Arc<Self>) {
         self.last_change_ms.store(self.now_ms(), Ordering::Release);
-        if self.armed.swap(true, Ordering::AcqRel) {
+        if self.sleep(Duration::ZERO) || self.armed.swap(true, Ordering::AcqRel) {
             return;
         }
         let timer = Arc::clone(self);
@@ -656,7 +693,9 @@ impl QuietTimer {
                     .saturating_add(quiet_ms);
                 let now = timer.now_ms();
                 if now < due {
-                    std::thread::sleep(Duration::from_millis(due - now));
+                    if timer.sleep(Duration::from_millis(due - now)) {
+                        break;
+                    }
                     continue;
                 }
                 timer.armed.store(false, Ordering::Release);
@@ -948,5 +987,27 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 2);
         std::thread::sleep(Duration::from_millis(400));
         assert_eq!(fired.load(Ordering::SeqCst), 2, "fired without a change");
+    }
+
+    #[test]
+    fn a_stopped_quiet_timer_ends_its_thread_without_firing() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&fired);
+        let timer = Arc::new(QuietTimer::new(Duration::from_secs(120), move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        timer.changed();
+        // The waiting thread holds the timer.
+        assert_eq!(Arc::strong_count(&timer), 2);
+        timer.stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&timer) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&timer), 1, "the thread is still waiting");
+        // Changes after the stop start no thread.
+        timer.changed();
+        assert_eq!(Arc::strong_count(&timer), 1);
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
     }
 }

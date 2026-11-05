@@ -134,6 +134,54 @@ fn a_symlink_retarget_resolves_like_a_cold_build() {
 }
 
 #[test]
+fn a_workspace_package_rename_resolves_like_a_cold_build() {
+    // The caller imports a package name no workspace member has until the
+    // member's package.json is renamed: the miss must be recorded, or the
+    // rename never reaches the caller.
+    let caller = (
+        "packages/app/src/main.ts",
+        "import { target } from '@scope/new';\nexport function run(): string { return target(); }\n",
+    );
+    let library = (
+        "packages/pkg/src/index.ts",
+        "export function target(): string { return 'ok'; }\n",
+    );
+    let root = ("package.json", r#"{"workspaces":["packages/*"]}"#);
+    let app = ("packages/app/package.json", r#"{"name":"app"}"#);
+    let before = checkout(
+        &[
+            caller,
+            library,
+            root,
+            app,
+            ("packages/pkg/package.json", r#"{"name":"@scope/old"}"#),
+        ],
+        &[],
+    );
+    let after = checkout(
+        &[
+            caller,
+            library,
+            root,
+            app,
+            ("packages/pkg/package.json", r#"{"name":"@scope/new"}"#),
+        ],
+        &[],
+    );
+    let rows = update_matches_cold(
+        before,
+        after,
+        &["packages/pkg/package.json"],
+        "packages/app/src/main.ts",
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, path, _)| path.as_deref() == Some("packages/pkg/src/index.ts")),
+        "the rename must resolve the import: {rows:?}"
+    );
+}
+
+#[test]
 fn a_go_module_rename_resolves_like_a_cold_build() {
     let caller = (
         "app/main.go",
