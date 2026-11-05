@@ -250,10 +250,27 @@ struct Change {
 enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
-    /// A parsed file: its parse key and parse.
-    Parse(String, Arc<ParseBlob>),
-    /// A resolver configuration file's bytes.
-    Config(Arc<[u8]>),
+    /// A parsed file: its parse key and parse, and the content record
+    /// they came from, which a publication of the change stores.
+    Parse(String, Arc<ParseBlob>, Arc<ContentRecord>),
+    /// A resolver configuration file's bytes, and its content record.
+    Config(Arc<[u8]>, Arc<ContentRecord>),
+}
+
+/// What publishing the changes since a publication wrote.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct DeltaReport {
+    /// Paths changed since the publication.
+    pub paths: usize,
+    /// Fragments written: files resolved again, or whose stored terms no
+    /// longer applied.
+    pub fragments: usize,
+    /// Content records written: the changed parsed and configuration files.
+    pub records: usize,
+    pub text_units: usize,
+    /// Segments in the family's store afterwards.
+    pub segments: usize,
+    pub ms: f64,
 }
 
 /// What a build did.
@@ -772,8 +789,14 @@ impl Checkout {
             .text
             .write(pending.writer())
             .map_err(DataError::store)?;
-        let fragments = write_sections(pending.writer(), &inputs, &resolved, &collected.records)
-            .map_err(DataError::Store)?;
+        let fragments = write_sections(
+            pending.writer(),
+            &inputs,
+            &resolved,
+            &collected.records,
+            true,
+        )
+        .map_err(DataError::Store)?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         report.write_ms = elapsed_ms(started);
 
@@ -1264,6 +1287,208 @@ impl Checkout {
             .is_some()
             .then(|| (engine.overlay.clone(), engine.refreshed.clone()));
         Ok((stats, served))
+    }
+
+    /// Publishes what changed since the publication in a segment of its
+    /// own: the changed contents' text and records, and the fragments of
+    /// the files whose resolution or stored terms changed, with the
+    /// checkout's new state naming every path's fragment. Queries then
+    /// answer from that publication with nothing laid over it, and a
+    /// restart starts from it. `None` when there is nothing to publish, the
+    /// call graph has not resolved every change yet (refresh first), a
+    /// build is running, or another process published this checkout
+    /// meanwhile; the checkout then serves that publication.
+    ///
+    /// # Errors
+    ///
+    /// When the store cannot be written; nothing is published then.
+    pub fn publish_changes(&self) -> Result<Option<DeltaReport>, DataError> {
+        let started = Instant::now();
+        let (published, changes, covered, text) = {
+            let live = self.live.read().expect("no panics while holding it");
+            let Some(published) = live.published.clone() else {
+                return Ok(None);
+            };
+            if live.building || live.changes.is_empty() || !published.graph_built {
+                return Ok(None);
+            }
+            (
+                published,
+                live.changes.clone(),
+                live.sequence,
+                Arc::clone(&live.text),
+            )
+        };
+        // What the engine resolved, for exactly these changes.
+        let (inputs, resolved) = {
+            let Ok(slot) = self.engine.lock() else {
+                return Ok(None);
+            };
+            let Some(engine) = slot
+                .as_ref()
+                .filter(|engine| Arc::ptr_eq(&engine.published, &published))
+            else {
+                return Ok(None);
+            };
+            if changes
+                .iter()
+                .any(|(path, change)| engine.applied.get(path) != Some(&change.sequence))
+            {
+                return Ok(None);
+            }
+            let mut files = engine
+                .refreshed
+                .replaced
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            files.extend(engine.live.refiled());
+            let resolved = files
+                .iter()
+                .filter_map(|file| {
+                    engine
+                        .live
+                        .resolved
+                        .get(file)
+                        .map(|resolution| (file.clone(), resolution.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (engine.live.inputs.clone(), resolved)
+        };
+        // The changed contents' records and text, each content once.
+        let mut records = HashMap::new();
+        let mut text_units = TextSectionsBuilder::new();
+        let mut seen = HashSet::new();
+        for (path, change) in &changes {
+            let Some(record) = &change.record else {
+                continue;
+            };
+            let key = RecordKey::new(record.content, &record.language, EXTRACTOR_VERSION);
+            match &change.extracted {
+                Extracted::Parse(_, _, stored) | Extracted::Config(_, stored) => {
+                    records.insert(key.digest().to_string(), (key, Arc::clone(stored)));
+                }
+                Extracted::Nothing => {}
+            }
+            if !seen.insert(record.content) {
+                continue;
+            }
+            let size = record.stat.size;
+            match text.get(path) {
+                Some(OverlayEntry::Content(trigrams)) => {
+                    text_units.add_indexed(record.content, size, trigrams);
+                }
+                Some(OverlayEntry::Unindexed) => match record.kind {
+                    PathKind::Binary => {
+                        text_units.add_unindexed(record.content, size, TextStatus::Binary);
+                    }
+                    PathKind::Large => {
+                        text_units.add_unindexed(record.content, size, TextStatus::Oversize);
+                    }
+                    PathKind::Text if size > self.layer.policy.max_indexed_len => {
+                        text_units.add_unindexed(record.content, size, TextStatus::Oversize);
+                    }
+                    _ => {}
+                },
+                Some(OverlayEntry::Deleted) | None => {}
+            }
+        }
+        let text_unit_count = text_units.len();
+        // A path keeps the fragment the publication stored for it unless it
+        // got a new one, or its content or language changed.
+        let stored_fragments = published
+            .state
+            .paths()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                published
+                    .state
+                    .fragment(index)
+                    .map(|fragment| (record.path.as_slice(), (record, fragment)))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut session = self.writer()?;
+        let started_from = published
+            ._snapshot
+            .manifest()
+            .checkout(self.checkout)
+            .cloned();
+        if session.base().checkout(self.checkout) != started_from.as_ref() {
+            // Another process published this checkout since; serve its
+            // publication, as a build that stands down does.
+            drop(session);
+            self.adopt_newest()?;
+            return Ok(None);
+        }
+        let mut pending = session.create_segment().map_err(DataError::store)?;
+        text_units
+            .write(pending.writer())
+            .map_err(DataError::store)?;
+        let fragments = write_sections(pending.writer(), &inputs, &resolved, &records, false)
+            .map_err(DataError::Store)?;
+        let segment = session.finish_segment(pending).map_err(DataError::store)?;
+        let per_path = inputs
+            .state
+            .paths()
+            .iter()
+            .map(|record| {
+                let path = std::str::from_utf8(&record.path).ok();
+                if let Some(key) = path.and_then(|path| fragments.get(path)) {
+                    return Some(key.digest());
+                }
+                stored_fragments
+                    .get(record.path.as_slice())
+                    .filter(|(stored, _)| {
+                        stored.content == record.content && stored.language == record.language
+                    })
+                    .map(|(_, fragment)| *fragment)
+            })
+            .collect();
+        let state = inputs
+            .state
+            .clone()
+            .with_fragments(per_path)
+            .map_err(DataError::store)?;
+        let written = session
+            .write_checkout_state(self.checkout, &state)
+            .map_err(DataError::store)?;
+        session
+            .publish(&Publication {
+                add_segments: vec![segment],
+                states: vec![written],
+                ..Publication::default()
+            })
+            .map_err(DataError::store)?;
+        // The state this one replaces, and older manifests, go once no
+        // reader holds them.
+        let _ = session.reclaim();
+        drop(session);
+        let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        let report = DeltaReport {
+            paths: changes.len(),
+            fragments: fragments.len(),
+            records: records.len(),
+            text_units: text_unit_count,
+            segments: snapshot.manifest().segments().len(),
+            ms: 0.0,
+        };
+        self.serve_new(snapshot, covered)?;
+        Ok(Some(DeltaReport {
+            ms: elapsed_ms(started),
+            ..report
+        }))
+    }
+
+    /// How many paths changed since the publication.
+    #[must_use]
+    pub fn changed_paths(&self) -> usize {
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .changes
+            .len()
     }
 
     /// The incremental state for `published`: every stored resolution, and
@@ -1896,10 +2121,10 @@ fn next_inputs(
         parses.remove(name);
         configs.remove(path);
         match changes.get(path).map(|change| &change.extracted) {
-            Some(Extracted::Parse(key, parse)) => {
+            Some(Extracted::Parse(key, parse, _)) => {
                 parses.insert(name.to_string(), (key.clone(), Arc::clone(parse)));
             }
-            Some(Extracted::Config(source)) => {
+            Some(Extracted::Config(source, _)) => {
                 configs.insert(path.clone(), Arc::clone(source));
             }
             Some(Extracted::Nothing) | None => {}
@@ -1973,11 +2198,18 @@ fn extract_changed(record: &PathRecord, bytes: &[u8]) -> (String, Extracted) {
         return (language, Extracted::Nothing);
     };
     let content = match &extracted.data {
-        RecordBody::Config { source } => Extracted::Config(Arc::from(source.as_slice())),
+        RecordBody::Config { source } => {
+            let source = Arc::from(source.as_slice());
+            Extracted::Config(source, Arc::new(extracted))
+        }
         RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
             Ok(CallgraphBlob::Parse(parse)) => {
                 let key = RecordKey::new(record.content, &language, EXTRACTOR_VERSION);
-                Extracted::Parse(key.digest().to_string(), Arc::new(parse))
+                Extracted::Parse(
+                    key.digest().to_string(),
+                    Arc::new(parse),
+                    Arc::new(extracted),
+                )
             }
             _ => Extracted::Nothing,
         },
@@ -2698,6 +2930,60 @@ pub fn other() { callee(); }
         let theirs = callers_of(&cold.view().unwrap(), "other/lib.ts", "run");
         assert!(theirs.contains("main"), "{theirs}");
         assert_eq!(ours, theirs);
+    }
+
+    /// Publishing the changes since a publication: the checkout then
+    /// serves the new one with nothing laid over it, answers as a cold
+    /// build does, and a restart starts from it with nothing to redo.
+    #[test]
+    fn published_changes_serve_as_a_cold_build_and_survive_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout =
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        write(
+            root.path(),
+            "src/util.rs",
+            "pub fn callee() {}\npub fn other() { callee(); }\n",
+        );
+        write(root.path(), "notes.txt", "zzneedle\n");
+        checkout
+            .record_paths(&[b"src/util.rs".to_vec(), b"notes.txt".to_vec()])
+            .unwrap();
+        // The call graph has not resolved the changes yet.
+        assert!(checkout.publish_changes().unwrap().is_none());
+        checkout.refresh_callgraph().unwrap();
+        let report = checkout.publish_changes().unwrap().expect("published");
+        assert_eq!(report.paths, 2);
+        assert_eq!(report.segments, 2, "{report:?}");
+        assert!(report.fragments >= 1, "{report:?}");
+        assert_eq!(checkout.changed_paths(), 0);
+        let view = checkout.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        let ours = callers_of(&view, "src/util.rs", "callee");
+        assert!(ours.contains("other"), "{ours}");
+        assert!(ours.contains("caller"), "{ours}");
+        assert_eq!(candidates_for(&view, "zzneedle"), ["notes.txt"]);
+        let cold_store = tempfile::tempdir().unwrap();
+        let cold =
+            Checkout::bind(Arc::clone(&layer), cold_store.path(), family(), root.path()).unwrap();
+        cold.build().unwrap();
+        assert_eq!(
+            ours,
+            callers_of(&cold.view().unwrap(), "src/util.rs", "callee")
+        );
+        drop(view);
+        drop(checkout);
+        // A restart finds nothing changed since the publication.
+        let restarted = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        assert_eq!(restarted.changed_paths(), 0);
+        let view = restarted.view().unwrap();
+        assert_eq!(view.status().callgraph, PlaneStatus::Ready);
+        assert_eq!(ours, callers_of(&view, "src/util.rs", "callee"));
+        assert_eq!(candidates_for(&view, "zzneedle"), ["notes.txt"]);
     }
 
     #[test]

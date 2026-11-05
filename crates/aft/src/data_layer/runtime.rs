@@ -128,6 +128,25 @@ pub(crate) enum Fresh {
     Failed(String),
 }
 
+/// When the changes since a publication are published on their own, after
+/// a refresh resolves them: at once past this many changed paths, and
+/// otherwise when the checkout goes quiet.
+const PUBLISH_AT: usize = 64;
+
+/// A family store holding more segments than this is built again whole,
+/// which writes everything a checkout reads into one segment and retires
+/// the rest; each publication of changes adds one.
+const COMPACT_AT: usize = 8;
+
+/// Whether a refresh publishes the changes it resolved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Publish {
+    /// Only past [`PUBLISH_AT`] changed paths.
+    WhenMany,
+    /// Whenever any path changed: the checkout went quiet.
+    Always,
+}
+
 /// One root's checkout in a running AFT.
 pub(crate) struct DataCheckout {
     checkout: Arc<Checkout>,
@@ -191,7 +210,7 @@ impl DataCheckout {
             let building = Arc::clone(&building);
             Arc::new(QuietTimer::new(QUIET, move || {
                 if let Some(checkout) = checkout.upgrade() {
-                    start_refresh(&checkout, &refreshing, &building);
+                    start_refresh(&checkout, &refreshing, &building, Publish::Always);
                 }
             }))
         };
@@ -214,7 +233,12 @@ impl DataCheckout {
             start_build(&handle.checkout, &handle.building, &handle.refreshing);
         } else {
             // A bind may have recorded what changed while nothing watched.
-            start_refresh(&handle.checkout, &handle.refreshing, &handle.building);
+            start_refresh(
+                &handle.checkout,
+                &handle.refreshing,
+                &handle.building,
+                Publish::WhenMany,
+            );
         }
         Ok(handle)
     }
@@ -248,7 +272,12 @@ impl DataCheckout {
         if self.checkout.needs_build() {
             start_build(&self.checkout, &self.building, &self.refreshing);
         } else {
-            start_refresh(&self.checkout, &self.refreshing, &self.building);
+            start_refresh(
+                &self.checkout,
+                &self.refreshing,
+                &self.building,
+                Publish::WhenMany,
+            );
         }
     }
 
@@ -362,8 +391,10 @@ fn start_refresh(
     checkout: &Arc<Checkout>,
     refreshing: &Arc<AtomicBool>,
     building: &Arc<AtomicBool>,
+    publish: Publish,
 ) {
-    if !pending(checkout) || refreshing.swap(true, Ordering::AcqRel) {
+    let unpublished = publish == Publish::Always && checkout.changed_paths() > 0;
+    if !(pending(checkout) || unpublished) || refreshing.swap(true, Ordering::AcqRel) {
         return;
     }
     let checkout = Arc::clone(checkout);
@@ -383,6 +414,8 @@ fn start_refresh(
                         "data layer call-graph refresh failed for {}: {error}",
                         checkout.root().display()
                     );
+                } else {
+                    maybe_publish(&checkout, &building, &running, publish);
                 }
                 drop(flag.take());
                 match result {
@@ -403,6 +436,42 @@ fn start_refresh(
         });
     if spawned.is_err() {
         refreshing.store(false, Ordering::Release);
+    }
+}
+
+/// Publishes the changes a refresh resolved, when `publish` asks for it,
+/// and builds the store again whole once publications of changes have
+/// piled up.
+fn maybe_publish(
+    checkout: &Arc<Checkout>,
+    building: &Arc<AtomicBool>,
+    refreshing: &Arc<AtomicBool>,
+    publish: Publish,
+) {
+    let changed = checkout.changed_paths();
+    if changed == 0 || (publish == Publish::WhenMany && changed < PUBLISH_AT) {
+        return;
+    }
+    match checkout.publish_changes() {
+        Ok(Some(report)) => {
+            crate::slog_info!(
+                "data layer published changes for {}: {} paths, {} fragments, {} text units, {} segments, {:.0} ms",
+                checkout.root().display(),
+                report.paths,
+                report.fragments,
+                report.text_units,
+                report.segments,
+                report.ms
+            );
+            if report.segments > COMPACT_AT {
+                start_build(checkout, building, refreshing);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => crate::slog_warn!(
+            "data layer could not publish changes for {}: {error}",
+            checkout.root().display()
+        ),
     }
 }
 
@@ -449,7 +518,7 @@ fn start_build(checkout: &Arc<Checkout>, building: &Arc<AtomicBool>, refreshing:
                         drop(_flag);
                         // Changes recorded while the build ran stay laid over
                         // its publication and wait for the call graph.
-                        start_refresh(&checkout, &refreshing, &running);
+                        start_refresh(&checkout, &refreshing, &running, Publish::WhenMany);
                         return;
                     }
                     Err(error) => {

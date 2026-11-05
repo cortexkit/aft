@@ -301,6 +301,26 @@ struct StaleAnswers {
 }
 
 impl LiveCheckout {
+    /// Files resolved now whose terms stored in the publication this engine
+    /// started from no longer apply: re-resolved, bound again, or whose
+    /// recorded reads now consult other paths. Publishing what changed
+    /// writes their fragments again.
+    pub(crate) fn refiled(&self) -> BTreeSet<String> {
+        let reverse = &self.reverse;
+        [
+            &reverse.binding,
+            &reverse.resolution,
+            &reverse.dispatch,
+            &reverse.sites,
+            &reverse.subjects,
+        ]
+        .into_iter()
+        .flat_map(|readers| readers.replaced.iter())
+        .filter(|file| self.resolved.contains_key(file))
+        .cloned()
+        .collect()
+    }
+
     /// Checks that `stored`, the publication this engine started from,
     /// files every resolution under each input key the engine's own reverse
     /// index holds, and lists every key whose readers the stored terms miss.

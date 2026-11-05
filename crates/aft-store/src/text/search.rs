@@ -334,6 +334,12 @@ impl TextOverlay {
         self.entries.remove(path);
     }
 
+    /// The change recorded for `path`, if any.
+    #[must_use]
+    pub fn get(&self, path: &[u8]) -> Option<&OverlayEntry> {
+        self.entries.get(path)
+    }
+
     /// The changed paths, in byte order.
     pub fn paths(&self) -> impl Iterator<Item = &[u8]> {
         self.entries.keys().map(Vec::as_slice)

@@ -184,23 +184,27 @@ pub(crate) fn write_segment(
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut writer = SegmentWriter::create(path, meta).map_err(|error| error.to_string())?;
-    let keys = write_sections(&mut writer, inputs, resolved, records)?;
+    let keys = write_sections(&mut writer, inputs, resolved, records, true)?;
     writer.finish().map_err(|error| error.to_string())?;
     Ok(keys)
 }
 
 /// Writes the content records and fragments of `resolved`'s files into
 /// `writer`, as [`write_segment`] does, for a segment that may hold other
-/// planes' sections too. Returns each file's fragment key.
+/// planes' sections too. Returns each file's fragment key. With
+/// `all_records`, every file's content record must be in `records`;
+/// without, a file whose record is missing keeps the one already stored.
 ///
 /// # Errors
 ///
-/// When a file has no content record, or the sections cannot be written.
+/// When a file has no content record and `all_records` asks for one, or
+/// the sections cannot be written.
 pub(crate) fn write_sections(
     writer: &mut SegmentWriter,
     inputs: &CheckoutInputs,
     resolved: &BTreeMap<String, FileResolution>,
     records: &HashMap<String, (RecordKey, Arc<ContentRecord>)>,
+    all_records: bool,
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut content = ContentSectionsBuilder::new();
     // Configuration files' records too, so a reader of the segment can give
@@ -224,10 +228,14 @@ pub(crate) fn write_sections(
     let mut subjects = HashMap::new();
     for (file, resolution) in resolved {
         let (key, parse) = &inputs.parses[file];
-        let (record_key, record) = records
-            .get(key)
-            .ok_or_else(|| format!("no content record for {file}"))?;
-        content.add(*record_key, record);
+        // A segment holding only what changed since a publication writes
+        // the records of changed contents; an unchanged one stays where the
+        // publication stored it.
+        match records.get(key) {
+            Some((record_key, record)) => content.add(*record_key, record),
+            None if all_records => return Err(format!("no content record for {file}")),
+            None => {}
+        }
         let slice = FileSlice::build(file, key, parse, resolution);
         let mut terms = slice_terms(&slice);
         terms.extend(input_terms(resolution, &facts, &mut subjects));
