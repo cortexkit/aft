@@ -3411,9 +3411,25 @@ impl InspectManager {
                 self.data_layer_dead_code
                     .snapshot(&snapshot.project_root)
                     .or_else(|| {
-                        crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                            .ok()
-                            .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+                        let started = Instant::now();
+                        let projected =
+                            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                                .ok()
+                                .map(|(_, snapshot, _, _)| Arc::new(snapshot))?;
+                        crate::slog_info!(
+                            "perf tier2_callgraph_snapshot: source=pinned_view files={} exports={} edges={} entry_points={} ms={}",
+                            projected.files.len(),
+                            projected.exported_symbols.len(),
+                            projected.outbound_calls.len()
+                                + projected
+                                    .go_initializers
+                                    .iter()
+                                    .map(|group| group.edge_count())
+                                    .sum::<usize>(),
+                            projected.entry_points.len(),
+                            started.elapsed().as_millis()
+                        );
+                        Some(projected)
                     })
             });
         let mut config = (*snapshot.config).clone();

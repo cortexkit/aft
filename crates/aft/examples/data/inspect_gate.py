@@ -165,8 +165,8 @@ class Process:
         seconds, while an analysis in the reply was still running."""
         request = dict(body, id=request_id)
         started_all = time.monotonic()
-        deadline = started_all + TIMEOUT
         settle_deadline = started_all + SETTLE
+        deadline = settle_deadline + TIMEOUT
         attempts = 0
         while True:
             attempts += 1
@@ -310,6 +310,16 @@ def data_layer_checks(log, marks):
     }
 
 
+def costs(log):
+    """Each dead-code snapshot's build time in one run's log, by where it
+    came from: the data layer, today's database (`callgraph_store`), today's
+    view (`view`), or the store a views request pinned (`pinned_view`)."""
+    found = {}
+    for source, ms in re.findall(r'perf tier2_callgraph_snapshot: source=(\w+) .* ms=(\d+)', log):
+        found.setdefault(source, []).append(int(ms))
+    return found
+
+
 def gate_case(binary, name, source, work, modes, control):
     results = []
     root = (work / 'roots' / name).resolve()
@@ -339,6 +349,7 @@ def gate_case(binary, name, source, work, modes, control):
         result = {'case': name, 'mode': mode, 'replies_compared': len(ids), 'differing': differing,
                   'seconds': {label: run_[4] for label, run_ in runs.items()},
                   'timings': {label: run_[1] for label, run_ in runs.items()},
+                  'costs': {label: costs(run_[3]) for label, run_ in runs.items()},
                   'data_layer': data_layer_checks(runs['data_layer'][3], runs['data_layer'][2])}
         if control:
             result['control_differing'] = compare(name, runs['today'][0], runs['control'][0])[1]
@@ -358,6 +369,7 @@ def gate_case(binary, name, source, work, modes, control):
 
 
 def main():
+    global SETTLE
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('binary', type=pathlib.Path)
     parser.add_argument('out', type=pathlib.Path)
@@ -366,7 +378,10 @@ def main():
     parser.add_argument('--modes', default='legacy,views')
     parser.add_argument('--control', action='store_true')
     parser.add_argument('--only', help='comma-separated corpus project names')
+    parser.add_argument('--settle', type=int, default=SETTLE,
+                        help='seconds a measured request is resent while an analysis is still running')
     args = parser.parse_args()
+    SETTLE = args.settle
     binary = args.binary.resolve()
     work = args.out.resolve()
     work.mkdir(parents=True, exist_ok=True)
