@@ -562,18 +562,45 @@ pub struct TaskIdentity {
     pub session: String,
 }
 
+thread_local! {
+    static CURRENT_TASK_IDENTITY: std::cell::RefCell<Option<TaskIdentity>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct TaskIdentityScope(Option<TaskIdentity>);
+
+impl Drop for TaskIdentityScope {
+    fn drop(&mut self) {
+        CURRENT_TASK_IDENTITY.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// Keep task delivery scoped during ordinary tool calls and their response
+/// finalizers, which do not need to install shell-spawn authority.
+pub(crate) fn task_identity_scope(identity: Option<TaskIdentity>) -> TaskIdentityScope {
+    TaskIdentityScope(CURRENT_TASK_IDENTITY.with(|slot| slot.replace(identity)))
+}
+
 impl TaskIdentity {
     pub(crate) fn current() -> Option<Self> {
-        match current_authenticated_principal() {
+        if let Some(identity) = CURRENT_TASK_IDENTITY.with(|slot| slot.borrow().clone()) {
+            return Some(identity);
+        }
+        Self::from_principal(&current_authenticated_principal())
+    }
+
+    pub(crate) fn from_principal(
+        principal: &crate::sandbox_spawn::AuthenticatedPrincipal,
+    ) -> Option<Self> {
+        match principal {
             crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
                 principal_id,
                 harness,
                 session_id,
                 ..
             } => Some(Self {
-                principal: principal_id,
-                harness,
-                session: session_id,
+                principal: principal_id.clone(),
+                harness: harness.clone(),
+                session: session_id.clone(),
             }),
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => None,
         }
@@ -1782,12 +1809,7 @@ mod spawn_reply_tests {
 // A root context is shared by routes from different harnesses. Determine a
 // command's owner from its route binding, not the last harness to configure the root.
 pub(crate) fn route_harness() -> Option<crate::harness::Harness> {
-    match current_authenticated_principal() {
-        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { harness, .. } => {
-            harness.parse().ok()
-        }
-        _ => None,
-    }
+    TaskIdentity::current()?.harness.parse().ok()
 }
 
 pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {

@@ -1968,7 +1968,10 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
     session_id
         .map(|session_id| {
             completion.session_id == session_id
-                && super::TaskIdentity::allows_current(completion.launching_identity.as_ref())
+                && completion
+                    .launching_identity
+                    .as_ref()
+                    .is_none_or(|owner| super::TaskIdentity::current().as_ref() == Some(owner))
         })
         .unwrap_or(true)
 }
@@ -4206,9 +4209,7 @@ impl BgTaskRegistry {
             .filter(|(harness, row)| {
                 self.task_launching_identity_record(session_id, &row.task_id, Some(harness))
                     .map_or(identity.is_none(), |owner| {
-                        owner
-                            .as_ref()
-                            .is_none_or(|owner| identity.is_none_or(|caller| caller == owner))
+                        owner.as_ref().is_none_or(|owner| Some(owner) == identity)
                     })
             })
             .filter_map(|(harness, row)| {
@@ -10790,6 +10791,14 @@ impl BgTaskRegistry {
                 }
                 continue;
             };
+            if task
+                .launching_identity
+                .as_ref()
+                .is_some_and(|owner| super::TaskIdentity::current().as_ref() != Some(owner))
+            {
+                self.index_cancelled_call_here(session_id, &task_id);
+                continue;
+            }
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
                 continue;
@@ -26834,6 +26843,15 @@ mod tests {
         }
     }
 
+    fn with_task_caller<T>(
+        caller: crate::sandbox_spawn::AuthenticatedPrincipal,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _identity =
+            super::super::task_identity_scope(super::super::TaskIdentity::from_principal(&caller));
+        run()
+    }
+
     fn assert_task_caller_isolation(principal: &str, harness: &str) {
         use crate::sandbox_spawn::with_authenticated_principal;
         let dir = tempfile::tempdir().unwrap();
@@ -26875,6 +26893,9 @@ mod tests {
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashPatternMatch(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         assert!(notices.iter().any(|frame| matches!(frame, PushFrame::BashLongRunning(frame) if frame.launching_identity.as_ref() == Some(&identity))));
         drop(notices);
+        assert!(registry
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
         with_authenticated_principal(owner.clone(), || {
             assert!(
                 !registry
@@ -26883,7 +26904,7 @@ mod tests {
                 "owner has a durable match before foreign calls"
             );
         });
-        with_authenticated_principal(other.clone(), || {
+        with_task_caller(other.clone(), || {
             assert_eq!(
                 registry.write_pty(&task_id, "session", b"input"),
                 Err("task_not_found".to_string())
@@ -26941,7 +26962,7 @@ mod tests {
                 .iter()
                 .find(|frame| frame.match_text == "ready")
                 .unwrap();
-            with_authenticated_principal(other.clone(), || {
+            with_task_caller(other.clone(), || {
                 assert!(registry
                     .ack_pattern_match_for_session(
                         "session",
@@ -26961,9 +26982,13 @@ mod tests {
         {
             let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
+            state.metadata.cancelled_call_unannounced = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
-        with_authenticated_principal(other.clone(), || {
+        registry.index_cancelled_call_here("session", &task_id);
+        assert!(registry.take_cancelled_call_notices("session").is_empty());
+        with_task_caller(other.clone(), || {
+            assert!(registry.take_cancelled_call_notices("session").is_empty());
             assert!(registry
                 .owned_running_task_ids(dir.path(), dir.path(), "session", None)
                 .unwrap()
@@ -26971,6 +26996,7 @@ mod tests {
                 .is_empty());
         });
         with_authenticated_principal(owner, || {
+            assert_eq!(registry.take_cancelled_call_notices("session").len(), 1);
             assert_eq!(
                 registry
                     .owned_running_task_ids(dir.path(), dir.path(), "session", None)
@@ -27006,7 +27032,7 @@ mod tests {
         assert!(read_task(&task.paths.json).unwrap().completion_delivered);
         registry.inner.tasks.lock().unwrap().remove(&task_id);
         delete_task_bundle(&task.paths).unwrap();
-        with_authenticated_principal(other, || {
+        with_task_caller(other, || {
             assert!(registry
                 .terminal_db_status_for_session("session", &task_id, dir.path())
                 .is_none());
@@ -27048,7 +27074,7 @@ mod tests {
         restarted.enqueue_completion_if_needed(&persisted, Some(&task.paths), true);
         assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, PushFrame::BashCompleted(frame) if frame.launching_identity == recorded_identity)));
         let other = task_caller(dir.path(), "direct", "opencode", 2);
-        with_authenticated_principal(other.clone(), || {
+        with_task_caller(other.clone(), || {
             assert!(restarted
                 .drain_completions_for_session(Some("session"))
                 .is_empty());
@@ -27092,7 +27118,7 @@ mod tests {
                 .observed_status(&task_id, "session", 1024)
                 .is_some());
         });
-        with_authenticated_principal(other, || {
+        with_task_caller(other, || {
             assert_eq!(
                 upgraded
                     .drain_completions_for_session(Some("session"))

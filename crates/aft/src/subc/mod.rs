@@ -10531,6 +10531,8 @@ impl PlainToolRun {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
             let _display = rich_ui::display::enter(ledger_key.as_ref());
+            let _task_identity =
+                crate::bash_background::task_identity_scope(Some(identity_for_run.task_identity()));
             let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
