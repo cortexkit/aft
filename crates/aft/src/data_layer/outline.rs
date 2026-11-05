@@ -1071,6 +1071,32 @@ pub fn separator() -> char {
             records_memory.estimated_bytes
         );
 
+        // Where the prewarm's time went, measured after it, so neither part
+        // warms a cache for it: reading and hashing the files, and reading
+        // their records.
+        let parsed_paths = view
+            .current_state()
+            .paths()
+            .iter()
+            .filter(|record| !record.language.is_empty() && record.language != "config")
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        for record in &parsed_paths {
+            if let Some(path) = absolute(&repo, &record.path) {
+                let _ = crate::parser::read_source(&path)
+                    .map(|source| ContentKey::of(source.as_bytes()));
+            }
+        }
+        let reads_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        for record in &parsed_paths {
+            let _ = view.outline_symbols(&record.path).unwrap();
+        }
+        let records_read_ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "prewarm parts, run again: file reads and hashes {reads_ms:.0} ms, record reads {records_read_ms:.0} ms"
+        );
+
         // Today: every file the search index lists with a parser language,
         // parsed and written to the disk symbol cache, then loaded into a
         // fresh cache as a restart's prewarm does.
