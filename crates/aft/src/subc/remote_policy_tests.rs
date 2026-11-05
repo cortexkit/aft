@@ -2423,14 +2423,14 @@ fn siblings_catalog_refuses_outside_checkout_and_dotdot_escape() {
     ctx.update_config(|config| config.restrict_to_project_root = false);
     let worker = identity(&root, "siblings-outside", 7, true);
     for sibling in [outside.clone(), root.join("..").join("unrelated-checkout")] {
-        let error = catalog(
-            json!({"preset":"worker", "params":{"siblings":[sibling]}}),
-            &worker,
-            &ctx,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "invalid_request");
-        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+        assert_siblings_refused(
+            catalog(
+                json!({"preset":"worker", "params":{"siblings":[sibling]}}),
+                &worker,
+                &ctx,
+            ),
+            &not_readable(&crate::access_policy::policy_path(&outside)),
+        );
         assert!(lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).is_none());
     }
 }
@@ -2447,14 +2447,15 @@ fn siblings_catalog_refuses_symlink_to_outside_checkout() {
     let ctx = context(root.path(), storage.path(), None);
     let worker = identity(root.path(), "siblings-symlink", 7, true);
     ctx.update_config(|config| config.restrict_to_project_root = false);
-    let error = catalog(
-        json!({"preset":"worker", "params":{"siblings":[link]}}),
-        &worker,
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(error.code, "invalid_request");
-    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    // The link's target is named, as the path that was refused.
+    assert_siblings_refused(
+        catalog(
+            json!({"preset":"worker", "params":{"siblings":[link]}}),
+            &worker,
+            &ctx,
+        ),
+        &not_readable(&crate::access_policy::policy_path(outside.path())),
+    );
 }
 
 #[test]
@@ -2466,14 +2467,14 @@ fn siblings_catalog_requires_checkout_root_and_saves_canonical_workdir() {
     std::fs::create_dir(&folder).unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let worker = identity(root.path(), "siblings-workdir", 7, true);
-    let error = catalog(
-        json!({"preset":"worker", "params":{"siblings":[folder]}}),
-        &worker,
-        &ctx,
-    )
-    .unwrap_err();
-    assert_eq!(error.code, "invalid_request");
-    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+    assert_siblings_refused(
+        catalog(
+            json!({"preset":"worker", "params":{"siblings":[folder]}}),
+            &worker,
+            &ctx,
+        ),
+        &not_checkout_root(&folder),
+    );
     catalog(
         json!({"preset":"worker", "params":{"siblings":[folder.join("..")]}}),
         &worker,
@@ -2523,8 +2524,10 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     let request =
         json!({"preset":"worker", "params":{"siblings":[outside.path().join("child/..")]}});
     for route in [&head, &worker] {
-        let error = catalog(request.clone(), route, &ctx).unwrap_err();
-        assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+        assert_siblings_refused(
+            catalog(request.clone(), route, &ctx),
+            &not_readable(&crate::access_policy::policy_path(outside.path())),
+        );
     }
     let granted_path = crate::access_policy::policy_path(outside.path());
     crate::db::access_grants::insert(
@@ -2631,10 +2634,30 @@ impl SiblingGrantFixture {
     }
 }
 
+/// The approved refusal for a sibling that is not absolute, does not resolve,
+/// or has no `.git` at its top, naming the path as the plan gave it. Spelled out
+/// here so a wording change cannot pass unnoticed.
+fn not_checkout_root(given: &Path) -> String {
+    format!(
+        "sibling {} is not the root of a git checkout; the command was not run",
+        given.display()
+    )
+}
+
+/// The approved refusal for a checkout root the session may not read, naming
+/// the resolved path.
+fn not_readable(resolved: &Path) -> String {
+    format!(
+        "this session's file tools may not read sibling {}; grant read access to it in allow_paths; the command was not run",
+        resolved.display()
+    )
+}
+
 #[track_caller]
-fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>) {
+fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>, message: &str) {
     let error = result.unwrap_err();
     assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, message);
     assert_eq!(error.detail.unwrap()["field"], "params.siblings");
 }
 
@@ -2644,6 +2667,7 @@ fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>) {
 /// grants do not cover or one that is not a checkout root.
 #[test]
 fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
+    use crate::access_policy::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-preflight-head");
     let (ctx, head) = (&fixture.ctx, &fixture.head);
     let commons = fixture.path("granted/commons");
@@ -2659,7 +2683,10 @@ fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
     };
     // The head's saved grant does not let this route's own file tools read
     // the sibling, so without the plan's allow_paths it is refused.
-    assert_siblings_refused(catalog(plan(json!([commons]), None), head, ctx));
+    assert_siblings_refused(
+        catalog(plan(json!([commons]), None), head, ctx),
+        &not_readable(&policy_path(&commons)),
+    );
     // A `sibling: true` entry reaches the catalog as the sibling plus a read
     // allow_paths entry for the same path.
     catalog(
@@ -2683,23 +2710,26 @@ fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
     .unwrap();
     let folder_grant = Some(json!([{"path":granted, "mode":"read"}]));
     // Covered, but not a checkout root.
-    assert_siblings_refused(catalog(
-        plan(json!([fixture.path("granted/plain")]), folder_grant.clone()),
-        head,
-        ctx,
-    ));
+    let plain = fixture.path("granted/plain");
+    assert_siblings_refused(
+        catalog(plan(json!([plain]), folder_grant.clone()), head, ctx),
+        &not_checkout_root(&plain),
+    );
     // A checkout root that no grant covers.
-    assert_siblings_refused(catalog(
-        plan(json!([fixture.path("other")]), folder_grant.clone()),
-        head,
-        ctx,
-    ));
+    let other = fixture.path("other");
+    assert_siblings_refused(
+        catalog(plan(json!([other]), folder_grant.clone()), head, ctx),
+        &not_readable(&policy_path(&other)),
+    );
     // A link inside the granted folder that resolves to a checkout outside it.
     #[cfg(unix)]
     {
         let link = granted.join("link");
-        std::os::unix::fs::symlink(fixture.path("other"), &link).unwrap();
-        assert_siblings_refused(catalog(plan(json!([link]), folder_grant), head, ctx));
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_siblings_refused(
+            catalog(plan(json!([link]), folder_grant), head, ctx),
+            &not_readable(&policy_path(&other)),
+        );
     }
     // The check saved nothing: the head holds only the grant it started with.
     assert_eq!(
@@ -2750,7 +2780,10 @@ fn siblings_worker_fetch_counts_only_saved_grants() {
         .unwrap(),
         1
     );
-    assert_siblings_refused(catalog(request, &worker, ctx));
+    assert_siblings_refused(
+        catalog(request, &worker, ctx),
+        &not_readable(&crate::access_policy::policy_path(&commons)),
+    );
 }
 
 #[cfg(unix)]
@@ -2827,7 +2860,10 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     assert_eq!(read.data["code"], crate::access_policy::ACCESS_ASK_REQUIRED);
     let asks_before_submit = crate::context::confinement::ask_calls();
     crate::bash_background::registry::remote::assert_siblings_submit_refused_before_connect(
-        &ctx, launch, &daemon,
+        &ctx,
+        launch,
+        &daemon,
+        &format!("runon refused: {}", not_readable(&path)),
     );
     assert_eq!(
         crate::context::confinement::ask_calls(),

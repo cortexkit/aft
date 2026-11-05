@@ -924,13 +924,15 @@ fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() 
             ..Default::default()
         },
     );
+    let given = child.join("..");
     let mut params = FrozenParams {
-        siblings: vec![child.join("..").to_str().unwrap().into()],
+        siblings: vec![given.to_str().unwrap().into()],
         ..Default::default()
     };
-    assert!(params
-        .validate_siblings(&ctx, "siblings", "session", &[])
-        .is_err());
+    assert_eq!(
+        params.validate_siblings(&ctx, "siblings", "session", &[]),
+        Err(not_checkout_root(&given))
+    );
     std::fs::write(root.path().join(".git"), "gitdir: /checkout/metadata\n").unwrap();
     params
         .validate_siblings(&ctx, "siblings", "session", &[])
@@ -939,6 +941,25 @@ fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() 
         params.siblings,
         [root.path().canonicalize().unwrap().to_str().unwrap()]
     );
+}
+
+/// The approved refusal for a sibling that is not absolute, does not resolve,
+/// or has no `.git` at its top, naming the path as the plan gave it. Spelled out
+/// here so a wording change cannot pass unnoticed.
+fn not_checkout_root(given: &std::path::Path) -> String {
+    format!(
+        "sibling {} is not the root of a git checkout; the command was not run",
+        given.display()
+    )
+}
+
+/// The approved refusal for a checkout root the session may not read, naming
+/// the resolved path.
+fn not_readable(resolved: &std::path::Path) -> String {
+    format!(
+        "this session's file tools may not read sibling {}; grant read access to it in allow_paths; the command was not run",
+        resolved.display()
+    )
 }
 
 /// A plan preflight may count grants its own allow_paths validated but did not
@@ -979,8 +1000,12 @@ fn siblings_read_gate_counts_preflight_grants_only_where_they_cover_a_checkout_r
             .validate_siblings(&ctx, "siblings", "session", grants)
             .map(|()| params.siblings)
     };
+    let folder_grant = [grant(&granted, AccessOperation::Read)];
     // The session's own file tools may not read outside its project.
-    assert_eq!(check(&commons, &[]), Err(SIBLINGS_REFUSAL));
+    assert_eq!(
+        check(&commons, &[]),
+        Err(not_readable(&policy_path(&commons)))
+    );
     let canonical = commons.canonicalize().unwrap().to_str().unwrap().to_owned();
     assert_eq!(
         check(&commons, &[grant(&commons, AccessOperation::Read)]).unwrap(),
@@ -994,21 +1019,30 @@ fn siblings_read_gate_counts_preflight_grants_only_where_they_cover_a_checkout_r
     // A grant that does not cover the checkout admits nothing.
     assert_eq!(
         check(&commons, &[grant(&other, AccessOperation::Read)]),
-        Err(SIBLINGS_REFUSAL)
+        Err(not_readable(&policy_path(&commons)))
     );
-    // A covered folder that is not a checkout root is still refused.
+    // A covered folder that is not a checkout root is still refused, as are
+    // a missing path and a relative one.
+    assert_eq!(check(&plain, &folder_grant), Err(not_checkout_root(&plain)));
+    let missing = granted.join("missing");
     assert_eq!(
-        check(&plain, &[grant(&granted, AccessOperation::Read)]),
-        Err(SIBLINGS_REFUSAL)
+        check(&missing, &folder_grant),
+        Err(not_checkout_root(&missing))
     );
-    // A link inside the granted folder resolves to a checkout outside it.
+    let relative = std::path::Path::new("granted/commons");
+    assert_eq!(
+        check(relative, &folder_grant),
+        Err(not_checkout_root(relative))
+    );
+    // A link inside the granted folder resolves to a checkout outside it,
+    // which is named as resolved.
     #[cfg(unix)]
     {
         let link = granted.join("link");
         std::os::unix::fs::symlink(&other, &link).unwrap();
         assert_eq!(
-            check(&link, &[grant(&granted, AccessOperation::Read)]),
-            Err(SIBLINGS_REFUSAL)
+            check(&link, &folder_grant),
+            Err(not_readable(&policy_path(&other)))
         );
     }
 }

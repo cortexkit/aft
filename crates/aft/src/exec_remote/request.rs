@@ -48,34 +48,52 @@ impl FrozenParams {
     /// grants cover is accepted too. Every other caller passes no grants, so the
     /// worker's own fetch and the check before a job is submitted rely only on
     /// the grants saved for the session.
+    ///
+    /// The read check runs first, so the `.git` marker is never looked up in a
+    /// folder the session may not read. Such a folder is refused as unreadable
+    /// whether or not it is a checkout root.
     pub(crate) fn validate_siblings(
         &mut self,
         ctx: &crate::context::AppContext,
         request_id: &str,
         session_id: &str,
         preflight_grants: &[crate::access_policy::AccessGrant],
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), String> {
         let siblings = self
             .siblings
             .iter()
             .map(|sibling| {
-                let path = Path::new(sibling);
-                if !path.is_absolute() {
-                    return Err(SIBLINGS_REFUSAL);
+                let given = Path::new(sibling);
+                let not_checkout_root = || sibling_refusal(SiblingRefusal::NotCheckoutRoot, given);
+                if !given.is_absolute() {
+                    return Err(not_checkout_root());
                 }
-                let path = crate::bounded_io::canonicalize(path).map_err(|_| SIBLINGS_REFUSAL)?;
+                let path =
+                    crate::bounded_io::canonicalize(given).map_err(|_| not_checkout_root())?;
                 let path =
                     match ctx.validate_read_path_without_approval(request_id, session_id, &path) {
                         Ok(path) => path,
                         Err(_) if preflight_covers(preflight_grants, &path) => path,
-                        Err(_) => return Err(SIBLINGS_REFUSAL),
+                        Err(_) => {
+                            // A confined session keeps link targets outside its
+                            // root private, so the refusal names the sibling as
+                            // the plan gave it.
+                            let shown = if crate::context::confinement::for_request(request_id) {
+                                given.to_path_buf()
+                            } else {
+                                crate::inspect::job::normalize_path(&path)
+                            };
+                            return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown));
+                        }
                     };
                 let marker = crate::bounded_io::metadata(&path.join(".git"))
-                    .map_err(|_| SIBLINGS_REFUSAL)?;
+                    .map_err(|_| not_checkout_root())?;
                 if !marker.is_dir() && !marker.is_file() {
-                    return Err(SIBLINGS_REFUSAL);
+                    return Err(not_checkout_root());
                 }
-                path.to_str().map(str::to_owned).ok_or(SIBLINGS_REFUSAL)
+                path.to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(not_checkout_root)
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.siblings = siblings;
@@ -137,9 +155,29 @@ fn preflight_covers(grants: &[crate::access_policy::AccessGrant], path: &Path) -
         .any(|grant| grant.covers(crate::access_policy::AccessOperation::Read, &path))
 }
 
-// Agent-visible refusal wording. Approved by Ufuk (2026-11-02).
-pub(crate) const SIBLINGS_REFUSAL: &str =
-    "siblings must be git checkout roots the session's file tools may read; the command was not run";
+/// Why a sibling was refused. Each reason has its own agent-visible sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SiblingRefusal {
+    /// The path is not absolute, does not resolve, or has no `.git` at its top.
+    /// Named as the plan gave it.
+    NotCheckoutRoot,
+    /// The session's file tools may not read the resolved checkout root, and
+    /// no preflight grant covers it. Named as resolved.
+    NotReadable,
+}
+
+// Agent-visible refusal wording. Approved by Ufuk (2026-11-05).
+pub(crate) fn sibling_refusal(reason: SiblingRefusal, path: &Path) -> String {
+    let path = path.display();
+    match reason {
+        SiblingRefusal::NotCheckoutRoot => {
+            format!("sibling {path} is not the root of a git checkout; the command was not run")
+        }
+        SiblingRefusal::NotReadable => format!(
+            "this session's file tools may not read sibling {path}; grant read access to it in allow_paths; the command was not run"
+        ),
+    }
+}
 
 /// Caller-side defense in depth, independent of ck-motor's authoritative
 /// allowlist. Only names are inspected; no allowlist is mirrored here.

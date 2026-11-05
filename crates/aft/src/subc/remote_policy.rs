@@ -282,10 +282,18 @@ fn catalog_inner(
                 once: vec![],
                 launch: access_grants::launch_key(identity, &preset),
             }));
+        let first = policy.siblings[0].clone();
         with_call_policy(ctx, identity, "tool.catalog", "read", json!({}), |_| {
             policy.validate_siblings(ctx, "tool.catalog", &identity.session, preflight_grants)
         })
-        .unwrap_or(Err(crate::exec_remote::SIBLINGS_REFUSAL))
+        // The session's call policy refused before any sibling could be
+        // resolved, so the first one is named as the plan gave it.
+        .unwrap_or_else(|_| {
+            Err(crate::exec_remote::sibling_refusal(
+                crate::exec_remote::SiblingRefusal::NotReadable,
+                std::path::Path::new(&first),
+            ))
+        })
         .map_err(|message| {
             cortexkit_role_tool_provider::errors::invalid_request("params.siblings", message)
         })?;
