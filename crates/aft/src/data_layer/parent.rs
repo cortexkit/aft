@@ -117,7 +117,7 @@ impl ChildCheckouts {
 ///
 /// # Errors
 ///
-/// Why the child's family store could not be opened.
+/// Why the child's checkout could not be bound.
 fn bind(
     slot: &Slot,
     child: &Path,
