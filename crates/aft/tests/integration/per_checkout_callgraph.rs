@@ -266,7 +266,7 @@ impl FirstLoadDriver for Driver {
         Producers {
             trigram: "test".into(),
             semantic: None,
-            callgraph: callgraph::PRODUCER.into(),
+            callgraph: aft::callgraph_extractor::PRODUCER.into(),
         }
     }
     fn head_tree(&self, _: &ViewAccess) -> Option<String> {

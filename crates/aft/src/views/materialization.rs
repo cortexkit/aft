@@ -292,7 +292,7 @@ pub(crate) fn apply_manifest_diff_from_blob_reader(
 fn check_job_cancelled() -> Result<()> {
     if crate::executor::current_job_cancelled() {
         Err(CallGraphStoreError::Unavailable(
-            super::first_load::SUPERSEDED_PUBLISH.into(),
+            crate::callgraph_store::join::SUPERSEDED_PUBLISH.into(),
         ))
     } else {
         Ok(())
@@ -1443,7 +1443,7 @@ fn materialize_reading(
     stats.dispatch_full = dispatch_work.full;
     {
         use std::sync::atomic::Ordering::Relaxed;
-        let work = &super::io::WORK;
+        let work = &crate::io_accounting::WORK;
         work.dispatch_blobs_decoded
             .fetch_add(dispatch_work.decoded_blobs as u64, Relaxed);
         work.dispatch_files_resolved
@@ -1463,7 +1463,7 @@ fn materialize_reading(
         rewritten_ref_files,
     ));
     profile.finish("dispatch");
-    let mut commit_stage = profile::StageTimer::new("commit");
+    let mut commit_stage = crate::stage_timer::StageTimer::new("commit");
     set_meta_ready(&transaction, true)?;
     crate::callgraph_store::insert_meta(&transaction)?;
     let manifest_fingerprint = fingerprint(manifest)?;

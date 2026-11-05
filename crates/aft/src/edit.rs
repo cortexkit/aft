@@ -2171,7 +2171,7 @@ fn write_format_validate_impl(
         .as_deref()
         .and_then(|source| validate_captured_syntax(path, source));
 
-    let _view_intent = crate::views::intent::record_paths([path]);
+    let _view_intent = crate::write_intent::record_paths([path]);
     // Step 1: Write
     let write_phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
     let mut write_warnings = atomic_write_source(path, content.as_bytes())

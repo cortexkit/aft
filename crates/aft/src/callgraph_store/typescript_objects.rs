@@ -220,8 +220,7 @@ impl<'a> ObjectDispatch<'a> {
     }
 
     pub(super) fn prepare(&mut self, references: &[NameMatchRef]) -> Result<()> {
-        let mut profile =
-            crate::views::materialization::profile::StageTimer::new("typescript_objects");
+        let mut profile = crate::stage_timer::StageTimer::new("typescript_objects");
         let callers = references
             .iter()
             .filter(|r| matches!(r.lang.as_str(), "typescript" | "tsx"))

@@ -1951,7 +1951,7 @@ fn retention_report_totals(
 ) -> Value {
     let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
     let mut trash = crate::storage_retention::TrashReport {
-        at_ms: crate::pins::now_ms(),
+        at_ms: crate::clock::now_ms(),
         ..Default::default()
     };
     for report in reports.values() {
@@ -4268,7 +4268,10 @@ fn build_health_report_with_snapshots(
         "process_io".to_string(),
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
-    metrics.insert("views_work".to_string(), crate::views::io::work_snapshot());
+    metrics.insert(
+        "views_work".to_string(),
+        crate::io_accounting::work_snapshot(),
+    );
     metrics.insert(
         "v2_family_sweeps".to_string(),
         json!(sweep_snapshot.details),
@@ -4998,7 +5001,7 @@ mod tests {
     #[test]
     fn disk_reserve_health_survives_ready_root_filtering_and_abbreviation() {
         let storage = tempfile::tempdir().unwrap();
-        let _low = crate::blob_store::v3::set_free_space_for_test(
+        let _low = crate::disk_floor::set_free_space_for_test(
             storage.path(),
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,
@@ -6101,7 +6104,7 @@ mod tests {
                 generation: Some("1-fixture".into()),
                 manifest: None,
                 head_fingerprint: String::new(),
-                head_metadata: crate::alias::GitHeadMetadata {
+                head_metadata: crate::git_head::GitHeadMetadata {
                     head_path: Default::default(),
                     head_mtime: None,
                     resolved_ref_path: None,
@@ -9159,7 +9162,7 @@ mod tests {
                         errors: vec!["example maintenance error".repeat(8)],
                         incomplete: vec!["retention deadline reached".into()],
                         trash: crate::storage_retention::TrashReport {
-                            at_ms: crate::pins::now_ms(),
+                            at_ms: crate::clock::now_ms(),
                             entries: 2,
                             bytes_estimate: 1_500_000_000,
                             oldest_age_ms: Some(7_200_000),

@@ -125,7 +125,7 @@ pub(crate) fn callgraph_paths_match_cached(
             note_checkout_verification_refusal!("verification_relative_path_invalid: path={path:?} relative={relative:?} error={error}");
             error
         })?;
-        let language = if super::assembly::is_resolution_input(key.as_bytes()) {
+        let language = if crate::callgraph_extractor::is_resolution_input(key.as_bytes()) {
             Some("config".to_string())
         } else {
             crate::parser::detect_language(path).map(|lang| format!("{lang:?}").to_lowercase())
@@ -178,7 +178,7 @@ pub(crate) fn callgraph_paths_match_cached(
             );
             error
         })?;
-        let actual_key = verification_key(&source, language, super::callgraph::PRODUCER);
+        let actual_key = verification_key(&source, language, crate::callgraph_extractor::PRODUCER);
         if actual_key != *expected_key {
             note_checkout_verification_refusal!("verification_source_key_mismatch: path={path:?} expected_key={expected_key} actual_key={actual_key} stats={stats:?} source_bytes={}", source.len());
             verified.remove(path);
@@ -508,7 +508,7 @@ pub(crate) fn callgraph_paths_match(
     root: &std::path::Path,
     paths: &[PathBuf],
 ) -> super::Result<bool> {
-    callgraph_paths_match_with_producer(manifest, root, paths, super::callgraph::PRODUCER)
+    callgraph_paths_match_with_producer(manifest, root, paths, crate::callgraph_extractor::PRODUCER)
 }
 
 /// Content verification for an opted-in ruled callgraph generation. Legacy
@@ -520,7 +520,12 @@ pub fn callgraph_paths_match_v2(
 ) -> super::Result<bool> {
     let projected = super::callgraph::project_manifest(manifest)
         .map_err(|error| super::ViewError::InvalidManifest(error.to_string()))?;
-    callgraph_paths_match_with_producer(&projected, root, paths, super::callgraph::PRODUCER)
+    callgraph_paths_match_with_producer(
+        &projected,
+        root,
+        paths,
+        crate::callgraph_extractor::PRODUCER,
+    )
 }
 
 fn callgraph_paths_match_with_producer(
@@ -534,7 +539,7 @@ fn callgraph_paths_match_with_producer(
             return Ok(false);
         };
         let key = super::RelPath::from_os_path(relative)?;
-        let language = if super::assembly::is_resolution_input(key.as_bytes()) {
+        let language = if crate::callgraph_extractor::is_resolution_input(key.as_bytes()) {
             Some("config".to_string())
         } else {
             crate::parser::detect_language(path)
@@ -706,7 +711,7 @@ mod producer_tests {
                 producers: super::super::manifest_v2::Producers {
                     trigram: "test".into(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 head_tree: None,
                 ignore_fingerprint: None,
@@ -751,7 +756,7 @@ mod producer_tests {
         for path in files {
             let relative =
                 super::super::RelPath::from_os_path(path.strip_prefix(&root).unwrap()).unwrap();
-            let language = if super::super::assembly::is_resolution_input(relative.as_bytes()) {
+            let language = if crate::callgraph_extractor::is_resolution_input(relative.as_bytes()) {
                 Some("config".to_string())
             } else {
                 crate::parser::detect_language(&path).map(|lang| format!("{lang:?}").to_lowercase())
@@ -762,7 +767,7 @@ mod producer_tests {
             let key = crate::blob_store::CallgraphKey::from_bytes(
                 &bytes,
                 language,
-                super::super::callgraph::PRODUCER,
+                crate::callgraph_extractor::PRODUCER,
             )
             .full_key()
             .to_hex();

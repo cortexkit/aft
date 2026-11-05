@@ -2177,7 +2177,7 @@ mod composition_tests {
             producers: Producers {
                 trigram: "tri".into(),
                 semantic: Some("sem".into()),
-                callgraph: super::super::callgraph::PRODUCER.into(),
+                callgraph: crate::callgraph_extractor::PRODUCER.into(),
             },
             head_tree: None,
             ignore_fingerprint: None,

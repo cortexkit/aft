@@ -391,7 +391,7 @@ fn trigram_inflight_reconcile_cannot_clear_intent() {
     write(root.path(), "a.txt", files[0].1);
     let delta = Arc::new(Mutex::new(LiveDelta::new(generation(files, "a"))));
     intent::register(root.path(), &delta);
-    let guard = intent::record_paths([root.path().join("a.txt").as_path()]);
+    let guard = aft::write_intent::record_paths([root.path().join("a.txt").as_path()]);
     live_delta::reconcile(&mut delta.lock().unwrap(), root.path(), &policy());
     assert!(delta
         .lock()
@@ -801,7 +801,7 @@ fn trigram_partial_io_error_keeps_written_bytes_visible() {
     let plane = index(segment(files), &delta.lock().unwrap(), files);
     let failed_write = || -> std::io::Result<()> {
         let path = directory.path().join("a.txt");
-        let _intent = intent::record_paths([path.as_path()]);
+        let _intent = aft::write_intent::record_paths([path.as_path()]);
         fs::write(path, b"partial needle\n")?;
         // A real error after the first write models a multi-file mutator's
         // partial failure, rather than pretending the operation was atomic.

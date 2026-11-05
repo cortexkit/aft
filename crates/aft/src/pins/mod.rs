@@ -7,12 +7,12 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::blob_store::v2::{FamilyKey, FamilyStore, TouchReport};
 use crate::blob_store::FullKey;
+use crate::clock::now_ms;
 use crate::fs_lock;
 use crate::root_cache::{self, ReadMarker};
 use crate::views::registry::ViewRegistration;
@@ -150,11 +150,11 @@ impl AssemblyPin {
         keys: Vec<String>,
     ) -> Result<Self, PinError> {
         let _barrier = crate::storage_retention::pin_barrier(view_dir)
-            .map_err(|e| crate::views::io::at("acquiring pin barrier in", view_dir, e))?;
+            .map_err(|e| crate::io_accounting::at("acquiring pin barrier in", view_dir, e))?;
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
         crate::private_storage::create_dir_all(&pins_dir)
-            .map_err(|e| crate::views::io::at("creating pin directory", &pins_dir, e))?;
+            .map_err(|e| crate::io_accounting::at("creating pin directory", &pins_dir, e))?;
 
         let keys_path = pins_dir.join(format!("{generation}.keys"));
         write_keys(&keys_path, keys)?;
@@ -311,13 +311,13 @@ pub fn protect_then_touch(
 /// family sweep aborts on such an error instead of skipping the pin.
 pub(crate) fn read_metadata_strict(path: &Path) -> Result<PinMetadata, PinError> {
     Ok(serde_json::from_slice(&fs::read(path).map_err(|e| {
-        crate::views::io::at("reading pin metadata", path, e)
+        crate::io_accounting::at("reading pin metadata", path, e)
     })?)?)
 }
 
 pub(crate) fn read_keys(path: &Path) -> Result<Vec<[u8; 32]>, PinError> {
-    let contents =
-        fs::read_to_string(path).map_err(|e| crate::views::io::at("reading pin keys", path, e))?;
+    let contents = fs::read_to_string(path)
+        .map_err(|e| crate::io_accounting::at("reading pin keys", path, e))?;
     contents.lines().map(parse_hex_key).collect()
 }
 
@@ -325,13 +325,6 @@ pub(crate) fn owner_is_live(owner: &PinOwner) -> bool {
     root_cache::process_start_time_ms(owner.pid)
         .map(|actual| actual == owner.start_time)
         .unwrap_or_else(|| crate::fs_lock::process_alive(owner.pid))
-}
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn validate_generation(generation: &str) -> Result<(), PinError> {
@@ -350,7 +343,7 @@ fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.dedup();
     let file = create_private(path)?;
     write_key_lines(file, encoded.iter().map(String::as_str))
-        .map_err(|e| crate::views::io::at("writing pin keys", path, e))?;
+        .map_err(|e| crate::io_accounting::at("writing pin keys", path, e))?;
     Ok(())
 }
 
@@ -423,14 +416,14 @@ fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {
     let result = (|| {
         let mut file = create_private(&temporary)?;
         file.write_all(&serde_json::to_vec(metadata)?)
-            .map_err(|e| crate::views::io::at("writing pin metadata", &temporary, e))?;
+            .map_err(|e| crate::io_accounting::at("writing pin metadata", &temporary, e))?;
         file.write_all(b"\n")
-            .map_err(|e| crate::views::io::at("writing pin metadata", &temporary, e))?;
+            .map_err(|e| crate::io_accounting::at("writing pin metadata", &temporary, e))?;
         crate::durability::sync_file(&file, path)
-            .map_err(|e| crate::views::io::at("syncing pin metadata", &temporary, e))?;
+            .map_err(|e| crate::io_accounting::at("syncing pin metadata", &temporary, e))?;
         drop(file);
         fs_lock::rename_over(&temporary, path).map_err(|e| {
-            crate::views::io::at(
+            crate::io_accounting::at(
                 &format!("renaming pin metadata {} to", temporary.display()),
                 path,
                 e,
@@ -451,7 +444,7 @@ fn create_private(path: &Path) -> io::Result<File> {
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|e| crate::views::io::at("creating pin file", path, e))
+        .map_err(|e| crate::io_accounting::at("creating pin file", path, e))
 }
 
 fn parse_hex_key(value: &str) -> Result<[u8; 32], PinError> {

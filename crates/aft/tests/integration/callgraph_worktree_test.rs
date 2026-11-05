@@ -375,7 +375,7 @@ fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay
     let key = aft::blob_store::CallgraphKey::from_bytes(
         worker_source.as_bytes(),
         "typescript",
-        aft::views::callgraph::PRODUCER,
+        aft::callgraph_extractor::PRODUCER,
     )
     .full_key();
     // With views on, the worktree's own content lands in the family's v3

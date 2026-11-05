@@ -71,7 +71,7 @@ fn read_open_source(
     // Check the bytes from this handle, including undecodable and oversized
     // sources, before they can contribute rows to a cold generation.
     verify(&bytes)?;
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_read_bytes
         .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
     let after = SourceStat::of_file(&file)?;

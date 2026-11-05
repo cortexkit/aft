@@ -2895,7 +2895,7 @@ pub(crate) struct ViewRuntimeSnapshot {
     pub(crate) generation: Option<String>,
     pub(crate) manifest: Option<Manifest>,
     pub(crate) head_fingerprint: String,
-    pub(crate) head_metadata: crate::alias::GitHeadMetadata,
+    pub(crate) head_metadata: crate::git_head::GitHeadMetadata,
     pub(crate) pending_paths: BTreeSet<Vec<u8>>,
     pub(crate) pending_inputs: BTreeMap<Vec<u8>, crate::views::assembly::PendingInput>,
 }
@@ -5200,7 +5200,7 @@ impl crate::views::first_load::PublishFence for CallgraphPublicationFence {
     ) -> Result<(), crate::views::contracts::PlaneError> {
         let refused = || crate::views::contracts::PlaneError {
             plane: Some(crate::blob_store::v2::FamilyPlane::Callgraph),
-            reason: crate::views::first_load::SUPERSEDED_PUBLISH.into(),
+            reason: crate::callgraph_store::join::SUPERSEDED_PUBLISH.into(),
         };
         loop {
             if crate::executor::current_job_cancelled() {
@@ -8244,7 +8244,7 @@ impl AppContext {
         project_root: &Path,
         requested_path: &str,
         scan_root_is_protected: impl Fn(&Path) -> bool,
-    ) -> Result<PathBuf, crate::readonly_artifacts::GitRootResolutionError> {
+    ) -> Result<PathBuf, crate::git_root_resolution::GitRootResolutionError> {
         let raw_path = Path::new(requested_path);
         let canonical_requested = if raw_path.is_absolute() {
             std::fs::canonicalize(raw_path).ok()
@@ -8261,7 +8261,7 @@ impl AppContext {
             return Ok(root);
         }
 
-        let root = crate::readonly_artifacts::resolve_git_root_from_user_path(
+        let root = crate::git_root_resolution::resolve_git_root_from_user_path(
             project_root,
             requested_path,
             scan_root_is_protected,
@@ -9192,7 +9192,7 @@ impl AppContext {
                 &family,
                 &root,
                 config.idle.checkout_hours,
-                crate::pins::now_ms(),
+                crate::clock::now_ms(),
             ) {
                 crate::slog_warn!("views checkout activity: {error}");
             }
@@ -10583,9 +10583,10 @@ impl AppContext {
         let refreshed = (|| {
             let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
             let fingerprint = crate::views::assembly::head_tree_fingerprint(&head);
+            // Worded as an alias error, like the head-tree read above.
             let metadata =
-                crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
-                    .map_err(|error| error.to_string())?;
+                crate::git_head::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
+                    .map_err(|error| crate::alias::AliasError::from(error).to_string())?;
             Ok::<_, String>((fingerprint, metadata))
         })();
         let mut runtime = self
@@ -10680,7 +10681,7 @@ impl AppContext {
     ) -> Result<PreparedViewUpdate, String> {
         // store_live_semantic_blobs copies semantic-index payloads into databases
         // shared by this repository's worktrees before checkout assembly starts.
-        let store_writes = crate::views::write_accounting::Publication::default();
+        let store_writes = crate::db::write_accounting::Publication::default();
         let _store_writes = store_writes.enter();
         #[cfg(test)]
         {
@@ -10707,9 +10708,10 @@ impl AppContext {
         let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
         let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
         crate::views::cache_head_fingerprint(root.clone(), desired_head.clone());
+        // Worded as an alias error, like the head-tree read above.
         let head_metadata =
-            crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
-                .map_err(|error| error.to_string())?;
+            crate::git_head::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
+                .map_err(|error| crate::alias::AliasError::from(error).to_string())?;
         // With a per-checkout semantic view, the content-addressed view this
         // function publishes (used for views-on callgraph reads) carries no
         // semantic plane: its vectors came from the legacy semantic index,
@@ -18664,7 +18666,7 @@ mod core_regressions {
                 generation: Some("1-fixture".to_owned()),
                 manifest: None,
                 head_fingerprint: String::new(),
-                head_metadata: crate::alias::GitHeadMetadata {
+                head_metadata: crate::git_head::GitHeadMetadata {
                     head_path: PathBuf::new(),
                     head_mtime: None,
                     resolved_ref_path: None,
@@ -20536,10 +20538,10 @@ mod callgraph_store_for_ops_tests {
             .unwrap();
         let held_read_wall = held_read_started.elapsed();
         let io_before = std::fs::read_to_string("/proc/self/io").unwrap();
-        let source_bytes_before = crate::views::io::WORK
+        let source_bytes_before = crate::io_accounting::WORK
             .content_read_bytes
             .load(Ordering::Relaxed);
-        let hash_bytes_before = crate::views::io::WORK
+        let hash_bytes_before = crate::io_accounting::WORK
             .source_hash_bytes
             .load(Ordering::Relaxed);
         let scan_started = Instant::now();
@@ -20565,11 +20567,11 @@ mod callgraph_store_for_ops_tests {
             .finished_at_for_test()
             .duration_since(scan_started);
         let io_after = std::fs::read_to_string("/proc/self/io").unwrap();
-        let source_bytes = crate::views::io::WORK
+        let source_bytes = crate::io_accounting::WORK
             .content_read_bytes
             .load(Ordering::Relaxed)
             - source_bytes_before;
-        let hash_bytes = crate::views::io::WORK
+        let hash_bytes = crate::io_accounting::WORK
             .source_hash_bytes
             .load(Ordering::Relaxed)
             - hash_bytes_before;
@@ -22129,7 +22131,7 @@ mod callgraph_store_for_ops_tests {
                     generation: None,
                     manifest: None,
                     head_fingerprint: String::new(),
-                    head_metadata: crate::alias::capture_git_head_metadata(&root, None).unwrap(),
+                    head_metadata: crate::git_head::capture_git_head_metadata(&root, None).unwrap(),
                     pending_paths: BTreeSet::from([b"lib.rs".to_vec()]),
                     pending_inputs: BTreeMap::new(),
                 },
@@ -22234,7 +22236,7 @@ mod callgraph_store_for_ops_tests {
         let key = crate::blob_store::CallgraphKey::from_bytes(
             &source,
             "rust",
-            crate::views::callgraph::PRODUCER,
+            crate::callgraph_extractor::PRODUCER,
         )
         .full_key();
         // Normal checkout publication may put its own immutable blobs. Keep

@@ -121,7 +121,7 @@ fn fixture_files(root: &Path) -> Vec<PathBuf> {
             } else if entry.file_type().unwrap().is_file() {
                 let relative = relative_path(root, &path);
                 if crate::parser::detect_language(&path).is_some()
-                    || crate::views::assembly::is_resolution_input(relative.as_bytes())
+                    || crate::callgraph_extractor::is_resolution_input(relative.as_bytes())
                 {
                     files.push(path);
                 }
@@ -257,16 +257,16 @@ fn try_view_store_custom(
         if !crate::views::callgraph::applies_to_relative(relative.as_bytes()) {
             continue;
         }
-        let resolution_input = crate::views::assembly::is_resolution_input(relative.as_bytes());
+        let resolution_input = crate::callgraph_extractor::is_resolution_input(relative.as_bytes());
         let mut blob = if resolution_input {
             join::CallgraphBlob::config(
                 source.as_bytes().to_vec(),
-                crate::views::callgraph::PRODUCER,
+                crate::callgraph_extractor::PRODUCER,
             )
         } else {
             let language =
                 lang_label(crate::parser::detect_language_from_source(file, &source).unwrap());
-            join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
+            join::CallgraphBlob::extract(&source, language, crate::callgraph_extractor::PRODUCER)
                 .unwrap()
         };
         mutate(&relative, &mut blob);

@@ -788,7 +788,7 @@ fn access_policy_cached_plain_scan_root_rechecks_protection() {
     assert!(
         matches!(
             result,
-            Err(crate::readonly_artifacts::GitRootResolutionError::ProtectedScanRoot)
+            Err(crate::git_root_resolution::GitRootResolutionError::ProtectedScanRoot)
         ),
         "{result:?}"
     );

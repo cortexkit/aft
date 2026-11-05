@@ -609,7 +609,7 @@ fn s4_one_node_per_scoped_name_for_every_supported_language() {
             "{language}"
         );
         let blob =
-            join::CallgraphBlob::extract(source, language, crate::views::callgraph::PRODUCER)
+            join::CallgraphBlob::extract(source, language, crate::callgraph_extractor::PRODUCER)
                 .unwrap();
         let symbols = &blob.parse().unwrap().symbols;
         assert!(!symbols.is_empty(), "{language}");

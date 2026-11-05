@@ -41,7 +41,7 @@ fn disk_reserve_lexical_routes_use_the_approved_sentence_and_recover() {
     assert!(handle_configure_for_test(&configure_lexical_views(&root, &storage), &ctx).success);
     assert!(ctx.lexical_view_snapshot("bind").unwrap().is_ok());
     let working = ctx.lexical_source_for_test();
-    let low = crate::blob_store::v3::set_free_space_for_test(
+    let low = crate::disk_floor::set_free_space_for_test(
         &storage,
         21 * 1024 * 1024 * 1024,
         3_900_000_000_000,
@@ -115,7 +115,7 @@ fn disk_reserve_callgraph_routes_use_the_approved_sentence() {
     assert!(
         handle_configure_for_test(&configure_callgraph_views(&root, &storage, true), &ctx).success
     );
-    let _low = crate::blob_store::v3::set_free_space_for_test(
+    let _low = crate::disk_floor::set_free_space_for_test(
         &storage,
         21 * 1024 * 1024 * 1024,
         3_900_000_000_000,
@@ -202,7 +202,7 @@ fn disk_reserve_probe_failure_keeps_the_existing_bug_treatment() {
     let mut config = crate::config::Config::default();
     config.storage_dir = Some(storage.clone());
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-    let _failed_probe = crate::blob_store::v3::set_free_space_probe_failure_for_test(&storage);
+    let _failed_probe = crate::disk_floor::set_free_space_probe_failure_for_test(&storage);
     let error = crate::blob_store::v3::publish(&storage, &"f".repeat(64), 1, None, |_| Ok(()))
         .unwrap_err()
         .to_string();
@@ -210,7 +210,7 @@ fn disk_reserve_probe_failure_keeps_the_existing_bug_treatment() {
     // Even if probing starts working before the reply, the failed admission
     // has no measurement and must retain the unexpected-error treatment.
     drop(_failed_probe);
-    let _now_measured = crate::blob_store::v3::set_free_space_for_test(
+    let _now_measured = crate::disk_floor::set_free_space_for_test(
         &storage,
         21 * 1024 * 1024 * 1024,
         3_900_000_000_000,

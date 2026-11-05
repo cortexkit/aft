@@ -258,7 +258,7 @@ fn lexical_rebind_pending_write_refuses_reuse_until_it_is_reconciled() {
         ));
         super::super::intent::register(&f.root, &delta);
         let path = f.root.join("a.rs");
-        let write = super::super::intent::record_paths([path.as_path()]);
+        let write = crate::write_intent::record_paths([path.as_path()]);
         assert!(super::super::intent::active(&f.root));
         fs::write(f.root.join("a.rs"), "fn written_needle() {}\n").unwrap();
         f.ctx.mark_subc_unbound();

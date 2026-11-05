@@ -171,7 +171,8 @@ fn go_view_answers(
     for path in source_files(&fixture.root) {
         let source = fs::read_to_string(&path).unwrap();
         let blob =
-            join::CallgraphBlob::extract(&source, "go", crate::views::callgraph::PRODUCER).unwrap();
+            join::CallgraphBlob::extract(&source, "go", crate::callgraph_extractor::PRODUCER)
+                .unwrap();
         let mut value = serde_json::to_value(&blob).unwrap();
         if !package_known || unknown_file == Some(relative_path(&fixture.root, &path).as_str()) {
             value["dispatch"]

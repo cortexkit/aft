@@ -87,7 +87,7 @@ pub enum FreshnessVerdict {
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> blake3::Hash {
-    crate::views::io::source_hash(bytes)
+    crate::io_accounting::source_hash(bytes)
 }
 
 pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blake3::Hash>> {
@@ -120,7 +120,7 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
     // The same read-policy gate as `project_content::read`, but streamed.
     // The work counters match what that read and `hash_bytes` record.
     let (hash, bytes_read) = hash_small_reader(crate::project_content::open(path)?)?;
-    let work = &crate::views::io::WORK;
+    let work = &crate::io_accounting::WORK;
     work.content_read_bytes
         .fetch_add(bytes_read, std::sync::atomic::Ordering::Relaxed);
     if hash.is_some() {

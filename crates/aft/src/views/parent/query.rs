@@ -617,7 +617,7 @@ mod disk_reserve_tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().canonicalize().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let _low = crate::blob_store::v3::set_free_space_for_test(
+        let _low = crate::disk_floor::set_free_space_for_test(
             storage.path(),
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,

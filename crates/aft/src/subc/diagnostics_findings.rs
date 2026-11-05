@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn disk_reserve_findings_are_not_reader_floor_or_view_load_bugs() {
         let storage = tempfile::tempdir().unwrap();
-        let _space = crate::blob_store::v3::set_free_space_for_test(
+        let _space = crate::disk_floor::set_free_space_for_test(
             storage.path(),
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,

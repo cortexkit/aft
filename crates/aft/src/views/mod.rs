@@ -24,7 +24,6 @@ pub mod lazy_read_benchmark;
 pub mod materialization;
 mod profile;
 pub(crate) mod publication_reason;
-pub(crate) mod write_accounting;
 #[cfg(test)]
 pub(crate) use profile::observe_publication_phases_for_test;
 pub(crate) mod read;
@@ -70,7 +69,6 @@ pub mod semantic_runtime;
 mod tree_base;
 pub mod trigram;
 pub(crate) mod verification;
-pub(crate) use verification::NativeStat;
 
 #[cfg(test)]
 mod dispatch_parity_probe;
@@ -1430,7 +1428,7 @@ fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<[u8; 32]> {
             .open(&temporary)
             .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
         let bytes = manifest.json_bytes()?;
-        let mut writer = write_accounting::ManifestWriter(&mut file);
+        let mut writer = crate::db::write_accounting::ManifestWriter(&mut file);
         writer
             .write_all(&bytes)
             .map_err(|error| ViewError::io_at("writing", &temporary, error))?;

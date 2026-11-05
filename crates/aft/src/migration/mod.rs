@@ -1232,7 +1232,7 @@ mod tests {
                 family: &request.family,
                 view_dir: view.view_dir(),
                 byte_budget: 0,
-                now_ms: crate::pins::now_ms().saturating_add(crate::gc::BLOB_AGE_FLOOR_MS + 1),
+                now_ms: crate::clock::now_ms().saturating_add(crate::gc::BLOB_AGE_FLOOR_MS + 1),
                 references: crate::gc::SweepReferences::default(),
             })
             .unwrap()

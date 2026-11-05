@@ -715,7 +715,7 @@ impl LexicalSnapshotSource for BaseBuilderTestSource {
                 paths: &paths,
                 policy: self.policy,
                 semantic_producer: None,
-                callgraph_producer: super::callgraph::PRODUCER.into(),
+                callgraph_producer: crate::callgraph_extractor::PRODUCER.into(),
                 ignore_fingerprint: None,
                 history: None,
                 budget: super::eviction::DiskBudget::default(),
@@ -1906,7 +1906,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _guard = crate::blob_store::v3::serial_for_test();
             let _space =
-                crate::blob_store::v3::set_free_space_for_test(&other_storage, 1 << 20, 1 << 40);
+                crate::disk_floor::set_free_space_for_test(&other_storage, 1 << 20, 1 << 40);
             let refusal = || {
                 crate::blob_store::v3::publish(&other_storage, "full-device", 1, None, |_| Ok(()))
                     .unwrap_err()

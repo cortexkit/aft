@@ -303,7 +303,7 @@ fn database_count(
                 let producers = super::manifest_v2::Producers {
                     trigram: policy.fingerprint_hex(),
                     semantic: None,
-                    callgraph: super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 };
                 let route = super::snapshot::V3Route {
                     storage: storage.to_path_buf(),
@@ -389,7 +389,7 @@ pub(crate) fn needs_producer_rebuild(
         .has_older_callgraph_than(&super::manifest_v2::Producers {
             trigram: policy.fingerprint_hex(),
             semantic: None,
-            callgraph: super::callgraph::PRODUCER.into(),
+            callgraph: crate::callgraph_extractor::PRODUCER.into(),
         })
 }
 
@@ -408,7 +408,7 @@ pub(crate) fn open_published(
     let producers = super::manifest_v2::Producers {
         trigram: policy.fingerprint_hex(),
         semantic: None,
-        callgraph: super::callgraph::PRODUCER.into(),
+        callgraph: crate::callgraph_extractor::PRODUCER.into(),
     };
     let generation =
         match super::base_refs::open_callgraph_seed_v3(storage, family, scope, &producers) {
@@ -754,7 +754,10 @@ mod tests {
                             let bytes = std::fs::read(peer.join(name)).unwrap();
                             (
                                 name.to_owned(),
-                                (bytes.len() as u64, super::super::io::source_hash(&bytes)),
+                                (
+                                    bytes.len() as u64,
+                                    crate::io_accounting::source_hash(&bytes),
+                                ),
                             )
                         })
                         .collect(),

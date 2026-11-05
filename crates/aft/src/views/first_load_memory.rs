@@ -22,7 +22,7 @@ fn first_load_memory_corpus() {
     let producers = Producers {
         trigram: policy.fingerprint_hex(),
         semantic: None,
-        callgraph: crate::views::callgraph::PRODUCER.into(),
+        callgraph: crate::callgraph_extractor::PRODUCER.into(),
     };
     let driver = if legacy {
         let registry = crate::views::registry::FamilyRegistry::open(&storage, "memory").unwrap();
@@ -185,7 +185,7 @@ fn fresh_checkout_bind_after_a_warm_sibling() {
         let producers = Producers {
             trigram: policy.fingerprint_hex(),
             semantic: None,
-            callgraph: crate::views::callgraph::PRODUCER.into(),
+            callgraph: crate::callgraph_extractor::PRODUCER.into(),
         };
         let driver = CheckoutDriver::new_v3(
             &storage,

@@ -138,7 +138,7 @@ pub struct ContentHash([u8; 32]);
 
 impl ContentHash {
     pub fn of(bytes: &[u8]) -> Self {
-        Self(*crate::views::io::source_hash(bytes).as_bytes())
+        Self(*crate::io_accounting::source_hash(bytes).as_bytes())
     }
 
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -688,10 +688,10 @@ impl FamilyStore {
         crate::gc::family::record_stale_rows(&self.inner.path, &self.inner.family, written as u64);
         if self.plane() == FamilyPlane::Semantic {
             use std::sync::atomic::Ordering;
-            crate::views::io::WORK
+            crate::io_accounting::WORK
                 .semantic_touch_transactions
                 .fetch_add(1, Ordering::Relaxed);
-            crate::views::io::WORK
+            crate::io_accounting::WORK
                 .semantic_touch_rows_written
                 .fetch_add(written as u64, Ordering::Relaxed);
         }
@@ -1753,7 +1753,7 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
         });
     }
     if inner.plane == FamilyPlane::Semantic {
-        crate::views::io::WORK
+        crate::io_accounting::WORK
             .semantic_store_gets
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1768,7 +1768,7 @@ fn get(inner: &StoreInner, key: &FamilyKey) -> StoreResult<Option<Vec<u8>>> {
         return Ok(None);
     };
     if inner.plane == FamilyPlane::Semantic {
-        crate::views::io::WORK
+        crate::io_accounting::WORK
             .semantic_store_payload_bytes
             .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1828,7 +1828,7 @@ fn usage(inner: &StoreInner) -> StoreResult<StoreUsage> {
 
 /// Counts one sum over every payload row.
 fn count_logical_aggregate() {
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .logical_aggregates
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]

@@ -141,7 +141,7 @@ fn views_idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_fir
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let clock = crate::pins::now_ms() + 3_601_000;
+    let clock = crate::clock::now_ms() + 3_601_000;
     let report = crate::storage_retention::sweep_checkout_views_at_for_test(&paths, &family, clock);
     assert!(report.errors.is_empty(), "{report:?}");
     assert!(

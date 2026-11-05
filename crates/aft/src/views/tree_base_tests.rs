@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::blob_store::v2::{FamilyPlane, TrigramPolicy};
+use crate::native_stat::{FileIdentity, NativeStat};
 use crate::views::base_refs::{base_kind, open_foreign_v3, BaseKind};
 use crate::views::first_load::{
     CheckoutDriver, ConfiguredMembershipWalker, FirstLoadDriver, ReconcileWork, TrigramBridge,
@@ -14,7 +15,7 @@ use crate::views::manifest_v2::Producers;
 use crate::views::snapshot::{DiskState, Snapshot};
 use crate::views::verification::{
     evidence_path, known_attribute_sources_for_test, read_tree_proof, write_tree_proof,
-    BlobReceipt, FileIdentity, NativeStat, TreeProof, TREE_PROOF_APP, TREE_PROOF_FILE,
+    BlobReceipt, TreeProof, TREE_PROOF_APP, TREE_PROOF_FILE,
 };
 use crate::views::RelPath;
 

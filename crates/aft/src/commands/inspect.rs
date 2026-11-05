@@ -9686,7 +9686,7 @@ mod checkout_deferred_tests {
             producers: Producers {
                 trigram: "test".into(),
                 semantic: None,
-                callgraph: crate::views::callgraph::PRODUCER.into(),
+                callgraph: crate::callgraph_extractor::PRODUCER.into(),
             },
             head_tree: None,
             ignore_fingerprint: None,

@@ -10,9 +10,11 @@ pub(crate) mod fact_answers;
 pub(crate) mod facts;
 mod go_dispatch;
 pub mod join;
+pub(crate) mod method_call_facts;
 #[cfg(target_os = "macos")]
 mod readiness_watch_macos;
 pub(crate) mod resolution_config;
+pub(crate) mod resolution_facts;
 mod source_stat;
 mod typescript_objects;
 use disk_facts::DiskFacts;
@@ -10313,7 +10315,7 @@ impl ReadonlyCallGraphStore {
         let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
         // A sealed donor never changes; open it without locks or a WAL.
-        let conn = if crate::views::donor::is_sealed(&sqlite_path) {
+        let conn = if crate::db::sealed_database::is_sealed(&sqlite_path) {
             open_sealed_connection(&sqlite_path)?
         } else {
             open_readonly_connection(&sqlite_path)?
@@ -13357,7 +13359,7 @@ fn manifest_producer_ready(view_dir: &Path, generation: &str) -> Result<bool> {
         .load_manifest_v2(generation)
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     let mut expected = manifest.header().producers.clone();
-    expected.callgraph = crate::views::callgraph::PRODUCER.into();
+    expected.callgraph = crate::callgraph_extractor::PRODUCER.into();
     if manifest
         .header()
         .producers
@@ -26397,7 +26399,7 @@ fn corpus_fingerprint_for(project_root: &Path, files: &[PathBuf]) -> Result<Stri
 #[derive(Clone)]
 struct CorpusFile {
     hash: std::result::Result<blake3::Hash, String>,
-    stamp: Option<crate::views::NativeStat>,
+    stamp: Option<crate::native_stat::NativeStat>,
     observed_ns: u128,
 }
 
@@ -26506,7 +26508,7 @@ fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<Cor
         // A memo hit reuses a content digest, not a stat-based breaker key.
         // Native identity and change time catch in-place rewrites that restore
         // size/mtime. Unsupported filesystems conservatively rehash on probes.
-        let before = crate::views::NativeStat::read(&path).ok();
+        let before = crate::native_stat::NativeStat::read(&path).ok();
         let cached = if let Some(corpus) = &previous {
             corpus.file(project_root, &path)?
         } else {
@@ -26522,7 +26524,7 @@ fn corpus_snapshot_for(project_root: &Path, files: &[PathBuf]) -> Result<Arc<Cor
             file.clone()
         } else {
             let hash = hash_file_bounded(&path).map_err(|error| error.to_string());
-            let after = crate::views::NativeStat::read(&path).ok();
+            let after = crate::native_stat::NativeStat::read(&path).ok();
             CorpusFile {
                 stamp: (hash.is_ok() && before == after).then_some(after).flatten(),
                 hash,
@@ -33879,12 +33881,12 @@ edition = "2021"
                 .file_name()
                 .is_some_and(|s| s == "go.mod" || s == "Cargo.toml");
             let blob = if config {
-                join::CallgraphBlob::config(bytes, crate::views::callgraph::PRODUCER)
+                join::CallgraphBlob::config(bytes, crate::callgraph_extractor::PRODUCER)
             } else {
                 join::CallgraphBlob::extract(
                     std::str::from_utf8(&bytes).unwrap(),
                     lang_label(crate::parser::detect_language(path).unwrap()),
-                    crate::views::callgraph::PRODUCER,
+                    crate::callgraph_extractor::PRODUCER,
                 )
                 .unwrap()
             };
@@ -34126,11 +34128,11 @@ edition = "2021"
             ),
             (
                 "ruled-callgraph-v6-manifest-root-reexport-resolution",
-                crate::views::callgraph::PRODUCER,
+                crate::callgraph_extractor::PRODUCER,
             ),
             (
                 "ruled-callgraph-v9-without-ast-index",
-                crate::views::callgraph::PRODUCER,
+                crate::callgraph_extractor::PRODUCER,
             ),
         ] {
             let old = CallgraphKey::from_bytes(source, "go", old_version).full_key();
@@ -34392,10 +34394,11 @@ edition = "2021"
     #[test]
     fn callgraph_view_collision_keys_are_stable_and_previous_rows_are_refused() {
         let source = "#[macro_export]\nmacro_rules! outer { () => { helper(); other_helper(); } }\npub(crate) fn helper() {}\npub(crate) fn other_helper() {}\npub(crate) fn anchor() { helper(); }\n";
-        let blob = join::CallgraphBlob::extract(source, "rust", crate::views::callgraph::PRODUCER)
-            .unwrap();
+        let blob =
+            join::CallgraphBlob::extract(source, "rust", crate::callgraph_extractor::PRODUCER)
+                .unwrap();
         let repeated =
-            join::CallgraphBlob::extract(source, "rust", crate::views::callgraph::PRODUCER)
+            join::CallgraphBlob::extract(source, "rust", crate::callgraph_extractor::PRODUCER)
                 .unwrap();
         let parse = blob.parse().unwrap();
         let keys = parse.reference_keys();

@@ -172,7 +172,7 @@ fn bench_health_rollup_steps() {
                         generation: Some("1-bench".into()),
                         manifest: None,
                         head_fingerprint: String::new(),
-                        head_metadata: crate::alias::GitHeadMetadata {
+                        head_metadata: crate::git_head::GitHeadMetadata {
                             head_path: std::path::PathBuf::new(),
                             head_mtime: None,
                             resolved_ref_path: None,

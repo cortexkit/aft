@@ -100,7 +100,7 @@ fn build() -> BusyRoot {
             generation: Some("1-fixture".into()),
             manifest: None,
             head_fingerprint: String::new(),
-            head_metadata: crate::alias::GitHeadMetadata {
+            head_metadata: crate::git_head::GitHeadMetadata {
                 head_path: PathBuf::new(),
                 head_mtime: None,
                 resolved_ref_path: None,

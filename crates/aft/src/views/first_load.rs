@@ -9,6 +9,7 @@ use std::sync::Arc;
 mod memory;
 
 use crate::blob_store::v2::FamilyPlane;
+use crate::callgraph_store::join::SUPERSEDED_PUBLISH;
 pub use crate::watcher_backend::cookie::{CookieObservation, CookieTicket};
 
 use super::contracts::{LoaderStage, PlaneError, ViewAccess};
@@ -125,9 +126,6 @@ pub const CHECKOUT_CHANGED_DURING_RECONCILE: &str =
     "checkout changed during strict reconciliation; retry load";
 pub const CHECKOUT_WRITE_ACTIVE: &str = "checkout write still active during reconciliation";
 pub const CHECKOUT_CHANGED_BEFORE_INSTALL: &str = "checkout changed before snapshot installation";
-
-/// The reason a [`PublishFence`] gives when it refuses a publication.
-pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publication refused";
 
 /// Operations supplied by the durable base/referrer owner. The defaults refuse
 /// every operation: a legacy view registration does not protect a shared base.
@@ -1428,7 +1426,7 @@ struct ObservedStat {
     device: u64,
     recorded_ns: u128,
     delivery_seq: u64,
-    native: Option<super::verification::NativeStat>,
+    native: Option<crate::native_stat::NativeStat>,
 }
 
 /// Publish stat evidence together with the extracted content it validates.
@@ -2627,7 +2625,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 name,
                 ".gitattributes" | ".gitignore" | ".ignore" | ".aftignore"
             ) || path.as_bytes().starts_with(b".git/")
-                || super::assembly::is_resolution_input(path.as_bytes())
+                || crate::callgraph_extractor::is_resolution_input(path.as_bytes())
                 || std::fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir());
             candidates.insert(absolute);
         }
@@ -2697,7 +2695,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
             // Round down to the second so coarse filesystem timestamps in the
             // observation's second are also treated as racily clean.
-            let recorded_ns = super::verification::now_ns();
+            let recorded_ns = crate::native_stat::now_ns();
             let delivery_seq = self
                 .delivery
                 .lock()
@@ -2935,7 +2933,7 @@ impl FirstLoadDriver for CheckoutDriver {
                 "v3-only driver requires verified_bind bootstrap before publication",
             ));
         }
-        super::io::WORK
+        crate::io_accounting::WORK
             .own_generation_folds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let store = self
@@ -4294,10 +4292,10 @@ mod composite_tests {
         drop(loader.load(&access).unwrap());
         let directory = root.path().join("new-directory");
         std::fs::create_dir(&directory).unwrap();
-        super::super::intent::WriteIntentListener::record_change(
+        crate::write_intent::WriteIntentListener::record_change(
             &*driver,
-            &super::super::intent::WriteIntent::Directory(directory.clone()),
-            super::super::intent::WritePhase::Before,
+            &crate::write_intent::WriteIntent::Directory(directory.clone()),
+            crate::write_intent::WritePhase::Before,
         );
         let (snapshot, revision) = driver.installed_cut();
         assert!(driver.install(&access, &snapshot, revision).is_err());
@@ -4759,8 +4757,9 @@ mod composite_tests {
 }
 
 /// Bridges the ruled callgraph extractor/materializer into the composite loader.
-/// Pass `adapter` to `CheckoutDriver::with_adapters`; use `callgraph::PRODUCER`
-/// in the driver's producer header. No global registration occurs here.
+/// Pass `adapter` to `CheckoutDriver::with_adapters`; use
+/// `callgraph_extractor::PRODUCER` in the driver's producer header. No global
+/// registration occurs here.
 #[derive(Default)]
 pub struct CallgraphBridge {
     pub adapter: Arc<super::callgraph::CallgraphPlane>,
@@ -4783,7 +4782,7 @@ pub(super) fn sealed_donor(
     let route = base.v3_route().ok_or(ColdReason::NoSealedDonor)?;
     let donor = super::resolve_derived_path(&route.member_dir(), base.name())
         .map_err(|_| ColdReason::NoSealedDonor)?;
-    if !super::donor::is_sealed(&donor) {
+    if !crate::db::sealed_database::is_sealed(&donor) {
         return Err(ColdReason::NoSealedDonor);
     }
     super::donor::verify(&donor).map_err(ColdReason::SealInvalid)?;
@@ -4951,7 +4950,7 @@ impl CompositePlane for CallgraphBridge {
         path: &RelPath,
         bytes: &[u8],
     ) -> Result<super::snapshot::PlaneAttachment, PlaneError> {
-        let language = if super::assembly::is_resolution_input(path.as_bytes()) {
+        let language = if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
             "config".to_string()
         } else {
             let path = std::str::from_utf8(path.as_bytes()).map_err(|error| PlaneError {
@@ -5045,7 +5044,8 @@ impl CompositePlane for CallgraphBridge {
             }) = manifest.get_mut(path)
             {
                 planes.callgraph = Some(super::readiness::PlaneState::ready(&attachment.key));
-                *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+                *resolution_input =
+                    crate::callgraph_extractor::is_resolution_input(path.as_bytes());
             }
         }
         // Return freed extraction buffers before the resolver grows its indices.
@@ -5108,7 +5108,7 @@ impl CompositePlane for CallgraphBridge {
                 error(super::ViewError::io_at(
                     "renaming derived database to",
                     &published_path,
-                    super::io::at("from", &staging_path, e),
+                    crate::io_accounting::at("from", &staging_path, e),
                 ))
             })?;
         }
@@ -5166,7 +5166,8 @@ impl CompositePlane for CallgraphBridge {
                 }) = delta.get_mut(path)
                 {
                     planes.callgraph = Some(super::readiness::PlaneState::ready(&cached.0));
-                    *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+                    *resolution_input =
+                        crate::callgraph_extractor::is_resolution_input(path.as_bytes());
                 }
                 continue;
             }
@@ -5228,7 +5229,8 @@ impl CompositePlane for CallgraphBridge {
             }) = delta.get_mut(path)
             {
                 planes.callgraph = Some(super::readiness::PlaneState::ready(key));
-                *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+                *resolution_input =
+                    crate::callgraph_extractor::is_resolution_input(path.as_bytes());
             }
         }
         for (_, attachment) in &attachments {
@@ -5344,7 +5346,7 @@ impl CompositePlane for CallgraphBridge {
                 error(super::ViewError::io_at(
                     "renaming derived database to",
                     &published_path,
-                    super::io::at("from", &staging_path, e),
+                    crate::io_accounting::at("from", &staging_path, e),
                 ))
             })?;
         }
@@ -5440,7 +5442,7 @@ mod callgraph_bridge_tests {
                 Producers {
                     trigram: "test".into(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 None,
                 Arc::new(Walker),
@@ -5689,7 +5691,7 @@ mod callgraph_bridge_tests {
                 Producers {
                     trigram: "test".into(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 None,
                 Arc::new(Walker),
@@ -5764,7 +5766,7 @@ mod callgraph_bridge_tests {
                 Producers {
                     trigram: "test".into(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 None,
                 Arc::new(Walker),
@@ -6372,13 +6374,13 @@ impl CheckoutDriver {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_file() => {
                 let mut stat = ObservedStat::new(&metadata, recorded_ns);
-                stat.native = super::verification::NativeStat::strict_read(path).ok();
+                stat.native = crate::native_stat::NativeStat::strict_read(path).ok();
                 Ok(Some(stat))
             }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(SiblingLoader::error(
-                super::io::at("reading checkout metadata", path, error).to_string(),
+                crate::io_accounting::at("reading checkout metadata", path, error).to_string(),
             )),
         }
     }
@@ -6475,19 +6477,23 @@ impl CheckoutDriver {
     /// Subscribe before serving the first snapshot. Weak writer registration
     /// stops notifying this checkout automatically when its driver is dropped.
     pub fn register_write_intent(self: &Arc<Self>) {
-        let listener: Arc<dyn super::intent::WriteIntentListener> = self.clone();
-        super::intent::register_listener(&listener);
+        let listener: Arc<dyn crate::write_intent::WriteIntentListener> = self.clone();
+        crate::write_intent::register_listener(&listener);
     }
 }
-impl super::intent::WriteIntentListener for CheckoutDriver {
-    fn record_change(&self, change: &super::intent::WriteIntent, _: super::intent::WritePhase) {
+impl crate::write_intent::WriteIntentListener for CheckoutDriver {
+    fn record_change(
+        &self,
+        change: &crate::write_intent::WriteIntent,
+        _: crate::write_intent::WritePhase,
+    ) {
         match change {
-            super::intent::WriteIntent::Paths(paths) => {
+            crate::write_intent::WriteIntent::Paths(paths) => {
                 for absolute in paths {
                     self.record_absolute_change(absolute);
                 }
             }
-            super::intent::WriteIntent::Directory(absolute) => {
+            crate::write_intent::WriteIntent::Directory(absolute) => {
                 let Some(relative) = super::intent::relative_to_root(absolute, self.owner.root())
                 else {
                     return;
@@ -6571,7 +6577,7 @@ mod integrated_plane_tests {
                 Producers {
                     trigram: policy.fingerprint_hex(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 None,
                 Arc::new(ConfiguredMembershipWalker),
@@ -6592,7 +6598,7 @@ mod integrated_plane_tests {
         }
         let revision = driver.revision(&access);
         {
-            let _intent = super::super::intent::record_paths([absolute.as_path()]);
+            let _intent = crate::write_intent::record_paths([absolute.as_path()]);
             assert!(driver.revision(&access) > revision);
             for plane in [FamilyPlane::Trigram, FamilyPlane::Callgraph] {
                 assert_eq!(
@@ -6722,7 +6728,7 @@ mod checkout_kind_tests {
                     Producers {
                         trigram: policy.fingerprint_hex(),
                         semantic: None,
-                        callgraph: super::super::callgraph::PRODUCER.into(),
+                        callgraph: crate::callgraph_extractor::PRODUCER.into(),
                     },
                     None,
                     Arc::new(ConfiguredMembershipWalker),
@@ -6886,7 +6892,7 @@ mod v3_bootstrap_tests {
                     trigram: policy.fingerprint_hex(),
                     semantic: (plane == FamilyPlane::Semantic).then(|| "model".into()),
                     callgraph: if plane == FamilyPlane::Callgraph {
-                        super::super::callgraph::PRODUCER.into()
+                        crate::callgraph_extractor::PRODUCER.into()
                     } else {
                         "unregistered".into()
                     },
@@ -7181,7 +7187,7 @@ mod v3_bootstrap_tests {
         driver.record_absolute_change(&canonical);
         driver.record_absolute_change(&outside.path().join(&relative));
         driver.record_absolute_change(&relative);
-        use super::super::intent::{WriteIntent, WriteIntentListener, WritePhase};
+        use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
         WriteIntentListener::record_change(
             &driver,
             &WriteIntent::Paths(vec![ordinary]),
@@ -7343,7 +7349,7 @@ mod v3_bootstrap_tests {
                 Producers {
                     trigram: policy.fingerprint_hex(),
                     semantic: None,
-                    callgraph: super::super::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 Arc::new(ConfiguredMembershipWalker),
                 vec![
@@ -7411,7 +7417,7 @@ mod v3_bootstrap_tests {
             producers: Producers {
                 trigram: "unused".into(),
                 semantic: None,
-                callgraph: super::super::callgraph::PRODUCER.into(),
+                callgraph: crate::callgraph_extractor::PRODUCER.into(),
             },
             head_tree: None,
             ignore_fingerprint: None,

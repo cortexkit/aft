@@ -20,9 +20,8 @@ use super::{
     AstPreorderNode, BlobRef, BlobRefKind, CallgraphBlob, ManifestJoinError, ParseBlob, Parser,
 };
 use crate::callgraph;
-use crate::callgraph_store::facts::{BlobKey, FactPaths, ManifestFacts};
+use crate::callgraph_store::facts::{FactPaths, NoProjectFacts};
 use crate::parser::{grammar_for, LangId};
-use crate::views::Manifest;
 
 /// Parses `source` as `language` and extracts its parse output.
 pub(super) fn extract(
@@ -75,15 +74,9 @@ pub(super) fn extract_tree(
     if lang == LangId::Rust {
         refs.extend(rust_module_refs(source, &index));
     }
-    let empty = Manifest::new([]).map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-    let reader = |_: &BlobKey| None;
-    let empty_facts = ManifestFacts {
-        manifest: &empty,
-        blobs: &reader,
-    };
     let paths = FactPaths {
         root: Path::new("/"),
-        facts: &empty_facts,
+        facts: &NoProjectFacts,
     };
     let file = Path::new("/__callgraph_blob__");
     let mut structural = crate::callgraph_store::collect_reexport_refs_with_line_index(

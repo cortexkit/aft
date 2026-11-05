@@ -14,9 +14,9 @@ fn resident_chunk_shortcut_matches_store_and_full_rebuild() {
         let snapshot = edit_snapshot(&checkout, &edited);
         let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
         let probe = crate::blob_store::v2::read_tests::ReadProbe::start(&store);
-        let before = crate::views::io::work_snapshot();
+        let before = crate::io_accounting::work_snapshot();
         let report = checkout.fill(&snapshot, &Model::default(), "model-a");
-        let after = crate::views::io::work_snapshot();
+        let after = crate::io_accounting::work_snapshot();
         let reads = probe.finish();
         let gets: usize = reads
             .statements
@@ -341,12 +341,12 @@ fn repository_semantic_fill_read_probe() {
         );
     }
     let second = Checkout::open(storage.path(), "second", sibling.path(), &plane);
-    let before_sibling = crate::views::io::work_snapshot();
+    let before_sibling = crate::io_accounting::work_snapshot();
     let probe = ReadProbe::start(&store);
     let second_snapshot = second.load();
     let second_report = fill(&second, &second_snapshot);
     eprintln!("SIBLING {second_report:?}\nSQL {:?}", probe.finish());
-    let after_sibling = crate::views::io::work_snapshot();
+    let after_sibling = crate::io_accounting::work_snapshot();
     eprintln!(
         "SIBLING_COUNTERS gets={} payload_bytes={} fills={}",
         after_sibling["semantic_store_gets"].as_u64().unwrap()
@@ -378,11 +378,11 @@ fn repository_semantic_fill_read_probe() {
             ));
             std::fs::write(path, text).unwrap();
         }
-        let before = crate::views::io::work_snapshot();
+        let before = crate::io_accounting::work_snapshot();
         second.driver.register_write_intent();
         let snapshot = second.load();
         let report = fill(&second, &snapshot);
-        let after = crate::views::io::work_snapshot();
+        let after = crate::io_accounting::work_snapshot();
         let delta = [
             "semantic_store_gets",
             "semantic_store_payload_bytes",
@@ -1041,18 +1041,18 @@ fn restart_edit_read_probe() {
             ]
             .map(|key| snapshot[key].as_u64().unwrap())
         };
-        let before = counters(&crate::views::io::work_snapshot());
+        let before = counters(&crate::io_accounting::work_snapshot());
         let probe = crate::blob_store::v2::read_tests::ReadProbe::start(&store);
         checkout.load();
         let admission = probe.finish();
-        let admitted = counters(&crate::views::io::work_snapshot());
+        let admitted = counters(&crate::io_accounting::work_snapshot());
         let edited = source.replace("input + 149\n", "input * 149\n");
         let snapshot = edit_snapshot(&checkout, &edited);
-        let edit_start = counters(&crate::views::io::work_snapshot());
+        let edit_start = counters(&crate::io_accounting::work_snapshot());
         let probe = crate::blob_store::v2::read_tests::ReadProbe::start(&store);
         let report = checkout.fill(&snapshot, &Model::default(), "model-a");
         let edit = probe.finish();
-        let after = counters(&crate::views::io::work_snapshot());
+        let after = counters(&crate::io_accounting::work_snapshot());
         let marker_probes = admission
             .statements
             .iter()

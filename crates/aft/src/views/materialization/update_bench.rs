@@ -223,14 +223,17 @@ fn bench_repository_incremental_update() {
             let key = crate::blob_store::CallgraphKey::from_bytes(
                 source.as_bytes(),
                 language.as_str(),
-                crate::views::callgraph::PRODUCER,
+                crate::callgraph_extractor::PRODUCER,
             )
             .full_key();
-            let payload =
-                join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
-                    .unwrap()
-                    .to_bytes()
-                    .unwrap();
+            let payload = join::CallgraphBlob::extract(
+                &source,
+                language,
+                crate::callgraph_extractor::PRODUCER,
+            )
+            .unwrap()
+            .to_bytes()
+            .unwrap();
             store.put(&key, &payload).unwrap();
             let ManifestEntry::Regular { mode, planes, .. } = entry else {
                 unreachable!("candidates are regular entries");
@@ -292,10 +295,14 @@ fn bench_repository_incremental_update() {
             let key = crate::blob_store::CallgraphKey::for_current(source.as_bytes(), language)
                 .full_key();
             let blob = if language == "config" {
-                join::CallgraphBlob::config(source.as_bytes(), crate::views::callgraph::PRODUCER)
+                join::CallgraphBlob::config(source.as_bytes(), crate::callgraph_extractor::PRODUCER)
             } else {
-                join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
-                    .unwrap()
+                join::CallgraphBlob::extract(
+                    &source,
+                    language,
+                    crate::callgraph_extractor::PRODUCER,
+                )
+                .unwrap()
             };
             store.put(&key, &blob.to_bytes().unwrap()).unwrap();
             let edited = Manifest::new(new.entries().map(|(entry_path, entry)| {

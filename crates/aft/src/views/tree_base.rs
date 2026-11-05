@@ -24,8 +24,9 @@ use super::base_refs::{
 use super::manifest_v2::{EntryPlanes, EntryV2, ManifestHeader, ManifestV2, Producers};
 use super::readiness::PlaneState;
 use super::snapshot::{ComposedGeneration, V3Route};
-use super::verification::{BindGuard, BlobReceipt, Evidence, NativeStat, TreeProof};
+use super::verification::{BindGuard, BlobReceipt, Evidence, TreeProof};
 use super::RelPath;
+use crate::native_stat::NativeStat;
 
 /// What a fresh checkout needs to build a tree-keyed base.
 pub(crate) struct TreeBaseInput<'a> {
@@ -153,7 +154,7 @@ fn prove_until(
         let absolute = input
             .root
             .join(super::segment_store::rel_path_to_os(path).map_err(|_| "unrepresentable_path")?);
-        let observed_ns = super::verification::now_ns();
+        let observed_ns = crate::native_stat::now_ns();
         let unreadable = |_| "member_unreadable";
         let before = NativeStat::read(&absolute).map_err(unreadable)?;
         if !std::fs::symlink_metadata(&absolute)

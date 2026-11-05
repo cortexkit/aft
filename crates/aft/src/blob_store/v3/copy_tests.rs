@@ -81,7 +81,7 @@ fn v1_sweep(storage: &Path) -> crate::gc::SweepReport {
         family: FAMILY,
         view_dir: &storage.join("views").join(HOLDER),
         byte_budget: 0,
-        now_ms: crate::pins::now_ms() + crate::gc::BLOB_AGE_FLOOR_MS + 1,
+        now_ms: crate::clock::now_ms() + crate::gc::BLOB_AGE_FLOOR_MS + 1,
         references: Default::default(),
     })
     .unwrap()

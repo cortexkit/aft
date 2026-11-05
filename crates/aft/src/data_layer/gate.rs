@@ -218,7 +218,7 @@ pub fn run(root: &Path, threads: usize) -> Result<ResolveGateReport, String> {
                     semantic: None,
                     callgraph: keys_by_path.get(text).cloned(),
                 },
-                resolution_input: crate::views::assembly::is_resolution_input(&record.path),
+                resolution_input: crate::callgraph_extractor::is_resolution_input(&record.path),
             }
         };
         (path, entry)

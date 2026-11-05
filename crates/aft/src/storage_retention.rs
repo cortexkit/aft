@@ -337,7 +337,7 @@ impl State {
                 .min(Duration::from_secs(60 * 60));
             self.protection_retry = Some(now + delay);
             report.protection_retry_at_ms =
-                Some(crate::pins::now_ms().saturating_add(delay.as_millis() as u64));
+                Some(crate::clock::now_ms().saturating_add(delay.as_millis() as u64));
         } else {
             self.protection_failures = 0;
             self.protection_retry = None;
@@ -980,7 +980,7 @@ pub(crate) fn record_bind_until(
             linked_worktree: linked_worktree_at_bind(&root),
             root,
             artifact_key: artifact_key.to_owned(),
-            last_bound_ms: crate::pins::now_ms(),
+            last_bound_ms: crate::clock::now_ms(),
         },
         started,
         deadline,
@@ -1148,7 +1148,7 @@ fn publish_bind_round(
     for member in members {
         check_deadline()?;
         let mut binding = member.binding.clone();
-        binding.last_bound_ms = crate::pins::now_ms();
+        binding.last_bound_ms = crate::clock::now_ms();
         let scope = crate::path_identity::project_scope_key(&binding.root);
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random).map_err(io::Error::other)?;
@@ -1627,7 +1627,7 @@ pub(crate) fn missing_root_eligibility(
             linked_worktree: false,
         });
     binding.last_bound_ms = binding.last_bound_ms.max(last_bind_ms);
-    binding_eligibility(&binding, crate::pins::now_ms())
+    binding_eligibility(&binding, crate::clock::now_ms())
 }
 
 // A missing checkout still needs the identity spelling used when it was bound.
@@ -1823,7 +1823,7 @@ fn unreadable_binding_sentinel(storage: &Path, scope: &str) -> Binding {
     Binding {
         root: storage.join("retention/roots"),
         artifact_key: scope.to_owned(),
-        last_bound_ms: crate::pins::now_ms(),
+        last_bound_ms: crate::clock::now_ms(),
         volume: None,
         stable_volume: None,
         linked_worktree: false,
@@ -3911,7 +3911,7 @@ fn reap_retired(storage: &StoragePaths) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut budget = crate::bash_background::persistence::RepairBudget::until(deadline, cancelled);
     let mut report = TrashReport {
-        at_ms: crate::pins::now_ms(),
+        at_ms: crate::clock::now_ms(),
         ..Default::default()
     };
     let result = reap_retired_with_budget(storage, deadline, &mut budget, &mut report);
@@ -5272,7 +5272,7 @@ fn run_pass_with_root_identities(
     let started = Instant::now();
     begin_root_history_pass(storage);
     let mut report = SweepReport {
-        at_ms: crate::pins::now_ms(),
+        at_ms: crate::clock::now_ms(),
         ..Default::default()
     };
     let result = (|| -> io::Result<()> {
@@ -6531,7 +6531,7 @@ fn collect_v3_family(
         cancelled,
         report,
         bounds,
-        crate::pins::now_ms(),
+        crate::clock::now_ms(),
     )
 }
 
@@ -6866,7 +6866,7 @@ mod storage_retention_tests {
                 &Binding {
                     root: temp.path().to_path_buf(),
                     artifact_key: key,
-                    last_bound_ms: crate::pins::now_ms(),
+                    last_bound_ms: crate::clock::now_ms(),
                     volume: None,
                     stable_volume: None,
                     linked_worktree: false,
@@ -7103,7 +7103,7 @@ mod storage_retention_tests {
                 &Binding {
                     root,
                     artifact_key: format!("{i:016x}"),
-                    last_bound_ms: crate::pins::now_ms(),
+                    last_bound_ms: crate::clock::now_ms(),
                     volume: None,
                     stable_volume: None,
                     linked_worktree: false,
@@ -7533,7 +7533,7 @@ mod storage_retention_tests {
             BgTaskStatus::Running
         };
         if finished {
-            metadata.finished_at = Some(crate::pins::now_ms());
+            metadata.finished_at = Some(crate::clock::now_ms());
             metadata.exit_code = Some(0);
         }
         let metadata = serde_json::to_vec(&metadata).unwrap();
@@ -8965,7 +8965,7 @@ mod storage_retention_tests {
             &key,
             true,
             &super::bindings(&paths, &mut RootIdentities::default()).unwrap(),
-            crate::pins::now_ms(),
+            crate::clock::now_ms(),
             Instant::now() + PASS_BUDGET,
             &|| false,
             &mut ViewMembers::default(),
@@ -9192,7 +9192,7 @@ mod storage_retention_tests {
             let binding = Binding {
                 root: temp.path().join(format!("checkout-{}", index % 20)),
                 artifact_key: format!("{index:016x}"),
-                last_bound_ms: crate::pins::now_ms(),
+                last_bound_ms: crate::clock::now_ms(),
                 volume: None,
                 stable_volume: None,
                 linked_worktree: linked,
@@ -9273,7 +9273,7 @@ mod storage_retention_tests {
         fs::write(&file, b"file").unwrap();
         let unresolved = file.join("checkout");
         assert!(fs::canonicalize(&unresolved).is_err());
-        let now = crate::pins::now_ms();
+        let now = crate::clock::now_ms();
         let mut memo = BTreeMap::new();
         for (index, root) in [&linked, &live, &missing, &unresolved]
             .into_iter()
@@ -9445,12 +9445,12 @@ mod storage_retention_tests {
             family,
             &crate::path_identity::project_scope_key(&main),
             std::process::id(),
-            crate::pins::now_ms(),
+            crate::clock::now_ms(),
         );
         let family_cache = paths.artifacts.join("index").join(family);
         fs::create_dir_all(&family_cache).unwrap();
         let mut report = SweepReport {
-            at_ms: crate::pins::now_ms(),
+            at_ms: crate::clock::now_ms(),
             ..Default::default()
         };
         super::prune_bindings(&paths, &|| false, &mut report).unwrap();
@@ -9510,7 +9510,7 @@ mod storage_retention_tests {
             binding: Binding {
                 root: fs::canonicalize(root).unwrap(),
                 artifact_key: "0123456789abcdef".into(),
-                last_bound_ms: crate::pins::now_ms(),
+                last_bound_ms: crate::clock::now_ms(),
                 volume: None,
                 stable_volume: None,
                 linked_worktree: false,
@@ -11794,7 +11794,7 @@ mod storage_retention_tests {
         record_bind(temp.path(), &root, &scope).unwrap();
         let record = temp.path().join(format!("retention/roots/{scope}.json"));
         let mut binding: serde_json::Value = read_json(&record).unwrap();
-        let last_bound = crate::pins::now_ms() - minutes * 60 * 1000;
+        let last_bound = crate::clock::now_ms() - minutes * 60 * 1000;
         binding["last_bound_ms"] = last_bound.into();
         if legacy {
             binding.as_object_mut().unwrap().remove("linked_worktree");
@@ -11903,7 +11903,7 @@ mod storage_retention_tests {
             .path()
             .join(format!("artifact-owners/{scope}/owner.json"));
         let mut metadata: serde_json::Value = read_json(&owner).unwrap();
-        metadata["heartbeat_at_ms"] = (crate::pins::now_ms() - 9 * 60 * 1000).into();
+        metadata["heartbeat_at_ms"] = (crate::clock::now_ms() - 9 * 60 * 1000).into();
         atomic_json(&owner, &metadata).unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
@@ -11953,7 +11953,7 @@ mod storage_retention_tests {
         assert!(path.exists());
         let record = temp.path().join(format!("retention/roots/{scope}.json"));
         let mut binding: serde_json::Value = read_json(&record).unwrap();
-        binding["last_bound_ms"] = (crate::pins::now_ms() - 8 * 24 * 60 * 60 * 1000).into();
+        binding["last_bound_ms"] = (crate::clock::now_ms() - 8 * 24 * 60 * 60 * 1000).into();
         atomic_json(&record, &binding).unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 1);
         assert!(!path.exists());
@@ -13011,7 +13011,7 @@ mod storage_retention_tests {
         due.flush(
             &StoragePaths::same(temp.path()),
             &mut RootIdentities::default(),
-            crate::pins::now_ms(),
+            crate::clock::now_ms(),
             deadline,
             &Instant::now,
             &|| false,
@@ -13306,7 +13306,7 @@ mod storage_retention_tests {
 
     /// Makes an orphan view look observed, and unchanged, for over an hour.
     fn age_orphan(storage: &Path, view: &Path, key: &str) {
-        let two_hours_ago = (crate::pins::now_ms() / 1000) as i64 - 2 * 60 * 60;
+        let two_hours_ago = (crate::clock::now_ms() / 1000) as i64 - 2 * 60 * 60;
         filetime::set_file_mtime(
             view.join("payload.bin"),
             filetime::FileTime::from_unix_time(two_hours_ago, 0),
@@ -13314,7 +13314,7 @@ mod storage_retention_tests {
         .unwrap();
         atomic_json(
             &storage.join(format!("retention/unknown/{key}.json")),
-            &(crate::pins::now_ms() - ORPHAN_VIEW_GRACE_MS - 60_000),
+            &(crate::clock::now_ms() - ORPHAN_VIEW_GRACE_MS - 60_000),
         )
         .unwrap();
     }
@@ -13379,7 +13379,7 @@ mod storage_retention_tests {
 
         atomic_json(
             &temp.path().join(format!("retention/unknown/{key}.json")),
-            &crate::pins::now_ms(),
+            &crate::clock::now_ms(),
         )
         .unwrap();
         let observed = run_pass_entry_bound(temp.path());
@@ -14463,7 +14463,7 @@ mod storage_retention_tests {
                 &Binding {
                     root: live_root.clone(),
                     artifact_key: "x".into(),
-                    last_bound_ms: crate::pins::now_ms(),
+                    last_bound_ms: crate::clock::now_ms(),
                     volume: Some((anchor.clone(), 0)),
                     stable_volume: Some(VolumeIdentity {
                         uuid: Some("retention-cycle-volume".into()),
@@ -14970,7 +14970,7 @@ mod v3_collector_tests {
                 assert!(warning.is_none(), "{warning:?}");
                 config
             });
-        let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
+        let _space = crate::disk_floor::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
         v3::publish(&storage, FAMILY, 1 << 20, None, |publication| {
             for line in members.lines() {
                 let mut fields = line.split('\t');
@@ -15064,8 +15064,8 @@ mod v3_collector_tests {
             view: view_dir.file_name().unwrap().to_string_lossy().into_owned(),
             generation: generation.to_owned(),
             owner,
-            created_at: crate::pins::now_ms(),
-            renewed_at: crate::pins::now_ms(),
+            created_at: crate::clock::now_ms(),
+            renewed_at: crate::clock::now_ms(),
         };
         fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
         fs::write(&keys_path, b"").unwrap();
@@ -15117,7 +15117,7 @@ mod v3_collector_tests {
             fill_view_dir(&view_dir(&storage, scope));
         }
         let paths = StoragePaths::same(&storage);
-        let used = crate::pins::now_ms();
+        let used = crate::clock::now_ms();
         touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
         let before = sweep_checkout_views_at_for_test(&paths, FAMILY, used + 3_599_999);
         assert_eq!(before.removed_roots, 0, "{before:?}");
@@ -15143,7 +15143,7 @@ mod v3_collector_tests {
             ],
         );
         let paths = StoragePaths::same(&storage);
-        let used = crate::pins::now_ms();
+        let used = crate::clock::now_ms();
         touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
         for offset in [1, 20_000, 59_999] {
             touch_view_checkout(&paths, FAMILY, &root, 1, used + offset).unwrap();
@@ -15188,7 +15188,8 @@ mod v3_collector_tests {
         let (ctx, root) = checkout_activity_context(temp.path());
         let paths = ctx.storage_paths();
         let family = ctx.memoized_artifact_cache_key(&root);
-        let _space = v3::set_free_space_for_test(&paths.artifacts, u64::MAX, u64::MAX / 2);
+        let _space =
+            crate::disk_floor::set_free_space_for_test(&paths.artifacts, u64::MAX, u64::MAX / 2);
         v3::publish(&paths.artifacts, &family, 1 << 20, None, |publication| {
             publication
                 .registry
@@ -15273,7 +15274,7 @@ mod v3_collector_tests {
             1,
             "{logs:?}"
         );
-        let later = crate::pins::now_ms() + 60_000;
+        let later = crate::clock::now_ms() + 60_000;
         assert!(touch_view_checkout(&paths, &family, &root, 1, later).is_err());
         for offset in [1, 20_000, 59_999] {
             touch_view_checkout(&paths, &family, &root, 2, later + offset).unwrap();
@@ -15307,7 +15308,7 @@ mod v3_collector_tests {
             let graph = view_dir(&storage, "main.callgraph");
             fill_view_dir(&graph);
             let paths = StoragePaths::same(&storage);
-            let used = crate::pins::now_ms();
+            let used = crate::clock::now_ms();
             touch_view_checkout(&paths, FAMILY, &root, 1, used).unwrap();
             let pin = (hold == "pin").then(|| write_pin(&graph, "g1", live_owner()));
             let reader = (hold == "reader")
@@ -15402,7 +15403,7 @@ mod v3_collector_tests {
             ] {
                 tx.execute(
                     "UPDATE members SET last_bind_ms=?2 WHERE scope=?1",
-                    rusqlite::params![scope, crate::pins::now_ms() - age],
+                    rusqlite::params![scope, crate::clock::now_ms() - age],
                 )?;
             }
             Ok(())
@@ -15734,7 +15735,7 @@ mod v3_collector_tests {
         with_registry(&storage, |tx| {
             tx.execute(
                 "UPDATE members SET last_bind_ms=?1 WHERE scope='reappeared'",
-                [crate::pins::now_ms()],
+                [crate::clock::now_ms()],
             )?;
             tx.execute(
                 "UPDATE members SET last_bind_ms=0 WHERE scope='one-pass'",
@@ -16609,7 +16610,7 @@ mod v3_base_reference_collector_tests {
         let (unused, _) = publish_test_base(storage.path(), &[("src/a.rs", b"unused")]);
         let (pinned, _) = publish_test_base(storage.path(), &[("src/a.rs", b"pinned")]);
         let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &pinned.scope).unwrap();
-        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let _floor = crate::disk_floor::set_free_space_for_test(storage.path(), 0, 1 << 30);
         let probes = Arc::new(Mutex::new(Vec::new()));
         let _hook = observe_test_hook(
             storage.path(),
@@ -16618,11 +16619,14 @@ mod v3_base_reference_collector_tests {
                 let storage = storage.path().to_path_buf();
                 move |step| {
                     if step == "v3-pressure-reclaimed" {
-                        probes.lock().unwrap().push(v3::set_free_space_for_test(
-                            &storage,
-                            u64::MAX,
-                            1 << 30,
-                        ));
+                        probes
+                            .lock()
+                            .unwrap()
+                            .push(crate::disk_floor::set_free_space_for_test(
+                                &storage,
+                                u64::MAX,
+                                1 << 30,
+                            ));
                     }
                 }
             }),
@@ -16647,7 +16651,7 @@ mod v3_base_reference_collector_tests {
         let storage = tempfile::tempdir().unwrap();
         let (held, _) = publish_test_base(storage.path(), &[("src/a.rs", b"held")]);
         let _pin = crate::pins::LivePin::create_v3(storage.path(), FAMILY, &held.scope).unwrap();
-        let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+        let _floor = crate::disk_floor::set_free_space_for_test(storage.path(), 0, 1 << 30);
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let _hook = observe_test_hook(
             storage.path(),

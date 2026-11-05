@@ -31,7 +31,7 @@ use aft_store::ids::{Digest128, FamilyId};
 
 use super::checkout::{Checkout, CheckoutView, DataError, DataLayer};
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
-use crate::views::intent::{WriteIntent, WriteIntentListener, WritePhase};
+use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 
 /// Whether this process runs the data layer.
 #[must_use]
@@ -501,7 +501,7 @@ impl DataCheckout {
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
             quiet: Arc::clone(&quiet),
         });
-        crate::views::intent::register_listener(&listener);
+        crate::write_intent::register_listener(&listener);
         // A bind may have recorded what changed while nothing watched.
         work.catch_up(Publish::WhenMany);
         Ok(Arc::new(Self {

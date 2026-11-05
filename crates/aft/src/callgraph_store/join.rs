@@ -43,7 +43,7 @@ pub(crate) mod single_walk;
 #[path = "syntax_index.rs"]
 pub(crate) mod syntax_index;
 
-use super::facts::{BlobKey, FactPaths, ManifestFacts, ProjectFacts};
+use super::facts::{BlobKey, FactPaths, ManifestFacts, NoProjectFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
@@ -55,6 +55,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
+
+/// The reason a view publication fence gives when it refuses a publication
+/// because the checkout's view owner was superseded. A cancelled join
+/// ([`ManifestJoinError::Cancelled`]) reports the same text.
+pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publication refused";
 
 /// An error raised while decoding or assembling manifest-addressed callgraph data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,7 +75,7 @@ pub enum ManifestJoinError {
 impl fmt::Display for ManifestJoinError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cancelled => formatter.write_str(crate::views::first_load::SUPERSEDED_PUBLISH),
+            Self::Cancelled => formatter.write_str(SUPERSEDED_PUBLISH),
             Self::UnsupportedLanguage(language) => {
                 write!(formatter, "unsupported callgraph blob language {language}")
             }
@@ -361,16 +366,9 @@ impl CallgraphBlob {
         let mut imports = blob_imports(&data);
         let mut refs = blob_refs(&line_index, &data);
         refs.extend(rust_module_refs(source, lang, root));
-        let empty =
-            Manifest::new([]).map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-        let reader = |_: &BlobKey| None;
-        let empty_facts = ManifestFacts {
-            manifest: &empty,
-            blobs: &reader,
-        };
         let paths = FactPaths {
             root: Path::new("/"),
-            facts: &empty_facts,
+            facts: &NoProjectFacts,
         };
         let file = Path::new("/__callgraph_blob__");
         let mut structural = super::collect_reexport_refs_with_line_index(
@@ -3109,7 +3107,7 @@ fn join_manifest_with_surfaces(
         crate::memory::relieve_allocator_pressure();
     }
     profile.finish("decode_bind_index_entries");
-    let mut replay_stage = crate::views::materialization::profile::StageTimer::new("join");
+    let mut replay_stage = crate::stage_timer::StageTimer::new("join");
     let index = ManifestProjectIndex::from_parts(
         root,
         files,
@@ -3218,7 +3216,7 @@ fn join_manifest_with_surfaces(
     let mut dispatch_type_target_traces = 0;
     let mut module_domain_traces = 0;
     if let Some(plan) = dispatch_type_target_plan {
-        let mut stage = crate::views::materialization::profile::StageTimer::new("join");
+        let mut stage = crate::stage_timer::StageTimer::new("join");
         let (recompute, replayed) = match plan {
             DispatchTypeTargetPlan::All => (None, 0),
             DispatchTypeTargetPlan::Selected {
@@ -3660,15 +3658,9 @@ fn binding_caller_node_lookup_is_linear_and_preserves_first_duplicate() {
     let mut duplicate = parse.symbols[0].clone();
     duplicate.ordinal += 10000;
     parse.symbols.push(duplicate);
-    let manifest = Manifest::new([]).unwrap();
-    let reader = |_: &BlobKey| None;
-    let facts = ManifestFacts {
-        manifest: &manifest,
-        blobs: &reader,
-    };
     let paths = FactPaths {
         root: Path::new("/"),
-        facts: &facts,
+        facts: &NoProjectFacts,
     };
     CALLER_NODE_LOOKUP_WORK.with(|work| work.set(0));
     let extract = parse

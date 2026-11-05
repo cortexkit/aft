@@ -7,11 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -228,28 +227,6 @@ pub struct TrackedPath {
     pub tracked: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitHeadMetadata {
-    pub head_path: PathBuf,
-    pub head_mtime: Option<SystemTime>,
-    pub resolved_ref_path: Option<PathBuf>,
-    pub resolved_ref_mtime: Option<SystemTime>,
-}
-
-impl GitHeadMetadata {
-    pub fn matches_path(&self, path: &Path) -> bool {
-        same_file_path(path, &self.head_path)
-            || self
-                .resolved_ref_path
-                .as_deref()
-                .is_some_and(|resolved| same_file_path(path, resolved))
-    }
-
-    pub fn watch_paths(&self) -> impl Iterator<Item = &Path> {
-        std::iter::once(self.head_path.as_path()).chain(self.resolved_ref_path.as_deref())
-    }
-}
-
 impl TrackedPath {
     pub fn new(rel_path: Vec<u8>, mode: GitMode, git_oid: GitOid) -> Result<Self, AliasError> {
         validate_rel_path(&rel_path)?;
@@ -315,7 +292,7 @@ impl AliasStore {
             .join("oid-alias.sqlite");
         if let Some(parent) = path.parent() {
             crate::private_storage::open_dir(storage, parent).map_err(|e| {
-                crate::views::io::at("creating alias database directory", parent, e)
+                crate::io_accounting::at("creating alias database directory", parent, e)
             })?;
         }
 
@@ -635,7 +612,7 @@ impl ManifestSqliteStore {
     pub fn open(path: &Path) -> Result<Self, AliasError> {
         if let Some(parent) = path.parent() {
             crate::private_storage::create_dir_all(parent).map_err(|e| {
-                crate::views::io::at("creating alias manifest directory", parent, e)
+                crate::io_accounting::at("creating alias manifest directory", parent, e)
             })?;
         }
         let connection = crate::db::file_identity::IdentityConnection::open(
@@ -714,67 +691,6 @@ pub fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
 }
 
-pub fn capture_git_head_metadata(
-    repo_root: &Path,
-    git_common_dir: Option<&Path>,
-) -> Result<GitHeadMetadata, AliasError> {
-    let dot_git = repo_root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        canonical_or_original(dot_git)
-    } else {
-        let marker = fs::read_to_string(&dot_git)
-            .map_err(|e| crate::views::io::at("reading Git directory marker", &dot_git, e))?;
-        let relative = marker
-            .trim()
-            .strip_prefix("gitdir:")
-            .map(str::trim)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid gitdir marker at {}", dot_git.display()),
-                )
-            })?;
-        let path = PathBuf::from(relative);
-        canonical_or_original(if path.is_absolute() {
-            path
-        } else {
-            repo_root.join(path)
-        })
-    };
-    let head_path = canonical_or_original(git_dir.join("HEAD"));
-    let head = fs::read_to_string(&head_path)
-        .map_err(|e| crate::views::io::at("reading Git HEAD", &head_path, e))?;
-    let resolved_ref_path = head
-        .trim()
-        .strip_prefix("ref:")
-        .map(str::trim)
-        .filter(|reference| !reference.is_empty())
-        .map(|reference| canonical_or_original(git_common_dir.unwrap_or(&git_dir).join(reference)));
-    Ok(GitHeadMetadata {
-        head_mtime: modified_time(&head_path),
-        resolved_ref_mtime: resolved_ref_path.as_deref().and_then(modified_time),
-        head_path,
-        resolved_ref_path,
-    })
-}
-
-fn canonical_or_original(path: PathBuf) -> PathBuf {
-    fs::canonicalize(&path).unwrap_or(path)
-}
-
-fn modified_time(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-}
-
-fn same_file_path(path: &Path, target: &Path) -> bool {
-    path == target
-        || fs::canonicalize(target)
-            .map(|target| path == target)
-            .unwrap_or(false)
-}
-
 /// Lists `HEAD` paths from Git metadata without opening working-tree files.
 pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasError> {
     #[cfg(test)]
@@ -791,7 +707,7 @@ pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasErro
         .arg(repo_root)
         .args(["ls-tree", "-r", "-z", "HEAD"])
         .output()
-        .map_err(|e| crate::views::io::at("running git ls-tree -r -z HEAD in", repo_root, e))?;
+        .map_err(|e| crate::io_accounting::at("running git ls-tree -r -z HEAD in", repo_root, e))?;
     if !output.status.success() {
         return Err(AliasError::Git {
             command: "ls-tree -r -z HEAD",
@@ -931,7 +847,7 @@ fn git_filter_attributes(
         GIT_METADATA_TIMEOUT,
     )
     .map_err(|e| {
-        crate::views::io::at(
+        crate::io_accounting::at(
             "running git check-attr --cached -z --stdin filter in",
             repo_root,
             e,
@@ -1141,31 +1057,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn path_display(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
-}
-
-#[cfg(test)]
-mod io_tests {
-    use super::*;
-
-    #[test]
-    fn directory_head_error_names_operation_and_path() {
-        let root = tempfile::tempdir().unwrap();
-        let head = root.path().join(".git").join("HEAD");
-        fs::create_dir_all(&head).unwrap();
-        let error = capture_git_head_metadata(root.path(), None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("reading Git HEAD"), "{error}");
-        // Windows reports the root in its verbatim `\\?\` spelling, so accept
-        // the canonical form as well as the path the test built.
-        let canonical = fs::canonicalize(&head).unwrap();
-        assert!(
-            error.contains(&head.display().to_string())
-                || error.contains(&canonical.display().to_string()),
-            "{error}"
-        );
-        assert!(head.is_dir());
-    }
 }
 
 #[cfg(all(test, unix))]

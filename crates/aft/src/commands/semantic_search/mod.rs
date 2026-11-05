@@ -118,13 +118,14 @@ use crate::context::{AppContext, SemanticIndexStatus};
 use crate::feature_status::{
     cause as feature_cause, observed_index_status, IndexEffective, IndexObservation, IndexPlane,
 };
+use crate::git_root_resolution::GitRootResolutionError;
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
-use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
+use crate::readonly_artifacts::{ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from_matching,
     GrepMatch, GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
@@ -896,7 +897,7 @@ fn handle_semantic_search_with_disk_fallback(
         .map(str::trim)
         .filter(|path| !path.is_empty());
     let external_root = if let Some(requested_path) = requested_path {
-        let requested = project_root.join(crate::readonly_artifacts::expand_tilde(requested_path));
+        let requested = project_root.join(crate::git_root_resolution::expand_tilde(requested_path));
         let storage = crate::access_policy::policy_path(&ctx.storage_dir());
         let scan_root_is_protected = |root: &Path| {
             // Resolve both sides: storage may be configured through a parent

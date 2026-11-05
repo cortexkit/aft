@@ -9873,7 +9873,7 @@ fn walk_applicable_area_uncached(
             reason: "project root is not a directory".to_string(),
         });
     }
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .applicability_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     delay_applicability_walk_for_test();

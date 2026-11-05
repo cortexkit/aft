@@ -15,11 +15,14 @@ fn manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption() {
         let source = "export function target() {}";
         let key = crate::blob_store::CallgraphKey::for_current(source.as_bytes(), "typescript")
             .full_key();
-        let payload =
-            join::CallgraphBlob::extract(source, "typescript", crate::views::callgraph::PRODUCER)
-                .unwrap()
-                .to_bytes()
-                .unwrap();
+        let payload = join::CallgraphBlob::extract(
+            source,
+            "typescript",
+            crate::callgraph_extractor::PRODUCER,
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
         store.put(&key, &payload).unwrap();
         let connection = Connection::open(store.path()).unwrap();
         let reader = ManifestViewBlobReader::new(&connection);
@@ -2631,14 +2634,14 @@ fn incremental_dispatch_resolves_only_files_whose_inputs_changed() {
                 .path()
                 .join(format!("independent-{label}-{every_file}.sqlite"));
             crate::views::generation::clone_derived_for_test(&base_db, &db).unwrap();
-            let work_before = crate::views::io::work_snapshot();
+            let work_before = crate::io_accounting::work_snapshot();
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(every_file));
             let stats = apply_manifest_diff(&db, &base, next, &f.blobs);
             dispatch::RESOLVE_EVERY_FILE.with(|cell| cell.set(false));
             let stats = stats.unwrap();
             // The process-wide counters other tests also add to cover at least
             // this pass's own work.
-            let work_after = crate::views::io::work_snapshot();
+            let work_after = crate::io_accounting::work_snapshot();
             for (field, own) in [
                 ("dispatch_blobs_decoded", stats.dispatch_decoded_blobs),
                 ("dispatch_files_resolved", stats.dispatch_resolved_files),

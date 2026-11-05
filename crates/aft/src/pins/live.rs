@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    fs_lock, now_ms, pin_paths, root_cache, validate_generation, write_key_lines, write_metadata,
-    PinError, PinMetadata, PinOwner, Protection,
+    fs_lock, pin_paths, root_cache, validate_generation, write_key_lines, write_metadata, PinError,
+    PinMetadata, PinOwner, Protection,
 };
 use crate::blob_store::v2::{to_hex, FamilyKey};
+use crate::clock::now_ms;
 use crate::views::registry::ViewRegistration;
 
 /// Label prefix of live pins inside `pins/`.
@@ -96,7 +97,7 @@ impl LivePin {
         validate_generation(&label)?;
         let pins_dir = view_dir.join("pins");
         crate::private_storage::create_dir_all(&pins_dir)
-            .map_err(|e| crate::views::io::at("creating live pin directory", &pins_dir, e))?;
+            .map_err(|e| crate::io_accounting::at("creating live pin directory", &pins_dir, e))?;
         let (metadata_path, keys_path) = pin_paths(view_dir, &label);
         let metadata = PinMetadata {
             family,
@@ -190,11 +191,11 @@ impl LivePin {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)
-                .map_err(|e| crate::views::io::at("creating live pin keys", &temporary, e))?;
+                .map_err(|e| crate::io_accounting::at("creating live pin keys", &temporary, e))?;
             write_key_lines(file, self.keys.iter().map(String::as_str))
-                .map_err(|e| crate::views::io::at("writing live pin keys", &temporary, e))?;
+                .map_err(|e| crate::io_accounting::at("writing live pin keys", &temporary, e))?;
             fs_lock::rename_over(&temporary, &self.keys_path).map_err(|e| {
-                crate::views::io::at(
+                crate::io_accounting::at(
                     &format!("renaming live pin keys {} to", temporary.display()),
                     &self.keys_path,
                     e,

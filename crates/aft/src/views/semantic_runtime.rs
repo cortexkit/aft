@@ -30,7 +30,6 @@ use super::contracts::{PlaneAdapter, ViewAccess};
 use super::first_load::{
     CheckoutDriver, CompositePlane, ConfiguredMembershipWalker, FirstLoadDriver, InstalledDriver,
 };
-use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::ViewRegistration;
 use super::semantic::{
@@ -38,6 +37,7 @@ use super::semantic::{
     SemanticQuery,
 };
 use super::snapshot::{DiskState, LiveDelta, Snapshot};
+use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 
 /// Producer written into a manifest header for a plane its view does not
 /// register (for example the call graph of a lexical-only view).
@@ -224,7 +224,7 @@ impl CheckoutSemantic {
             root: root.to_path_buf(),
             slot: wake,
         });
-        super::intent::register_listener(&listener);
+        crate::write_intent::register_listener(&listener);
         let access = ViewAccess::Owner(owner.clone());
         hold_view(plane.as_ref(), &access);
         Ok(Self {
@@ -1480,7 +1480,7 @@ impl super::first_load::PublishFence for LaneFence {
             );
             Err(super::contracts::PlaneError {
                 plane: Some(crate::blob_store::v2::FamilyPlane::Semantic),
-                reason: super::first_load::SUPERSEDED_PUBLISH.to_owned(),
+                reason: crate::callgraph_store::join::SUPERSEDED_PUBLISH.to_owned(),
             })
         };
         let Some(slot) = self.slot.upgrade() else {
@@ -2700,7 +2700,7 @@ pub enum RefreshError {
 
 impl RefreshError {
     fn classify(reason: String) -> Self {
-        if reason.contains(super::first_load::SUPERSEDED_PUBLISH)
+        if reason.contains(crate::callgraph_store::join::SUPERSEDED_PUBLISH)
             || reason == "semantic lane superseded"
         {
             Self::Superseded
@@ -2716,7 +2716,7 @@ impl std::fmt::Display for RefreshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transient(reason) | Self::Unavailable(reason) => f.write_str(reason),
-            Self::Superseded => f.write_str(super::first_load::SUPERSEDED_PUBLISH),
+            Self::Superseded => f.write_str(crate::callgraph_store::join::SUPERSEDED_PUBLISH),
         }
     }
 }

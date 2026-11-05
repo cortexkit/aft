@@ -1302,7 +1302,13 @@ impl ViewStore {
                 }
                 let suffixes = if sqlite {
                     // A sealed donor's seal record goes with its database.
-                    &["", "-wal", "-shm", "-journal", super::donor::SEAL_SUFFIX][..]
+                    &[
+                        "",
+                        "-wal",
+                        "-shm",
+                        "-journal",
+                        crate::db::sealed_database::SEAL_SUFFIX,
+                    ][..]
                 } else {
                     &[""][..]
                 };

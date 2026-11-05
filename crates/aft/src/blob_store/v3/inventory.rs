@@ -102,7 +102,7 @@ fn inventory(path: &Path) -> Result<Arc<Mutex<Inventory>>> {
     type Cache = HashMap<PathBuf, (Instant, Arc<Mutex<Inventory>>)>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let path = fs::canonicalize(path)
-        .map_err(|e| crate::views::io::at("resolving v3 accounting directory", path, e))?;
+        .map_err(|e| crate::io_accounting::at("resolving v3 accounting directory", path, e))?;
     let mut cache = CACHE
         .get_or_init(Default::default)
         .lock()

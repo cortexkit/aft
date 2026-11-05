@@ -1116,7 +1116,7 @@ impl ViewRegistration {
     ) -> RegistryResult<Self> {
         let registry = FamilyRegistry::open_v3(storage, family)?;
         let root = std::fs::canonicalize(root)
-            .map_err(|e| super::io::at("resolving checkout root", root, e))?;
+            .map_err(|e| crate::io_accounting::at("resolving checkout root", root, e))?;
         let owner = current_owner();
         let session_id = super::base_refs::fresh_nonce();
         let view_dir = registry.with_barrier(|tx| {
@@ -1545,7 +1545,7 @@ fn path_text(path: &Path) -> String {
 }
 
 fn now_ms() -> u64 {
-    crate::pins::now_ms()
+    crate::clock::now_ms()
 }
 
 pub const VIEW_TOKEN_TTL_MS: u64 = 600_000;
@@ -1660,8 +1660,8 @@ pub fn consume_view_token(
         Err(_) => return Ok(TokenUse::IdentityMismatch),
     };
     let identities = match (
-        super::verification::NativeStat::strict_read(&root),
-        super::verification::NativeStat::strict_read(&directory),
+        crate::native_stat::NativeStat::strict_read(&root),
+        crate::native_stat::NativeStat::strict_read(&directory),
     ) {
         (Ok(root), Ok(gitdir)) => (root.identity, (directory, gitdir.identity)),
         _ => return Ok(TokenUse::IdentityMismatch),

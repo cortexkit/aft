@@ -1628,7 +1628,7 @@ impl SemanticPlane {
         }
         let mut items = self.work_items(&lock(&view), &resident, snapshot, true);
         report.queued = items.len();
-        super::io::WORK
+        crate::io_accounting::WORK
             .semantic_fills
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::cold_build_limiter::progress::remaining(items.len());
@@ -1672,7 +1672,7 @@ impl SemanticPlane {
                 crate::project_content::read(&source)
             };
             report.source_reads += 1;
-            super::io::WORK
+            crate::io_accounting::WORK
                 .semantic_files_filled
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             report.source_bytes += bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);

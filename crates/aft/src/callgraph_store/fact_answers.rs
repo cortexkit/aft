@@ -101,7 +101,7 @@ pub(crate) fn config_answer(bytes: Option<&[u8]>) -> FactAnswer {
 /// what is known to be the field's only input.
 pub(crate) fn config_field_answer(path: &[u8], bytes: Option<&[u8]>, name: &str) -> FactAnswer {
     let projected = bytes
-        .and_then(|bytes| crate::views::materialization::resolution_facts::project(path, bytes))
+        .and_then(|bytes| super::resolution_facts::project(path, bytes))
         .and_then(|fields| fields.get(name).cloned());
     match projected {
         Some(digest) => {

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::blob_store::v2::{parse_hex32, FamilyKey, FamilyPlane, FamilyStoreReader};
+use crate::callgraph_extractor::{source_language, PRODUCER};
 use crate::callgraph_store::join::{CallgraphBlob, ManifestBlobReader, ManifestJoinError};
 use crate::callgraph_store::ReadonlyCallGraphStore;
 
@@ -29,15 +30,6 @@ use super::manifest_v2::EntryV2;
 use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
 use super::snapshot::{ComposedGeneration, DiskState, LiveEntry, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
-
-/// Bump when extracted evidence, its encoding or interpretation changes. Version
-/// 9 omits the extraction-only AST index from stored payloads; facts are unchanged.
-/// Version 10 stores the parser's corrected symbols: Go type aliases, separate
-/// ranges for specs in a grouped `type (...)` block, and non-inverted ranges for
-/// HTML headings that share a row.
-/// Version 14 records the facts behind precise Go receiver, Python package and
-/// `super()`, TypeScript object-member and Rust trait and associated calls.
-pub const PRODUCER: &str = "ruled-callgraph-v14-resolver-precision";
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,13 +130,6 @@ pub(super) fn retire_attachments(
     }
 }
 
-/// Markdown has outline headings, not callable definitions or call references.
-/// It remains a manifest member for other planes, but needs no callgraph blob.
-pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
-    crate::parser::detect_language(path)
-        .filter(|language| *language != crate::parser::LangId::Markdown)
-}
-
 /// Whether a member needs a callgraph blob: a source file in a callgraph
 /// language, or resolver configuration such as `package.json`.
 pub(crate) fn applies_to(path: &RelPath) -> bool {
@@ -153,7 +138,7 @@ pub(crate) fn applies_to(path: &RelPath) -> bool {
 
 /// [`applies_to`] for a root-relative path with `/` separators.
 pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
-    super::assembly::is_resolution_input(path)
+    crate::callgraph_extractor::is_resolution_input(path)
         || std::str::from_utf8(path)
             .ok()
             .is_some_and(|p| source_language(Path::new(p)).is_some())
@@ -165,7 +150,7 @@ pub(crate) fn applies_to_relative(path: &[u8]) -> bool {
 /// the call graph does not index: neither a recognised source language nor a
 /// resolver configuration file such as `package.json`.
 pub(crate) fn graph_key(path: &[u8], source: blake3::Hash) -> Option<blake3::Hash> {
-    let language = if super::assembly::is_resolution_input(path) {
+    let language = if crate::callgraph_extractor::is_resolution_input(path) {
         "config".to_owned()
     } else {
         let path = std::str::from_utf8(path).ok()?;
@@ -2386,7 +2371,7 @@ mod tests {
             &storage, family, policy, &scope, &worker,
         )
         .unwrap();
-        let used = crate::pins::now_ms();
+        let used = crate::clock::now_ms();
         crate::storage_retention::touch_view_checkout(&paths, family, &main, 1, used).unwrap();
         drop(main_view);
         let due = used + 3_600_000;
@@ -2549,7 +2534,7 @@ mod tests {
                             (*name).to_owned(),
                             (
                                 text.len() as u64,
-                                crate::views::io::source_hash(text.as_bytes()),
+                                crate::io_accounting::source_hash(text.as_bytes()),
                             ),
                         )
                     })
@@ -2586,7 +2571,10 @@ mod tests {
                 let bytes = std::fs::read(second.join(name)).unwrap();
                 (
                     name.to_owned(),
-                    (bytes.len() as u64, crate::views::io::source_hash(&bytes)),
+                    (
+                        bytes.len() as u64,
+                        crate::io_accounting::source_hash(&bytes),
+                    ),
                 )
             })
             .collect();

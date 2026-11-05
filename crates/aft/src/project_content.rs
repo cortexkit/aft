@@ -416,12 +416,12 @@ pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     #[cfg(test)]
     record_open(path);
     use std::io::Read;
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut bytes = Vec::new();
     crate::task_temp_reads::open(path)?.read_to_end(&mut bytes)?;
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_read_bytes
         .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(bytes)
@@ -437,7 +437,7 @@ pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     admit(path, None)?;
     #[cfg(test)]
     record_open(path);
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .content_reads
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::task_temp_reads::open(path)

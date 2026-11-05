@@ -48,7 +48,7 @@ pub(crate) fn register_base_in(
         None => {
             tx.execute(
                 "INSERT INTO members(scope,kind,root,view_dir,registered_at_ms,last_bind_ms,state) VALUES(?1,'base',NULL,?2,?3,?3,'active')",
-                params![scope, dir.to_string_lossy(), crate::pins::now_ms() as i64],
+                params![scope, dir.to_string_lossy(), crate::clock::now_ms() as i64],
             )?;
             Ok((dir, true))
         }
@@ -340,7 +340,7 @@ fn claim_base_locked(
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let now = crate::pins::now_ms() as i64;
+        let now = crate::clock::now_ms() as i64;
         match existing {
             None => {
                 let registered: bool = tx.query_row(
@@ -439,7 +439,7 @@ impl BuildClaim {
                 super::base_refs::fresh_nonce()
             ));
         std::fs::create_dir_all(&dir)
-            .map_err(|e| super::io::at("creating base staging directory", &dir, e))?;
+            .map_err(|e| crate::io_accounting::at("creating base staging directory", &dir, e))?;
         Ok(dir)
     }
     /// `derived-<generation>-a<attempt>-<owner_token>.sqlite`.
@@ -610,12 +610,12 @@ impl BuildClaim {
             .view_dir()
             .join(format!(".derived-{generation}.ref.tmp"));
         std::fs::write(&temporary, owner.as_bytes())
-            .map_err(|e| super::io::at("writing derived reference", &temporary, e))?;
+            .map_err(|e| crate::io_accounting::at("writing derived reference", &temporary, e))?;
         // Windows refuses FlushFileBuffers on a read-only handle, so sync
         // through the views helper, which opens the file for writing there.
         super::sync_file(&temporary)?;
         std::fs::rename(&temporary, &reference).map_err(|e| {
-            super::io::at(
+            crate::io_accounting::at(
                 &format!("renaming derived reference {} to", temporary.display()),
                 &reference,
                 e,
@@ -634,15 +634,19 @@ impl BuildClaim {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                return Err(super::io::at("listing dead base staging", &staging, error).into())
+                return Err(
+                    crate::io_accounting::at("listing dead base staging", &staging, error).into(),
+                )
             }
         };
         for entry in entries {
-            let entry =
-                entry.map_err(|e| super::io::at("reading dead base staging entry", &staging, e))?;
+            let entry = entry.map_err(|e| {
+                crate::io_accounting::at("reading dead base staging entry", &staging, e)
+            })?;
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                std::fs::remove_dir_all(entry.path())
-                    .map_err(|e| super::io::at("removing dead base staging", &entry.path(), e))?;
+                std::fs::remove_dir_all(entry.path()).map_err(|e| {
+                    crate::io_accounting::at("removing dead base staging", &entry.path(), e)
+                })?;
             }
         }
         Ok(())
@@ -661,7 +665,7 @@ impl BuildClaim {
         with_base_barrier(&self.storage, &self.family, |tx| {
             let updated = tx.execute(
                 "UPDATE base_builds SET heartbeat_at_ms=?1 WHERE base_scope=?2 AND owner_token=?3",
-                params![crate::pins::now_ms() as i64, self.scope, self.token],
+                params![crate::clock::now_ms() as i64, self.scope, self.token],
             )?;
             if updated != 1 {
                 return Err(BaseRefError::Unavailable(
@@ -760,23 +764,23 @@ pub fn read_stable(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     for _ in 0..STABLE_READ_ATTEMPTS {
         let before = std::fs::symlink_metadata(path)
-            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
+            .map_err(|e| crate::io_accounting::at("reading base source metadata", path, e))?;
         if !before.is_file() {
-            return Err(super::io::at(
+            return Err(crate::io_accounting::at(
                 "reading base source",
                 path,
                 std::io::Error::other("not a regular file"),
             ));
         }
-        let bytes =
-            std::fs::read(path).map_err(|e| super::io::at("reading base source", path, e))?;
+        let bytes = std::fs::read(path)
+            .map_err(|e| crate::io_accounting::at("reading base source", path, e))?;
         let after = std::fs::symlink_metadata(path)
-            .map_err(|e| super::io::at("reading base source metadata", path, e))?;
+            .map_err(|e| crate::io_accounting::at("reading base source metadata", path, e))?;
         if stamp(&before) == stamp(&after) && bytes.len() as u64 == after.len() {
             return Ok(bytes);
         }
     }
-    Err(super::io::at(
+    Err(crate::io_accounting::at(
         "reading stable base source",
         path,
         std::io::Error::other("file kept changing during strict reads"),
@@ -797,7 +801,7 @@ pub(crate) fn base_entry(
         resolution_input, ..
     } = &mut entry
     {
-        *resolution_input = super::assembly::is_resolution_input(path.as_bytes());
+        *resolution_input = crate::callgraph_extractor::is_resolution_input(path.as_bytes());
     }
     entry
 }

@@ -17,10 +17,11 @@ impl ManifestBlobReader for Blobs {
 }
 fn frozen(root: &Path) -> (Manifest, Blobs) {
     let source = std::fs::read_to_string(root.join("fixture.ts")).unwrap();
-    let payload = CallgraphBlob::extract(&source, "typescript", super::callgraph::PRODUCER)
-        .unwrap()
-        .to_bytes()
-        .unwrap();
+    let payload =
+        CallgraphBlob::extract(&source, "typescript", crate::callgraph_extractor::PRODUCER)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
     let key = blake3::hash(&payload).to_hex().to_string();
     let manifest = Manifest::new([(
         RelPath::new(b"fixture.ts").unwrap(),

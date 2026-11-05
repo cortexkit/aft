@@ -38,10 +38,10 @@ use crate::callgraph_store::join::{
     DerivedRow, DispatchTypeTargets, ManifestJoinError, ParseBlob, ViewBindingDependencies,
     ViewBindingFacts,
 };
+use crate::callgraph_store::method_call_facts::FileFacts;
 use crate::callgraph_store::{
     DbFileIndex, LoadedFileIndexes, LoadedIndex, ProjectIndex, WorkspaceCratePrefixCache,
 };
-use crate::views::materialization::dispatch::FileFacts;
 
 use super::graph_rows::references_by_key;
 use super::graph_store::StoredSlices;

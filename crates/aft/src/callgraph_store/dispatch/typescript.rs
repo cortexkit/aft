@@ -216,8 +216,7 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
         nominal: bool,
         nav: N,
     ) -> Self {
-        let mut profile =
-            crate::views::materialization::profile::StageTimer::new("typescript_index");
+        let mut profile = crate::stage_timer::StageTimer::new("typescript_index");
         let mut result = Self {
             nodes,
             source,

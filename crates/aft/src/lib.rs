@@ -70,10 +70,12 @@ pub(crate) mod bounded_io;
 pub mod build_breaker;
 pub mod cache_freshness;
 pub mod callgraph;
+pub mod callgraph_extractor;
 pub mod callgraph_maintenance;
 pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;
+pub(crate) mod clock;
 pub mod cold_build_limiter;
 pub mod commands;
 pub mod compress;
@@ -87,6 +89,7 @@ pub mod data_layer;
 pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
+pub mod disk_floor;
 pub(crate) mod durability;
 pub mod edit;
 pub mod effective_path;
@@ -116,16 +119,20 @@ pub mod gh_shim_ticket;
 pub(crate) mod gh_shim_worker_broker;
 #[cfg(unix)]
 pub(crate) mod gh_shim_worker_endpoints;
+pub mod git_head;
 pub mod git_index_reader;
 pub(crate) mod git_probe;
+pub(crate) mod git_root_resolution;
 pub mod github_read;
 pub mod grep_executor;
 pub mod harness;
+pub mod harness_partition_guard;
 pub mod hashline;
 pub mod host_tool_names;
 pub mod imports;
 pub mod indent;
 pub mod inspect;
+pub(crate) mod io_accounting;
 pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
@@ -146,6 +153,7 @@ pub mod lsp_hints;
 pub mod memory;
 pub mod migrate_storage;
 pub mod migration;
+pub(crate) mod native_stat;
 pub mod ndjson_text;
 #[cfg(test)]
 mod nested_worktree_tests;
@@ -194,6 +202,7 @@ pub mod secret_proxy;
 pub mod semantic_admission;
 pub mod semantic_index;
 pub mod setup_plan;
+pub(crate) mod stage_timer;
 pub mod standing_roots;
 pub(crate) mod status_push;
 #[cfg(all(test, unix))]
@@ -220,6 +229,7 @@ pub(crate) mod walk_boundary;
 pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
+pub mod write_intent;
 pub mod write_ledger;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
@@ -240,6 +250,8 @@ pub(crate) mod search_hot_path_measurements;
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;
+#[cfg(all(test, windows))]
+pub(crate) mod test_read_denial;
 #[cfg(test)]
 pub(crate) mod test_support;
 

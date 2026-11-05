@@ -4,7 +4,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
-use crate::views::verification::NativeStat;
+use crate::native_stat::NativeStat;
 
 struct VerifiedContent {
     stat: NativeStat,

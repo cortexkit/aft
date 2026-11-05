@@ -477,7 +477,7 @@ fn member_row(
     let registry = v3::family_dir(storage, family)?.join("members.sqlite");
     if !registry
         .try_exists()
-        .map_err(|e| super::io::at("checking base registry", &registry, e))?
+        .map_err(|e| crate::io_accounting::at("checking base registry", &registry, e))?
     {
         return Ok(None);
     }
@@ -706,7 +706,7 @@ pub(crate) fn register_view_in(
     }
     tx.execute(
         "INSERT INTO members(scope,kind,root,view_dir,registered_at_ms,last_bind_ms,state) VALUES(?1,'view',?2,?3,?4,?4,'active') ON CONFLICT(scope) DO UPDATE SET last_bind_ms=excluded.last_bind_ms,root=excluded.root,missing_sweeps=0",
-        params![scope, encode_root(root), dir.to_string_lossy(), crate::pins::now_ms() as i64],
+        params![scope, encode_root(root), dir.to_string_lossy(), crate::clock::now_ms() as i64],
     )?;
     Ok(dir)
 }

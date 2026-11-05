@@ -36,8 +36,7 @@ fn absolute_sqlite_path(path: &Path) -> PathBuf {
 
 fn platform() -> *mut ffi::sqlite3_vfs {
     static PLATFORM: OnceLock<usize> = OnceLock::new();
-    *PLATFORM.get_or_init(|| crate::views::write_accounting::vfs() as usize)
-        as *mut ffi::sqlite3_vfs
+    *PLATFORM.get_or_init(|| crate::db::write_accounting::vfs() as usize) as *mut ffi::sqlite3_vfs
 }
 
 const VFS_NAME: &str = "aft-derived-dirty-pages";
@@ -55,7 +54,7 @@ pub(crate) fn open_probe_connection(
     if measured {
         Connection::open_with_flags_and_vfs(path, flags, VFS_NAME)
     } else {
-        crate::views::write_accounting::open_connection(path, flags)
+        crate::db::write_accounting::open_connection(path, flags)
     }
 }
 

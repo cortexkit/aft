@@ -1492,7 +1492,7 @@ fn over_hard(totals: UsageTotals, budget: DiskBudget, reserve: u64) -> Vec<Strin
 /// [`FAMILY_FREE_USAGE_SCHEMA`], created only when there are any to record,
 /// so a family that never measured free pages keeps the registry it had.
 fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<()> {
-    let now = crate::pins::now_ms() as i64;
+    let now = crate::clock::now_ms() as i64;
     let views_complete = usage.views_complete();
     registry.with_barrier(|tx| {
         tx.execute_batch(super::registry::RUNTIME_SCHEMA)?;
@@ -2382,7 +2382,7 @@ mod tests {
                     // A disappearing pending name makes std's metadata open
                     // and fallback fail. Deny listing after enumeration to make
                     // the fallback failure deterministic instead of timing it.
-                    let (guard, enforced) = crate::blob_store::v3::deny_read_for_test(
+                    let (guard, enforced) = crate::test_read_denial::deny_read_for_test(
                         path.parent().unwrap(),
                         "stat of a delete-pending file",
                         || fs::symlink_metadata(path),
@@ -2407,7 +2407,7 @@ mod tests {
         assert_eq!(result.unwrap(), (payload.len() as u64, true));
 
         let (denied, enforced) =
-            crate::blob_store::v3::deny_read_for_test(root.path(), "directory listing", || {
+            crate::test_read_denial::deny_read_for_test(root.path(), "directory listing", || {
                 fs::read_dir(root.path())
             });
         let result = tree_bytes(root.path(), None);
@@ -3282,7 +3282,7 @@ mod tests {
                 Producers {
                     trigram: policy().fingerprint_hex(),
                     semantic: None,
-                    callgraph: crate::views::callgraph::PRODUCER.into(),
+                    callgraph: crate::callgraph_extractor::PRODUCER.into(),
                 },
                 None,
                 Arc::new(ConfiguredMembershipWalker),
@@ -4505,13 +4505,13 @@ mod tests {
             .count();
         let mut passes = Vec::new();
         for _ in 0..5 {
-            let before = crate::views::io::WORK
+            let before = crate::io_accounting::WORK
                 .logical_aggregates
                 .load(Ordering::SeqCst);
             let started = Instant::now();
             let report = enforce(&registry, EnforceOptions::default()).unwrap();
             let wall_us = started.elapsed().as_micros() as u64;
-            let aggregates = crate::views::io::WORK
+            let aggregates = crate::io_accounting::WORK
                 .logical_aggregates
                 .load(Ordering::SeqCst)
                 - before;

@@ -582,7 +582,7 @@ fn g7_v3_writer_child() {
             thread::park();
         }
     }
-    let _space = v3::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
+    let _space = aft::disk_floor::set_free_space_for_test(&storage, u64::MAX, u64::MAX / 2);
     let missing_root = storage.join("g7-missing-checkout");
     v3::publish(&storage, &family, 1 << 20, None, |publication| {
         publication

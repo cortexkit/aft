@@ -24,7 +24,7 @@ use crate::parser::LangId;
 
 /// The version of the extractor whose output the records hold. Records
 /// carry it, so output from another version is extracted again.
-pub const EXTRACTOR_VERSION: &str = crate::views::callgraph::PRODUCER;
+pub const EXTRACTOR_VERSION: &str = crate::callgraph_extractor::PRODUCER;
 
 /// The scan policy every data-layer scan uses: a file a plane parses or
 /// embeds is read up to the larger read limit even past the text-index
@@ -44,7 +44,7 @@ pub fn scan_policy() -> aft_store::scan::ScanPolicy {
 /// file or a source file), or today's semantic index embeds files with its
 /// name or extension.
 fn parsed_or_embedded_path(path: &[u8]) -> bool {
-    if crate::views::assembly::is_resolution_input(path) {
+    if crate::callgraph_extractor::is_resolution_input(path) {
         return true;
     }
     let Ok(path) = std::str::from_utf8(path) else {
@@ -52,7 +52,7 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
     };
     let path = Path::new(path);
     path.extension().is_some_and(|extension| extension == "h")
-        || crate::views::callgraph::source_language(path).is_some()
+        || crate::callgraph_extractor::source_language(path).is_some()
         || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
@@ -61,7 +61,7 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
 /// graph does not read.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
-    if crate::views::assembly::is_resolution_input(path.as_bytes()) {
+    if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
         return Some("config".to_string());
     }
     let path = Path::new(path);
@@ -70,7 +70,7 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
         // then Objective-C. A header that is not text parses as nothing.
         crate::parser::detect_language_from_source(path, std::str::from_utf8(source).ok()?)?
     } else {
-        crate::views::callgraph::source_language(path)?
+        crate::callgraph_extractor::source_language(path)?
     };
     Some(format!("{language:?}").to_lowercase())
 }

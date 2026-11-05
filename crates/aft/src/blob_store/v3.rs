@@ -12,6 +12,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 
 use super::v2::{FamilyKey, FamilyPlane};
 use crate::db::file_identity::{identity_of, FileIdentity, IdentityConnection};
+use crate::disk_floor::{
+    canonical_free_space_path, free_disk_floor, free_space, record_floor_refusal,
+};
 use crate::persisted_format::{
     self, IncompatibleReason, PersistedStore, UnsupportedPersistedFormat,
 };
@@ -23,49 +26,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const LAYOUT_TAG: u32 = 2;
 pub const REGISTRY_APPLICATION_ID: i64 = 0x41465452;
 pub const PLANE_APPLICATION_ID: i64 = 0x41465450;
-/// Minimum free bytes a v3 reservation must leave on the device. The reserve
-/// is 5% of capacity, bounded by this minimum and [`MAX_FREE_BYTES`].
-pub const MIN_FREE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub const MAX_FREE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-
-pub(crate) fn free_disk_floor(capacity: u64) -> u64 {
-    (capacity / 20).clamp(MIN_FREE_BYTES, MAX_FREE_BYTES)
-}
-
-// View loaders carry refusal strings across their error boundaries. Preserve
-// the admission measurement separately so a later probe cannot turn an
-// unexpected probe failure into an ordinary reserve pause.
-static FLOOR_REFUSALS: Mutex<std::collections::BTreeMap<PathBuf, (u64, u64)>> =
-    Mutex::new(std::collections::BTreeMap::new());
-
 fn floor_refusal(storage: &Path, measurement: Option<(u64, u64)>) -> Error {
     record_floor_refusal(storage, measurement);
     Error::Refused("device_free_space_floor")
 }
 
-fn record_floor_refusal(storage: &Path, measurement: Option<(u64, u64)>) {
-    let mut refusals = FLOOR_REFUSALS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if measurement.is_none() && refusals.is_empty() {
-        return;
-    }
-    let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
-    if let Some(measurement) = measurement {
-        refusals.insert(key, measurement);
-    } else {
-        refusals.remove(&key);
-    }
-}
-
-pub(crate) fn floor_refusal_measurement(storage: &Path) -> Option<(u64, u64)> {
-    let key = canonical_free_space_path(storage).unwrap_or_else(|| storage.to_path_buf());
-    FLOOR_REFUSALS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .copied()
-}
 /// Sweep epochs a symbol-plane row survives without being touched. Symbol
 /// rows are a reusable cache that no manifest names, so the plane-row sweep
 /// ages them out by epoch instead of by marking.
@@ -316,205 +281,6 @@ pub fn view_dir(storage: &Path, family: &str, scope: &str) -> Result<PathBuf> {
     Ok(family_dir(storage, family)?.join("views").join(scope))
 }
 
-struct FreeSpaceOverrides {
-    storage: std::collections::BTreeMap<PathBuf, FreeSpaceOverride>,
-    unlimited: usize,
-}
-struct FreeSpaceOverride {
-    canonical: Option<PathBuf>,
-    value: Option<(u64, u64)>,
-}
-static FREE_SPACE: Mutex<FreeSpaceOverrides> = Mutex::new(FreeSpaceOverrides {
-    storage: std::collections::BTreeMap::new(),
-    unlimited: 0,
-});
-
-/// Restores a storage root's previous test probe when dropped, including on unwind.
-#[doc(hidden)]
-#[must_use]
-pub struct FreeSpaceTestGuard {
-    storage: PathBuf,
-    previous: Option<FreeSpaceOverride>,
-}
-impl Drop for FreeSpaceTestGuard {
-    fn drop(&mut self) {
-        let mut overrides = FREE_SPACE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(previous) = self.previous.take() {
-            overrides.storage.insert(self.storage.clone(), previous);
-        } else {
-            overrides.storage.remove(&self.storage);
-        }
-    }
-}
-
-/// Overrides probes under `storage` on every thread until the guard drops.
-/// Raw and canonical spellings both match; the most specific root wins.
-/// Production never calls this setter.
-#[doc(hidden)]
-pub fn set_free_space_for_test(storage: &Path, free: u64, capacity: u64) -> FreeSpaceTestGuard {
-    set_free_space_probe_for_test(storage, Some((free, capacity)))
-}
-
-#[cfg(test)]
-pub(crate) fn set_free_space_probe_failure_for_test(storage: &Path) -> FreeSpaceTestGuard {
-    set_free_space_probe_for_test(storage, None)
-}
-
-fn set_free_space_probe_for_test(storage: &Path, value: Option<(u64, u64)>) -> FreeSpaceTestGuard {
-    let storage = storage.to_path_buf();
-    let entry = FreeSpaceOverride {
-        canonical: canonical_free_space_path(&storage),
-        value,
-    };
-    let previous = FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .storage
-        .insert(storage.clone(), entry);
-    FreeSpaceTestGuard { storage, previous }
-}
-
-/// Admission can run before a storage root or its descendants exist. Resolve
-/// the existing ancestor, preserving missing components only for comparison.
-fn canonical_free_space_path(path: &Path) -> Option<PathBuf> {
-    for ancestor in path.ancestors() {
-        let existing = if ancestor.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            ancestor
-        };
-        if let Ok(canonical) = fs::canonicalize(existing) {
-            return Some(canonical.join(path.strip_prefix(ancestor).ok()?));
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-pub(crate) struct UnlimitedFreeSpaceForTestProcess;
-#[cfg(test)]
-impl Drop for UnlimitedFreeSpaceForTestProcess {
-    fn drop(&mut self) {
-        FREE_SPACE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .unlimited -= 1;
-    }
-}
-/// Existing shared fixtures acquire their guard before creating one or more
-/// storage roots. Their fallback can only allow admission; refusal simulations
-/// must name a storage root and always take precedence over this fallback.
-#[cfg(test)]
-fn unlimited_free_space_for_test_process() -> UnlimitedFreeSpaceForTestProcess {
-    FREE_SPACE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .unlimited += 1;
-    UnlimitedFreeSpaceForTestProcess
-}
-/// The platform probe itself, bypassing the test override.
-#[cfg(test)]
-pub(crate) fn probe_free_space_for_test(path: &Path) -> Option<(u64, u64)> {
-    probe_free_space(path)
-}
-fn free_space(path: &Path) -> Option<(u64, u64)> {
-    let value = {
-        let overrides = FREE_SPACE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let canonical = if overrides.storage.is_empty() {
-            None
-        } else {
-            canonical_free_space_path(path)
-        };
-        overrides
-            .storage
-            .iter()
-            .filter_map(|(root, entry)| {
-                let canonical_depth = canonical.as_ref().and_then(|path| {
-                    entry
-                        .canonical
-                        .as_ref()
-                        .filter(|root| path.starts_with(root))
-                        .map(|root| root.components().count())
-                });
-                let depth = canonical_depth
-                    .or_else(|| path.starts_with(root).then(|| root.components().count()))?;
-                Some((depth, entry.value))
-            })
-            .max_by_key(|(depth, _)| *depth)
-            .map(|(_, value)| value)
-            .or_else(|| (overrides.unlimited > 0).then_some(Some((u64::MAX, u64::MAX / 2))))
-    };
-    if let Some(value) = value {
-        return value;
-    }
-    probe_free_space(path)
-}
-#[cfg(unix)]
-fn probe_free_space(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    // The storage root may not exist yet. Probe its nearest existing ancestor
-    // without creating anything, so a first-floor refusal is read-only.
-    let mut existing = path;
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-    }
-    let path = std::ffi::CString::new(existing.as_os_str().as_bytes()).ok()?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: path is NUL-terminated and stat points to writable storage.
-    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: statvfs succeeded and initialized stat.
-    let stat = unsafe { stat.assume_init() };
-    Some((
-        (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64),
-        (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64),
-    ))
-}
-#[cfg(windows)]
-fn probe_free_space(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::ffi::OsStrExt;
-    // As on unix: probe the nearest existing ancestor without creating it.
-    let mut existing = path;
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-    }
-    let wide: Vec<u16> = existing
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut available = 0u64;
-    let mut total = 0u64;
-    let mut total_free = 0u64;
-    // SAFETY: `wide` is NUL-terminated and the three out-pointers name live
-    // u64 locals for the duration of the call.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut available,
-            &mut total,
-            &mut total_free,
-        )
-    };
-    // `available` honours per-user quotas, like statvfs's f_bavail.
-    (ok != 0).then_some((available, total))
-}
-#[cfg(not(any(unix, windows)))]
-fn probe_free_space(_path: &Path) -> Option<(u64, u64)> {
-    None
-}
-
 /// Read the whole namespace, including SQLite sidecars and member directories.
 /// Symlinks are charged as entries, not followed outside the namespace.
 pub fn allocated_bytes(path: &Path) -> Result<u64> {
@@ -581,7 +347,7 @@ fn walk_allocated(
     entries: &mut inventory::Entries,
 ) -> Result<bool> {
     for entry in fs::read_dir(path)
-        .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
+        .map_err(|e| crate::io_accounting::at("listing v3 accounting directory", path, e))?
     {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(false);
@@ -593,7 +359,7 @@ fn walk_allocated(
             }
         });
         let entry =
-            entry.map_err(|e| crate::views::io::at("reading v3 accounting entry", path, e))?;
+            entry.map_err(|e| crate::io_accounting::at("reading v3 accounting entry", path, e))?;
         let path = entry.path();
         #[cfg(test)]
         WALK_BEFORE_STAT.with(|hook| {
@@ -607,9 +373,12 @@ fn walk_allocated(
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(
-                    crate::views::io::at("reading v3 accounting metadata", &path, error).into(),
+                return Err(crate::io_accounting::at(
+                    "reading v3 accounting metadata",
+                    &path,
+                    error,
                 )
+                .into())
             }
         };
         let relative = path
@@ -646,7 +415,7 @@ fn walk_stat_allocated(
 ) -> Result<Option<u64>> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)
-        .map_err(|e| crate::views::io::at("listing v3 accounting directory", path, e))?
+        .map_err(|e| crate::io_accounting::at("listing v3 accounting directory", path, e))?
     {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Ok(None);
@@ -658,7 +427,7 @@ fn walk_stat_allocated(
             }
         });
         let entry =
-            entry.map_err(|e| crate::views::io::at("reading v3 accounting entry", path, e))?;
+            entry.map_err(|e| crate::io_accounting::at("reading v3 accounting entry", path, e))?;
         let path = entry.path();
         #[cfg(test)]
         WALK_BEFORE_STAT.with(|hook| {
@@ -675,9 +444,12 @@ fn walk_stat_allocated(
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(
-                    crate::views::io::at("reading v3 accounting metadata", &path, error).into(),
+                return Err(crate::io_accounting::at(
+                    "reading v3 accounting metadata",
+                    &path,
+                    error,
                 )
+                .into())
             }
         };
         if meta.is_dir() {
@@ -719,7 +491,7 @@ fn registry_allocated(dir: &Path) -> Result<u64> {
             Ok(meta) => total = total.saturating_add(file_allocated(&meta)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(crate::views::io::at(
+                return Err(crate::io_accounting::at(
                     "reading v3 registry accounting metadata",
                     &path,
                     error,
@@ -810,7 +582,7 @@ impl ReservationLock {
         crate::reader_floor::publish_v3_with_floor(storage, FORMAT_VERSION, FORMAT_VERSION, || {
             let dir = storage.join("blobs/v3");
             fs::create_dir_all(&dir)
-                .map_err(|e| crate::views::io::at("creating v3 namespace", &dir, e))?;
+                .map_err(|e| crate::io_accounting::at("creating v3 namespace", &dir, e))?;
             Ok(dir.join("reservations.lock"))
         })
         .map_err(|e| Error::Io(std::io::Error::other(e)))?
@@ -837,7 +609,7 @@ impl ReservationLock {
     fn verify(&self, storage: &Path) -> Result<()> {
         if self.storage != storage
             || !self.guard.verify_writer_epoch().map_err(|e| {
-                crate::views::io::at(
+                crate::io_accounting::at(
                     "verifying v3 reservation lock",
                     &storage.join("blobs/v3/reservations.lock"),
                     e,
@@ -1183,18 +955,20 @@ fn for_each_registry(
     let root = storage.join("blobs/v3");
     if !root
         .try_exists()
-        .map_err(|e| crate::views::io::at("checking v3 namespace", &root, e))?
+        .map_err(|e| crate::io_accounting::at("checking v3 namespace", &root, e))?
     {
         return Ok(());
     }
-    for entry in
-        fs::read_dir(&root).map_err(|e| crate::views::io::at("listing v3 registries", &root, e))?
+    for entry in fs::read_dir(&root)
+        .map_err(|e| crate::io_accounting::at("listing v3 registries", &root, e))?
     {
         let entry =
-            entry.map_err(|e| crate::views::io::at("reading v3 registry entry", &root, e))?;
+            entry.map_err(|e| crate::io_accounting::at("reading v3 registry entry", &root, e))?;
         if !entry
             .file_type()
-            .map_err(|e| crate::views::io::at("reading v3 registry entry type", &entry.path(), e))?
+            .map_err(|e| {
+                crate::io_accounting::at("reading v3 registry entry type", &entry.path(), e)
+            })?
             .is_dir()
         {
             continue;
@@ -1383,18 +1157,18 @@ fn check_floor(storage: &Path, request: u64, own: Option<(&Path, &Connection)>) 
     let root = storage.join("blobs/v3");
     if root
         .try_exists()
-        .map_err(|e| crate::views::io::at("checking v3 namespace", &root, e))?
+        .map_err(|e| crate::io_accounting::at("checking v3 namespace", &root, e))?
     {
         for entry in fs::read_dir(&root)
-            .map_err(|e| crate::views::io::at("listing v3 reservation registries", &root, e))?
+            .map_err(|e| crate::io_accounting::at("listing v3 reservation registries", &root, e))?
         {
             let entry = entry.map_err(|e| {
-                crate::views::io::at("reading v3 reservation registry entry", &root, e)
+                crate::io_accounting::at("reading v3 reservation registry entry", &root, e)
             })?;
             if !entry
                 .file_type()
                 .map_err(|e| {
-                    crate::views::io::at(
+                    crate::io_accounting::at(
                         "reading v3 reservation registry entry type",
                         &entry.path(),
                         e,
@@ -1487,7 +1261,7 @@ impl<'a> RegistryWriter<'a> {
         let dir = family_dir(storage, family)?;
         if create {
             fs::create_dir_all(&dir)
-                .map_err(|e| crate::views::io::at("creating v3 family directory", &dir, e))?;
+                .map_err(|e| crate::io_accounting::at("creating v3 family directory", &dir, e))?;
         }
         Ok(Self {
             database: connections::shared(
@@ -1761,7 +1535,7 @@ impl<'a> RegistryWriter<'a> {
             scope,
         )?;
         let root = root.and_then(encode_root);
-        self.with_barrier(|tx| { tx.execute("INSERT INTO members(scope,kind,root,view_dir,registered_at_ms,last_bind_ms,state) VALUES(?1,?2,?3,?4,?5,?5,'active') ON CONFLICT(scope) DO UPDATE SET last_bind_ms=excluded.last_bind_ms,root=excluded.root",params![scope,kind,root,dir.to_string_lossy(),crate::pins::now_ms()])?; Ok(()) })?;
+        self.with_barrier(|tx| { tx.execute("INSERT INTO members(scope,kind,root,view_dir,registered_at_ms,last_bind_ms,state) VALUES(?1,?2,?3,?4,?5,?5,'active') ON CONFLICT(scope) DO UPDATE SET last_bind_ms=excluded.last_bind_ms,root=excluded.root",params![scope,kind,root,dir.to_string_lossy(),crate::clock::now_ms()])?; Ok(()) })?;
         Ok(dir)
     }
     pub fn release(&mut self, reservation: Reservation) -> Result<()> {
@@ -1842,7 +1616,7 @@ impl<'a> RegistryWriter<'a> {
     fn registry_identity(&self) -> Result<RegistryIdentity> {
         let registry = self.dir.join("members.sqlite");
         let path = fs::canonicalize(&registry)
-            .map_err(|e| crate::views::io::at("resolving v3 registry", &registry, e))?;
+            .map_err(|e| crate::io_accounting::at("resolving v3 registry", &registry, e))?;
         Ok(RegistryIdentity {
             file: identity_of(&path),
             path,
@@ -2135,7 +1909,7 @@ pub fn open_base_refs_registry<'a>(
             observe(observer, DurabilityStep::V3FloorRaised);
             let path = family_dir(storage, family)?.join("members.sqlite");
             let exists = path.try_exists().map_err(|e| {
-                crate::views::io::at("checking v3 base reference registry", &path, e)
+                crate::io_accounting::at("checking v3 base reference registry", &path, e)
             })?;
             let mut registry = if exists {
                 RegistryWriter::open_for_barrier(storage, family, lock)?
@@ -2457,9 +2231,9 @@ impl Publication<'_, '_> {
             false
         } else {
             if layout == 1 {
-                tx.execute("INSERT INTO blob_payloads VALUES(?1,?2,?3,?4,(SELECT gc_epoch FROM store_meta),?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
+                tx.execute("INSERT INTO blob_payloads VALUES(?1,?2,?3,?4,(SELECT gc_epoch FROM store_meta),?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::clock::now_ms()])?;
             } else {
-                tx.execute("INSERT INTO blob_payloads(full_key,payload,payload_digest,payload_schema,created_at_ms) VALUES(?1,?2,?3,?4,?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::pins::now_ms()])?;
+                tx.execute("INSERT INTO blob_payloads(full_key,payload,payload_digest,payload_schema,created_at_ms) VALUES(?1,?2,?3,?4,?5)",params![key.as_bytes().as_slice(),payload,digest.as_bytes().as_slice(),payload_schema,crate::clock::now_ms()])?;
                 tx.execute("INSERT INTO blob_liveness VALUES(last_insert_rowid(),(SELECT gc_epoch FROM store_meta))",[])?;
             }
             true
@@ -2475,7 +2249,7 @@ impl Publication<'_, '_> {
             checkpoint(&**database.connection()?)?;
         }
         crate::durability::sync_dir(&self.registry.dir).map_err(|e| {
-            crate::views::io::at("syncing v3 registry directory", &self.registry.dir, e)
+            crate::io_accounting::at("syncing v3 registry directory", &self.registry.dir, e)
         })?;
         Ok(())
     }
@@ -2669,5 +2443,3 @@ mod replay_tests;
 mod source_guard;
 #[cfg(test)]
 mod tests;
-#[cfg(all(test, windows))]
-pub(crate) use tests::deny_read_for_test;

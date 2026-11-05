@@ -746,7 +746,7 @@ impl GitQueries {
             timeout
         };
         pump(&mut command, input, timeout, &self.spawned).map_err(|error| {
-            crate::views::io::at(
+            crate::io_accounting::at(
                 &format!("running git {} in", args.join(" ")),
                 &self.root,
                 error,
@@ -775,7 +775,7 @@ fn pump(
         .stderr(Stdio::piped())
         .spawn()?;
     spawned.fetch_add(1, Ordering::Relaxed);
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .git_subprocesses
         .fetch_add(1, Ordering::Relaxed);
     let mut stdin = child.stdin.take().expect("piped stdin");
@@ -1196,7 +1196,7 @@ mod tests {
             io::Error::last_os_error()
         );
         // Prevent std's directory-listing fallback from hiding the delete-pending error.
-        let (_denied, enforced) = crate::blob_store::v3::deny_read_for_test(
+        let (_denied, enforced) = crate::test_read_denial::deny_read_for_test(
             lock.parent().unwrap(),
             "delete-pending index.lock metadata",
             || fs::symlink_metadata(&lock),
@@ -1738,14 +1738,14 @@ mod tests {
 fn attribute_source_queries_count_both_spawns_even_on_unsupported_git() {
     let root = tempfile::tempdir().unwrap();
     let queries = GitQueries::new(root.path().to_owned(), Duration::from_secs(2));
-    let before = crate::views::io::WORK
+    let before = crate::io_accounting::WORK
         .git_subprocesses
         .load(Ordering::Relaxed);
     queries.attribute_source(false).unwrap();
     queries.attribute_source(true).unwrap();
     assert_eq!(queries.spawned(), 2);
     assert!(
-        crate::views::io::WORK
+        crate::io_accounting::WORK
             .git_subprocesses
             .load(Ordering::Relaxed)
             >= before + 2

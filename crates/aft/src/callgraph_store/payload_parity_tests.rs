@@ -58,7 +58,7 @@ fn cold_pair(root: &Path, files: &[PathBuf]) {
             || path
                 .file_name()
                 .is_some_and(|name| name == ".gitignore" || name == ".aftignore");
-        let language = crate::views::callgraph::source_language(path);
+        let language = crate::callgraph_extractor::source_language(path);
         if !config && language.is_none() {
             continue;
         }

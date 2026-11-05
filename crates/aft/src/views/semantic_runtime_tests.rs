@@ -1942,7 +1942,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
         for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
             let file = root.path().join("file_0000.rs");
             {
-                let _intent = crate::views::intent::record_paths([file.as_path()]);
+                let _intent = crate::write_intent::record_paths([file.as_path()]);
                 std::fs::write(&file, &source).unwrap();
             }
             let before = model.texts();
@@ -1962,7 +1962,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
                 "second/third worktree repeated an embedding"
             );
             // Repeated no-op writes to the same content must not send texts.
-            let _intent = crate::views::intent::record_paths([file.as_path()]);
+            let _intent = crate::write_intent::record_paths([file.as_path()]);
             std::fs::write(&file, &source).unwrap();
             drop(_intent);
             let report = runtime
@@ -2084,7 +2084,7 @@ fn watcher_and_aft_edits_reach_the_fill() {
     let before = model.texts();
     let target = root_path.join("src/alpha.rs");
     {
-        let _intent = crate::views::intent::record_paths([target.as_path()]);
+        let _intent = crate::write_intent::record_paths([target.as_path()]);
         std::fs::write(&target, "pub fn alpha_written_by_aft() -> u8 {\n    1\n}\n").unwrap();
     }
     assert!(
@@ -2197,7 +2197,7 @@ fn large_own_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSem
         .map(|i| root.path().join(format!("file_{i:04}.rs")))
         .collect();
     {
-        let _intent = crate::views::intent::record_paths(paths.iter().map(PathBuf::as_path));
+        let _intent = crate::write_intent::record_paths(paths.iter().map(PathBuf::as_path));
         for (i, path) in paths.iter().enumerate() {
             std::fs::write(path, format!("pub fn own_item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
         }
@@ -2322,7 +2322,7 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
     let target = root.join("file_0000.rs");
     let changed = "pub fn rewritten_item() -> u32 { 9999 }\n";
     {
-        let _intent = crate::views::intent::record_paths([target.as_path()]);
+        let _intent = crate::write_intent::record_paths([target.as_path()]);
         std::fs::write(&target, changed).unwrap();
     }
     let report = runtime
@@ -4967,7 +4967,7 @@ fn superseded_lane_cannot_publish_over_its_replacement() {
 
     let error = refused.expect_err("a superseded lane published its view");
     assert!(
-        error.contains(super::super::first_load::SUPERSEDED_PUBLISH),
+        error.contains(crate::callgraph_store::join::SUPERSEDED_PUBLISH),
         "{error}"
     );
     // The member's published generation is still the replacement's.
@@ -5021,12 +5021,11 @@ fn aft_writes_wake_only_their_own_lane() {
     .unwrap();
     assert!(slot.install(epoch, Arc::new(runtime)));
     {
-        let _intent = crate::views::intent::record_paths([other.path().join("x.rs").as_path()]);
+        let _intent = crate::write_intent::record_paths([other.path().join("x.rs").as_path()]);
     }
     assert!(wake.try_recv().is_err());
     {
-        let _intent =
-            crate::views::intent::record_paths([root_path.join("src/alpha.rs").as_path()]);
+        let _intent = crate::write_intent::record_paths([root_path.join("src/alpha.rs").as_path()]);
     }
     assert!(wake.try_recv().is_ok());
     slot.clear();

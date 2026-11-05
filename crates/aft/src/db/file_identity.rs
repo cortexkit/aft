@@ -400,7 +400,7 @@ impl IdentityConnection {
 
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
         super::lifecycle::production_write_gate(path.as_ref())?;
-        crate::views::donor::refuse_sealed_write(path.as_ref())?;
+        super::sealed_database::refuse_sealed_write(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
         // Long view-store paths (and their `-journal`/`-wal` sidecars) pass
@@ -412,7 +412,7 @@ impl IdentityConnection {
             rusqlite::OpenFlags::default(),
         )?;
         #[cfg(not(test))]
-        let connection = crate::views::write_accounting::open_connection(
+        let connection = crate::db::write_accounting::open_connection(
             &sqlite_path,
             rusqlite::OpenFlags::default(),
         )?;
@@ -426,7 +426,7 @@ impl IdentityConnection {
     ) -> rusqlite::Result<Self> {
         if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
             super::lifecycle::production_write_gate(path.as_ref())?;
-            crate::views::donor::refuse_sealed_write(path.as_ref())?;
+            super::sealed_database::refuse_sealed_write(path.as_ref())?;
         }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
@@ -443,7 +443,7 @@ impl IdentityConnection {
         #[cfg(test)]
         let connection = crate::views::materialization::open_probe_connection(&sqlite_path, flags)?;
         #[cfg(not(test))]
-        let connection = crate::views::write_accounting::open_connection(&sqlite_path, flags)?;
+        let connection = crate::db::write_accounting::open_connection(&sqlite_path, flags)?;
         Ok(Self::new(connection, seam))
     }
 

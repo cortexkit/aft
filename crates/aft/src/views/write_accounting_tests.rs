@@ -129,10 +129,7 @@ fn publication_store_writes_are_local_and_noop_is_zero() {
             assert_eq!(snapshot.0[3].wal_bytes, 0);
         } else {
             assert_eq!(count, 0);
-            assert_eq!(
-                snapshot,
-                super::super::write_accounting::Snapshot::default()
-            );
+            assert_eq!(snapshot, crate::db::write_accounting::Snapshot::default());
         }
         drop(prepared);
         let view = ViewStore::open(&request.storage, &request.scope).unwrap();
@@ -142,7 +139,7 @@ fn publication_store_writes_are_local_and_noop_is_zero() {
 
 #[test]
 fn publication_counter_read_overhead() {
-    let publication = super::super::write_accounting::Publication::default();
+    let publication = crate::db::write_accounting::Publication::default();
     let started = Instant::now();
     for _ in 0..100_000 {
         std::hint::black_box(publication.snapshot());
@@ -158,7 +155,7 @@ fn publication_counter_read_overhead() {
     eprintln!(
         "STORE_OVERHEAD fields_us={:.3} samples=10000 record_us={:.3} record_samples=100000",
         started.elapsed().as_secs_f64() * 1e6 / 10_000.0,
-        super::super::write_accounting::counter_overhead_us()
+        crate::db::write_accounting::counter_overhead_us()
     );
     let paths = (0..300)
         .map(|index| format!("src/file_{index:03}.ts").into_bytes())

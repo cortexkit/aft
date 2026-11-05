@@ -580,7 +580,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     let producers = Producers {
         trigram: session.trigram_policy.fingerprint_hex(),
         semantic: None,
-        callgraph: super::super::callgraph::PRODUCER.into(),
+        callgraph: crate::callgraph_extractor::PRODUCER.into(),
     };
     let scope = super::super::callgraph::view_scope(&child.root);
     let generation = match super::super::base_refs::open_foreign_v3(

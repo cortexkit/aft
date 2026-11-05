@@ -288,38 +288,6 @@ impl PhaseTimer {
     }
 }
 
-/// Wall-clock sub-stages inside one materialization phase, printed to stderr
-/// as `view_profile {prefix}.{stage} ms=...` only when `AFT_VIEW_PROFILE` is
-/// set. Unlike [`PhaseTimer`] it records nothing into [`PhaseTimings`].
-pub(crate) struct StageTimer {
-    prefix: &'static str,
-    pub(crate) enabled: bool,
-    started: Instant,
-}
-
-impl StageTimer {
-    pub(crate) fn new(prefix: &'static str) -> Self {
-        Self {
-            prefix,
-            enabled: std::env::var_os("AFT_VIEW_PROFILE").is_some(),
-            started: Instant::now(),
-        }
-    }
-
-    pub(crate) fn finish(&mut self, stage: &str, detail: std::fmt::Arguments<'_>) {
-        #[cfg(test)]
-        crate::test_allocations::heap_marker(self.prefix, stage);
-        if self.enabled {
-            eprintln!(
-                "view_profile {}.{stage} ms={:.3} {detail}",
-                self.prefix,
-                self.started.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        self.started = Instant::now();
-    }
-}
-
 pub(crate) struct PhaseProbe {
     started: Instant,
     cache_writes_before: Option<u64>,

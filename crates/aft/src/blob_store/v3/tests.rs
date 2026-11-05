@@ -1,4 +1,10 @@
 use super::*;
+use crate::disk_floor::{
+    set_free_space_for_test, unlimited_free_space_for_test_process, FreeSpaceTestGuard,
+    UnlimitedFreeSpaceForTestProcess, MIN_FREE_BYTES,
+};
+#[cfg(windows)]
+use crate::test_read_denial::deny_read_for_test;
 use std::sync::{MutexGuard, OnceLock};
 use tempfile::tempdir;
 
@@ -35,76 +41,6 @@ pub(super) fn serial() -> SerialTestGuard {
         _unlimited: unlimited_free_space_for_test_process(),
         _serial: guard,
     }
-}
-
-#[test]
-fn free_space_override_guard_restores_after_unwind() {
-    let _serial = serial();
-    let storage = tempdir().unwrap();
-    let _previous = set_free_space_for_test(storage.path(), 17, 42);
-    let observed = Mutex::new(None);
-    let panic = std::panic::catch_unwind(|| {
-        let _guard = set_free_space_for_test(storage.path(), 1, 1 << 40);
-        *observed.lock().unwrap() = free_space(storage.path());
-        panic!("unwind the free-space test guard");
-    });
-    assert!(panic.is_err());
-    assert_eq!(*observed.lock().unwrap(), Some((1, 1 << 40)));
-    assert_eq!(free_space(storage.path()), Some((17, 42)));
-    drop(_previous);
-    assert_eq!(free_space(storage.path()), Some((u64::MAX, u64::MAX / 2)));
-}
-
-#[test]
-fn free_space_override_reaches_other_threads_under_its_storage_root() {
-    let _serial = serial();
-    let root = tempdir().unwrap();
-    let storage = root.path().join("storage");
-    let _space = set_free_space_for_test(&storage, 17, 42);
-    let path = storage.join("blobs/v3/plane.sqlite");
-    assert_eq!(
-        std::thread::spawn(move || free_space(&path))
-            .join()
-            .unwrap(),
-        Some((17, 42))
-    );
-    assert_eq!(
-        free_space(&root.path().join("storage-other")),
-        Some((u64::MAX, u64::MAX / 2))
-    );
-    let inner = storage.join("nested");
-    let _inner = set_free_space_for_test(&inner, 23, 84);
-    assert_eq!(free_space(&inner.join("blobs/v3")), Some((23, 84)));
-    assert_eq!(free_space(&storage), Some((17, 42)));
-}
-
-#[cfg(unix)]
-#[test]
-fn free_space_override_matches_resolved_symlink_roots() {
-    let _serial = serial();
-    let root = tempdir().unwrap();
-    let storage = root.path().join("storage");
-    fs::create_dir(&storage).unwrap();
-    let alias = root.path().join("alias");
-    std::os::unix::fs::symlink(&storage, &alias).unwrap();
-    let resolved = fs::canonicalize(&storage).unwrap();
-
-    for suffix in ["", "not-created"] {
-        let raw = alias.join(suffix);
-        let canonical = resolved.join(suffix);
-        let _space = set_free_space_for_test(&raw, 17, 42);
-        assert_eq!(free_space(&raw), Some((17, 42)));
-        assert_eq!(free_space(&canonical), Some((17, 42)));
-        assert_eq!(
-            free_space(&canonical.join("missing/blobs/v3")),
-            Some((17, 42))
-        );
-        assert_eq!(
-            free_space(&root.path().join("other-storage")),
-            Some((u64::MAX, u64::MAX / 2))
-        );
-    }
-    assert!(!storage.join("not-created").exists());
 }
 
 fn key() -> FamilyKey {
@@ -241,61 +177,6 @@ fn open_permission_fixture(
         // SAFETY: CreateFileW returned a valid, uniquely owned handle.
         Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
     }
-}
-
-#[cfg(windows)]
-fn icacls_for_test(path: &Path, action: &str, rights: &str) {
-    let output = std::process::Command::new("icacls")
-        .arg(path)
-        .args([action, rights])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "icacls: {output:?}");
-}
-
-#[cfg(windows)]
-pub(crate) struct DeniedReadForTest(PathBuf);
-
-#[cfg(windows)]
-impl Drop for DeniedReadForTest {
-    fn drop(&mut self) {
-        icacls_for_test(&self.0, "/remove:d", "*S-1-1-0");
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn deny_read_for_test<T>(
-    path: &Path,
-    operation: &str,
-    probe: impl FnOnce() -> std::io::Result<T>,
-) -> (DeniedReadForTest, bool) {
-    // Everyone's read-data right is also the directory-listing right. A SID
-    // avoids depending on the localized account name on the Windows runner.
-    icacls_for_test(path, "/deny", "*S-1-1-0:(RD)");
-    let restore = DeniedReadForTest(path.to_path_buf());
-    // Installing an access control entry does not prove the process observes it.
-    // Probe the operation the fixture needs denied before asserting denial-dependent behavior.
-    let enforced = match probe() {
-        Err(error) => {
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied,
-                "{error}"
-            );
-            eprintln!("ACL denial confirmed: {operation} at {}", path.display());
-            true
-        }
-        Ok(_) => {
-            eprintln!(
-                "note: this machine cannot model ACL denial for {operation} at {}; \
-                 the operation succeeded after icacls /deny; skipping only the \
-                 ACL-dependent assertions, not the accounting checks",
-                path.display()
-            );
-            false
-        }
-    };
-    (restore, enforced)
 }
 
 /// A deletion can make the initial metadata open fail with error 5, then remove
@@ -503,7 +384,7 @@ pub(super) fn with_changing_namespace<T>(
 #[test]
 fn path_context_keeps_io_contention_classifiable() {
     let path = Path::new("busy-ledger/members.sqlite");
-    let error = crate::views::io::at(
+    let error = crate::io_accounting::at(
         "checking v3 registry",
         path,
         std::io::Error::from(std::io::ErrorKind::WouldBlock),
@@ -511,7 +392,7 @@ fn path_context_keeps_io_contention_classifiable() {
     let error = Error::Io(std::io::Error::other(error));
     assert!(error.is_busy(), "{error}");
     for code in [32, 33] {
-        let error = crate::views::io::at(
+        let error = crate::io_accounting::at(
             "resolving v3 database",
             path,
             std::io::Error::from_raw_os_error(code),

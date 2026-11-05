@@ -51,8 +51,6 @@ mod clone_accounting_tests;
 pub mod reclaim;
 pub mod v2;
 pub mod v3;
-#[doc(hidden)]
-pub use v3::set_free_space_for_test;
 pub use v3::{v3_format_report, V3FormatReport};
 
 #[cfg(test)]
@@ -343,7 +341,7 @@ impl SemanticKey {
             None
         };
         Self {
-            source_digest: *crate::views::io::source_hash(bytes).as_bytes(),
+            source_digest: *crate::io_accounting::source_hash(bytes).as_bytes(),
             rel_path: rel_path.to_vec(),
             chunker_version: chunker_version.into(),
             embed_template_version: embed_template_version.into(),
@@ -424,7 +422,7 @@ impl CallgraphKey {
         extractor_version: impl Into<String>,
     ) -> Self {
         Self::from_source_digest(
-            *crate::views::io::source_hash(bytes).as_bytes(),
+            *crate::io_accounting::source_hash(bytes).as_bytes(),
             language,
             extractor_version,
         )
@@ -718,7 +716,7 @@ impl BlobStore {
     /// admission uses this before an insert so a rejected payload never enters
     /// the immutable store.
     pub fn usage(&self) -> Result<BlobUsage, BlobStoreError> {
-        crate::views::io::WORK
+        crate::io_accounting::WORK
             .logical_aggregates
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (rows, payload_bytes): (u64, u64) = self.connection.query_row(
@@ -1163,7 +1161,7 @@ mod tests {
             BlobPlane::Semantic,
             b"aft/blob-store/semantic/v1",
             &[
-                crate::views::io::source_hash(bytes).as_bytes(),
+                crate::io_accounting::source_hash(bytes).as_bytes(),
                 path,
                 b"semantic-v1",
                 b"semantic-v1",
@@ -1180,7 +1178,7 @@ mod tests {
             "callgraph-v9-python-import-bindings"
         );
         assert_eq!(
-            crate::views::callgraph::PRODUCER,
+            crate::callgraph_extractor::PRODUCER,
             "ruled-callgraph-v14-resolver-precision"
         );
         let c = b"int plain(void);\n";
@@ -1202,7 +1200,7 @@ mod tests {
             let main = main_semantic_key(bytes, path);
             assert_eq!(current.full_key() != main, changed, "{path:?}");
             let from_hash = SemanticKey::from_source_hash(
-                *crate::views::io::source_hash(bytes).as_bytes(),
+                *crate::io_accounting::source_hash(bytes).as_bytes(),
                 path,
                 "semantic-v1",
                 "semantic-v1",
@@ -1257,7 +1255,7 @@ mod tests {
     #[test]
     fn h_header_invalidation_hash_only_key_misses_until_language_is_known() {
         let bytes = b"template <typename UnknownHeaderType> class UniqueHeaderCacheFixture {};\n";
-        let hash = *crate::views::io::source_hash(bytes).as_bytes();
+        let hash = *crate::io_accounting::source_hash(bytes).as_bytes();
         assert!(SemanticKey::from_source_hash(
             hash,
             b"unknown.h",
@@ -1291,7 +1289,7 @@ mod tests {
             vec![b'x'; 1024 * 1024],
         ] {
             let from_hash = SemanticKey::from_source_hash(
-                *crate::views::io::source_hash(&bytes).as_bytes(),
+                *crate::io_accounting::source_hash(&bytes).as_bytes(),
                 b"src/example.rs",
                 "chunker",
                 "template",

@@ -153,7 +153,7 @@ fn live_base_cap_second_claim_within_cooldown_does_not_walk() {
     ));
     assert_eq!(walks.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(registered_bases(storage.path()), scopes);
-    let _floor = v3::set_free_space_for_test(storage.path(), 0, 1 << 30);
+    let _floor = crate::disk_floor::set_free_space_for_test(storage.path(), 0, 1 << 30);
     assert!(matches!(
         v3::publish(storage.path(), FAMILY, 1, None, |_| Ok(())),
         Err(v3::Error::Refused("device_free_space_floor"))
@@ -396,7 +396,7 @@ fn v3_admission_has_no_family_byte_limit_and_refuses_only_at_the_device_floor() 
     };
     // A 6 GiB request with room on the device is admitted, since only the
     // device floor refuses; it exceeds the target, so the caller sweeps.
-    let roomy = v3::set_free_space_for_test(storage.path(), 1024 * GIB, 2048 * GIB);
+    let roomy = crate::disk_floor::set_free_space_for_test(storage.path(), 1024 * GIB, 2048 * GIB);
     let admitted = budget.admit_v3(&mut registry, 6 * GIB).unwrap();
     assert!(admitted.over_target);
     budget.extend_v3(&mut registry, &admitted, 3 * GIB).unwrap();
@@ -408,10 +408,10 @@ fn v3_admission_has_no_family_byte_limit_and_refuses_only_at_the_device_floor() 
     drop(roomy);
     // A device short of its free-space floor refuses by name and reserves
     // nothing; growth into the floor is refused before any byte is written.
-    let _tight = v3::set_free_space_for_test(
+    let _tight = crate::disk_floor::set_free_space_for_test(
         storage.path(),
-        v3::MIN_FREE_BYTES + 8 * MIB,
-        2 * v3::MIN_FREE_BYTES,
+        crate::disk_floor::MIN_FREE_BYTES + 8 * MIB,
+        2 * crate::disk_floor::MIN_FREE_BYTES,
     );
     let before = registry.accounting().unwrap();
     let refused = budget.admit_v3(&mut registry, 9 * MIB).unwrap_err();
@@ -438,7 +438,7 @@ fn v3_admission_has_no_family_byte_limit_and_refuses_only_at_the_device_floor() 
 fn the_real_free_space_probe_reports_this_volume() {
     let storage = tempfile::tempdir().unwrap();
     let (free, capacity) =
-        v3::probe_free_space_for_test(storage.path()).expect("supported platform");
+        crate::disk_floor::probe_free_space_for_test(storage.path()).expect("supported platform");
     assert!(capacity > 0 && free <= capacity, "{free} / {capacity}");
 }
 
@@ -579,10 +579,10 @@ fn a_refused_admission_sends_the_bind_strict_with_the_named_gap_and_frees_the_cl
     let _serial = v3::serial_for_test();
     let storage = tempfile::tempdir().unwrap();
     let (root, paths) = checkout(FILES);
-    let tight = v3::set_free_space_for_test(
+    let tight = crate::disk_floor::set_free_space_for_test(
         storage.path(),
-        v3::MIN_FREE_BYTES + 1,
-        2 * v3::MIN_FREE_BYTES,
+        crate::disk_floor::MIN_FREE_BYTES + 1,
+        2 * crate::disk_floor::MIN_FREE_BYTES,
     );
     let BaseBuild::Strict(reason) = build_base(
         input(storage.path(), root.path(), &paths, DiskBudget::default()),

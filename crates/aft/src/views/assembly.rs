@@ -10,6 +10,7 @@ use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
+use crate::callgraph_extractor::is_resolution_input;
 use crate::callgraph_store::join::CallgraphBlob;
 use crate::path_status::{PathStatusStore, SkipReason};
 use crate::pins::AssemblyPin;
@@ -745,7 +746,7 @@ pub fn prepare_checkout_deferring(
     let defer_derived = defer_derived && request.callgraph;
     timing.phase("previous_manifest");
     let head_started = Instant::now();
-    super::io::WORK
+    crate::io_accounting::WORK
         .full_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The mark epoch read here, before the checkout is read, is the cutoff
@@ -1709,7 +1710,7 @@ pub fn prepare_checkout_deferring(
 struct PublicationProfile {
     root: PathBuf,
     scheduling: String,
-    store_writes: super::write_accounting::Publication,
+    store_writes: crate::db::write_accounting::Publication,
     io: super::io::PublicationIo,
     overlap: super::io::Overlap,
     concurrent_publications: u64,
@@ -1752,7 +1753,7 @@ impl PublicationProfile {
         Self {
             root: root.to_owned(),
             scheduling: String::new(),
-            store_writes: super::write_accounting::Publication::current_or_default(),
+            store_writes: crate::db::write_accounting::Publication::current_or_default(),
             io: super::io::PublicationIo::new(root),
             overlap: super::io::Overlap::new(true),
             concurrent_publications: 0,
@@ -2170,15 +2171,6 @@ fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
     }
 }
 
-pub(crate) fn is_resolution_input(path: &[u8]) -> bool {
-    let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
-    name == b"package.json"
-        || name == b"Cargo.toml"
-        || name == b"go.mod"
-        || name == b".gitignore"
-        || name.starts_with(b"tsconfig") && name.ends_with(b".json")
-}
-
 fn next_generation(current: Option<&str>, desired_head: &str) -> String {
     let generation = current
         .map(generation_number)
@@ -2367,7 +2359,7 @@ fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {
     };
     planes.callgraph.is_none()
         && (*resolution_input
-            || super::callgraph::source_language(&path_from_bytes(rel_path)).is_some())
+            || crate::callgraph_extractor::source_language(&path_from_bytes(rel_path)).is_some())
 }
 
 /// What the semantic index makes of a member file's bytes on disk.
@@ -2437,7 +2429,7 @@ fn missing_callgraph_payload(
         return Ok(None);
     }
     let blob = if resolution_input {
-        CallgraphBlob::config(source.to_vec(), crate::views::callgraph::PRODUCER)
+        CallgraphBlob::config(source.to_vec(), crate::callgraph_extractor::PRODUCER)
     } else {
         // A source that is not valid UTF-8 cannot be parsed. Failing here
         // would fail the whole publication, so it gets the call graph of an
@@ -2457,7 +2449,7 @@ fn missing_callgraph_payload(
         CallgraphBlob::extract(
             std::str::from_utf8(source).unwrap_or(""),
             language,
-            crate::views::callgraph::PRODUCER,
+            crate::callgraph_extractor::PRODUCER,
         )
         .map_err(|error| {
             ViewError::InvalidManifest(format!(
@@ -2519,9 +2511,12 @@ impl CandidateReader<'_> {
             .as_deref()
             .filter(|_| request.callgraph)
             .map(|language| {
-                let key =
-                    CallgraphKey::from_bytes(&source, language, crate::views::callgraph::PRODUCER)
-                        .full_key();
+                let key = CallgraphKey::from_bytes(
+                    &source,
+                    language,
+                    crate::callgraph_extractor::PRODUCER,
+                )
+                .full_key();
                 let key_hex = key.to_hex();
                 let callgraph_is_current = trust_previous_key
                     && self
@@ -2821,7 +2816,7 @@ mod reuse_tests {
                 let key = CallgraphKey::from_bytes(
                     &source,
                     "typescript",
-                    crate::views::callgraph::PRODUCER,
+                    crate::callgraph_extractor::PRODUCER,
                 )
                 .full_key();
                 let payload = missing_callgraph_payload(store, &key, &source, "typescript", false)
@@ -2901,8 +2896,9 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "corrupt", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
-            .full_key();
+        let key =
+            CallgraphKey::from_bytes(source, "typescript", crate::callgraph_extractor::PRODUCER)
+                .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();
@@ -2965,7 +2961,7 @@ mod reuse_tests {
         // the failed publication did not persist its candidate manifest.
         let source = fs::read(project.path().join("file_7.ts")).unwrap();
         let key =
-            CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+            CallgraphKey::from_bytes(&source, "typescript", crate::callgraph_extractor::PRODUCER)
                 .full_key();
         let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
             .unwrap()
@@ -2990,8 +2986,9 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "reuse", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
-            .full_key();
+        let key =
+            CallgraphKey::from_bytes(source, "typescript", crate::callgraph_extractor::PRODUCER)
+                .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();
@@ -3011,7 +3008,7 @@ mod reuse_tests {
         let mut store = BlobStore::open(storage.path(), "late-fill", BlobPlane::Callgraph).unwrap();
         let source = fs::read(project.path().join("file_0.ts")).unwrap();
         let key =
-            CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+            CallgraphKey::from_bytes(&source, "typescript", crate::callgraph_extractor::PRODUCER)
                 .full_key();
         let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
             .unwrap()

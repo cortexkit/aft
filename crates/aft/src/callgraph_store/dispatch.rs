@@ -63,7 +63,7 @@ pub(crate) fn typescript_objects_from_data(
     if !matches!(lang, LangId::TypeScript | LangId::Tsx) {
         return None;
     }
-    let mut profile = crate::views::materialization::profile::StageTimer::new("typescript_facts");
+    let mut profile = crate::stage_timer::StageTimer::new("typescript_facts");
     let mut refs = Vec::new();
     for (caller, calls) in &data.calls_by_symbol {
         for call in calls.iter().filter(|call| {

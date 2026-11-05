@@ -757,7 +757,7 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
         paths.push(info_exclude);
     }
     if let Ok(metadata) =
-        crate::alias::capture_git_head_metadata(root_path, ctx.git_common_dir().as_deref())
+        crate::git_head::capture_git_head_metadata(root_path, ctx.git_common_dir().as_deref())
     {
         paths.extend(metadata.watch_paths().map(Path::to_path_buf));
         if let Some(git_common_dir) = ctx.git_common_dir() {
@@ -9427,7 +9427,7 @@ fn view_working_tree_refresh_path(
         let language = if *resolution_input {
             "config".to_string()
         } else {
-            let Some(language) = crate::views::callgraph::source_language(&absolute) else {
+            let Some(language) = crate::callgraph_extractor::source_language(&absolute) else {
                 continue;
             };
             format!("{language:?}").to_lowercase()
@@ -9444,7 +9444,7 @@ fn view_working_tree_refresh_path(
                     let head_key = crate::blob_store::CallgraphKey::from_source_digest(
                         digest,
                         &language,
-                        crate::views::callgraph::PRODUCER,
+                        crate::callgraph_extractor::PRODUCER,
                     )
                     .full_key()
                     .to_hex();
@@ -9464,7 +9464,7 @@ fn view_working_tree_refresh_path(
         let actual = crate::blob_store::CallgraphKey::from_bytes(
             &source,
             &language,
-            crate::views::callgraph::PRODUCER,
+            crate::callgraph_extractor::PRODUCER,
         )
         .full_key()
         .to_hex();
@@ -9604,11 +9604,12 @@ fn open_view_runtime_for_configure(
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
         .map_err(|error| error.to_string())?;
     let desired_head = crate::views::assembly::head_tree_fingerprint(&head_entries);
-    let head_metadata = crate::alias::capture_git_head_metadata(
+    // Worded as an alias error, like the head-tree read above.
+    let head_metadata = crate::git_head::capture_git_head_metadata(
         &job.canonical_cache_root,
         input.git_common_dir.as_deref(),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| crate::alias::AliasError::from(error).to_string())?;
     let generation = view
         .current_generation()
         .map_err(|error| error.to_string())?;
@@ -12960,7 +12961,7 @@ mod tests {
                     crate::blob_store::CallgraphKey::from_bytes(
                         original.as_bytes(),
                         "typescript",
-                        crate::views::callgraph::PRODUCER,
+                        crate::callgraph_extractor::PRODUCER,
                     )
                     .full_key()
                     .to_hex(),
@@ -13043,7 +13044,7 @@ mod tests {
                 crate::blob_store::CallgraphKey::from_bytes(
                     edited.as_bytes(),
                     "typescript",
-                    crate::views::callgraph::PRODUCER,
+                    crate::callgraph_extractor::PRODUCER,
                 )
                 .full_key()
                 .to_hex(),
@@ -27655,7 +27656,7 @@ mod startup_view_sweep_tests {
             generation: None,
             manifest: Some(crate::views::Manifest::new(Vec::new()).unwrap()),
             head_fingerprint: String::new(),
-            head_metadata: crate::alias::GitHeadMetadata {
+            head_metadata: crate::git_head::GitHeadMetadata {
                 head_path: PathBuf::new(),
                 head_mtime: None,
                 resolved_ref_path: None,

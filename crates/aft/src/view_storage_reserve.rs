@@ -22,8 +22,8 @@ impl DiskReserveCondition {
         }
         // A failed probe has no sizes to disclose. Keep its unexpected-error
         // treatment rather than inventing a free-space measurement.
-        let (free_bytes, capacity) = crate::blob_store::v3::floor_refusal_measurement(storage)?;
-        let floor_bytes = crate::blob_store::v3::free_disk_floor(capacity);
+        let (free_bytes, capacity) = crate::disk_floor::floor_refusal_measurement(storage)?;
+        let floor_bytes = crate::disk_floor::free_disk_floor(capacity);
         let message = APPROVED_MESSAGE
             .replace("{free}", &size(free_bytes))
             .replace("{floor}", &size(floor_bytes));
@@ -66,7 +66,7 @@ mod tests {
     fn disk_reserve_approved_sentence_is_pinned_byte_for_byte() {
         assert_eq!(APPROVED_MESSAGE, "View storage is paused: {free} is free on this disk and AFT keeps {floor} free. Unused view data is being cleaned up; retry later.");
         let storage = tempfile::tempdir().unwrap();
-        let _space = crate::blob_store::v3::set_free_space_for_test(
+        let _space = crate::disk_floor::set_free_space_for_test(
             storage.path(),
             21 * 1024 * 1024 * 1024,
             3_900_000_000_000,

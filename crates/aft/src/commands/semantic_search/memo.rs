@@ -12,8 +12,8 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffsetRange};
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
+use crate::native_stat::{now_ns, NativeStat};
 use crate::search_index::ExactEvidenceScope;
-use crate::views::verification::{now_ns, NativeStat};
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 const MAX_EXACT_MEMO_BYTES: usize = 8 * 1024 * 1024;

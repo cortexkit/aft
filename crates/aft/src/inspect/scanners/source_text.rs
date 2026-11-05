@@ -151,7 +151,7 @@ fn read_source_bytes_with_limit(path: &Path, limit: u64) -> std::io::Result<Sour
         bump_source_read_count(path);
         let mut bytes = Vec::new();
         file.take(limit + 1).read_to_end(&mut bytes)?;
-        crate::views::io::WORK
+        crate::io_accounting::WORK
             .content_read_bytes
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(if bytes.len() as u64 > limit {

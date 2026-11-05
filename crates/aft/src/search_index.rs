@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
+use crate::native_stat::{now_ns, NativeStat};
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
-use crate::views::verification::{now_ns, NativeStat};
 
 pub use crate::commands::semantic_search::{exact_lane, memo};
 
@@ -7059,7 +7059,7 @@ fn project_walk_builder_with_admission(
     search_root: &Path,
     excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
 ) -> WalkBuilder {
-    crate::views::io::WORK
+    crate::io_accounting::WORK
         .full_walks
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     project_walk_builder_pruned(search_root, excludes, |_| true)
@@ -11916,7 +11916,7 @@ mod tests {
                     super::ArtifactCacheKeyMemoEntry {
                         key: "0123456789abcdef".into(),
                         git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-                        recorded_at_ms: crate::pins::now_ms(),
+                        recorded_at_ms: crate::clock::now_ms(),
                     },
                 )
             })
@@ -12451,7 +12451,7 @@ mod tests {
                         super::ArtifactCacheKeyMemoEntry {
                             key: "0123456789abcdef".into(),
                             git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-                            recorded_at_ms: crate::pins::now_ms(),
+                            recorded_at_ms: crate::clock::now_ms(),
                         },
                     )
                 })
@@ -12495,7 +12495,7 @@ mod tests {
                         super::ArtifactCacheKeyMemoEntry {
                             key: "0123456789abcdef".into(),
                             git_root_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-                            recorded_at_ms: crate::pins::now_ms(),
+                            recorded_at_ms: crate::clock::now_ms(),
                         },
                     )
                 })

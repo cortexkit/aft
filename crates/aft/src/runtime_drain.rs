@@ -3011,7 +3011,7 @@ pub(crate) struct FileMutationGuard<'a> {
     files_before: std::collections::BTreeMap<PathBuf, bool>,
     before: MutationRefreshBudget,
     overflowed: bool,
-    _view_intent: crate::views::intent::IntentGuard,
+    _view_intent: crate::write_intent::IntentGuard,
 }
 
 struct MutationRefreshBudget {
@@ -3099,7 +3099,7 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     paths: impl IntoIterator<Item = &'p Path>,
 ) -> FileMutationGuard<'a> {
     let roots = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
-    let view_intent = crate::views::intent::record_paths(roots.iter().map(PathBuf::as_path));
+    let view_intent = crate::write_intent::record_paths(roots.iter().map(PathBuf::as_path));
     let mut paths = std::collections::BTreeSet::new();
     let mut revisit = Vec::new();
     let mut before = MutationRefreshBudget::new();

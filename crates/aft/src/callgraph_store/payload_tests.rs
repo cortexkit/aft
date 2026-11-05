@@ -44,7 +44,7 @@ fn payload_view_key_is_distinct_from_full_ast_producer() {
     let current = crate::blob_store::CallgraphKey::from_bytes(
         source,
         "rust",
-        crate::views::callgraph::PRODUCER,
+        crate::callgraph_extractor::PRODUCER,
     );
     assert_ne!(old.full_key(), current.full_key());
 }

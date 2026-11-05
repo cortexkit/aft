@@ -381,7 +381,7 @@ impl WatcherBatchMetadata {
         let mut head_paths = BTreeSet::new();
         #[cfg(test)]
         crate::search_index::audit_record(|work| work.watcher_head += 1);
-        if let Ok(metadata) = crate::alias::capture_git_head_metadata(
+        if let Ok(metadata) = crate::git_head::capture_git_head_metadata(
             &config.project_root,
             config.git_common_dir.as_deref(),
         ) {

@@ -39,7 +39,7 @@ fn fixture(files: usize) -> (tempfile::TempDir, AssemblyRequest) {
     let payload = CallgraphBlob::extract(
         "export function f() {}",
         "typescript",
-        super::super::callgraph::PRODUCER,
+        crate::callgraph_extractor::PRODUCER,
     )
     .unwrap()
     .to_bytes()
@@ -54,7 +54,7 @@ fn fixture(files: usize) -> (tempfile::TempDir, AssemblyRequest) {
         let key = CallgraphKey::from_bytes(
             source.as_bytes(),
             "typescript",
-            super::super::callgraph::PRODUCER,
+            crate::callgraph_extractor::PRODUCER,
         )
         .full_key();
         tx.execute("INSERT INTO blob_payloads(full_key, payload, payload_digest, payload_schema) VALUES(?1, ?2, ?3, 1)",

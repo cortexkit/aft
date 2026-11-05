@@ -1865,7 +1865,7 @@ mod tests {
                 generation: Some("verified".into()),
                 manifest: None,
                 head_fingerprint: String::new(),
-                head_metadata: crate::alias::GitHeadMetadata {
+                head_metadata: crate::git_head::GitHeadMetadata {
                     head_path: root.join(".git/HEAD"),
                     head_mtime: None,
                     resolved_ref_path: None,

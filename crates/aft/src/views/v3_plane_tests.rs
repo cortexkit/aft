@@ -71,7 +71,7 @@ fn fixture() -> Fixture {
             paths: &paths,
             policy: policy(),
             semantic_producer: None,
-            callgraph_producer: crate::views::callgraph::PRODUCER.into(),
+            callgraph_producer: crate::callgraph_extractor::PRODUCER.into(),
             ignore_fingerprint: None,
             history: None,
             budget: DiskBudget::default(),

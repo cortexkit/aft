@@ -704,7 +704,7 @@ impl WriterLease {
             )));
         }
         if let Some(storage_root) = cache_dir.parent().and_then(Path::parent) {
-            crate::legacy_partitions::guard_new_layout_write_path(
+            crate::harness_partition_guard::guard_new_layout_write_path(
                 storage_root,
                 cache_dir,
                 "root-keyed writer lease",
@@ -803,7 +803,7 @@ impl ReadMarker {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => {
-                return Err(crate::views::io::at(
+                return Err(crate::io_accounting::at(
                     "opening reader marker",
                     &self.path,
                     error,
@@ -814,7 +814,9 @@ impl ReadMarker {
         (&mut file)
             .take(32 * 1024)
             .read_to_end(&mut bytes)
-            .map_err(|error| crate::views::io::at("reading reader marker", &self.path, error))?;
+            .map_err(|error| {
+                crate::io_accounting::at("reading reader marker", &self.path, error)
+            })?;
         Ok(serde_json::from_slice::<ReadMarkerMetadata>(&bytes)
             .is_ok_and(|stored| stored == self.metadata))
     }
@@ -832,7 +834,7 @@ impl ReadMarker {
         };
         let dir = read_marker_dir(cache_dir, generation_label);
         crate::private_storage::open_dir(cache_dir, &dir).map_err(|error| {
-            crate::views::io::at("creating reader marker directory", &dir, error)
+            crate::io_accounting::at("creating reader marker directory", &dir, error)
         })?;
         let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
@@ -842,16 +844,18 @@ impl ReadMarker {
             metadata.created_at_ms,
             seq
         ));
-        let generation = match pin_cache_path(&dir)
-            .map_err(|error| crate::views::io::at("pinning reader marker directory", &dir, error))?
-        {
+        let generation = match pin_cache_path(&dir).map_err(|error| {
+            crate::io_accounting::at("pinning reader marker directory", &dir, error)
+        })? {
             Some(access) => access.directory(false),
             None => crate::bash_background::persistence::PinnedDir::repair_open_path(&dir),
         }
-        .map_err(|error| crate::views::io::at("opening reader marker directory", &dir, error))?;
+        .map_err(|error| {
+            crate::io_accounting::at("opening reader marker directory", &dir, error)
+        })?;
         let name = path.file_name().unwrap().to_os_string();
         write_marker_file_pinned(&generation, &name, &metadata)
-            .map_err(|error| crate::views::io::at("writing reader marker", &path, error))?;
+            .map_err(|error| crate::io_accounting::at("writing reader marker", &path, error))?;
         let last_touched_at_ms = AtomicU64::new(metadata.created_at_ms);
         Ok(Self {
             path,
@@ -863,8 +867,9 @@ impl ReadMarker {
     }
 
     pub fn touch(&self) -> io::Result<()> {
-        write_marker_file_pinned(&self.generation, &self.name, &self.metadata)
-            .map_err(|error| crate::views::io::at("writing reader marker", &self.path, error))?;
+        write_marker_file_pinned(&self.generation, &self.name, &self.metadata).map_err(
+            |error| crate::io_accounting::at("writing reader marker", &self.path, error),
+        )?;
         self.last_touched_at_ms.store(now_ms(), Ordering::Relaxed);
         Ok(())
     }

@@ -77,6 +77,38 @@ pub(crate) trait ProjectFacts {
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry>;
 }
 
+/// Stands for "no project facts": per-file extraction binds one file's parse
+/// on its own, before it belongs to any checkout. It is not an empty checkout.
+/// Every question answers that nothing exists, and no directory visit, read
+/// or consultation is recorded.
+pub(crate) struct NoProjectFacts;
+
+impl ProjectFacts for NoProjectFacts {
+    fn is_file(&self, _rel: &[u8]) -> bool {
+        false
+    }
+
+    fn is_dir(&self, _rel: &[u8]) -> bool {
+        false
+    }
+
+    fn config_bytes(&self, _rel: &[u8]) -> Option<Arc<[u8]>> {
+        None
+    }
+
+    fn symlink_target(&self, _rel: &[u8]) -> Option<&[u8]> {
+        None
+    }
+
+    fn canonical(&self, _rel: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn list_dir(&self, _rel: &[u8]) -> Vec<DirEntry> {
+        Vec::new()
+    }
+}
+
 pub(crate) struct ManifestFacts<'m> {
     pub manifest: &'m Manifest,
     pub blobs: &'m dyn Fn(&BlobKey) -> Option<Arc<[u8]>>,
