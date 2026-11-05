@@ -219,6 +219,30 @@ fn covered(reply: &Value) -> Value {
     reply
 }
 
+/// Asserts two replies are equal, naming each top-level field that differs.
+#[track_caller]
+fn assert_same(data: &Value, today: &Value) {
+    let (Some(data), Some(today)) = (data.as_object(), today.as_object()) else {
+        assert_eq!(data, today);
+        return;
+    };
+    let differing = data
+        .keys()
+        .chain(today.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| data.get(*key) != today.get(*key))
+        .map(|key| {
+            format!(
+                "{key}: data layer {:?}, today {:?}",
+                data.get(key),
+                today.get(key)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(differing.is_empty(), "{}", differing.join("\n"));
+}
+
 fn gaps(reply: &Value) -> Vec<Value> {
     reply["gaps"].as_array().cloned().unwrap_or_default()
 }
@@ -431,7 +455,7 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     ];
     // Every other child builds its checkout on first use.
     let data_grep = settled(|| grep(&parent, COMMON), |reply| child_gaps(reply) == named);
-    assert_eq!(covered(&data_grep), covered(&today_grep));
+    assert_same(&covered(&data_grep), &covered(&today_grep));
     assert_eq!(gaps(&data_grep), [named.clone(), scope_gaps].concat());
     // The bare children today cannot answer for, past the cap excepted.
     let data_bare = grep(&parent, BARE);
@@ -451,7 +475,7 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
             .collect::<Vec<_>>()
     );
     let data_glob = glob(&parent, "**/*.rs");
-    assert_eq!(covered(&data_glob), covered(&today_glob));
+    assert_same(&covered(&data_glob), &covered(&today_glob));
     assert_eq!(child_gaps(&data_glob), named);
 
     // The call graph, answered as today but current, so without `as_of`.
@@ -462,7 +486,7 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
         );
         let mut expected = today.data.clone();
         expected.as_object_mut().unwrap().remove("as_of");
-        assert_eq!(answer.data, expected, "{command}");
+        assert_same(&answer.data, &expected);
     }
     let building = routed(
         &parent,
@@ -483,9 +507,12 @@ fn a_parent_folder_answers_from_its_childrens_checkouts_as_from_their_published_
     );
     assert_eq!(failed.data["code"], "parent_child_unavailable");
     let capped = routed(&parent, &callgraph_request("callers", "zz-60/notes.txt"));
-    assert_eq!(capped.data, today_capped.data);
+    assert_same(&capped.data, &today_capped.data);
     // Inspect reads what the children's own sessions stored, as today.
-    assert_eq!(routed(&parent, &inspect_request()).data, today_inspect.data);
+    assert_same(
+        &routed(&parent, &inspect_request()).data,
+        &today_inspect.data,
+    );
 
     // The parent folder's own root binds nothing; each served child has
     // its own checkout.
