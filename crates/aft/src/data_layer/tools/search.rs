@@ -815,17 +815,24 @@ mod tests {
         /// ANDs every phrase trigram with its next-character masks; the
         /// view's candidates skip long conjuncts and hash the masks
         /// differently, so they admit a few files today's pruning never
-        /// reached. On aft's checkout over the 6,700 real queries:
+        /// reached. Which queries meet such a file depends on the tree's
+        /// posting sizes. On aft's own checkout over the 6,700 real queries
+        /// the measured pairs were:
         ///
         /// - `16 GiB`, scope All: `const GIB` in `crates/aft/src/views/eviction.rs`
-        ///   and one in `crates/aft/src/views/base_builder_tests.rs` (the
-        ///   files lack the trigram `16 `);
+        ///   and one declaration in `crates/aft/src/views/base_builder_tests.rs`
+        ///   (neither file has the trigram `16 `);
         /// - `/pi/model`, scope All: six `model` declarations in
-        ///   `crates/aft/src/commands/semantic_search/rerank/onnx.rs` (it
-        ///   lacks `/pi`);
-        /// - `fn now_ms`, scope All and DefinitionsMentioning: `now_ms`
-        ///   fields and parameters in FILES_NOW_MS (they hold every trigram of
-        ///   the phrase; only today's masks left them out).
+        ///   `crates/aft/src/commands/semantic_search/rerank/onnx.rs` (it has
+        ///   no `/pi`);
+        /// - `fn now_ms`, scope All and scope DefinitionsMentioning (two
+        ///   pairs): 18 `now_ms` fields and parameters, among them in
+        ///   `crates/aft/src/bash_background/gc_memo.rs`,
+        ///   `crates/aft/src/build_breaker.rs`,
+        ///   `crates/aft/src/build_breaker_audit_tests.rs` and
+        ///   `crates/aft/src/gc/mod.rs` (they hold every trigram of the
+        ///   phrase; only today's masks left them out). With 7,453 paths the
+        ///   two sources agreed on this query.
         fn extra_declarations_name(self) -> &'static str {
             match self {
                 Self::Identifier => "allowed_extra_declarations_identifier_scope_all",

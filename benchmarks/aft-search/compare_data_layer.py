@@ -145,7 +145,9 @@ def without_process_noise(left: JsonObject, right: JsonObject) -> tuple[JsonObje
         text = reply.get("text")
         if isinstance(text, str):
             text = STATUS_BAR.sub("", text)
-            text = text.replace("\n" + WATCHER_NOTICE, "").replace(WATCHER_NOTICE, "")
+            # The notice sits on its own line after a blank line, or ends the
+            # text after one.
+            text = re.sub(r"\n{1,2}" + re.escape(WATCHER_NOTICE), "", text)
             reply["text"] = text
         gaps = reply.get("gaps")
         if isinstance(gaps, list):
