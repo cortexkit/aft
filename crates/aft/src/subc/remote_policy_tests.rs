@@ -2560,6 +2560,188 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     );
 }
 
+/// Prefrontal core checks a worker plan on the head's scope but over its own
+/// connection, so the route's principal is core's rather than a session
+/// host's. The head's saved grants then decide what it may delegate through
+/// allow_paths, but not what the route's own file tools may read.
+fn core_head(root: &Path, scope_ref: &str) -> RouteIdentity {
+    let mut head = identity(root, scope_ref, 7, true);
+    let data = Arc::get_mut(&mut head.0).unwrap();
+    let stamp = data.scope.as_mut().unwrap();
+    stamp.kind = subc_protocol::scope::ScopeKind::Head;
+    stamp.scope_ref = scope_ref.into();
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
+        *principal_id = Some("reserved:prefrontal-core".into());
+    }
+    head
+}
+
+/// A head (`head`) that holds a saved read grant on `granted`, a folder holding
+/// `granted/commons`, a checkout root, and `granted/plain`, which is not one.
+struct SiblingGrantFixture {
+    dir: tempfile::TempDir,
+    ctx: AppContext,
+    head: RouteIdentity,
+    head_grant: crate::access_policy::AccessGrant,
+}
+
+impl SiblingGrantFixture {
+    fn new(scope_ref: &str) -> Self {
+        use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("head");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(dir.path().join("granted/commons/.git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("granted/plain")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other/.git")).unwrap();
+        let ctx = context(&root, &dir.path().join("store"), None);
+        let head = core_head(&root, scope_ref);
+        access_grants::register(&head, &ctx).unwrap();
+        let head_grant = AccessGrant {
+            path: crate::access_policy::policy_path(&dir.path().join("granted")),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        crate::db::access_grants::insert(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(&head),
+            &head_grant,
+        )
+        .unwrap();
+        Self {
+            dir,
+            ctx,
+            head,
+            head_grant,
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+}
+
+fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>) {
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.detail.unwrap()["field"], "params.siblings");
+}
+
+/// A head checks a worker plan before the worker exists, so the plan's own
+/// allow_paths grants are not saved yet. A sibling those grants cover passes
+/// the check; the same plan without them is refused, and so is a sibling the
+/// grants do not cover or one that is not a checkout root.
+#[test]
+fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
+    let fixture = SiblingGrantFixture::new("siblings-preflight-head");
+    let (ctx, head) = (&fixture.ctx, &fixture.head);
+    let commons = fixture.path("granted/commons");
+    let granted = fixture.path("granted");
+    let plan = |siblings: Value, allow_paths: Option<Value>| {
+        let mut request = json!({"preset":"worker", "params":{
+            "remote_exec":{"enabled":true}, "siblings":siblings,
+        }});
+        if let Some(allow_paths) = allow_paths {
+            request["params"]["allow_paths"] = allow_paths;
+        }
+        request
+    };
+    // The head's saved grant does not let this route's own file tools read
+    // the sibling, so without the plan's allow_paths it is refused.
+    assert_siblings_refused(catalog(plan(json!([commons]), None), head, ctx));
+    // A `sibling: true` entry reaches the catalog as the sibling plus a read
+    // allow_paths entry for the same path.
+    catalog(
+        plan(
+            json!([commons]),
+            Some(json!([{"path":commons, "mode":"read"}])),
+        ),
+        head,
+        ctx,
+    )
+    .unwrap();
+    // A grant on a folder containing the sibling covers it too.
+    catalog(
+        plan(
+            json!([commons]),
+            Some(json!([{"path":granted, "mode":"read"}])),
+        ),
+        head,
+        ctx,
+    )
+    .unwrap();
+    let folder_grant = Some(json!([{"path":granted, "mode":"read"}]));
+    // Covered, but not a checkout root.
+    assert_siblings_refused(catalog(
+        plan(json!([fixture.path("granted/plain")]), folder_grant.clone()),
+        head,
+        ctx,
+    ));
+    // A checkout root that no grant covers.
+    assert_siblings_refused(catalog(
+        plan(json!([fixture.path("other")]), folder_grant.clone()),
+        head,
+        ctx,
+    ));
+    // A link inside the granted folder that resolves to a checkout outside it.
+    #[cfg(unix)]
+    {
+        let link = granted.join("link");
+        std::os::unix::fs::symlink(fixture.path("other"), &link).unwrap();
+        assert_siblings_refused(catalog(plan(json!([link]), folder_grant), head, ctx));
+    }
+    // The check saved nothing: the head holds only the grant it started with.
+    assert_eq!(
+        crate::db::access_grants::list(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(head),
+        )
+        .unwrap(),
+        [fixture.head_grant.clone()]
+    );
+}
+
+/// The worker's own fetch saves the plan's allow_paths grants and then checks
+/// its siblings against the session's saved grants only. Once the saved grant
+/// is revoked, a refetch of the same plan is refused even though its
+/// allow_paths entry still validates against the head.
+#[test]
+fn siblings_worker_fetch_counts_only_saved_grants() {
+    let fixture = SiblingGrantFixture::new("siblings-saved-head");
+    let ctx = &fixture.ctx;
+    let commons = fixture.path("granted/commons");
+    let mut worker = identity(&fixture.path("head"), "siblings-saved-worker", 7, true);
+    let stamp = Arc::get_mut(&mut worker.0).unwrap().scope.as_mut().unwrap();
+    stamp.scope_ref = "siblings-saved-worker".into();
+    stamp.parent = Some(
+        serde_json::from_value(json!({
+            "owner":fixture.head.scope.as_ref().unwrap().owner,
+            "ref":"siblings-saved-head", "scope_epoch":7
+        }))
+        .unwrap(),
+    );
+    let request = json!({"preset":"worker", "params":{
+        "remote_exec":{"enabled":true}, "siblings":[commons],
+        "allow_paths":[{"path":commons, "mode":"read"}],
+    }});
+    catalog(request.clone(), &worker, ctx).unwrap();
+    let saved = lookup(ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).unwrap();
+    assert_eq!(
+        saved.params.siblings,
+        [commons.canonicalize().unwrap().to_str().unwrap()]
+    );
+    assert_eq!(
+        crate::db::access_grants::revoke(
+            &ctx.db().unwrap().lock().unwrap(),
+            &access_grants::policy_scope_key(&worker),
+            &crate::access_policy::policy_path(&commons),
+        )
+        .unwrap(),
+        1
+    );
+    assert_siblings_refused(catalog(request, &worker, ctx));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact() {

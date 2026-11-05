@@ -929,16 +929,88 @@ fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() 
         ..Default::default()
     };
     assert!(params
-        .validate_siblings(&ctx, "siblings", "session")
+        .validate_siblings(&ctx, "siblings", "session", &[])
         .is_err());
     std::fs::write(root.path().join(".git"), "gitdir: /checkout/metadata\n").unwrap();
     params
-        .validate_siblings(&ctx, "siblings", "session")
+        .validate_siblings(&ctx, "siblings", "session", &[])
         .unwrap();
     assert_eq!(
         params.siblings,
         [root.path().canonicalize().unwrap().to_str().unwrap()]
     );
+}
+
+/// A plan preflight may count grants its own allow_paths validated but did not
+/// save. They admit a sibling only when one of them covers the resolved
+/// checkout root, and the sibling must still be a checkout root.
+#[test]
+fn siblings_read_gate_counts_preflight_grants_only_where_they_cover_a_checkout_root() {
+    use crate::access_policy::{policy_path, AccessGrant, AccessOperation, GrantKind};
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let granted = dir.path().join("granted");
+    let commons = granted.join("commons");
+    let plain = granted.join("plain");
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(commons.join(".git")).unwrap();
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.clone()),
+            storage_dir: Some(dir.path().join("store")),
+            ..Default::default()
+        },
+    );
+    let grant = |path: &std::path::Path, operation| AccessGrant {
+        path: policy_path(path),
+        kind: GrantKind::Subtree,
+        operation,
+    };
+    let check = |sibling: &std::path::Path, grants: &[AccessGrant]| {
+        let mut params = FrozenParams {
+            siblings: vec![sibling.to_str().unwrap().into()],
+            ..Default::default()
+        };
+        params
+            .validate_siblings(&ctx, "siblings", "session", grants)
+            .map(|()| params.siblings)
+    };
+    // The session's own file tools may not read outside its project.
+    assert_eq!(check(&commons, &[]), Err(SIBLINGS_REFUSAL));
+    let canonical = commons.canonicalize().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(
+        check(&commons, &[grant(&commons, AccessOperation::Read)]).unwrap(),
+        [canonical.clone()]
+    );
+    // A write grant on a folder containing the checkout covers reading it.
+    assert_eq!(
+        check(&commons, &[grant(&granted, AccessOperation::Write)]).unwrap(),
+        [canonical]
+    );
+    // A grant that does not cover the checkout admits nothing.
+    assert_eq!(
+        check(&commons, &[grant(&other, AccessOperation::Read)]),
+        Err(SIBLINGS_REFUSAL)
+    );
+    // A covered folder that is not a checkout root is still refused.
+    assert_eq!(
+        check(&plain, &[grant(&granted, AccessOperation::Read)]),
+        Err(SIBLINGS_REFUSAL)
+    );
+    // A link inside the granted folder resolves to a checkout outside it.
+    #[cfg(unix)]
+    {
+        let link = granted.join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(
+            check(&link, &[grant(&granted, AccessOperation::Read)]),
+            Err(SIBLINGS_REFUSAL)
+        );
+    }
 }
 
 #[test]

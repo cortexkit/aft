@@ -41,11 +41,19 @@ impl FrozenParams {
     /// Authorize snapshot inputs with the file tools' read policy. Paths needing
     /// approval are refused without triggering consent prompts or plugin approval
     /// requests.
+    ///
+    /// `preflight_grants` are read or write grants that the same catalog request
+    /// validated from its `allow_paths` but did not save, because the fetch is a
+    /// head's check of a worker plan before the worker exists. A sibling those
+    /// grants cover is accepted too. Every other caller passes no grants, so the
+    /// worker's own fetch and the check before a job is submitted rely only on
+    /// the grants saved for the session.
     pub(crate) fn validate_siblings(
         &mut self,
         ctx: &crate::context::AppContext,
         request_id: &str,
         session_id: &str,
+        preflight_grants: &[crate::access_policy::AccessGrant],
     ) -> Result<(), &'static str> {
         let siblings = self
             .siblings
@@ -56,9 +64,12 @@ impl FrozenParams {
                     return Err(SIBLINGS_REFUSAL);
                 }
                 let path = crate::bounded_io::canonicalize(path).map_err(|_| SIBLINGS_REFUSAL)?;
-                let path = ctx
-                    .validate_read_path_without_approval(request_id, session_id, &path)
-                    .map_err(|_| SIBLINGS_REFUSAL)?;
+                let path =
+                    match ctx.validate_read_path_without_approval(request_id, session_id, &path) {
+                        Ok(path) => path,
+                        Err(_) if preflight_covers(preflight_grants, &path) => path,
+                        Err(_) => return Err(SIBLINGS_REFUSAL),
+                    };
                 let marker = crate::bounded_io::metadata(&path.join(".git"))
                     .map_err(|_| SIBLINGS_REFUSAL)?;
                 if !marker.is_dir() && !marker.is_file() {
@@ -110,6 +121,20 @@ impl FrozenParams {
                 .map(str::to_owned),
         })
     }
+}
+
+/// Whether a preflight's unsaved grants let it read `path`, which must already
+/// be resolved: a read or write grant on the path itself or on a folder that
+/// contains it. Comparing the resolved path refuses a symlink that sits inside
+/// a granted folder but points outside it.
+fn preflight_covers(grants: &[crate::access_policy::AccessGrant], path: &Path) -> bool {
+    if grants.is_empty() {
+        return false;
+    }
+    let path = crate::access_policy::policy_path(path);
+    grants
+        .iter()
+        .any(|grant| grant.covers(crate::access_policy::AccessOperation::Read, &path))
 }
 
 // Agent-visible refusal wording. Approved by Ufuk (2026-11-02).
