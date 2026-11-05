@@ -61,6 +61,10 @@ impl Fixture {
     /// receives admitted calls) and the transport writer (which receives
     /// settled replies). Must run inside a tokio runtime.
     fn new(name: &str, sessions: u16) -> Arc<Self> {
+        // The module compiles its admission validators before it registers
+        // with the daemon; do the same so no measured call pays that one-time
+        // cost.
+        tool_provider::prepare_admission();
         let (dir, root) = test_support::test_root(name);
         let ctx = test_support::test_ctx();
         ctx.set_db(Arc::new(StdMutex::new(
