@@ -9582,6 +9582,22 @@ pub(crate) fn canonical_git_root_commit_identity(
     }
 }
 
+/// The repository identity of `project_root` for the data layer's family
+/// key: the canonical root-commit identity, `None` when Git confirms the
+/// folder is not a repository (or has no commit yet), and an error when Git
+/// could not tell, so the caller can wait rather than key the folder by its
+/// path and later find it belongs to a repository.
+pub(crate) fn root_commit_identity_or_folder(
+    project_root: &Path,
+) -> Result<Option<String>, String> {
+    match repo_root_commit_with_retry(project_root) {
+        RootCommitResolution::Commit(identity) => Ok(Some(identity)),
+        RootCommitResolution::NotARepo => Ok(None),
+        RootCommitResolution::Failed(detail) => Err(detail),
+        RootCommitResolution::Cancelled => Err("the identity probe was cancelled".to_string()),
+    }
+}
+
 /// Resolve the repository root commit, retrying transient git failures.
 ///
 /// The distinction matters because the fallback is not benign: two clones of

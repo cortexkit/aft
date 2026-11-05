@@ -24,16 +24,21 @@ impl DiskReserveCondition {
         // treatment rather than inventing a free-space measurement.
         let (free_bytes, capacity) = crate::disk_floor::floor_refusal_measurement(storage)?;
         let floor_bytes = crate::disk_floor::free_disk_floor(capacity);
-        let message = APPROVED_MESSAGE
-            .replace("{free}", &size(free_bytes))
-            .replace("{floor}", &size(floor_bytes));
         Some(Self {
             code: CODE,
             free_bytes,
             floor_bytes,
-            message,
+            message: message(free_bytes, floor_bytes),
         })
     }
+}
+
+/// The approved pause sentence for `free_bytes` free against a floor of
+/// `floor_bytes`.
+pub(crate) fn message(free_bytes: u64, floor_bytes: u64) -> String {
+    APPROVED_MESSAGE
+        .replace("{free}", &size(free_bytes))
+        .replace("{floor}", &size(floor_bytes))
 }
 
 /// A size for the agent-facing sentence, such as `21.0 GiB`. The exact byte

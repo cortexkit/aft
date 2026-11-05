@@ -44,7 +44,12 @@ pub(crate) enum Access {
 /// The data layer's call graph for `ctx`'s root, once no recorded edit
 /// waits for it, or [`Access::Building`] after [`READ_WAIT`].
 pub(crate) fn access(ctx: &AppContext) -> Access {
-    let Some(checkout) = ctx.data_checkout() else {
+    // With the call graph switched off, today's store answers, and it
+    // refuses as switched off.
+    let Some(checkout) = ctx
+        .data_checkout()
+        .filter(|checkout| checkout.checkout().planes().callgraph)
+    else {
         return Access::Off;
     };
     match checkout.fresh_view(READ_WAIT) {

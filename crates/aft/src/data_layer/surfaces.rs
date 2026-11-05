@@ -47,6 +47,13 @@ pub(crate) mod reason {
     pub(crate) const REFRESH_FAILED: &str = "refresh_failed";
     /// Another process held the family store's writer past the wait.
     pub(crate) const STORE_BUSY: &str = "store_busy";
+    /// The store's disk has less free space than AFT's floor, so nothing
+    /// new is written; the error is the approved pause sentence.
+    pub(crate) const DISK_RESERVE: &str = "disk_reserve";
+    /// Configure leaves the root unindexed: it is too broad to index (a
+    /// filesystem or volume root), or it is the home folder.
+    pub(crate) const ROOT_TOO_BROAD: &str = crate::feature_status::cause::ROOT_TOO_BROAD;
+    pub(crate) const HOME_ROOT: &str = crate::feature_status::cause::HOME_ROOT;
 }
 
 /// This root's checkout in the data layer, as a status read finds it.
@@ -58,7 +65,20 @@ pub(crate) enum DataCheckoutProbe {
     Binding,
     /// The last bind failed, with the error.
     BindFailed(String),
+    /// The root is never bound; see [`Withheld`].
+    Withheld(Withheld),
     Bound(Arc<DataCheckout>),
+}
+
+/// Why a root's checkout is never bound in the data layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Withheld {
+    /// The root is a filesystem, volume or drive root.
+    TooBroad,
+    /// The root is the home folder.
+    Home,
+    /// The text and call-graph indexes are both switched off.
+    IndexesOff,
 }
 
 /// One plane as status, health and zoom report it.
@@ -90,7 +110,9 @@ impl PlaneReport {
     }
 
     fn failed(failure: &DataFailure) -> Self {
-        let reason = if failure.busy {
+        let reason = if crate::view_storage_reserve::is_message(&failure.error) {
+            reason::DISK_RESERVE
+        } else if failure.busy {
             reason::STORE_BUSY
         } else if failure.stage == "refresh" {
             reason::REFRESH_FAILED
@@ -231,6 +253,16 @@ pub(crate) fn report(ctx: &AppContext) -> Option<DataStoreReport> {
             reason::BIND_FAILED,
             Some(error),
         )),
+        // As today's indexes report these roots.
+        DataCheckoutProbe::Withheld(Withheld::TooBroad) => {
+            DataStoreReport::both(PlaneReport::because(OFF, reason::ROOT_TOO_BROAD, None))
+        }
+        DataCheckoutProbe::Withheld(Withheld::Home) => {
+            DataStoreReport::both(PlaneReport::because(UNAVAILABLE, reason::HOME_ROOT, None))
+        }
+        DataCheckoutProbe::Withheld(Withheld::IndexesOff) => {
+            DataStoreReport::both(PlaneReport::of(OFF))
+        }
         DataCheckoutProbe::Bound(checkout) => report_of(&checkout),
     })
 }
@@ -266,13 +298,17 @@ fn report_from(
         _ => PlaneReport::of(BUILDING),
     };
     let (text, indexed_files) = match (files, status.text) {
+        // Switched off in the configuration: not built, and grep walks.
+        _ if !status.planes.text => (PlaneReport::of(OFF), None),
         (Some(_), PlaneStatus::Ready) => (PlaneReport::of(READY), None),
         (Some(_), PlaneStatus::Building { done, .. }) => (PlaneReport::of(BUILDING), Some(done)),
         _ => (unpublished(), None),
     };
     // The call graph is refreshed lazily: a published graph with edits
     // waiting answers, so it is ready, with the edits counted.
-    let callgraph = if !status.callgraph_published {
+    let callgraph = if !status.planes.callgraph {
+        PlaneReport::of(OFF)
+    } else if !status.callgraph_published {
         unpublished()
     } else if let Some(failure) = refresh_failure {
         PlaneReport::failed(failure)
@@ -312,7 +348,9 @@ fn dir_bytes(dir: &Path) -> u64 {
 pub(crate) fn memory_estimate(ctx: &AppContext) -> Option<MemoryEstimate> {
     Some(match ctx.probe_data_checkout()? {
         // Nothing is held for a checkout that is not bound.
-        DataCheckoutProbe::NotBound | DataCheckoutProbe::BindFailed(_) => {
+        DataCheckoutProbe::NotBound
+        | DataCheckoutProbe::BindFailed(_)
+        | DataCheckoutProbe::Withheld(_) => {
             MemoryEstimate::estimated(0).count("bound_checkouts", 0)
         }
         DataCheckoutProbe::Binding => MemoryEstimate::busy().gap("checkout_binding"),
@@ -572,6 +610,15 @@ mod tests {
 
     /// A configured context over a small Rust crate, with its own storage.
     fn context(root: &Path, storage: &Path) -> AppContext {
+        context_with(root, storage, |_| {})
+    }
+
+    /// As [`context`], with `edit` applied to its configuration.
+    fn context_with(
+        root: &Path,
+        storage: &Path,
+        edit: impl FnOnce(&mut crate::config::Config),
+    ) -> AppContext {
         write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
         write(
             root,
@@ -579,14 +626,110 @@ mod tests {
             "mod util;\npub fn caller() { util::callee(); }\n",
         );
         write(root, "src/util.rs", "pub fn callee() {}\n");
-        let config = crate::config::Config {
+        let mut config = crate::config::Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
             ..crate::config::Config::default()
         };
+        edit(&mut config);
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx
+    }
+
+    #[test]
+    fn an_idle_release_drops_the_checkout_and_its_next_use_serves_the_publication() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context(&root, storage.path());
+        assert!(ctx.data_checkout().is_some());
+        settled(&ctx);
+
+        // The reaper's release after `idle.checkout_hours` without a call.
+        assert!(ctx.try_release_idle_checkout_views());
+        assert!(matches!(
+            ctx.probe_data_checkout(),
+            Some(DataCheckoutProbe::NotBound)
+        ));
+        // The state stayed on disk: the next use binds it and answers at
+        // once, without a build.
+        let checkout = ctx.data_checkout().unwrap();
+        assert!(checkout.view().is_some());
+        assert!(!checkout.checkout().needs_build());
+    }
+
+    #[test]
+    fn roots_configure_leaves_unindexed_and_switched_off_indexes_bind_nothing() {
+        crate::data_layer::runtime::force_on_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context(&root, storage.path());
+        let plane = |ctx: &AppContext, key: &str| {
+            let payload = ctx.build_status_snapshot();
+            (
+                payload[key]["status"].as_str().unwrap().to_string(),
+                payload[key]["reason"].as_str().map(str::to_string),
+            )
+        };
+        let unavailable = |reason: &str| (UNAVAILABLE.to_string(), Some(reason.to_string()));
+        let off = |reason: Option<&str>| (OFF.to_string(), reason.map(str::to_string));
+
+        // The home folder and a filesystem root, as configure marks them.
+        ctx.set_degraded_reasons(vec!["home_root".to_string()]);
+        assert!(ctx.data_checkout().is_none());
+        assert!(matches!(
+            ctx.probe_data_checkout(),
+            Some(DataCheckoutProbe::Withheld(Withheld::Home))
+        ));
+        assert_eq!(plane(&ctx, "search_index"), unavailable(reason::HOME_ROOT));
+        assert_eq!(
+            plane(&ctx, "callgraph_store"),
+            unavailable(reason::HOME_ROOT)
+        );
+        ctx.set_degraded_reasons(vec!["root_too_broad".to_string()]);
+        assert!(ctx.data_checkout().is_none());
+        assert_eq!(
+            plane(&ctx, "callgraph_store"),
+            off(Some(reason::ROOT_TOO_BROAD))
+        );
+        assert!(
+            !storage.path().join("data").exists(),
+            "no store was opened for either"
+        );
+
+        // Both indexes switched off: nothing to build.
+        let none = context_with(&root, storage.path(), |config| {
+            config.indexes.trigram = false;
+            config.indexes.callgraph = false;
+        });
+        assert!(none.data_checkout().is_none());
+        assert_eq!(plane(&none, "search_index"), off(None));
+        assert!(!storage.path().join("data").exists());
+
+        // The text index alone switched off: the call graph is built, and
+        // grep gets no view, so it walks the folder.
+        let graph_only = context_with(&root, storage.path(), |config| {
+            config.indexes.trigram = false;
+        });
+        assert!(graph_only.data_checkout().is_some());
+        let settled_graph = {
+            let started = Instant::now();
+            loop {
+                let report = report(&graph_only).unwrap();
+                if report.callgraph.status == READY || started.elapsed() > Duration::from_secs(60) {
+                    break report;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(
+            (settled_graph.text.status, settled_graph.callgraph.status),
+            (OFF, READY)
+        );
+        assert!(graph_only.data_view().is_none());
     }
 
     /// Waits up to 60 s for both planes of `ctx`'s bound checkout to be
@@ -652,6 +795,7 @@ mod tests {
             building,
             unparsed: 1,
             failed: false,
+            planes: crate::data_layer::checkout::Planes::ALL,
         }
     }
 

@@ -183,7 +183,7 @@ pub fn scan(
 ) -> Result<Scan, ScanError> {
     let (records, mut counters) = walk_records(root, policy, previous, None, sink)?;
     counters.files = records.len();
-    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?;
+    let state = CheckoutState::new(Vec::new(), Digest128::of(b""), records)?.with_root(root);
     Ok(Scan { state, counters })
 }
 
@@ -255,7 +255,8 @@ pub fn scan_paths(
     drop(walked_by_path);
     records.extend(walked);
     counters.files = records.len();
-    let state = CheckoutState::new(previous.git.clone(), previous.conversion, records)?;
+    let state =
+        CheckoutState::new(previous.git.clone(), previous.conversion, records)?.with_root(root);
     Ok(PathScan {
         state,
         changed: changed.into_iter().collect(),

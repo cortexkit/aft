@@ -9207,9 +9207,7 @@ impl AppContext {
     /// timestamp or configuration lock is contended, defer release.
     pub(crate) fn try_views_idle_request(&self) -> Option<(Instant, u32)> {
         let config = try_read_unpoisoned(&self.config)?;
-        config
-            .views
-            .enabled
+        (config.views.enabled || crate::data_layer::runtime::enabled())
             .then(|| {
                 self.last_request_at
                     .try_lock()
@@ -9932,17 +9930,23 @@ impl AppContext {
     /// the process runs it (`AFT_DATA_LAYER=1`); `None` otherwise, or when
     /// no root is configured or its store cannot be opened.
     pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
-        if !crate::data_layer::runtime::enabled() {
+        if !crate::data_layer::runtime::enabled() || self.data_layer_withheld().is_some() {
             return None;
         }
         let root = self.canonical_cache_root_opt()?;
+        let planes = self.data_layer_planes();
         let mut slot = self.data_checkout.lock();
-        if slot.as_ref().is_none_or(|checkout| checkout.root() != root) {
+        // The index switches take effect at the next bind, as they do for
+        // today's indexes; a checkout bound with other planes is replaced.
+        if slot.as_ref().is_none_or(|checkout| {
+            checkout.root() != root || checkout.checkout().planes() != planes
+        }) {
             let executor = self.callgraph_executor.lock().clone();
-            *slot = match crate::data_layer::runtime::DataCheckout::open(
+            *slot = match crate::data_layer::runtime::DataCheckout::open_planes(
                 &root,
                 &self.storage_dir(),
                 executor,
+                planes,
             ) {
                 Ok(checkout) => {
                     *self.data_bind_failure.lock() = None;
@@ -9982,6 +9986,9 @@ impl AppContext {
         if !crate::data_layer::runtime::enabled() {
             return None;
         }
+        if let Some(withheld) = self.data_layer_withheld() {
+            return Some(DataCheckoutProbe::Withheld(withheld));
+        }
         let Some(slot) = self.data_checkout.try_lock() else {
             return Some(DataCheckoutProbe::Binding);
         };
@@ -9999,10 +10006,42 @@ impl AppContext {
         })
     }
 
-    /// The data layer's current view of this root, when it runs and has
-    /// published; see [`Self::data_checkout`].
+    /// The data layer's current view of this root for text queries, when it
+    /// runs, builds the text index and has published; see
+    /// [`Self::data_checkout`]. With the text index switched off, grep and
+    /// glob walk the folder instead.
     pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
-        self.data_checkout()?.view()
+        self.data_checkout()?
+            .view()
+            .filter(|view| view.planes().text)
+    }
+
+    /// The planes this root's checkout builds: the text index and the call
+    /// graph, as `indexes.trigram` and `indexes.callgraph` switch them.
+    fn data_layer_planes(&self) -> crate::data_layer::checkout::Planes {
+        let config = self.config();
+        crate::data_layer::checkout::Planes {
+            text: config.indexes.trigram,
+            callgraph: config.indexes.callgraph,
+        }
+    }
+
+    /// Why this root's checkout is never bound in the data layer, as
+    /// configure leaves today's indexes off for it: the root is a
+    /// filesystem, volume or drive root, or the home folder, or both of the
+    /// data layer's indexes are switched off.
+    pub(crate) fn data_layer_withheld(&self) -> Option<crate::data_layer::surfaces::Withheld> {
+        use crate::data_layer::surfaces::Withheld;
+        let planes = self.data_layer_planes();
+        if self.root_too_broad() {
+            Some(Withheld::TooBroad)
+        } else if self.is_home_root() {
+            Some(Withheld::Home)
+        } else if !planes.text && !planes.callgraph {
+            Some(Withheld::IndexesOff)
+        } else {
+            None
+        }
     }
 
     /// Holds the slot a bind holds while it scans, so a test sees the
@@ -15814,6 +15853,12 @@ impl AppContext {
         let Some(mut callgraph_retry) = self.callgraph_construction_retry.try_lock() else {
             return false;
         };
+        // The data layer's checkout keeps its published state on disk; what it
+        // holds in memory (decoded call-graph slices, the update engine, the
+        // text overlay's index) is rebuilt from that state at its next use.
+        let Some(mut data_checkout) = self.data_checkout.try_lock() else {
+            return false;
+        };
         if !self.search_exact_memo.try_clear_idle() {
             return false;
         }
@@ -15844,6 +15889,7 @@ impl AppContext {
             lexical_view.take(),
             callgraph_view.take(),
             callgraph_borrow.take(),
+            data_checkout.take(),
         );
         self.semantic_refresh_epoch.fetch_add(1, Ordering::SeqCst);
         self.semantic_refresh_build_epoch.store(0, Ordering::SeqCst);
@@ -15859,6 +15905,7 @@ impl AppContext {
             callgraph_borrow,
             lexical_retry,
             callgraph_retry,
+            data_checkout,
         ));
         // Native session destruction can wait for ORT. Keep it, and worker
         // channel teardown, off the daemon's frame loop.

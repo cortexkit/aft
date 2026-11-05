@@ -56,6 +56,13 @@ pub enum DataError {
     /// or AFT is draining): it stopped at a checkpoint, published nothing,
     /// and is not a failure. The work runs again once the root is bound.
     Cancelled,
+    /// Writing would leave less than AFT's free-disk floor on the store's
+    /// disk, so nothing new is written; what is published keeps serving.
+    /// Holds the approved pause sentence.
+    DiskFloor(String),
+    /// Git could not tell which repository the checkout belongs to, so it
+    /// is not bound yet; the bind is tried again later.
+    Identity(String),
 }
 
 impl std::fmt::Display for DataError {
@@ -67,6 +74,8 @@ impl std::fmt::Display for DataError {
             Self::Busy(error) => write!(f, "data store busy: {error}"),
             Self::Damaged(error) => write!(f, "data store damaged: {error}"),
             Self::Cancelled => write!(f, "cancelled"),
+            Self::DiskFloor(message) => f.write_str(message),
+            Self::Identity(error) => write!(f, "repository identity: {error}"),
         }
     }
 }
@@ -119,9 +128,26 @@ fn known_sections() -> Vec<KnownSection> {
         .collect()
 }
 
+/// Which planes a checkout builds and serves. A plane that is off is not
+/// built, and its readers answer as they do with that index switched off:
+/// grep and glob walk the folder, call-graph commands refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Planes {
+    pub text: bool,
+    pub callgraph: bool,
+}
+
+impl Planes {
+    pub const ALL: Self = Self {
+        text: true,
+        callgraph: true,
+    };
+}
+
 /// One bound checkout.
 pub struct Checkout {
     layer: Arc<DataLayer>,
+    planes: Planes,
     root: PathBuf,
     family: Family,
     checkout: CheckoutId,
@@ -324,6 +350,9 @@ pub struct BuildReport {
     pub segment_bytes: u64,
     /// Segments no checkout needs any more, left out of the new generation.
     pub retired_segments: usize,
+    /// Other checkouts of the family whose folder is gone, left out of the
+    /// new generation with their states.
+    pub retired_checkouts: usize,
     /// Another process published this checkout while the build ran, so
     /// nothing was published; the checkout serves that publication.
     pub superseded: bool,
@@ -349,10 +378,26 @@ impl Checkout {
         family: FamilyId,
         root: &Path,
     ) -> Result<Self, DataError> {
+        Self::bind_planes(layer, family_dir, family, root, Planes::ALL)
+    }
+
+    /// As [`Self::bind`], building and serving only `planes`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bind`].
+    pub fn bind_planes(
+        layer: Arc<DataLayer>,
+        family_dir: &Path,
+        family: FamilyId,
+        root: &Path,
+        planes: Planes,
+    ) -> Result<Self, DataError> {
         let checkout = CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()));
         let family = Family::open(family_dir, family).map_err(DataError::store)?;
         let handle = Self {
             layer,
+            planes,
             root: root.to_path_buf(),
             family,
             checkout,
@@ -421,6 +466,12 @@ impl Checkout {
         &self.root
     }
 
+    /// The planes this checkout builds and serves.
+    #[must_use]
+    pub fn planes(&self) -> Planes {
+        self.planes
+    }
+
     fn write_live(&self) -> std::sync::RwLockWriteGuard<'_, Live> {
         self.live.write().expect("no panics while holding it")
     }
@@ -438,6 +489,7 @@ impl Checkout {
         });
         Some(CheckoutView {
             published,
+            planes: self.planes,
             text: Arc::clone(&live.text),
             callgraph_pending: Arc::clone(&live.callgraph_pending),
             graph,
@@ -470,18 +522,21 @@ impl Checkout {
                 ..view.status()
             };
         }
-        let plane = if building {
-            PlaneStatus::Building {
-                done: 0,
-                total: None,
+        let plane = |on: bool| {
+            if building && on {
+                PlaneStatus::Building {
+                    done: 0,
+                    total: None,
+                }
+            } else {
+                PlaneStatus::Off
             }
-        } else {
-            PlaneStatus::Off
         };
         CheckoutStatus {
-            text: plane,
-            callgraph: plane,
+            text: plane(self.planes.text),
+            callgraph: plane(self.planes.callgraph),
             callgraph_published: false,
+            planes: self.planes,
             callgraph_pending: 0,
             building,
             unparsed: 0,
@@ -540,8 +595,9 @@ impl Checkout {
     }
 
     /// Whether the checkout needs a build: nothing is published, or what is
-    /// published has no call graph (a build published the text index first
-    /// and stopped before the call graph, or another process did).
+    /// published has no call graph while this checkout builds one (a build
+    /// published the text index first and stopped before the call graph,
+    /// or another process did).
     #[must_use]
     pub fn needs_build(&self) -> bool {
         self.live
@@ -549,7 +605,7 @@ impl Checkout {
             .expect("no panics while holding it")
             .published
             .as_ref()
-            .is_none_or(|published| !published.graph_built)
+            .is_none_or(|published| self.planes.callgraph && !published.graph_built)
     }
 
     /// Records that `paths` (relative to the root, such as a watcher or an
@@ -692,7 +748,8 @@ impl Checkout {
             })
             .collect::<Vec<_>>();
         let state = CheckoutState::new(state.git.clone(), state.conversion, records)
-            .expect("the scanned state's paths, unchanged");
+            .expect("the scanned state's paths, unchanged")
+            .with_root_of(&state);
         if changed.is_empty() {
             let mut live = self.write_live();
             if live.generation != generation {
@@ -767,6 +824,17 @@ impl Checkout {
     fn build_inner(&self) -> Result<BuildReport, DataError> {
         let mut report = BuildReport::default();
         let build_started = Instant::now();
+        // Below the floor the writer refuses anyway; refuse before the scan
+        // and resolution rather than after them.
+        self.check_disk_floor()?;
+        if !self.planes.callgraph {
+            // Without a call graph, a build is the text scan alone.
+            checkpoint()?;
+            let published = self.publish_text(&mut report)?;
+            report.superseded = !published;
+            report.text_ready_ms = Some(elapsed_ms(build_started));
+            return Ok(report);
+        }
         // A checkout with nothing published gets its text index first: a
         // text-only scan takes about a second where the call graph takes
         // far longer, and text queries need nothing else.
@@ -777,11 +845,11 @@ impl Checkout {
             .published
             .is_none();
         checkpoint()?;
-        if unpublished && !self.publish_text_first()? {
-            report.superseded = true;
-            return Ok(report);
-        }
-        if unpublished {
+        if unpublished && self.planes.text {
+            if !self.publish_text_first()? {
+                report.superseded = true;
+                return Ok(report);
+            }
             report.text_ready_ms = Some(elapsed_ms(build_started));
         }
         checkpoint()?;
@@ -803,7 +871,10 @@ impl Checkout {
             .checkout(self.checkout)
             .cloned();
         let started = Instant::now();
-        let sink = BuildSink::default();
+        let sink = BuildSink {
+            skip_text: !self.planes.text,
+            ..BuildSink::default()
+        };
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
         let mut collected = sink.finish();
@@ -811,7 +882,8 @@ impl Checkout {
         // indexed; record them so grep reports them rather than walking
         // them.
         for record in scanned.state.paths() {
-            if record.kind == PathKind::Text
+            if self.planes.text
+                && record.kind == PathKind::Text
                 && record.stat.size > self.layer.policy.max_indexed_len
                 && collected.seen_text.insert(record.content)
             {
@@ -843,7 +915,8 @@ impl Checkout {
             .collect::<Vec<_>>();
         let state =
             CheckoutState::new(scanned.state.git.clone(), scanned.state.conversion, records)
-                .map_err(DataError::store)?;
+                .map_err(DataError::store)?
+                .with_root_of(&scanned.state);
         let inputs = collected.inputs(&state);
         report.parsed_files = inputs.parses.len();
         checkpoint()?;
@@ -899,15 +972,16 @@ impl Checkout {
             .map_err(DataError::store)?;
         // The new segment holds everything this checkout's new state needs,
         // so an older segment stays only while another checkout reads from
-        // it.
-        let retired = self.unneeded_segments(&state)?;
-        report.retired_segments = retired.len();
+        // it. A checkout whose folder is gone reads nothing any more.
+        let unneeded = self.unneeded(&state)?;
+        report.retired_segments = unneeded.segments.len();
+        report.retired_checkouts = unneeded.checkouts.len();
         session
             .publish(&Publication {
                 add_segments: vec![segment],
-                remove_segments: retired,
+                remove_segments: unneeded.segments,
                 states: vec![written],
-                ..Publication::default()
+                retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
         // Removes what no generation at or above the horizon names. A view
@@ -935,11 +1009,19 @@ impl Checkout {
         Ok(report)
     }
 
-    /// Waits up to [`WRITER_WAIT`] for the store's writer.
+    /// Waits up to [`WRITER_WAIT`] for the store's writer, and refuses it
+    /// below the free-disk floor.
     fn writer(&self) -> Result<aft_store::family::WriteSession<'_>, DataError> {
         let deadline = Instant::now() + WRITER_WAIT;
         loop {
-            if let Some(session) = self.family.try_write().map_err(DataError::store)? {
+            if let Some(mut session) = self.family.try_write().map_err(DataError::store)? {
+                if let Err(error) = self.check_disk_floor() {
+                    // Nothing new is written below the floor, but files no
+                    // generation names any more are still removed, as the
+                    // pause sentence promises.
+                    let _ = session.reclaim();
+                    return Err(error);
+                }
                 return Ok(session);
             }
             if Instant::now() >= deadline {
@@ -952,11 +1034,37 @@ impl Checkout {
         }
     }
 
+    /// Refuses with the approved pause sentence when the store's disk has
+    /// less free space than AFT's floor: 5% of the disk, at least 4 GiB and
+    /// at most 32 GiB. A disk whose free space cannot be measured is refused
+    /// too, as an error rather than a pause.
+    fn check_disk_floor(&self) -> Result<(), DataError> {
+        let dir = self.family.dir();
+        let Some((free, capacity)) = crate::disk_floor::free_space(dir) else {
+            return Err(DataError::Store(format!(
+                "the free space on the disk holding {} could not be measured",
+                dir.display()
+            )));
+        };
+        let floor = crate::disk_floor::free_disk_floor(capacity);
+        if free >= floor {
+            return Ok(());
+        }
+        Err(DataError::DiskFloor(crate::view_storage_reserve::message(
+            free, floor,
+        )))
+    }
+
     /// Scans the checkout's text only, then publishes and serves a state
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published
     /// this checkout first; the checkout then serves that publication.
     pub(crate) fn publish_text_first(&self) -> Result<bool, DataError> {
+        self.publish_text(&mut BuildReport::default())
+    }
+
+    /// [`Self::publish_text_first`], filling in what it did in `report`.
+    fn publish_text(&self, report: &mut BuildReport) -> Result<bool, DataError> {
         let covered = self
             .live
             .read()
@@ -969,6 +1077,7 @@ impl Checkout {
             .manifest()
             .checkout(self.checkout)
             .cloned();
+        let started = Instant::now();
         let sink = BuildSink::text_only();
         let scanned = scan(&self.root, &self.layer.policy, None, &sink)
             .map_err(|error| DataError::Scan(error.to_string()))?;
@@ -985,6 +1094,9 @@ impl Checkout {
                 );
             }
         }
+        report.files = scanned.state.paths().len();
+        report.text_units = collected.text.len();
+        report.scan_ms = elapsed_ms(started);
         let mut session = self.writer()?;
         if session.base().checkout(self.checkout) != started_from.as_ref() {
             drop(session);
@@ -1000,15 +1112,38 @@ impl Checkout {
         let written = session
             .write_checkout_state(self.checkout, &scanned.state)
             .map_err(DataError::store)?;
+        // A checkout without a call graph is built this way every time, so
+        // what it no longer reads is retired here as a full build retires
+        // it.
+        let unneeded = self.unneeded(&scanned.state)?;
+        report.retired_segments = unneeded.segments.len();
+        report.retired_checkouts = unneeded.checkouts.len();
         session
             .publish(&Publication {
                 add_segments: vec![segment],
+                remove_segments: unneeded.segments,
                 states: vec![written],
-                ..Publication::default()
+                retire_checkouts: unneeded.checkouts,
             })
             .map_err(DataError::store)?;
+        // As in a full build: the publication stands whether or not
+        // reclamation runs, and the next one tries again.
+        match session.reclaim() {
+            Ok(reclaimed) => {
+                report.reclaimed_files = reclaimed.removed_segments
+                    + reclaimed.removed_states
+                    + reclaimed.removed_manifests;
+            }
+            Err(error) => report.reclaim_error = Some(error.to_string()),
+        }
         drop(session);
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
+        report.segment_bytes = snapshot
+            .manifest()
+            .segments()
+            .iter()
+            .map(|entry| entry.len)
+            .sum();
         self.serve_new(snapshot, covered)?;
         Ok(true)
     }
@@ -1078,18 +1213,27 @@ impl Checkout {
     /// own rule ([`super::vectors::needed_vector_segments`]), over every
     /// other checkout's state and `own`, the state this build publishes,
     /// since the build's new segment holds no vectors.
-    fn unneeded_segments(&self, own: &CheckoutState) -> Result<Vec<SegmentId>, DataError> {
+    fn unneeded(&self, own: &CheckoutState) -> Result<Unneeded, DataError> {
         let snapshot = self.family.snapshot().map_err(DataError::store)?;
         let mut states = Vec::new();
+        let mut gone = Vec::new();
         for state_ref in snapshot.manifest().checkouts() {
             if state_ref.checkout == self.checkout {
                 continue;
             }
             match snapshot.checkout_state(state_ref.checkout) {
+                Ok(Some(state)) if state.root().is_some_and(folder_is_gone) => {
+                    gone.push(state_ref.checkout);
+                }
                 Ok(Some(state)) => states.push(state),
                 Ok(None) => {}
                 // A state this build cannot read could need any segment.
-                Err(error) if error.is_unusable_file() => return Ok(Vec::new()),
+                Err(error) if error.is_unusable_file() => {
+                    return Ok(Unneeded {
+                        segments: Vec::new(),
+                        checkouts: gone,
+                    });
+                }
                 Err(error) => return Err(DataError::store(error)),
             }
         }
@@ -1114,13 +1258,16 @@ impl Checkout {
         {
             needed[index] |= vectors;
         }
-        Ok(read
-            .entries
-            .iter()
-            .zip(needed)
-            .filter(|(_, needed)| !needed)
-            .map(|(entry, _)| entry.id)
-            .collect())
+        Ok(Unneeded {
+            segments: read
+                .entries
+                .iter()
+                .zip(needed)
+                .filter(|(_, needed)| !needed)
+                .map(|(entry, _)| entry.id)
+                .collect(),
+            checkouts: gone,
+        })
     }
 
     /// For each segment of `snapshot`, in manifest order, whether a member
@@ -1249,7 +1396,7 @@ impl Checkout {
         };
         // Without a call graph there is nothing to update; the build that
         // makes one covers every change recorded before its scan.
-        if changes.is_empty() || !published.graph_built {
+        if changes.is_empty() || !published.graph_built || !self.planes.callgraph {
             return Ok(None);
         }
         // An update that stopped part way through dropped its engine before
@@ -1914,6 +2061,9 @@ pub struct CheckoutStatus {
     /// The last build or call-graph refresh failed, and none has succeeded
     /// since; [`Checkout::failure`] says why.
     pub failed: bool,
+    /// The planes the checkout builds; a plane that is off reports
+    /// [`PlaneStatus::Off`].
+    pub planes: Planes,
 }
 
 /// A checkout's data as queries see it at one moment: the last publication
@@ -1922,6 +2072,7 @@ pub struct CheckoutStatus {
 #[derive(Clone)]
 pub struct CheckoutView {
     published: Arc<Published>,
+    planes: Planes,
     text: Arc<TextOverlay>,
     callgraph_pending: Arc<BTreeSet<Vec<u8>>>,
     graph: Arc<dyn SliceSource + Send + Sync>,
@@ -2052,15 +2203,23 @@ impl CheckoutView {
                 total: Some(pending),
             },
         };
+        let on = |plane: PlaneStatus, on: bool| if on { plane } else { PlaneStatus::Off };
         CheckoutStatus {
-            text,
-            callgraph,
-            callgraph_published: self.published.graph_built,
+            text: on(text, self.planes.text),
+            callgraph: on(callgraph, self.planes.callgraph),
+            callgraph_published: self.published.graph_built && self.planes.callgraph,
             callgraph_pending: self.callgraph_pending.len(),
             building: false,
             unparsed: self.unparsed.len(),
             failed: false,
+            planes: self.planes,
         }
+    }
+
+    /// The planes this view's checkout builds and serves.
+    #[must_use]
+    pub fn planes(&self) -> Planes {
+        self.planes
     }
 
     /// The paths in `scope` that may match `query`, in byte order, with the
@@ -2276,6 +2435,7 @@ fn with_changes(base: &CheckoutState, changes: &BTreeMap<Vec<u8>, Change>) -> Ch
     records.extend(changes.values().filter_map(|change| change.record.clone()));
     CheckoutState::new(base.git.clone(), base.conversion, records)
         .expect("base paths without the changed ones, plus the changed ones")
+        .with_root_of(base)
 }
 
 /// Paths whose member differs between two states of one checkout: added,
@@ -2397,11 +2557,36 @@ impl ContentSink for ChangeSink {
     }
 }
 
+/// What a build leaves out of its publication.
+struct Unneeded {
+    /// Segments no checkout reads any more.
+    segments: Vec<SegmentId>,
+    /// Other checkouts of the family whose folder is gone.
+    checkouts: Vec<CheckoutId>,
+}
+
+/// Whether the checkout folder `root` is confirmed gone: it is not found
+/// while its parent folder can be listed. Any other answer is "can't tell"
+/// and keeps the checkout: a volume that is not mounted (its parent is
+/// missing too), a folder that cannot be read, or one that exists. Worker
+/// worktrees are created and deleted all day, and a deleted one's state
+/// would otherwise keep every segment it read for good.
+fn folder_is_gone(root: &Path) -> bool {
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+    root.parent()
+        .is_some_and(|parent| std::fs::read_dir(parent).is_ok())
+}
+
 /// What a build's scan collects from the files it reads.
 #[derive(Default)]
 struct BuildSink {
     /// Whether parsed files are extracted, or only text is indexed.
     text_only: bool,
+    /// Whether the text index is off, so no text is indexed.
+    skip_text: bool,
     text: Mutex<TextSectionsBuilder>,
     seen_text: Mutex<HashSet<ContentKey>>,
     /// Each parsed path's language.
@@ -2455,7 +2640,7 @@ impl ContentSink for BuildSink {
             .lock()
             .expect("no panics while holding it")
             .insert(key);
-        if first {
+        if first && !self.skip_text {
             let len = bytes.len() as u64;
             match kind {
                 ContentKind::Text => {
@@ -3372,6 +3557,159 @@ pub fn other() { callee(); }
             .filter_map(Result::ok)
             .count();
         assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn a_build_retires_checkouts_whose_folder_is_gone() {
+        let parent = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let main = parent.path().join("main");
+        let deleted = parent.path().join("worker");
+        let unmounted = parent.path().join("volume/worker");
+        for root in [&main, &deleted, &unmounted] {
+            demo(root);
+            Checkout::bind(Arc::clone(&layer), store.path(), family(), root)
+                .unwrap()
+                .build()
+                .unwrap();
+        }
+        // One worktree was deleted. The other went with its parent folder,
+        // as a checkout on a volume that is not mounted does: that is
+        // "can't tell", and keeps it.
+        std::fs::remove_dir_all(&deleted).unwrap();
+        std::fs::remove_dir_all(parent.path().join("volume")).unwrap();
+
+        let checkout = Checkout::bind(Arc::clone(&layer), store.path(), family(), &main).unwrap();
+        let report = checkout.build().unwrap();
+        assert_eq!(report.retired_checkouts, 1, "{report:?}");
+        let id = |root: &Path| {
+            CheckoutId::from_digest(Digest128::of(root.as_os_str().as_encoded_bytes()))
+        };
+        let snapshot = Family::open(store.path(), family())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let kept = snapshot
+            .manifest()
+            .checkouts()
+            .iter()
+            .map(|state| state.checkout)
+            .collect::<Vec<_>>();
+        assert!(kept.contains(&id(&main)), "{kept:?}");
+        assert!(kept.contains(&id(&unmounted)), "{kept:?}");
+        assert!(!kept.contains(&id(&deleted)), "{kept:?}");
+    }
+
+    #[test]
+    fn below_the_disk_floor_nothing_is_written_and_the_published_view_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+
+        // 1 GiB free on a 1 TiB disk: below the 32 GiB floor.
+        let low = crate::disk_floor::set_free_space_for_test(store.path(), 1 << 30, 1 << 40);
+        let paused = "View storage is paused: 1.0 GiB is free on this disk and AFT keeps \
+                      32.0 GiB free. Unused view data is being cleaned up; retry later.";
+        let error = checkout.build().unwrap_err();
+        assert!(matches!(error, DataError::DiskFloor(_)), "{error}");
+        assert_eq!(error.to_string(), paused);
+        // Resolving an edit writes nothing; publishing it is refused too.
+        write(
+            root.path(),
+            "src/util.rs",
+            "pub fn callee() {}\npub fn other() {}\n",
+        );
+        checkout.record_paths(&[b"src/util.rs".to_vec()]).unwrap();
+        checkout.refresh_callgraph().unwrap();
+        assert_eq!(checkout.publish_changes().unwrap_err().to_string(), paused);
+        // What was published keeps answering, with the edit laid over it.
+        let view = checkout.view().unwrap();
+        assert_eq!(
+            candidates_for(&view, "other"),
+            vec!["src/util.rs".to_string()]
+        );
+        assert!(callers_of(&view, "src/util.rs", "callee").contains("caller"));
+
+        drop(low);
+        checkout.build().unwrap();
+    }
+
+    #[test]
+    fn a_checkout_without_the_call_graph_builds_and_serves_its_text_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let checkout = Checkout::bind_planes(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            store.path(),
+            family(),
+            root.path(),
+            Planes {
+                text: true,
+                callgraph: false,
+            },
+        )
+        .unwrap();
+        assert!(checkout.needs_build());
+        let report = checkout.build().unwrap();
+        assert_eq!(report.parsed_files, 0, "{report:?}");
+        assert!(!checkout.needs_build(), "the text index is all it builds");
+        let status = checkout.status();
+        assert_eq!(
+            (status.text, status.callgraph, status.callgraph_published),
+            (PlaneStatus::Ready, PlaneStatus::Off, false)
+        );
+        let view = checkout.view().unwrap();
+        assert_eq!(
+            candidates_for(&view, "callee"),
+            vec!["src/lib.rs", "src/util.rs"]
+        );
+        assert!(!view.callgraph_has_file("src/lib.rs"));
+
+        // An edit is laid over the text index and never resolved; the next
+        // build folds it in and retires what the checkout no longer reads.
+        write(root.path(), "src/extra.rs", "pub fn callee_too() {}\n");
+        checkout.record_paths(&[b"src/extra.rs".to_vec()]).unwrap();
+        assert!(checkout.refresh_callgraph().unwrap().is_none());
+        assert_eq!(
+            candidates_for(&checkout.view().unwrap(), "callee_too"),
+            vec!["src/extra.rs"]
+        );
+        let rebuilt = checkout.build().unwrap();
+        assert_eq!(rebuilt.retired_segments, 1, "{rebuilt:?}");
+        assert_eq!(checkout.changed_paths(), 0);
+    }
+
+    #[test]
+    fn a_checkout_without_the_text_index_builds_its_call_graph_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let checkout = Checkout::bind_planes(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            store.path(),
+            family(),
+            root.path(),
+            Planes {
+                text: false,
+                callgraph: true,
+            },
+        )
+        .unwrap();
+        let report = checkout.build().unwrap();
+        assert_eq!(report.text_units, 0, "{report:?}");
+        assert!(report.text_ready_ms.is_none(), "no text publication first");
+        let status = checkout.status();
+        assert_eq!(
+            (status.text, status.callgraph),
+            (PlaneStatus::Off, PlaneStatus::Ready)
+        );
+        let view = checkout.view().unwrap();
+        assert!(callers_of(&view, "src/util.rs", "callee").contains("caller"));
     }
 
     #[test]

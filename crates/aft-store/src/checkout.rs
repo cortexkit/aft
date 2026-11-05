@@ -5,6 +5,8 @@
 //! Paths are sorted by their bytes, so a directory is a contiguous range and
 //! a lookup is a binary search.
 
+use std::path::Path;
+
 use crate::content::DecodeError;
 use crate::content::codec::{Decoder, Encoder};
 use crate::family::record::RecordError;
@@ -115,6 +117,10 @@ pub struct CheckoutState {
     /// A digest of every attributes source and conversion setting in effect,
     /// under which the recorded contents were read.
     pub conversion: Digest128,
+    /// The checkout's root folder as UTF-8, so another checkout of the
+    /// family can tell when this one's folder is gone; empty when the root
+    /// is not UTF-8 or was not recorded.
+    root: Vec<u8>,
     paths: Vec<PathRecord>,
     /// For each path, the call-graph fragment that holds its resolution in
     /// this checkout, when it has one. Empty, or one entry per path.
@@ -160,9 +166,36 @@ impl CheckoutState {
         Ok(Self {
             git,
             conversion,
+            root: Vec::new(),
             paths,
             fragments: Vec::new(),
         })
+    }
+
+    /// This state recording `root` as its checkout's root folder. A root
+    /// that is not UTF-8 is not recorded.
+    #[must_use]
+    pub fn with_root(mut self, root: &Path) -> Self {
+        self.root = root
+            .to_str()
+            .map_or_else(Vec::new, |root| root.as_bytes().to_vec());
+        self
+    }
+
+    /// This state recording the root folder `from` records.
+    #[must_use]
+    pub fn with_root_of(mut self, from: &Self) -> Self {
+        self.root.clone_from(&from.root);
+        self
+    }
+
+    /// The checkout's root folder, when recorded.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        std::str::from_utf8(&self.root)
+            .ok()
+            .filter(|root| !root.is_empty())
+            .map(Path::new)
     }
 
     /// This state with `fragments`, one entry per path in path order: the
@@ -242,6 +275,7 @@ impl CheckoutState {
         out.byte(STATE_FORMAT);
         out.blob(&self.git);
         out.blob(self.conversion.as_bytes());
+        out.blob(&self.root);
         out.usize(self.paths.len());
         let mut previous: Option<&PathRecord> = None;
         for record in &self.paths {
@@ -307,7 +341,9 @@ impl CheckoutState {
     pub(crate) fn decode(payload: &[u8]) -> Result<Self, RecordError> {
         let invalid = |error: DecodeError| RecordError::Invalid(error.0);
         let mut input = Decoder::new(payload).map_err(invalid)?;
-        if input.byte().map_err(invalid)? != STATE_FORMAT {
+        let format = input.byte().map_err(invalid)?;
+        // Format 2 is format 3 without the root folder.
+        if format != STATE_FORMAT && format != 2 {
             return Err(RecordError::Invalid("unknown checkout state format"));
         }
         let git = input.blob().map_err(invalid)?.to_vec();
@@ -321,6 +357,15 @@ impl CheckoutState {
                 .try_into()
                 .map_err(|_| RecordError::Invalid("conversion digest length"))?,
         );
+        let root = if format == STATE_FORMAT {
+            let root = input.blob().map_err(invalid)?.to_vec();
+            if std::str::from_utf8(&root).is_err() {
+                return Err(RecordError::Invalid("root folder is not UTF-8"));
+            }
+            root
+        } else {
+            Vec::new()
+        };
         let count = input.count_of(MIN_PATH_RECORD_LEN).map_err(invalid)?;
         let mut paths = Vec::<PathRecord>::with_capacity(count);
         for _ in 0..count {
@@ -410,6 +455,7 @@ impl CheckoutState {
         Ok(Self {
             git,
             conversion,
+            root,
             paths,
             fragments,
         })
@@ -417,7 +463,7 @@ impl CheckoutState {
 }
 
 /// The version of [`CheckoutState::encode`]'s layout, its first byte.
-const STATE_FORMAT: u8 = 2;
+const STATE_FORMAT: u8 = 3;
 
 /// The fewest bytes one path record takes in [`CheckoutState::encode`]'s
 /// layout: the 16-byte content key and its length byte, plus one byte for
@@ -475,6 +521,34 @@ mod tests {
             },
             language: "rust".to_string(),
         }
+    }
+
+    #[test]
+    fn a_state_keeps_its_root_folder_through_encoding_and_rebuilding() {
+        let root = Path::new("/work/checkouts/aft-feature");
+        let state = CheckoutState::new(
+            Vec::new(),
+            Digest128::of(b""),
+            vec![record("src/a.rs", "a")],
+        )
+        .unwrap()
+        .with_root(root);
+        assert_eq!(state.root(), Some(root));
+        let decoded = CheckoutState::decode(&state.encode()).unwrap();
+        assert_eq!(decoded.root(), Some(root));
+        assert_eq!(decoded, state);
+        // A state rebuilt from another keeps the root it names.
+        let rebuilt = CheckoutState::new(Vec::new(), Digest128::of(b""), Vec::new())
+            .unwrap()
+            .with_root_of(&decoded);
+        assert_eq!(rebuilt.root(), Some(root));
+        // A state that never named a root names none after decoding either.
+        let rootless =
+            CheckoutState::new(Vec::new(), Digest128::of(b""), vec![record("a", "a")]).unwrap();
+        assert_eq!(
+            CheckoutState::decode(&rootless.encode()).unwrap().root(),
+            None
+        );
     }
 
     #[test]
@@ -569,6 +643,8 @@ mod tests {
         out.byte(STATE_FORMAT);
         out.blob(b"");
         out.blob(Digest128::of(b"").as_bytes());
+        // No root folder.
+        out.blob(b"");
         out.u64(count);
         for _ in 0..filler {
             out.byte(0);

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use aft_store::ids::{Digest128, FamilyId};
 
-use super::checkout::{Checkout, CheckoutView, DataError, DataLayer};
+use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, Planes};
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 
@@ -68,11 +68,18 @@ fn layer() -> Arc<DataLayer> {
 
 /// The family a checkout at `root` belongs to: its repository's root
 /// commits, so every worktree and clone of one repository shares a store.
-/// A folder outside Git is a family of its own.
-fn family_of(root: &Path) -> FamilyId {
-    let identity = crate::search_index::canonical_git_root_commit_identity(root)
-        .unwrap_or_else(|_| format!("folder:{}", root.display()));
-    FamilyId::from_digest(Digest128::of(identity.as_bytes()))
+/// A folder Git confirms is not a repository is a family of its own.
+///
+/// # Errors
+///
+/// When Git could not tell. Keying such a folder by its path would give it
+/// a store of its own that the repository's checkouts never share, so the
+/// bind waits and tries again instead.
+fn family_of(root: &Path) -> Result<FamilyId, DataError> {
+    let identity = crate::search_index::root_commit_identity_or_folder(root)
+        .map_err(DataError::Identity)?
+        .unwrap_or_else(|| format!("folder:{}", root.display()));
+    Ok(FamilyId::from_digest(Digest128::of(identity.as_bytes())))
 }
 
 /// How long a checkout goes without a recorded change before its call
@@ -310,6 +317,17 @@ impl Work {
     /// ending, by the check after it lets go of the flag. A refresh that
     /// finds the stored call graph damaged starts a build, which replaces it.
     fn start_refresh(self: &Arc<Self>, publish: Publish) {
+        if !self.checkout.planes().callgraph {
+            // Without a call graph there is nothing to resolve: the changes
+            // laid over the text index are folded in by a text-only build,
+            // which takes about a second, once the checkout goes quiet or
+            // many have piled up.
+            let changed = self.checkout.changed_paths();
+            if changed > 0 && (publish == Publish::Always || changed >= PUBLISH_AT) {
+                self.start_build();
+            }
+            return;
+        }
         let unpublished = publish == Publish::Always && self.checkout.changed_paths() > 0;
         if !(pending(&self.checkout) || unpublished) || self.refreshing.swap(true, Ordering::AcqRel)
         {
@@ -428,18 +446,31 @@ pub(crate) struct DataCheckout {
 }
 
 impl DataCheckout {
-    /// Binds the checkout at `root`, with its family store under
-    /// `storage`, and builds or refreshes it in the background as it needs.
-    /// Under the daemon, `executor` is the root's: the background work runs
-    /// as its maintenance. `None` runs it on threads, for a standalone AFT.
-    ///
-    /// # Errors
-    ///
-    /// When the family store cannot be opened.
+    /// [`Self::open_planes`] with every plane.
+    #[cfg(test)]
     pub(crate) fn open(
         root: &Path,
         storage: &Path,
         executor: Option<RootMaintenanceExecutor>,
+    ) -> Result<Arc<Self>, DataError> {
+        Self::open_planes(root, storage, executor, Planes::ALL)
+    }
+
+    /// Binds the checkout at `root`, with its family store under
+    /// `storage`, and builds or refreshes `planes` in the background as it
+    /// needs. Under the daemon, `executor` is the root's: the background work
+    /// runs as its maintenance. `None` runs it on threads, for a standalone
+    /// AFT.
+    ///
+    /// # Errors
+    ///
+    /// When Git could not tell the repository's identity, or the family
+    /// store cannot be opened.
+    pub(crate) fn open_planes(
+        root: &Path,
+        storage: &Path,
+        executor: Option<RootMaintenanceExecutor>,
+        planes: Planes,
     ) -> Result<Arc<Self>, DataError> {
         {
             let failures = bind_failures()
@@ -451,9 +482,11 @@ impl DataCheckout {
                 }
             }
         }
-        let family = family_of(root);
-        let family_dir = storage.join("data").join(family.digest().to_string());
-        let checkout = match Checkout::bind(layer(), &family_dir, family, root) {
+        let bound = family_of(root).and_then(|family| {
+            let family_dir = storage.join("data").join(family.digest().to_string());
+            Checkout::bind_planes(layer(), &family_dir, family, root, planes)
+        });
+        let checkout = match bound {
             Ok(checkout) => {
                 bind_failures()
                     .lock()
@@ -741,9 +774,10 @@ pub(crate) fn block_cache_stats() -> Option<aft_store::cache::CacheStats> {
 ///
 /// # Errors
 ///
-/// When the family store cannot be opened.
+/// When Git could not tell the repository's identity, or the family store
+/// cannot be opened.
 pub(crate) fn bind_foreground(root: &Path, storage: &Path) -> Result<Checkout, DataError> {
-    let family = family_of(root);
+    let family = family_of(root)?;
     let family_dir = storage.join("data").join(family.digest().to_string());
     Checkout::bind(layer(), &family_dir, family, root)
 }
@@ -806,7 +840,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("src/util.rs"), "pub fn callee() {}\n").unwrap();
-        let family = family_of(&root);
+        let family = family_of(&root).unwrap();
         let family_dir = storage
             .path()
             .join("data")

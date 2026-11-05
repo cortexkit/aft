@@ -916,7 +916,10 @@ fn handle_inspect_payload(
             .inspect
             .category_enabled(InspectCategory::DeadCode)
     {
-        if let Some(checkout) = ctx.data_checkout() {
+        if let Some(checkout) = ctx
+            .data_checkout()
+            .filter(|checkout| checkout.checkout().planes().callgraph)
+        {
             manager.read_dead_code_from_data_layer(&snapshot.project_root, &checkout);
         }
     }
